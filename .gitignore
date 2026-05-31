@@ -1,0 +1,10 @@
+# Secrets — real credential/env files (the .example variants ARE tracked)
+credentials.env
+.env
+.env.local
+.env.*.local
+*.local
+
+# OS / editor cruft
+.DS_Store
+*.swp

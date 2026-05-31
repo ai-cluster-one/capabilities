@@ -1,0 +1,565 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""
+windmill — agent-first CLI for a Windmill instance (scripts, schedules, jobs, vars).
+
+This tool is designed to be invoked by agents. Run `windmill help` to load the
+full usage contract on demand — do not rely on memorised knowledge of its surface.
+It is identity-free: it knows nothing about any consuming project. Connection +
+workspace come from config/env/flags; project-specific paths (folders, script
+paths, variable paths) are supplied by the caller.
+
+Credentials resolve in a 4-tier cascade (first non-empty wins):
+  1. flags          --url / --token / --workspace
+  2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
+  3. user config    $XDG_CONFIG_HOME/windmill/credentials.env (default ~/.config/windmill/)
+  4. process env    WINDMILL_URL / WINDMILL_API_TOKEN / WINDMILL_WORKSPACE
+Same WINDMILL_* keys at every tier; the project you're in wins, process env is the
+fallback (so a deployed host's injected env governs when no config file is present).
+Never pass the token on the command line.
+
+Commands:
+  windmill help                               Print this document.
+  windmill doctor                             Version + whoami + workspace reachability
+                                              (the health check).
+
+  Scripts (Windmill versions by content hash; no PUT — update = archive+create):
+  windmill scripts [--prefix f/x] [--limit N] List scripts (optionally by path prefix).
+  windmill script-get <path>                  Show one script (incl. content, hash).
+  windmill deploy <path> <file|->             Create/update a script from a file or
+        [--lang bun] [--summary S]            stdin. Re-deploy archives the old hash
+        [--description D] [--timeout 600]     then creates the new version at the same
+        [--tag TAG]                           path. --tag pins a worker group/tag.
+
+  Schedules (native Windmill cron — the schedule registry):
+  windmill schedules [--limit N]              List schedules.
+  windmill schedule-get <path>                Show one schedule.
+  windmill schedule-set <path> --script SP    Create or update a cron schedule on a
+        --cron "0 */5 * * * *"                script. Cron is Windmill format (6-7
+        [--timezone Etc/UTC] [--arg k=v ...]  fields: sec min hour dom mon dow [year]).
+        [--off]                               --arg sets static job args. --off creates
+                                              it disabled.
+  windmill schedule-enable <path> (--on|--off) Toggle a schedule.
+  windmill schedule-delete <path>             Delete a schedule.
+
+  Jobs / runs:
+  windmill run <path> [--sync] [--arg k=v ...] Run a script. Async (default) returns the
+        [--timeout N]                         job id; --sync blocks and returns result.
+  windmill runs [--script PATH] [--limit N]   List recent runs (no logs/result body).
+        [--running] [--success|--failed]
+  windmill job <id>                           Show one job WITH result + logs.
+
+  Variables (secrets + config):
+  windmill vars [--prefix f/x]                List variables (names only; values hidden).
+  windmill var-set <path> [--value V|--stdin] Create or update a variable. Defaults to
+        [--plain] [--description D]           secret; --plain stores non-secret. Value
+                                              from --value, --stdin, or a file path.
+  windmill var-delete <path>                  Delete a variable.
+
+  Folders:
+  windmill folder-create <name> [--owner U]   Create a folder (e.g. myproj → f/myproj).
+        [--owner U ...]                       --owner repeats; pass like u/jess or g/team.
+
+References:
+  <path> values are Windmill paths like f/myproj/runner (folder-scoped). The
+  workspace is NOT part of the path — it comes from --workspace / WINDMILL_WORKSPACE.
+
+I/O contract:
+  - Success: JSON (or a bare string for scalar responses like a hash/job-id) on
+    stdout, exit 0.
+  - Error:   {"error": {"code","message","hint","status"}} on stderr, non-zero exit.
+
+Exit codes:
+  0 success | 2 auth | 3 not found | 5 server/network | 6 input/validation
+
+Notes:
+  - Worker model: a worker runs ONE job at a time for its whole duration; long jobs
+    block a slot. Keep jobs bounded; use --tag to route heavy jobs to a dedicated
+    worker group so they don't starve other scripts on a shared instance.
+  - Timeout is YOURS to set: --timeout on deploy (default 600s) hard-kills any run that
+    overruns. It is not a fixed platform limit — choose it per script to fit the job's
+    real worst-case duration, and keep each job a bounded step rather than a long wait.
+  - Lock resolves async after deploy: a freshly-deployed bun/deno script is not runnable
+    until Windmill computes its dependency lock (seconds). Until then `run` returns
+    404 "script not found at name" even though `scripts` lists it. `deploy` does not wait
+    — poll `script-get <path>` until its `lock` field is non-null, then run.
+  - Scalar endpoints (deploy hash, run job-id, version) return a bare string, not an
+    object — that's expected.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import NoReturn
+
+import httpx
+
+TIMEOUT = httpx.Timeout(60.0)
+MAX_RETRIES = 3
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CONFIG_DIR = _CONFIG_HOME / "windmill"
+CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
+CONN_KEYS = ("WINDMILL_URL", "WINDMILL_API_TOKEN", "WINDMILL_WORKSPACE")
+
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+# --- Config (cascade: flags > project .env > user config > process env) ------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_env() -> dict:
+    """Nearest project .env(.local), walking up from $CLAUDE_PROJECT_DIR (else cwd).
+    .env.local overrides .env. Stops at the first dir holding either, or a .git root."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    for d in (here, *here.parents):
+        if (d / ".env").exists() or (d / ".env.local").exists():
+            merged = _parse_env_file(d / ".env")
+            merged.update(_parse_env_file(d / ".env.local"))  # .local wins
+            return merged
+        if (d / ".git").is_dir():
+            break  # project root reached, no env file here
+    return {}
+
+
+def _resolve_conn(args) -> tuple[str, str, str]:
+    project = _project_env()       # tier 2
+    user = _parse_env_file(CREDENTIALS_ENV)  # tier 3
+
+    def pick(flag, env_key):
+        # First non-empty wins: flag > project .env(.local) > user config > process env.
+        return (getattr(args, flag, None)
+                or project.get(env_key)
+                or user.get(env_key)
+                or os.environ.get(env_key))
+
+    url = pick("url", "WINDMILL_URL")
+    token = pick("token", "WINDMILL_API_TOKEN")
+    workspace = pick("workspace", "WINDMILL_WORKSPACE")
+
+    if not url or not token:
+        _die(2, "missing_credentials",
+             "WINDMILL_URL and WINDMILL_API_TOKEN are required",
+             f"set them in a project .env(.local), {CREDENTIALS_ENV}, the environment, or via --url/--token")
+    if not workspace:
+        _die(6, "missing_workspace",
+             "WINDMILL_WORKSPACE is required",
+             "set WINDMILL_WORKSPACE in a project .env, the user config, the environment, or pass --workspace")
+    return url.rstrip("/"), token, workspace
+
+
+# --- HTTP --------------------------------------------------------------------
+
+def _client(url: str, token: str) -> httpx.Client:
+    return httpx.Client(
+        base_url=url,
+        timeout=TIMEOUT,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+
+
+def _request(client: httpx.Client, method: str, path: str,
+             params: dict | None = None, json_body: dict | None = None,
+             raw: bool = False):
+    """Return parsed JSON, or — for bare scalar/text endpoints — the trimmed text.
+
+    Windmill returns bare quoted scalars (hashes, job ids) which json() decodes to
+    a str; /api/version returns unquoted text. raw=True forces text handling.
+    """
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, path, params=params, json=json_body)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "timeout", f"request timed out: {method} {path}",
+                 "Windmill was unresponsive")
+        except httpx.RequestError as e:
+            _die(5, "network_error", f"network error: {e}", "check WINDMILL_URL / connectivity")
+
+        last_status = resp.status_code
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", "1"))
+            if attempt < MAX_RETRIES:
+                time.sleep(retry_after)
+                continue
+            _die(5, "rate_limited", "rate-limited", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "server_error", f"Windmill returned {resp.status_code}",
+                 (resp.text or "")[:300], status=resp.status_code)
+
+        if resp.status_code >= 400:
+            body = (resp.text or "").strip()
+            msg = body[:400] or "unknown error"
+            try:
+                j = resp.json()
+                if isinstance(j, dict):
+                    msg = j.get("error", {}).get("message") if isinstance(j.get("error"), dict) else None
+                    msg = msg or j.get("error") or j.get("message") or body[:400]
+            except ValueError:
+                pass
+            if resp.status_code in (401, 403):
+                _die(2, "unauthorized", msg, "token invalid or lacks workspace access",
+                     status=resp.status_code)
+            if resp.status_code == 404:
+                _die(3, "not_found", msg, "verify the path and workspace",
+                     status=resp.status_code)
+            if resp.status_code in (400, 409, 422):
+                _die(6, "invalid_request", msg, status=resp.status_code)
+            _die(5, "api_error", msg, status=resp.status_code)
+
+        text = resp.text
+        if raw:
+            return text.strip().strip('"')
+        try:
+            # strict=False: Windmill job logs carry raw ANSI control bytes that
+            # strict JSON rejects — parse leniently so `job`/`runs` stay usable.
+            return json.loads(text, strict=False)
+        except ValueError:
+            return text.strip().strip('"')
+
+    _die(5, "exhausted_retries", f"exhausted {MAX_RETRIES} attempts on {method} {path}",
+         status=last_status)
+
+
+# --- Output ------------------------------------------------------------------
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value if value.endswith("\n") else value + "\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _read_text(src: str | None) -> str:
+    if src is None or src == "-":
+        return sys.stdin.read()
+    p = Path(src)
+    if p.exists():
+        return p.read_text()
+    return src
+
+
+def _parse_args_kv(pairs: list[str]) -> dict:
+    out: dict = {}
+    for kv in pairs:
+        if "=" not in kv:
+            _die(6, "bad_arg", f"--arg expects key=value, got {kv!r}")
+        k, v = kv.split("=", 1)
+        # best-effort typing: JSON value if it parses, else string
+        try:
+            out[k] = json.loads(v)
+        except ValueError:
+            out[k] = v
+    return out
+
+
+def W(ws: str, suffix: str) -> str:
+    return f"/api/w/{ws}/{suffix}"
+
+
+# --- Commands ----------------------------------------------------------------
+
+def cmd_doctor(c, ws):
+    version = _request(c, "GET", "/api/version", raw=True)
+    whoami = _request(c, "GET", W(ws, "users/whoami"))
+    # cheap reachability: list one script in the workspace
+    scripts = _request(c, "GET", W(ws, "scripts/list"), params={"per_page": 1})
+    name = whoami.get("username") or whoami.get("email") if isinstance(whoami, dict) else whoami
+    return {"ok": True, "version": version, "workspace": ws, "whoami": name,
+            "scripts_reachable": isinstance(scripts, list)}
+
+
+def cmd_scripts(c, ws, prefix, limit):
+    params = {"per_page": limit}
+    if prefix:
+        params["path_start"] = prefix
+    return _request(c, "GET", W(ws, "scripts/list"), params=params)
+
+
+def cmd_script_get(c, ws, path):
+    return _request(c, "GET", W(ws, f"scripts/get/p/{path}"))
+
+
+def cmd_deploy(c, ws, path, content, lang, summary, description, timeout, tag):
+    # Update = archive-then-create (no PUT). Carry forward prior metadata if present.
+    prior_hash = None
+    try:
+        prior = _request(c, "GET", W(ws, f"scripts/get/p/{path}"))
+        if isinstance(prior, dict):
+            prior_hash = prior.get("hash")
+            lang = lang or prior.get("language")
+            summary = summary if summary is not None else prior.get("summary")
+            description = description if description is not None else prior.get("description")
+    except SystemExit:
+        pass  # 404 -> fresh create
+    if prior_hash:
+        _request(c, "POST", W(ws, f"scripts/archive/h/{prior_hash}"), raw=True)
+    body = {
+        "path": path,
+        "content": content,
+        "language": lang or "bun",
+        "summary": summary or "",
+        "description": description or "",
+        "timeout": timeout,
+    }
+    if prior_hash:
+        body["parent_hash"] = prior_hash
+    if tag:
+        body["tag"] = tag
+    new_hash = _request(c, "POST", W(ws, "scripts/create"), json_body=body, raw=True)
+    return {"path": path, "hash": new_hash, "language": body["language"],
+            "archived": prior_hash, "tag": tag}
+
+
+def cmd_schedules(c, ws, limit):
+    return _request(c, "GET", W(ws, "schedules/list"), params={"per_page": limit})
+
+
+def cmd_schedule_get(c, ws, path):
+    return _request(c, "GET", W(ws, f"schedules/get/{path}"))
+
+
+def cmd_schedule_set(c, ws, path, script, cron, timezone, args_kv, off):
+    args = _parse_args_kv(args_kv)
+    exists = False
+    try:
+        _request(c, "GET", W(ws, f"schedules/get/{path}"))
+        exists = True
+    except SystemExit:
+        pass
+    if exists:
+        body = {"schedule": cron, "timezone": timezone, "args": args,
+                "script_path": script, "is_flow": False}
+        _request(c, "POST", W(ws, f"schedules/update/{path}"), json_body=body)
+        # enabled state is managed separately on update
+        _request(c, "POST", W(ws, f"schedules/setenabled/{path}"),
+                 json_body={"enabled": not off})
+        return {"path": path, "updated": True, "enabled": not off, "cron": cron}
+    body = {"path": path, "schedule": cron, "timezone": timezone, "args": args,
+            "script_path": script, "is_flow": False, "enabled": not off}
+    _request(c, "POST", W(ws, "schedules/create"), json_body=body)
+    return {"path": path, "created": True, "enabled": not off, "cron": cron,
+            "script_path": script}
+
+
+def cmd_schedule_enable(c, ws, path, on):
+    _request(c, "POST", W(ws, f"schedules/setenabled/{path}"), json_body={"enabled": on})
+    return {"path": path, "enabled": on}
+
+
+def cmd_schedule_delete(c, ws, path):
+    _request(c, "DELETE", W(ws, f"schedules/delete/{path}"), raw=True)
+    return {"path": path, "deleted": True}
+
+
+def cmd_run(c, ws, path, sync, args_kv, timeout):
+    args = _parse_args_kv(args_kv)
+    params = {}
+    if timeout:
+        params["timeout"] = timeout
+    if sync:
+        result = _request(c, "POST", W(ws, f"jobs/run_wait_result/p/{path}"),
+                          params=params, json_body=args)
+        return {"path": path, "result": result}
+    job_id = _request(c, "POST", W(ws, f"jobs/run/p/{path}"),
+                      params=params, json_body=args, raw=True)
+    return {"path": path, "job_id": job_id}
+
+
+def cmd_runs(c, ws, script, limit, running, success, failed):
+    params = {"per_page": limit, "no_logs": "true"}
+    if script:
+        params["script_path_exact"] = script
+    if running:
+        params["running"] = "true"
+    if success:
+        params["success"] = "true"
+    if failed:
+        params["success"] = "false"
+    return _request(c, "GET", W(ws, "jobs/list"), params=params)
+
+
+def cmd_job(c, ws, job_id):
+    return _request(c, "GET", W(ws, f"jobs_u/get/{job_id}"))
+
+
+def cmd_vars(c, ws, prefix):
+    params = {}
+    if prefix:
+        params["path_start"] = prefix
+    return _request(c, "GET", W(ws, "variables/list"), params=params)
+
+
+def cmd_var_set(c, ws, path, value, secret, description):
+    # create, fall back to update if it already exists
+    try:
+        _request(c, "POST", W(ws, "variables/create"),
+                 json_body={"path": path, "value": value,
+                            "is_secret": secret, "description": description or ""},
+                 raw=True)
+        return {"path": path, "created": True, "is_secret": secret}
+    except SystemExit as e:
+        if e.code != 6:  # not an "already exists"-class error
+            raise
+    _request(c, "POST", W(ws, f"variables/update/{path}"),
+             json_body={"value": value})
+    return {"path": path, "updated": True, "is_secret": secret}
+
+
+def cmd_var_delete(c, ws, path):
+    _request(c, "DELETE", W(ws, f"variables/delete/{path}"), raw=True)
+    return {"path": path, "deleted": True}
+
+
+def cmd_folder_create(c, ws, name, owners):
+    body = {"name": name, "owners": owners or [], "extra_perms": {}}
+    _request(c, "POST", W(ws, "folders/create"), json_body=body, raw=True)
+    return {"folder": f"f/{name}", "owners": owners or []}
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="windmill", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--url", default=None, help="Windmill base URL (overrides env/config)")
+    p.add_argument("--token", default=None, help="API token (prefer config/env; avoid CLI)")
+    p.add_argument("--workspace", default=None, help="workspace id (overrides env/config)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("help")
+    sub.add_parser("doctor")
+
+    sp = sub.add_parser("scripts"); sp.add_argument("--prefix"); sp.add_argument("--limit", type=int, default=100)
+    sp = sub.add_parser("script-get"); sp.add_argument("path")
+    sp = sub.add_parser("deploy")
+    sp.add_argument("path"); sp.add_argument("file", help="source file or '-' for stdin")
+    sp.add_argument("--lang", default=None, help="bun (default) | deno | python3 | bash | go | nativets")
+    sp.add_argument("--summary", default=None); sp.add_argument("--description", default=None)
+    sp.add_argument("--timeout", type=int, default=600); sp.add_argument("--tag", default=None)
+
+    sp = sub.add_parser("schedules"); sp.add_argument("--limit", type=int, default=100)
+    sp = sub.add_parser("schedule-get"); sp.add_argument("path")
+    sp = sub.add_parser("schedule-set")
+    sp.add_argument("path"); sp.add_argument("--script", required=True)
+    sp.add_argument("--cron", required=True); sp.add_argument("--timezone", default="Etc/UTC")
+    sp.add_argument("--arg", action="append", default=[]); sp.add_argument("--off", action="store_true")
+    sp = sub.add_parser("schedule-enable"); sp.add_argument("path")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--on", action="store_true"); g.add_argument("--off", action="store_true")
+    sp = sub.add_parser("schedule-delete"); sp.add_argument("path")
+
+    sp = sub.add_parser("run"); sp.add_argument("path")
+    sp.add_argument("--sync", action="store_true"); sp.add_argument("--arg", action="append", default=[])
+    sp.add_argument("--timeout", type=int, default=None)
+    sp = sub.add_parser("runs"); sp.add_argument("--script"); sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--running", action="store_true")
+    sp.add_argument("--success", action="store_true"); sp.add_argument("--failed", action="store_true")
+    sp = sub.add_parser("job"); sp.add_argument("id")
+
+    sp = sub.add_parser("vars"); sp.add_argument("--prefix")
+    sp = sub.add_parser("var-set"); sp.add_argument("path")
+    sp.add_argument("--value", default=None); sp.add_argument("--stdin", action="store_true")
+    sp.add_argument("--plain", action="store_true", help="store non-secret (default is secret)")
+    sp.add_argument("--description", default=None)
+    sp = sub.add_parser("var-delete"); sp.add_argument("path")
+
+    sp = sub.add_parser("folder-create"); sp.add_argument("name")
+    sp.add_argument("--owner", action="append", default=[])
+
+    args = p.parse_args()
+    if args.cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n")); return
+
+    url, token, ws = _resolve_conn(args)
+    with _client(url, token) as c:
+        if args.cmd == "doctor":
+            _emit(cmd_doctor(c, ws))
+        elif args.cmd == "scripts":
+            _emit(cmd_scripts(c, ws, args.prefix, args.limit))
+        elif args.cmd == "script-get":
+            _emit(cmd_script_get(c, ws, args.path))
+        elif args.cmd == "deploy":
+            _emit(cmd_deploy(c, ws, args.path, _read_text(args.file), args.lang,
+                             args.summary, args.description, args.timeout, args.tag))
+        elif args.cmd == "schedules":
+            _emit(cmd_schedules(c, ws, args.limit))
+        elif args.cmd == "schedule-get":
+            _emit(cmd_schedule_get(c, ws, args.path))
+        elif args.cmd == "schedule-set":
+            _emit(cmd_schedule_set(c, ws, args.path, args.script, args.cron,
+                                   args.timezone, args.arg, args.off))
+        elif args.cmd == "schedule-enable":
+            _emit(cmd_schedule_enable(c, ws, args.path, args.on and not args.off))
+        elif args.cmd == "schedule-delete":
+            _emit(cmd_schedule_delete(c, ws, args.path))
+        elif args.cmd == "run":
+            _emit(cmd_run(c, ws, args.path, args.sync, args.arg, args.timeout))
+        elif args.cmd == "runs":
+            _emit(cmd_runs(c, ws, args.script, args.limit, args.running, args.success, args.failed))
+        elif args.cmd == "job":
+            _emit(cmd_job(c, ws, args.id))
+        elif args.cmd == "vars":
+            _emit(cmd_vars(c, ws, args.prefix))
+        elif args.cmd == "var-set":
+            if args.value is None and not args.stdin:
+                _die(6, "no_value", "var-set needs --value or --stdin")
+            value = _read_text(None) if args.stdin else args.value
+            _emit(cmd_var_set(c, ws, args.path, value, not args.plain, args.description))
+        elif args.cmd == "var-delete":
+            _emit(cmd_var_delete(c, ws, args.path))
+        elif args.cmd == "folder-create":
+            _emit(cmd_folder_create(c, ws, args.name, args.owner))
+
+
+if __name__ == "__main__":
+    main()
