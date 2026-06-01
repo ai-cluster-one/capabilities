@@ -34,7 +34,7 @@ Every script connects with the `ssh2` library, reading three folder-scoped varia
 ## Deploy
 
 ```
-windmill deploy f/<namespace>/<name> .assets/<namespace>/scripts/<name>.ts --timeout <secs> [--tag <wg>]
+windmill deploy f/<namespace>/<name> .capabilities/<namespace>/scripts/<name>.ts --timeout <secs> [--tag <wg>]
 ```
 
 Re-deploy archives the prior hash and creates the new version at the same path (no PUT). A freshly-deployed script isn't runnable until its dependency lock resolves — poll `windmill script-get <path>` until `lock` is non-null, then run. (Both behaviours are in `windmill help`.)

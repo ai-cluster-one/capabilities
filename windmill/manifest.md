@@ -38,16 +38,16 @@ Per-project override: a consuming project may set these in its own `.env` / `.en
 | Source (repo) | Destination |
 |---|---|
 | `project/capability.md` | `.claude/rules/capability/WINDMILL.md` (auto-loaded) |
-| `project/assets/identifiers.md` | `.assets/<namespace>/identifiers.md` |
-| `project/assets/reference.md` | `.assets/<namespace>/reference.md` |
-| `project/assets/windmill-guide.md` | `.assets/<namespace>/windmill-guide.md` |
-| `project/assets/scripts/` | `.assets/<namespace>/scripts/` (example scripts; adapt) |
+| `project/assets/identifiers.md` | `.capabilities/<namespace>/identifiers.md` |
+| `project/assets/reference.md` | `.capabilities/<namespace>/reference.md` |
+| `project/assets/windmill-guide.md` | `.capabilities/<namespace>/windmill-guide.md` |
+| `project/assets/scripts/` | `.capabilities/<namespace>/scripts/` (example scripts; adapt) |
 
 ## Template variables
 
 | Variable | Class | Resolve by | Written into |
 |---|---|---|---|
-| `<namespace>` | discoverable | infer from the project (dir name / existing `.assets/` convention); confirm if unsure | the Windmill folder `f/<namespace>/`, the `.assets/<namespace>/` path, every script |
+| `<namespace>` | discoverable | infer from the project (dir name / existing `.capabilities/` convention); confirm if unsure | the Windmill folder `f/<namespace>/`, the `.capabilities/<namespace>/` path, every script |
 | `WINDMILL_URL` / `WINDMILL_WORKSPACE` / `WINDMILL_API_TOKEN` | must-confirm | ask the user | the credentials env file (global) or project `.env` |
 | `<AGENT_IMAGE>` | must-confirm (if using the SSH/box scripts) | ask the user; else leave-breadcrumb | the example scripts' container filter |
 | `f/<namespace>/agent_ssh_*` | leave-breadcrumb | created as Windmill variables when the box leg is wired | the example scripts |

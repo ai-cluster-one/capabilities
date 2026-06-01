@@ -13,7 +13,7 @@ Open `<capability>/manifest.md` for the full list of artifacts and their homes, 
 
 ## 2. Project layer
 
-- Remove `.claude/rules/capability/<NAME>.md` and the `.assets/<namespace>/` tree.
+- Remove `.claude/rules/capability/<NAME>.md` and the `.capabilities/<namespace>/` tree.
 - **Scan first** for references to the capability elsewhere in the project (other rules files, pointers, scripts). Report them so no dangling links are left behind.
 
 ## 3. Global layer

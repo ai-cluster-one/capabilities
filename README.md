@@ -32,12 +32,14 @@ A capability folder here mirrors that:
     credentials.env.example   env keys, no values
   project/
     capability.md             → .claude/rules/capability/<NAME>.md (auto-loaded)
-    assets/                    → .assets/<namespace>/
+    assets/                    → .capabilities/<namespace>/
       identifiers.md          non-secret structural identifiers only
       reference.md            seat/project-specific operational context
       <name>-guide.md         the usage / authoring guide
       scripts/                authored sources (optional; Windmill has them)
 ```
+
+Slots are **flat by default**. When one outgrows a single file, keep its `<slot>.md` as a thin index and move the focused files into a sibling `<slot>/` folder — see TEMPLATE's [*When a slot outgrows one file*](TEMPLATE.md#when-a-slot-outgrows-one-file).
 
 ## Procedures (the SOPs)
 

@@ -36,7 +36,7 @@ For each **must-confirm** template variable (e.g. a Windmill instance URL), **as
 If installing into a project, lay down the template instance from `<capability>/project/`:
 
 - `project/capability.md` → `.claude/rules/capability/<NAME>.md` (auto-loaded).
-- `project/assets/*` → `.assets/<namespace>/` (identifiers, reference, guide, optional `scripts/`).
+- `project/assets/*` → `.capabilities/<namespace>/` (identifiers, reference, guide, optional `scripts/`).
 
 Resolve placeholders: **discover** what you can (e.g. infer `<namespace>` from the project), **ask** for must-confirms, and **breadcrumb** the rest as clearly-marked placeholders. Connection-level values do **not** go in the markdown — they belong in the project's `.env` / `.env.local` as an override of the global credentials.
 

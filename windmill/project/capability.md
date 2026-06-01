@@ -14,6 +14,6 @@ Via the `~/bin/windmill` global tool — run `windmill help` first (the CLI surf
 
 ## Operational context (load on demand)
 
-- [.assets/<namespace>/identifiers.md](../../../.assets/<namespace>/identifiers.md) — all fixed values and paths: the `f/<namespace>/` folder, the agent-box SSH target, the folder-scoped variables, script/schedule paths.
-- [.assets/<namespace>/reference.md](../../../.assets/<namespace>/reference.md) — project-specific operational context: folder-as-isolation-boundary, dedicated worker-tag routing, the link-don't-copy rule for Windmill's own docs.
-- [.assets/<namespace>/windmill-guide.md](../../../.assets/<namespace>/windmill-guide.md) — **how to write a script**: the prefer-the-box's-CLIs principle, capability discovery, the SSH bridge, self-contained-per-file rule, deploy. Sources + examples in [.assets/<namespace>/scripts/](../../../.assets/<namespace>/scripts/).
+- [.capabilities/<namespace>/identifiers.md](../../../.capabilities/<namespace>/identifiers.md) — all fixed values and paths: the `f/<namespace>/` folder, the agent-box SSH target, the folder-scoped variables, script/schedule paths.
+- [.capabilities/<namespace>/reference.md](../../../.capabilities/<namespace>/reference.md) — project-specific operational context: folder-as-isolation-boundary, dedicated worker-tag routing, the link-don't-copy rule for Windmill's own docs.
+- [.capabilities/<namespace>/windmill-guide.md](../../../.capabilities/<namespace>/windmill-guide.md) — **how to write a script**: the prefer-the-box's-CLIs principle, capability discovery, the SSH bridge, self-contained-per-file rule, deploy. Sources + examples in [.capabilities/<namespace>/scripts/](../../../.capabilities/<namespace>/scripts/).

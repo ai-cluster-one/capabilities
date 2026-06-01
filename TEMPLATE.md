@@ -17,12 +17,28 @@ Global is the introduction; project is the elaboration. A fact lives at exactly 
 |---|---|---|---|
 | 1. Global context | the **stub** (`~/.claude/tools/<name>.md`) | global | tool awareness + how to load the full contract (`<name> help`) |
 | 2. Project context | the **capability file** (`.claude/rules/capability/<NAME>.md`) | project | role/purpose **in this project** + a pointer list. Lightweight. |
-| 3. Pointers | the pointer list *inside* slot 2 | project | links to slots 4–6, loaded on demand |
-| 4. Identifiers | `.assets/<ns>/identifiers.md` | project | **non-secret structural** values only: paths, folders, variable names, gids |
-| 5. Usage guide | `.assets/<ns>/<name>-guide.md` | project | how to use/author for this project's needs |
-| (opt) Artifacts | `.assets/<ns>/scripts/` etc. | project | sources the capability authors (most have none; Windmill does) |
+| 3. Pointers | the pointer list *inside* slot 2 | project | links to slots 4–6, loaded on demand — **the single home for those asset paths** (consumers address assets by role, not literal path; rule 7) |
+| 4. Identifiers | `.capabilities/<ns>/identifiers.md` | project | **non-secret structural** values only: paths, folders, variable names, gids |
+| 5. Usage guide | `.capabilities/<ns>/<name>-guide.md` | project | how to use/author for this project's needs |
+| (opt) Artifacts | `.capabilities/<ns>/scripts/` etc. | project | sources the capability authors (most have none; Windmill does) |
 
-A sixth, `.assets/<ns>/reference.md`, carries project-specific operational *context* (prose that isn't a value and isn't a how-to). Use it when there's genuine context to hold; skip it when there isn't.
+A sixth, `.capabilities/<ns>/reference.md`, carries project-specific operational *context* (prose that isn't a value and isn't a how-to). Use it when there's genuine context to hold; skip it when there isn't.
+
+## Project layout
+
+In a consuming project, capability assets live under `.capabilities/<ns>/` — one folder per installed capability, each mirroring the slots above (`identifiers.md`, `reference.md`, `<name>-guide.md`, optional `scripts/`). `ls .capabilities/` lists the installed capabilities. The stub for slot 2 lives at `.claude/rules/capability/<NAME>.md`.
+
+## When a slot outgrows one file
+
+The slots above are **flat by default** — one `identifiers.md`, one `reference.md`, one `<name>-guide.md`. A capability whose project usage is small keeps them that way.
+
+When a single slot's content grows past one coherent file, **branch that slot into a sibling `<slot>/` folder** of focused files, and keep the slot's `<slot>.md` at its canonical path as a **thin index** — a pointer list into the sub-files, nothing more. (So `reference.md` stays put and gains a `reference/` folder beside it; `reference/<topic>.md` holds the detail.) This is rule 7 applied one level down:
+
+- The capability file (slot 2) still addresses the slot **by role** ("the reference") — it never learns the sub-file names. Only the slot's index knows them.
+- Sub-files **within** a slot may link each other directly — they're declared together (the sibling allowance).
+- `(capability, slot)` stays a **computable address**: the index's path never moved, so every consumer that named "the X reference" keeps resolving — the index absorbs the fan-out. A sub-file's literal path must never leak past its index.
+
+Branch on genuine growth, not anticipation: a two-paragraph reference doesn't need a folder; a reference that has become five distinct topics does. Identifiers and the guide branch the same way when they earn it.
 
 ## Standing rules (the validator's invariants)
 
@@ -32,6 +48,7 @@ A sixth, `.assets/<ns>/reference.md`, carries project-specific operational *cont
 4. **Connection-level / secret identifiers go to env, not markdown.** URLs, tokens, workspaces, hostnames-with-tenant live in the credentials env file (global) or the project's `.env` / `.env.local` (override) — resolved by the cascade below. The identifiers asset holds only non-secret *structural* values and points to env for the rest.
 5. **Link platform docs, don't copy them.** For deep usage of the underlying service, point to its official docs (fetchable live) rather than transcribing — copied docs rot silently. Capture only what's specific to *this* capability or *this* project.
 6. **Placeholders, never secrets.** Project files install with clearly-marked placeholders; credential files install as `*.example` with empty values. A real secret never enters the repo or a committed file.
+7. **Asset paths are addressed by role, declared once.** A file that needs an asset names it by `(capability, slot)` — "the Windmill identifiers", "the Asana usage guide" — and lets the always-loaded capability file (slot 2) resolve where it lives. It does **not** hard-link the literal path. This is rule 1 applied to paths: a path is a fact, its one home is the pointer list (slot 3). Because slot naming is fixed (`.capabilities/<ns>/identifiers.md`, `…/reference.md`, `…/<name>-guide.md`), `(capability, slot)` is a **computable address** — the same way a consumer names an env var, never its value (rule 4). Rename or move an asset and only slot 3 changes; every consumer keeps resolving. (A capability's own sibling assets may link each other directly — they're declared together; the rule governs *cross-asset* consumers.)
 
 ## Credential resolution — the cascade
 

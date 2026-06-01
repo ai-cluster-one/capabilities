@@ -17,10 +17,12 @@ Before flagging anything, load the **deviation log** (project-scoped, e.g. `.cla
 Reason about each; these are judgments, not regexes:
 
 - **Non-duplication (one fact, one home).** Scan the project for the capability's facts and identifiers restated in more than one place. Scattered IDs, a principle stated in three files, connection values copied into markdown — flag each with the single home they should consolidate into.
+- **Asset paths addressed by role (rule 7).** Are consumers hard-linking literal asset paths (`.capabilities/<ns>/identifiers.md`) instead of naming the asset by role ("the Windmill identifiers") and letting the capability file resolve it? Flag scattered literal paths that should collapse to the single pointer-list home — a rename should touch one file, not every consumer. (A capability's own sibling assets linking each other directly is fine, not a finding.)
 - **Just enough at each altitude.** Is the global stub a minimal introduction, or has it grown project specifics? Is the project capability file *lightweight* (role + pointers), or is it re-teaching the tool / carrying detail that belongs in an on-demand asset? Flag bloat at the wrong altitude.
 - **Identifiers split, no secrets in markdown.** Are non-secret structural identifiers in `identifiers.md`, and connection-level/secret values in env (not the markdown)? Flag any secret or connection value sitting in a committed file.
 - **Discoverable knowledge in the tool, not the docs.** Is anything transcribed into markdown that `<name> help` should answer? Suggest pushing it into the CLI's help and replacing the prose with a pointer.
 - **Link, don't copy.** Are the underlying service's own docs transcribed (and rotting) instead of linked?
+- **Branched slots are not drift.** A slot may legitimately branch into a sibling `<slot>/` folder with the slot's `<slot>.md` kept as a thin index (see [../TEMPLATE.md](../TEMPLATE.md) "When a slot outgrows one file"). Don't flag the branch itself. Check instead that: the index only points (no orphaned detail that belongs in a sub-file), the capability file still addresses the slot **by role** (not by a sub-file path), and no sub-file's literal path has leaked to a consumer outside the slot — flag any that has. Conversely, a flat slot that has clearly outgrown one coherent file may be *suggested* for branching, but only as cosmetic advice, never as structural drift.
 
 ## 3. Output — advisory report
 
