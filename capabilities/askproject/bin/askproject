@@ -1,0 +1,387 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+askproject — ask a Claude Code agent running in ANOTHER project to answer in
+its own context, then return its answer plus traceability to the caller.
+
+This tool is designed to be invoked BY an agent (you), from inside your own
+project. It spawns a headless `claude -p` in a target project's directory, so
+that peer loads the target's CLAUDE.md / settings / rights and answers as that
+project — then hands back the answer with cost, token, and files-changed data.
+
+Run `askproject help` to (re)load this contract on demand — do not rely on
+memorised knowledge of its surface.
+
+────────────────────────────────────────────────────────────────────────────
+COMMANDS
+  askproject <target> "<question>"        Ask the peer (read-only research).
+  askproject <target> --act "<task>"      Let the peer modify its own project.
+  askproject <target> -c "<follow-up>"    Continue the last conversation with
+                                          that target (resumes its session).
+  askproject targets                       List targets you've talked to (this
+                                          project) + their last session.
+  askproject help                          Print this document.
+
+<target> is a path to the other project: absolute, ~-expanded, or relative to
+your cwd. YOU decide which project to talk to and pass its path. It must be a
+directory (a git repo is strongly recommended — see snapshots below).
+
+────────────────────────────────────────────────────────────────────────────
+MODES & MODELS  (model is auto-picked from mode; override with --model)
+  read  (default)   Peer gets ONLY Read/Glob/Grep + plan mode. It physically
+                    cannot edit, write, or run shell — pure research. Model:
+                    haiku (cheap). Use for "what does X do", "find Y", reviews.
+  act   (--act)     Peer gets acceptEdits + the target as an --add-dir. It can
+                    edit files INSIDE its project without prompts; writes
+                    outside the project and un-allowlisted shell are auto-denied
+                    in headless mode. Model: opus. Use for "fix X", "refactor".
+  bypass (--bypass) Adds --dangerously-skip-permissions. ⚠ This REMOVES all
+                    fences: the peer can touch ANYTHING your user can, anywhere
+                    on disk — not just its own project. Explicit opt-in only.
+
+FENCING REALITY: flags are behavioural, not an OS sandbox. read mode is a hard
+"no tools to do harm" fence. act mode confines a cooperative agent but is not
+escape-proof against allowlisted shell. The git snapshot (below) is your safety
+net. A true OS sandbox is future work.
+
+────────────────────────────────────────────────────────────────────────────
+SESSION CONTINUITY  (state is LOCAL to the project you call from)
+  The map of "which target → which session" is written to:
+      <your-project-root>/.claude/askproject/sessions.json
+  (your-project-root = nearest ancestor with .git or .claude; else cwd.)
+  This is a config of YOUR project, not of the tool — it travels with the repo
+  that initiates the calls. It is git-ignored automatically (session ids are
+  machine-local). `-c/--continue` resumes the last session for that target;
+  add --fork to branch instead of continue.
+
+────────────────────────────────────────────────────────────────────────────
+OUTPUT  (stdout = one JSON object; use --text to get just the answer)
+  {
+    "ok": bool, "error": str|null,
+    "target": "<abs path>", "mode": "read|act|bypass",
+    "model": "<model id>", "session_id": "<uuid>", "resumed": bool,
+    "answer": <string OR parsed object when --schema is used>,
+    "cost_usd": float, "duration_ms": int, "num_turns": int,
+    "tokens": {input, output, cache_read, cache_creation},
+    "git": {"repo": bool, "head_before","head_after","dirty_before",
+            "files_changed":[{"path","status"}]},
+    "permission_denials": [ ... attempts the peer made and was blocked on ... ]
+  }
+  In read mode files_changed must be empty; if it isn't, ok=false and it is
+  flagged loudly (a read query should never mutate).
+
+FLAGS
+  --act                 Modification mode (acceptEdits + opus).
+  --bypass              Add --dangerously-skip-permissions (DANGEROUS).
+  -c, --continue        Resume the last session for this target.
+  --fork                With -c: branch a new session instead of continuing.
+  --model <m>           Override the model (alias like 'opus'/'haiku' or id).
+  --schema <file|json>  Pass a JSON Schema to constrain the peer's answer;
+                        `answer` is then the parsed object.
+  --timeout <seconds>   Kill the peer after N seconds (default 600).
+  --text                Print only the answer to stdout (still exits non-zero
+                        on error).
+  --append <text>       Extra instruction appended to the peer's system prompt.
+
+EXAMPLES
+  askproject ../simplbooks "Which file defines the VAT regime taxonomy?"
+  askproject ~/dev/api --act "Add a --json flag to the export command"
+  askproject ../simplbooks -c "And where is it consumed?"
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+READ_MODEL = "claude-haiku-4-5-20251001"
+ACT_MODEL = "opus"
+
+
+def die(msg: str, *, as_json: bool, code: int = 1):
+    if as_json:
+        print(json.dumps({"ok": False, "error": msg}, indent=2))
+    else:
+        print(f"askproject: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def find_project_root(start: Path) -> Path:
+    """Nearest ancestor (incl. start) containing .git or .claude; else start."""
+    start = start.resolve()
+    for d in [start, *start.parents]:
+        if (d / ".git").exists() or (d / ".claude").exists():
+            return d
+    return start
+
+
+def state_path() -> Path:
+    root = find_project_root(Path.cwd())
+    d = root / ".claude" / "askproject"
+    d.mkdir(parents=True, exist_ok=True)
+    gi = d / ".gitignore"
+    if not gi.exists():
+        gi.write_text("# session ids are machine-local\nsessions.json\n")
+    return d / "sessions.json"
+
+
+def load_state() -> dict:
+    p = state_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def save_state(state: dict):
+    state_path().write_text(json.dumps(state, indent=2) + "\n")
+
+
+def git(target: Path, *args) -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(target), *args],
+            capture_output=True, text=True, timeout=30,
+        )
+        if out.returncode != 0:
+            return None
+        return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def snapshot(target: Path) -> dict:
+    head = git(target, "rev-parse", "HEAD")
+    if head is None:
+        return {"repo": False}
+    status = git(target, "status", "--porcelain") or ""
+    return {"repo": True, "head": head, "status": status}
+
+
+def diff_snapshots(before: dict, after: dict) -> tuple[list[dict], bool]:
+    """Return (files_changed, dirty_before)."""
+    if not before.get("repo"):
+        return [], False
+    dirty_before = bool(before.get("status"))
+    before_lines = set(before.get("status", "").splitlines())
+    after_lines = set(after.get("status", "").splitlines())
+    changed = []
+    for line in sorted(after_lines - before_lines):
+        # porcelain: "XY path"
+        code, _, path = line.partition(" ")
+        changed.append({"path": path.strip() or line, "status": code.strip()})
+    if before.get("head") != after.get("head"):
+        changed.append({"path": "<HEAD>", "status": "moved"})
+    return changed, dirty_before
+
+
+def resolve_schema(spec: str) -> str:
+    p = Path(spec).expanduser()
+    if p.exists():
+        return p.read_text()
+    return spec  # assume inline JSON
+
+
+def build_preamble(mode: str, caller: str, extra: str | None) -> str:
+    base = (
+        f"You are being queried programmatically by a peer Claude Code agent "
+        f"working in another project ('{caller}'), via the askproject bridge. "
+        f"Answer concisely and return information, not conversation. Do NOT "
+        f"invoke askproject yourself or spawn further peer queries. "
+    )
+    if mode == "read":
+        base += (
+            "This is a READ-ONLY research query — you have no tools to modify "
+            "anything; do not attempt to."
+        )
+    else:
+        base += (
+            "You may modify files within THIS project only. Make the smallest "
+            "change that satisfies the request and summarise what you changed."
+        )
+    if extra:
+        base += " " + extra
+    return base
+
+
+def run(args):
+    text_only = args.text
+    as_json = not text_only
+
+    if not shutil.which("claude"):
+        die("`claude` CLI not found on PATH", as_json=as_json)
+
+    target = Path(args.target).expanduser()
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+    if not target.is_dir():
+        die(f"target is not a directory: {target}", as_json=as_json)
+
+    mode = "act" if args.act else "read"
+    model = args.model or (ACT_MODEL if mode == "act" else READ_MODEL)
+    caller = find_project_root(Path.cwd()).name
+
+    state = load_state()
+    key = str(target)
+    entry = state.get(key, {})
+
+    cmd = ["claude", "-p", args.prompt, "--output-format", "json", "--model", model]
+
+    # resume / continuity
+    resumed = False
+    if args.cont:
+        last = entry.get("last_session_id")
+        if not last:
+            die(f"no prior session for {target}; run without -c first",
+                as_json=as_json)
+        cmd += ["--resume", last]
+        resumed = True
+        if args.fork:
+            cmd += ["--fork-session"]
+
+    # mode → permissions / tools
+    if mode == "read":
+        cmd += ["--tools", "Read,Glob,Grep", "--permission-mode", "plan"]
+    else:
+        cmd += ["--permission-mode", "acceptEdits", "--add-dir", str(target)]
+    if args.bypass:
+        cmd += ["--dangerously-skip-permissions"]
+
+    cmd += ["--append-system-prompt", build_preamble(mode, caller, args.append)]
+
+    if args.schema:
+        cmd += ["--json-schema", resolve_schema(args.schema)]
+
+    before = snapshot(target)
+
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(target), capture_output=True, text=True,
+            timeout=args.timeout,
+        )
+    except subprocess.TimeoutExpired:
+        die(f"peer timed out after {args.timeout}s", as_json=as_json)
+
+    if proc.returncode != 0:
+        snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
+        die(f"peer exited {proc.returncode}: {snippet}", as_json=as_json)
+
+    try:
+        env = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        die(f"could not parse peer output: {proc.stdout[:800]}", as_json=as_json)
+
+    after = snapshot(target)
+    files_changed, dirty_before = diff_snapshots(before, after)
+
+    answer = env.get("result", "")
+    if args.schema:
+        # structured output may arrive parsed in `structured_output`, or as a
+        # JSON string in `result` depending on harness version — handle both.
+        if env.get("structured_output") is not None:
+            answer = env["structured_output"]
+        elif isinstance(answer, str):
+            try:
+                answer = json.loads(answer)
+            except json.JSONDecodeError:
+                pass
+
+    session_id = env.get("session_id")
+    usage = env.get("usage", {}) or {}
+
+    ok = not env.get("is_error", False)
+    err = None
+    if mode == "read" and files_changed:
+        ok = False
+        err = "READ MODE MUTATED THE TARGET — investigate"
+
+    # persist session mapping (local to the initiating project)
+    if session_id:
+        entry["last_session_id"] = session_id
+        entry["last_model"] = model
+        entry["interactions"] = entry.get("interactions", 0) + 1
+        state[key] = entry
+        save_state(state)
+
+    if text_only:
+        out = answer if isinstance(answer, str) else json.dumps(answer, indent=2)
+        print(out)
+        sys.exit(0 if ok else 1)
+
+    result = {
+        "ok": ok,
+        "error": err,
+        "target": str(target),
+        "mode": "bypass" if args.bypass else mode,
+        "model": model,
+        "session_id": session_id,
+        "resumed": resumed,
+        "answer": answer,
+        "cost_usd": env.get("total_cost_usd"),
+        "duration_ms": env.get("duration_ms"),
+        "num_turns": env.get("num_turns"),
+        "tokens": {
+            "input": usage.get("input_tokens"),
+            "output": usage.get("output_tokens"),
+            "cache_read": usage.get("cache_read_input_tokens"),
+            "cache_creation": usage.get("cache_creation_input_tokens"),
+        },
+        "git": {
+            "repo": before.get("repo", False),
+            "head_before": before.get("head"),
+            "head_after": after.get("head"),
+            "dirty_before": dirty_before,
+            "files_changed": files_changed,
+        },
+        "permission_denials": env.get("permission_denials", []),
+    }
+    print(json.dumps(result, indent=2))
+    sys.exit(0 if ok else 1)
+
+
+def cmd_targets():
+    state = load_state()
+    if not state:
+        print("no targets recorded for this project")
+        return
+    for k, v in state.items():
+        print(f"{k}")
+        print(f"  last_session: {v.get('last_session_id')}")
+        print(f"  model: {v.get('last_model')}  interactions: {v.get('interactions')}")
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        print(__doc__)
+        return
+    if argv[0] == "targets":
+        cmd_targets()
+        return
+
+    p = argparse.ArgumentParser(prog="askproject", add_help=False)
+    p.add_argument("target")
+    p.add_argument("prompt")
+    p.add_argument("--act", action="store_true")
+    p.add_argument("--bypass", action="store_true")
+    p.add_argument("-c", "--continue", dest="cont", action="store_true")
+    p.add_argument("--fork", action="store_true")
+    p.add_argument("--model")
+    p.add_argument("--schema")
+    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--text", action="store_true")
+    p.add_argument("--append")
+    args = p.parse_args(argv)
+    run(args)
+
+
+if __name__ == "__main__":
+    main()

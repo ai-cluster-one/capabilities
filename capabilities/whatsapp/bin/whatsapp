@@ -1,0 +1,986 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+whatsapp — read-only WhatsApp CLI via WAHA (WhatsApp HTTP API).
+
+Config: ~/.config/whatsapp/credentials.env
+        WAHA_WHATSAPP_API_KEY      — API key for X-Api-Key header
+        WAHA_DASHBOARD_USERNAME    — Basic auth username
+        WAHA_DASHBOARD_PASSWORD    — Basic auth password
+        WAHA_BASE_URL              — (optional) defaults to https://waha.callva.one
+
+A cwd-local .env or .env.local takes precedence over the credentials file
+when present (matches the behaviour of the previous in-tree script).
+
+Commands:
+  whatsapp help                        Print this usage block
+  whatsapp status [--session NAME]     Show session status, account, engine
+  whatsapp chats [--search TERM] [--limit N] [--session NAME]
+                                       List chats sorted by last activity
+  whatsapp messages <chat_id> [--limit N] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+                              [--format conversation|table] [--session NAME]
+                                       Fetch messages from a chat
+  whatsapp contact <contact_id> [--session NAME]
+                                       Show contact name, number, business flag
+  whatsapp export <chat_id> --out PATH [--media-dir PATH] [--page-size N]
+                            [--max-pages N] [--no-photos] [--no-stickers]
+                            [--videos] [--documents] [--session NAME]
+                                       Dump full chat history to JSON; download
+                                       voice/audio + photos/stickers by default;
+                                       videos/documents opt-in. Idempotent —
+                                       re-runs preserve existing transcriptions
+                                       and skip already-downloaded media.
+  whatsapp transcribe <json_path> [--force] [--model nova-3]
+                                       Fill transcription placeholders for
+                                       voice/audio messages in an exported JSON
+                                       using Deepgram (requires DEEPGRAM_API_KEY
+                                       in ~/.config/whatsapp/credentials.env).
+  whatsapp render <json_path> [--out PATH]
+                                       Pretty-print an exported messages.json
+                                       as a markdown conversation log (date
+                                       headers, sender names, voice
+                                       transcriptions inlined). stdout by
+                                       default; --out writes to a file.
+
+Chat IDs:
+  DMs    — <number>@c.us            e.g. 64225623750@c.us
+  Groups — <id>@g.us                e.g. 120363409111496450@g.us
+
+Read-only by design. There is no send capability.
+"""
+
+import argparse
+import base64
+import datetime
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+DEFAULT_BASE_URL = "https://waha.callva.one"
+DEFAULT_SESSION = "default"
+CREDS_PATH = Path.home() / ".config" / "whatsapp" / "credentials.env"
+NEEDED_KEYS = ("WAHA_WHATSAPP_API_KEY", "WAHA_DASHBOARD_USERNAME",
+               "WAHA_DASHBOARD_PASSWORD", "WAHA_BASE_URL")
+
+
+def _parse_env_file(path: Path) -> dict:
+    vals = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        vals[key.strip()] = value.strip().strip("'\"")
+    return vals
+
+
+def load_env():
+    """Load WAHA env vars. Precedence: cwd .env(.local) > ~/.config > shell env."""
+    for filename in (".env", ".env.local"):
+        candidate = Path.cwd() / filename
+        if candidate.is_file():
+            for k, v in _parse_env_file(candidate).items():
+                if k in NEEDED_KEYS and not os.environ.get(k):
+                    os.environ[k] = v
+    if CREDS_PATH.is_file():
+        for k, v in _parse_env_file(CREDS_PATH).items():
+            if k in NEEDED_KEYS and not os.environ.get(k):
+                os.environ[k] = v
+
+
+def get_config():
+    load_env()
+    api_key = os.environ.get("WAHA_WHATSAPP_API_KEY")
+    username = os.environ.get("WAHA_DASHBOARD_USERNAME")
+    password = os.environ.get("WAHA_DASHBOARD_PASSWORD")
+    base_url = os.environ.get("WAHA_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+    if not api_key and not (username and password):
+        sys.exit(
+            f"Missing credentials. Populate {CREDS_PATH} with "
+            "WAHA_WHATSAPP_API_KEY and/or WAHA_DASHBOARD_USERNAME + "
+            "WAHA_DASHBOARD_PASSWORD."
+        )
+
+    return {
+        "api_key": api_key,
+        "username": username,
+        "password": password,
+        "base_url": base_url,
+    }
+
+
+def _auth_headers(config):
+    headers = {}
+    if config.get("api_key"):
+        headers["X-Api-Key"] = config["api_key"]
+    if config.get("username") and config.get("password"):
+        credentials = f"{config['username']}:{config['password']}"
+        b64 = base64.b64encode(credentials.encode()).decode()
+        headers["Authorization"] = f"Basic {b64}"
+    return headers
+
+
+def make_request(path, config=None, timeout=60):
+    if config is None:
+        config = get_config()
+
+    url = f"{config['base_url']}{path}"
+    req = urllib.request.Request(url, headers=_auth_headers(config), method="GET")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        try:
+            msg = json.loads(body).get("message", str(e))
+        except json.JSONDecodeError:
+            msg = body or str(e)
+        sys.exit(f"HTTP {e.code} — {msg}")
+    except urllib.error.URLError as e:
+        sys.exit(f"Connection failed — {e.reason}")
+
+
+def download_media(media_url, config, dest_path, timeout=120):
+    """Fetch a WAHA media file. Translates the container-internal localhost
+    URL back to the public WAHA_BASE_URL and writes to dest_path."""
+    parsed = urllib.parse.urlparse(media_url)
+    public_url = f"{config['base_url']}{parsed.path}"
+    if parsed.query:
+        public_url += f"?{parsed.query}"
+
+    req = urllib.request.Request(public_url, headers=_auth_headers(config), method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        dest_path.write_bytes(response.read())
+
+
+def ts_to_dt(ts):
+    if not ts:
+        return None
+    return datetime.datetime.fromtimestamp(ts)
+
+
+def format_dt(ts):
+    dt = ts_to_dt(ts)
+    return dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
+
+
+def parse_date(date_str):
+    try:
+        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+        return int(dt.timestamp())
+    except ValueError:
+        sys.exit(f"Invalid date format '{date_str}'. Use YYYY-MM-DD.")
+
+
+# ── Commands ────────────────────────────────────────────────────────────────
+
+
+def cmd_help(_args):
+    print(__doc__.strip())
+
+
+def cmd_status(args):
+    config = get_config()
+    session = args.session
+    result = make_request(f"/api/sessions/{session}", config)
+    status = result.get("status", "UNKNOWN")
+    me = result.get("me") or {}
+    me_id = me.get("id", "—")
+    me_name = me.get("pushName", "—")
+    engine = (result.get("engine") or {}).get("engine", "—")
+
+    print(f"Session:  {session}")
+    print(f"Status:   {status}")
+    print(f"Account:  {me_name} ({me_id})")
+    print(f"Engine:   {engine}")
+
+
+def cmd_chats(args):
+    config = get_config()
+    session = args.session
+    data = make_request(f"/api/{session}/chats?limit=500", config)
+
+    if not isinstance(data, list):
+        msg = data.get("message", "Unexpected response") if isinstance(data, dict) else str(data)
+        sys.exit(f"Error: {msg}")
+
+    search = (args.search or "").lower()
+
+    results = []
+    for chat in data:
+        cid = chat.get("id", {})
+        serialized = cid.get("_serialized", "") if isinstance(cid, dict) else str(cid)
+        name = chat.get("name", "") or ""
+        is_group = chat.get("isGroup", False)
+        unread = chat.get("unreadCount", 0)
+        ts = chat.get("timestamp", 0)
+
+        if search and search not in name.lower() and search not in serialized.lower():
+            continue
+
+        results.append({
+            "id": serialized,
+            "name": name,
+            "group": is_group,
+            "unread": unread,
+            "last_activity": ts,
+        })
+
+    if not results:
+        print("No chats found." + (f" (search: '{args.search}')" if args.search else ""))
+        return
+
+    results.sort(key=lambda x: x["last_activity"], reverse=True)
+    if args.limit:
+        results = results[:args.limit]
+
+    print("| # | Name | ID | Group | Unread | Last Activity |")
+    print("|---|------|-----|-------|--------|---------------|")
+    for i, r in enumerate(results, 1):
+        group_str = "Yes" if r["group"] else "—"
+        unread_str = str(r["unread"]) if r["unread"] else "—"
+        last = format_dt(r["last_activity"])
+        print(f"| {i} | {r['name']} | `{r['id']}` | {group_str} | {unread_str} | {last} |")
+
+    suffix = f" (filtered by '{args.search}')" if args.search else ""
+    print(f"\n{len(results)} chat(s) shown{suffix}")
+
+
+def cmd_messages(args):
+    config = get_config()
+    session = args.session
+    chat_id = args.chat_id
+    limit = args.limit
+
+    encoded_chat_id = urllib.parse.quote(chat_id, safe="")
+
+    chat_name = None
+    if "@c.us" in chat_id:
+        try:
+            chat_info = make_request(f"/api/{session}/contacts/{encoded_chat_id}", config)
+            if isinstance(chat_info, dict):
+                chat_name = chat_info.get("name") or chat_info.get("pushname") or None
+        except SystemExit:
+            pass
+
+    url = f"/api/{session}/chats/{encoded_chat_id}/messages?limit={limit}"
+    data = make_request(url, config)
+
+    if not isinstance(data, list):
+        msg = data.get("message", "Unexpected response") if isinstance(data, dict) else str(data)
+        sys.exit(f"Error: {msg}")
+
+    if not data:
+        print("No messages found.")
+        return
+
+    from_ts = parse_date(args.from_date) if args.from_date else None
+    to_ts = parse_date(args.to_date) + 86400 if args.to_date else None
+
+    filtered = []
+    for msg in data:
+        ts = msg.get("timestamp", 0)
+        if from_ts and ts < from_ts:
+            continue
+        if to_ts and ts >= to_ts:
+            continue
+        filtered.append(msg)
+
+    if not filtered:
+        print("No messages in the specified date range.")
+        return
+
+    filtered.sort(key=lambda m: m.get("timestamp", 0))
+    is_group = "@g.us" in chat_id
+
+    if args.format == "table":
+        _print_messages_table(filtered, is_group, chat_name)
+    else:
+        _print_messages_conversation(filtered, is_group, chat_name)
+
+
+def _resolve_sender(msg, is_group, chat_name=None):
+    if msg.get("fromMe"):
+        return "You"
+
+    notify_name = msg.get("_data", {}).get("notifyName", "")
+    if notify_name:
+        return notify_name
+
+    if is_group:
+        return msg.get("author", "") or msg.get("from", "")
+
+    if chat_name:
+        return chat_name
+
+    return msg.get("from", "Contact")
+
+
+def _print_messages_conversation(messages, is_group, chat_name=None):
+    current_date = None
+
+    for msg in messages:
+        ts = msg.get("timestamp", 0)
+        dt = ts_to_dt(ts)
+        date_str = dt.strftime("%Y-%m-%d") if dt else "—"
+        time_str = dt.strftime("%H:%M") if dt else "—"
+
+        if date_str != current_date:
+            current_date = date_str
+            print(f"\n── {date_str} ──\n")
+
+        sender = _resolve_sender(msg, is_group, chat_name)
+        body = msg.get("body", "") or ""
+        msg_type = msg.get("type", "")
+
+        if not body:
+            placeholder = {
+                "image": "[Image]",
+                "video": "[Video]",
+                "audio": "[Voice message]",
+                "ptt": "[Voice message]",
+                "document": "[Document]",
+                "sticker": "[Sticker]",
+                "location": "[Location]",
+                "vcard": "[Contact card]",
+                "ciphertext": "[Encrypted/pending]",
+            }.get(msg_type)
+            body = placeholder or (f"[{msg_type}]" if msg_type else "[Empty]")
+
+        lines = body.split("\n")
+        if len(lines) > 1:
+            indent = " " * (len(time_str) + 2 + len(sender) + 2)
+            body = lines[0] + "\n" + "\n".join(indent + line for line in lines[1:])
+
+        print(f"[{time_str}] {sender}: {body}")
+
+    print(f"\n--- {len(messages)} message(s) ---")
+
+
+def _print_messages_table(messages, is_group, chat_name=None):
+    print("| # | Time | Sender | Type | Message |")
+    print("|---|------|--------|------|---------|")
+
+    for i, msg in enumerate(messages, 1):
+        ts = msg.get("timestamp", 0)
+        time_str = format_dt(ts)
+        sender = _resolve_sender(msg, is_group, chat_name)
+        body = (msg.get("body", "") or "")[:120].replace("\n", " ").replace("|", "\\|")
+        msg_type = msg.get("type", "")
+        if not body and msg_type:
+            body = f"[{msg_type}]"
+        print(f"| {i} | {time_str} | {sender} | {msg_type} | {body} |")
+
+    print(f"\n{len(messages)} message(s)")
+
+
+def cmd_contact(args):
+    config = get_config()
+    session = args.session
+    contact_id = urllib.parse.quote(args.contact_id, safe="")
+    data = make_request(f"/api/{session}/contacts/{contact_id}", config)
+
+    if isinstance(data, dict):
+        name = data.get("name") or data.get("pushname") or "—"
+        number = data.get("number", "—") or "—"
+        cid = data.get("id", {})
+        serialized = cid.get("_serialized", "") if isinstance(cid, dict) else str(cid)
+        is_business = data.get("isBusiness", False)
+        is_blocked = data.get("isBlocked", False)
+
+        print(f"Name:      {name}")
+        print(f"Number:    {number}")
+        print(f"ID:        {serialized}")
+        print(f"Business:  {'Yes' if is_business else 'No'}")
+        print(f"Blocked:   {'Yes' if is_blocked else 'No'}")
+    else:
+        print(json.dumps(data, indent=2))
+
+
+# ── Export / sync ───────────────────────────────────────────────────────────
+
+
+SCHEMA_VERSION = 1
+PAGE_SIZE_DEFAULT = 100
+
+# Message types we treat as voice for transcription.
+VOICE_TYPES = {"ptt", "audio"}
+
+
+def _msg_type(msg):
+    """Resolve canonical message type. WAHA leaves top-level `type` empty for
+    many messages; the truth is in _data.type."""
+    return msg.get("type") or msg.get("_data", {}).get("type") or "text"
+
+
+def _msg_author(msg, is_group):
+    """Author of a single message. For groups, the real sender is in
+    _data.author._serialized; top-level `from` is the group id."""
+    if msg.get("fromMe"):
+        return None
+    if is_group:
+        author = msg.get("_data", {}).get("author")
+        if isinstance(author, dict):
+            return author.get("_serialized") or author.get("user")
+        if isinstance(author, str):
+            return author
+        return msg.get("author") or msg.get("from")
+    return msg.get("from")
+
+
+def _msg_author_name(msg, is_group, chat_name):
+    notify = msg.get("_data", {}).get("notifyName") or ""
+    if notify:
+        return notify
+    if msg.get("fromMe"):
+        return "You"
+    if not is_group and chat_name:
+        return chat_name
+    return None
+
+
+def _media_ext(mimetype, filename):
+    if filename and "." in filename:
+        return "." + filename.rsplit(".", 1)[-1].lower()
+    return {
+        "audio/ogg": ".ogg",
+        "audio/ogg; codecs=opus": ".ogg",
+        "audio/opus": ".opus",
+        "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/webm": ".webm",
+        "audio/wav": ".wav",
+        "audio/flac": ".flac",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+        "video/quicktime": ".mov",
+        "application/pdf": ".pdf",
+    }.get((mimetype or "").lower(), ".bin")
+
+
+def _safe_id_for_filename(message_id):
+    """WAHA message IDs contain '@'. Strip to make a safe filename."""
+    return message_id.replace("/", "_").replace("@", "_at_")
+
+
+def _find_existing_media(media_dir, message_id):
+    safe = _safe_id_for_filename(message_id)
+    for p in media_dir.glob(f"{safe}.*"):
+        if p.is_file():
+            return p
+    return None
+
+
+def cmd_export(args):
+    config = get_config()
+    session = args.session
+    chat_id = args.chat_id
+    is_group = "@g.us" in chat_id
+
+    out = Path(args.out).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    media_dir = (Path(args.media_dir).expanduser().resolve()
+                 if args.media_dir else out.parent / "media")
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    download_kinds = set(VOICE_TYPES)
+    if not args.no_photos:
+        download_kinds.add("image")
+    if not args.no_stickers:
+        download_kinds.add("sticker")
+    if args.videos:
+        download_kinds.add("video")
+    if args.documents:
+        download_kinds.add("document")
+
+    # Resolve chat metadata
+    chat_name = chat_id
+    encoded_chat = urllib.parse.quote(chat_id, safe="")
+    try:
+        chats = make_request(f"/api/{session}/chats?limit=500", config)
+        if isinstance(chats, list):
+            for c in chats:
+                cid = c.get("id", {})
+                serialized = cid.get("_serialized", "") if isinstance(cid, dict) else str(cid)
+                if serialized == chat_id:
+                    chat_name = c.get("name") or chat_id
+                    break
+    except SystemExit:
+        pass
+
+    # Load prior export (preserve transcriptions, skip already-downloaded media)
+    prior_messages_by_id = {}
+    if out.exists():
+        try:
+            prior = json.loads(out.read_text())
+            for m in prior.get("messages", []):
+                if m.get("id"):
+                    prior_messages_by_id[m["id"]] = m
+        except Exception:
+            pass
+
+    print(f"Exporting:    {chat_name}  ({chat_id})")
+    print(f"Output:       {out}")
+    print(f"Media dir:    {media_dir}")
+    print(f"Downloading:  {sorted(download_kinds)}")
+    if prior_messages_by_id:
+        prior_tx = sum(1 for m in prior_messages_by_id.values()
+                       if isinstance(m.get("transcription"), dict)
+                       and m["transcription"].get("text"))
+        print(f"Prior export: {len(prior_messages_by_id)} messages, "
+              f"{prior_tx} transcription(s) preserved")
+
+    # Paginate from newest to oldest. Stop when a page is fully composed of
+    # already-seen IDs and the page returns less than page_size.
+    all_messages = {}  # id -> raw msg
+    seen_in_prior = set(prior_messages_by_id.keys())
+    page = 0
+    while True:
+        if args.max_pages and page >= args.max_pages:
+            print(f"Reached --max-pages={args.max_pages}, stopping.")
+            break
+        offset = page * args.page_size
+        path = (f"/api/{session}/chats/{encoded_chat}/messages"
+                f"?limit={args.page_size}&offset={offset}&downloadMedia=true")
+        try:
+            batch = make_request(path, config, timeout=240)
+        except SystemExit:
+            print(f"Page {page+1} (offset={offset}) failed; stopping.")
+            break
+        if not isinstance(batch, list) or not batch:
+            print(f"Page {page+1}: empty, stopping.")
+            break
+
+        new_ids = 0
+        for m in batch:
+            mid = m.get("id")
+            if not mid:
+                continue
+            if mid not in all_messages:
+                all_messages[mid] = m
+                if mid not in seen_in_prior:
+                    new_ids += 1
+
+        print(f"Page {page+1} (offset={offset}): fetched {len(batch)}, new {new_ids}")
+
+        # Stop heuristic: short page means we hit the end of history.
+        if len(batch) < args.page_size:
+            break
+        # Incremental stop: if every msg in this page was already in prior export,
+        # we're past the cutoff — no need to keep paging.
+        if prior_messages_by_id and new_ids == 0:
+            print("All messages in this page already in prior export; stopping.")
+            break
+        page += 1
+
+    print(f"Total messages collected: {len(all_messages)}")
+
+    # Process each message into our schema, downloading media as needed
+    processed = []
+    dl_counts = {}
+    dl_errors = 0
+    sorted_msgs = sorted(all_messages.values(), key=lambda m: m.get("timestamp", 0))
+
+    for raw in sorted_msgs:
+        mid = raw["id"]
+        ts = raw.get("timestamp", 0)
+        kind = _msg_type(raw)
+        body = raw.get("body") or None
+
+        author_id = _msg_author(raw, is_group)
+        author_name = _msg_author_name(raw, is_group, chat_name if not is_group else None)
+
+        media_meta = raw.get("media") or {}
+        has_media = bool(raw.get("hasMedia") or media_meta)
+
+        prior = prior_messages_by_id.get(mid)
+        entry = {
+            "id": mid,
+            "timestamp": ts,
+            "date": (datetime.datetime.fromtimestamp(ts).isoformat() if ts else None),
+            "from": {
+                "id": author_id,
+                "name": author_name,
+                "from_me": bool(raw.get("fromMe")),
+            },
+            "type": kind,
+            "text": body,
+            "reply_to": raw.get("_data", {}).get("quotedStanzaID")
+                        or raw.get("replyTo"),
+            "media": None,
+            "transcription": (prior or {}).get("transcription"),
+        }
+
+        if has_media:
+            media_entry = {
+                "filename": media_meta.get("filename"),
+                "mimetype": media_meta.get("mimetype"),
+            }
+            if media_meta.get("error"):
+                media_entry["fetch_error"] = (
+                    media_meta["error"].get("details", "")[:200]
+                    if isinstance(media_meta["error"], dict) else str(media_meta["error"])[:200]
+                )
+
+            if kind in download_kinds:
+                existing = (Path(prior["media"]["file_path"])
+                            if prior and prior.get("media", {}).get("file_path")
+                               and Path(prior["media"]["file_path"]).exists()
+                            else _find_existing_media(media_dir, mid))
+                if existing:
+                    media_entry["file_path"] = str(existing.resolve())
+                elif media_meta.get("url"):
+                    ext = _media_ext(media_meta.get("mimetype"), media_meta.get("filename"))
+                    dest = media_dir / f"{_safe_id_for_filename(mid)}{ext}"
+                    try:
+                        download_media(media_meta["url"], config, dest)
+                        media_entry["file_path"] = str(dest.resolve())
+                        dl_counts[kind] = dl_counts.get(kind, 0) + 1
+                    except Exception as e:
+                        media_entry["download_error"] = repr(e)
+                        dl_errors += 1
+                # If no url and no existing, we can't fetch — leave fetch_error
+            entry["media"] = media_entry
+
+        processed.append(entry)
+
+    # Preserve messages that exist in prior export but were not returned by this
+    # API call. WAHA's WEBJS store rotates aggressively after restarts/re-auths;
+    # without this merge the file would lose history every time the store thins.
+    processed_ids = {p["id"] for p in processed}
+    carried_over = 0
+    for pid, prior_msg in prior_messages_by_id.items():
+        if pid not in processed_ids:
+            processed.append(prior_msg)
+            carried_over += 1
+    if carried_over:
+        processed.sort(key=lambda m: m.get("timestamp", 0))
+        print(f"Carried over {carried_over} message(s) from prior export "
+              f"not present in current API result.")
+
+    payload = {
+        "chat": {
+            "id": chat_id,
+            "name": chat_name,
+            "type": "group" if is_group else "dm",
+        },
+        "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "exported_via": "whatsapp (WAHA)",
+        "message_count": len(processed),
+        "media_dir": str(media_dir),
+        "media_policy": {
+            "voice_audio": True,
+            "photos": not args.no_photos,
+            "stickers": not args.no_stickers,
+            "videos": args.videos,
+            "documents": args.documents,
+        },
+        "schema_version": SCHEMA_VERSION,
+        "messages": processed,
+    }
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(f"Done. {len(processed)} messages written.")
+    print(f"New downloads: {dl_counts}" + (f"  errors: {dl_errors}" if dl_errors else ""))
+
+
+# ── Transcribe ──────────────────────────────────────────────────────────────
+
+
+def _load_deepgram_key():
+    if CREDS_PATH.is_file():
+        vals = _parse_env_file(CREDS_PATH)
+        if vals.get("DEEPGRAM_API_KEY"):
+            return vals["DEEPGRAM_API_KEY"]
+    sys.exit(f"DEEPGRAM_API_KEY not found in {CREDS_PATH}.")
+
+
+def _content_type_for(path):
+    return {
+        ".ogg": "audio/ogg",
+        ".oga": "audio/ogg",
+        ".opus": "audio/ogg",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".wav": "audio/wav",
+        ".webm": "audio/webm",
+        ".flac": "audio/flac",
+    }.get(path.suffix.lower(), "application/octet-stream")
+
+
+def _deepgram_transcribe(audio_path, api_key, model):
+    params = (
+        f"model={model}&detect_language=true&smart_format=true"
+        f"&punctuate=true&paragraphs=true"
+    )
+    url = f"https://api.deepgram.com/v1/listen?{params}"
+    req = urllib.request.Request(
+        url,
+        data=audio_path.read_bytes(),
+        method="POST",
+        headers={
+            "Authorization": f"Token {api_key}",
+            "Content-Type": _content_type_for(audio_path),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Deepgram HTTP {e.code}: {detail}") from e
+
+    dg = json.loads(body)
+    channels = dg.get("results", {}).get("channels", [])
+    if not channels:
+        raise RuntimeError(f"Deepgram returned no channels: {body[:500]}")
+    alt = channels[0].get("alternatives", [{}])[0]
+    text = (alt.get("paragraphs", {}) or {}).get("transcript") or alt.get("transcript") or ""
+
+    return {
+        "text": text.strip(),
+        "language": channels[0].get("detected_language"),
+        "confidence": alt.get("confidence"),
+        "model": model,
+        "provider": "deepgram",
+        "transcribed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def cmd_transcribe(args):
+    api_key = _load_deepgram_key()
+    p = Path(args.json_path).expanduser().resolve()
+    if not p.exists():
+        sys.exit(f"Not found: {p}")
+    payload = json.loads(p.read_text())
+    messages = payload.get("messages", [])
+
+    to_do = []
+    for idx, m in enumerate(messages):
+        if m.get("type") not in VOICE_TYPES:
+            continue
+        file_path = (m.get("media") or {}).get("file_path")
+        if not file_path:
+            continue
+        existing = m.get("transcription")
+        if not args.force and isinstance(existing, dict) and existing.get("text"):
+            continue
+        to_do.append((idx, m, Path(file_path)))
+
+    if not to_do:
+        print("Nothing to transcribe (use --force to re-run).")
+        return
+
+    print(f"Transcribing {len(to_do)} file(s) with Deepgram (model={args.model})...")
+    failures = 0
+    for n, (idx, m, ap) in enumerate(to_do, 1):
+        if not ap.exists():
+            print(f"  [{n}/{len(to_do)}] SKIP missing file: {ap}")
+            m["transcription"] = {"error": f"file not found: {ap}"}
+            failures += 1
+            continue
+        size_kb = ap.stat().st_size // 1024
+        print(f"  [{n}/{len(to_do)}] id={m['id']}  {ap.name}  ({size_kb} KB)")
+        try:
+            result = _deepgram_transcribe(ap, api_key, args.model)
+            m["transcription"] = result
+            preview = (result["text"][:80] + "…") if len(result["text"]) > 80 else result["text"]
+            print(f"       → [{result.get('language')}] {preview}")
+        except Exception as e:
+            m["transcription"] = {"error": str(e)}
+            failures += 1
+            print(f"       → ERROR: {e}")
+        # Incremental save so a crash doesn't lose prior work
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    print(f"Done. {len(to_do) - failures}/{len(to_do)} transcribed. File: {p}")
+
+
+# ── Render ──────────────────────────────────────────────────────────────────
+
+
+def _render_export(payload):
+    """Convert an exported messages.json payload into a markdown
+    conversation log. Returns the rendered string."""
+    chat = payload.get("chat", {})
+    chat_name = chat.get("name") or chat.get("id") or "Conversation"
+    chat_type = chat.get("type") or "chat"
+    exported_at = payload.get("exported_at", "")
+    messages = payload.get("messages", [])
+
+    lines = []
+    header_meta = f"{chat_type}, {len(messages)} messages"
+    if exported_at:
+        header_meta += f" • exported {exported_at[:10]}"
+    lines.append(f"# {chat_name}")
+    lines.append(f"_{header_meta}_")
+    lines.append("")
+
+    current_date = None
+    for m in messages:
+        ts = m.get("timestamp", 0)
+        dt = datetime.datetime.fromtimestamp(ts) if ts else None
+        date_str = dt.strftime("%Y-%m-%d") if dt else "?"
+        time_str = dt.strftime("%H:%M") if dt else "?"
+
+        if date_str != current_date:
+            current_date = date_str
+            lines.append("")
+            lines.append(f"## {date_str}")
+            lines.append("")
+
+        sender = m.get("from", {}).get("name") or m.get("from", {}).get("id") or "(unknown)"
+        msg_type = m.get("type") or "text"
+        text = (m.get("text") or "").strip()
+        media = m.get("media") or {}
+        tx = m.get("transcription") or {}
+
+        if msg_type in VOICE_TYPES:
+            if isinstance(tx, dict) and tx.get("text"):
+                lang = tx.get("language") or "?"
+                lines.append(f"[{time_str}] {sender}: [Voice, {lang}, transcribed]")
+                for ln in tx["text"].splitlines():
+                    lines.append(f"    > {ln}")
+            elif isinstance(tx, dict) and tx.get("error"):
+                lines.append(f"[{time_str}] {sender}: [Voice — transcription error: {tx['error']}]")
+            else:
+                lines.append(f"[{time_str}] {sender}: [Voice — not yet transcribed]")
+        elif msg_type == "image":
+            label = media.get("filename") or "image"
+            note = f" ({media['fetch_error'][:80]}…)" if media.get("fetch_error") else ""
+            lines.append(f"[{time_str}] {sender}: [Image: {label}]{note}")
+            if text:
+                for ln in text.splitlines():
+                    lines.append(f"    > {ln}")
+        elif msg_type == "video":
+            label = media.get("filename") or "video"
+            lines.append(f"[{time_str}] {sender}: [Video: {label}]")
+        elif msg_type == "document":
+            label = media.get("filename") or "document"
+            lines.append(f"[{time_str}] {sender}: [Document: {label}]")
+        elif msg_type == "sticker":
+            lines.append(f"[{time_str}] {sender}: [Sticker]")
+        elif msg_type in ("gp2", "e2e_notification", "notification_template"):
+            label = text or msg_type
+            lines.append(f"[{time_str}] _system: {label}_")
+        elif text:
+            text_lines = text.splitlines()
+            lines.append(f"[{time_str}] {sender}: {text_lines[0]}")
+            indent = " " * (len(time_str) + 2 + len(sender) + 2)
+            for ln in text_lines[1:]:
+                lines.append(f"{indent}{ln}")
+        else:
+            lines.append(f"[{time_str}] {sender}: [{msg_type}]")
+
+    return "\n".join(lines) + "\n"
+
+
+def cmd_render(args):
+    p = Path(args.json_path).expanduser().resolve()
+    if not p.exists():
+        sys.exit(f"Not found: {p}")
+    payload = json.loads(p.read_text())
+    rendered = _render_export(payload)
+    if args.out:
+        out = Path(args.out).expanduser().resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered)
+        print(f"Wrote {out}", file=sys.stderr)
+    else:
+        sys.stdout.write(rendered)
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="whatsapp",
+        description="WAHA WhatsApp API client — read chats and messages (read-only).",
+    )
+    parser.add_argument(
+        "--session", default=DEFAULT_SESSION,
+        help="WAHA session name (default: 'default')",
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("help", help="Print full usage block")
+    sub.add_parser("status", help="Check connection and session status")
+
+    pc = sub.add_parser("chats", help="List chats")
+    pc.add_argument("--search", "-s", help="Filter chats by name (case-insensitive)")
+    pc.add_argument("--limit", "-n", type=int, help="Max chats to show")
+
+    pm = sub.add_parser("messages", help="Fetch messages from a chat")
+    pm.add_argument("chat_id", help="Chat ID (e.g. 64225623750@c.us or 120363...@g.us)")
+    pm.add_argument("--limit", "-n", type=int, default=50,
+                    help="Max messages to fetch from API (default: 50)")
+    pm.add_argument("--from", dest="from_date", help="Start date filter (YYYY-MM-DD)")
+    pm.add_argument("--to", dest="to_date", help="End date filter (YYYY-MM-DD)")
+    pm.add_argument("--format", "-f", choices=["conversation", "table"],
+                    default="conversation", help="Output format (default: conversation)")
+
+    pk = sub.add_parser("contact", help="Get contact info")
+    pk.add_argument("contact_id", help="Contact ID (e.g. 64225623750@c.us)")
+
+    pe = sub.add_parser("export", help="Dump full chat history to JSON; download media")
+    pe.add_argument("chat_id", help="Chat ID (e.g. 120363409111496450@g.us)")
+    pe.add_argument("--out", required=True, help="Output JSON path")
+    pe.add_argument("--media-dir", help="Media output dir (default: <out>/../media)")
+    pe.add_argument("--page-size", type=int, default=PAGE_SIZE_DEFAULT,
+                    help=f"Messages per WAHA page (default: {PAGE_SIZE_DEFAULT})")
+    pe.add_argument("--max-pages", type=int,
+                    help="Cap on number of pages (default: unlimited; stop at end)")
+    pe.add_argument("--no-photos", action="store_true",
+                    help="Skip photo downloads (default: download photos)")
+    pe.add_argument("--no-stickers", action="store_true",
+                    help="Skip sticker downloads (default: download stickers)")
+    pe.add_argument("--videos", action="store_true",
+                    help="Also download videos (default: off)")
+    pe.add_argument("--documents", action="store_true",
+                    help="Also download documents (default: off)")
+
+    pt = sub.add_parser("transcribe",
+                        help="Fill voice/audio transcription placeholders via Deepgram")
+    pt.add_argument("json_path", help="Path to a messages.json produced by `whatsapp export`")
+    pt.add_argument("--force", action="store_true",
+                    help="Re-transcribe even if already filled")
+    pt.add_argument("--model", default="nova-3",
+                    help="Deepgram model (default: nova-3)")
+
+    pr = sub.add_parser("render",
+                        help="Pretty-print an exported messages.json as markdown")
+    pr.add_argument("json_path", help="Path to a messages.json produced by `whatsapp export`")
+    pr.add_argument("--out", help="Write to file instead of stdout")
+
+    args = parser.parse_args()
+
+    {
+        "help": cmd_help,
+        "status": cmd_status,
+        "chats": cmd_chats,
+        "messages": cmd_messages,
+        "contact": cmd_contact,
+        "export": cmd_export,
+        "transcribe": cmd_transcribe,
+        "render": cmd_render,
+    }[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

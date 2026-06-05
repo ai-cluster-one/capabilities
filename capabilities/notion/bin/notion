@@ -1,0 +1,487 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""
+notion — agent-first CLI for publishing markdown to Notion pages.
+
+This tool is designed to be invoked by agents. Run `notion help` to load
+the full usage contract on demand — do not rely on memorised knowledge of
+its surface.
+
+Credentials are read automatically from ~/.config/notion/credentials.env
+(NOTION_TOKEN=<Notion Personal Access Token>). Never pass the token on
+the command line.
+
+Commands:
+  notion help                                 Print this document.
+  notion whoami                               Identity + workspace.
+  notion children <parent>                    List direct child pages.
+  notion get <page>                           Fetch page as markdown (incl. title).
+  notion publish <page> [<md>|-]              Replace body + title of existing page.
+  notion create --parent <p> [--title T] [<md>|-]
+                                              Create new page under parent.
+  notion upsert --parent <p> [--title T] [<md>|-]
+                                              Update by exact title or create.
+
+Page references:
+  <page> / <parent> accept a bare UUID (dashed or 32-char) OR a full Notion
+  URL. The 32-hex slug is extracted from URLs automatically.
+
+Markdown input:
+  Any command that takes <md> accepts a file path, "-" for stdin, or no
+  argument (defaults to stdin).
+
+Title handling:
+  The local markdown file is the source of truth for both the title and the
+  body. If the first non-blank line is a level-1 heading (`# Title`), that
+  line is extracted as the page title and stripped from the body before
+  sending. This keeps local file and Notion page in sync via a single edit.
+
+  - `get`: prepends `# <page title>` to the returned markdown.
+  - `publish`: updates both the page body and (if the H1 changed) the title.
+  - `create` / `upsert`: title comes from the H1 when present; `--title`
+    is required only when the file has no leading H1. If both are given,
+    the H1 wins.
+
+I/O contract:
+  - Success: JSON on stdout, exit 0. (`get` emits raw markdown.)
+  - Error:   {"error": {"code", "message", "hint", "status"}} on stderr,
+             non-zero exit.
+
+Exit codes:
+  0  success
+  2  auth (unauthorized / restricted_resource / missing credentials)
+  3  not found (object_not_found)
+  4  conflict (e.g. ambiguous title in upsert)
+  5  server / network (5xx, timeout, rate-limit exhausted)
+  6  input / validation
+
+Quirks worth knowing:
+  - `POST /v1/search` is unavailable to PAT tokens (returns 0 results).
+    To locate a page by name, list a known parent's `children` and match
+    in the caller. There is no global workspace-wide name lookup.
+  - `upsert` matches direct children only; a grandchild with the same
+    title is not considered. Walk the tree explicitly if you need that.
+"""
+
+import argparse
+import json
+import re
+import sys
+import time
+from pathlib import Path
+from typing import NoReturn
+
+import httpx
+
+API_BASE = "https://api.notion.com/v1"
+NOTION_VERSION = "2026-03-11"
+TIMEOUT = httpx.Timeout(30.0)
+MAX_RETRIES = 3
+
+UUID_DASHED = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+UUID_PLAIN = re.compile(r"[0-9a-f]{32}")
+H1_RE = re.compile(r"\A(?:[ \t]*\n)*[ \t]*#[ \t]+([^\n]+?)[ \t]*(?:\n|\Z)")
+
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+# --- Credentials -------------------------------------------------------------
+
+def _load_token() -> str:
+    env_path = Path.home() / ".config" / "notion" / "credentials.env"
+    if not env_path.exists():
+        _die(2, "missing_credentials",
+             f"{env_path} does not exist",
+             "create the file with a single line: NOTION_TOKEN=<your token>")
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        if k.strip() == "NOTION_TOKEN":
+            tok = v.strip()
+            if not tok:
+                _die(2, "empty_token",
+                     "NOTION_TOKEN is set but empty",
+                     "paste your Notion PAT after NOTION_TOKEN=")
+            return tok
+    _die(2, "missing_token",
+         "NOTION_TOKEN not found in credentials.env",
+         "add a line: NOTION_TOKEN=<your token>")
+
+
+# --- Reference parsing -------------------------------------------------------
+
+def _to_uuid(ref: str) -> str:
+    """Extract a canonical dashed UUID from a Notion URL or raw ID."""
+    s = ref.strip().lower()
+    m = UUID_DASHED.search(s)
+    if m:
+        return m.group(0)
+    m = UUID_PLAIN.search(s.replace("-", ""))
+    if m:
+        h = m.group(0)
+        return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+    _die(6, "bad_page_ref",
+         f"could not extract a Notion page UUID from {ref!r}",
+         "pass a 32-char hex UUID, a dashed UUID, or a full Notion page URL")
+
+
+# --- Markdown input ----------------------------------------------------------
+
+def _extract_h1_title(md: str) -> tuple[str | None, str]:
+    """If the first non-blank line is `# Title`, return (title, body_without_h1).
+    Otherwise return (None, md). Strips immediately following blank lines from
+    the body so a round-trip with `_compose_with_h1` is idempotent.
+    """
+    m = H1_RE.match(md)
+    if not m:
+        return None, md
+    title = m.group(1).strip()
+    body = md[m.end():].lstrip("\n")
+    return title, body
+
+
+def _compose_with_h1(title: str, body: str) -> str:
+    """Inverse of `_extract_h1_title`: prepend `# title` + blank line to body."""
+    return f"# {title}\n\n{body}" if body else f"# {title}\n"
+
+
+def _read_md(arg: str | None) -> str:
+    if arg is None or arg == "-":
+        data = sys.stdin.read()
+        if not data:
+            _die(6, "empty_stdin",
+                 "no markdown content received on stdin",
+                 "pipe content in, or pass a file path")
+        return data
+    p = Path(arg)
+    if not p.exists():
+        _die(6, "file_not_found",
+             f"markdown file does not exist: {arg}",
+             "check the path; pass '-' to read from stdin")
+    return p.read_text(encoding="utf-8")
+
+
+# --- HTTP --------------------------------------------------------------------
+
+def _client(token: str) -> httpx.Client:
+    return httpx.Client(
+        base_url=API_BASE,
+        timeout=TIMEOUT,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json",
+        },
+    )
+
+
+def _request(client: httpx.Client, method: str, path: str,
+             json_body: dict | None = None) -> dict:
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, path, json=json_body)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "timeout",
+                 f"request timed out: {method} {path}",
+                 "Notion API was unresponsive; check status.notion.com")
+        except httpx.RequestError as e:
+            _die(5, "network_error", f"network error: {e}", "check connectivity")
+
+        last_status = resp.status_code
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", "1"))
+            if attempt < MAX_RETRIES:
+                time.sleep(retry_after)
+                continue
+            _die(5, "rate_limited",
+                 f"rate-limited after {MAX_RETRIES} attempts",
+                 "back off and retry later", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "server_error",
+                 f"Notion returned {resp.status_code}",
+                 "check status.notion.com", status=resp.status_code)
+
+        try:
+            data = resp.json()
+        except ValueError:
+            _die(5, "invalid_response",
+                 f"non-JSON response from {method} {path}",
+                 status=resp.status_code)
+
+        if resp.status_code >= 400:
+            notion_code = data.get("code", "unknown_error")
+            notion_msg = data.get("message", "")
+            if notion_code in ("unauthorized", "restricted_resource"):
+                exit_code = 2
+                hint = "PAT may not have access to this resource"
+            elif notion_code == "object_not_found":
+                exit_code = 3
+                hint = "verify the page UUID and that the PAT can see it"
+            elif notion_code == "validation_error":
+                exit_code = 6
+                hint = "check request body shape against Notion API docs"
+            elif notion_code == "conflict_error":
+                exit_code = 4
+                hint = "the resource was modified concurrently; retry"
+            else:
+                exit_code = 5
+                hint = None
+            _die(exit_code, notion_code, notion_msg, hint, status=resp.status_code)
+
+        return data
+
+    _die(5, "exhausted_retries",
+         f"exhausted {MAX_RETRIES} attempts on {method} {path}",
+         status=last_status)
+
+
+# --- Helpers -----------------------------------------------------------------
+
+def _page_title(page: dict) -> str:
+    props = page.get("properties", {}) or {}
+    for v in props.values():
+        if v.get("type") == "title":
+            arr = v.get("title") or []
+            if arr:
+                return "".join(t.get("plain_text", "") for t in arr)
+    return ""
+
+
+def _title_prop_key(page: dict) -> str | None:
+    """Find the property key whose type is `title` (usually 'title' for normal
+    pages; can differ for database rows)."""
+    props = page.get("properties", {}) or {}
+    for k, v in props.items():
+        if v.get("type") == "title":
+            return k
+    return None
+
+
+def _title_property_body(prop_key: str, title: str) -> dict:
+    return {
+        "properties": {
+            prop_key: {"title": [{"type": "text", "text": {"content": title}}]}
+        }
+    }
+
+
+def _page_summary(page: dict, action: str | None = None) -> dict:
+    out = {
+        "page_id": page.get("id"),
+        "url": page.get("url"),
+        "title": _page_title(page),
+    }
+    if action:
+        out["action"] = action
+    return out
+
+
+# --- Commands ----------------------------------------------------------------
+
+def cmd_whoami(c: httpx.Client) -> dict:
+    data = _request(c, "GET", "/users/me")
+    bot = data.get("bot", {}) or {}
+    owner = bot.get("owner", {}) or {}
+    out = {
+        "id": data.get("id"),
+        "name": data.get("name"),
+        "type": data.get("type"),
+        "owner_type": owner.get("type"),
+        "workspace_name": bot.get("workspace_name"),
+    }
+    if owner.get("type") == "user":
+        out["owner_user"] = (owner.get("user") or {}).get("name")
+    return out
+
+
+def cmd_children(c: httpx.Client, parent: str) -> list[dict]:
+    parent_id = _to_uuid(parent)
+    results: list[dict] = []
+    cursor: str | None = None
+    while True:
+        path = f"/blocks/{parent_id}/children?page_size=100"
+        if cursor:
+            path += f"&start_cursor={cursor}"
+        data = _request(c, "GET", path)
+        for r in data.get("results", []):
+            if r.get("type") == "child_page":
+                results.append({
+                    "id": r["id"],
+                    "title": (r.get("child_page") or {}).get("title", ""),
+                })
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return results
+
+
+def cmd_get(c: httpx.Client, page: str) -> str:
+    page_id = _to_uuid(page)
+    page_data = _request(c, "GET", f"/pages/{page_id}")
+    title = _page_title(page_data)
+    data = _request(c, "GET", f"/pages/{page_id}/markdown")
+    md = data.get("markdown", "")
+    return _compose_with_h1(title, md) if title else md
+
+
+def cmd_publish(c: httpx.Client, page: str, md: str) -> dict:
+    page_id = _to_uuid(page)
+    h1_title, body_md = _extract_h1_title(md)
+
+    body_patch = {"type": "replace_content",
+                  "replace_content": {"new_str": body_md}}
+    data = _request(c, "PATCH", f"/pages/{page_id}/markdown", body_patch)
+    if data.get("object") != "page":
+        data = _request(c, "GET", f"/pages/{page_id}")
+
+    if h1_title is not None and h1_title != _page_title(data):
+        prop_key = _title_prop_key(data)
+        if prop_key is None:
+            _die(5, "no_title_property",
+                 "page has no property of type 'title'",
+                 "this should not happen for normal pages; check the page id")
+        data = _request(c, "PATCH", f"/pages/{page_id}",
+                        _title_property_body(prop_key, h1_title))
+    return _page_summary(data, action="updated")
+
+
+def _resolve_title(h1_title: str | None, title_arg: str | None) -> str:
+    """H1 wins; fall back to --title; otherwise abort."""
+    if h1_title:
+        return h1_title
+    if title_arg:
+        return title_arg
+    _die(6, "missing_title",
+         "no title: file has no leading '# H1' and --title not given",
+         "add a '# Title' as the first line of the file, or pass --title")
+
+
+def cmd_create(c: httpx.Client, parent: str,
+               title_arg: str | None, md: str) -> dict:
+    parent_id = _to_uuid(parent)
+    h1_title, body_md = _extract_h1_title(md)
+    title = _resolve_title(h1_title, title_arg)
+    body = {
+        "parent": {"page_id": parent_id},
+        "properties": {
+            "title": {"title": [{"type": "text", "text": {"content": title}}]}
+        },
+        "markdown": body_md,
+    }
+    data = _request(c, "POST", "/pages", body)
+    return _page_summary(data, action="created")
+
+
+def cmd_upsert(c: httpx.Client, parent: str,
+               title_arg: str | None, md: str) -> dict:
+    parent_id = _to_uuid(parent)
+    h1_title, _ = _extract_h1_title(md)
+    title = _resolve_title(h1_title, title_arg)
+    children = cmd_children(c, parent_id)
+    matches = [ch for ch in children if ch["title"] == title]
+    if len(matches) > 1:
+        _die(4, "ambiguous_title",
+             f"{len(matches)} direct children of parent match title {title!r}",
+             "use 'publish <id>' against a specific page to disambiguate")
+    if len(matches) == 1:
+        return cmd_publish(c, matches[0]["id"], md)
+    return cmd_create(c, parent_id, title, md)
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="notion",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("help", help="print the full usage contract")
+    sub.add_parser("whoami", help="confirm token and return identity")
+
+    sp = sub.add_parser("children", help="list child pages of a parent page")
+    sp.add_argument("parent", help="parent page UUID or Notion URL")
+
+    sp = sub.add_parser("get", help="fetch page body as markdown")
+    sp.add_argument("page", help="page UUID or Notion URL")
+
+    sp = sub.add_parser("publish", help="replace body of an existing page")
+    sp.add_argument("page", help="page UUID or Notion URL")
+    sp.add_argument("md", nargs="?", default="-",
+                    help="markdown file path or '-' for stdin (default: stdin)")
+
+    sp = sub.add_parser("create", help="create a new page under a parent")
+    sp.add_argument("--parent", required=True, help="parent page UUID or URL")
+    sp.add_argument("--title", default=None,
+                    help="title for the new page (optional if file has '# H1')")
+    sp.add_argument("md", nargs="?", default="-",
+                    help="markdown file path or '-' for stdin (default: stdin)")
+
+    sp = sub.add_parser("upsert", help="find by title under parent, or create")
+    sp.add_argument("--parent", required=True, help="parent page UUID or URL")
+    sp.add_argument("--title", default=None,
+                    help="exact title to match (optional if file has '# H1')")
+    sp.add_argument("md", nargs="?", default="-",
+                    help="markdown file path or '-' for stdin (default: stdin)")
+
+    args = p.parse_args()
+
+    if args.cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+
+    token = _load_token()
+
+    with _client(token) as c:
+        if args.cmd == "whoami":
+            _emit(cmd_whoami(c))
+        elif args.cmd == "children":
+            _emit(cmd_children(c, args.parent))
+        elif args.cmd == "get":
+            _emit(cmd_get(c, args.page))
+        elif args.cmd == "publish":
+            _emit(cmd_publish(c, args.page, _read_md(args.md)))
+        elif args.cmd == "create":
+            _emit(cmd_create(c, args.parent, args.title, _read_md(args.md)))
+        elif args.cmd == "upsert":
+            _emit(cmd_upsert(c, args.parent, args.title, _read_md(args.md)))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,657 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""stripe — read-only Stripe fetch CLI. Emits a neutral JSON contract of what
+happened on Stripe; knows nothing about SimpleBooks (no account ids, no vat
+types). The consumer (the simplbooks-stripe-worker routine) maps the contract to
+bookkeeping primitives. The contract is the only coupling.
+
+USAGE
+  stripe <command> [options]
+
+Identity-free: it reports on whatever account STRIPE_SECRET_KEY authorizes — no
+company specifics baked in. Read-only: it never writes to Stripe. All structured
+reads emit JSON to stdout. Date ranges are --from inclusive, --to exclusive
+(YYYY-MM-DD, interpreted at local-midnight, mirroring the sync-bt convention).
+
+CREDENTIALS
+  STRIPE_SECRET_KEY resolves in a cascade (first non-empty wins):
+    1. flag           --api-key
+    2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
+    3. user config    $XDG_CONFIG_HOME/stripe/credentials.env (default ~/.config/stripe/)
+    4. process env    STRIPE_SECRET_KEY
+
+COMMANDS
+  doctor
+      Validate STRIPE_SECRET_KEY + API reachability (GET /v1/balance).
+      Exit 0 healthy / 2 missing-or-rejected key / 5 unreachable.
+
+  sync-plan --from YYYY-MM-DD --to YYYY-MM-DD [--only-type T]
+      THE contract producer. Walks balance_transactions over [from, to),
+      classifies each into the neutral event taxonomy, and emits the JSON
+      contract on stdout. One call = everything the worker needs to reconcile.
+        · charge  → gross/fee/net split + customer block + invoice block
+                    (stripe number, line items [description/qty/amount],
+                    hosted PDF url) + resolve:{sb_client_id, sb_invoice_id}=null
+                    (the seam the consumer fills)
+        · fee     → amount + category (billing_usage / invoicing / tax / processing)
+        · payout  → amount (for tying to the bank side)
+        · refund  → kind:"refund", flagged residual — surfaced, never dropped
+      Stateless: emits everything in range. Idempotency is the consumer's (it
+      scans the books for the txn_ prefix and skips what's booked).
+      --only-type restricts to one of charge|fee|payout|refund.
+
+  contract
+      Print a valid example of the contract sync-plan emits — the event and
+      envelope shape, not live data, no API key required. The machine-readable
+      companion to the event taxonomy above; built from the same builders the
+      producer uses, so it never drifts. Pipe to jq to inspect the fields.
+
+  invoices list --from YYYY-MM-DD --to YYYY-MM-DD [--status paid]
+      Standalone read of Stripe invoices (number, customer, amount, currency,
+      hosted PDF url). Inspection read; sync-plan's charge events embed this.
+
+  invoices pdf <invoice_id> --out PATH
+      Download an invoice's hosted PDF, for attaching to the books on create.
+
+  balance-transactions list --from YYYY-MM-DD --to YYYY-MM-DD [--type T]
+      Lower-level normalized BT read — for resolving an edge case sync-plan
+      flagged, or a staged by-type migration. --type one of
+      charge|stripe_fee|payout|refund.
+
+  payouts list --from YYYY-MM-DD --to YYYY-MM-DD
+      Standalone payout read.
+
+EXIT CODES
+  0 success · 2 auth/credentials · 3 not found · 5 server/network · 6 input
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import NoReturn
+
+import httpx
+
+STRIPE_API = "https://api.stripe.com/v1"
+TIMEOUT = httpx.Timeout(60.0)
+MAX_RETRIES = 3
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / "stripe" / "credentials.env"
+KEY_NAME = "STRIPE_SECRET_KEY"
+
+
+# ── output helpers ──────────────────────────────────────────────────────────
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value if value.endswith("\n") else value + "\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# ── credentials ─────────────────────────────────────────────────────────────
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_env() -> dict:
+    """Nearest project .env(.local), walking up from $CLAUDE_PROJECT_DIR (else cwd).
+    .env.local overrides .env. Stops at the first dir holding either, or a .git root."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    for d in (here, *here.parents):
+        if (d / ".env").exists() or (d / ".env.local").exists():
+            merged = _parse_env_file(d / ".env")
+            merged.update(_parse_env_file(d / ".env.local"))  # .local wins
+            return merged
+        if (d / ".git").is_dir():
+            break
+    return {}
+
+
+def _resolve_key(args) -> str:
+    key = (getattr(args, "api_key", None)
+           or _project_env().get(KEY_NAME)
+           or _parse_env_file(CREDENTIALS_ENV).get(KEY_NAME)
+           or os.environ.get(KEY_NAME))
+    if not key:
+        _die(2, "missing_credentials",
+             f"{KEY_NAME} is required",
+             f"set it in a project .env(.local), {CREDENTIALS_ENV}, the environment, or via --api-key")
+    return key
+
+
+# ── HTTP with 429/5xx backoff ───────────────────────────────────────────────
+
+def _client(key: str) -> httpx.Client:
+    return httpx.Client(base_url=STRIPE_API, auth=(key, ""), timeout=TIMEOUT)
+
+
+def _request(client: httpx.Client, method: str, path: str,
+             params=None, raw: bool = False):
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, path, params=params)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "timeout", f"request timed out: {method} {path}", "Stripe was unresponsive")
+        except httpx.RequestError as e:
+            _die(5, "network_error", f"network error: {e}", "check connectivity to api.stripe.com")
+
+        last_status = resp.status_code
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", str(attempt * 1.5)))
+            if attempt < MAX_RETRIES:
+                time.sleep(retry_after)
+                continue
+            _die(5, "rate_limited", "rate-limited by Stripe", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "server_error", f"Stripe returned {resp.status_code}",
+                 (resp.text or "")[:300], status=resp.status_code)
+
+        if resp.status_code >= 400:
+            msg = (resp.text or "").strip()[:400] or "unknown error"
+            try:
+                j = resp.json()
+                if isinstance(j, dict) and isinstance(j.get("error"), dict):
+                    msg = j["error"].get("message") or msg
+            except ValueError:
+                pass
+            if resp.status_code in (401, 403):
+                _die(2, "unauthorized", msg, "STRIPE_SECRET_KEY invalid or lacks scope", status=resp.status_code)
+            if resp.status_code == 404:
+                _die(3, "not_found", msg, status=resp.status_code)
+            _die(6, "invalid_request", msg, status=resp.status_code)
+
+        if raw:
+            return resp.content
+        try:
+            return resp.json()
+        except ValueError:
+            return {}
+
+    _die(5, "exhausted_retries", f"exhausted {MAX_RETRIES} attempts on {method} {path}", status=last_status)
+
+
+# ── Stripe domain helpers ───────────────────────────────────────────────────
+
+def _ts(date_str: str) -> int:
+    try:
+        return int(datetime.strptime(date_str, "%Y-%m-%d").timestamp())
+    except ValueError:
+        _die(6, "bad_date", f"expected YYYY-MM-DD, got {date_str!r}")
+
+
+def _amt(cents, currency: str) -> str:
+    """Minor units → decimal string. Zero-decimal currencies kept whole.
+    Neutral dot-decimal — the consumer reformats to its own locale."""
+    zero_decimal = {"jpy", "krw", "vnd", "clp", "isk", "huf", "twd"}
+    if (currency or "").lower() in zero_decimal:
+        return str(abs(int(cents)))
+    return f"{abs(int(cents)) / 100:.2f}"
+
+
+def _day(epoch) -> str | None:
+    """Epoch seconds → YYYY-MM-DD in local time, matching the local-midnight
+    basis of the --from/--to range filter."""
+    if not epoch:
+        return None
+    return datetime.fromtimestamp(int(epoch)).strftime("%Y-%m-%d")
+
+
+def _paginate(client: httpx.Client, path: str, params: list[tuple[str, str]]):
+    starting_after = None
+    while True:
+        page_params = list(params)
+        if starting_after:
+            page_params.append(("starting_after", starting_after))
+        data = _request(client, "GET", path, params=page_params)
+        items = data.get("data", []) if isinstance(data, dict) else []
+        for item in items:
+            yield item
+        if not (isinstance(data, dict) and data.get("has_more") and items):
+            return
+        starting_after = items[-1]["id"]
+
+
+def _list_bts(client: httpx.Client, ts_from: int, ts_to: int):
+    params = [
+        ("limit", "100"),
+        ("created[gte]", str(ts_from)),
+        ("created[lt]", str(ts_to)),
+        ("expand[]", "data.source"),
+    ]
+    return _paginate(client, "/balance_transactions", params)
+
+
+def _fee_category(description: str | None) -> str:
+    """Best-effort Stripe-domain bucket of a standalone fee. Raw description is
+    kept alongside; this is a hint, not authority."""
+    d = (description or "").lower()
+    if "tax" in d:
+        return "tax"
+    if "invoic" in d:
+        return "invoicing"
+    if "billing" in d or "usage" in d:
+        return "billing_usage"
+    return "processing"
+
+
+def _resolve_customer(client: httpx.Client, charge: dict, cache: dict) -> dict:
+    """stripe_id (the stable mapping key) + best-effort name/email."""
+    cust_id = charge.get("customer")
+    bd = charge.get("billing_details") or {}
+    name = bd.get("name")
+    email = bd.get("email") or charge.get("receipt_email")
+    if cust_id and cust_id not in cache:
+        try:
+            c = _request(client, "GET", f"/customers/{cust_id}")
+            cache[cust_id] = {"name": c.get("name"), "email": c.get("email")}
+        except SystemExit:
+            cache[cust_id] = {}
+    extra = cache.get(cust_id, {})
+    return {
+        "stripe_id": cust_id,
+        "name": name or extra.get("name"),
+        "email": email or extra.get("email"),
+    }
+
+
+def _resolve_invoice(client: httpx.Client, charge: dict, cache: dict) -> dict | None:
+    inv_id = charge.get("invoice")
+    if not inv_id:
+        return None
+    if inv_id not in cache:
+        inv = _request(client, "GET", f"/invoices/{inv_id}")
+        currency = inv.get("currency", "eur")
+        lines = [
+            {
+                "description": ln.get("description"),
+                "quantity": ln.get("quantity"),
+                "amount": _amt(ln["amount"], currency) if ln.get("amount") is not None else None,
+            }
+            for ln in (inv.get("lines", {}).get("data") or [])
+        ]
+        cache[inv_id] = {
+            "stripe_number": inv.get("number"),
+            "pdf_url": inv.get("invoice_pdf"),
+            "hosted_url": inv.get("hosted_invoice_url"),
+            "lines": lines,
+        }
+    return cache[inv_id]
+
+
+# ── contract shape — the single source of the event/envelope structure ───────
+# Both the producer (sync-plan) and the `contract` example call these, so the
+# shape lives once and cannot drift between the two.
+
+def _event_charge(txn, date_iso, customer, invoice, gross, fee, net, currency) -> dict:
+    return {
+        "kind": "charge",
+        "txn": txn,
+        "date": date_iso,
+        "customer": customer,
+        "invoice": invoice,
+        "gross": gross,
+        "fee": fee,
+        "net": net,
+        "currency": currency,
+        "resolve": {"sb_client_id": None, "sb_invoice_id": None},
+    }
+
+
+def _event_fee(txn, date_iso, amount, currency, category, description) -> dict:
+    return {
+        "kind": "fee",
+        "txn": txn,
+        "date": date_iso,
+        "amount": amount,
+        "currency": currency,
+        "category": category,
+        "description": description,
+    }
+
+
+def _event_payout(txn, date_iso, amount, currency, description) -> dict:
+    return {
+        "kind": "payout",
+        "txn": txn,
+        "date": date_iso,
+        "amount": amount,
+        "currency": currency,
+        "description": description,
+    }
+
+
+def _event_refund(txn, date_iso, amount, currency, description) -> dict:
+    return {
+        "kind": "refund",
+        "txn": txn,
+        "date": date_iso,
+        "amount": amount,
+        "currency": currency,
+        "residual": True,
+        "description": description,
+    }
+
+
+def _event_other(txn, date_iso, stripe_type, amount, currency) -> dict:
+    return {
+        "kind": "other",
+        "txn": txn,
+        "date": date_iso,
+        "stripe_type": stripe_type,
+        "amount": amount,
+        "currency": currency,
+        "residual": True,
+    }
+
+
+def _contract_envelope(from_date: str, to_date: str, events: list[dict]) -> dict:
+    counts: dict = {}
+    for e in events:
+        counts[e["kind"]] = counts.get(e["kind"], 0) + 1
+    return {
+        "source": "stripe",
+        "clears_through": "stripe",
+        "period": {"from": from_date, "to": to_date},
+        "counts": counts,
+        "events": events,
+    }
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def cmd_doctor(client: httpx.Client) -> dict:
+    bal = _request(client, "GET", "/balance")
+    available = bal.get("available", []) if isinstance(bal, dict) else []
+    currencies = sorted({b.get("currency") for b in available if b.get("currency")})
+    return {"ok": True, "livemode": bool(bal.get("livemode")), "currencies": currencies}
+
+
+def cmd_sync_plan(client: httpx.Client, from_date: str, to_date: str, only_type: str | None) -> dict:
+    ts_from, ts_to = _ts(from_date), _ts(to_date)
+    cust_cache: dict = {}
+    inv_cache: dict = {}
+    events: list[dict] = []
+
+    for bt in sorted(_list_bts(client, ts_from, ts_to), key=lambda b: b.get("created", 0)):
+        bt_type = bt.get("type")
+        date_iso = _day(bt.get("created"))
+        currency = bt.get("currency", "eur")
+        amount = int(bt.get("amount") or 0)
+        fee = int(bt.get("fee") or 0)
+
+        if bt_type == "charge":
+            kind = "charge"
+        elif bt_type == "stripe_fee":
+            kind = "fee"
+        elif bt_type == "payout":
+            kind = "payout"
+        elif bt_type == "refund":
+            kind = "refund"
+        else:
+            kind = "other"
+        if only_type and kind != only_type:
+            continue
+
+        if kind == "charge":
+            charge = bt.get("source") if isinstance(bt.get("source"), dict) else {}
+            events.append(_event_charge(
+                bt["id"], date_iso,
+                _resolve_customer(client, charge, cust_cache),
+                _resolve_invoice(client, charge, inv_cache),
+                _amt(amount, currency), _amt(fee, currency), _amt(amount - fee, currency),
+                currency,
+            ))
+        elif kind == "fee":
+            desc = bt.get("description")
+            events.append(_event_fee(
+                bt["id"], date_iso, _amt(amount, currency), currency,
+                _fee_category(desc), desc,
+            ))
+        elif kind == "payout":
+            events.append(_event_payout(
+                bt["id"], date_iso, _amt(amount, currency), currency, bt.get("description"),
+            ))
+        elif kind == "refund":
+            events.append(_event_refund(
+                bt["id"], date_iso, _amt(amount, currency), currency, bt.get("description"),
+            ))
+        else:
+            events.append(_event_other(
+                bt["id"], date_iso, bt_type, _amt(amount, currency), currency,
+            ))
+
+    return _contract_envelope(from_date, to_date, events)
+
+
+def cmd_contract() -> dict:
+    """A valid example of the contract sync-plan emits — the shape, not live
+    data. Built by the same event builders as the producer, so it cannot drift
+    from what sync-plan actually returns. No API key required."""
+    return _contract_envelope("2026-01-01", "2026-02-01", [
+        _event_charge(
+            "txn_1ExampleCharge0000", "2026-01-12",
+            {"stripe_id": "cus_Example", "name": "Acme OÜ", "email": "billing@acme.example"},
+            {"stripe_number": "ABCD-0001",
+             "pdf_url": "https://pay.stripe.com/invoice/.../pdf",
+             "hosted_url": "https://invoice.stripe.com/i/...",
+             "lines": [{"description": "Voice agent subscription",
+                        "quantity": 1, "amount": "100.00"}]},
+            "100.00", "2.50", "97.50", "eur",
+        ),
+        _event_fee("txn_1ExampleFee000000", "2026-01-31", "1.20", "eur", "tax",
+                   "Tax computation fee"),
+        _event_payout("txn_1ExamplePayout000", "2026-01-15", "950.00", "eur",
+                      "STRIPE PAYOUT"),
+        _event_refund("txn_1ExampleRefund000", "2026-01-20", "-30.00", "eur",
+                      "Refund for ch_Example"),
+        _event_other("txn_1ExampleOther0000", "2026-01-22", "adjustment", "-5.00", "eur"),
+    ])
+
+
+def cmd_invoices_list(client: httpx.Client, from_date: str, to_date: str, status: str | None) -> list:
+    params = [
+        ("limit", "100"),
+        ("created[gte]", str(_ts(from_date))),
+        ("created[lt]", str(_ts(to_date))),
+    ]
+    if status:
+        params.append(("status", status))
+    out = []
+    for inv in _paginate(client, "/invoices", params):
+        currency = inv.get("currency", "eur")
+        out.append({
+            "id": inv.get("id"),
+            "number": inv.get("number"),
+            "status": inv.get("status"),
+            "customer": inv.get("customer"),
+            "customer_name": inv.get("customer_name"),
+            "customer_email": inv.get("customer_email"),
+            "total": _amt(inv.get("total") or 0, currency),
+            "currency": currency,
+            "date": _day(inv.get("created")),
+            "pdf_url": inv.get("invoice_pdf"),
+            "hosted_url": inv.get("hosted_invoice_url"),
+        })
+    return out
+
+
+def cmd_invoices_pdf(client: httpx.Client, invoice_id: str, out: str) -> dict:
+    inv = _request(client, "GET", f"/invoices/{invoice_id}")
+    pdf_url = inv.get("invoice_pdf")
+    if not pdf_url:
+        _die(3, "no_pdf", f"invoice {invoice_id} has no invoice_pdf url")
+    # invoice_pdf is a fully-qualified URL outside the /v1 base; fetch raw.
+    with httpx.Client(timeout=TIMEOUT) as plain:
+        try:
+            r = plain.get(pdf_url, follow_redirects=True)
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            _die(5, "pdf_fetch_failed", f"could not download PDF: {e}")
+        content = r.content
+    dest = Path(out).expanduser()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(content)
+    return {"ok": True, "invoice": invoice_id, "number": inv.get("number"),
+            "out": str(dest), "bytes": len(content)}
+
+
+def cmd_bt_list(client: httpx.Client, from_date: str, to_date: str, bt_type: str | None) -> list:
+    out = []
+    for bt in _list_bts(client, _ts(from_date), _ts(to_date)):
+        if bt_type and bt.get("type") != bt_type:
+            continue
+        currency = bt.get("currency", "eur")
+        out.append({
+            "id": bt.get("id"),
+            "type": bt.get("type"),
+            "date": _day(bt.get("created")),
+            "amount": _amt(bt.get("amount") or 0, currency),
+            "fee": _amt(bt.get("fee") or 0, currency),
+            "net": _amt(int(bt.get("amount") or 0) - int(bt.get("fee") or 0), currency),
+            "currency": currency,
+            "description": bt.get("description"),
+        })
+    return out
+
+
+def cmd_payouts_list(client: httpx.Client, from_date: str, to_date: str) -> list:
+    params = [
+        ("limit", "100"),
+        ("created[gte]", str(_ts(from_date))),
+        ("created[lt]", str(_ts(to_date))),
+    ]
+    out = []
+    for po in _paginate(client, "/payouts", params):
+        currency = po.get("currency", "eur")
+        out.append({
+            "id": po.get("id"),
+            "status": po.get("status"),
+            "amount": _amt(po.get("amount") or 0, currency),
+            "currency": currency,
+            "arrival_date": _day(po.get("arrival_date")),
+            "created": _day(po.get("created")),
+            "description": po.get("description"),
+        })
+    return out
+
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="stripe", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--api-key", default=None, help="STRIPE_SECRET_KEY (prefer config/env; avoid on CLI)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("help")
+    sub.add_parser("contract")
+    sub.add_parser("doctor")
+
+    sp = sub.add_parser("sync-plan")
+    sp.add_argument("--from", dest="from_date", required=True)
+    sp.add_argument("--to", dest="to_date", required=True)
+    sp.add_argument("--only-type", choices=["charge", "fee", "payout", "refund"], default=None)
+
+    inv = sub.add_parser("invoices")
+    inv_sub = inv.add_subparsers(dest="subcmd", required=True)
+    il = inv_sub.add_parser("list")
+    il.add_argument("--from", dest="from_date", required=True)
+    il.add_argument("--to", dest="to_date", required=True)
+    il.add_argument("--status", default=None)
+    ip = inv_sub.add_parser("pdf")
+    ip.add_argument("invoice_id")
+    ip.add_argument("--out", required=True)
+
+    bt = sub.add_parser("balance-transactions")
+    bt_sub = bt.add_subparsers(dest="subcmd", required=True)
+    bl = bt_sub.add_parser("list")
+    bl.add_argument("--from", dest="from_date", required=True)
+    bl.add_argument("--to", dest="to_date", required=True)
+    bl.add_argument("--type", dest="bt_type",
+                    choices=["charge", "stripe_fee", "payout", "refund"], default=None)
+
+    po = sub.add_parser("payouts")
+    po_sub = po.add_subparsers(dest="subcmd", required=True)
+    pl = po_sub.add_parser("list")
+    pl.add_argument("--from", dest="from_date", required=True)
+    pl.add_argument("--to", dest="to_date", required=True)
+
+    args = p.parse_args()
+    if args.cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+    if args.cmd == "contract":
+        _emit(cmd_contract())
+        return
+
+    key = _resolve_key(args)
+    try:
+        with _client(key) as c:
+            if args.cmd == "doctor":
+                _emit(cmd_doctor(c))
+            elif args.cmd == "sync-plan":
+                _emit(cmd_sync_plan(c, args.from_date, args.to_date, args.only_type))
+            elif args.cmd == "invoices" and args.subcmd == "list":
+                _emit(cmd_invoices_list(c, args.from_date, args.to_date, args.status))
+            elif args.cmd == "invoices" and args.subcmd == "pdf":
+                _emit(cmd_invoices_pdf(c, args.invoice_id, args.out))
+            elif args.cmd == "balance-transactions" and args.subcmd == "list":
+                _emit(cmd_bt_list(c, args.from_date, args.to_date, args.bt_type))
+            elif args.cmd == "payouts" and args.subcmd == "list":
+                _emit(cmd_payouts_list(c, args.from_date, args.to_date))
+            else:
+                _die(6, "unknown_command", f"no handler for {args.cmd!r}")
+    finally:
+        del key
+
+
+if __name__ == "__main__":
+    main()
