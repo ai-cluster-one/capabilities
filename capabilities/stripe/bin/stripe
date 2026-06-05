@@ -6,17 +6,17 @@
 # ]
 # ///
 """stripe — read-only Stripe fetch CLI. Emits a neutral JSON contract of what
-happened on Stripe; knows nothing about SimpleBooks (no account ids, no vat
-types). The consumer (the simplbooks-stripe-worker routine) maps the contract to
-bookkeeping primitives. The contract is the only coupling.
+happened on Stripe; it carries Stripe-domain facts only. A consumer maps the
+contract onto its own domain primitives downstream. The contract is the only
+coupling.
 
 USAGE
   stripe <command> [options]
 
-Identity-free: it reports on whatever account STRIPE_SECRET_KEY authorizes — no
-company specifics baked in. Read-only: it never writes to Stripe. All structured
+Identity-free: it reports on whatever account STRIPE_SECRET_KEY authorizes.
+Read-only: every command is a GET against the Stripe REST API. All structured
 reads emit JSON to stdout. Date ranges are --from inclusive, --to exclusive
-(YYYY-MM-DD, interpreted at local-midnight, mirroring the sync-bt convention).
+(YYYY-MM-DD, interpreted at local-midnight).
 
 CREDENTIALS
   STRIPE_SECRET_KEY resolves in a cascade (first non-empty wins):
@@ -33,16 +33,16 @@ COMMANDS
   sync-plan --from YYYY-MM-DD --to YYYY-MM-DD [--only-type T]
       THE contract producer. Walks balance_transactions over [from, to),
       classifies each into the neutral event taxonomy, and emits the JSON
-      contract on stdout. One call = everything the worker needs to reconcile.
+      contract on stdout. One call = everything a consumer needs to reconcile.
         · charge  → gross/fee/net split + customer block + invoice block
                     (stripe number, line items [description/qty/amount],
-                    hosted PDF url) + resolve:{sb_client_id, sb_invoice_id}=null
-                    (the seam the consumer fills)
+                    hosted PDF url) + resolve:{client_id, invoice_id}=null
+                    (the seam a consumer fills with its own ids)
         · fee     → amount + category (billing_usage / invoicing / tax / processing)
         · payout  → amount (for tying to the bank side)
         · refund  → kind:"refund", flagged residual — surfaced, never dropped
       Stateless: emits everything in range. Idempotency is the consumer's (it
-      scans the books for the txn_ prefix and skips what's booked).
+      skips events already recorded in its own store, keyed by the txn_ id).
       --only-type restricts to one of charge|fee|payout|refund.
 
   contract
@@ -167,7 +167,7 @@ def _client(key: str) -> httpx.Client:
 
 
 def _request(client: httpx.Client, method: str, path: str,
-             params=None, raw: bool = False):
+             params=None):
     last_status: int | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -208,8 +208,6 @@ def _request(client: httpx.Client, method: str, path: str,
                 _die(3, "not_found", msg, status=resp.status_code)
             _die(6, "invalid_request", msg, status=resp.status_code)
 
-        if raw:
-            return resp.content
         try:
             return resp.json()
         except ValueError:
@@ -308,7 +306,7 @@ def _resolve_invoice(client: httpx.Client, charge: dict, cache: dict) -> dict | 
         return None
     if inv_id not in cache:
         inv = _request(client, "GET", f"/invoices/{inv_id}")
-        currency = inv.get("currency", "eur")
+        currency = inv.get("currency")
         lines = [
             {
                 "description": ln.get("description"),
@@ -341,7 +339,7 @@ def _event_charge(txn, date_iso, customer, invoice, gross, fee, net, currency) -
         "fee": fee,
         "net": net,
         "currency": currency,
-        "resolve": {"sb_client_id": None, "sb_invoice_id": None},
+        "resolve": {"client_id": None, "invoice_id": None},
     }
 
 
@@ -423,7 +421,7 @@ def cmd_sync_plan(client: httpx.Client, from_date: str, to_date: str, only_type:
     for bt in sorted(_list_bts(client, ts_from, ts_to), key=lambda b: b.get("created", 0)):
         bt_type = bt.get("type")
         date_iso = _day(bt.get("created"))
-        currency = bt.get("currency", "eur")
+        currency = bt.get("currency")
         amount = int(bt.get("amount") or 0)
         fee = int(bt.get("fee") or 0)
 
@@ -478,11 +476,11 @@ def cmd_contract() -> dict:
     return _contract_envelope("2026-01-01", "2026-02-01", [
         _event_charge(
             "txn_1ExampleCharge0000", "2026-01-12",
-            {"stripe_id": "cus_Example", "name": "Acme OÜ", "email": "billing@acme.example"},
+            {"stripe_id": "cus_Example", "name": "Example Co", "email": "billing@example.com"},
             {"stripe_number": "ABCD-0001",
              "pdf_url": "https://pay.stripe.com/invoice/.../pdf",
              "hosted_url": "https://invoice.stripe.com/i/...",
-             "lines": [{"description": "Voice agent subscription",
+             "lines": [{"description": "Monthly subscription",
                         "quantity": 1, "amount": "100.00"}]},
             "100.00", "2.50", "97.50", "eur",
         ),
@@ -506,7 +504,7 @@ def cmd_invoices_list(client: httpx.Client, from_date: str, to_date: str, status
         params.append(("status", status))
     out = []
     for inv in _paginate(client, "/invoices", params):
-        currency = inv.get("currency", "eur")
+        currency = inv.get("currency")
         out.append({
             "id": inv.get("id"),
             "number": inv.get("number"),
@@ -548,7 +546,7 @@ def cmd_bt_list(client: httpx.Client, from_date: str, to_date: str, bt_type: str
     for bt in _list_bts(client, _ts(from_date), _ts(to_date)):
         if bt_type and bt.get("type") != bt_type:
             continue
-        currency = bt.get("currency", "eur")
+        currency = bt.get("currency")
         out.append({
             "id": bt.get("id"),
             "type": bt.get("type"),
@@ -570,7 +568,7 @@ def cmd_payouts_list(client: httpx.Client, from_date: str, to_date: str) -> list
     ]
     out = []
     for po in _paginate(client, "/payouts", params):
-        currency = po.get("currency", "eur")
+        currency = po.get("currency")
         out.append({
             "id": po.get("id"),
             "status": po.get("status"),
