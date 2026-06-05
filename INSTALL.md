@@ -60,7 +60,7 @@ A real secret only ever lands in `~/.config/<name>/credentials.env` (or a projec
 
 ## 3. Project layer — the consuming project, if there is one
 
-The CLI is centralized (step 2) — a project never copies it; it calls `<name>` by PATH. The project layer is only the lightweight, project-specific knowledge, surfaced by one project-side loader.
+The CLI is centralized (step 2) — a project never copies it; it calls `<name>` by PATH. The project layer is only the lightweight, project-specific knowledge, surfaced by two project-side loaders (one for capabilities, one for routines).
 
 **a. Lay down the assets.** Copy the project template into `<project>/.capabilities/<ns>/` (infer `<ns>` from the project; confirm if unsure). The template `~/.capabilities/<name>/project/` holds the entry file `CAPABILITY.md` (front-matter `name` + `description` + role prose) plus `identifiers.md` and a self-describing `reference.md` scaffold, and an optional `scripts/`:
 
@@ -136,14 +136,85 @@ exit 0
 
 Then `chmod +x .claude/hooks/build-capabilities-rule.sh`. The generated `.claude/rules/CAPABILITIES.md` is deterministic and safe to commit.
 
-**c. Wire the generator to run.** The project's `.claude/settings.json` runs the generator at `SessionStart`. **Merge — never overwrite.** Read the file (it may carry `permissions`, `enabledPlugins`, sibling hooks), then converge it on this, preserving everything else:
+**c. Add the routines loader.** A capability's primary consumer is the **routine** — a project's repeatable procedure (see [ROUTINES.md](ROUTINES.md)) — and routines surface by the same mechanism: a sibling generator at `.claude/hooks/build-routines-rule.sh` writes `.claude/rules/ROUTINES.md`, one line per `.routines/*.md` (a markdown link plus the routine's front-matter `description`), so a routine **declares itself into every session as soon as its file exists**, its body staying on-demand. Capability-agnostic and project-wide — set up once, beside the capabilities loader. Create it with exactly this content:
+
+```bash
+#!/bin/bash
+# Generate the routines rule file — the routine index, rules-tier edition.
+# Instead of listing routines on stdout (capped at 10k per hook), this writes
+# .claude/rules/ROUTINES.md: one line per discovered .routines/*.md, each a
+# markdown link to the routine file plus its front-matter description. The recipe
+# bodies stay on-demand — only this index is always-on — so a routine names where
+# it lives and what it does, and the model loads the file when it runs it.
+# Source of truth is each routine's YAML front matter; this file is generated,
+# never hand-edited.
+#
+# Discovery is by glob (no registry: add a file, it shows up next session).
+# Regeneration is deterministic — identical routines produce identical bytes, so a
+# committed index stays clean and only diffs when a routine is added, removed, or
+# its name/description changes.
+
+ROUTINES_DIR="$CLAUDE_PROJECT_DIR/.routines"
+RULE_FILE="$CLAUDE_PROJECT_DIR/.claude/rules/ROUTINES.md"
+
+# SessionStart delivers a JSON payload on stdin with a "source" field
+# (startup | resume | clear | compact). Read it defensively and fail open — an
+# unparseable payload still regenerates.
+input=$(cat 2>/dev/null)
+source=$(printf '%s' "$input" | sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+case "$source" in
+  startup|resume|compact|clear|"") : ;;  # regenerate
+  *) exit 0 ;;
+esac
+
+# Build into a temp file, then move into place atomically so a concurrent reader
+# never sees a half-written rule.
+tmp="$(mktemp "${RULE_FILE}.XXXXXX")" || exit 0
+trap 'rm -f "$tmp"' EXIT
+
+{
+  echo "# Routines (repeatable procedures)"
+  echo ""
+  echo "Each is a self-contained recipe. Load its file when you need to run that procedure. This file is generated at session start from each routine's YAML front matter; do not hand-edit."
+  echo ""
+
+  FOUND=0
+  if [ -d "$ROUTINES_DIR" ]; then
+    while IFS= read -r f; do
+      # name + description come from the first YAML front-matter block.
+      name=$(awk '/^---[ \t]*$/{c++; next} c==1 && /^name:/{sub(/^name:[ \t]*/,""); print; exit}' "$f")
+      desc=$(awk '/^---[ \t]*$/{c++; next} c==1 && /^description:/{sub(/^description:[ \t]*/,""); print; exit}' "$f")
+      # link target is project-root-relative so it resolves from the working dir,
+      # regardless of where this rule file sits.
+      rel=${f#"$CLAUDE_PROJECT_DIR/"}
+      [ -z "$name" ] && name=$(basename "$f" .md)
+      [ -z "$desc" ] && desc="(no description)"
+      echo "- **[$name]($rel)** — $desc"
+      FOUND=$((FOUND + 1))
+    done < <(find "$ROUTINES_DIR" -name '*.md' | sort)
+  fi
+
+  if [ "$FOUND" -eq 0 ]; then
+    echo "No routines defined yet."
+  fi
+} > "$tmp"
+
+mv -f "$tmp" "$RULE_FILE"
+trap - EXIT
+exit 0
+```
+
+Then `chmod +x .claude/hooks/build-routines-rule.sh`. The generated `.claude/rules/ROUTINES.md` is deterministic and safe to commit; with no `.routines/` folder yet it simply reads "No routines defined yet." and fills in as routine files land.
+
+**d. Wire the generators to run.** The project's `.claude/settings.json` runs both generators at `SessionStart`. **Merge — never overwrite.** Read the file (it may carry `permissions`, `enabledPlugins`, sibling hooks), then converge it on this, preserving everything else:
 
 ```json
 {
   "hooks": {
     "SessionStart": [
       { "hooks": [
-        { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/build-capabilities-rule.sh\"" }
+        { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/build-capabilities-rule.sh\"" },
+        { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/build-routines-rule.sh\"" }
       ] }
     ]
   }
@@ -152,17 +223,18 @@ Then `chmod +x .claude/hooks/build-capabilities-rule.sh`. The generated `.claude
 
 - no `settings.json` → create it with this block.
 - has it, no `SessionStart` → add the `SessionStart` array.
-- has `SessionStart` → append the command to the existing `hooks` array, keeping any siblings.
-- command already present → leave it.
+- has `SessionStart` → append any missing command to the existing `hooks` array, keeping any siblings.
+- a command already present → leave it.
 
-The command is the quoted, `$CLAUDE_PROJECT_DIR`-relative path so it resolves on any machine and survives paths with spaces.
+Each command is the quoted, `$CLAUDE_PROJECT_DIR`-relative path so it resolves on any machine and survives paths with spaces.
 
-Wiring the generator and settings is once per project. Every capability after the first is just step 3a — drop the `.capabilities/<ns>/` folder; the generator picks it up next session.
+Wiring the generators and settings is once per project. Every capability after the first is just step 3a — drop the `.capabilities/<ns>/` folder; the generator picks it up next session. Likewise, a new routine is just a file in `.routines/` — the loader declares it next session, no wiring touched.
 
 ## 4. Verify and report
 
 - Run the capability's health check (`<name> doctor` or `<name> help`) to confirm the CLI resolves on PATH and finds its credentials.
 - Confirm `~/.claude/skills/<name>/SKILL.md` resolves (the stub surfaces next session).
 - If you're in a project, confirm `.claude/hooks/build-capabilities-rule.sh` is executable, the `SessionStart` hook names it, and running it once produces `.claude/rules/CAPABILITIES.md` with an `@`-import for the capability.
+- Confirm `.claude/hooks/build-routines-rule.sh` is executable and named in the same `SessionStart` hook; running it produces `.claude/rules/ROUTINES.md` — an index line per `.routines/*.md`, or "No routines defined yet." when none exist.
 
 Report what you placed where, and which credential keys are still empty (the breadcrumbs the user must fill).

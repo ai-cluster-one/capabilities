@@ -36,7 +36,7 @@ When in doubt: a *fact or model* is a capability's; a *sequence of actions* is a
 
 The doctrine ([DOCTRINE.md](DOCTRINE.md)) governs the shared ones: a routine is **self-contained and resolved by role** (rules 7, 8), holds **procedure, not model** (rule 11), and is **affirmative and self-contained** (rule 12). Two are routine-specific:
 
-1. **The description is load-bearing.** A routine's one-line description is surfaced into every session before its body is ever opened. It must state what the routine *does* and where its scope ends — affirmatively, in one line. It is how an agent decides whether to load the body.
+1. **The description is load-bearing.** A routine's one-line description is surfaced into every session before its body is ever opened. It must state what the routine *does* and where its scope ends — affirmatively, in one line. It is how an agent decides whether to load the body. The surfacing is mechanical: a project-side `SessionStart` loader (`build-routines-rule.sh`, shipped and wired by [INSTALL.md](INSTALL.md)) regenerates an always-on `.claude/rules/ROUTINES.md` index from each `.routines/*.md` front matter — so dropping a routine file declares it next session, with no registry to edit and bodies staying on-demand.
 2. **Idempotent from the source.** A routine that mutates state derives "already done" from the system of record, not a local file, so re-running over an overlapping range is safe.
 
 ## The formalization ladder
