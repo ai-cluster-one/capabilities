@@ -15,10 +15,9 @@ Cron-triggered scripts dispatch work to an agent box over SSH → `docker exec`;
 
 ## Interaction
 
-Via the `windmill` CLI on `PATH` — run `windmill help` first (the CLI surface is self-documenting). Connection comes from `~/.config/windmill/credentials.env`, overridable per project in `.env` / `.env.local`.
+Via the `windmill` CLI on `PATH` — run `windmill help` first (the CLI surface is self-documenting). Connection config lives in env — see the identifiers below.
 
 ## Operational context (load on demand)
 
-- [identifiers.md](identifiers.md) — all fixed values and paths: the `f/<namespace>/` folder, the agent-box SSH target, the folder-scoped variables, script/schedule paths.
-- [reference.md](reference.md) — project-specific operational context: folder-as-isolation-boundary, dedicated worker-tag routing, the link-don't-copy rule for Windmill's own docs.
-- [windmill-guide.md](windmill-guide.md) — **how to write a script**: the prefer-the-box's-CLIs principle, capability discovery, the SSH bridge, self-contained-per-file rule, deploy. Sources + examples in [scripts/](scripts/).
+- [identifiers.md](identifiers.md) — all fixed values and paths: the connection env keys, the `f/<namespace>/` folder, the agent-box SSH target, the folder-scoped variables, script/schedule paths.
+- [reference.md](reference.md) — project-specific operational context (folder-as-isolation-boundary, worker-tag routing, link-don't-copy) **and the script-authoring model**: prefer-the-box's-CLIs, capability discovery, the SSH bridge, conventions. Sources + examples in [scripts/](scripts/).

@@ -13,3 +13,7 @@ credentials.env
 # OS / editor cruft
 .DS_Store
 *.swp
+
+# Python build artifacts (uv runs the CLIs; no bytecode is tracked)
+__pycache__/
+*.pyc

@@ -9,4 +9,6 @@ Windmill CLI — drive a Windmill instance over its REST API.
 - Credentials: `~/.config/windmill/credentials.env` (`WINDMILL_URL`, `WINDMILL_API_TOKEN`, `WINDMILL_WORKSPACE`; also honored as env vars and `--url` / `--token` / `--workspace` flags — flags > env > file).
 - Load full reference: `windmill help`
 
+Standing up a workspace is built in: `windmill provision` ensures the folder, operator user, and scripts from config + a scripts dir (read-only check with `windmill verify`).
+
 Run `windmill help` before issuing any subcommand the first time in a session. Project-scoped workspace / folder paths live in each project's own reference, not here.

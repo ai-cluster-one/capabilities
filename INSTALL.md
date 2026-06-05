@@ -230,7 +230,13 @@ Each command is the quoted, `$CLAUDE_PROJECT_DIR`-relative path so it resolves o
 
 Wiring the generators and settings is once per project. Every capability after the first is just step 3a — drop the `.capabilities/<ns>/` folder; the generator picks it up next session. Likewise, a new routine is just a file in `.routines/` — the loader declares it next session, no wiring touched.
 
-## 4. Verify and report
+## 4. Post-install — run the capability's setup step, if it declares one
+
+Some capabilities need a one-time setup action once their files are in place — e.g. provisioning a remote workspace. Read `~/.capabilities/<name>/manifest.md`: if it has a **Post-install** section, surface its command(s) and **offer to run them** — don't auto-run, since these can mutate a remote service. Honour any caveat the section states (a step may be only partially completable until a separate dependency exists — run what you can, name what's deferred). The action is declared idempotent, so it's safe for the user to defer and re-run later.
+
+A capability with no Post-install section needs nothing here.
+
+## 5. Verify and report
 
 - Run the capability's health check (`<name> doctor` or `<name> help`) to confirm the CLI resolves on PATH and finds its credentials.
 - Confirm `~/.claude/skills/<name>/SKILL.md` resolves (the stub surfaces next session).

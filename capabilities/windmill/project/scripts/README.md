@@ -1,10 +1,10 @@
 # Example scripts
 
-These are **adaptable examples**, not production scripts — they teach the one pattern this capability is about: *Windmill as a thin SSH dispatcher*. Windmill holds only the SSH key; the **agent box** holds every credential and exposes the real capabilities as CLIs. A script SSHes into the box and `docker exec`s a tool. It never reimplements a capability (no raw HTTP, no SDKs, no service tokens).
+These are **adaptable examples**, not production scripts — they demonstrate the one pattern this capability is about: *Windmill as a thin SSH dispatcher*. The full model — why it works this way and the conventions to follow — is the script authoring reference ([../reference.md](../reference.md)); these files show it in code.
 
 Adapt points in every example (the installer fills these from the manifest's template variables):
 
-- `<AGENT_IMAGE>` — the box's docker image; the container is resolved by `ancestor=<image>`, never by name (a PaaS renames it on redeploy).
+- `<AGENT_IMAGE>` — the box's docker image; the container is resolved by image, never by name.
 - `f/<namespace>/agent_ssh_host` · `…_user` · `…_key` — the three folder-scoped Windmill variables holding the SSH target (the key is secret).
 - the prompt / tool / timeout — what *your* job actually does.
 
@@ -19,8 +19,4 @@ Compose the primitives into a **populate → dispatch → run** triad: a cron *p
 
 ## Deploy
 
-```
-windmill deploy f/<namespace>/<name> scripts/<name>.ts --timeout <secs> [--tag <worker-group>]
-```
-
-Each script is self-contained — Windmill has no cross-script imports, so the SSH helpers are duplicated per file by design. See [../<name>-guide.md](../windmill-guide.md) for the full authoring rules.
+Deploy with `windmill deploy` — run `windmill help` for the flags. Each script is self-contained: Windmill has no cross-script imports, so the SSH helpers are duplicated per file by design. The full script authoring model is in [../reference.md](../reference.md).

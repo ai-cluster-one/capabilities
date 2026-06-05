@@ -23,6 +23,13 @@ Same WINDMILL_* keys at every tier; the project you're in wins, process env is t
 fallback (so a deployed host's injected env governs when no config file is present).
 Never pass the token on the command line.
 
+Acting as another user (isolation): the stored token is the workspace admin's.
+  windmill --as <email> <cmd ...>             Run the call AS that workspace user, by
+                                              minting a short-lived impersonation token
+                                              from the admin token (nothing per-user is
+                                              stored). Use it to execute under an operator
+                                              identity so folder RBAC confines secret reads.
+
 Commands:
   windmill help                               Print this document.
   windmill doctor                             Version + whoami + workspace reachability
@@ -31,6 +38,8 @@ Commands:
   Scripts (Windmill versions by content hash; no PUT — update = archive+create):
   windmill scripts [--prefix f/x] [--limit N] List scripts (optionally by path prefix).
   windmill script-get <path>                  Show one script (incl. content, hash).
+  windmill script-delete <path>               Hard-delete every version of a script at a
+                                              path (irreversible; `deploy` recreates).
   windmill deploy <path> <file|->             Create/update a script from a file or
         [--lang bun] [--summary S]            stdin. Re-deploy archives the old hash
         [--description D] [--timeout 600]     then creates the new version at the same
@@ -63,7 +72,34 @@ Commands:
 
   Folders:
   windmill folder-create <name> [--owner U]   Create a folder (e.g. myproj → f/myproj).
-        [--owner U ...]                       --owner repeats; pass like u/jess or g/team.
+        [--owner U ...]                       --owner repeats; pass like u/alice or g/team.
+  windmill folder-ensure <name> [--owner U]   Idempotent create-or-update of a folder's
+                                              owners/ACL (owners also granted in extra_perms).
+
+  Users (workspace membership — the isolation identity):
+  windmill users                              List workspace users (email, operator, admin).
+  windmill user-ensure --email E [--operator] Idempotent: ensure a global user exists and is
+        [--admin] [--name N]                  a member of this workspace. No token is minted
+                                              or stored — act as the user via `--as E`.
+
+  Provisioning (workspace skeleton — folder, operator user, scripts):
+  windmill verify [--folder NS]               Read-only: check the workspace skeleton against
+        [--operator E] [--scripts-dir D]      live state (folder+owners, operator user, each
+        [<manifest.json>]                     discovered script) and report per-item ok + `ready`.
+  windmill provision [--folder NS]            Idempotent, non-destructive apply of that skeleton.
+        [--operator E] [--operator-name N]    Never deletes; never overwrites a present secret.
+        [--owner U ...] [--scripts-dir D]     Inputs resolve from config unless flagged:
+        [<manifest.json>]                       folder    --folder | WINDMILL_FOLDER (the namespace)
+                                                operator  --operator | WINDMILL_OPERATOR (email) +
+                                                          --operator-name | WINDMILL_OPERATOR_NAME
+                                                owners    the operator user, plus any --owner
+                                                scripts   *.ts under --scripts-dir (path
+                                                          f/<folder>/<stem>; example_* skipped)
+                                              Variables are NOT provisioned here: the box↔Windmill
+                                              SSH vars are wired by the consumer's box routine. Pass
+                                              an explicit <manifest.json> to override config-discovery
+                                              (schema: {folder, owners[], users[], variables[],
+                                              scripts[], schedules[]}; file paths relative to it).
 
 References:
   <path> values are Windmill paths like f/myproj/runner (folder-scoped). The
@@ -95,8 +131,11 @@ Notes:
 import argparse
 import json
 import os
+import re
+import secrets
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NoReturn
 
@@ -188,6 +227,16 @@ def _resolve_conn(args) -> tuple[str, str, str]:
 
 # --- HTTP --------------------------------------------------------------------
 
+def _impersonate(url: str, admin_token: str, ws: str, email: str) -> str:
+    """Mint a short-lived (15-min) token that acts as `email`, via the super-admin
+    token. Per-user tokens are never stored — this is the on-demand alternative."""
+    exp = (datetime.now(timezone.utc) + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _client(url, admin_token) as c:
+        return _request(c, "POST", "/api/users/tokens/impersonate",
+                        json_body={"impersonate_email": email, "label": "windmill-cli",
+                                   "workspace_id": ws, "expiration": exp}, raw=True)
+
+
 def _client(url: str, token: str) -> httpx.Client:
     return httpx.Client(
         base_url=url,
@@ -200,13 +249,21 @@ def _client(url: str, token: str) -> httpx.Client:
     )
 
 
+def _is_err(value) -> bool:
+    """True if `value` is the soft-error marker returned by _request(soft=True)."""
+    return isinstance(value, dict) and "__http_error__" in value
+
+
 def _request(client: httpx.Client, method: str, path: str,
              params: dict | None = None, json_body: dict | None = None,
-             raw: bool = False):
+             raw: bool = False, soft: bool = False):
     """Return parsed JSON, or — for bare scalar/text endpoints — the trimmed text.
 
     Windmill returns bare quoted scalars (hashes, job ids) which json() decodes to
     a str; /api/version returns unquoted text. raw=True forces text handling.
+
+    soft=True: on a 4xx, return {"__http_error__": status, "message": ...} instead of
+    exiting — for idempotent existence checks that expect a miss (test with _is_err).
     """
     last_status: int | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -245,6 +302,8 @@ def _request(client: httpx.Client, method: str, path: str,
                     msg = msg or j.get("error") or j.get("message") or body[:400]
             except ValueError:
                 pass
+            if soft:
+                return {"__http_error__": resp.status_code, "message": msg}
             if resp.status_code in (401, 403):
                 _die(2, "unauthorized", msg, "token invalid or lacks workspace access",
                      status=resp.status_code)
@@ -331,15 +390,12 @@ def cmd_script_get(c, ws, path):
 def cmd_deploy(c, ws, path, content, lang, summary, description, timeout, tag):
     # Update = archive-then-create (no PUT). Carry forward prior metadata if present.
     prior_hash = None
-    try:
-        prior = _request(c, "GET", W(ws, f"scripts/get/p/{path}"))
-        if isinstance(prior, dict):
-            prior_hash = prior.get("hash")
-            lang = lang or prior.get("language")
-            summary = summary if summary is not None else prior.get("summary")
-            description = description if description is not None else prior.get("description")
-    except SystemExit:
-        pass  # 404 -> fresh create
+    prior = _request(c, "GET", W(ws, f"scripts/get/p/{path}"), soft=True)
+    if isinstance(prior, dict) and not _is_err(prior):
+        prior_hash = prior.get("hash")
+        lang = lang or prior.get("language")
+        summary = summary if summary is not None else prior.get("summary")
+        description = description if description is not None else prior.get("description")
     if prior_hash:
         _request(c, "POST", W(ws, f"scripts/archive/h/{prior_hash}"), raw=True)
     body = {
@@ -359,6 +415,13 @@ def cmd_deploy(c, ws, path, content, lang, summary, description, timeout, tag):
             "archived": prior_hash, "tag": tag}
 
 
+def cmd_script_delete(c, ws, path):
+    """Hard-delete every version of a script at a path. Irreversible — there is no
+    archive-then-restore here; use `deploy` to recreate if needed."""
+    _request(c, "POST", W(ws, f"scripts/delete/p/{path}"), raw=True)
+    return {"path": path, "deleted": True}
+
+
 def cmd_schedules(c, ws, limit):
     return _request(c, "GET", W(ws, "schedules/list"), params={"per_page": limit})
 
@@ -369,12 +432,7 @@ def cmd_schedule_get(c, ws, path):
 
 def cmd_schedule_set(c, ws, path, script, cron, timezone, args_kv, off):
     args = _parse_args_kv(args_kv)
-    exists = False
-    try:
-        _request(c, "GET", W(ws, f"schedules/get/{path}"))
-        exists = True
-    except SystemExit:
-        pass
+    exists = not _is_err(_request(c, "GET", W(ws, f"schedules/get/{path}"), soft=True))
     if exists:
         body = {"schedule": cron, "timezone": timezone, "args": args,
                 "script_path": script, "is_flow": False}
@@ -440,15 +498,12 @@ def cmd_vars(c, ws, prefix):
 
 def cmd_var_set(c, ws, path, value, secret, description):
     # create, fall back to update if it already exists
-    try:
-        _request(c, "POST", W(ws, "variables/create"),
+    r = _request(c, "POST", W(ws, "variables/create"),
                  json_body={"path": path, "value": value,
                             "is_secret": secret, "description": description or ""},
-                 raw=True)
+                 raw=True, soft=True)
+    if not _is_err(r):
         return {"path": path, "created": True, "is_secret": secret}
-    except SystemExit as e:
-        if e.code != 6:  # not an "already exists"-class error
-            raise
     _request(c, "POST", W(ws, f"variables/update/{path}"),
              json_body={"value": value})
     return {"path": path, "updated": True, "is_secret": secret}
@@ -465,6 +520,283 @@ def cmd_folder_create(c, ws, name, owners):
     return {"folder": f"f/{name}", "owners": owners or []}
 
 
+def cmd_folder_ensure(c, ws, name, owners):
+    """Idempotent: create the folder if absent, else update its owners/ACL.
+    Owners are also granted in extra_perms so they retain read+write."""
+    owners = owners or []
+    extra = {o: True for o in owners}
+    r = _request(c, "POST", W(ws, "folders/create"),
+                 json_body={"name": name, "owners": owners, "extra_perms": extra},
+                 raw=True, soft=True)
+    if not _is_err(r):
+        return {"folder": f"f/{name}", "owners": owners, "created": True}
+    _request(c, "POST", W(ws, f"folders/update/{name}"),
+             json_body={"owners": owners, "extra_perms": extra}, raw=True)
+    return {"folder": f"f/{name}", "owners": owners, "updated": True}
+
+
+# --- Users (workspace membership + the isolation identity) -------------------
+
+def _username_for(email: str) -> str:
+    """Mirror Windmill's username derivation: local part, non-alphanumerics stripped."""
+    return re.sub(r"[^a-z0-9]", "", email.split("@")[0].lower())
+
+
+def cmd_users(c, ws):
+    return _request(c, "GET", W(ws, "users/list"))
+
+
+def cmd_user_ensure(c, ws, email, operator, is_admin, name):
+    """Idempotent: ensure a global user exists and is a member of this workspace.
+    Tolerates re-runs — 'already exists' / 'already in workspace' are no-ops.
+    The user's token is NOT minted or stored: act as this user on demand with
+    the global `--as <email>` flag, which impersonates via the admin token."""
+    username = _username_for(email)
+    created = not _is_err(_request(c, "POST", "/api/users/create",
+                          json_body={"email": email, "password": secrets.token_hex(16),
+                                     "super_admin": False, "name": name or "",
+                                     "skip_email": True}, raw=True, soft=True))
+    added = not _is_err(_request(c, "POST", W(ws, "workspaces/add_user"),
+                        json_body={"email": email, "is_admin": is_admin, "operator": operator},
+                        raw=True, soft=True))
+    return {"email": email, "username": username, "operator": operator,
+            "is_admin": is_admin, "created": created, "added_to_workspace": added}
+
+
+# --- Manifest-driven provision / verify (declarative completeness) -----------
+
+def _load_manifest(path: str) -> tuple[dict, Path]:
+    p = Path(path).resolve()
+    try:
+        data = json.loads(p.read_text())
+    except OSError as e:
+        _die(6, "manifest_unreadable", f"cannot read manifest {path}: {e}")
+    except ValueError as e:
+        _die(6, "manifest_invalid", f"manifest {path} is not valid JSON: {e}")
+    return data, p.parent
+
+
+def _config_value(args, flag: str, env_key: str) -> str | None:
+    """Resolve a non-secret provisioning scalar: flag > project .env(.local) > user
+    config > process env. Mirrors the credential cascade for config-driven provision."""
+    return (getattr(args, flag, None)
+            or _project_env().get(env_key)
+            or _parse_env_file(CREDENTIALS_ENV).get(env_key)
+            or os.environ.get(env_key))
+
+
+_EXT_LANG = {".ts": "bun", ".py": "python3", ".sh": "bash", ".go": "go"}
+
+
+def _discover_scripts(scripts_dir: Path, folder: str) -> list[dict]:
+    """Each deployable source under scripts_dir → a manifest script spec. Deploy path
+    is f/<folder>/<stem>; lang from the extension; summary from a leading comment line.
+    `example_*` files are templates, not deployables — skipped."""
+    specs: list[dict] = []
+    if not scripts_dir.is_dir():
+        return specs
+    for f in sorted(scripts_dir.iterdir()):
+        if not f.is_file() or f.suffix not in _EXT_LANG or f.stem.startswith("example_"):
+            continue
+        summary = None
+        for line in f.read_text().splitlines():
+            s = line.strip()
+            if s.startswith("#!"):
+                continue  # shebang — keep scanning for a real comment
+            if s.startswith("//"):
+                summary = s.lstrip("/ ").strip(); break
+            if s.startswith("#"):
+                summary = s.lstrip("# ").strip(); break
+            if s:
+                break
+        specs.append({"path": f"f/{folder}/{f.stem}", "file": f.name,
+                      "lang": _EXT_LANG[f.suffix], "summary": summary})
+    return specs
+
+
+def _config_manifest(args) -> tuple[dict, Path]:
+    """Build the workspace-skeleton manifest from config + flags + script discovery —
+    the file-less default for provision/verify. Variables and schedules are out of
+    scope here: the SSH var trio is the consumer's box-wiring routine's job, and a cron
+    is an operational toggle attached with `schedule-set` when a source is wired."""
+    folder = _config_value(args, "folder", "WINDMILL_FOLDER")
+    if not folder:
+        _die(6, "missing_folder", "no folder/namespace resolved",
+             "pass --folder <ns> or set WINDMILL_FOLDER in the project .env")
+    operator = _config_value(args, "operator", "WINDMILL_OPERATOR")
+    if not operator:
+        _die(6, "missing_config", "no operator user resolved",
+             "set WINDMILL_OPERATOR (email) in config, or pass --operator")
+    op_name = _config_value(args, "operator_name", "WINDMILL_OPERATOR_NAME")
+    owners = list(dict.fromkeys([f"u/{operator.split('@')[0]}", *args.owner]))
+    scripts_dir = Path(args.scripts_dir).resolve() if args.scripts_dir else None
+    m = {
+        "folder": folder,
+        "owners": owners,
+        "users": [{"email": operator, "operator": True, "name": op_name}],
+        "variables": [],
+        "scripts": _discover_scripts(scripts_dir, folder) if scripts_dir else [],
+        "schedules": [],
+    }
+    return m, (scripts_dir or Path.cwd())
+
+
+def _var_value(spec: dict) -> str | None:
+    """Resolve a manifest variable's value: literal `value`, or `value_env`
+    looked up in the project .env then the process env. None if neither/external."""
+    if "value" in spec:
+        return str(spec["value"])
+    env_key = spec.get("value_env")
+    if env_key:
+        return _project_env().get(env_key) or os.environ.get(env_key)
+    return None
+
+
+def _check_manifest(c, ws, m: dict, base: Path) -> dict:
+    """Read-only: compare the manifest to live state. Returns checks + overall ready."""
+    checks: list[dict] = []
+
+    folder = m.get("folder")
+    owners = m.get("owners", [])
+    if folder:
+        f = _request(c, "GET", W(ws, f"folders/get/{folder}"), soft=True)
+        if _is_err(f):
+            checks.append({"item": f"folder f/{folder}", "ok": False, "detail": "absent"})
+        else:
+            have = set(f.get("owners") or [])
+            ok = set(owners).issubset(have)
+            checks.append({"item": f"folder f/{folder}", "ok": ok,
+                           "detail": f"owners={sorted(have)}" if ok else f"missing owners {sorted(set(owners)-have)}"})
+
+    members = {u.get("email"): u for u in (_request(c, "GET", W(ws, "users/list")) or [])}
+    for u in m.get("users", []):
+        em = u.get("email")
+        cur = members.get(em)
+        if not cur:
+            checks.append({"item": f"user {em}", "ok": False, "detail": "not a workspace member"})
+        else:
+            ok = bool(cur.get("operator")) == bool(u.get("operator", False))
+            checks.append({"item": f"user {em}", "ok": ok,
+                           "detail": f"operator={cur.get('operator')}"})
+
+    live_vars = {v["path"]: v for v in (_request(c, "GET", W(ws, "variables/list"),
+                                                  params={"path_start": f"f/{folder}"} if folder else None) or [])}
+    for v in m.get("variables", []):
+        path = v["path"]
+        cur = live_vars.get(path)
+        tag = " (external)" if v.get("external") else ""
+        if not cur:
+            checks.append({"item": f"var {path}{tag}", "ok": False, "detail": "absent"})
+        else:
+            ok = bool(cur.get("is_secret")) == bool(v.get("secret", False))
+            checks.append({"item": f"var {path}{tag}", "ok": ok,
+                           "detail": f"secret={cur.get('is_secret')}"})
+
+    for s in m.get("scripts", []):
+        path = s["path"]
+        sc = _request(c, "GET", W(ws, f"scripts/get/p/{path}"), soft=True)
+        if _is_err(sc):
+            checks.append({"item": f"script {path}", "ok": False, "detail": "absent"})
+        else:
+            locked = sc.get("lock") is not None
+            errs = sc.get("has_deploy_errors")
+            ok = locked and not errs
+            checks.append({"item": f"script {path}", "ok": ok,
+                           "detail": "ready" if ok else f"lock={'set' if locked else 'pending'} deploy_errors={errs}"})
+
+    for sch in m.get("schedules", []):
+        path = sch["path"]
+        cur = _request(c, "GET", W(ws, f"schedules/get/{path}"), soft=True)
+        if _is_err(cur):
+            checks.append({"item": f"schedule {path}", "ok": False, "detail": "absent"})
+        else:
+            want = bool(sch.get("enabled", False))
+            ok = bool(cur.get("enabled")) == want
+            checks.append({"item": f"schedule {path}", "ok": ok,
+                           "detail": f"enabled={cur.get('enabled')} (want {want})"})
+
+    return {"ready": all(ch["ok"] for ch in checks), "checks": checks}
+
+
+def cmd_verify(c, ws, m, base):
+    return _check_manifest(c, ws, m, base)
+
+
+def cmd_provision(c, ws, m, base, url, admin_token):
+    """Idempotent, non-destructive apply of the manifest. Never deletes; never
+    overwrites a secret that is already present; `external` vars are reported,
+    not minted (the project routine that owns the box mints those)."""
+    actions: list[dict] = []
+
+    folder = m.get("folder")
+    if folder:
+        actions.append(cmd_folder_ensure(c, ws, folder, m.get("owners", [])))
+
+    for u in m.get("users", []):
+        actions.append(cmd_user_ensure(c, ws, u["email"], bool(u.get("operator", False)),
+                                        bool(u.get("admin", False)), u.get("name")))
+
+    live_vars = {v["path"]: v for v in (_request(c, "GET", W(ws, "variables/list"),
+                                                  params={"path_start": f"f/{folder}"} if folder else None) or [])}
+    for v in m.get("variables", []):
+        path = v["path"]
+        if v.get("external"):
+            actions.append({"var": path, "external": True,
+                            "present": path in live_vars,
+                            "note": v.get("note", "provisioned out-of-band")})
+            continue
+        if v.get("secret") and path in live_vars:
+            actions.append({"var": path, "skipped": "secret already present"})
+            continue
+        value = _var_value(v)
+        if value is None:
+            actions.append({"var": path, "skipped": "no value resolved (value/value_env)"})
+            continue
+        actions.append(cmd_var_set(c, ws, path, value, bool(v.get("secret", False)),
+                                   v.get("description")))
+
+    for s in m.get("scripts", []):
+        path, src = s["path"], (base / s["file"])
+        content = src.read_text()
+        cur = _request(c, "GET", W(ws, f"scripts/get/p/{path}"), soft=True)
+        if isinstance(cur, dict) and not _is_err(cur) and (cur.get("content") or "").strip() == content.strip():
+            actions.append({"script": path, "skipped": "unchanged"})
+            continue
+        actions.append(cmd_deploy(c, ws, path, content, s.get("lang", "bun"),
+                                  s.get("summary"), s.get("description"), s.get("timeout", 600),
+                                  s.get("tag")))
+
+    for sch in m.get("schedules", []):
+        actions.append(_provision_schedule(c, ws, sch, url, admin_token))
+
+    return {"folder": folder, "actions": actions}
+
+
+def _provision_schedule(c, ws, sch, url, admin_token):
+    """Ensure a schedule. If `run_as` is set, author it as that user (impersonation)
+    so its jobs execute under that identity — the runtime half of folder isolation."""
+    path, run_as = sch["path"], sch.get("run_as")
+    sc = c
+    if run_as:
+        try:
+            tok = _impersonate(url, admin_token, ws, run_as)
+            sc = _client(url, tok)
+        except SystemExit:
+            return {"schedule": path, "run_as": run_as, "note": "impersonation failed; left unmanaged"}
+    try:
+        return cmd_schedule_set(sc, ws, path, sch["script"], sch["cron"],
+                                sch.get("timezone", "Etc/UTC"), [],
+                                not sch.get("enabled", False))
+    except SystemExit as e:
+        if run_as and e.code in (2, 6):
+            return {"schedule": path, "run_as": run_as,
+                    "note": "operator cannot author schedules on this instance; enable as admin when wiring cron"}
+        raise
+    finally:
+        if sc is not c:
+            sc.close()
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def main() -> None:
@@ -474,6 +806,8 @@ def main() -> None:
     p.add_argument("--url", default=None, help="Windmill base URL (overrides env/config)")
     p.add_argument("--token", default=None, help="API token (prefer config/env; avoid CLI)")
     p.add_argument("--workspace", default=None, help="workspace id (overrides env/config)")
+    p.add_argument("--as", dest="as_user", default=None, metavar="EMAIL",
+                   help="act as this workspace user for the call (impersonation via the admin token)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("help")
@@ -481,6 +815,7 @@ def main() -> None:
 
     sp = sub.add_parser("scripts"); sp.add_argument("--prefix"); sp.add_argument("--limit", type=int, default=100)
     sp = sub.add_parser("script-get"); sp.add_argument("path")
+    sp = sub.add_parser("script-delete"); sp.add_argument("path")
     sp = sub.add_parser("deploy")
     sp.add_argument("path"); sp.add_argument("file", help="source file or '-' for stdin")
     sp.add_argument("--lang", default=None, help="bun (default) | deno | python3 | bash | go | nativets")
@@ -515,12 +850,35 @@ def main() -> None:
 
     sp = sub.add_parser("folder-create"); sp.add_argument("name")
     sp.add_argument("--owner", action="append", default=[])
+    sp = sub.add_parser("folder-ensure"); sp.add_argument("name")
+    sp.add_argument("--owner", action="append", default=[])
+
+    sub.add_parser("users")
+    sp = sub.add_parser("user-ensure"); sp.add_argument("--email", required=True)
+    sp.add_argument("--operator", action="store_true"); sp.add_argument("--admin", action="store_true")
+    sp.add_argument("--name", default=None)
+
+    for _name in ("verify", "provision"):
+        sp = sub.add_parser(_name)
+        sp.add_argument("manifest", nargs="?", default=None,
+                        help="optional explicit manifest.json; omit to build from config + --scripts-dir")
+        sp.add_argument("--folder", default=None, help="workspace folder/namespace (else WINDMILL_FOLDER)")
+        sp.add_argument("--operator", default=None, help="operator user email (else WINDMILL_OPERATOR)")
+        sp.add_argument("--operator-name", dest="operator_name", default=None,
+                        help="operator display name (else WINDMILL_OPERATOR_NAME)")
+        sp.add_argument("--owner", action="append", default=[],
+                        help="extra folder owner (u/.. or g/..); the operator is always an owner")
+        sp.add_argument("--scripts-dir", dest="scripts_dir", default=None,
+                        help="dir of deployable scripts (path f/<folder>/<stem>); omit to skip scripts")
 
     args = p.parse_args()
     if args.cmd == "help":
         sys.stdout.write((__doc__ or "").lstrip("\n")); return
 
     url, token, ws = _resolve_conn(args)
+    admin_token = token
+    if args.as_user:
+        token = _impersonate(url, admin_token, ws, args.as_user)
     with _client(url, token) as c:
         if args.cmd == "doctor":
             _emit(cmd_doctor(c, ws))
@@ -528,6 +886,8 @@ def main() -> None:
             _emit(cmd_scripts(c, ws, args.prefix, args.limit))
         elif args.cmd == "script-get":
             _emit(cmd_script_get(c, ws, args.path))
+        elif args.cmd == "script-delete":
+            _emit(cmd_script_delete(c, ws, args.path))
         elif args.cmd == "deploy":
             _emit(cmd_deploy(c, ws, args.path, _read_text(args.file), args.lang,
                              args.summary, args.description, args.timeout, args.tag))
@@ -559,6 +919,19 @@ def main() -> None:
             _emit(cmd_var_delete(c, ws, args.path))
         elif args.cmd == "folder-create":
             _emit(cmd_folder_create(c, ws, args.name, args.owner))
+        elif args.cmd == "folder-ensure":
+            _emit(cmd_folder_ensure(c, ws, args.name, args.owner))
+        elif args.cmd == "users":
+            _emit(cmd_users(c, ws))
+        elif args.cmd == "user-ensure":
+            _emit(cmd_user_ensure(c, ws, args.email, args.operator, args.admin, args.name))
+        elif args.cmd in ("verify", "provision"):
+            m, base = (_load_manifest(args.manifest) if args.manifest
+                       else _config_manifest(args))
+            if args.cmd == "verify":
+                _emit(cmd_verify(c, ws, m, base))
+            else:
+                _emit(cmd_provision(c, ws, m, base, url, admin_token))
 
 
 if __name__ == "__main__":
