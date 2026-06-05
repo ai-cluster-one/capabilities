@@ -12,12 +12,19 @@ This tool is designed to be invoked by agents. Run `notion help` to load
 the full usage contract on demand — do not rely on memorised knowledge of
 its surface.
 
-Credentials are read automatically from ~/.config/notion/credentials.env
-(NOTION_TOKEN=<Notion Personal Access Token>). Never pass the token on
-the command line.
+Credentials resolve through the standard four-tier cascade (first non-empty
+wins): a project .env(.local) > ~/.config/notion/credentials.env > the
+process environment. The token is read by env-var NAME (NOTION_TOKEN =
+<Notion Personal Access Token>) and never travels on the command line.
+
+  --token-env <KEY>   Act as a different identity by naming the env/cred KEY
+                      that holds the PAT (default NOTION_TOKEN). Names the key,
+                      never the value — a global option accepted anywhere on
+                      the line (e.g. notion publish <page> --token-env NOTION_ALT_TOKEN).
 
 Commands:
   notion help                                 Print this document.
+  notion doctor                               Health check: creds + reachability + identity.
   notion whoami                               Identity + workspace.
   notion children <parent>                    List direct child pages.
   notion get <page>                           Fetch page as markdown (incl. title).
@@ -56,9 +63,9 @@ Exit codes:
   0  success
   2  auth (unauthorized / restricted_resource / missing credentials)
   3  not found (object_not_found)
-  4  conflict (e.g. ambiguous title in upsert)
   5  server / network (5xx, timeout, rate-limit exhausted)
   6  input / validation
+  7  conflict (domain-specific: ambiguous title in upsert, concurrent edit)
 
 Quirks worth knowing:
   - `POST /v1/search` is unavailable to PAT tokens (returns 0 results).
@@ -70,6 +77,7 @@ Quirks worth knowing:
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -82,6 +90,10 @@ API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2026-03-11"
 TIMEOUT = httpx.Timeout(30.0)
 MAX_RETRIES = 3
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CONFIG_DIR = _CONFIG_HOME / "notion"
+CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
 
 UUID_DASHED = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 UUID_PLAIN = re.compile(r"[0-9a-f]{32}")
@@ -103,27 +115,60 @@ def _die(exit_code: int, code: str, message: str,
 
 # --- Credentials -------------------------------------------------------------
 
-def _load_token() -> str:
-    env_path = Path.home() / ".config" / "notion" / "credentials.env"
-    if not env_path.exists():
-        _die(2, "missing_credentials",
-             f"{env_path} does not exist",
-             "create the file with a single line: NOTION_TOKEN=<your token>")
-    for line in env_path.read_text().splitlines():
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        if k.strip() == "NOTION_TOKEN":
-            tok = v.strip()
-            if not tok:
-                _die(2, "empty_token",
-                     "NOTION_TOKEN is set but empty",
-                     "paste your Notion PAT after NOTION_TOKEN=")
-            return tok
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_env() -> dict:
+    """Nearest project .env(.local), walking up from $CLAUDE_PROJECT_DIR (else cwd).
+    .env.local overrides .env. Stops at the first dir holding either, or a .git root."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    for d in (here, *here.parents):
+        if (d / ".env").exists() or (d / ".env.local").exists():
+            merged = _parse_env_file(d / ".env")
+            merged.update(_parse_env_file(d / ".env.local"))  # .local wins
+            return merged
+        if (d / ".git").is_dir():
+            break  # project root reached, no env file here
+    return {}
+
+
+def _load_token(key: str = "NOTION_TOKEN") -> str:
+    """Resolve a PAT by env-var NAME through the credential cascade — a project
+    .env(.local), then ~/.config/notion/credentials.env, then the process env;
+    first non-empty wins. `key` defaults to NOTION_TOKEN; the global
+    `--token-env <KEY>` flag selects an alternate key to act as another identity.
+    The token value never travels on the command line — only its name (so there is
+    no value flag tier; the secret stays off argv, deliberately)."""
+    tok = (_project_env().get(key)
+           or _parse_env_file(CREDENTIALS_ENV).get(key)
+           or os.environ.get(key)
+           or "").strip()
+    if tok:
+        return tok
+    if key == "NOTION_TOKEN":
+        _die(2, "missing_token",
+             f"NOTION_TOKEN not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+             "add NOTION_TOKEN=<your PAT> to the user config or a project .env")
     _die(2, "missing_token",
-         "NOTION_TOKEN not found in credentials.env",
-         "add a line: NOTION_TOKEN=<your token>")
+         f"{key} not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+         f"add {key}=<PAT> to the user config or a project .env to use --token-env {key}")
 
 
 # --- Reference parsing -------------------------------------------------------
@@ -246,7 +291,7 @@ def _request(client: httpx.Client, method: str, path: str,
                 exit_code = 6
                 hint = "check request body shape against Notion API docs"
             elif notion_code == "conflict_error":
-                exit_code = 4
+                exit_code = 7
                 hint = "the resource was modified concurrently; retry"
             else:
                 exit_code = 5
@@ -302,6 +347,13 @@ def _page_summary(page: dict, action: str | None = None) -> dict:
 
 
 # --- Commands ----------------------------------------------------------------
+
+def cmd_doctor(c: httpx.Client) -> dict:
+    """Cheapest authenticated round-trip — proves creds resolved, endpoint
+    reachable, identity confirmed. Rides the same exit codes (2 if the token is
+    missing/rejected, 5 if Notion is unreachable)."""
+    return {"ok": True, "reachable": True, **cmd_whoami(c)}
+
 
 def cmd_whoami(c: httpx.Client) -> dict:
     data = _request(c, "GET", "/users/me")
@@ -405,7 +457,7 @@ def cmd_upsert(c: httpx.Client, parent: str,
     children = cmd_children(c, parent_id)
     matches = [ch for ch in children if ch["title"] == title]
     if len(matches) > 1:
-        _die(4, "ambiguous_title",
+        _die(7, "ambiguous_title",
              f"{len(matches)} direct children of parent match title {title!r}",
              "use 'publish <id>' against a specific page to disambiguate")
     if len(matches) == 1:
@@ -433,6 +485,7 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("help", help="print the full usage contract")
+    sub.add_parser("doctor", help="health check: creds + reachability + identity")
     sub.add_parser("whoami", help="confirm token and return identity")
 
     sp = sub.add_parser("children", help="list child pages of a parent page")
@@ -460,16 +513,34 @@ def main() -> None:
     sp.add_argument("md", nargs="?", default="-",
                     help="markdown file path or '-' for stdin (default: stdin)")
 
-    args = p.parse_args()
+    # `--token-env <KEY>` is a global override accepted anywhere on the line
+    # (extracted before argparse so it works after the subcommand, e.g.
+    # `notion publish <page> --token-env NOTION_ALT_TOKEN`). It names the env/cred
+    # key holding the PAT to act as — never the token value itself.
+    argv = sys.argv[1:]
+    token_key = "NOTION_TOKEN"
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--token-env" and i + 1 < len(argv):
+            token_key = argv[i + 1]; i += 2; continue
+        if a.startswith("--token-env="):
+            token_key = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+
+    args = p.parse_args(cleaned)
 
     if args.cmd == "help":
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
 
-    token = _load_token()
+    token = _load_token(token_key)
 
     with _client(token) as c:
-        if args.cmd == "whoami":
+        if args.cmd == "doctor":
+            _emit(cmd_doctor(c))
+        elif args.cmd == "whoami":
             _emit(cmd_whoami(c))
         elif args.cmd == "children":
             _emit(cmd_children(c, args.parent))
