@@ -12,6 +12,7 @@ Each capability is one folder under [`capabilities/`](capabilities/) — the cat
 |---|---|---|
 | [capabilities/windmill/](capabilities/windmill/) | drive a Windmill instance (deploy scripts, cron, jobs, vars) + the SSH-dispatch script pattern | yes |
 | [capabilities/directo/](capabilities/directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) | no |
+| [capabilities/mail/](capabilities/mail/) | read and draft mail across Mail.app's configured accounts over macOS Automation (read/search/show/links/attachments/draft/export; never sends) | no |
 
 *(more get appended as they're extracted.)*
 

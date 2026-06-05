@@ -1,0 +1,772 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+mail — personal Mail.app CLI (JXA-backed; read + draft only; no send).
+
+No credentials on disk. Uses Mail.app's already-configured accounts. First
+invocation requires a one-time macOS Automation grant:
+  System Settings → Privacy & Security → Automation → your terminal → Mail
+
+Commands:
+  mail accounts [--json]
+      List accounts Mail.app knows about.
+
+  mail mailboxes <account> [--json]
+      List mailboxes (folders) for an account.
+
+  mail read <account> [--mailbox NAME] [--limit N] [--since ISO] [--json]
+      Read recent messages from a mailbox (newest first).
+
+  mail search <account> <query> [--mailbox NAME]
+       [--field subject|sender|content|any] [--limit N] [--json]
+      Search within an account. Default field is 'any' (subject OR sender).
+      Content search is supported but slow.
+
+  mail show <account> <message-id> [--json] [--html] [--raw]
+      Show one message by RFC-822 Message-ID, including headers + body.
+      --html prints the HTML body (link URLs intact); --raw prints the
+      full RFC-822 source.
+
+  mail links <account> <message-id> [--match TEXT] [--json]
+      List hyperlinks (anchor text + URL) from a message's HTML body.
+      --match filters to links whose text or URL contains TEXT.
+
+  mail attachments <account> <message-id> [--save DIR] [--index N] [--json]
+      List a message's attachments, or save them to DIR. --index N saves
+      only the attachment at that index.
+
+  mail fetch <url> --out PATH [--header 'Name: value' ...] [--timeout SEC]
+      Download a URL to disk (follows redirects). Use to pull a PDF behind
+      a 'Download receipt' link surfaced by `mail links`.
+
+  mail draft <account> --to ADDR [--to ADDR ...] [--cc ADDR] [--bcc ADDR]
+       --subject TEXT [--in-reply-to MESSAGE-ID] [--body TEXT | --body -]
+      Compose a draft and save it to the account's Drafts folder.
+      NO SEND. Use '--body -' to read body from stdin.
+
+  mail export <account> --mailbox NAME --out PATH [--limit N] [--since ISO]
+      Dump a mailbox to JSON (for .assets/messages/email/<conv>/messages.json).
+
+<account> matches case-insensitively against the account's Mail.app name or
+any of its configured email addresses.
+"""
+
+import argparse
+import email
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from email import policy
+from html.parser import HTMLParser
+from pathlib import Path
+
+
+JXA_PRELUDE = r"""
+ObjC.import('Foundation');
+
+function env(name) {
+  const v = $.NSProcessInfo.processInfo.environment.objectForKey(name);
+  if (v.isNil()) return null;
+  const s = ObjC.unwrap(v);
+  return s === '' ? null : s;
+}
+
+function die(msg) { throw new Error(msg); }
+
+function findAccount(target) {
+  if (!target) die('No account specified');
+  const Mail = Application('Mail');
+  const needle = target.toLowerCase();
+  for (const a of Mail.accounts()) {
+    const name = (a.name() || '').toLowerCase();
+    const emails = (a.emailAddresses() || []).map(e => (e || '').toLowerCase());
+    if (name.includes(needle)) return a;
+    if (emails.some(e => e.includes(needle))) return a;
+  }
+  die(`No Mail.app account matching: ${target}`);
+}
+
+function findMailbox(acct, name) {
+  if (!name) name = 'INBOX';
+  const target = name.toLowerCase();
+  const mailboxes = acct.mailboxes();
+  for (const mb of mailboxes) {
+    if ((mb.name() || '').toLowerCase() === target) return mb;
+  }
+  for (const mb of mailboxes) {
+    if ((mb.name() || '').toLowerCase().includes(target)) return mb;
+  }
+  die(`No mailbox "${name}" in account ${acct.name()}`);
+}
+
+function safeDateISO(d) {
+  if (!d) return null;
+  try { return d.toISOString(); } catch (e) { return null; }
+}
+
+function messageSummary(m) {
+  let mbName = null;
+  try { mbName = m.mailbox().name(); } catch (e) {}
+  return {
+    id: m.id(),
+    messageId: m.messageId(),
+    subject: m.subject(),
+    sender: m.sender(),
+    dateReceived: safeDateISO(m.dateReceived()),
+    dateSent: safeDateISO(m.dateSent()),
+    readStatus: m.readStatus(),
+    mailbox: mbName
+  };
+}
+
+function recipientList(m, kind) {
+  const out = [];
+  try {
+    const recips = kind === 'to' ? m.toRecipients() :
+                   kind === 'cc' ? m.ccRecipients() :
+                                   m.bccRecipients();
+    for (const r of recips) out.push({address: r.address(), name: r.name()});
+  } catch (e) {}
+  return out;
+}
+
+function messageFull(m) {
+  const base = messageSummary(m);
+  base.toRecipients = recipientList(m, 'to');
+  base.ccRecipients = recipientList(m, 'cc');
+  try { base.replyTo = m.replyTo(); } catch (e) { base.replyTo = null; }
+  try { base.content = m.content(); } catch (e) { base.content = null; }
+  try { base.allHeaders = m.allHeaders(); } catch (e) { base.allHeaders = null; }
+  return base;
+}
+
+function accountSenderString(acct) {
+  const emails = acct.emailAddresses() || [];
+  const addr = emails[0];
+  if (!addr) die(`Account ${acct.name()} has no email addresses configured`);
+  const full = acct.fullName();
+  return full ? `${full} <${addr}>` : addr;
+}
+"""
+
+
+def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 600):
+    """Execute a JXA script via osascript; return parsed JSON or None."""
+    full_script = JXA_PRELUDE + "\n" + script_body
+    env = os.environ.copy()
+    if env_extras:
+        for k, v in env_extras.items():
+            env[k] = "" if v is None else str(v)
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", full_script],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+    except FileNotFoundError:
+        sys.exit("osascript not found — this CLI only works on macOS.")
+    if result.returncode != 0:
+        err = result.stderr.strip()
+        if "-1743" in err or "Not authorized to send Apple events" in err:
+            sys.exit(
+                "Mail.app automation is not authorized for this terminal.\n"
+                "  Grant: System Settings → Privacy & Security → Automation\n"
+                "         → [your terminal app] → enable Mail\n"
+                "  Then run the command again.\n"
+                f"  ({err})"
+            )
+        sys.exit(f"osascript failed: {err}")
+    out = result.stdout.strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return out
+
+
+SOURCE_FETCH = r"""
+const acct = findAccount(env('ACCOUNT'));
+const target = env('MSG_ID');
+let found = null;
+for (const mb of acct.mailboxes()) {
+  try {
+    const hits = mb.messages.whose({messageId: target})();
+    if (hits.length > 0) { found = hits[0]; break; }
+  } catch (e) {}
+}
+if (!found) die(`Message not found: ${target}`);
+JSON.stringify({source: found.source()});
+"""
+
+
+def fetch_source(account, message_id):
+    """Return the raw RFC-822 source for a message, found by Message-ID."""
+    res = run_jxa(SOURCE_FETCH, {"ACCOUNT": account, "MSG_ID": message_id})
+    if not res or not res.get("source"):
+        sys.exit(f"Could not read raw source for message: {message_id}")
+    return res["source"]
+
+
+def parse_source(raw):
+    return email.message_from_string(raw, policy=policy.default)
+
+
+def html_body(msg):
+    """The text/html body part decoded to str, or None."""
+    part = msg.get_body(preferencelist=("html",))
+    if part is None:
+        return None
+    try:
+        return part.get_content()
+    except Exception:
+        payload = part.get_payload(decode=True) or b""
+        return payload.decode(part.get_content_charset() or "utf-8", "replace")
+
+
+class _LinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self._href = None
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self._href = href
+                self._buf = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            text = " ".join("".join(self._buf).split())
+            self.links.append({"text": text, "url": self._href})
+            self._href = None
+            self._buf = []
+
+
+def extract_links(html):
+    if not html:
+        return []
+    p = _LinkParser()
+    p.feed(html)
+    return p.links
+
+
+def list_attachments(msg):
+    out = []
+    for i, att in enumerate(msg.iter_attachments()):
+        payload = att.get_payload(decode=True) or b""
+        out.append({
+            "index": i,
+            "filename": att.get_filename(),
+            "content_type": att.get_content_type(),
+            "disposition": att.get_content_disposition(),
+            "size": len(payload),
+        })
+    return out
+
+
+def safe_name(name):
+    name = os.path.basename(name or "")
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip()
+    return cleaned or "attachment"
+
+
+def cmd_accounts(args):
+    script = r"""
+    const Mail = Application('Mail');
+    const out = Mail.accounts().map(a => ({
+      name: a.name(),
+      id: a.id(),
+      enabled: a.enabled(),
+      emailAddresses: a.emailAddresses(),
+      userName: a.userName(),
+      fullName: a.fullName()
+    }));
+    JSON.stringify(out);
+    """
+    accounts = run_jxa(script) or []
+    if args.json:
+        print(json.dumps(accounts, ensure_ascii=False, indent=2))
+        return
+    print(f"# {len(accounts)} account(s) in Mail.app")
+    for a in accounts:
+        flag = "" if a.get("enabled") else " [disabled]"
+        emails = ", ".join(a.get("emailAddresses") or [])
+        print(f"  {a['name']}{flag}")
+        if a.get("fullName"):
+            print(f"    full name: {a['fullName']}")
+        print(f"    email(s):  {emails or '(none)'}")
+
+
+def cmd_mailboxes(args):
+    script = r"""
+    const acct = findAccount(env('ACCOUNT'));
+    const out = acct.mailboxes().map(m => {
+      let unread = null;
+      try { unread = m.unreadCount(); } catch (e) {}
+      return { name: m.name(), unreadCount: unread };
+    });
+    JSON.stringify({ account: acct.name(), mailboxes: out });
+    """
+    result = run_jxa(script, {"ACCOUNT": args.account})
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    print(f"# {result['account']}  ({len(result['mailboxes'])} mailboxes)")
+    for m in result["mailboxes"]:
+        unread = f"  [{m['unreadCount']} unread]" if m.get("unreadCount") else ""
+        print(f"  {m['name']}{unread}")
+
+
+def cmd_read(args):
+    script = r"""
+    const acct = findAccount(env('ACCOUNT'));
+    const mb = findMailbox(acct, env('MAILBOX'));
+    const limit = parseInt(env('LIMIT') || '50');
+    const sinceIso = env('SINCE');
+    const sinceDate = sinceIso ? new Date(sinceIso) : null;
+    const n = mb.messages.length;
+    const out = [];
+    for (let i = 0; i < n && out.length < limit; i++) {
+      const m = mb.messages[i];
+      const d = m.dateReceived();
+      if (sinceDate && d && d < sinceDate) break;
+      out.push(messageSummary(m));
+    }
+    JSON.stringify(out);
+    """
+    msgs = run_jxa(script, {
+        "ACCOUNT": args.account,
+        "MAILBOX": args.mailbox,
+        "LIMIT": str(args.limit),
+        "SINCE": args.since or "",
+    }) or []
+    if args.json:
+        print(json.dumps(msgs, ensure_ascii=False, indent=2))
+        return
+    label = f"{args.account}:{args.mailbox}"
+    print(f"# {label}  ({len(msgs)} messages)")
+    for m in msgs:
+        ts = (m.get("dateReceived") or "")[:16].replace("T", " ")
+        unread = "●" if not m.get("readStatus") else " "
+        subj = (m.get("subject") or "(no subject)").replace("\n", " ")
+        sender = m.get("sender") or "(unknown)"
+        mid = m.get("messageId") or ""
+        print(f"{unread} [{ts}] {sender}")
+        print(f"    {subj}")
+        if mid:
+            print(f"    id: {mid}")
+
+
+def cmd_search(args):
+    script = r"""
+    const acct = findAccount(env('ACCOUNT'));
+    const mbName = env('MAILBOX');
+    const query = env('QUERY') || '';
+    const field = env('FIELD') || 'any';
+    const limit = parseInt(env('LIMIT') || '100');
+
+    let clause;
+    if (field === 'subject')      clause = {subject: {_contains: query}};
+    else if (field === 'sender')  clause = {sender:  {_contains: query}};
+    else if (field === 'content') clause = {content: {_contains: query}};
+    else clause = {_or: [
+      {subject: {_contains: query}},
+      {sender:  {_contains: query}}
+    ]};
+
+    function searchMailbox(mb) {
+      try {
+        const hits = mb.messages.whose(clause)();
+        return hits.slice(0, limit);
+      } catch (e) { return []; }
+    }
+
+    let messages = [];
+    if (mbName) {
+      messages = searchMailbox(findMailbox(acct, mbName));
+    } else {
+      for (const mb of acct.mailboxes()) {
+        const hits = searchMailbox(mb);
+        for (const m of hits) {
+          messages.push(m);
+          if (messages.length >= limit) break;
+        }
+        if (messages.length >= limit) break;
+      }
+    }
+    JSON.stringify(messages.map(messageSummary));
+    """
+    msgs = run_jxa(script, {
+        "ACCOUNT": args.account,
+        "MAILBOX": args.mailbox or "",
+        "QUERY": args.query,
+        "FIELD": args.field,
+        "LIMIT": str(args.limit),
+    }) or []
+    if args.json:
+        print(json.dumps(msgs, ensure_ascii=False, indent=2))
+        return
+    scope = args.mailbox or "all mailboxes"
+    print(f"# search {args.query!r} in {args.account}:{scope}  ({len(msgs)} hits)")
+    for m in msgs:
+        ts = (m.get("dateReceived") or "")[:16].replace("T", " ")
+        subj = (m.get("subject") or "(no subject)").replace("\n", " ")
+        sender = m.get("sender") or "(unknown)"
+        mbox = m.get("mailbox") or ""
+        mid = m.get("messageId") or ""
+        print(f"[{ts}] ({mbox}) {sender}")
+        print(f"    {subj}")
+        if mid:
+            print(f"    id: {mid}")
+
+
+def cmd_show(args):
+    if getattr(args, "raw", False):
+        print(fetch_source(args.account, args.message_id))
+        return
+    if getattr(args, "html", False):
+        msg = parse_source(fetch_source(args.account, args.message_id))
+        body = html_body(msg)
+        print(body if body is not None else "(no HTML body in this message)")
+        return
+    script = r"""
+    const acct = findAccount(env('ACCOUNT'));
+    const target = env('MSG_ID');
+    let found = null;
+    for (const mb of acct.mailboxes()) {
+      try {
+        const hits = mb.messages.whose({messageId: target})();
+        if (hits.length > 0) { found = hits[0]; break; }
+      } catch (e) {}
+    }
+    if (!found) die(`Message not found: ${target}`);
+    JSON.stringify(messageFull(found));
+    """
+    m = run_jxa(script, {"ACCOUNT": args.account, "MSG_ID": args.message_id})
+    if args.json:
+        print(json.dumps(m, ensure_ascii=False, indent=2))
+        return
+    print(f"From:    {m.get('sender')}")
+    tos = [f"{(r.get('name') or '').strip()} <{r['address']}>".strip()
+           for r in m.get('toRecipients') or []]
+    print(f"To:      {', '.join(tos) if tos else '(none)'}")
+    if m.get("ccRecipients"):
+        ccs = [f"{(r.get('name') or '').strip()} <{r['address']}>".strip()
+               for r in m["ccRecipients"]]
+        print(f"Cc:      {', '.join(ccs)}")
+    print(f"Subject: {m.get('subject')}")
+    print(f"Date:    {m.get('dateSent') or m.get('dateReceived')}")
+    print(f"Id:      {m.get('messageId')}")
+    print(f"Mailbox: {m.get('mailbox')}")
+    print()
+    print(m.get("content") or "")
+
+
+def cmd_links(args):
+    msg = parse_source(fetch_source(args.account, args.message_id))
+    links = extract_links(html_body(msg))
+    if getattr(args, "match", None):
+        needle = args.match.lower()
+        links = [l for l in links
+                 if needle in (l["text"] or "").lower()
+                 or needle in l["url"].lower()]
+    if args.json:
+        print(json.dumps(links, ensure_ascii=False, indent=2))
+        return
+    if not links:
+        print("(no links found)")
+        return
+    for i, l in enumerate(links):
+        print(f"[{i}] {l['text'] or '(no text)'}")
+        print(f"    {l['url']}")
+
+
+def cmd_attachments(args):
+    msg = parse_source(fetch_source(args.account, args.message_id))
+
+    if args.save:
+        out_dir = Path(args.save).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for i, att in enumerate(msg.iter_attachments()):
+            if args.index is not None and i != args.index:
+                continue
+            payload = att.get_payload(decode=True) or b""
+            dest = out_dir / safe_name(att.get_filename() or f"attachment-{i}")
+            dest.write_bytes(payload)
+            saved.append({"index": i, "path": str(dest), "size": len(payload)})
+        if args.json:
+            print(json.dumps(saved, ensure_ascii=False, indent=2))
+            return
+        if not saved:
+            print("(no matching attachments to save)")
+            return
+        for s in saved:
+            print(f"saved [{s['index']}] → {s['path']}  ({s['size']} bytes)")
+        return
+
+    atts = list_attachments(msg)
+    if args.json:
+        print(json.dumps(atts, ensure_ascii=False, indent=2))
+        return
+    if not atts:
+        print("(no attachments)")
+        return
+    for a in atts:
+        print(f"[{a['index']}] {a['filename'] or '(unnamed)'}  "
+              f"{a['content_type']}  {a['size']} bytes  ({a['disposition']})")
+
+
+def cmd_fetch(args):
+    out_path = Path(args.out).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    headers = {"User-Agent": "Mozilla/5.0 (mail-cli)"}
+    for h in args.header or []:
+        if ":" in h:
+            k, v = h.split(":", 1)
+            headers[k.strip()] = v.strip()
+    req = urllib.request.Request(args.url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+            data = resp.read()
+            final_url = resp.geturl()
+            ctype = resp.headers.get("Content-Type", "")
+    except Exception as e:
+        sys.exit(f"fetch failed: {e}")
+    out_path.write_bytes(data)
+    print(f"Fetched {len(data)} bytes → {out_path}")
+    if final_url != args.url:
+        print(f"  (final URL: {final_url})")
+    if ctype:
+        print(f"  content-type: {ctype}")
+
+
+def cmd_draft(args):
+    if args.body == "-":
+        body = sys.stdin.read()
+    elif args.body is None:
+        body = ""
+    else:
+        body = args.body
+
+    script = r"""
+    const Mail = Application('Mail');
+    const acct = findAccount(env('ACCOUNT'));
+    const senderStr = accountSenderString(acct);
+    const subject = env('SUBJECT') || '';
+    const body = env('BODY') || '';
+    const to = JSON.parse(env('TO_JSON') || '[]');
+    const cc = JSON.parse(env('CC_JSON') || '[]');
+    const bcc = JSON.parse(env('BCC_JSON') || '[]');
+    const inReplyTo = env('IN_REPLY_TO');
+
+    let msg;
+    if (inReplyTo) {
+      let orig = null;
+      for (const mb of acct.mailboxes()) {
+        try {
+          const hits = mb.messages.whose({messageId: inReplyTo})();
+          if (hits.length > 0) { orig = hits[0]; break; }
+        } catch (e) {}
+      }
+      if (!orig) die(`Message not found for reply: ${inReplyTo}`);
+      msg = Mail.reply(orig, {openingWindow: false, replyToAll: false});
+      if (body) msg.content = body;
+      if (subject) msg.subject = subject;
+    } else {
+      msg = Mail.OutgoingMessage({
+        subject: subject,
+        content: body,
+        sender: senderStr,
+        visible: false
+      });
+      Mail.outgoingMessages.push(msg);
+    }
+
+    for (const addr of to)  msg.toRecipients.push(Mail.ToRecipient({address: addr}));
+    for (const addr of cc)  msg.ccRecipients.push(Mail.CcRecipient({address: addr}));
+    for (const addr of bcc) msg.bccRecipients.push(Mail.BccRecipient({address: addr}));
+
+    msg.save();
+
+    JSON.stringify({
+      status: 'saved',
+      account: acct.name(),
+      sender: senderStr,
+      subject: msg.subject(),
+      to: to, cc: cc, bcc: bcc,
+      inReplyTo: inReplyTo || null
+    });
+    """
+    result = run_jxa(script, {
+        "ACCOUNT": args.account,
+        "SUBJECT": args.subject or "",
+        "BODY": body,
+        "TO_JSON": json.dumps(args.to or []),
+        "CC_JSON": json.dumps(args.cc or []),
+        "BCC_JSON": json.dumps(args.bcc or []),
+        "IN_REPLY_TO": args.in_reply_to or "",
+    })
+    print(f"Draft saved to {result['account']} Drafts folder.")
+    print(f"  From:     {result['sender']}")
+    print(f"  To:       {', '.join(result['to']) or '(none)'}")
+    if result.get("cc"):
+        print(f"  Cc:       {', '.join(result['cc'])}")
+    if result.get("bcc"):
+        print(f"  Bcc:      {', '.join(result['bcc'])}")
+    print(f"  Subject:  {result['subject']}")
+    if result.get("inReplyTo"):
+        print(f"  Reply to: {result['inReplyTo']}")
+    print()
+    print("Review in Mail.app → Drafts. No email was sent.")
+
+
+def cmd_export(args):
+    out_path = Path(args.out).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    script = r"""
+    const acct = findAccount(env('ACCOUNT'));
+    const mb = findMailbox(acct, env('MAILBOX'));
+    const limit = parseInt(env('LIMIT') || '0');
+    const sinceIso = env('SINCE');
+    const sinceDate = sinceIso ? new Date(sinceIso) : null;
+    const n = mb.messages.length;
+    const max = limit > 0 ? limit : n;
+    const out = [];
+    for (let i = 0; i < n && out.length < max; i++) {
+      const m = mb.messages[i];
+      const d = m.dateReceived();
+      if (sinceDate && d && d < sinceDate) break;
+      out.push(messageFull(m));
+    }
+    JSON.stringify({
+      account: acct.name(),
+      mailbox: mb.name(),
+      exported_at: new Date().toISOString(),
+      message_count: out.length,
+      messages: out
+    });
+    """
+    payload = run_jxa(script, {
+        "ACCOUNT": args.account,
+        "MAILBOX": args.mailbox,
+        "LIMIT": str(args.limit or 0),
+        "SINCE": args.since or "",
+    })
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(f"Exported {payload['message_count']} messages from "
+          f"{payload['account']}:{payload['mailbox']} → {out_path}")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="mail",
+        description="Personal Mail.app CLI (JXA; read + draft, no send).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pa = sub.add_parser("accounts", help="List Mail.app accounts.")
+    pa.add_argument("--json", action="store_true")
+
+    pm = sub.add_parser("mailboxes", help="List mailboxes for an account.")
+    pm.add_argument("account")
+    pm.add_argument("--json", action="store_true")
+
+    pr = sub.add_parser("read", help="Read recent messages.")
+    pr.add_argument("account")
+    pr.add_argument("--mailbox", default="INBOX")
+    pr.add_argument("--limit", type=int, default=50)
+    pr.add_argument("--since", help="ISO datetime; stop at this date")
+    pr.add_argument("--json", action="store_true")
+
+    ps = sub.add_parser("search", help="Search within an account.")
+    ps.add_argument("account")
+    ps.add_argument("query")
+    ps.add_argument("--mailbox", help="Restrict to one mailbox (default: all)")
+    ps.add_argument("--field", choices=["subject", "sender", "content", "any"],
+                    default="any")
+    ps.add_argument("--limit", type=int, default=100)
+    ps.add_argument("--json", action="store_true")
+
+    psh = sub.add_parser("show", help="Show one message by Message-ID.")
+    psh.add_argument("account")
+    psh.add_argument("message_id")
+    psh.add_argument("--json", action="store_true")
+    psh.add_argument("--html", action="store_true",
+                     help="Print the raw HTML body (preserves link URLs).")
+    psh.add_argument("--raw", action="store_true",
+                     help="Print the full raw RFC-822 source.")
+
+    pl = sub.add_parser("links", help="List hyperlinks in a message's HTML body.")
+    pl.add_argument("account")
+    pl.add_argument("message_id")
+    pl.add_argument("--match", help="Only links whose text or URL contains this")
+    pl.add_argument("--json", action="store_true")
+
+    pat = sub.add_parser("attachments", help="List or save message attachments.")
+    pat.add_argument("account")
+    pat.add_argument("message_id")
+    pat.add_argument("--save", metavar="DIR",
+                     help="Save attachments to this directory instead of listing")
+    pat.add_argument("--index", type=int,
+                     help="With --save, only save the attachment at this index")
+    pat.add_argument("--json", action="store_true")
+
+    pf = sub.add_parser("fetch", help="Download a URL to a file (follow a link).")
+    pf.add_argument("url")
+    pf.add_argument("--out", required=True)
+    pf.add_argument("--header", action="append",
+                    help="Extra request header 'Name: value'. Repeat for many.")
+    pf.add_argument("--timeout", type=int, default=60)
+
+    pd = sub.add_parser("draft", help="Create a draft (never sends).")
+    pd.add_argument("account")
+    pd.add_argument("--to", action="append", required=True,
+                    help="Recipient address. Repeat for multiple.")
+    pd.add_argument("--cc", action="append", default=None)
+    pd.add_argument("--bcc", action="append", default=None)
+    pd.add_argument("--subject", required=True)
+    pd.add_argument("--in-reply-to",
+                    help="Message-ID to thread this as a reply to")
+    pd.add_argument("--body", help="Body text; use '-' to read from stdin")
+
+    pe = sub.add_parser("export", help="Dump a mailbox to JSON.")
+    pe.add_argument("account")
+    pe.add_argument("--mailbox", required=True)
+    pe.add_argument("--out", required=True)
+    pe.add_argument("--limit", type=int, default=0)
+    pe.add_argument("--since", help="ISO datetime; stop at this date")
+
+    args = p.parse_args()
+
+    dispatch = {
+        "accounts": cmd_accounts,
+        "mailboxes": cmd_mailboxes,
+        "read": cmd_read,
+        "search": cmd_search,
+        "show": cmd_show,
+        "links": cmd_links,
+        "attachments": cmd_attachments,
+        "fetch": cmd_fetch,
+        "draft": cmd_draft,
+        "export": cmd_export,
+    }
+    dispatch[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
