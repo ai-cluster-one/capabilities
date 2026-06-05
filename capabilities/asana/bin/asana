@@ -77,6 +77,17 @@ Commands:
                                               (text + created_at + author gid),
                                               oldest first. The "did they reply?"
                                               read for the HITL resume check.
+  asana follower-add <task> <user> [<user>…]  Subscribe users to a task (Asana
+                                              `addFollowers`). This is what
+                                              actually NOTIFIES them — adding a
+                                              collaborator sends an "added you"
+                                              notification, whereas a comment
+                                              @mention does NOT (it neither
+                                              notifies nor follows via the API).
+                                              To reliably reach someone: follower-add
+                                              them, then comment. <user> is a gid/URL.
+  asana follower-remove <task> <user> […]     Unsubscribe users from a task
+                                              (Asana `removeFollowers`).
   asana complete <task> [--reopen]            Mark a task complete (or reopen).
         [--force] [--no-rollup]               REFUSES (exit 7) if the task has
                                               open dependencies — pass --force to
@@ -648,6 +659,18 @@ def cmd_comments(c: httpx.Client, task: str, limit: int) -> list:
     return [s for s in stories if s.get("type") == "comment"]
 
 
+def _followers(c: httpx.Client, task: str, users: list[str], op: str) -> dict:
+    """addFollowers / removeFollowers — the reliable notify+subscribe path.
+
+    Adding a collaborator sends the user an Asana notification; a comment
+    @mention via the API does not. Returns the task's resulting follower list.
+    """
+    t = _request(c, "POST", f"/tasks/{_gid(task)}/{op}",
+                 json_body={"data": {"followers": [_gid(u) for u in users]}},
+                 params={"opt_fields": "followers.name,followers.gid"})["data"]
+    return {"task": _gid(task), "followers": t.get("followers", [])}
+
+
 def cmd_complete(c: httpx.Client, task: str, reopen: bool,
                  force: bool = False, no_rollup: bool = False) -> dict:
     tgid = _gid(task)
@@ -1136,6 +1159,14 @@ def main() -> None:
     sp.add_argument("task", help="task GID or URL")
     sp.add_argument("--limit", type=int, default=100)
 
+    sp = sub.add_parser("follower-add", help="subscribe users to a task (notifies them)")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("user", nargs="+", help="user GID or URL (one or more)")
+
+    sp = sub.add_parser("follower-remove", help="unsubscribe users from a task")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("user", nargs="+", help="user GID or URL (one or more)")
+
     sp = sub.add_parser("complete", help="mark a task complete")
     sp.add_argument("task", help="task GID or URL")
     sp.add_argument("--reopen", action="store_true", help="mark incomplete instead")
@@ -1334,6 +1365,10 @@ def main() -> None:
             _emit(cmd_comment(c, args.task, _read_text(args.text), args.mention, mode))
         elif args.cmd == "comments":
             _emit(cmd_comments(c, args.task, args.limit))
+        elif args.cmd == "follower-add":
+            _emit(_followers(c, args.task, args.user, "addFollowers"))
+        elif args.cmd == "follower-remove":
+            _emit(_followers(c, args.task, args.user, "removeFollowers"))
         elif args.cmd == "complete":
             _emit(cmd_complete(c, args.task, args.reopen, args.force, args.no_rollup))
         elif args.cmd == "update":
