@@ -6,13 +6,13 @@ The doctrine ([../DOCTRINE.md](../DOCTRINE.md)) holds every rule and, with each,
 
 ## The unit and the scope
 
-- **Unit** — the measuring unit is one **capability**: its files across the slots (the stub, `CAPABILITY.md`, identifiers, reference, any scripts), on this machine and/or in a consuming project. "All installed" runs the routine once per capability.
+- **Unit** — the measuring unit is one **capability**: its files across the slots (the stub, the executable `bin/<name>`, `CAPABILITY.md`, identifiers, reference, any scripts), on this machine and/or in a consuming project. "All installed" runs the routine once per capability.
 - **Scope** — this project, this machine, or both.
 
 ## Run
 
-1. **Read [../DOCTRINE.md](../DOCTRINE.md) and the capability's `manifest.md`.** The doctrine's rules and their Validate clauses are the entire measuring stick.
-2. **Honour recorded deviations first.** Load the deviation log (project-scoped, e.g. `.claude/capability-deviations.md`, and any machine-scoped equivalent). A difference from the doctrine that is **already recorded with a justification** is a deliberate choice, not a finding — acknowledge it and move on.
+1. **Read [../DOCTRINE.md](../DOCTRINE.md), [../SHEBANG.md](../SHEBANG.md), and the capability's `manifest.md`.** The doctrine's rules (and their Validate clauses) measure the capability's docs and structure; SHEBANG.md measures its executable — the `bin/<name>` slot. Together they are the measuring stick.
+2. **Honour recorded deviations first.** Load the capability's **dedicated deviation file** (and any project-scoped deviation log). A difference from the doctrine or SHEBANG.md that is **already recorded with a justification** is a deliberate choice, not a finding — acknowledge it and move on.
 3. **Apply every rule.** Walk the doctrine top to bottom and run each rule's Validate clause against the unit — reasoning semantically, these are judgments, not regexes. **Every rule must be met.** For each rule that isn't, record a violation: what it is, which rule, and the consolidation the rule's Validate clause implies. A branched slot (a `<slot>/` folder with a thin `<slot>.md` index) is not itself a finding — check that the index only points, the capability file still addresses the slot by role, and no sub-file path has leaked to an outside consumer.
 
 ## Output — advisory report

@@ -23,7 +23,7 @@ Every capability and routine obeys one set of rules, stated once in [DOCTRINE.md
 
 ## How a capability is shaped
 
-Every capability fills one structural template — read [TEMPLATE.md](TEMPLATE.md). In short, two layers:
+Every capability fills one structural template — read [TEMPLATE.md](TEMPLATE.md); its executable fills one code template — read [SHEBANG.md](SHEBANG.md). In short, two layers:
 
 - **Global** (machine-level, install once per host): the executable, its context **stub**, a credentials **template**. The source folder `capabilities/<name>/` installs to the host registry `~/.capabilities/<name>/` (undotted catalogue in the repo → dotted registry in `$HOME`); the CLI is symlinked onto `PATH` and the stub is surfaced as a skill (`~/.claude/skills/<name>/SKILL.md`). Declared *just enough to be visible*.
 - **Project** (repo-level, per consuming project): a lightweight `CAPABILITY.md` + `identifiers` + a self-describing `reference` scaffold, with `scripts/` if the capability authors any, under `.capabilities/<namespace>/`. A `SessionStart` hook regenerates `.claude/rules/CAPABILITIES.md` — an `@`-import manifest the harness expands inline — so they load each session. This is where a consuming project **expands** on how it uses the capability.
@@ -69,3 +69,5 @@ The author's machine is both ends of the loop:
 3. From any project, **run `procedures/update.md`** naming the capability — it pulls and re-applies, so every consumer benefits.
 
 So a change starts at the source here, travels through GitHub, and lands back in each consumer on demand.
+
+This repo — and its GitHub mirror — is the **single source of truth** for every capability, the **executable included**. The CLI symlinked onto a machine's `PATH` (e.g. `~/bin/<name>`) is a *downstream install*, not a second master: a change is authored **here** and reaches a machine only when `procedures/update.md` pulls it — never edited in place on `PATH`. If a live copy has drifted ahead (edited directly on a machine), that edit is first folded **back into the repo** to restore it as the single master, then flows outward again on the next update. The hierarchy is one-directional: repo → GitHub → installed CLI.

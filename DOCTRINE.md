@@ -45,17 +45,10 @@ The single source of truth for how capabilities — and the routines that consum
 
 ## The credential cascade
 
-Every capability's executable resolves its credentials with the **same 4-tier cascade** (first non-empty wins) — a contract the CLI must implement, not just document, because it is how config follows the developer across a laptop and a deployed host:
+Every capability's executable resolves its credentials with the **same deterministic cascade** — a contract the CLI implements in code, not merely documents, because it is how config follows the developer from a laptop (project and user config present) to a deployed host (global env only) with no change in behaviour and no model lookup. The tiers, their order, the reason process env sits below the user file, and the shared code that realizes it are defined once in [SHEBANG.md](SHEBANG.md#the-credential-cascade) — the executable's authoring standard. The principle the doctrine fixes: resolution is deterministic and identity-free (rule 10), and secrets resolve from env, never from a committed file (rule 4).
 
-1. **Flags** — explicit `--…` overrides, per invocation.
-2. **Project env** — `.env.local` then `.env`, discovered by **walking up** from `$CLAUDE_PROJECT_DIR` (else cwd) to the project root (stop at the first dir holding either, or a `.git` root). The project you're working in wins.
-3. **User config** — `$XDG_CONFIG_HOME/<name>/credentials.env` (default `~/.config/<name>/`). The persistent default.
-4. **Process env** — exported or host-injected variables. The fallback that lets a deployed box (no config files, secrets injected by the platform) resolve correctly.
-
-*"System-injected"* and *"ambient export"* are indistinguishable at runtime (both are just process env), so they share tier 4. Process env sits **below** the user file deliberately — files are authoritative on a dev machine; injection governs on the box only because no file is present there. A one-shot override uses a flag, not an `export`.
-
-*Validate:* confirm the executable resolves credentials in this order, and that the identifiers asset points to env for secrets rather than holding them (rule 4).
+*Validate:* confirm the executable implements the SHEBANG.md cascade in order (flags → project `.env` → user config → process env, first non-empty wins), and that the identifiers asset points to env for secrets rather than holding them (rule 4).
 
 ## Deviations are allowed — and recorded
 
-These rules are a strong default, not a cage. A consuming project may deviate **with justification**. When it does, the deviation + reason is saved locally (machine- or project-scoped) so a later audit reads it as a **deliberate choice or a known edge case**, not drift to "fix." The validator advises; it does not force one path. A recorded, justified deviation is not a violation.
+These rules are a strong default, not a cage. A capability may deviate **with justification**. When it does, the deviation + reason is recorded in the capability's **own dedicated deviation file** — a file whose sole purpose is to hold it, kept apart so it is never commingled with other content or accidentally removed — so a later audit reads it as a **deliberate choice or a known edge case**, not drift to "fix." The validator advises; it does not force one path. A recorded, justified deviation is not a violation.
