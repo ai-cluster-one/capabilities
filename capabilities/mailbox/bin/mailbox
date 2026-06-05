@@ -51,11 +51,16 @@ Commands:
   mailbox list [--unread] [--folder F]        List messages (headers only).
         [--since YYYY-MM-DD] [--limit N]      JSON: uid, message_id, date,
                                               from, subject, seen.
-  mailbox show <uid> [--folder F]             One message: headers, text body,
-                                              attachment manifest (no payloads).
-  mailbox fetch <uid> --save-dir DIR          Save attachments to DIR.
-        [--folder F] [--mark-seen]            JSON: saved paths + content types.
-                                              mark-seen is OFF by default.
+  mailbox show <uid> | --message-id <id>      One message: headers, text body,
+        [--folder F]                          attachment manifest (no payloads).
+                                              --message-id locates it across ALL
+                                              folders (folder-agnostic; survives an
+                                              INBOX -> Archive move) and reports the
+                                              folder it now lives in.
+  mailbox fetch <uid> | --message-id <id>     Save attachments to DIR.
+        --save-dir DIR [--folder F]           JSON: saved paths + content types.
+        [--mark-seen]                         mark-seen is OFF by default.
+                                              --message-id as for show.
   mailbox seen <uid> [--unsee] [--folder F]   Flag / unflag \\Seen.
   mailbox folders                             List IMAP folders (find Archive).
   mailbox move <uid> --to-folder F            Move a message to another folder
@@ -67,7 +72,11 @@ Commands:
 
 Idempotency:
   Use message_id (globally stable) as the dedup key for processing, NOT uid.
-  IMAP uids reset if the folder's UIDVALIDITY changes (server migration).
+  IMAP uids reset if the folder's UIDVALIDITY changes (server migration), and
+  a uid is only valid inside the folder it was read from — moving a message
+  (e.g. INBOX -> Archive) reassigns it. To re-open a message after a move, use
+  `show`/`fetch --message-id <id>`, which finds it in whatever folder it now
+  lives in. A uid + --folder is the fast path when both are known and current.
 
 I/O contract:
   - Success: JSON on stdout, exit 0.
@@ -290,6 +299,36 @@ def _one(mb: MailBox, uid: str, mark_seen: bool):
     return msgs[0]
 
 
+# Folders probed first when locating by Message-ID; the rest are appended.
+_PRIORITY_FOLDERS = ("INBOX", "Archive")
+
+
+def _locate_by_message_id(mb: MailBox, message_id: str):
+    """Find the message carrying this Message-ID, in whatever folder holds it.
+
+    message_id is globally stable, so the first hit is THE message regardless of
+    which folder it now lives in (e.g. after an INBOX -> Archive move, where the
+    uid the message had in INBOX no longer addresses it). Returns (folder, msg);
+    dies 3 if no folder holds it. IMAP HEADER search is a substring match, so the
+    value matches with or without its angle brackets.
+    """
+    crit = f'HEADER MESSAGE-ID "{message_id.strip()}"'
+    names = [f.name for f in mb.folder.list()]
+    ordered = [n for n in _PRIORITY_FOLDERS if n in names] + \
+              [n for n in names if n not in _PRIORITY_FOLDERS]
+    for name in ordered:
+        try:
+            mb.folder.set(name)
+        except Exception:
+            continue  # unselectable container (\Noselect) — can't hold a message
+        msgs = list(mb.fetch(crit, mark_seen=False, bulk=False, limit=1))
+        if msgs:
+            return name, msgs[0]
+    _die(3, "not_found",
+         f"no message with Message-ID {message_id} in any folder",
+         "use the message_id exactly as `list`/`show` report it")
+
+
 # --- Commands ----------------------------------------------------------------
 
 def cmd_doctor(cfg: dict) -> dict:
@@ -329,13 +368,17 @@ def cmd_list(cfg: dict, folder: str, unread: bool, since: str | None, limit: int
     return out
 
 
-def cmd_show(cfg: dict, uid: str, folder: str) -> dict:
+def cmd_show(cfg: dict, uid: str | None, folder: str, message_id: str | None = None) -> dict:
     with _imap(cfg) as mb:
-        if folder != "INBOX":
-            mb.folder.set(folder)
-        m = _one(mb, uid, mark_seen=False)
+        if message_id:
+            folder, m = _locate_by_message_id(mb, message_id)
+        else:
+            if folder != "INBOX":
+                mb.folder.set(folder)
+            m = _one(mb, uid, mark_seen=False)
         return {
-            "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
+            "uid": m.uid, "folder": folder,
+            "message_id": m.headers.get("message-id", ("",))[0] or None,
             "date": m.date_str, "from": m.from_, "to": list(m.to), "cc": list(m.cc),
             "subject": m.subject, "seen": "\\Seen" in m.flags,
             "text": m.text or m.html, "has_html": bool(m.html),
@@ -346,20 +389,28 @@ def cmd_show(cfg: dict, uid: str, folder: str) -> dict:
         }
 
 
-def cmd_fetch(cfg: dict, uid: str, folder: str, save_dir: str, mark_seen: bool) -> dict:
+def cmd_fetch(cfg: dict, uid: str | None, folder: str, save_dir: str,
+              mark_seen: bool, message_id: str | None = None) -> dict:
     out_dir = Path(save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     saved = []
     with _imap(cfg) as mb:
-        if folder != "INBOX":
-            mb.folder.set(folder)
-        m = _one(mb, uid, mark_seen=mark_seen)
+        if message_id:
+            folder, m = _locate_by_message_id(mb, message_id)
+            uid = m.uid
+            if mark_seen:
+                mb.flag(str(uid), MailMessageFlags.SEEN, True)
+        else:
+            if folder != "INBOX":
+                mb.folder.set(folder)
+            m = _one(mb, uid, mark_seen=mark_seen)
         for i, a in enumerate(m.attachments):
             fname = _safe_filename(a.filename, uid, i, a.content_type)
             dest = out_dir / fname
             dest.write_bytes(a.payload)
             saved.append({"path": str(dest), "content_type": a.content_type, "size": a.size})
-    return {"uid": uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
+    return {"uid": uid, "folder": folder,
+            "message_id": m.headers.get("message-id", ("",))[0] or None,
             "saved": saved, "marked_seen": mark_seen}
 
 
@@ -420,6 +471,18 @@ def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
 
 # --- CLI ---------------------------------------------------------------------
 
+def _require_selector(args) -> None:
+    """show/fetch take exactly one of a positional <uid> or --message-id."""
+    has_uid = getattr(args, "uid", None) is not None
+    has_mid = getattr(args, "message_id", None) is not None
+    if has_uid and has_mid:
+        _die(6, "ambiguous_selector",
+             "pass either <uid> or --message-id, not both")
+    if not has_uid and not has_mid:
+        _die(6, "missing_selector",
+             f"the {args.cmd} command needs a <uid> or --message-id <id>")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         prog="mailbox", description=__doc__,
@@ -440,12 +503,16 @@ def main() -> None:
     sp.add_argument("--since", default=None, help="YYYY-MM-DD")
     sp.add_argument("--limit", type=int, default=50)
 
-    sp = sub.add_parser("show", help="show one message")
-    sp.add_argument("uid")
+    sp = sub.add_parser("show", help="show one message (by uid or --message-id)")
+    sp.add_argument("uid", nargs="?", default=None)
+    sp.add_argument("--message-id", dest="message_id", default=None,
+                    help="locate across all folders by Message-ID (folder-agnostic)")
     sp.add_argument("--folder", default="INBOX")
 
-    sp = sub.add_parser("fetch", help="save a message's attachments")
-    sp.add_argument("uid")
+    sp = sub.add_parser("fetch", help="save a message's attachments (by uid or --message-id)")
+    sp.add_argument("uid", nargs="?", default=None)
+    sp.add_argument("--message-id", dest="message_id", default=None,
+                    help="locate across all folders by Message-ID (folder-agnostic)")
     sp.add_argument("--save-dir", required=True)
     sp.add_argument("--folder", default="INBOX")
     sp.add_argument("--mark-seen", action="store_true")
@@ -488,9 +555,11 @@ def main() -> None:
     elif args.cmd == "list":
         _emit(cmd_list(cfg, args.folder, args.unread, args.since, args.limit))
     elif args.cmd == "show":
-        _emit(cmd_show(cfg, args.uid, args.folder))
+        _require_selector(args)
+        _emit(cmd_show(cfg, args.uid, args.folder, args.message_id))
     elif args.cmd == "fetch":
-        _emit(cmd_fetch(cfg, args.uid, args.folder, args.save_dir, args.mark_seen))
+        _require_selector(args)
+        _emit(cmd_fetch(cfg, args.uid, args.folder, args.save_dir, args.mark_seen, args.message_id))
     elif args.cmd == "seen":
         _emit(cmd_seen(cfg, args.uid, args.folder, args.unsee))
     elif args.cmd == "send":
