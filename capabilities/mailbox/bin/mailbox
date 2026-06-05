@@ -1,0 +1,502 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "imap-tools>=1.13",
+# ]
+# ///
+"""
+mailbox — agent-first IMAP/SMTP CLI for one mailbox.
+
+This tool is designed to be invoked by agents. Run `mailbox help` to load
+the full usage contract on demand — do not rely on memorised knowledge of
+its surface.
+
+This is a THIN, project-agnostic adapter: read, fetch attachments, flag, send.
+Any orchestration (invoice-drain, triage, routing) is a CONSUMER's operation
+layer that reads this tool's JSON — it does NOT live here. The tool knows
+nothing about who owns the mailbox; that lives in the consuming project.
+
+Mailboxes are defined in a project's committed config:
+  <project>/.capabilities/mailbox/mailbox.json   (preferred)
+  <project>/.assets/config/mailbox.json          (legacy fallback)
+mapping a profile id to its non-secret wiring:
+  {
+    "<id>": {
+      "address":    "user@example.com",
+      "imap_host":  "mail.example.com", "imap_port": 993,
+      "smtp_host":  "mail.example.com", "smtp_port": 587,
+      "secret_env": "MAILBOX_<ID>_APP_PASSWORD"
+    }
+  }
+Only the password is secret: the profile names the env var holding it
+("secret_env"); the value lives in the project's .env / .env.local (gitignored).
+
+Discovery: $MAILBOX_CONFIG (if set) is the explicit config path and wins over
+everything — absolute, or relative to $CLAUDE_PROJECT_DIR/cwd; it must come from
+the real environment, not a project .env (the .env loads only after the config
+is located). Otherwise, start at $CLAUDE_PROJECT_DIR (else cwd) and walk up to
+the nearest dir holding a candidate layout (capability path preferred, legacy
+fallback second) — that dir is the project root. Its .env then .env.local are
+loaded into the environment (never overriding what's already set, so a
+cron-injected secret wins). Pick the profile with --mailbox <id|address>, or
+omit it when the config defines exactly one mailbox.
+
+Every command accepts [--mailbox <id|address>] to pick the profile.
+
+Commands:
+  mailbox help                                Print this document.
+  mailbox mailboxes                           List configured mailbox profiles.
+  mailbox doctor                              Validate IMAP + SMTP login.
+  mailbox list [--unread] [--folder F]        List messages (headers only).
+        [--since YYYY-MM-DD] [--limit N]      JSON: uid, message_id, date,
+                                              from, subject, seen.
+  mailbox show <uid> [--folder F]             One message: headers, text body,
+                                              attachment manifest (no payloads).
+  mailbox fetch <uid> --save-dir DIR          Save attachments to DIR.
+        [--folder F] [--mark-seen]            JSON: saved paths + content types.
+                                              mark-seen is OFF by default.
+  mailbox seen <uid> [--unsee] [--folder F]   Flag / unflag \\Seen.
+  mailbox folders                             List IMAP folders (find Archive).
+  mailbox move <uid> --to-folder F            Move a message to another folder
+        [--folder F]                          (e.g. INBOX -> Archive).
+  mailbox send --to A [--to B ...] --subject S
+        [--body TEXT | --body-file F | -]     Send a message. Body from
+        [--cc A ...] [--attach FILE ...]      --body, a file, or stdin.
+        [--in-reply-to MESSAGE-ID]
+
+Idempotency:
+  Use message_id (globally stable) as the dedup key for processing, NOT uid.
+  IMAP uids reset if the folder's UIDVALIDITY changes (server migration).
+
+I/O contract:
+  - Success: JSON on stdout, exit 0.
+  - Error:   {"error": {"code", "message", "hint"}} on stderr, non-zero exit.
+
+Exit codes:
+  0  success
+  2  auth (missing credentials, login rejected)
+  3  not found (no message with that uid)
+  5  server / network (IMAP/SMTP unreachable, timeout)
+  6  input / validation
+"""
+
+import argparse
+import json
+import mimetypes
+import os
+import smtplib
+import ssl
+import sys
+from datetime import date, datetime
+from email.message import EmailMessage
+from pathlib import Path
+from typing import NoReturn
+
+from imap_tools import AND, MailBox, MailboxLoginError, MailMessageFlags
+
+
+CONFIG_RELS = (
+    Path(".capabilities") / "mailbox" / "mailbox.json",
+    Path(".assets") / "config" / "mailbox.json",
+)
+PORT_DEFAULTS = {"imap_port": 993, "smtp_port": 587}
+
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str, hint: str | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+# --- Config / credentials ----------------------------------------------------
+
+def _find_project_dir() -> tuple[Path, Path]:
+    """Locate the config file and the project dir whose .env holds the secret.
+
+    Returns (project_dir, config_path). Precedence:
+      1. $MAILBOX_CONFIG — explicit path override (absolute, or relative to
+         $CLAUDE_PROJECT_DIR/cwd); the start dir is the .env anchor. Must come
+         from the real environment, not a project .env (.env loads only after
+         the config is located).
+      2. Walk up from $CLAUDE_PROJECT_DIR (else cwd) to the first dir holding a
+         candidate layout — .capabilities/mailbox/mailbox.json preferred, then
+         the legacy .assets/config/mailbox.json. That dir is the .env anchor.
+    """
+    start = Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path.cwd()).resolve()
+
+    override = os.environ.get("MAILBOX_CONFIG")
+    if override:
+        cfg = Path(override).expanduser()
+        cfg = cfg if cfg.is_absolute() else (start / cfg)
+        cfg = cfg.resolve()
+        if not cfg.is_file():
+            _die(6, "no_config",
+                 f"$MAILBOX_CONFIG points to {cfg}, which is not a file",
+                 "unset MAILBOX_CONFIG or point it at the mailbox json")
+        return start, cfg
+
+    for d in (start, *start.parents):
+        for rel in CONFIG_RELS:
+            if (d / rel).is_file():
+                return d, d / rel
+    _die(6, "no_config",
+         f"no {CONFIG_RELS[0]} found from {start} upward",
+         "create the mailbox config in the project's .capabilities/mailbox/, "
+         "or set $MAILBOX_CONFIG to its path")
+
+
+def _load_env_into_environ(project_dir: Path) -> None:
+    """Load .env then .env.local into os.environ without overriding existing keys."""
+    for name in (".env", ".env.local"):
+        path = project_dir / name
+        if not path.is_file():
+            continue
+        for line in path.read_text().splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, _, v = s.partition("=")
+            k = k.strip()
+            if k and not os.environ.get(k):
+                os.environ[k] = v.strip().strip('"').strip("'")
+
+
+def _select_profile(profiles: dict, wanted: str | None) -> tuple[str, dict]:
+    if wanted:
+        if wanted in profiles:
+            return wanted, profiles[wanted]
+        for pid, p in profiles.items():
+            if p.get("address", "").lower() == wanted.lower():
+                return pid, p
+        _die(6, "unknown_mailbox", f"no mailbox profile matches {wanted!r}",
+             f"known: {', '.join(profiles) or '(none)'}")
+    if len(profiles) == 1:
+        pid = next(iter(profiles))
+        return pid, profiles[pid]
+    _die(6, "ambiguous_mailbox",
+         f"config defines {len(profiles)} mailboxes; pass --mailbox <id|address>",
+         f"known: {', '.join(profiles)}")
+
+
+def _load_config(wanted: str | None) -> dict:
+    project_dir, config_path = _find_project_dir()
+    try:
+        profiles = json.loads(config_path.read_text())
+    except (ValueError, OSError) as e:
+        _die(6, "bad_config", f"cannot read {config_path}: {e}")
+    if not isinstance(profiles, dict) or not profiles:
+        _die(6, "empty_config", f"{config_path} defines no mailbox profiles")
+
+    pid, prof = _select_profile(profiles, wanted)
+    _load_env_into_environ(project_dir)
+
+    secret_env = prof.get("secret_env")
+    if not secret_env:
+        _die(6, "no_secret_env", f"profile {pid!r} is missing 'secret_env'")
+    password = os.environ.get(secret_env)
+    if not password:
+        _die(2, "missing_secret",
+             f"env var {secret_env} (for mailbox {pid!r}) is unset",
+             f"set {secret_env} in the project's .env / .env.local")
+
+    user = prof.get("address")
+    imap_host, smtp_host = prof.get("imap_host"), prof.get("smtp_host")
+    missing = [k for k, v in {"address": user, "imap_host": imap_host,
+                              "smtp_host": smtp_host}.items() if not v]
+    if missing:
+        _die(6, "incomplete_profile",
+             f"profile {pid!r} missing: {', '.join(missing)}")
+
+    return {
+        "id": pid,
+        "user": user,
+        "password": password,
+        "imap_host": imap_host,
+        "imap_port": int(prof.get("imap_port", PORT_DEFAULTS["imap_port"])),
+        "smtp_host": smtp_host,
+        "smtp_port": int(prof.get("smtp_port", PORT_DEFAULTS["smtp_port"])),
+    }
+
+
+def _list_mailboxes() -> list:
+    project_dir, config_path = _find_project_dir()
+    profiles = json.loads(config_path.read_text())
+    return [
+        {"id": pid, "address": p.get("address"),
+         "imap_host": p.get("imap_host"), "smtp_host": p.get("smtp_host")}
+        for pid, p in profiles.items()
+    ]
+
+
+# --- Output ------------------------------------------------------------------
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value if value.endswith("\n") else value + "\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _read_body(src: str | None) -> str:
+    if src is None or src == "-":
+        return sys.stdin.read()
+    p = Path(src)
+    return p.read_text() if p.exists() else src
+
+
+def _safe_filename(name: str | None, uid: str, idx: int, content_type: str) -> str:
+    if not name:
+        ext = mimetypes.guess_extension(content_type or "") or ".bin"
+        return f"attachment_{uid}_{idx}{ext}"
+    name = os.path.basename(name).replace("/", "_").replace("\\", "_").lstrip(".")
+    return name or f"attachment_{uid}_{idx}"
+
+
+# --- IMAP --------------------------------------------------------------------
+
+def _imap(cfg: dict) -> MailBox:
+    try:
+        mb = MailBox(cfg["imap_host"], port=cfg["imap_port"])
+        mb.login(cfg["user"], cfg["password"], initial_folder="INBOX")
+        return mb
+    except MailboxLoginError as e:
+        _die(2, "login_rejected", f"IMAP login failed: {e}",
+             "check the mailbox address and its app password")
+    except (OSError, ssl.SSLError) as e:
+        _die(5, "imap_unreachable", f"cannot reach IMAP {cfg['imap_host']}:{cfg['imap_port']}: {e}")
+
+
+def _criteria(unread: bool, since: str | None):
+    kw = {}
+    if unread:
+        kw["seen"] = False
+    if since:
+        try:
+            kw["date_gte"] = datetime.strptime(since, "%Y-%m-%d").date()
+        except ValueError:
+            _die(6, "bad_date", f"--since must be YYYY-MM-DD, got {since!r}")
+    return AND(**kw) if kw else "ALL"
+
+
+def _one(mb: MailBox, uid: str, mark_seen: bool):
+    msgs = list(mb.fetch(AND(uid=str(uid)), mark_seen=mark_seen, bulk=False))
+    if not msgs:
+        _die(3, "not_found", f"no message with uid {uid} in this folder")
+    return msgs[0]
+
+
+# --- Commands ----------------------------------------------------------------
+
+def cmd_doctor(cfg: dict) -> dict:
+    with _imap(cfg) as mb:
+        mb.folder.set("INBOX")
+        total = len(mb.uids("ALL"))
+        unseen = len(mb.uids(AND(seen=False)))
+    # SMTP check
+    try:
+        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=30) as s:
+            s.starttls(context=ssl.create_default_context())
+            s.login(cfg["user"], cfg["password"])
+        smtp_ok = True
+    except smtplib.SMTPAuthenticationError as e:
+        _die(2, "smtp_auth", f"SMTP login failed: {e}")
+    except (OSError, smtplib.SMTPException) as e:
+        _die(5, "smtp_unreachable", f"cannot reach SMTP {cfg['smtp_host']}:{cfg['smtp_port']}: {e}")
+    return {
+        "ok": True, "user": cfg["user"],
+        "imap": f"{cfg['imap_host']}:{cfg['imap_port']}", "smtp_ok": smtp_ok,
+        "inbox_total": total, "inbox_unseen": unseen,
+    }
+
+
+def cmd_list(cfg: dict, folder: str, unread: bool, since: str | None, limit: int) -> list:
+    out = []
+    with _imap(cfg) as mb:
+        if folder != "INBOX":
+            mb.folder.set(folder)
+        for m in mb.fetch(_criteria(unread, since), mark_seen=False,
+                          headers_only=True, bulk=False, reverse=True, limit=limit):
+            out.append({
+                "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
+                "date": m.date_str, "from": m.from_, "to": list(m.to),
+                "subject": m.subject, "seen": "\\Seen" in m.flags,
+            })
+    return out
+
+
+def cmd_show(cfg: dict, uid: str, folder: str) -> dict:
+    with _imap(cfg) as mb:
+        if folder != "INBOX":
+            mb.folder.set(folder)
+        m = _one(mb, uid, mark_seen=False)
+        return {
+            "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
+            "date": m.date_str, "from": m.from_, "to": list(m.to), "cc": list(m.cc),
+            "subject": m.subject, "seen": "\\Seen" in m.flags,
+            "text": m.text or m.html, "has_html": bool(m.html),
+            "attachments": [
+                {"filename": a.filename, "content_type": a.content_type, "size": a.size}
+                for a in m.attachments
+            ],
+        }
+
+
+def cmd_fetch(cfg: dict, uid: str, folder: str, save_dir: str, mark_seen: bool) -> dict:
+    out_dir = Path(save_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    with _imap(cfg) as mb:
+        if folder != "INBOX":
+            mb.folder.set(folder)
+        m = _one(mb, uid, mark_seen=mark_seen)
+        for i, a in enumerate(m.attachments):
+            fname = _safe_filename(a.filename, uid, i, a.content_type)
+            dest = out_dir / fname
+            dest.write_bytes(a.payload)
+            saved.append({"path": str(dest), "content_type": a.content_type, "size": a.size})
+    return {"uid": uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
+            "saved": saved, "marked_seen": mark_seen}
+
+
+def cmd_seen(cfg: dict, uid: str, folder: str, unsee: bool) -> dict:
+    with _imap(cfg) as mb:
+        if folder != "INBOX":
+            mb.folder.set(folder)
+        _one(mb, uid, mark_seen=False)  # validate existence
+        mb.flag(str(uid), MailMessageFlags.SEEN, not unsee)
+    return {"uid": uid, "seen": not unsee}
+
+
+def cmd_folders(cfg: dict) -> list:
+    with _imap(cfg) as mb:
+        return [{"name": f.name, "delimiter": f.delim} for f in mb.folder.list()]
+
+
+def cmd_move(cfg: dict, uid: str, folder: str, to_folder: str) -> dict:
+    with _imap(cfg) as mb:
+        if folder != "INBOX":
+            mb.folder.set(folder)
+        _one(mb, uid, mark_seen=False)  # validate existence in source folder
+        mb.move(str(uid), to_folder)
+    return {"uid": uid, "from_folder": folder, "moved_to": to_folder}
+
+
+def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
+             body: str, attach: list[str], in_reply_to: str | None) -> dict:
+    msg = EmailMessage()
+    msg["From"] = cfg["user"]
+    msg["To"] = ", ".join(to)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg["Subject"] = subject
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
+    msg.set_content(body)
+    for f in attach:
+        p = Path(f)
+        if not p.exists():
+            _die(6, "attachment_missing", f"attachment not found: {f}")
+        ctype, _ = mimetypes.guess_type(p.name)
+        maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
+        msg.add_attachment(p.read_bytes(), maintype=maintype, subtype=subtype, filename=p.name)
+    try:
+        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=30) as s:
+            s.starttls(context=ssl.create_default_context())
+            s.login(cfg["user"], cfg["password"])
+            s.send_message(msg)
+    except smtplib.SMTPAuthenticationError as e:
+        _die(2, "smtp_auth", f"SMTP login failed: {e}")
+    except (OSError, smtplib.SMTPException) as e:
+        _die(5, "send_failed", f"send failed: {e}")
+    return {"sent": True, "to": to, "cc": cc, "subject": subject,
+            "attachments": [Path(f).name for f in attach]}
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="mailbox", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--mailbox", default=None,
+                   help="profile id or address (optional if config has one mailbox)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("help", help="print the full usage contract")
+    sub.add_parser("mailboxes", help="list configured mailbox profiles")
+    sub.add_parser("doctor", help="validate IMAP + SMTP login")
+    sub.add_parser("folders", help="list IMAP folders")
+
+    sp = sub.add_parser("list", help="list messages (headers only)")
+    sp.add_argument("--folder", default="INBOX")
+    sp.add_argument("--unread", action="store_true")
+    sp.add_argument("--since", default=None, help="YYYY-MM-DD")
+    sp.add_argument("--limit", type=int, default=50)
+
+    sp = sub.add_parser("show", help="show one message")
+    sp.add_argument("uid")
+    sp.add_argument("--folder", default="INBOX")
+
+    sp = sub.add_parser("fetch", help="save a message's attachments")
+    sp.add_argument("uid")
+    sp.add_argument("--save-dir", required=True)
+    sp.add_argument("--folder", default="INBOX")
+    sp.add_argument("--mark-seen", action="store_true")
+
+    sp = sub.add_parser("seen", help="flag or unflag \\Seen")
+    sp.add_argument("uid")
+    sp.add_argument("--unsee", action="store_true")
+    sp.add_argument("--folder", default="INBOX")
+
+    sp = sub.add_parser("move", help="move a message to another folder")
+    sp.add_argument("uid")
+    sp.add_argument("--to-folder", required=True)
+    sp.add_argument("--folder", default="INBOX")
+
+    sp = sub.add_parser("send", help="send a message")
+    sp.add_argument("--to", action="append", required=True)
+    sp.add_argument("--cc", action="append", default=[])
+    sp.add_argument("--subject", required=True)
+    sp.add_argument("--body", default=None)
+    sp.add_argument("--body-file", default=None, help="file path or '-' for stdin")
+    sp.add_argument("--attach", action="append", default=[])
+    sp.add_argument("--in-reply-to", default=None)
+
+    args = p.parse_args()
+
+    if args.cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+    if args.cmd == "mailboxes":
+        _emit(_list_mailboxes())
+        return
+
+    cfg = _load_config(args.mailbox)
+    if args.cmd == "doctor":
+        _emit(cmd_doctor(cfg))
+    elif args.cmd == "folders":
+        _emit(cmd_folders(cfg))
+    elif args.cmd == "move":
+        _emit(cmd_move(cfg, args.uid, args.folder, args.to_folder))
+    elif args.cmd == "list":
+        _emit(cmd_list(cfg, args.folder, args.unread, args.since, args.limit))
+    elif args.cmd == "show":
+        _emit(cmd_show(cfg, args.uid, args.folder))
+    elif args.cmd == "fetch":
+        _emit(cmd_fetch(cfg, args.uid, args.folder, args.save_dir, args.mark_seen))
+    elif args.cmd == "seen":
+        _emit(cmd_seen(cfg, args.uid, args.folder, args.unsee))
+    elif args.cmd == "send":
+        body = args.body if args.body is not None else _read_body(args.body_file)
+        _emit(cmd_send(cfg, args.to, args.cc, args.subject, body, args.attach, args.in_reply_to))
+
+
+if __name__ == "__main__":
+    main()

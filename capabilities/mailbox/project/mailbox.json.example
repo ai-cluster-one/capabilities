@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy this file to mailbox.json (same folder) and fill it with this project's real mailbox profiles. NON-SECRET WIRING ONLY. Each key is a profile id you pick (pass it to --mailbox; optional when only one profile is defined). 'secret_env' names the env var holding that profile's app-password — set the value in the project's .env / .env.local (gitignored), NEVER here. Delete this _comment line in the real mailbox.json.",
+  "<profile-id>": {
+    "address": "user@example.com",
+    "imap_host": "imap.example.com",
+    "imap_port": 993,
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 587,
+    "secret_env": "MAILBOX_<PROFILE_ID>_APP_PASSWORD"
+  }
+}
