@@ -7,22 +7,20 @@ You are an LLM agent. The user wants to pull a newer version of an already-insta
 - The **capability** (or "all installed").
 - The **scope**: machine, project, or both.
 
-## 1. Refresh the source
+## 1. Re-fetch the global folder
 
-Make sure you have the latest repo (git pull, or re-fetch it). This repo is the source of truth — the author changes a capability here and pushes; you are the consumer pulling it back down.
+Re-fetch the capability folder from the repo into `~/.capabilities/<name>/`, overwriting the immutable copy in place (the same fetch step [INSTALL.md](../INSTALL.md) uses). This repo is the source of truth — the author changes a capability here and pushes; you are the consumer pulling it back down.
 
-## 2. Diff installed vs. repo
+- The registry folder is immutable, so a wholesale overwrite is correct. The PATH symlink and the skill symlink already point **into** the folder, so they need no change.
+- Re-`chmod +x` the executable. If `credentials.env.example` gained keys, add the empty keys to `~/.config/<name>/credentials.env` without touching existing values.
 
-For each artifact the manifest declares, compare what's installed against the repo version:
+## 2. Re-apply the project template, preserving local truth
 
-- **Global** (executable, stub, credentials *template*): these are the parts that legitimately change wholesale — a newer script, a richer stub, new env keys. Plan to replace them.
-- **Project** (capability file, assets): these carry **filled placeholders and local edits** you must not clobber. Treat the repo version as the new *template* and re-apply it **preserving** the resolved values, the project's identifiers, and any recorded deviations.
+The project assets under `.capabilities/<namespace>/` carry **filled placeholders and local edits** you must not clobber. Treat the refreshed `~/.capabilities/<name>/project/` as the new *template* and merge:
 
-## 3. Apply, preserving local truth
+- Where the new template adds a slot, asset, or pointer, apply it; preserve the resolved values, the project's identifiers, and any recorded deviations.
+- The `CAPABILITY.md` `@`-import regenerates automatically next session — no manual rule edit.
 
-- Replace global artifacts; re-`chmod +x` the executable; if the credentials template gained keys, add the empty keys to the existing credentials file without touching existing values.
-- For project artifacts, merge the new template structure with the existing filled values. Where the new template adds a slot or rule, apply it; where the project deliberately deviated (per the deviation log), keep the deviation.
-
-## 4. Re-audit
+## 3. Re-audit
 
 Run [audit.md](audit.md) afterward so any drift the update introduced (or resolved) is surfaced. Report what changed, what you preserved, and anything the user should review.

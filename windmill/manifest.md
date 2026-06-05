@@ -7,7 +7,7 @@ The declarative spec the [procedures](../procedures/) read to install / update /
 - **Name**: `windmill`
 - **Summary**: drive a Windmill instance (deploy scripts, attach cron schedules, run jobs, read run history/logs, manage secret variables and folders) over its REST API.
 - **Underlying service**: a Windmill instance (Community or EE). Not bundled — the user supplies one.
-- **Has authored artifacts**: yes — example scripts under `project/assets/scripts/`.
+- **Has authored artifacts**: yes — example scripts under `project/scripts/`.
 
 ## Dependencies
 
@@ -15,15 +15,17 @@ The declarative spec the [procedures](../procedures/) read to install / update /
 
 ## Global artifacts
 
+The capability folder installs, immutable, at `~/.capabilities/windmill/`; the rows below are surfaced from there (Claude Code host).
+
 | Source (repo) | Destination (requirement) |
 |---|---|
-| `global/bin/windmill` | somewhere on `PATH`, **executable** (`chmod +x`). Proven: `~/bin/windmill`. |
-| `global/stub.md` | a location **auto-loaded into every agent session**. Proven (Claude Code): `~/.claude/tools/windmill.md` + an `@`-import line in user-level `CLAUDE.md`. |
-| `global/credentials.env.example` | copied to the standard credentials home **with empty values**. Proven: `~/.config/windmill/credentials.env`. |
+| `bin/windmill` | `~/.capabilities/windmill/bin/windmill`, **executable** (`chmod +x`), symlinked into a `PATH` dir (`~/bin` or `~/.local/bin`) so `windmill` resolves by name. |
+| `stub.md` | `~/.capabilities/windmill/stub.md`, surfaced by symlinking it as `~/.claude/skills/windmill/SKILL.md` — front-matter `name` + `description` load every session, body on demand. |
+| `credentials.env.example` | copied to `~/.config/windmill/credentials.env` **with empty values**. |
 
 ## Credentials
 
-Env keys, resolved by the standard [4-tier cascade](../TEMPLATE.md#credential-resolution--the-cascade) (flags > project `.env(.local)` > user config > process env). All **must-confirm** — Windmill has no standard public endpoint, so the instance must be named by the user; none are guessable.
+Env keys, resolved by the standard [4-tier cascade](../DOCTRINE.md#the-credential-cascade) (flags > project `.env(.local)` > user config > process env). All **must-confirm** — Windmill has no standard public endpoint, so the instance must be named by the user; none are guessable.
 
 | Key | Secret? | Notes |
 |---|---|---|
@@ -35,13 +37,15 @@ Per-project override: a consuming project may set these in its own `.env` / `.en
 
 ## Project artifacts
 
+The whole `project/` template copies into `.capabilities/<namespace>/`; the project's `build-capabilities-rule.sh` regenerates `.claude/rules/CAPABILITIES.md` with an `@`-import of the entry file, which the harness expands inline each session.
+
 | Source (repo) | Destination |
 |---|---|
-| `project/capability.md` | `.claude/rules/capability/WINDMILL.md` (auto-loaded) |
-| `project/assets/identifiers.md` | `.capabilities/<namespace>/identifiers.md` |
-| `project/assets/reference.md` | `.capabilities/<namespace>/reference.md` |
-| `project/assets/windmill-guide.md` | `.capabilities/<namespace>/windmill-guide.md` |
-| `project/assets/scripts/` | `.capabilities/<namespace>/scripts/` (example scripts; adapt) |
+| `project/CAPABILITY.md` | `.capabilities/<namespace>/CAPABILITY.md` (entry file — `@`-imported into `.claude/rules/CAPABILITIES.md`) |
+| `project/identifiers.md` | `.capabilities/<namespace>/identifiers.md` |
+| `project/reference.md` | `.capabilities/<namespace>/reference.md` |
+| `project/windmill-guide.md` | `.capabilities/<namespace>/windmill-guide.md` |
+| `project/scripts/` | `.capabilities/<namespace>/scripts/` (example scripts; adapt) |
 
 ## Template variables
 
@@ -58,7 +62,7 @@ A capability is dysfunctional without its must-haves: here, the three `WINDMILL_
 
 Capability-specific conformance the audit should check, on top of the [template invariants](../TEMPLATE.md):
 
-- The project capability file is **lightweight** — role + pointer list, not a re-teaching of Windmill's command surface (that's `windmill help`).
+- `CAPABILITY.md` is **lightweight** — role + pointer list, not a re-teaching of Windmill's command surface (that's `windmill help`).
 - **No connection values in markdown** — `WINDMILL_URL`/workspace/token live in env, not `identifiers.md`.
 - **Platform gotchas live in `windmill help`**, not transcribed into the assets (timeout control, async-lock-after-deploy, worker slot model, no-PUT, scalar bare strings).
 - The example scripts carry **placeholders, not a real namespace / image / gids**.

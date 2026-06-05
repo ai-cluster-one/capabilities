@@ -1,6 +1,6 @@
 # Windmill — operational reference
 
-Project-specific operational context for driving Windmill via `~/bin/windmill`. Role + routing live in the capability file (`.claude/rules/capability/WINDMILL.md`). Fixed values and paths are in [identifiers.md](identifiers.md); how to write scripts is in [windmill-guide.md](windmill-guide.md).
+Project-specific operational context for driving Windmill via the `windmill` CLI. Role + routing live in the capability file ([CAPABILITY.md](CAPABILITY.md)). Fixed values and paths are in [identifiers.md](identifiers.md); how to write scripts is in [windmill-guide.md](windmill-guide.md).
 
 The CLI surface (commands, flags, platform behaviours, gotchas) is **self-documenting** — run `windmill help`. Don't restate it here; this file holds only what's specific to this project.
 

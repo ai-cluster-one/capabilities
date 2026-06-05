@@ -5,6 +5,11 @@ credentials.env
 .env.*.local
 *.local
 
+# Private working notes — grounded scratch (backlog, plans, session recaps).
+# Deliberately reference the cross-project conversations that produced them;
+# kept local so the public repo never ships those specifics.
+.assets/
+
 # OS / editor cruft
 .DS_Store
 *.swp

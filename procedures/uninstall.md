@@ -13,15 +13,16 @@ Open `<capability>/manifest.md` for the full list of artifacts and their homes, 
 
 ## 2. Project layer
 
-- Remove `.claude/rules/capability/<NAME>.md` and the `.capabilities/<namespace>/` tree.
+- Remove the `.capabilities/<namespace>/` tree. Next session's `build-capabilities-rule.sh` regenerates `.claude/rules/CAPABILITIES.md` without it — the capability's `@`-import drops on its own.
+- If this was the **last** capability in the project, you may also remove `.claude/hooks/build-capabilities-rule.sh`, its `SessionStart` entry in `.claude/settings.json` (leaving sibling hooks intact), and `.claude/rules/CAPABILITIES.md`. Otherwise leave the wiring — it's capability-agnostic.
 - **Scan first** for references to the capability elsewhere in the project (other rules files, pointers, scripts). Report them so no dangling links are left behind.
 
 ## 3. Global layer
 
 Only if the user asked for machine-level removal:
 
-- Remove the executable from `PATH` and the stub from its auto-load location; remove the `@`-import line from the user-level `CLAUDE.md`.
-- **Credentials**: the file may hold real secrets. Show the user what you're about to remove and confirm explicitly before deleting it. Offer to keep it (orphaned but harmless) if they're unsure.
+- Remove the PATH symlink (`~/bin/<name>` or `~/.local/bin/<name>`), the skill symlink (`~/.claude/skills/<name>/`), and the registry folder (`~/.capabilities/<name>/`).
+- **Credentials**: `~/.config/<name>/credentials.env` may hold real secrets. Show the user what you're about to remove and confirm explicitly before deleting it. Offer to keep it (orphaned but harmless) if they're unsure.
 
 ## 4. Record and report
 

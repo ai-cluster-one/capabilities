@@ -1,0 +1,901 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+#     "click>=8.1",
+# ]
+# ///
+"""directo — agent-first CLI for a Directo ERP instance (login.directo.ee).
+
+This tool is designed to be invoked by agents. Run `directo help` to load the
+full usage contract on demand — do not rely on memorised knowledge of its
+surface. It is identity-free: it knows nothing about any consuming project.
+Connection (database, credentials, location) comes from config/env/flags.
+
+Directo has no public API; this drives the same browser-session endpoints the
+web UI uses. Auth is a three-step ceremony (see `directo help`); the resulting
+session cookie is persisted back to the user config and auto-renewed on expiry.
+
+Credentials resolve in a 4-tier cascade (first non-empty wins):
+  1. flags          --username / --password / --db / --koht
+  2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
+  3. user config    $XDG_CONFIG_HOME/directo/credentials.env (default ~/.config/directo/)
+  4. process env    DIRECTO_USERNAME / DIRECTO_PASSWORD / DIRECTO_DB / DIRECTO_KOHT / DIRECTO_COOKIE
+Same DIRECTO_* keys at every tier; the project you're in wins, process env is the
+fallback (so a deployed host's injected env governs when no config file is present).
+Never pass the password on the command line outside a throwaway shell.
+"""
+from __future__ import annotations
+
+import hashlib
+import html as html_mod
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+import click
+import httpx
+
+# ─── Constants ───────────────────────────────────────────────────────────────
+
+HOST = "https://login.directo.ee"
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+)
+DEFAULT_KOHT = "L01"  # session default when none is selected or stored
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CONFIG_DIR = _CONFIG_HOME / "directo"
+CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
+# Persisted back by `login`; the rest are user-supplied primaries.
+CRED_KEYS = ("DIRECTO_USERNAME", "DIRECTO_PASSWORD", "DIRECTO_DB", "DIRECTO_KOHT", "DIRECTO_COOKIE")
+
+HELP = """directo — agent-first CLI for a Directo ERP instance.
+
+Directo exposes no public API. This tool reproduces the browser-session calls the
+web UI makes against https://login.directo.ee/<db>/. Load this contract on demand;
+do not rely on memorised surface knowledge.
+
+AUTH — the three-step ceremony (login mints the session):
+  1. GET  /<db>/keeks.asp                      seeds cookie=x + ASPSESSIONID*
+  2. POST /<db>/keeks.asp   nimi+sala+login=1   credential entry → place-selection page
+  3. POST /<db>/keeks_koht.asp  koht=<CODE>      pick a location → authenticated session
+The session is (chuser + ASPSESSIONID); it is bound to the chosen location (koht).
+`login` runs all three and writes DIRECTO_COOKIE + DIRECTO_KOHT back to the user config.
+
+LOCATION (koht) is a per-session selection, not a fixed preset. Pass --koht to choose;
+if omitted, the last-selected DIRECTO_KOHT is reused, else the default ({default}).
+Run `directo kohts` to list the locations this login offers. Ask the user which
+location they want before acting when it matters.
+
+CREDENTIALS — 4-tier cascade (flags > project .env(.local) > user config > process env):
+  DIRECTO_USERNAME  DIRECTO_PASSWORD  DIRECTO_DB  DIRECTO_KOHT  DIRECTO_COOKIE
+User config: {cfg}
+
+COMMANDS:
+  directo help                       this contract
+  directo doctor                     validate the session (auto-login on expiry); show active
+                                     db/koht — start here on the first call of a session
+  directo login [--koht CODE]        run the full ceremony; persist session + location
+  directo kohts                      list the locations this login offers (code + label)
+  directo api <action> [-p k=v ...]  authed GET of components_api.asp?action=<action>&...; prints JSON
+  directo get <path> [-p k=v ...]    authed GET of an arbitrary /<db>-relative path; prints body
+  directo schema <asp>               dump a report form's parameter schema (fields, options,
+                                     lisa:* filter enums) — read before reaching for -p
+  directo report <asp> [--from D --to D] [-p k=v ...]
+                                     run a report → compact manifest (stdout) + full typed rows
+                                     sidecar (on disk). --from/--to → aeg1/aeg2 (dd.mm.yyyy);
+                                     showall=jee added for you. --refresh bypasses cache,
+                                     --tsv writes TSV, --raw emits the underlying HTML.
+  directo fetch <asp> [...]          fetch raw HTML into the cache, print its path (network only)
+  directo render <asp> [...] [--file F]   render cached/given HTML → manifest (no network)
+  directo cache list|prune|clear     inspect / sweep the on-disk cache (~/.cache/directo/<db>/);
+                                     e.g. cache prune --older-than 7d
+
+REPORTS — form is the schema, the manifest is the answer. A report page (e.g.
+mr_aru_art_stat.asp) is server-rendered HTML; its form declares the settable fields
+(date range, filters like artikkel/klass/klient/ladu/objekt/projekt/myyja, and mode
+selects like mida/naita/sortby/grupp — many gated by `tükelda`). Read them with
+`directo schema`. `report` GETs them, caches the raw HTML, and renders the result —
+either a flat `list` or a pivot `matrix` — into an envelope: typed columns, the
+report's own grand totals, a `truncated` flag, a preview, and the path to the full
+NDJSON rows. Fetch is split from render: re-parse cached HTML with `render`, no refetch.
+To break a report down by an attribute, set a time bucket: `-p tykk=<BUCKET> -p
+mida=<DIM> -p naita=<MEASURE>` renders the matrix; without `tykk`, mida/naita are ignored.
+
+Every authed call self-heals: a session that has expired (302 → login) triggers a
+re-login from DIRECTO_USERNAME/PASSWORD, then the call is retried once.
+
+ONE SESSION PER LOGIN: re-authenticating a login anywhere (another host, a browser
+sign-in) rotates the server session and invalidates the prior cookie — two actors on
+one login keep evicting each other. Use one login per concurrent actor.
+""".format(default=DEFAULT_KOHT, cfg=CREDENTIALS_ENV)
+
+
+# ─── Errors ──────────────────────────────────────────────────────────────────
+
+class AuthError(click.ClickException):
+    pass
+
+
+# ─── Config cascade (flags > project .env > user config > process env) ───────
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_env() -> dict[str, str]:
+    """Nearest project .env(.local), walking up from $CLAUDE_PROJECT_DIR (else cwd).
+    .env.local overrides .env. Stops at the first dir holding either, or a .git root."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    for d in (here, *here.parents):
+        if (d / ".env").exists() or (d / ".env.local").exists():
+            merged = _parse_env_file(d / ".env")
+            merged.update(_parse_env_file(d / ".env.local"))
+            return merged
+        if (d / ".git").is_dir():
+            break
+    return {}
+
+
+def resolve_config(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """First non-empty wins per key: flag > project .env(.local) > user config > process env."""
+    overrides = {k: v for k, v in (overrides or {}).items() if v}
+    project = _project_env()
+    user = _parse_env_file(CREDENTIALS_ENV)
+    out: dict[str, str] = {}
+    for key in CRED_KEYS:
+        out[key] = (overrides.get(key)
+                    or project.get(key)
+                    or user.get(key)
+                    or os.environ.get(key)
+                    or "")
+    return out
+
+
+def _persist_session(cookie_str: str, koht: str) -> None:
+    """Write DIRECTO_COOKIE + DIRECTO_KOHT back to the user config, preserving the rest."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    existing = _parse_env_file(CREDENTIALS_ENV)
+    existing["DIRECTO_COOKIE"] = cookie_str
+    existing["DIRECTO_KOHT"] = koht
+    lines = [
+        "# directo credentials.",
+        "# Auto-login (primary): DIRECTO_USERNAME + DIRECTO_PASSWORD → `directo login`.",
+        "# DIRECTO_DB is the database/instance segment in the URL path (login.directo.ee/<db>/...).",
+        "# DIRECTO_KOHT is the active place/location for the session — written by `directo login`.",
+        "# DIRECTO_COOKIE is the live session — written by `directo login`. Never commit a value.",
+    ]
+    for key in CRED_KEYS:
+        if existing.get(key):
+            lines.append(f"{key}='{existing[key]}'")
+    CREDENTIALS_ENV.write_text("\n".join(lines) + "\n")
+    os.chmod(CREDENTIALS_ENV, 0o600)
+
+
+# ─── URLs ────────────────────────────────────────────────────────────────────
+
+def _base(db: str) -> str:
+    return f"{HOST}/{db}"
+
+
+def _login_url(db: str) -> str:
+    return f"{_base(db)}/keeks.asp?/{db}/default2.asp?"
+
+
+def _koht_url(db: str) -> str:
+    return f"{_base(db)}/keeks_koht.asp?/{db}/default2.asp?"
+
+
+def parse_cookie_string(s: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for pair in s.split(";"):
+        if "=" in pair:
+            k, _, v = pair.strip().partition("=")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def parse_kohts(html: str) -> list[str]:
+    """Location codes offered on the keeks_koht place-selection page."""
+    seen: list[str] = []
+    for code in re.findall(r"vali_koht\('([^']+)'\)", html):
+        if code not in seen:
+            seen.append(code)
+    return seen
+
+
+# ─── Login ceremony ──────────────────────────────────────────────────────────
+
+def _base_headers() -> dict[str, str]:
+    return {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+def do_login(username: str, password: str, db: str, koht: str) -> tuple[str, str]:
+    """Run the three-step ceremony. Returns (cookie_string, selected_koht).
+
+    Raises AuthError on rejected credentials or an unavailable location."""
+    if not username or not password:
+        raise AuthError(
+            "Auto-login needs DIRECTO_USERNAME + DIRECTO_PASSWORD.\n"
+            f"  → set them in {CREDENTIALS_ENV} (or a project .env / the environment)."
+        )
+    if not db:
+        raise AuthError("DIRECTO_DB is required (the database segment in login.directo.ee/<db>/).")
+
+    with httpx.Client(headers=_base_headers(), follow_redirects=True, timeout=30) as c:
+        c.get(_login_url(db))  # step 1: seed cookie=x + ASPSESSIONID
+        r = c.post(  # step 2: credential entry
+            _login_url(db),
+            data={
+                "nimi": username, "sala": password, "login": "1",
+                "reso": "", "resor": "", "resow": "", "resoh": "",
+            },
+            headers={"Origin": HOST, "Referer": _login_url(db),
+                     "Content-Type": "application/x-www-form-urlencoded"},
+        )
+        body = r.text
+        # Still on the credential form → bad username/password.
+        if 'name="sala"' in body and "keeks_koht" not in body and "vali_koht" not in body:
+            raise AuthError("Login rejected — check DIRECTO_USERNAME / DIRECTO_PASSWORD.")
+
+        # Step 3: location selection, if the place page is presented.
+        if "keeks_koht" in str(r.url) or "vali_koht" in body:
+            available = parse_kohts(body)
+            if available and koht not in available:
+                raise AuthError(
+                    f"Location '{koht}' is not offered by this login. "
+                    f"Available: {', '.join(available)}. Pass --koht <CODE>."
+                )
+            c.post(
+                _koht_url(db),
+                data={"koht": koht},
+                headers={"Origin": HOST, "Referer": _koht_url(db),
+                         "Content-Type": "application/x-www-form-urlencoded"},
+            )
+
+        cookies = dict(c.cookies)
+
+    if "chuser" not in cookies:
+        raise AuthError("Login completed without a chuser cookie — the flow may have changed.")
+    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    # Verify the session actually authenticates against the API surface.
+    if not _session_ok(db, cookies):
+        raise AuthError("Login produced a session that does not authenticate (verification call failed).")
+    return cookie_str, koht
+
+
+def list_kohts(username: str, password: str, db: str) -> list[str]:
+    """Reach the place-selection page and return the offered location codes."""
+    if not username or not password:
+        raise AuthError("Listing locations needs DIRECTO_USERNAME + DIRECTO_PASSWORD.")
+    with httpx.Client(headers=_base_headers(), follow_redirects=True, timeout=30) as c:
+        c.get(_login_url(db))
+        r = c.post(
+            _login_url(db),
+            data={"nimi": username, "sala": password, "login": "1",
+                  "reso": "", "resor": "", "resow": "", "resoh": ""},
+            headers={"Origin": HOST, "Referer": _login_url(db),
+                     "Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if 'name="sala"' in r.text and "vali_koht" not in r.text:
+            raise AuthError("Login rejected — check DIRECTO_USERNAME / DIRECTO_PASSWORD.")
+        return parse_kohts(r.text)
+
+
+# ─── Authed requests (self-healing) ──────────────────────────────────────────
+
+def _session_ok(db: str, cookies: dict[str, str]) -> bool:
+    try:
+        with httpx.Client(headers={"User-Agent": UA}, follow_redirects=False, timeout=30) as c:
+            r = c.get(f"{_base(db)}/components_api.asp", params={"action": "calendar_info"},
+                      cookies=cookies)
+            return r.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def _is_expired(r: httpx.Response) -> bool:
+    # An unauthenticated session 302-redirects to the login handler.
+    return r.status_code in (301, 302) and "keeks" in r.headers.get("location", "").lower()
+
+
+def authed_get(cfg: dict[str, str], path: str, params: dict[str, str]) -> httpx.Response:
+    """GET a /<db>-relative path with the stored session; re-login + retry once on expiry."""
+    db = cfg["DIRECTO_DB"]
+    if not db:
+        raise AuthError("DIRECTO_DB is required.")
+    cookies = parse_cookie_string(cfg.get("DIRECTO_COOKIE", ""))
+    url = f"{_base(db)}/{path.lstrip('/')}"
+    headers = {"User-Agent": UA, "Accept": "application/json, text/javascript, */*; q=0.01",
+               "X-Requested-With": "XMLHttpRequest"}
+
+    def hit(cks: dict[str, str]) -> httpx.Response:
+        with httpx.Client(headers=headers, follow_redirects=False, timeout=30) as c:
+            return c.get(url, params=params, cookies=cks)
+
+    if cookies:
+        r = hit(cookies)
+        if not _is_expired(r):
+            return r
+        click.echo("→ session expired, re-authenticating…", err=True)
+
+    koht = cfg.get("DIRECTO_KOHT") or DEFAULT_KOHT
+    cookie_str, koht = do_login(cfg["DIRECTO_USERNAME"], cfg["DIRECTO_PASSWORD"], db, koht)
+    _persist_session(cookie_str, koht)
+    return hit(parse_cookie_string(cookie_str))
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+
+def _common_overrides(username, password, db, koht) -> dict[str, str]:
+    return {"DIRECTO_USERNAME": username, "DIRECTO_PASSWORD": password,
+            "DIRECTO_DB": db, "DIRECTO_KOHT": koht}
+
+
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cli(ctx):
+    if ctx.invoked_subcommand is None:
+        click.echo(HELP)
+
+
+@cli.command("help")
+def help_cmd():
+    """Print the full usage contract."""
+    click.echo(HELP)
+
+
+@cli.command()
+@click.option("--username")
+@click.option("--password")
+@click.option("--db")
+def doctor(username, password, db):
+    """Validate the session; show active db / location; auto-login on expiry."""
+    cfg = resolve_config(_common_overrides(username, password, db, None))
+    click.echo(f"config file : {CREDENTIALS_ENV}{'' if CREDENTIALS_ENV.exists() else '  (missing)'}")
+    click.echo(f"database    : {cfg['DIRECTO_DB'] or '(unset)'}")
+    click.echo(f"location    : {cfg['DIRECTO_KOHT'] or '(unset → default ' + DEFAULT_KOHT + ')'}")
+    click.echo(f"username    : {cfg['DIRECTO_USERNAME'] or '(unset)'}")
+    cookies = parse_cookie_string(cfg.get("DIRECTO_COOKIE", ""))
+    if cookies and _session_ok(cfg["DIRECTO_DB"], cookies):
+        click.secho("session     : ✓ live", fg="green")
+        return
+    click.secho("session     : stale or missing — attempting auto-login…", fg="yellow")
+    koht = cfg.get("DIRECTO_KOHT") or DEFAULT_KOHT
+    cookie_str, koht = do_login(cfg["DIRECTO_USERNAME"], cfg["DIRECTO_PASSWORD"], cfg["DIRECTO_DB"], koht)
+    _persist_session(cookie_str, koht)
+    click.secho(f"session     : ✓ re-authenticated (location {koht})", fg="green")
+
+
+@cli.command()
+@click.option("--koht", help=f"location code to select (default: stored, else {DEFAULT_KOHT})")
+@click.option("--username")
+@click.option("--password")
+@click.option("--db")
+def login(koht, username, password, db):
+    """Run the full ceremony and persist the session + location."""
+    cfg = resolve_config(_common_overrides(username, password, db, koht))
+    chosen = koht or cfg.get("DIRECTO_KOHT") or DEFAULT_KOHT
+    cookie_str, chosen = do_login(cfg["DIRECTO_USERNAME"], cfg["DIRECTO_PASSWORD"], cfg["DIRECTO_DB"], chosen)
+    _persist_session(cookie_str, chosen)
+    click.secho(f"✓ logged in to {cfg['DIRECTO_DB']} at location {chosen}", fg="green")
+    click.echo(f"  session written to {CREDENTIALS_ENV}")
+
+
+@cli.command()
+@click.option("--username")
+@click.option("--password")
+@click.option("--db")
+def kohts(username, password, db):
+    """List the locations this login offers."""
+    cfg = resolve_config(_common_overrides(username, password, db, None))
+    codes = list_kohts(cfg["DIRECTO_USERNAME"], cfg["DIRECTO_PASSWORD"], cfg["DIRECTO_DB"])
+    if not codes:
+        click.echo("(no location selection presented — this login may have a single implicit location)")
+        return
+    active = cfg.get("DIRECTO_KOHT") or DEFAULT_KOHT
+    for code in codes:
+        marker = "  ← active" if code == active else ""
+        click.echo(f"  {code}{marker}")
+
+
+def _emit(r: httpx.Response) -> None:
+    ct = r.headers.get("content-type", "")
+    text = r.text
+    if "json" in ct:
+        try:
+            click.echo(json.dumps(r.json(), ensure_ascii=False, indent=2))
+            return
+        except json.JSONDecodeError:
+            pass
+    click.echo(text)
+
+
+# ─── Cache (the artifact `render` re-reads; the network step is memoised here) ─
+
+_CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+CACHE_ROOT = _CACHE_HOME / "directo"
+
+
+def _cache_dir(db: str) -> Path:
+    d = CACHE_ROOT / re.sub(r"[^A-Za-z0-9_.-]", "_", db or "default")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _cache_key(asp: str, params: dict[str, str]) -> str:
+    """Deterministic, content-addressed: same report+params → same key → same files."""
+    canon = asp + "?" + "&".join(f"{k}={params[k]}" for k in sorted(params))
+    return hashlib.sha1(canon.encode("utf-8")).hexdigest()[:16]
+
+
+# ─── Report rendering (HTML result table → typed envelope) ───────────────────
+# Directo serves results as an HTML table under shared `data_table_*` classes,
+# in one of two shapes: a flat `list` (one row per article) or a `matrix` (the
+# pivot produced when a `tükelda` time-bucket is set — rows = the `mida`
+# dimension, columns = periods). The renderer detects the shape and is generic
+# across reports; per-report meaning (what a code stands for) is the consumer's.
+
+_WS = re.compile(r"\s+")
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _clean(s: str) -> str:
+    return _WS.sub(" ", html_mod.unescape(_TAG.sub(" ", s))).strip()
+
+
+def _row_cells(row_html: str) -> list[str]:
+    """Cells of one <tr>, split on <td>/<th> *starts* — Directo's pivot rows nest
+    unclosed cells (`<td class="dt">M<td>Käive<td ...>`), so closing-tag pairing
+    loses them. Splitting on openers segments correctly regardless."""
+    inner = re.sub(r"(?is)^.*?<tr[^>]*>", "", row_html, count=1)
+    inner = re.sub(r"(?is)</tr>.*$", "", inner)
+    return [_clean(p) for p in re.split(r"(?i)<t[dh][^>]*>", inner)[1:]]
+
+
+def _num(s):
+    """Estonian-formatted number → float, else None. Space/NBSP thousands; '.' or
+    ',' decimal."""
+    if not isinstance(s, str):
+        return s if isinstance(s, (int, float)) else None
+    t = s.replace("\xa0", "").replace(" ", "").strip()
+    if not t or t in {"-", "."}:
+        return None
+    t = t.replace(",", ".") if ("," in t and "." not in t) else t.replace(",", "")
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _typed(s: str):
+    n = _num(s)
+    return n if n is not None else s
+
+
+def _heads(page: str) -> list[str]:
+    return re.findall(r'(?is)<tr[^>]*class="data_table_head[^"]*"[^>]*>.*?</tr>', page)
+
+
+def _is_matrix(page: str) -> bool:
+    return bool(re.search(r'(?i)<td\s+class="dt"', page))
+
+
+def parse_list(page: str):
+    """Flat list: header row + `data_table_row`s; the trailing all-empty-label
+    `data_table_head` carries the report's own grand totals."""
+    heads = _heads(page)
+    cols = _row_cells(heads[0]) if heads else []
+    rows = []
+    for blk in re.findall(r'(?is)<tr[^>]*class="data_table_row[^"]*"[^>]*>.*?</tr>', page):
+        cells = _row_cells(blk)
+        if cols and len(cells) == len(cols):
+            rows.append({c: _typed(v) for c, v in zip(cols, cells)})
+        else:  # mismatch — positional keys, lossless
+            rows.append({str(i): _typed(v) for i, v in enumerate(cells)})
+    totals = {}
+    if len(heads) >= 2:
+        tcells = _row_cells(heads[-1])
+        if cols and tcells and not tcells[0]:
+            for c, v in zip(cols, tcells):
+                n = _num(v)
+                if n is not None:
+                    totals[c] = n
+    return cols, rows, totals
+
+
+def parse_matrix(page: str):
+    """Pivot: header `[dim, '', *periods, measure]`; each data row starts with a
+    `td.dt` dimension cell then `[code, measure, *period_values, row_total]`."""
+    heads = _heads(page)
+    hdr = _row_cells(heads[0]) if heads else []
+    row_dim = hdr[0] if hdr else "key"
+    measure = hdr[-1] if len(hdr) >= 2 else "value"
+    periods = hdr[2:-1]
+    rows = []
+    for blk in re.findall(r"(?is)<tr[^>]*>.*?</tr>", page):
+        if not re.search(r'(?i)<td\s+class="dt"', blk):
+            continue
+        cells = _row_cells(blk)
+        if len(cells) < 3:
+            continue
+        rec = {row_dim: cells[0]}
+        for p, v in zip(periods, cells[2:-1]):
+            rec[p] = _typed(v)
+        rec["_total"] = _typed(cells[-1])
+        rows.append(rec)
+    totals = {}
+    if len(heads) >= 2:
+        tcells = _row_cells(heads[-1])
+        for p, v in zip(periods, tcells[2:-1]):
+            n = _num(v)
+            if n is not None:
+                totals[p] = n
+        if tcells:
+            g = _num(tcells[-1])
+            if g is not None:
+                totals["_total"] = g
+    return row_dim, periods, measure, rows, totals
+
+
+def _col_type(rows, col) -> str:
+    vals = [r.get(col) for r in rows[:50] if r.get(col) not in (None, "")]
+    if vals and sum(isinstance(v, float) for v in vals) >= max(1, len(vals) // 2):
+        return "number"
+    return "text"
+
+
+def _detect_truncation(rows, totals) -> bool:
+    """A capped list silently undercounts. Compare the row-sum of each totalled
+    numeric column to the report's own total; a gap means rows were dropped."""
+    for col, tot in totals.items():
+        s = sum(r[col] for r in rows if isinstance(r.get(col), float))
+        if tot and abs(s - tot) > max(0.5, abs(tot) * 0.001):
+            return True
+    return False
+
+
+def render_envelope(asp: str, params: dict, page: str):
+    """Return (manifest, rows). The manifest is the compact, always-printed head;
+    `rows` is the full set written to the NDJSON sidecar."""
+    shape = "matrix" if _is_matrix(page) else "list"
+    if shape == "matrix":
+        row_dim, periods, measure, rows, totals = parse_matrix(page)
+        columns = (
+            [{"key": row_dim, "type": "text"}]
+            + [{"key": p, "type": "number"} for p in periods]
+            + [{"key": "_total", "type": "number"}]
+        )
+        extra = {"row_dim": row_dim, "periods": periods, "measure": measure}
+        truncated = False  # server pre-aggregates the pivot — nothing to cap
+    else:
+        cols, rows, totals = parse_list(page)
+        columns = [{"key": c, "type": _col_type(rows, c)} for c in cols]
+        extra = {}
+        truncated = _detect_truncation(rows, totals)
+    manifest = {
+        "report": asp[:-4] if asp.endswith(".asp") else asp,
+        "params": params,
+        "period": {"from": params.get("aeg1"), "to": params.get("aeg2")},
+        "shape": shape,
+        "columns": columns,
+        "totals": totals,
+        "row_count": len(rows),
+        "truncated": truncated,
+        **extra,
+    }
+    return manifest, rows
+
+
+def _write_render(cache_d: Path, key: str, manifest: dict, rows: list, tsv: bool = False):
+    """Write the NDJSON (or TSV) rows sidecar + the manifest json; return the
+    manifest enriched with on-disk paths."""
+    ext = "tsv" if tsv else "ndjson"
+    rows_path = cache_d / f"{key}.{ext}"
+    with rows_path.open("w", encoding="utf-8") as fh:
+        if tsv:
+            cols = [c["key"] for c in manifest["columns"]]
+            fh.write("\t".join(cols) + "\n")
+            for r in rows:
+                fh.write("\t".join("" if r.get(c) is None else str(r.get(c)) for c in cols) + "\n")
+        else:
+            for r in rows:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    manifest = {
+        **manifest,
+        "rows_path": str(rows_path),
+        "raw_path": str(cache_d / f"{key}.html"),
+    }
+    (cache_d / f"{key}.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return manifest
+
+
+# ─── Report-form schema (the form is the parameter schema) ───────────────────
+
+def parse_schema(asp: str, page: str) -> dict:
+    """Scrape the report form into a parameter schema: select fields with their
+    options, plus the `lisa:*` extra-field filter enums (e.g. RYHM ∈ N,L,M,A,…)
+    that live in JS. Read this instead of scraping the 100 KB form by hand."""
+    selects = {}
+    for m in re.finditer(r"(?is)<select[^>]*\bname=[\"']?(\w+)[\"']?[^>]*>(.*?)</select>", page):
+        if m.group(1) in selects:
+            continue  # first occurrence is the visible field; later ones are clone templates
+        opts = []
+        for o in re.finditer(r"(?is)<option[^>]*value=[\"']?([^\"'> ]*)[\"']?[^>]*>(.*?)</option>", m.group(2)):
+            label = _clean(o.group(2))
+            if o.group(1) or label:
+                opts.append({"value": o.group(1), "label": label})
+        selects[m.group(1)] = {"options": opts}
+    lisa = {}
+    for m in re.finditer(r"'lisa:(\w+)'\s*:\s*\{\s*'put'\s*:\s*'([^']*)'", page):
+        lisa[m.group(1)] = [v for v in m.group(2).split(",") if v != ""]
+    return {
+        "report": asp[:-4] if asp.endswith(".asp") else asp,
+        "fields": sorted(selects),
+        "selects": selects,
+        "lisa_enums": lisa,
+    }
+
+
+@cli.command()
+@click.argument("action")
+@click.option("--param", "-p", multiple=True, help="extra query param k=v (repeatable)")
+@click.option("--username")
+@click.option("--password")
+@click.option("--db")
+@click.option("--koht")
+def api(action, param, username, password, db, koht):
+    """Authed GET of components_api.asp?action=<action>&... — prints JSON."""
+    cfg = resolve_config(_common_overrides(username, password, db, koht))
+    params = {"action": action}
+    for kv in param:
+        k, _, v = kv.partition("=")
+        params[k] = v
+    r = authed_get(cfg, "components_api.asp", params)
+    if _is_expired(r):
+        raise AuthError("Still unauthenticated after re-login — check credentials / location.")
+    _emit(r)
+
+
+@cli.command()
+@click.argument("path")
+@click.option("--param", "-p", multiple=True, help="extra query param k=v (repeatable)")
+@click.option("--username")
+@click.option("--password")
+@click.option("--db")
+@click.option("--koht")
+def get(path, param, username, password, db, koht):
+    """Authed GET of an arbitrary /<db>-relative path — prints the body."""
+    cfg = resolve_config(_common_overrides(username, password, db, koht))
+    params = {}
+    for kv in param:
+        k, _, v = kv.partition("=")
+        params[k] = v
+    r = authed_get(cfg, path, params)
+    if _is_expired(r):
+        raise AuthError("Still unauthenticated after re-login — check credentials / location.")
+    _emit(r)
+
+
+def _norm_asp(report_asp: str) -> str:
+    return report_asp if report_asp.endswith(".asp") else f"{report_asp}.asp"
+
+
+def _build_params(date_from, date_to, param) -> dict:
+    params = {"showall": "jee"}
+    if date_from:
+        params["aeg1"] = date_from
+    if date_to:
+        params["aeg2"] = date_to
+    for kv in param:
+        k, _, v = kv.partition("=")
+        params[k] = v  # caller params win, including overriding showall/aeg*
+    return params
+
+
+def _ensure_fetched(cfg: dict, asp: str, params: dict, refresh: bool) -> tuple[Path, bool]:
+    """Return (raw_html_path, was_cached). The network step lives here and only
+    here; a present cache file is reused unless `refresh`."""
+    cache_d = _cache_dir(cfg["DIRECTO_DB"])
+    raw = cache_d / f"{_cache_key(asp, params)}.html"
+    if raw.exists() and not refresh:
+        return raw, True
+    r = authed_get(cfg, asp, params)
+    if _is_expired(r):
+        raise AuthError("Still unauthenticated after re-login — check credentials / location.")
+    raw.write_text(r.text, encoding="utf-8")
+    return raw, False
+
+
+def _emit_manifest(manifest: dict, rows: list, preview: int = 10) -> None:
+    out = {**manifest, "preview": rows[:preview]}
+    click.echo(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+# Shared option decorators keep the four data commands consistent.
+def _report_opts(f):
+    for opt in reversed([
+        click.argument("report_asp"),
+        click.option("--from", "date_from", help="period start → aeg1 (dd.mm.yyyy)"),
+        click.option("--to", "date_to", help="period end → aeg2 (dd.mm.yyyy)"),
+        click.option("--param", "-p", multiple=True, help="report parameter k=v (repeatable); see `directo help`"),
+        click.option("--username"),
+        click.option("--password"),
+        click.option("--db"),
+        click.option("--koht"),
+    ]):
+        f = opt(f)
+    return f
+
+
+@cli.command()
+@_report_opts
+@click.option("--refresh", is_flag=True, help="bypass the cache and refetch")
+@click.option("--tsv", is_flag=True, help="write the rows sidecar as TSV instead of NDJSON")
+@click.option("--raw", is_flag=True, help="emit the raw HTML instead of the envelope")
+def report(report_asp, date_from, date_to, param, username, password, db, koht, refresh, tsv, raw):
+    """Run a report → compact manifest (stdout) + full rows sidecar (on disk).
+
+    REPORT_ASP is the report page (e.g. mr_aru_art_stat). Settable parameters are
+    those on its form (see `directo schema <report>`) — pass with -p k=v. The run
+    trigger `showall=jee` and the date range are added for you. Fetches are cached
+    by (report, params); the manifest carries totals, a truncation flag, a preview,
+    and the path to the full typed rows. This is fetch + render in one call.
+    """
+    cfg = resolve_config(_common_overrides(username, password, db, koht))
+    asp = _norm_asp(report_asp)
+    params = _build_params(date_from, date_to, param)
+    raw_path, _ = _ensure_fetched(cfg, asp, params, refresh)
+    page = raw_path.read_text(encoding="utf-8")
+    if raw:
+        click.echo(page)
+        return
+    manifest, rows = render_envelope(asp, params, page)
+    manifest = _write_render(_cache_dir(cfg["DIRECTO_DB"]), _cache_key(asp, params), manifest, rows, tsv)
+    _emit_manifest(manifest, rows)
+
+
+@cli.command()
+@_report_opts
+@click.option("--refresh", is_flag=True, help="bypass the cache and refetch")
+def fetch(report_asp, date_from, date_to, param, username, password, db, koht, refresh):
+    """Fetch a report's raw HTML into the cache; print its path. The network step,
+    isolated — render/analyse it as a separate pass without refetching."""
+    cfg = resolve_config(_common_overrides(username, password, db, koht))
+    asp = _norm_asp(report_asp)
+    params = _build_params(date_from, date_to, param)
+    raw_path, cached = _ensure_fetched(cfg, asp, params, refresh)
+    click.echo(json.dumps({
+        "report": asp[:-4], "params": params,
+        "raw_path": str(raw_path), "cached": cached, "bytes": raw_path.stat().st_size,
+    }, ensure_ascii=False, indent=2))
+
+
+@cli.command()
+@_report_opts
+@click.option("--file", "from_file", type=click.Path(exists=True), help="render this HTML file instead of the cached fetch")
+@click.option("--tsv", is_flag=True, help="write the rows sidecar as TSV instead of NDJSON")
+def render(report_asp, date_from, date_to, param, username, password, db, koht, from_file, tsv):
+    """Render already-fetched HTML into the envelope — no network. Re-run this to
+    re-parse after a parser change; pass the same query (it re-derives the cache
+    key) or point at a file with --file."""
+    cfg = resolve_config(_common_overrides(username, password, db, koht))
+    asp = _norm_asp(report_asp)
+    params = _build_params(date_from, date_to, param)
+    cache_d = _cache_dir(cfg["DIRECTO_DB"])
+    if from_file:
+        page = Path(from_file).read_text(encoding="utf-8")
+    else:
+        raw = cache_d / f"{_cache_key(asp, params)}.html"
+        if not raw.exists():
+            raise click.ClickException(f"no cached fetch for these params — run `directo fetch {report_asp} …` first ({raw})")
+        page = raw.read_text(encoding="utf-8")
+    manifest, rows = render_envelope(asp, params, page)
+    manifest = _write_render(cache_d, _cache_key(asp, params), manifest, rows, tsv)
+    _emit_manifest(manifest, rows)
+
+
+@cli.command()
+@click.argument("report_asp")
+@click.option("--refresh", is_flag=True, help="refetch the form")
+@click.option("--username")
+@click.option("--password")
+@click.option("--db")
+@click.option("--koht")
+def schema(report_asp, refresh, username, password, db, koht):
+    """Dump a report form's parameter schema: select fields + options, plus the
+    `lisa:*` filter enums. Read this instead of scraping the form by hand."""
+    cfg = resolve_config(_common_overrides(username, password, db, koht))
+    asp = _norm_asp(report_asp)
+    cache_d = _cache_dir(cfg["DIRECTO_DB"])
+    form = cache_d / f"{asp[:-4]}.form.html"
+    if refresh or not form.exists():
+        r = authed_get(cfg, asp, {})  # no showall → the form, not the (heavy) result
+        if _is_expired(r):
+            raise AuthError("Still unauthenticated after re-login — check credentials / location.")
+        form.write_text(r.text, encoding="utf-8")
+    click.echo(json.dumps(parse_schema(asp, form.read_text(encoding="utf-8")), ensure_ascii=False, indent=2))
+
+
+def _parse_age(s: str) -> float:
+    m = re.fullmatch(r"(\d+)\s*([dhm])", s.strip().lower())
+    if not m:
+        raise click.ClickException("age must look like 7d / 24h / 30m")
+    return int(m.group(1)) * {"d": 86400, "h": 3600, "m": 60}[m.group(2)]
+
+
+@cli.group()
+def cache():
+    """Inspect and prune the on-disk report cache (raw HTML + rendered sidecars)."""
+
+
+@cache.command("list")
+def cache_list():
+    """Show cached files per database: count, total size, oldest entry."""
+    if not CACHE_ROOT.exists():
+        click.echo("cache empty"); return
+    now = time.time()
+    for db_dir in sorted(p for p in CACHE_ROOT.iterdir() if p.is_dir()):
+        files = list(db_dir.glob("*"))
+        size = sum(f.stat().st_size for f in files)
+        oldest = min((f.stat().st_mtime for f in files), default=now)
+        click.echo(f"{db_dir.name}: {len(files)} files, {size/1024:.0f} KiB, oldest {(now-oldest)/86400:.1f}d")
+
+
+@cache.command("prune")
+@click.option("--older-than", default="7d", help="delete cache files older than this (e.g. 7d, 24h)")
+def cache_prune(older_than):
+    """Delete cache files past an age — the residual sweep for system health."""
+    cutoff = time.time() - _parse_age(older_than)
+    removed = bytes_freed = 0
+    if CACHE_ROOT.exists():
+        for f in CACHE_ROOT.rglob("*"):
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                bytes_freed += f.stat().st_size
+                f.unlink()
+                removed += 1
+    click.echo(f"pruned {removed} files, freed {bytes_freed/1024:.0f} KiB (older than {older_than})")
+
+
+@cache.command("clear")
+@click.confirmation_option(prompt="Delete the entire directo report cache?")
+def cache_clear():
+    """Delete every cached file."""
+    removed = 0
+    if CACHE_ROOT.exists():
+        for f in CACHE_ROOT.rglob("*"):
+            if f.is_file():
+                f.unlink(); removed += 1
+    click.echo(f"cleared {removed} files")
+
+
+if __name__ == "__main__":
+    cli()

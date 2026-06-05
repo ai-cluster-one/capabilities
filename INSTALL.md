@@ -1,0 +1,168 @@
+# Install a capability
+
+You are an agent. Someone gave you a link to this file and said, in effect, *"install a capability for me."* This file is the whole installer — there is no script to run and nothing to clone. You read it, ask which capability, and place a handful of files by reasoning about the machine you're on. Ask before you guess. Never write a real secret.
+
+The repository is `ai-cluster-one/capabilities` on `main`. Raw files are at
+`https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/<path>`.
+
+## 0. Identify your host
+
+A capability is surfaced into a session differently per agent host. Detect which one you are and follow that section. Today this file covers **Claude Code**; another host adds its own section.
+
+If you are **Claude Code**, continue below.
+
+## 1. Pick the capability
+
+List the catalogue and ask the user which one to install (and whether they want the project layer too — see step 3):
+
+```
+curl -fsSL https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/README.md
+```
+
+The capability index there names each top-level folder. Take the chosen name as `<name>` for the rest of this file.
+
+## 2. Global layer — the machine, once per capability
+
+The capability lives, immutable, in a per-host-neutral registry at `~/.capabilities/<name>/`, and two symlinks surface it: one puts its CLI on PATH, one puts its stub into every session.
+
+**a. Fetch the capability folder into the registry.** No clone, no working tree — just the one folder:
+
+```
+mkdir -p "$HOME/.capabilities"
+curl -fsSL https://codeload.github.com/ai-cluster-one/capabilities/tar.gz/refs/heads/main \
+  | tar -xz -C "$HOME/.capabilities" --strip-components=1 capabilities-main/<name>
+```
+
+(If the repo is private, use `gh` with the user's auth instead.) Re-running this is how an update lands — it overwrites the immutable folder in place.
+
+**b. Put the CLI on PATH.** The executable is at `~/.capabilities/<name>/bin/<name>`. Make it executable and symlink it into a directory already on `PATH` (prefer `~/bin`, else `~/.local/bin`; if neither is on `PATH`, create `~/.local/bin`, symlink there, and tell the user to add it to `PATH` once):
+
+```
+chmod +x "$HOME/.capabilities/<name>/bin/<name>"
+ln -sf "$HOME/.capabilities/<name>/bin/<name>" "$HOME/bin/<name>"
+```
+
+**c. Put the stub into every session.** The stub is a skill: `~/.claude/skills/<name>/SKILL.md` is auto-discovered each session and its front-matter `name` + `description` surface as the capability's awareness line; its body loads on demand. Symlink it to the immutable source — the registry stays the one home:
+
+```
+mkdir -p "$HOME/.claude/skills/<name>"
+ln -sf "$HOME/.capabilities/<name>/stub.md" "$HOME/.claude/skills/<name>/SKILL.md"
+```
+
+**d. Credentials.** Copy the example to the standard home **with empty values**, then resolve the capability's template variables: ask for **must-confirm** values (a self-hosted URL, a token) and write them; leave **breadcrumb** keys empty in place. Read `~/.capabilities/<name>/manifest.md` for the variable classes.
+
+```
+mkdir -p "$HOME/.config/<name>"
+cp -n "$HOME/.capabilities/<name>/credentials.env.example" "$HOME/.config/<name>/credentials.env"
+```
+
+A real secret only ever lands in `~/.config/<name>/credentials.env` (or a project `.env`), never in the registry or any committed file.
+
+## 3. Project layer — the consuming project, if there is one
+
+The CLI is centralized (step 2) — a project never copies it; it calls `<name>` by PATH. The project layer is only the lightweight, project-specific knowledge, surfaced by one project-side loader.
+
+**a. Lay down the assets.** Copy the project template into `<project>/.capabilities/<ns>/` (infer `<ns>` from the project; confirm if unsure). The template `~/.capabilities/<name>/project/` holds the entry file `CAPABILITY.md` (front-matter `name` + `description` + role prose) plus `identifiers.md` and a self-describing `reference.md` scaffold, and — when the capability needs them — a `<name>-guide.md` and `scripts/`:
+
+```
+mkdir -p "<project>/.capabilities/<ns>"
+cp -R "$HOME/.capabilities/<name>/project/." "<project>/.capabilities/<ns>/"
+```
+
+Resolve placeholders: discover what you can (the namespace), ask for must-confirms, breadcrumb the rest as clearly-marked placeholders. Connection-level values go in the project's `.env` / `.env.local`, never the markdown.
+
+**b. Ensure the loader exists.** A `SessionStart` hook that echoes stub content into the session is capped at ~10k characters, so the project surfaces its `.capabilities/` registry a different way: a capability-agnostic generator at `.claude/hooks/build-capabilities-rule.sh` writes `.claude/rules/CAPABILITIES.md` — a manifest of `@`-imports, one per discovered `CAPABILITY.md`. The harness auto-loads the rule file and expands the imports inline, so the stubs land in context **uncapped**. If the generator isn't there, create it with exactly this content (it is the same for every project — drop a capability folder and it loads next session, with no edit here):
+
+```bash
+#!/bin/bash
+# Generate the capabilities rule file — the plug-in loader, rules-tier edition.
+# A SessionStart hook echoing stub content into the session is capped at ~10k
+# characters, so instead this writes .claude/rules/CAPABILITIES.md as a manifest
+# of @-imports — one per discovered .capabilities/<ns>/CAPABILITY.md. The harness
+# auto-loads the rule file and expands the imports inline, so the stubs land in
+# context uncapped. Source of truth stays in each CAPABILITY.md; this file is
+# generated, never hand-edited.
+#
+# Discovery is by folder glob (drop a folder, it loads — no registry, no list).
+# Regeneration is deterministic: identical capabilities produce identical bytes,
+# so the committed manifest only diffs when a capability is added or removed.
+
+CAP_DIR="$CLAUDE_PROJECT_DIR/.capabilities"
+RULE_FILE="$CLAUDE_PROJECT_DIR/.claude/rules/CAPABILITIES.md"
+
+# SessionStart delivers a JSON payload on stdin with a "source" field
+# (startup | resume | clear | compact). Read it defensively and fail open — an
+# unparseable payload still regenerates.
+input=$(cat 2>/dev/null)
+source=$(printf '%s' "$input" | sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+case "$source" in
+  startup|resume|compact|clear|"") : ;;  # regenerate
+  *) exit 0 ;;
+esac
+
+mkdir -p "$(dirname "$RULE_FILE")"
+
+# Build into a temp file, then move into place atomically so a concurrent reader
+# never sees a half-written rule.
+tmp="$(mktemp "${RULE_FILE}.XXXXXX")" || exit 0
+trap 'rm -f "$tmp"' EXIT
+
+{
+  echo "# Capabilities (installed)"
+  echo ""
+  echo "Each import below is a capability stub — its role plus pointers to load on demand. Routing context, not hard directives. Generated at session start from .capabilities/<ns>/CAPABILITY.md; do not hand-edit."
+  echo ""
+
+  FOUND=0
+  if [ -d "$CAP_DIR" ]; then
+    while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      # @-import path is relative to this rule file (.claude/rules/): climb two
+      # levels to the project root, then descend into .capabilities/.
+      echo "@../../.capabilities/$(basename "$(dirname "$f")")/CAPABILITY.md"
+      FOUND=$((FOUND + 1))
+    done < <(find "$CAP_DIR" -mindepth 2 -maxdepth 2 -name 'CAPABILITY.md' | sort)
+  fi
+
+  if [ "$FOUND" -eq 0 ]; then
+    echo "No capabilities installed."
+  fi
+} > "$tmp"
+
+mv -f "$tmp" "$RULE_FILE"
+trap - EXIT
+exit 0
+```
+
+Then `chmod +x .claude/hooks/build-capabilities-rule.sh`. The generated `.claude/rules/CAPABILITIES.md` is deterministic and safe to commit.
+
+**c. Wire the generator to run.** The project's `.claude/settings.json` runs the generator at `SessionStart`. **Merge — never overwrite.** Read the file (it may carry `permissions`, `enabledPlugins`, sibling hooks), then converge it on this, preserving everything else:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [
+        { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/build-capabilities-rule.sh\"" }
+      ] }
+    ]
+  }
+}
+```
+
+- no `settings.json` → create it with this block.
+- has it, no `SessionStart` → add the `SessionStart` array.
+- has `SessionStart` → append the command to the existing `hooks` array, keeping any siblings.
+- command already present → leave it.
+
+The command is the quoted, `$CLAUDE_PROJECT_DIR`-relative path so it resolves on any machine and survives paths with spaces.
+
+Wiring the generator and settings is once per project. Every capability after the first is just step 3a — drop the `.capabilities/<ns>/` folder; the generator picks it up next session.
+
+## 4. Verify and report
+
+- Run the capability's health check (`<name> doctor` or `<name> help`) to confirm the CLI resolves on PATH and finds its credentials.
+- Confirm `~/.claude/skills/<name>/SKILL.md` resolves (the stub surfaces next session).
+- If you're in a project, confirm `.claude/hooks/build-capabilities-rule.sh` is executable, the `SessionStart` hook names it, and running it once produces `.claude/rules/CAPABILITIES.md` with an `@`-import for the capability.
+
+Report what you placed where, and which credential keys are still empty (the breadcrumbs the user must fill).

@@ -1,54 +1,63 @@
 # capabilities
 
-A catalogue of **agent capabilities** — small, self-contained tools an LLM coding agent (Claude Code, Codex, …) can install into a machine and a project to gain a new ability: talk to Asana, drive Windmill, read a mailbox, keep books in SimplBooks.
+A catalogue of **agent capabilities** — small, self-contained tools an LLM coding agent (Claude Code, Codex, …) can install into a machine and a project to gain a new ability: drive a workflow engine, talk to a task tracker, read a mailbox, keep a set of books.
 
 Each capability is one top-level folder. The repo is **source and distribution** at once: a capability is authored/changed here, pushed to GitHub, and pulled into any consuming project by pointing an agent at this repo and running a procedure. No installer binary — the procedures are **plain-English instructions an LLM executes**, adapting to the environment by reasoning, not by hardcoded branches.
 
-> **Public repo.** Never commit a secret. Credentials ship only as `*.example` templates and empty-valued env breadcrumbs. A real token, key, URL-with-tenant, or VAT number must never land here.
+> **Public repo.** Never commit a secret. Credentials ship only as `*.example` templates and empty-valued env breadcrumbs. A real token, key, URL-with-tenant, or account number must never land here.
 
 ## Capability index
 
 | Capability | What it gives you | Has authored scripts? |
 |---|---|---|
 | [windmill/](windmill/) | drive a Windmill instance (deploy scripts, cron, jobs, vars) + the SSH-dispatch script pattern | yes |
+| [directo/](directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) | no |
 
-*(more get appended as they're extracted — Asana, mailbox, SimplBooks, Telegram, …)*
+*(more get appended as they're extracted.)*
+
+## Doctrine — the rules
+
+Every capability and routine obeys one set of rules, stated once in [DOCTRINE.md](DOCTRINE.md). Each rule carries its own **Validate** clause — so the [audit](procedures/audit.md) is just the routine that walks the doctrine and applies them. Read the doctrine for *what must hold and why*; read the template for *what a capability is made of*.
 
 ## How a capability is shaped
 
-Every capability follows one template — read [TEMPLATE.md](TEMPLATE.md). In short, two layers:
+Every capability fills one structural template — read [TEMPLATE.md](TEMPLATE.md). In short, two layers:
 
-- **Global** (machine-level, install once per host): the executable, its context **stub**, a credentials **template**. Declared *just enough to be visible*.
-- **Project** (repo-level, per consuming project): a lightweight capability file + `identifiers` / `reference` / `guide` assets (+ optional `scripts/`). This is where a consuming project **expands** on how it uses the capability.
+- **Global** (machine-level, install once per host): the executable, its context **stub**, a credentials **template**. The folder installs to `~/.capabilities/<name>/`; the CLI is symlinked onto `PATH` and the stub is surfaced as a skill (`~/.claude/skills/<name>/SKILL.md`). Declared *just enough to be visible*.
+- **Project** (repo-level, per consuming project): a lightweight `CAPABILITY.md` + `identifiers` + a self-describing `reference` scaffold, with a `guide` and `scripts/` as the capability needs them, under `.capabilities/<namespace>/`. A `SessionStart` hook regenerates `.claude/rules/CAPABILITIES.md` — an `@`-import manifest the harness expands inline — so they load each session. This is where a consuming project **expands** on how it uses the capability.
 
 A capability folder here mirrors that:
+
+The capability folder is **flat**, and the installer copies it verbatim — the folder *is* the install image:
 
 ```
 <capability>/
   manifest.md                 the declarative spec the procedures read
-  global/
-    bin/<name>                the executable (must end up on PATH, executable)
-    stub.md                   the context stub (must end up auto-loaded every session)
-    credentials.env.example   env keys, no values
-  project/
-    capability.md             → .claude/rules/capability/<NAME>.md (auto-loaded)
-    assets/                    → .capabilities/<namespace>/
-      identifiers.md          non-secret structural identifiers only
-      reference.md            seat/project-specific operational context
-      <name>-guide.md         the usage / authoring guide
-      scripts/                authored sources (optional; Windmill has them)
+  stub.md                     global stub (skill front-matter); → ~/.capabilities/<name>/stub.md, symlinked as ~/.claude/skills/<name>/SKILL.md
+  bin/<name>                  the executable; → ~/.capabilities/<name>/bin/<name>, symlinked onto PATH
+  credentials.env.example     env keys, no values; → ~/.config/<name>/credentials.env
+  project/                    → .capabilities/<namespace>/ in a consuming project
+    CAPABILITY.md             the entry file (role + pointers); @-imported into .claude/rules/CAPABILITIES.md
+    identifiers.md            non-secret structural identifiers only
+    reference.md              project-specific operational context (ships as a self-describing scaffold; populate on demand)
+    <name>-guide.md           the usage / authoring guide (optional; omit when `<name> help` covers it)
+    scripts/                  authored sources (optional; Windmill has them)
 ```
 
 Slots are **flat by default**. When one outgrows a single file, keep its `<slot>.md` as a thin index and move the focused files into a sibling `<slot>/` folder — see TEMPLATE's [*When a slot outgrows one file*](TEMPLATE.md#when-a-slot-outgrows-one-file).
+
+## Routines — the neighbouring consumer
+
+Capabilities exist to be *used*, and their primary consumer is the **routine**: a repeatable procedure — living in the consuming project, not here — that orchestrates one or more capabilities to do recurring work. The capability/routine boundary (model vs. procedure, reading vs. handling) is half of what defines a capability, so it's drawn here too: read [ROUTINES.md](ROUTINES.md).
 
 ## Procedures (the SOPs)
 
 Point an agent at the relevant file and let it run. Each is environment-aware and interactive (it asks before it guesses).
 
-- [procedures/install.md](procedures/install.md) — add a capability to this machine and/or the current project.
+- [INSTALL.md](INSTALL.md) — **the install entry point.** Give an agent this one link; it asks which capability and places everything (registry folder, CLI on PATH, stub, project assets, the loader). The only file a consumer needs to start.
 - [procedures/update.md](procedures/update.md) — pull newer versions of already-installed capabilities.
 - [procedures/uninstall.md](procedures/uninstall.md) — remove a capability cleanly.
-- [procedures/audit.md](procedures/audit.md) — the **validator**: a semantic, advisory drift check against the template.
+- [procedures/audit.md](procedures/audit.md) — the **validator**: a semantic, advisory drift check that applies every rule in the doctrine.
 
 ## Source → distribution → consumer
 
