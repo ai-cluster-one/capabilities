@@ -6,7 +6,7 @@ The doctrine ([../DOCTRINE.md](../DOCTRINE.md)) holds every rule and, with each,
 
 ## The unit and the scope
 
-- **Unit** — the measuring unit is one **capability**: its files across the slots (the stub, `CAPABILITY.md`, identifiers, reference, an optional guide, any scripts), on this machine and/or in a consuming project. "All installed" runs the routine once per capability.
+- **Unit** — the measuring unit is one **capability**: its files across the slots (the stub, `CAPABILITY.md`, identifiers, reference, any scripts), on this machine and/or in a consuming project. "All installed" runs the routine once per capability.
 - **Scope** — this project, this machine, or both.
 
 ## Run

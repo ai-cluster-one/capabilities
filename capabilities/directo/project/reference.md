@@ -1,6 +1,6 @@
 # Directo — reference
 
-> **Purpose.** Slot 6 — the standing home for *project-specific* operational context: prose about how **this project** uses Directo, where that's neither a value nor the command surface. A treatment, a mapping, a behavioural quirk in this project's data, the meaning behind an identifier.
+> **Purpose.** The standing home for *project-specific* operational context: prose about how **this project** uses Directo, where that's neither a value nor the command surface. A treatment, a mapping, a behavioural quirk in this project's data, the meaning behind an identifier.
 >
 > Structural values (ids, codes, locations, paths) live in `identifiers.md`; how the CLI works — auth, session model, the report architecture — lives in `directo help` (project-agnostic, never copied here).
 >

@@ -1,6 +1,6 @@
 # windmill — manifest
 
-The declarative spec the [procedures](../procedures/) read to install / update / uninstall / audit this capability. This is the first manifest authored, so it doubles as the **schema** every other capability's manifest follows: the section set below is the contract.
+The declarative spec the [procedures](../../procedures/) read to install / update / uninstall / audit this capability. This is the first manifest authored, so it doubles as the **schema** every other capability's manifest follows: the section set below is the contract.
 
 ## Identity
 
@@ -25,7 +25,7 @@ The capability folder installs, immutable, at `~/.capabilities/windmill/`; the r
 
 ## Credentials
 
-Env keys, resolved by the standard [4-tier cascade](../DOCTRINE.md#the-credential-cascade) (flags > project `.env(.local)` > user config > process env). All **must-confirm** — Windmill has no standard public endpoint, so the instance must be named by the user; none are guessable.
+Env keys, resolved by the standard [4-tier cascade](../../DOCTRINE.md#the-credential-cascade) (flags > project `.env(.local)` > user config > process env). All **must-confirm** — Windmill has no standard public endpoint, so the instance must be named by the user; none are guessable.
 
 | Key | Secret? | Notes |
 |---|---|---|
@@ -60,7 +60,7 @@ A capability is dysfunctional without its must-haves: here, the three `WINDMILL_
 
 ## Validator notes
 
-Capability-specific conformance the audit should check, on top of the [template invariants](../TEMPLATE.md):
+Capability-specific conformance the audit should check, on top of the [template invariants](../../TEMPLATE.md):
 
 - `CAPABILITY.md` is **lightweight** — role + pointer list, not a re-teaching of Windmill's command surface (that's `windmill help`).
 - **No connection values in markdown** — `WINDMILL_URL`/workspace/token live in env, not `identifiers.md`.

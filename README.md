@@ -2,7 +2,7 @@
 
 A catalogue of **agent capabilities** — small, self-contained tools an LLM coding agent (Claude Code, Codex, …) can install into a machine and a project to gain a new ability: drive a workflow engine, talk to a task tracker, read a mailbox, keep a set of books.
 
-Each capability is one top-level folder. The repo is **source and distribution** at once: a capability is authored/changed here, pushed to GitHub, and pulled into any consuming project by pointing an agent at this repo and running a procedure. No installer binary — the procedures are **plain-English instructions an LLM executes**, adapting to the environment by reasoning, not by hardcoded branches.
+Each capability is one folder under [`capabilities/`](capabilities/) — the catalogue. The repo root holds the **doctrine** (the rules and procedures); `capabilities/` holds the **capabilities** those rules govern. The repo is **source and distribution** at once: a capability is authored/changed here, pushed to GitHub, and pulled into any consuming project by pointing an agent at this repo and running a procedure. No installer binary — the procedures are **plain-English instructions an LLM executes**, adapting to the environment by reasoning, not by hardcoded branches.
 
 > **Public repo.** Never commit a secret. Credentials ship only as `*.example` templates and empty-valued env breadcrumbs. A real token, key, URL-with-tenant, or account number must never land here.
 
@@ -10,8 +10,8 @@ Each capability is one top-level folder. The repo is **source and distribution**
 
 | Capability | What it gives you | Has authored scripts? |
 |---|---|---|
-| [windmill/](windmill/) | drive a Windmill instance (deploy scripts, cron, jobs, vars) + the SSH-dispatch script pattern | yes |
-| [directo/](directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) | no |
+| [capabilities/windmill/](capabilities/windmill/) | drive a Windmill instance (deploy scripts, cron, jobs, vars) + the SSH-dispatch script pattern | yes |
+| [capabilities/directo/](capabilities/directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) | no |
 
 *(more get appended as they're extracted.)*
 
@@ -23,15 +23,15 @@ Every capability and routine obeys one set of rules, stated once in [DOCTRINE.md
 
 Every capability fills one structural template — read [TEMPLATE.md](TEMPLATE.md). In short, two layers:
 
-- **Global** (machine-level, install once per host): the executable, its context **stub**, a credentials **template**. The folder installs to `~/.capabilities/<name>/`; the CLI is symlinked onto `PATH` and the stub is surfaced as a skill (`~/.claude/skills/<name>/SKILL.md`). Declared *just enough to be visible*.
-- **Project** (repo-level, per consuming project): a lightweight `CAPABILITY.md` + `identifiers` + a self-describing `reference` scaffold, with a `guide` and `scripts/` as the capability needs them, under `.capabilities/<namespace>/`. A `SessionStart` hook regenerates `.claude/rules/CAPABILITIES.md` — an `@`-import manifest the harness expands inline — so they load each session. This is where a consuming project **expands** on how it uses the capability.
+- **Global** (machine-level, install once per host): the executable, its context **stub**, a credentials **template**. The source folder `capabilities/<name>/` installs to the host registry `~/.capabilities/<name>/` (undotted catalogue in the repo → dotted registry in `$HOME`); the CLI is symlinked onto `PATH` and the stub is surfaced as a skill (`~/.claude/skills/<name>/SKILL.md`). Declared *just enough to be visible*.
+- **Project** (repo-level, per consuming project): a lightweight `CAPABILITY.md` + `identifiers` + a self-describing `reference` scaffold, with `scripts/` if the capability authors any, under `.capabilities/<namespace>/`. A `SessionStart` hook regenerates `.claude/rules/CAPABILITIES.md` — an `@`-import manifest the harness expands inline — so they load each session. This is where a consuming project **expands** on how it uses the capability.
 
 A capability folder here mirrors that:
 
 The capability folder is **flat**, and the installer copies it verbatim — the folder *is* the install image:
 
 ```
-<capability>/
+capabilities/<capability>/
   manifest.md                 the declarative spec the procedures read
   stub.md                     global stub (skill front-matter); → ~/.capabilities/<name>/stub.md, symlinked as ~/.claude/skills/<name>/SKILL.md
   bin/<name>                  the executable; → ~/.capabilities/<name>/bin/<name>, symlinked onto PATH
@@ -40,7 +40,6 @@ The capability folder is **flat**, and the installer copies it verbatim — the 
     CAPABILITY.md             the entry file (role + pointers); @-imported into .claude/rules/CAPABILITIES.md
     identifiers.md            non-secret structural identifiers only
     reference.md              project-specific operational context (ships as a self-describing scaffold; populate on demand)
-    <name>-guide.md           the usage / authoring guide (optional; omit when `<name> help` covers it)
     scripts/                  authored sources (optional; Windmill has them)
 ```
 

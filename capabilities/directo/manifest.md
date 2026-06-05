@@ -1,6 +1,6 @@
 # directo — manifest
 
-The declarative spec the [procedures](../procedures/) read to install / update / uninstall / audit this capability. Section set follows the manifest schema established by `windmill/manifest.md`.
+The declarative spec the [procedures](../../procedures/) read to install / update / uninstall / audit this capability. Section set follows the manifest schema established by `windmill/manifest.md`.
 
 ## Identity
 
@@ -25,7 +25,7 @@ The capability folder installs, immutable, at `~/.capabilities/directo/`; the ro
 
 ## Credentials
 
-Env keys, resolved by the standard [4-tier cascade](../DOCTRINE.md#the-credential-cascade) (flags > project `.env(.local)` > user config > process env). Directo has no public endpoint scheme — the database segment must be named by the user; the login is the user's own.
+Env keys, resolved by the standard [4-tier cascade](../../DOCTRINE.md#the-credential-cascade) (flags > project `.env(.local)` > user config > process env). Directo has no public endpoint scheme — the database segment must be named by the user; the login is the user's own.
 
 | Key | Secret? | Notes |
 |---|---|---|
@@ -60,9 +60,9 @@ A capability is dysfunctional without its must-haves: here, `DIRECTO_USERNAME`, 
 
 ## Validator notes
 
-Capability-specific conformance the audit should check, on top of the [template invariants](../TEMPLATE.md):
+Capability-specific conformance the audit should check, on top of the [template invariants](../../TEMPLATE.md):
 
 - `CAPABILITY.md` is **lightweight** — role + pointer list, not a re-teaching of the command surface (that's `directo help`).
 - **No connection or secret values in markdown** — database, login, cookie live in env, not `identifiers.md`.
 - **The `project/` template carries placeholders** — no real database, location codes, or entity taxonomy baked into the public registry; those fill in the consuming project at install.
-- **The whole operating contract lives in `directo help`** — auth ceremony, session model, report architecture, the one-session-per-login caveat. It is project-agnostic, so directo carries **no slot-5 guide** (the CLI self-documents; any procedure is a routine). Its **slot-6 reference ships as a self-describing scaffold**, empty until genuine project context accrues — present so the home is labeled, not a transcription of `directo help`. Identifiers holds the project values (db handle, locations, report params).
+- **The whole operating contract lives in `directo help`** — auth ceremony, session model, report architecture, the one-session-per-login caveat. It is project-agnostic, so directo carries **no guide** (there is no guide slot; the CLI self-documents and any procedure is a routine). Its **reference (slot 5) ships as a self-describing scaffold**, empty until genuine project context accrues — present so the home is labeled, not a transcription of `directo help`. Identifiers holds the project values (db handle, locations, report params).

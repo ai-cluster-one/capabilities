@@ -7,7 +7,7 @@ What a capability is **comprised of** — the slots it fills and how they are sh
 A capability exists at two altitudes, and the split is the whole point:
 
 - **Global (machine-level)** — declared *just enough to be visible*. The agent learns the capability exists, what it broadly does, and how to load its full contract on demand. One install per host.
-- **Project (repo-level)** — *expansion*. A consuming project says how **it** uses the capability, stores **its** identifiers and mappings, and adds project-specific guides or scripts. Per consuming project.
+- **Project (repo-level)** — *expansion*. A consuming project says how **it** uses the capability, stores **its** identifiers and mappings, and adds project-specific context or scripts. Per consuming project.
 
 Global is the introduction; project is the elaboration. A fact lives at exactly one altitude and is never restated at the other (DOCTRINE rules 1–2).
 
@@ -16,24 +16,38 @@ Global is the introduction; project is the elaboration. A fact lives at exactly 
 - The **spec** (the doctrine, this template, the procedures) is **domain-neutral** — slots and rules, no example domain's fingerprints.
 - The **global stub** (slot 1) is **consumer-neutral** — install-once, identical for every project; it names the system and how to load its contract, nothing about any one consumer.
 - The **project capability file** (slot 2) carries the project's *framing* — what the capability is for this project, plus pointers — but not its detail.
-- **identifiers** (slot 4) and **reference** (slot 6) are where the **specifics live** — concrete values and the operational model. Domain terms here are not bleed; they are the point.
+- **identifiers** (slot 4) and **reference** (slot 5) are where the **specifics live** — concrete values and the operational model. Domain terms here are not bleed; they are the point.
 
 Neutrality is a property of the declaration, not of the whole capability. (Enforced by DOCTRINE rules 2 and 10.)
 
-## The five slots (+ optional ones)
+## Altitude × register: where anything lives
+
+Two questions place any piece of knowledge, and crossing them leaves no blurry middle:
+
+1. **Altitude** — is it *agnostic* (true for every project; ships once, in the framework or the CLI) or *project-specific* (true only here; a project asset)?
+2. **Register** — is it *the product* (the knowledge itself, read and consumed) or *the meta* (how to author the product)?
+
+|  | The product | The meta — how to author it |
+|---|---|---|
+| **Agnostic** | the CLI + `<name> help`; the global stub | the doctrine, this template, the procedures |
+| **Project-specific** | identifiers (values), reference (model), routines (procedure) | *— nearly empty —* |
+
+The bottom-right cell is nearly empty on purpose: authoring guidance does not vary by project — *how to write a good reference* is the same everywhere — so it collapses **up** into agnostic meta, written once by asset-type, never per capability. This is why there is **no usage-guide slot**: a per-capability "how to use this for my project" file straddles that empty cell, and its content is always really either the product (→ identifiers / reference / a routine) or agnostic meta (→ the framework). Procedure that is *executable* is a **routine**; procedure that is *the tool's surface* is the CLI's `help`; everything declarative is the **reference**.
+
+## The five slots (+ one optional)
 
 | Slot | Lives in | Altitude | Holds |
 |---|---|---|---|
 | 1. Global context | the **stub** (`~/.capabilities/<name>/stub.md`, surfaced as a skill) | global | tool awareness + how to load the full contract (`<name> help`) |
 | 2. Project context | the **capability file** (`.capabilities/<ns>/CAPABILITY.md`, surfaced by the project loader) | project | role/purpose **in this project** + a pointer list. Lightweight. |
-| 3. Pointers | the pointer list *inside* slot 2 | project | links to slots 4–6, loaded on demand — **the single home for those asset paths** (consumers address assets by role, not literal path; DOCTRINE rule 7) |
+| 3. Pointers | the pointer list *inside* slot 2 | project | links to slots 4–5, loaded on demand — **the single home for those asset paths** (consumers address assets by role, not literal path; DOCTRINE rule 7) |
 | 4. Identifiers | `.capabilities/<ns>/identifiers.md` | project | **non-secret structural** values only: paths, folders, variable names, gids |
-| 5. Usage guide | `.capabilities/<ns>/<name>-guide.md` | project | how to use/author for this project's needs — **optional** (see below) |
+| 5. Reference | `.capabilities/<ns>/reference.md` | project | project-specific operational **context** — the model (see below). Ships as a self-describing scaffold; populated on demand. |
 | (opt) Artifacts | `.capabilities/<ns>/scripts/` etc. | project | sources the capability authors (most have none) |
 
-A sixth, `.capabilities/<ns>/reference.md`, holds project-specific operational *context* — prose about how **this** project uses the system that is neither a value (slot 4) nor the command surface (`<name> help`): a treatment, a mapping, a behavioural quirk in this project's data, the meaning behind an identifier. It **ships by default as a self-describing scaffold** — a body that states its own purpose — so the home is always present and labeled, and no agent has to rediscover whether it should exist or what belongs in it. Its resting state is empty: populate it only when genuine project context accrues, replacing the scaffold note with that content. An empty reference is conformant, not a gap; never invent content to fill it.
+Reference (slot 5) **ships by default as a self-describing scaffold** — a body that states its own purpose — so the home is always present and labeled, and no agent has to rediscover whether it should exist or what belongs in it. Its resting state is empty: populate it only when genuine project context accrues, replacing the scaffold note with that content. An empty reference is conformant, not a gap; never invent content to fill it.
 
-The usage guide (slot 5), by contrast, is **omittable** — created only when there's project-specific procedure beyond the CLI's own `<name> help` and not already captured as a routine (DOCTRINE rule 11). A capability whose CLI is self-documenting and whose procedure lives in routines has no slot 5, and its absence is conformant. The always-present project assets are the capability file (slot 2), identifiers (slot 4), and the reference scaffold (slot 6); the guide and scripts are added only when earned.
+There is no usage-guide slot. Procedure does not live with the capability: an *executable, repeatable* procedure is a **routine** in the consuming project, and a procedure that is merely *the tool's surface* is the CLI's own `<name> help`; the static model it applies stays in the reference (DOCTRINE rule 11). The always-present project assets are the capability file (slot 2), identifiers (slot 4), and the reference scaffold (slot 5); scripts are added only when the capability authors any.
 
 ## How each altitude reaches the agent
 
@@ -51,17 +65,17 @@ Another host swaps the two injections for its own equivalents; the registry fold
 The two project assets split by *shape of knowledge*:
 
 - **identifiers (slot 4) — the values.** Discrete, lookup-able structural facts: ids, codes, account/tenant handles, gids, paths, folder and variable names, the label or classification of each, and breadcrumbs for values not yet pinned. The answer to *"what is the handle for X?"* If it belongs in a key–value list or a table row, it's an identifier. No prose narrative, no how-to, no treatment (DOCTRINE rule 4).
-- **reference (slot 6) — the model and context.** The prose that is neither a value nor a step: how the system behaves, what its output represents, the operational model, the mapping or treatment the consumer applies. The answer to *"how does this work, what does it mean, how is it handled?"* Domain-specific terms belong here freely — this is the slot that holds them.
+- **reference (slot 5) — the model and context.** The prose that is neither a value nor a step: how the system behaves, what its output represents, the operational model, the mapping or treatment the consumer applies. The answer to *"how does this work, what does it mean, how is it handled?"* Domain-specific terms belong here freely — this is the slot that holds them.
 
-The line: a **value** (or a labelled set of values) is identifiers'; an **explanation or model** is the reference's; a **step-by-step to perform a task** is the guide's (slot 5) or a routine's — never the reference's (DOCTRINE rule 11).
+The line: a **value** (or a labelled set of values) is identifiers'; an **explanation or model** is the reference's; a **step-by-step to perform a task** is a routine's — never the reference's (DOCTRINE rule 11).
 
 ## Project layout
 
-In a consuming project, capability assets live under `.capabilities/<ns>/` — one folder per installed capability: the entry file `CAPABILITY.md` (slot 2) beside the slot assets (`identifiers.md`, `reference.md`, an optional `<name>-guide.md`, optional `scripts/`). `ls .capabilities/` lists the installed capabilities. At `SessionStart` the project's `.claude/hooks/build-capabilities-rule.sh` regenerates `.claude/rules/CAPABILITIES.md` — an `@`-import manifest the harness expands inline, so each `CAPABILITY.md` loads in full. Dropping a folder is the whole install.
+In a consuming project, capability assets live under `.capabilities/<ns>/` — one folder per installed capability: the entry file `CAPABILITY.md` (slot 2) beside the slot assets (`identifiers.md`, `reference.md`, optional `scripts/`). `ls .capabilities/` lists the installed capabilities. At `SessionStart` the project's `.claude/hooks/build-capabilities-rule.sh` regenerates `.claude/rules/CAPABILITIES.md` — an `@`-import manifest the harness expands inline, so each `CAPABILITY.md` loads in full. Dropping a folder is the whole install.
 
 ## When a slot outgrows one file
 
-The slots above are **flat by default** — one `identifiers.md`, one `reference.md`, one `<name>-guide.md`. A capability whose project usage is small keeps them that way.
+The slots above are **flat by default** — one `identifiers.md`, one `reference.md`. A capability whose project usage is small keeps them that way.
 
 When a single slot's content grows past one coherent file, **branch that slot into a sibling `<slot>/` folder** of focused files, and keep the slot's `<slot>.md` at its canonical path as a **thin index** — a pointer list into the sub-files, nothing more. (So `reference.md` stays put and gains a `reference/` folder beside it; `reference/<topic>.md` holds the detail.) This is DOCTRINE rule 7 applied one level down:
 
@@ -69,7 +83,7 @@ When a single slot's content grows past one coherent file, **branch that slot in
 - Sub-files **within** a slot may link each other directly — they're declared together (the sibling allowance).
 - `(capability, slot)` stays a **computable address**: the index's path never moved, so every consumer that named "the X reference" keeps resolving — the index absorbs the fan-out. A sub-file's literal path must never leak past its index.
 
-Branch on genuine growth, not anticipation: a two-paragraph reference doesn't need a folder; a reference that has become five distinct topics does. Identifiers and the guide branch the same way when they earn it.
+Branch on genuine growth, not anticipation: a two-paragraph reference doesn't need a folder; a reference that has become five distinct topics does. Identifiers branch the same way when they earn it.
 
 ## Template variables
 

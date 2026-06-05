@@ -19,7 +19,7 @@ List the catalogue and ask the user which one to install (and whether they want 
 curl -fsSL https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/README.md
 ```
 
-The capability index there names each top-level folder. Take the chosen name as `<name>` for the rest of this file.
+The capability index there names each folder under `capabilities/`. Take the chosen name as `<name>` for the rest of this file.
 
 ## 2. Global layer — the machine, once per capability
 
@@ -30,7 +30,7 @@ The capability lives, immutable, in a per-host-neutral registry at `~/.capabilit
 ```
 mkdir -p "$HOME/.capabilities"
 curl -fsSL https://codeload.github.com/ai-cluster-one/capabilities/tar.gz/refs/heads/main \
-  | tar -xz -C "$HOME/.capabilities" --strip-components=1 capabilities-main/<name>
+  | tar -xz -C "$HOME/.capabilities" --strip-components=2 capabilities-main/capabilities/<name>
 ```
 
 (If the repo is private, use `gh` with the user's auth instead.) Re-running this is how an update lands — it overwrites the immutable folder in place.
@@ -62,7 +62,7 @@ A real secret only ever lands in `~/.config/<name>/credentials.env` (or a projec
 
 The CLI is centralized (step 2) — a project never copies it; it calls `<name>` by PATH. The project layer is only the lightweight, project-specific knowledge, surfaced by one project-side loader.
 
-**a. Lay down the assets.** Copy the project template into `<project>/.capabilities/<ns>/` (infer `<ns>` from the project; confirm if unsure). The template `~/.capabilities/<name>/project/` holds the entry file `CAPABILITY.md` (front-matter `name` + `description` + role prose) plus `identifiers.md` and a self-describing `reference.md` scaffold, and — when the capability needs them — a `<name>-guide.md` and `scripts/`:
+**a. Lay down the assets.** Copy the project template into `<project>/.capabilities/<ns>/` (infer `<ns>` from the project; confirm if unsure). The template `~/.capabilities/<name>/project/` holds the entry file `CAPABILITY.md` (front-matter `name` + `description` + role prose) plus `identifiers.md` and a self-describing `reference.md` scaffold, and an optional `scripts/`:
 
 ```
 mkdir -p "<project>/.capabilities/<ns>"
