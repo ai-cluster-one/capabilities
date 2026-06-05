@@ -1,0 +1,1410 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""
+asana — agent-first CLI for Asana projects & tasks.
+
+This tool is designed to be invoked by agents. Run `asana help` to load
+the full usage contract on demand — do not rely on memorised knowledge of
+its surface.
+
+Credentials resolve through the standard cascade — a project .env(.local),
+then ~/.config/asana/credentials.env, then the process env — keyed by name
+(ASANA_TOKEN=<Asana Personal Access Token>). Never pass the token on the
+command line.
+
+Global option (accepted after any subcommand):
+  --token-env <KEY>   Act as a different identity by naming the env/cred KEY
+                      that holds the PAT (default ASANA_TOKEN). The value never
+                      touches the command line — only the key name. Drop the
+                      alternate PAT in the env/credentials (e.g. ASANA_ALT_TOKEN=…)
+                      and pass --token-env ASANA_ALT_TOKEN to comment/operate as
+                      that user (e.g. posting a teammate's reply on their behalf).
+
+Commands:
+  asana help                                  Print this document.
+  asana doctor                                Health check — resolve token,
+                                              confirm identity, list workspaces.
+  asana whoami                                Confirm token + identity.
+  asana workspaces                            List workspaces the token sees.
+  asana users [--workspace GID]               List users in a workspace.
+  asana projects [--workspace GID]            List projects in a workspace.
+  asana project-create --name NAME            Create a project in a workspace.
+        [--workspace GID] [--notes TEXT]
+  asana project-add-member <project> <user>   Add a member to a project (so
+                                              they see it in their sidebar).
+  asana tasks --project P [--all] [--limit N] List tasks in a project
+        [--with-state]                        (incomplete only unless --all).
+                                              --with-state adds tags + external +
+                                              section membership (the runner reads
+                                              task state in one list call).
+  asana task <task> [--with-subtasks]         Show one task in full; the flags
+        [--with-deps]                         attach its subtasks and/or its
+                                              dependencies + dependents inline.
+  asana create --name NAME --project P [...]  Create a task.
+        [--project P ...]                     Add to more projects (repeatable).
+        [--notes TEXT|-] [--assignee GID]     --notes '-' reads the body from
+        [--follower GID ...] [--due-on DATE]  stdin (use for multi-line prompts —
+        [--due-at ISO8601]                    avoids the two-shell-layer quoting
+        [--external-gid STR]                  footgun). --external-gid sets the
+        [--external-data STR]                 dedup key (unique → duplicate
+        [--section GID]                        create returns 400). --section
+        [--parent GID] [--plain] [--html]      places the task in a board column
+                                              (needs exactly one --project). Due
+                                              date+time UTC; not both due flags.
+                                              --parent makes it a SUBTASK while
+                                              keeping section membership (dual-
+                                              membership), so the pickup pipeline
+                                              still sees it. Use for fan-out.
+                                              --notes is converted markdown ->
+                                              Asana's rich-text subset by default
+                                              (Asana does NOT render raw markdown);
+                                              --plain stores literal text, --html
+                                              if it's already Asana-subset HTML.
+  asana comment <task> [--text TEXT|-]        Add a comment (story) to a task.
+        [--mention GID ...]                   @mention users (sends rich text
+        [--plain] [--html]                    so they get notified). Markdown is
+                                              converted to Asana's comment rich-
+                                              text subset by default (Asana does
+                                              NOT render raw markdown). --plain
+                                              posts literal text; --html if the
+                                              body is already Asana-subset HTML.
+  asana comments <task> [--limit N]           List a task's comment stories
+                                              (text + created_at + author gid),
+                                              oldest first. The "did they reply?"
+                                              read for the HITL resume check.
+  asana complete <task> [--reopen]            Mark a task complete (or reopen).
+        [--force] [--no-rollup]               REFUSES (exit 7) if the task has
+                                              open dependencies — pass --force to
+                                              override. On success it cascades:
+                                              auto-completes any parent whose
+                                              subtasks are now all done (recursing
+                                              up), and reports dependents this
+                                              just unblocked. --no-rollup skips
+                                              the cascade.
+  asana update <task> [--name N] [--notes T]  Update fields on an existing task.
+        [--due-on YYYY-MM-DD] [--due-at ISO]  --due-at carries time-of-day;
+        [--assignee GID] [--plain] [--html]   do not pass both due flags. --notes
+                                              takes inline text, a file, or '-'
+                                              (stdin) and is converted markdown ->
+                                              rich text by default; --plain /
+                                              --html as for create / comment.
+  asana tags [--workspace GID]                List tags in a workspace (name+gid;
+                                              resolve a status label to its gid).
+  asana tag-create --name NAME                Create a tag in a workspace.
+        [--workspace GID]
+  asana tag-add <task> <tag>                  Add a tag (the claim/status label)
+                                              to a task. <tag> is a gid.
+  asana tag-remove <task> <tag>               Remove a tag from a task.
+  asana external-get <task>                   Read the API-only `external`
+                                              field ({gid, data}) — UI-invisible
+                                              machine-state home. Null if unset.
+  asana external-set <task>                   Set external.gid and/or
+        [--gid STR] [--data STR|-]            external.data (read-merge-write so
+                                              the other key is preserved). --data
+                                              accepts inline, a file, or '-'.
+  asana external-find <gid>                   Resolve the task carrying this
+                                              external.gid (O(1) point lookup via
+                                              Asana's `external:` addressing) —
+                                              the deterministic dedup check. Task
+                                              JSON on a hit, `null` + exit 0 on a
+                                              miss (absence is not an error).
+  asana sections --project P                  List a project's sections (board
+                                              columns; name+gid).
+  asana section-create --project P            Create a section in a project.
+        --name NAME
+  asana section-move <task> <section>         Move a task into a section (the
+                                              visible status column). The section
+                                              must belong to a project the task
+                                              is in. <section> is a gid.
+  asana section-tasks <section>               List tasks currently in a section.
+        [--limit N] [--with-state]            Section-scoped — the reliable read
+                                              for "what's in the Ready column?"
+                                              (the project task-list lags tags /
+                                              external / memberships; this does
+                                              not). --with-state adds tags +
+                                              external + section membership.
+  asana subtasks <parent>                     List a parent task's subtasks.
+        [--limit N] [--with-state]            The roll-up read for fan-out: are
+                                              all children complete? (Subtasks
+                                              have no project/section unless added
+                                              via `create --parent` dual-member.)
+  asana deps <task> [--dependents]            List what <task> depends on (or, with
+                                              --dependents, what depends on it).
+  asana dep-add <task> --on GID [--on ...]    Mark <task> as depending on each --on
+                                              task. ADVISORY only — Asana warns but
+                                              does not hard-block completion.
+  asana dep-remove <task> --on GID [...]      Remove dependency links from <task>.
+  asana deliverable                           Atomically emit a human-owned REQUEST
+        --request-name N --request-notes T    + its dependent agent task (the
+        --agent-name N --agent-notes T        contract's fan-out pair for a human
+        --supervisor GID --agent GID          deliverable). The request is assigned
+        --project GID --waiting GID           to + @mentions --supervisor and is born
+        [--parent GID] [--actor A]            in Waiting; the dependent task is
+        [--request-gid K] [--agent-gid K]     assigned to --agent, born in Waiting, and
+        [--request-plain] [--agent-plain]     DEPENDS ON the request. Completing the
+                                              request clears the dependency, so the
+                                              runner resumes the dependent (pickup
+                                              §2b). One call → a request can never be
+                                              created without its agent half. --parent
+                                              makes the agent task a subtask (roll-up);
+                                              --request-gid/--agent-gid are external
+                                              dedup keys (idempotent retry). Notes T =
+                                              inline | file path | '-' (stdin); at most
+                                              one '-'.
+  asana attach <task> [FILE]                  Attach a local FILE to a task
+        [--url LINK] [--name NAME]            (multipart upload), or --url LINK
+                                              for an external link attachment.
+                                              --name overrides the display name.
+                                              Use to enrich a task with a doc /
+                                              PDF / markdown while working it.
+  asana attachments <task>                    List a task's attachments (gid,
+                                              name, subtype, size, permanent_url).
+  asana attachment <attachment>               Show one attachment's metadata
+                                              (incl. download_url). <attachment>
+                                              is an attachment GID.
+  asana download <attachment> [--out PATH]    Download a file attachment to disk
+                                              (default: its name in cwd). Errors
+                                              on external (link) attachments.
+  asana attachment-delete <attachment> --yes  Delete an attachment. IRREVERSIBLE
+                                              — refuses without --yes (the gate;
+                                              confirm with the human first).
+
+References:
+  <task>, --project, --workspace, --assignee, --follower, --mention all
+  accept a bare GID (numeric id) OR a full Asana URL — the trailing numeric
+  id is extracted from URLs automatically.
+
+Input:
+  `comment --text` accepts inline text, "-" for stdin, or omit it to read
+  stdin. Project/workspace ids that are stable for a repo belong in that
+  repo's own reference file, not here.
+
+I/O contract:
+  - Success: JSON on stdout, exit 0.
+  - Error:   {"error": {"code", "message", "hint", "status"}} on stderr,
+             non-zero exit.
+
+Exit codes:
+  0  success
+  2  auth (unauthorized / forbidden / missing credentials)
+  3  not found
+  5  server / network (5xx, timeout, rate-limit exhausted)
+  6  input / validation
+
+Notes:
+  - @mentions: Asana only delivers a notification when the mention is sent
+    as rich text. `comment --mention <gid>` builds the html_text for you;
+    adding the user as a task --follower also surfaces it to them.
+  - Listing is single-page (uses --limit, default 100). There is no
+    automatic pagination yet; raise --limit or filter by project.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from html import escape
+from pathlib import Path
+from typing import NoReturn
+
+import httpx
+
+API_BASE = "https://app.asana.com/api/1.0"
+TIMEOUT = httpx.Timeout(30.0)
+MAX_RETRIES = 3
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CONFIG_DIR = _CONFIG_HOME / "asana"
+CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
+
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+# --- Credentials -------------------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_env() -> dict:
+    """Nearest project .env(.local), walking up from $CLAUDE_PROJECT_DIR (else cwd).
+    .env.local overrides .env. Stops at the first dir holding either, or a .git root."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    for d in (here, *here.parents):
+        if (d / ".env").exists() or (d / ".env.local").exists():
+            merged = _parse_env_file(d / ".env")
+            merged.update(_parse_env_file(d / ".env.local"))  # .local wins
+            return merged
+        if (d / ".git").is_dir():
+            break  # project root reached, no env file here
+    return {}
+
+
+def _load_token(key: str = "ASANA_TOKEN") -> str:
+    """Resolve a PAT by env-var NAME through the credential cascade — a project
+    .env(.local), then ~/.config/asana/credentials.env, then the process env;
+    first non-empty wins. `key` defaults to ASANA_TOKEN; the global
+    `--token-env <KEY>` flag selects an alternate key to act as another identity.
+    The token value never travels on the command line — only its name (so there is
+    no value flag tier; the secret stays off argv, deliberately)."""
+    tok = (_project_env().get(key)
+           or _parse_env_file(CREDENTIALS_ENV).get(key)
+           or os.environ.get(key)
+           or "").strip()
+    if tok:
+        return tok
+    if key == "ASANA_TOKEN":
+        _die(2, "missing_token",
+             f"ASANA_TOKEN not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+             "add ASANA_TOKEN=<your PAT> to the user config or a project .env")
+    _die(2, "missing_token",
+         f"{key} not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+         f"add {key}=<PAT> to the user config or a project .env to use --token-env {key}")
+
+
+# --- Reference parsing -------------------------------------------------------
+
+def _gid(ref: str) -> str:
+    """Accept a bare GID or a full Asana URL; return the numeric GID."""
+    ref = ref.strip()
+    if ref.isdigit():
+        return ref
+    # URLs look like .../0/<project>/<task> or .../task/<gid> etc.
+    nums = re.findall(r"\d{6,}", ref)
+    if not nums:
+        _die(6, "bad_reference", f"could not extract a GID from {ref!r}",
+             "pass a numeric GID or a full Asana URL")
+    return nums[-1]
+
+
+# --- HTTP --------------------------------------------------------------------
+
+def _client(token: str) -> httpx.Client:
+    return httpx.Client(
+        base_url=API_BASE,
+        timeout=TIMEOUT,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+
+
+def _request(client: httpx.Client, method: str, path: str,
+             params: dict | None = None, json_body: dict | None = None,
+             allow_404: bool = False) -> dict | None:
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, path, params=params, json=json_body)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "timeout", f"request timed out: {method} {path}",
+                 "Asana API was unresponsive; check status.asana.com")
+        except httpx.RequestError as e:
+            _die(5, "network_error", f"network error: {e}", "check connectivity")
+
+        last_status = resp.status_code
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", "1"))
+            if attempt < MAX_RETRIES:
+                time.sleep(retry_after)
+                continue
+            _die(5, "rate_limited", f"rate-limited after {MAX_RETRIES} attempts",
+                 "back off and retry later", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "server_error", f"Asana returned {resp.status_code}",
+                 "check status.asana.com", status=resp.status_code)
+
+        try:
+            data = resp.json()
+        except ValueError:
+            _die(5, "invalid_response", f"non-JSON response from {method} {path}",
+                 status=resp.status_code)
+
+        if resp.status_code >= 400:
+            if allow_404 and resp.status_code == 404:
+                return None
+            errors = data.get("errors") or [{}]
+            msg = errors[0].get("message", "unknown error")
+            hint = errors[0].get("help")
+            if resp.status_code in (401, 403):
+                _die(2, "unauthorized", msg,
+                     hint or "PAT may be invalid or lack access", status=resp.status_code)
+            if resp.status_code == 404:
+                _die(3, "not_found", msg,
+                     hint or "verify the GID and that the PAT can see it",
+                     status=resp.status_code)
+            if resp.status_code in (400, 402, 451):
+                _die(6, "invalid_request", msg, hint, status=resp.status_code)
+            _die(5, "api_error", msg, hint, status=resp.status_code)
+
+        return data
+
+    _die(5, "exhausted_retries", f"exhausted {MAX_RETRIES} attempts on {method} {path}",
+         status=last_status)
+
+
+# --- Output ------------------------------------------------------------------
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _read_text(src: str | None) -> str:
+    if src is None or src == "-":
+        return sys.stdin.read()
+    p = Path(src)
+    if p.exists():
+        return p.read_text()
+    return src
+
+
+# --- Markdown -> Asana comment rich-text -------------------------------------
+# Asana comments accept ONLY a small HTML subset: h1-h3, strong, em, u, s, code,
+# pre (raw text — NO inner <code>, that 500s), ul/ol/li, blockquote, a[href],
+# table>tr>td (NO thead/th). ANY other tag (p, br, h4+, thead, th) makes Asana
+# escape the whole comment, so we emit strictly the whitelist and separate blocks
+# with newlines (never <p>/<br>). Markdown is NOT rendered by Asana — convert it.
+
+def _md_inline(s: str) -> str:
+    from html import escape as _esc
+    codes: list[str] = []
+    s = re.sub(r"`([^`]+)`", lambda m: codes.append(m.group(1)) or f"\x00{len(codes)-1}\x00", s)
+    s = _esc(s, quote=False)
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r'<a href="\2">\1</a>', s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", s)
+    s = re.sub(r"(?<![*\w])\*([^*\n]+)\*(?![*\w])", r"<em>\1</em>", s)
+    s = re.sub(r"(?<![_\w])_([^_\n]+)_(?![_\w])", r"<em>\1</em>", s)
+    s = re.sub(r"~~([^~]+)~~", r"<s>\1</s>", s)
+    s = re.sub(r"\x00(\d+)\x00", lambda m: f"<code>{_esc(codes[int(m.group(1))], quote=False)}</code>", s)
+    return s
+
+
+def _md_to_asana(md: str) -> str:
+    from html import escape as _esc
+    lines = md.replace("\r\n", "\n").split("\n")
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("```"):  # fenced code -> bare <pre>
+            j, buf = i + 1, []
+            while j < n and not lines[j].strip().startswith("```"):
+                buf.append(lines[j]); j += 1
+            out.append("<pre>" + _esc("\n".join(buf), quote=False) + "</pre>")
+            i = j + 1; continue
+        if stripped == "":
+            i += 1; continue
+        if re.match(r"^(-{3,}|\*{3,}|_{3,})$", stripped):  # hr
+            out.append("<hr>"); i += 1; continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)  # heading (cap at h3)
+        if m:
+            lvl = min(len(m.group(1)), 3)
+            out.append(f"<h{lvl}>{_md_inline(m.group(2))}</h{lvl}>"); i += 1; continue
+        # pipe table: a row with '|' followed by a separator line (|, -, :, space)
+        if "|" in line and i + 1 < n:
+            sep = lines[i + 1].strip()
+            if sep and set(sep) <= set("|-: ") and "-" in sep:
+                hdr = [c.strip() for c in stripped.strip("|").split("|")]
+                i += 2; rows = []
+                while i < n and "|" in lines[i] and lines[i].strip():
+                    rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")]); i += 1
+                tbl = "<tr>" + "".join(f"<td><strong>{_md_inline(h)}</strong></td>" for h in hdr) + "</tr>"
+                for r in rows:
+                    tbl += "<tr>" + "".join(f"<td>{_md_inline(c)}</td>" for c in r) + "</tr>"
+                out.append(f"<table>{tbl}</table>"); continue
+        if stripped.startswith(">"):  # blockquote
+            buf = []
+            while i < n and lines[i].strip().startswith(">"):
+                buf.append(re.sub(r"^\s*>\s?", "", lines[i])); i += 1
+            out.append("<blockquote>" + _md_inline(" ".join(buf)) + "</blockquote>"); continue
+        if re.match(r"^\s*([-*+])\s+", line) or re.match(r"^\s*\d+\.\s+", line):  # list
+            ordered = bool(re.match(r"^\s*\d+\.\s+", line)); items = []
+            while i < n and (re.match(r"^\s*([-*+])\s+", lines[i]) or re.match(r"^\s*\d+\.\s+", lines[i])):
+                items.append("<li>" + _md_inline(re.sub(r"^\s*([-*+]|\d+\.)\s+", "", lines[i])) + "</li>"); i += 1
+            tag = "ol" if ordered else "ul"
+            out.append(f"<{tag}>" + "".join(items) + f"</{tag}>"); continue
+        out.append(_md_inline(line)); i += 1  # plain line -> its own block
+    return "\n".join(out)
+
+
+def _notes_data(notes: str | None, mode: str) -> dict:
+    # A task description accepts the same rich-text HTML subset as a comment, via
+    # the `html_notes` field. Default: convert markdown -> that subset so the
+    # description actually formats (Asana does NOT render raw markdown in `notes`).
+    # plain -> literal text in `notes`; html -> caller already supplies subset HTML.
+    if not notes:
+        return {}
+    if mode == "plain":
+        return {"notes": notes}
+    body = _md_to_asana(notes) if mode == "markdown" else notes
+    return {"html_notes": f"<body>{body}</body>"}
+
+
+# --- Commands ----------------------------------------------------------------
+
+def cmd_whoami(c: httpx.Client) -> dict:
+    return _request(c, "GET", "/users/me",
+                    params={"opt_fields": "name,email,workspaces.name"})["data"]
+
+
+def cmd_doctor(c: httpx.Client) -> dict:
+    me = _request(c, "GET", "/users/me",
+                  params={"opt_fields": "name,email,workspaces.name"})["data"]
+    return {"ok": True,
+            "whoami": me.get("name") or me.get("email"),
+            "workspaces": [w.get("name") for w in me.get("workspaces", [])]}
+
+
+def cmd_workspaces(c: httpx.Client) -> list:
+    return _request(c, "GET", "/workspaces",
+                    params={"opt_fields": "name,is_organization"})["data"]
+
+
+def cmd_users(c: httpx.Client, workspace: str | None) -> list:
+    params = {"opt_fields": "name,email"}
+    if workspace:
+        params["workspace"] = _gid(workspace)
+    return _request(c, "GET", "/users", params=params)["data"]
+
+
+def cmd_projects(c: httpx.Client, workspace: str | None, limit: int) -> list:
+    params = {"opt_fields": "name,archived,team.name", "limit": limit}
+    if workspace:
+        params["workspace"] = _gid(workspace)
+    return _request(c, "GET", "/projects", params=params)["data"]
+
+
+def cmd_tasks(c: httpx.Client, project: str, show_all: bool, limit: int,
+              with_state: bool = False) -> list:
+    fields = "name,completed,assignee.name,assignee.gid,due_on"
+    if with_state:
+        fields += ",tags.name,external,memberships.section.name,memberships.project.name"
+    params = {
+        "project": _gid(project),
+        "opt_fields": fields,
+        "limit": limit,
+    }
+    if not show_all:
+        params["completed_since"] = "now"  # only incomplete + recently completed
+    return _request(c, "GET", "/tasks", params=params)["data"]
+
+
+def cmd_task(c: httpx.Client, task: str, with_subtasks: bool = False,
+             with_deps: bool = False) -> dict:
+    fields = ("name,notes,completed,completed_at,assignee.name,due_on,due_at,"
+              "projects.name,followers.name,permalink_url,created_at,modified_at")
+    tgid = _gid(task)
+    obj = _request(c, "GET", f"/tasks/{tgid}",
+                   params={"opt_fields": fields})["data"]
+    # Attach the relation lists Asana's task object omits by default — what this
+    # task is blocked on / what hangs off it. A resuming worker needs these in the
+    # task detail to reason about cleared blockers (see task-worker.md worker step).
+    if with_subtasks:
+        obj["subtasks"] = cmd_subtasks(c, tgid, 100)
+    if with_deps:
+        obj["dependencies"] = cmd_deps(c, tgid, dependents=False)
+        obj["dependents"] = cmd_deps(c, tgid, dependents=True)
+    return obj
+
+
+def cmd_create(c: httpx.Client, name: str, projects: list[str], notes: str | None,
+               assignee: str | None, followers: list[str],
+               due_on: str | None, due_at: str | None,
+               external_gid: str | None, external_data: str | None,
+               section: str | None, parent: str | None = None,
+               notes_mode: str = "markdown") -> dict:
+    if due_on and due_at:
+        _die(6, "conflicting_due", "pass only one of --due-on / --due-at",
+             "--due-at carries the time-of-day; --due-on is date-only")
+    if section and len(projects) != 1:
+        _die(6, "section_needs_one_project",
+             "--section requires exactly one --project",
+             "a section belongs to a single project")
+    if notes == "-":
+        notes = sys.stdin.read()
+    data: dict = {"name": name, "projects": [_gid(p) for p in projects]}
+    if parent:
+        # Dual-membership subtask: `parent` makes it a subtask (for the tree +
+        # roll-up); `projects`/`memberships` still give it section membership so
+        # the pickup pipeline (section-scoped reads) sees it like any task.
+        data["parent"] = _gid(parent)
+    if section:
+        # `projects` is the required anchor; `memberships` then drops the task into
+        # the specific board column (same project — Asana dedups, no double add).
+        data["memberships"] = [{"project": _gid(projects[0]), "section": _gid(section)}]
+    data.update(_notes_data(notes, notes_mode))
+    if assignee:
+        data["assignee"] = _gid(assignee)
+    if followers:
+        data["followers"] = [_gid(f) for f in followers]
+    if due_on:
+        data["due_on"] = due_on
+    if due_at:
+        data["due_at"] = due_at
+    if external_gid is not None or external_data is not None:
+        ext: dict = {}
+        if external_gid is not None:
+            ext["gid"] = external_gid
+        if external_data is not None:
+            ext["data"] = external_data
+        data["external"] = ext
+    return _request(c, "POST", "/tasks", json_body={"data": data},
+                    params={"opt_fields": "name,permalink_url,assignee.name,due_at,due_on,external"})["data"]
+
+
+def cmd_project_create(c: httpx.Client, name: str, workspace: str | None,
+                       notes: str | None) -> dict:
+    data: dict = {"name": name}
+    if workspace:
+        data["workspace"] = _gid(workspace)
+    if notes:
+        data["notes"] = notes
+    return _request(c, "POST", "/projects", json_body={"data": data},
+                    params={"opt_fields": "name,permalink_url,workspace.name"})["data"]
+
+
+def cmd_project_add_member(c: httpx.Client, project: str, user: str) -> dict:
+    return _request(c, "POST", f"/projects/{_gid(project)}/addMembers",
+                    json_body={"data": {"members": [_gid(user)]}},
+                    params={"opt_fields": "name,members.name"})["data"]
+
+
+def cmd_comment(c: httpx.Client, task: str, text: str, mentions: list[str],
+                mode: str = "markdown") -> dict:
+    # Asana renders comments as a small HTML subset, not markdown. Default: convert
+    # markdown -> that subset so the body actually formats. --plain = literal text,
+    # --html = caller already supplies Asana-subset HTML.
+    if mode == "plain" and not mentions:
+        data = {"text": text}
+    else:
+        if mode == "markdown":
+            body = _md_to_asana(text)
+        elif mode == "html":
+            body = text
+        else:  # plain, but a mention forces html_text
+            body = escape(text, quote=False)
+        for m in mentions:
+            body += f' <a data-asana-gid="{_gid(m)}"/>'
+        data = {"html_text": f"<body>{body}</body>"}
+    return _request(c, "POST", f"/tasks/{_gid(task)}/stories",
+                    json_body={"data": data},
+                    params={"opt_fields": "text,created_at,created_by.name"})["data"]
+
+
+def cmd_comments(c: httpx.Client, task: str, limit: int) -> list:
+    stories = _request(c, "GET", f"/tasks/{_gid(task)}/stories",
+                       params={"opt_fields": "text,created_at,created_by.name,created_by.gid,type",
+                               "limit": limit})["data"]
+    return [s for s in stories if s.get("type") == "comment"]
+
+
+def cmd_complete(c: httpx.Client, task: str, reopen: bool,
+                 force: bool = False, no_rollup: bool = False) -> dict:
+    tgid = _gid(task)
+    if reopen:
+        return _request(c, "PUT", f"/tasks/{tgid}",
+                        json_body={"data": {"completed": False}},
+                        params={"opt_fields": "name,completed,completed_at"})["data"]
+
+    # Dependency gate — refuse to complete a task with open dependencies unless --force.
+    blockers = _incomplete_deps(c, tgid)
+    if blockers and not force:
+        names = ", ".join(f"{b.get('name','?')} ({b['gid']})" for b in blockers)
+        _die(7, "blocked_by_dependencies",
+             f"{len(blockers)} incomplete dependenc{'y' if len(blockers)==1 else 'ies'}: {names}",
+             "resolve them first, or pass --force to complete anyway")
+
+    completed = _request(c, "PUT", f"/tasks/{tgid}",
+                         json_body={"data": {"completed": True}},
+                         params={"opt_fields": "name,completed,completed_at"})["data"]
+
+    result = {"completed": completed}
+    if not no_rollup:
+        # Cascade, deterministically: auto-complete fully-done parents, then report
+        # any dependents that this completion just unblocked (ready, not done).
+        rolled = _rollup_parents(c, tgid)
+        unblocked = _newly_unblocked(c, tgid)
+        if rolled:
+            result["rolled_up"] = rolled
+        if unblocked:
+            result["unblocked"] = unblocked
+    return result
+
+
+def cmd_update(c: httpx.Client, task: str, name: str | None, notes: str | None,
+               due_on: str | None, due_at: str | None, assignee: str | None,
+               notes_mode: str = "markdown") -> dict:
+    if due_on and due_at:
+        _die(6, "conflicting_due", "pass only one of --due-on / --due-at",
+             "--due-at carries the time-of-day; --due-on is date-only")
+    data: dict = {}
+    if name is not None:
+        data["name"] = name
+    data.update(_notes_data(notes, notes_mode))
+    if due_on:
+        data["due_on"] = due_on
+    if due_at:
+        data["due_at"] = due_at
+    if assignee:
+        data["assignee"] = _gid(assignee)
+    if not data:
+        _die(6, "no_changes", "update requires at least one field to change",
+             "pass --name / --notes / --due-on / --due-at / --assignee")
+    return _request(c, "PUT", f"/tasks/{_gid(task)}", json_body={"data": data},
+                    params={"opt_fields": "name,notes,due_on,due_at,assignee.name"})["data"]
+
+
+def cmd_tags(c: httpx.Client, workspace: str | None, limit: int) -> list:
+    if not workspace:
+        _die(6, "missing_workspace", "tags requires --workspace",
+             "pass --workspace <gid> (tags are workspace-scoped)")
+    return _request(c, "GET", f"/workspaces/{_gid(workspace)}/tags",
+                    params={"opt_fields": "name,color", "limit": limit})["data"]
+
+
+def cmd_tag_create(c: httpx.Client, name: str, workspace: str | None) -> dict:
+    if not workspace:
+        _die(6, "missing_workspace", "tag-create requires --workspace",
+             "pass --workspace <gid>")
+    return _request(c, "POST", "/tags",
+                    json_body={"data": {"name": name, "workspace": _gid(workspace)}},
+                    params={"opt_fields": "name,color"})["data"]
+
+
+def cmd_tag_add(c: httpx.Client, task: str, tag: str) -> dict:
+    return _request(c, "POST", f"/tasks/{_gid(task)}/addTag",
+                    json_body={"data": {"tag": _gid(tag)}})["data"]
+
+
+def cmd_tag_remove(c: httpx.Client, task: str, tag: str) -> dict:
+    return _request(c, "POST", f"/tasks/{_gid(task)}/removeTag",
+                    json_body={"data": {"tag": _gid(tag)}})["data"]
+
+
+def cmd_external_get(c: httpx.Client, task: str):
+    data = _request(c, "GET", f"/tasks/{_gid(task)}",
+                    params={"opt_fields": "external"})["data"]
+    return data.get("external")
+
+
+def cmd_external_set(c: httpx.Client, task: str,
+                     gid: str | None, data_str: str | None) -> dict:
+    if gid is None and data_str is None:
+        _die(6, "no_external", "external-set requires --gid and/or --data",
+             "pass at least one")
+    # Read-merge-write: external is a single object; a bare PUT of one key would
+    # drop the other (e.g. updating data must not null the dedup gid).
+    current = cmd_external_get(c, task) or {}
+    merged = dict(current)
+    if gid is not None:
+        merged["gid"] = gid
+    if data_str is not None:
+        merged["data"] = data_str
+    return _request(c, "PUT", f"/tasks/{_gid(task)}",
+                    json_body={"data": {"external": merged}},
+                    params={"opt_fields": "external"})["data"]
+
+
+def cmd_external_find(c: httpx.Client, external_gid: str) -> dict | None:
+    """Resolve the task carrying this external.gid, or None if no task has it.
+
+    Asana addresses a task by `external:<gid>` in place of a task gid, and the
+    external gid is unique per app+workspace — so this is an O(1) point lookup,
+    the deterministic 'does a task already exist for this key?' check. Returns
+    the task (name + section + external + url) on a hit, None on a miss; absence
+    is a normal answer, not an error."""
+    res = _request(c, "GET", f"/tasks/external:{external_gid}",
+                   params={"opt_fields": "name,completed,external,permalink_url,"
+                           "assignee.name,memberships.section.name"},
+                   allow_404=True)
+    return res["data"] if res else None
+
+
+def cmd_sections(c: httpx.Client, project: str, limit: int) -> list:
+    return _request(c, "GET", f"/projects/{_gid(project)}/sections",
+                    params={"opt_fields": "name", "limit": limit})["data"]
+
+
+def cmd_section_create(c: httpx.Client, project: str, name: str) -> dict:
+    return _request(c, "POST", f"/projects/{_gid(project)}/sections",
+                    json_body={"data": {"name": name}},
+                    params={"opt_fields": "name"})["data"]
+
+
+def cmd_section_move(c: httpx.Client, task: str, section: str) -> dict:
+    # addTask moves the task into this section within the section's project.
+    return _request(c, "POST", f"/sections/{_gid(section)}/addTask",
+                    json_body={"data": {"task": _gid(task)}})["data"]
+
+
+def cmd_section_tasks(c: httpx.Client, section: str, limit: int,
+                      with_state: bool = False) -> list:
+    fields = "name,completed,assignee.name,assignee.gid,due_on"
+    if with_state:
+        fields += ",tags.name,external,memberships.section.name,memberships.project.name"
+    return _request(c, "GET", f"/sections/{_gid(section)}/tasks",
+                    params={"opt_fields": fields, "limit": limit})["data"]
+
+
+def cmd_subtasks(c: httpx.Client, parent: str, limit: int,
+                 with_state: bool = False) -> list:
+    """List a parent task's subtasks (for fan-out roll-up: are all children done?)."""
+    fields = "name,completed,completed_at,assignee.name,assignee.gid"
+    if with_state:
+        fields += ",external,memberships.section.name,memberships.project.name"
+    return _request(c, "GET", f"/tasks/{_gid(parent)}/subtasks",
+                    params={"opt_fields": fields, "limit": limit})["data"]
+
+
+def cmd_deps(c: httpx.Client, task: str, dependents: bool) -> list:
+    """List a task's dependencies (what it waits on) or --dependents (what waits on it)."""
+    rel = "dependents" if dependents else "dependencies"
+    return _request(c, "GET", f"/tasks/{_gid(task)}/{rel}",
+                    params={"opt_fields": "name,completed,completed_at,assignee.name"})["data"]
+
+
+def _incomplete_deps(c: httpx.Client, task_gid: str) -> list:
+    """Dependencies of task_gid that are not yet complete (the blockers)."""
+    deps = _request(c, "GET", f"/tasks/{task_gid}/dependencies",
+                    params={"opt_fields": "name,completed"})["data"]
+    return [d for d in deps if not d.get("completed")]
+
+
+def _rollup_parents(c: httpx.Client, child_gid: str) -> list:
+    """Walk up from a just-completed task; complete each parent whose subtasks are
+    ALL complete and whose own dependencies are satisfied. Returns the parents
+    auto-completed (newest-first walk). Deterministic — no agent reasoning."""
+    rolled: list[dict] = []
+    cur = child_gid
+    while True:
+        obj = _request(c, "GET", f"/tasks/{cur}",
+                       params={"opt_fields": "parent.gid,parent.name"})["data"]
+        parent = obj.get("parent")
+        if not parent:
+            break
+        pg = parent["gid"]
+        subs = cmd_subtasks(c, pg, 100)
+        if not subs or not all(s.get("completed") for s in subs):
+            break  # siblings still open → parent stays open
+        if _incomplete_deps(c, pg):
+            break  # parent itself is dependency-blocked → leave open
+        _request(c, "PUT", f"/tasks/{pg}", json_body={"data": {"completed": True}},
+                 params={"opt_fields": "name,completed"})
+        rolled.append({"gid": pg, "name": parent.get("name")})
+        cur = pg
+    return rolled
+
+
+def _newly_unblocked(c: httpx.Client, task_gid: str) -> list:
+    """Tasks that depended on task_gid and are now fully unblocked (all their own
+    dependencies complete). Reported, NOT auto-completed — unblocked ≠ done."""
+    out: list[dict] = []
+    for dep in cmd_deps(c, task_gid, dependents=True):
+        dg = dep.get("gid")
+        if not dg:
+            continue
+        if not _incomplete_deps(c, dg):
+            out.append({"gid": dg, "name": dep.get("name")})
+    return out
+
+
+def cmd_dep_add(c: httpx.Client, task: str, on: list[str]) -> dict:
+    """Mark <task> as depending on each --on <gid> (cannot complete until they do)."""
+    return _request(c, "POST", f"/tasks/{_gid(task)}/addDependencies",
+                    json_body={"data": {"dependencies": [_gid(x) for x in on]}})["data"]
+
+
+def cmd_dep_remove(c: httpx.Client, task: str, on: list[str]) -> dict:
+    """Remove dependency links from <task> to each --on <gid>."""
+    return _request(c, "POST", f"/tasks/{_gid(task)}/removeDependencies",
+                    json_body={"data": {"dependencies": [_gid(x) for x in on]}})["data"]
+
+
+# --- Deliverable (the atomic human-request + dependent-agent pair) ------------
+
+def _get_or_create(c: httpx.Client, dedup_gid: str | None,
+                   create_kwargs: dict) -> tuple[dict, bool]:
+    """Return (task, created). If dedup_gid already resolves a task, reuse it so a
+    re-run after a partial failure is idempotent; otherwise create it."""
+    if dedup_gid:
+        existing = cmd_external_find(c, dedup_gid)
+        if existing:
+            return existing, False
+    return cmd_create(c, **create_kwargs), True
+
+
+def cmd_deliverable(c: httpx.Client, *, request_name: str, request_notes: str,
+                    agent_name: str, agent_notes: str, supervisor: str, agent: str,
+                    project: str, waiting: str, parent: str | None = None,
+                    actor: str | None = None, request_gid: str | None = None,
+                    agent_gid: str | None = None,
+                    request_notes_mode: str = "markdown",
+                    agent_notes_mode: str = "markdown") -> dict:
+    """Emit the human-owned request + its dependent agent task as one atomic pair —
+    the task-worker contract's fan-out for a human deliverable. The request is
+    assigned to + followed by + @mentions the Supervisor and is born in Waiting;
+    the dependent agent task is born in Waiting and takes a dependency on the
+    request. Completing the request clears that dependency, so the runner resumes
+    the dependent (pickup §2b). One call means a request can never be created
+    without its agent half — the half-wire that silently strands a completed
+    request with nothing downstream. Idempotent on the dedup keys."""
+    now = datetime.now(timezone.utc).isoformat()
+    sup = _gid(supervisor)
+
+    # Born-in-Waiting stamps — neither has run, so no `session`. `owner` on the
+    # request records whose court it sits in for a later pilot to read at a glance.
+    req_ext = {"phase": "waiting", "last_seen": now, "owner": sup}
+    agent_ext = {"phase": "waiting", "last_seen": now}
+    if actor:
+        req_ext["actor"] = actor
+        agent_ext["actor"] = actor
+
+    request, created = _get_or_create(c, request_gid, dict(
+        name=request_name, projects=[project], notes=request_notes,
+        assignee=sup, followers=[sup], due_on=None, due_at=None,
+        external_gid=request_gid, external_data=json.dumps(req_ext),
+        section=waiting, parent=None, notes_mode=request_notes_mode))
+
+    agent_task, _ = _get_or_create(c, agent_gid, dict(
+        name=agent_name, projects=[project], notes=agent_notes,
+        assignee=_gid(agent), followers=[], due_on=None, due_at=None,
+        external_gid=agent_gid, external_data=json.dumps(agent_ext),
+        section=waiting, parent=parent, notes_mode=agent_notes_mode))
+
+    # The agent task waits on the request — this is the edge the runner's §2b reads
+    # to resume the dependent once the human completes the request. dep-add is
+    # idempotent, so a retry re-asserting it is harmless.
+    cmd_dep_add(c, agent_task["gid"], [request["gid"]])
+
+    # @mention the Supervisor on the request: assignment + follower + mention are
+    # all three required for it to surface (per the contract). Skip on reuse so a
+    # retry doesn't stack duplicate pings.
+    if created:
+        link = agent_task.get("permalink_url") or agent_task["gid"]
+        cmd_comment(c, request["gid"],
+                    f"Need this from you to proceed — unblocks {link}", [sup])
+
+    return {"request": request, "agent": agent_task,
+            "dependency": {"dependent": agent_task["gid"], "on": request["gid"]}}
+
+
+# --- Attachments -------------------------------------------------------------
+
+def _upload(token: str, path: str, data: dict,
+            files=None, params: dict | None = None) -> dict:
+    """POST to /attachments as multipart (file) or form (external link). Kept
+    apart from _request because that client pins Content-Type: application/json,
+    which corrupts a multipart body (httpx must set the boundary itself)."""
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    with httpx.Client(base_url=API_BASE, timeout=httpx.Timeout(120.0),
+                      headers=headers) as c:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = c.post(path, params=params, data=data, files=files)
+            except httpx.TimeoutException:
+                if attempt < MAX_RETRIES:
+                    time.sleep(attempt * 1.5); continue
+                _die(5, "timeout", f"upload timed out: POST {path}",
+                     "Asana API was unresponsive; check status.asana.com")
+            except httpx.RequestError as e:
+                _die(5, "network_error", f"network error: {e}", "check connectivity")
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < MAX_RETRIES:
+                    time.sleep(float(resp.headers.get("Retry-After", attempt * 1.5)))
+                    continue
+            try:
+                body = resp.json()
+            except ValueError:
+                _die(5, "invalid_response", f"non-JSON response from POST {path}",
+                     status=resp.status_code)
+            if resp.status_code >= 400:
+                errors = body.get("errors") or [{}]
+                msg = errors[0].get("message", "unknown error")
+                hint = errors[0].get("help")
+                if resp.status_code in (401, 403):
+                    _die(2, "unauthorized", msg,
+                         hint or "PAT may be invalid or lack access", status=resp.status_code)
+                if resp.status_code == 404:
+                    _die(3, "not_found", msg,
+                         hint or "verify the task GID and that the PAT can see it",
+                         status=resp.status_code)
+                _die(6, "invalid_request", msg, hint, status=resp.status_code)
+            return body["data"]
+    _die(5, "exhausted_retries", f"exhausted {MAX_RETRIES} attempts on POST {path}")
+
+
+_ATTACH_FIELDS = ("name,resource_subtype,created_at,size,host,"
+                  "permanent_url,parent.name,parent.gid")
+
+
+def cmd_attach(token: str, task: str, file_path: str | None,
+               url: str | None, name: str | None) -> dict:
+    if url:
+        # External link attachment — enrich a task with a URL rather than a file.
+        data = {"resource_subtype": "external", "parent": _gid(task), "url": url}
+        if name:
+            data["name"] = name
+        return _upload(token, "/attachments", data=data,
+                       params={"opt_fields": _ATTACH_FIELDS})
+    if not file_path:
+        _die(6, "nothing_to_attach", "attach needs a FILE path or --url",
+             "pass a local file path, or --url <link> for an external attachment")
+    p = Path(file_path)
+    if not p.exists() or not p.is_file():
+        _die(6, "file_not_found", f"{file_path} is not a readable file",
+             "pass a path to a local file")
+    files = {"file": (name or p.name, p.read_bytes())}
+    return _upload(token, "/attachments", data={"parent": _gid(task)},
+                   files=files, params={"opt_fields": _ATTACH_FIELDS})
+
+
+def cmd_attachments(c: httpx.Client, task: str) -> list:
+    return _request(c, "GET", f"/tasks/{_gid(task)}/attachments",
+                    params={"opt_fields": "name,resource_subtype,created_at,"
+                            "size,host,permanent_url"})["data"]
+
+
+def cmd_attachment(c: httpx.Client, attachment: str) -> dict:
+    return _request(c, "GET", f"/attachments/{_gid(attachment)}",
+                    params={"opt_fields": _ATTACH_FIELDS + ",download_url"})["data"]
+
+
+def cmd_download(token: str, attachment: str, out: str | None) -> dict:
+    with _client(token) as c:
+        att = _request(c, "GET", f"/attachments/{_gid(attachment)}",
+                       params={"opt_fields": "name,resource_subtype,"
+                               "download_url,permanent_url"})["data"]
+    if att.get("resource_subtype") == "external":
+        _die(6, "external_attachment",
+             "this is an external (link) attachment — there is no file to download",
+             f"its url: {att.get('permanent_url') or att.get('download_url')}")
+    url = att.get("download_url")
+    if not url:
+        _die(5, "no_download_url",
+             "attachment has no download_url (signed link may have expired)",
+             "re-run; Asana mints download_url fresh on each read")
+    dest = Path(out) if out else Path(att.get("name") or f"attachment-{_gid(attachment)}")
+    # download_url is a pre-signed S3 link — fetch WITHOUT the Bearer header
+    # (the signature carries its own auth; an extra header can 403 it).
+    with httpx.Client(timeout=httpx.Timeout(120.0), follow_redirects=True) as raw:
+        r = raw.get(url)
+        if r.status_code >= 400:
+            _die(5, "download_failed", f"download_url returned {r.status_code}",
+                 status=r.status_code)
+        dest.write_bytes(r.content)
+    return {"downloaded": str(dest), "bytes": len(r.content),
+            "name": att.get("name"), "attachment_gid": _gid(attachment)}
+
+
+def cmd_attachment_delete(c: httpx.Client, attachment: str) -> dict:
+    _request(c, "DELETE", f"/attachments/{_gid(attachment)}")
+    return {"deleted": _gid(attachment)}
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="asana",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("help", help="print the full usage contract")
+    sub.add_parser("doctor", help="health check — resolve token, confirm identity")
+    sub.add_parser("whoami", help="confirm token and return identity")
+    sub.add_parser("workspaces", help="list workspaces")
+
+    sp = sub.add_parser("users", help="list users in a workspace")
+    sp.add_argument("--workspace", default=None, help="workspace GID or URL")
+
+    sp = sub.add_parser("projects", help="list projects in a workspace")
+    sp.add_argument("--workspace", default=None, help="workspace GID or URL")
+    sp.add_argument("--limit", type=int, default=100)
+
+    sp = sub.add_parser("tasks", help="list tasks in a project")
+    sp.add_argument("--project", required=True, help="project GID or URL")
+    sp.add_argument("--all", action="store_true", help="include completed tasks")
+    sp.add_argument("--limit", type=int, default=100)
+    sp.add_argument("--with-state", action="store_true",
+                    help="include tags + external (task state in one call)")
+
+    sp = sub.add_parser("task", help="show one task")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("--with-subtasks", action="store_true",
+                    help="attach the task's subtasks (name/completed/completed_at)")
+    sp.add_argument("--with-deps", action="store_true",
+                    help="attach the task's dependencies + dependents")
+
+    sp = sub.add_parser("create", help="create a task")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--project", action="append", required=True,
+                    help="project GID or URL (repeatable)")
+    sp.add_argument("--notes", default=None)
+    sp.add_argument("--assignee", default=None, help="assignee GID or URL")
+    sp.add_argument("--follower", action="append", default=[],
+                    help="follower GID or URL (repeatable)")
+    sp.add_argument("--due-on", default=None, help="YYYY-MM-DD")
+    sp.add_argument("--due-at", default=None,
+                    help="ISO8601 UTC datetime, e.g. 2026-05-30T16:00:00.000Z")
+    sp.add_argument("--external-gid", default=None,
+                    help="dedup key (globally unique; duplicate create → 400)")
+    sp.add_argument("--external-data", default=None,
+                    help="machine-state blob stored in the UI-invisible external field")
+    sp.add_argument("--section", default=None,
+                    help="section GID to place the task in (needs one --project)")
+    sp.add_argument("--parent", default=None,
+                    help="parent task GID — makes this a subtask (dual-membership: "
+                         "subtask of the parent AND a section member for pickup)")
+    sp.add_argument("--plain", action="store_true",
+                    help="store --notes as literal text (no markdown conversion)")
+    sp.add_argument("--html", action="store_true",
+                    help="--notes is already Asana-subset rich-text HTML")
+
+    sp = sub.add_parser("project-create", help="create a project")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--workspace", default=None, help="workspace GID or URL")
+    sp.add_argument("--notes", default=None)
+
+    sp = sub.add_parser("project-add-member", help="add a member to a project")
+    sp.add_argument("project", help="project GID or URL")
+    sp.add_argument("user", help="user GID or URL")
+
+    sp = sub.add_parser("comment", help="add a comment to a task")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("--text", default="-",
+                    help="comment text, a file path, or '-' for stdin")
+    sp.add_argument("--mention", action="append", default=[],
+                    help="user GID or URL to @mention (repeatable)")
+    sp.add_argument("--plain", action="store_true",
+                    help="post literal text (no markdown conversion)")
+    sp.add_argument("--html", action="store_true",
+                    help="body is already Asana-subset rich-text HTML")
+
+    sp = sub.add_parser("comments", help="list a task's comment stories")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("--limit", type=int, default=100)
+
+    sp = sub.add_parser("complete", help="mark a task complete")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("--reopen", action="store_true", help="mark incomplete instead")
+    sp.add_argument("--force", action="store_true",
+                    help="complete even if the task has open dependencies")
+    sp.add_argument("--no-rollup", action="store_true",
+                    help="skip the parent roll-up + unblocked-dependent report")
+
+    sp = sub.add_parser("update", help="update fields on a task")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("--name", default=None)
+    sp.add_argument("--notes", default=None,
+                    help="new description; a file path, or '-' for stdin")
+    sp.add_argument("--due-on", default=None, help="YYYY-MM-DD")
+    sp.add_argument("--due-at", default=None,
+                    help="ISO8601 UTC datetime, e.g. 2026-05-30T16:00:00.000Z")
+    sp.add_argument("--assignee", default=None, help="assignee GID or URL")
+    sp.add_argument("--plain", action="store_true",
+                    help="store --notes as literal text (no markdown conversion)")
+    sp.add_argument("--html", action="store_true",
+                    help="--notes is already Asana-subset rich-text HTML")
+
+    sp = sub.add_parser("tags", help="list tags in a workspace")
+    sp.add_argument("--workspace", default=None, help="workspace GID or URL")
+    sp.add_argument("--limit", type=int, default=100)
+
+    sp = sub.add_parser("tag-create", help="create a tag in a workspace")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--workspace", default=None, help="workspace GID or URL")
+
+    sp = sub.add_parser("tag-add", help="add a tag to a task")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("tag", help="tag GID")
+
+    sp = sub.add_parser("tag-remove", help="remove a tag from a task")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("tag", help="tag GID")
+
+    sp = sub.add_parser("external-get", help="read a task's external field")
+    sp.add_argument("task", help="task GID or URL")
+
+    sp = sub.add_parser("external-set", help="set a task's external gid/data")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("--gid", default=None, help="external dedup key")
+    sp.add_argument("--data", default=None,
+                    help="external data blob; inline, a file path, or '-' for stdin")
+
+    sp = sub.add_parser("external-find",
+                        help="find the task carrying an external gid (null if none)")
+    sp.add_argument("gid", help="external dedup key to look up")
+
+    sp = sub.add_parser("attach", help="upload a file (or --url link) as a task attachment")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("file", nargs="?", default=None, help="local file path to upload")
+    sp.add_argument("--url", default=None,
+                    help="attach an external link instead of a file")
+    sp.add_argument("--name", default=None, help="override the attachment display name")
+
+    sp = sub.add_parser("attachments", help="list a task's attachments")
+    sp.add_argument("task", help="task GID or URL")
+
+    sp = sub.add_parser("attachment", help="show one attachment's metadata")
+    sp.add_argument("attachment", help="attachment GID")
+
+    sp = sub.add_parser("download", help="download a file attachment to disk")
+    sp.add_argument("attachment", help="attachment GID")
+    sp.add_argument("--out", default=None,
+                    help="output path (default: the attachment's name in cwd)")
+
+    sp = sub.add_parser("attachment-delete",
+                        help="delete an attachment (irreversible; needs --yes)")
+    sp.add_argument("attachment", help="attachment GID")
+    sp.add_argument("--yes", action="store_true",
+                    help="confirm the irreversible delete")
+
+    sp = sub.add_parser("sections", help="list a project's sections")
+    sp.add_argument("--project", required=True, help="project GID or URL")
+    sp.add_argument("--limit", type=int, default=100)
+
+    sp = sub.add_parser("section-create", help="create a section in a project")
+    sp.add_argument("--project", required=True, help="project GID or URL")
+    sp.add_argument("--name", required=True)
+
+    sp = sub.add_parser("section-move", help="move a task into a section")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("section", help="section GID")
+
+    sp = sub.add_parser("section-tasks", help="list tasks in a section")
+    sp.add_argument("section", help="section GID")
+    sp.add_argument("--limit", type=int, default=100)
+    sp.add_argument("--with-state", action="store_true",
+                    help="include tags + external + section membership")
+
+    sp = sub.add_parser("subtasks", help="list a parent task's subtasks")
+    sp.add_argument("parent", help="parent task GID or URL")
+    sp.add_argument("--limit", type=int, default=100)
+    sp.add_argument("--with-state", action="store_true",
+                    help="include external + section membership")
+
+    sp = sub.add_parser("deps", help="list a task's dependencies (or --dependents)")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("--dependents", action="store_true",
+                    help="list what depends on this task instead of what it depends on")
+
+    sp = sub.add_parser("dep-add", help="add dependency: <task> depends on --on GIDs")
+    sp.add_argument("task", help="the dependent task (blocked until --on tasks finish)")
+    sp.add_argument("--on", action="append", required=True,
+                    help="task GID or URL this task depends on (repeatable)")
+
+    sp = sub.add_parser("dep-remove", help="remove dependency links from <task>")
+    sp.add_argument("task", help="the dependent task")
+    sp.add_argument("--on", action="append", required=True,
+                    help="task GID or URL to unlink (repeatable)")
+
+    sp = sub.add_parser(
+        "deliverable",
+        help="emit a human request + its dependent agent task (atomic pair)")
+    sp.add_argument("--request-name", required=True,
+                    help="title of the human-owned request task")
+    sp.add_argument("--request-notes", default="-",
+                    help="request body: inline, a file path, or '-' for stdin")
+    sp.add_argument("--agent-name", required=True,
+                    help="title of the dependent agent task")
+    sp.add_argument("--agent-notes", default="-",
+                    help="dependent-task body: inline, a file path, or '-' for stdin")
+    sp.add_argument("--supervisor", required=True,
+                    help="GID assigned + followed + @mentioned on the request")
+    sp.add_argument("--agent", required=True,
+                    help="GID assigned the dependent task")
+    sp.add_argument("--project", required=True, help="board project GID or URL")
+    sp.add_argument("--waiting", required=True,
+                    help="Waiting section GID (both tasks are born here)")
+    sp.add_argument("--parent", default=None,
+                    help="make the agent task a subtask of this task (roll-up)")
+    sp.add_argument("--actor", default=None,
+                    help="actor string stamped into both tasks' external.data")
+    sp.add_argument("--request-gid", default=None,
+                    help="external dedup key for the request (idempotent retry)")
+    sp.add_argument("--agent-gid", default=None,
+                    help="external dedup key for the agent task (idempotent retry)")
+    sp.add_argument("--request-plain", action="store_true",
+                    help="store request notes as literal text (no markdown convert)")
+    sp.add_argument("--agent-plain", action="store_true",
+                    help="store agent notes as literal text (no markdown convert)")
+
+    # `--token-env <KEY>` is a global override accepted anywhere on the line
+    # (extracted before argparse so it works after the subcommand, e.g.
+    # `asana comment <task> --token-env ASANA_KZ_TOKEN`). It names the env/cred
+    # key holding the PAT to act as — never the token value itself.
+    argv = sys.argv[1:]
+    token_key = "ASANA_TOKEN"
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--token-env" and i + 1 < len(argv):
+            token_key = argv[i + 1]; i += 2; continue
+        if a.startswith("--token-env="):
+            token_key = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+
+    args = p.parse_args(cleaned)
+
+    if args.cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+
+    token = _load_token(token_key)
+    with _client(token) as c:
+        if args.cmd == "doctor":
+            _emit(cmd_doctor(c))
+        elif args.cmd == "whoami":
+            _emit(cmd_whoami(c))
+        elif args.cmd == "workspaces":
+            _emit(cmd_workspaces(c))
+        elif args.cmd == "users":
+            _emit(cmd_users(c, args.workspace))
+        elif args.cmd == "projects":
+            _emit(cmd_projects(c, args.workspace, args.limit))
+        elif args.cmd == "project-create":
+            _emit(cmd_project_create(c, args.name, args.workspace, args.notes))
+        elif args.cmd == "project-add-member":
+            _emit(cmd_project_add_member(c, args.project, args.user))
+        elif args.cmd == "tasks":
+            _emit(cmd_tasks(c, args.project, args.all, args.limit))
+        elif args.cmd == "task":
+            _emit(cmd_task(c, args.task, args.with_subtasks, args.with_deps))
+        elif args.cmd == "create":
+            notes_mode = "html" if args.html else "plain" if args.plain else "markdown"
+            _emit(cmd_create(c, args.name, args.project, args.notes,
+                             args.assignee, args.follower, args.due_on, args.due_at,
+                             args.external_gid, args.external_data, args.section,
+                             args.parent, notes_mode))
+        elif args.cmd == "comment":
+            mode = "html" if args.html else "plain" if args.plain else "markdown"
+            _emit(cmd_comment(c, args.task, _read_text(args.text), args.mention, mode))
+        elif args.cmd == "comments":
+            _emit(cmd_comments(c, args.task, args.limit))
+        elif args.cmd == "complete":
+            _emit(cmd_complete(c, args.task, args.reopen, args.force, args.no_rollup))
+        elif args.cmd == "update":
+            notes_mode = "html" if args.html else "plain" if args.plain else "markdown"
+            notes = _read_text(args.notes) if args.notes is not None else None
+            _emit(cmd_update(c, args.task, args.name, notes,
+                             args.due_on, args.due_at, args.assignee, notes_mode))
+        elif args.cmd == "tags":
+            _emit(cmd_tags(c, args.workspace, args.limit))
+        elif args.cmd == "tag-create":
+            _emit(cmd_tag_create(c, args.name, args.workspace))
+        elif args.cmd == "tag-add":
+            _emit(cmd_tag_add(c, args.task, args.tag))
+        elif args.cmd == "tag-remove":
+            _emit(cmd_tag_remove(c, args.task, args.tag))
+        elif args.cmd == "external-get":
+            _emit(cmd_external_get(c, args.task))
+        elif args.cmd == "external-set":
+            data_str = _read_text(args.data) if args.data is not None else None
+            _emit(cmd_external_set(c, args.task, args.gid, data_str))
+        elif args.cmd == "external-find":
+            _emit(cmd_external_find(c, args.gid))
+        elif args.cmd == "attach":
+            _emit(cmd_attach(token, args.task, args.file, args.url, args.name))
+        elif args.cmd == "attachments":
+            _emit(cmd_attachments(c, args.task))
+        elif args.cmd == "attachment":
+            _emit(cmd_attachment(c, args.attachment))
+        elif args.cmd == "download":
+            _emit(cmd_download(token, args.attachment, args.out))
+        elif args.cmd == "attachment-delete":
+            if not args.yes:
+                _die(6, "delete_requires_confirmation",
+                     "attachment-delete is destructive and needs --yes",
+                     "deleting an attachment is irreversible — confirm with the "
+                     "human, then re-run with --yes")
+            _emit(cmd_attachment_delete(c, args.attachment))
+        elif args.cmd == "sections":
+            _emit(cmd_sections(c, args.project, args.limit))
+        elif args.cmd == "section-create":
+            _emit(cmd_section_create(c, args.project, args.name))
+        elif args.cmd == "section-move":
+            _emit(cmd_section_move(c, args.task, args.section))
+        elif args.cmd == "section-tasks":
+            _emit(cmd_section_tasks(c, args.section, args.limit, args.with_state))
+        elif args.cmd == "subtasks":
+            _emit(cmd_subtasks(c, args.parent, args.limit, args.with_state))
+        elif args.cmd == "deps":
+            _emit(cmd_deps(c, args.task, args.dependents))
+        elif args.cmd == "dep-add":
+            _emit(cmd_dep_add(c, args.task, args.on))
+        elif args.cmd == "dep-remove":
+            _emit(cmd_dep_remove(c, args.task, args.on))
+        elif args.cmd == "deliverable":
+            if args.request_notes == "-" and args.agent_notes == "-":
+                _die(6, "two_stdin",
+                     "--request-notes and --agent-notes can't both be '-'",
+                     "only one can read stdin; pass the other inline or as a file path")
+            _emit(cmd_deliverable(
+                c,
+                request_name=args.request_name,
+                request_notes=_read_text(args.request_notes),
+                agent_name=args.agent_name,
+                agent_notes=_read_text(args.agent_notes),
+                supervisor=args.supervisor, agent=args.agent,
+                project=args.project, waiting=args.waiting,
+                parent=args.parent, actor=args.actor,
+                request_gid=args.request_gid, agent_gid=args.agent_gid,
+                request_notes_mode="plain" if args.request_plain else "markdown",
+                agent_notes_mode="plain" if args.agent_plain else "markdown"))
+
+
+if __name__ == "__main__":
+    main()

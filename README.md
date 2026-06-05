@@ -10,6 +10,7 @@ Each capability is one folder under [`capabilities/`](capabilities/) — the cat
 
 | Capability | What it gives you | Has authored scripts? |
 |---|---|---|
+| [capabilities/asana/](capabilities/asana/) | drive Asana projects & tasks over the REST API (tasks/subtasks, comments with @mentions, sections-as-status, tags, dependencies, the API-only `external` field, attachments) | no |
 | [capabilities/windmill/](capabilities/windmill/) | drive a Windmill instance (deploy scripts, cron, jobs, vars) + the SSH-dispatch script pattern | yes |
 | [capabilities/directo/](capabilities/directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) | no |
 | [capabilities/mail/](capabilities/mail/) | read and draft mail across Mail.app's configured accounts over macOS Automation (read/search/show/links/attachments/draft/export; never sends) | no |
