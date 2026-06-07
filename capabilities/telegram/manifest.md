@@ -8,6 +8,7 @@ The declarative spec the [procedures](../../procedures/) read to install / updat
 - **Summary**: drive a personal Telegram account over MTProto (a full user account) — health check (`doctor`), interactive login, identity (`whoami`), list dialogs, read and search messages in a chat, send a message, export a chat's full history to JSON (downloading voice/audio + photos/stickers), and fill voice/audio transcription placeholders via Deepgram.
 - **Underlying service**: **Telegram** over the **MTProto** protocol via [Telethon](https://docs.telethon.dev), authenticated as a full user account — an app `api_id`/`api_hash` from [my.telegram.org/apps](https://my.telegram.org/apps) plus a persisted login session. The optional `transcribe` path additionally calls **Deepgram**'s HTTP API.
 - **Has authored artifacts**: no.
+- **Config dependency**: `global` — resolves app creds + the login session from `~/.config/telegram/` (or a project `.env`); usable from any project once `telegram login` has run.
 
 ## Dependencies
 
@@ -22,7 +23,7 @@ The capability folder installs, immutable, at `~/.capabilities/telegram/`; the r
 | Source (repo) | Destination (requirement) |
 |---|---|
 | `bin/telegram` | `~/.capabilities/telegram/bin/telegram`, **executable** (`chmod +x`), symlinked into a `PATH` dir (`~/bin` or `~/.local/bin`) so `telegram` resolves by name. |
-| `stub.md` | `~/.capabilities/telegram/stub.md`, surfaced by symlinking it as `~/.claude/skills/telegram/SKILL.md` — front-matter `name` + `description` load every session, body on demand. |
+| `stub.md` | `~/.capabilities/telegram/stub.md`, installed as `~/.claude/tools/telegram.md` and `@`-imported in the host `CLAUDE.md` — a front-matter-free awareness line, loaded every session. |
 | `credentials.env.example` | copied to `~/.config/telegram/credentials.env` **with empty values**. |
 
 The **session file** (default `~/.config/telegram/session.session`) is written by `telegram login` at first use, in the same user-config dir. It is auth material — it grants account access; never commit it.

@@ -8,16 +8,17 @@ Each capability is one folder under [`capabilities/`](capabilities/) — the cat
 
 ## Capability index
 
-| Capability | What it gives you | Has authored scripts? |
-|---|---|---|
-| [capabilities/asana/](capabilities/asana/) | drive Asana projects & tasks over the REST API (tasks/subtasks, comments with @mentions, sections-as-status, tags, dependencies, the API-only `external` field, attachments) | no |
-| [capabilities/windmill/](capabilities/windmill/) | drive a Windmill instance (deploy scripts, cron, jobs, vars) + the SSH-dispatch script pattern | yes |
-| [capabilities/directo/](capabilities/directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) | no |
-| [capabilities/mail/](capabilities/mail/) | read and draft mail across Mail.app's configured accounts over macOS Automation (read/search/show/links/attachments/draft/export; never sends) | no |
-| [capabilities/mailbox/](capabilities/mailbox/) | IMAP/SMTP adapter for one mailbox — list/show/fetch/flag/move and **send**; profiles in mailbox.json, app-password in .env | no |
-| [capabilities/telegram/](capabilities/telegram/) | drive a personal Telegram account over MTProto (a full user account) — read/search a chat, send, export a chat's full history to JSON with voice/audio + photos/stickers, and transcribe voice/audio via Deepgram; stateful login session | no |
-| [capabilities/notion/](capabilities/notion/) | publish markdown to Notion pages over the REST API (whoami, list child pages, fetch a page as markdown, replace a page's body+title, create under a parent, upsert by exact title); the local markdown H1 is the source of truth for the page title | no |
-| [capabilities/stripe/](capabilities/stripe/) | read-only Stripe fetch CLI over the REST API — a neutral JSON contract of account activity over a date range (doctor, sync-plan, contract, invoices + hosted-PDF download, balance-transactions, payouts); emits Stripe-domain facts only, every command a read | no |
+| Capability | What it gives you |
+|---|---|
+| [capabilities/asana/](capabilities/asana/) | drive Asana projects & tasks over the REST API (tasks/subtasks, comments with @mentions, sections-as-status, tags, dependencies, the API-only `external` field, attachments) |
+| [capabilities/windmill/](capabilities/windmill/) | drive a Windmill instance (deploy scripts, cron, jobs, vars) + the SSH-dispatch script pattern |
+| [capabilities/directo/](capabilities/directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) |
+| [capabilities/mail/](capabilities/mail/) | read and draft mail across Mail.app's configured accounts over macOS Automation (read/search/show/links/attachments/draft/export; never sends) |
+| [capabilities/mailbox/](capabilities/mailbox/) | IMAP/SMTP adapter for one mailbox — list/show/fetch/flag/move and **send**; profiles in mailbox.json, app-password in .env |
+| [capabilities/telegram/](capabilities/telegram/) | drive a personal Telegram account over MTProto (a full user account) — read/search a chat, send, export a chat's full history to JSON with voice/audio + photos/stickers, and transcribe voice/audio via Deepgram; stateful login session |
+| [capabilities/notion/](capabilities/notion/) | publish markdown to Notion pages over the REST API (whoami, list child pages, fetch a page as markdown, replace a page's body+title, create under a parent, upsert by exact title); the local markdown H1 is the source of truth for the page title |
+| [capabilities/stripe/](capabilities/stripe/) | read-only Stripe fetch CLI over the REST API — a neutral JSON contract of account activity over a date range (doctor, sync-plan, contract, invoices + hosted-PDF download, balance-transactions, payouts); emits Stripe-domain facts only, every command a read |
+| [capabilities/simplbooks/](capabilities/simplbooks/) | drive a SimpleBooks accounting account over its browser session (no public API) — read clients/invoices/expenses/accounts/bank-transactions/kanne, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist; stateful login session, identity-free (account ids resolve from env) |
 
 *(more get appended as they're extracted.)*
 
@@ -29,8 +30,10 @@ Every capability and routine obeys one set of rules, stated once in [DOCTRINE.md
 
 Every capability fills one structural template — read [TEMPLATE.md](TEMPLATE.md); its executable fills one code template — read [SHEBANG.md](SHEBANG.md). In short, two layers:
 
-- **Global** (machine-level, install once per host): the executable, its context **stub**, a credentials **template**. The source folder `capabilities/<name>/` installs to the host registry `~/.capabilities/<name>/` (undotted catalogue in the repo → dotted registry in `$HOME`); the CLI is symlinked onto `PATH` and the stub is surfaced as a skill (`~/.claude/skills/<name>/SKILL.md`). Declared *just enough to be visible*.
-- **Project** (repo-level, per consuming project): a lightweight `CAPABILITY.md` + `identifiers` + a self-describing `reference` scaffold, with `scripts/` if the capability authors any, under `.capabilities/<namespace>/`. A `SessionStart` hook regenerates `.claude/rules/CAPABILITIES.md` — an `@`-import manifest the harness expands inline — so they load each session. This is where a consuming project **expands** on how it uses the capability.
+- **Global** (machine-level, install once per host): the executable, its context **stub**, a credentials **template**. The source folder `capabilities/<name>/` installs to the host registry `~/.capabilities/<name>/` (undotted catalogue in the repo → dotted registry in `$HOME`); the CLI is symlinked onto `PATH` and the stub is surfaced by `@`-import (installed to `~/.claude/tools/<name>.md`, listed once in the host's global `CLAUDE.md`). Declared *just enough to be visible*.
+- **Project** (repo-level, per consuming project): a lightweight `CAPABILITY.md` + `identifiers` + a self-describing `reference` scaffold, with `scripts/` if the capability authors any, under `.capabilities/<namespace>/`. A `SessionStart` script regenerates `.claude/rules/CAPABILITIES.md` — an `@`-import manifest the harness expands inline (script-generated, never hand-edited by the agent) — so they load each session. This is where a consuming project **expands** on how it uses the capability.
+
+**Awareness, readiness, and usage are three different things** — and only the first is global. The **stub** is *awareness*: it tells any session the tool exists; it never promises the tool is usable here. **Readiness** — is it wired up in *this* context? — is resolved at use-time by the [credential cascade](DOCTRINE.md#the-credential-cascade) and self-reported by `<name> doctor`, which on failure names what's missing and where to put it. **Usage** — which targets, what model, project overrides — lives in the project files (`CAPABILITY.md` + identifiers + reference). So a capability may be fully usable from its global install alone (global `~/.config/<name>/` creds, or none at all), or it may need project-side config (e.g. `mailbox`'s project `mailbox.json`); either way the stub only announces it, and `doctor` reports whether it's ready.
 
 A capability folder here mirrors that:
 
@@ -39,7 +42,7 @@ The capability folder is **flat**, and the installer copies it verbatim — the 
 ```
 capabilities/<capability>/
   manifest.md                 the declarative spec the procedures read
-  stub.md                     global stub (skill front-matter); → ~/.capabilities/<name>/stub.md, symlinked as ~/.claude/skills/<name>/SKILL.md
+  stub.md                     global stub (awareness; no front-matter); → ~/.capabilities/<name>/stub.md, installed as ~/.claude/tools/<name>.md and @-imported in the host CLAUDE.md
   bin/<name>                  the executable; → ~/.capabilities/<name>/bin/<name>, symlinked onto PATH
   credentials.env.example     env keys, no values; → ~/.config/<name>/credentials.env
   project/                    → .capabilities/<namespace>/ in a consuming project

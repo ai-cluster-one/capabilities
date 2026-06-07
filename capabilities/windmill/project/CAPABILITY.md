@@ -1,8 +1,3 @@
----
-name: Windmill
-description: The project's orchestration substrate — the cron scheduler, the runner, and the durable run history / logs / retries behind its autonomous operations, driven via the `windmill` CLI. Holds when jobs run and that they ran; the project's systems of record hold the truth.
----
-
 # Windmill
 
 The project's **orchestration substrate**: the scheduler (cron), the runner, and the durable run history / logs / retries behind its autonomous operations. Windmill holds *when* jobs run and *that they ran*; this repo holds *how* (the runbooks); the project's systems of record hold the truth.

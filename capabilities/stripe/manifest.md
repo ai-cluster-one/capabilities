@@ -8,6 +8,7 @@ The declarative spec the [procedures](../../procedures/) read to install / updat
 - **Summary**: read-only Stripe fetch CLI over the REST API — confirm identity + reachability (`doctor`), produce a neutral JSON contract of what happened on the account over a date range (`sync-plan`), print the contract's own shape (`contract`), list invoices and download their hosted PDFs (`invoices`), and read normalized balance-transactions and payouts (`balance-transactions`, `payouts`). It emits Stripe-domain facts only; every command is a read.
 - **Underlying service**: **Stripe** (the SaaS), over its public REST API authenticated by a secret API key. Not bundled — the user supplies a Stripe account and a key that authorizes it.
 - **Has authored artifacts**: no.
+- **Config dependency**: `global` — resolves the secret key from `~/.config/stripe/` (or a project `.env`); usable from any project (read-only).
 
 ## Dependencies
 
@@ -21,7 +22,7 @@ The capability folder installs, immutable, at `~/.capabilities/stripe/`; the row
 | Source (repo) | Destination (requirement) |
 |---|---|
 | `bin/stripe` | `~/.capabilities/stripe/bin/stripe`, **executable** (`chmod +x`), symlinked into a `PATH` dir (`~/bin` or `~/.local/bin`) so `stripe` resolves by name. |
-| `stub.md` | `~/.capabilities/stripe/stub.md`, surfaced by symlinking it as `~/.claude/skills/stripe/SKILL.md` — front-matter `name` + `description` load every session, body on demand. |
+| `stub.md` | `~/.capabilities/stripe/stub.md`, installed as `~/.claude/tools/stripe.md` and `@`-imported in the host `CLAUDE.md` — a front-matter-free awareness line, loaded every session. |
 | `credentials.env.example` | copied to `~/.config/stripe/credentials.env` **with empty values**. |
 
 ## Credentials

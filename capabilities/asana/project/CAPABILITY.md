@@ -1,8 +1,3 @@
----
-name: Asana
-description: The project's Asana access — drive its projects & tasks via the `asana` CLI (REST API): list/read/create tasks, comment with @mentions, move across board sections, manage tags, dependencies, and the API-only `external` machine-state field. The way this project coordinates work on its Asana boards.
----
-
 # Asana
 
 The project's **Asana access** — reading and driving its projects and tasks through the `asana` CLI. Tasks, comments (with @mentions that notify), board sections as status, tags, dependencies, and the API-only `external` field for machine state.

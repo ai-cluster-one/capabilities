@@ -25,10 +25,10 @@ A script parked from a real machine usually carries its consumer's fingerprints.
 
 Read [../TEMPLATE.md](../TEMPLATE.md) and fill the slots, modeling on a canonical capability (e.g. `capabilities/notion/`). Keep neutrality tiered — the declaration slots carry no specifics; values live in the asset slots.
 
-- `manifest.md` — the declarative spec the procedures read: identity, dependencies, global + project artifacts, credentials (keys, which are secret), template variables (discoverable / must-confirm / leave-breadcrumb), and capability-specific validator notes.
-- `stub.md` — the global stub: front-matter `name` + `description` (the always-loaded awareness line) plus a short body naming the executable, the credential, and "run `<name> help`". Consumer-neutral.
+- `manifest.md` — the declarative spec the procedures read: identity (including the **config-dependency class** — `none` / `global` / `project-required`), dependencies, global + project artifacts, credentials (keys, which are secret), template variables (discoverable / must-confirm / leave-breadcrumb), and capability-specific validator notes.
+- `stub.md` — the global stub: a front-matter-free awareness paragraph (the `@`-imported, always-loaded line) — what the tool is and "run `<name> help`", nothing about credentials, readiness, or usage. Consumer-neutral.
 - `credentials.env.example` — the env keys with **empty** values and the cascade header; never a real secret.
-- `project/CAPABILITY.md` — lightweight entry: a role-in-the-project paragraph + a pointer list, no re-teaching of the surface.
+- `project/CAPABILITY.md` — a **front-matter-free** lightweight entry: a role-in-the-project paragraph + a pointer list, no re-teaching of the surface.
 - `project/identifiers.md` — non-secret structural placeholders only; secrets point to env.
 - `project/reference.md` — ships as the self-describing scaffold; empty is conformant.
 

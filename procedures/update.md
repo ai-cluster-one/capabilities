@@ -11,7 +11,7 @@ You are an LLM agent. The user wants to pull a newer version of an already-insta
 
 Re-fetch the capability folder from the repo into `~/.capabilities/<name>/`, overwriting the immutable copy in place (the same fetch step [INSTALL.md](../INSTALL.md) uses). This repo is the source of truth — the author changes a capability here and pushes; you are the consumer pulling it back down.
 
-- The registry folder is immutable, so a wholesale overwrite is correct. The PATH symlink and the skill symlink already point **into** the folder, so they need no change.
+- The registry folder is immutable, so a wholesale overwrite is correct. The PATH symlink and the stub install already point **into** the folder, so they need no change.
 - Re-`chmod +x` the executable. If `credentials.env.example` gained keys, add the empty keys to `~/.config/<name>/credentials.env` without touching existing values.
 
 ## 2. Re-apply the project template, preserving local truth

@@ -1,8 +1,3 @@
----
-name: Directo
-description: The project's Directo ERP system — sales, purchases, stock, and ledger for a Directo database, driven via the `directo` CLI over the browser-session endpoints the web UI uses. The source of truth for whatever this project keeps in Directo.
----
-
 # Directo
 
 The project's **Directo ERP system** — the database behind `login.directo.ee/<db>/` and the source of truth for whatever this project keeps there (sales, purchases, stock, ledger). Directo has no public API; the `directo` CLI reproduces the authenticated browser session.

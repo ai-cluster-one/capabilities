@@ -1,8 +1,3 @@
----
-name: Notion
-description: The project's Notion access — publish markdown to its pages via the `notion` CLI (REST API): whoami, list child pages, fetch a page as markdown, replace an existing page's body+title, create under a parent, and upsert by exact title. The way this project writes its docs/reports into Notion.
----
-
 # Notion
 
 The project's **Notion access** — reading and publishing its pages through the `notion` CLI. Fetch a page as markdown, replace a page's body and title in place, create a page under a parent, or upsert by exact title. The local markdown's leading `# H1` is the source of truth for the page title, so one edit keeps file and page in sync.

@@ -1,8 +1,3 @@
----
-name: Mail
-description: The project's mail access — read and draft across Mail.app's configured accounts via the `mail` CLI (macOS Automation/JXA). Read + draft only, never sends. The way this project reads incoming mail and stages outgoing drafts for the user to send.
----
-
 # Mail
 
 The project's **mail access** — reading incoming mail and staging outgoing **drafts** for the user, through the local Mail.app via the `mail` CLI. Read + draft only: it never sends, so anything it composes lands in the account's Drafts folder for the user to review and send by hand.

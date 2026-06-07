@@ -8,6 +8,7 @@ The declarative spec the [procedures](../../procedures/) read to install / updat
 - **Summary**: drive Asana projects & tasks over the REST API — workspaces, projects, users, tasks/subtasks, comments with @mentions, tags, sections (board columns), dependencies, the API-only `external` machine-state field, attachments, and the atomic deliverable request-pair.
 - **Underlying service**: **Asana** (the SaaS), over its public REST API authenticated by a Personal Access Token. Not bundled — the user supplies an Asana account and PAT.
 - **Has authored artifacts**: no.
+- **Config dependency**: `global` — resolves a PAT from `~/.config/asana/` (or a project `.env`); usable from any project once installed. Project identifiers only pin GIDs/targets.
 
 ## Dependencies
 
@@ -21,7 +22,7 @@ The capability folder installs, immutable, at `~/.capabilities/asana/`; the rows
 | Source (repo) | Destination (requirement) |
 |---|---|
 | `bin/asana` | `~/.capabilities/asana/bin/asana`, **executable** (`chmod +x`), symlinked into a `PATH` dir (`~/bin` or `~/.local/bin`) so `asana` resolves by name. |
-| `stub.md` | `~/.capabilities/asana/stub.md`, surfaced by symlinking it as `~/.claude/skills/asana/SKILL.md` — front-matter `name` + `description` load every session, body on demand. |
+| `stub.md` | `~/.capabilities/asana/stub.md`, installed as `~/.claude/tools/asana.md` and `@`-imported in the host `CLAUDE.md` — a front-matter-free awareness line, loaded every session. |
 | `credentials.env.example` | copied to `~/.config/asana/credentials.env` **with empty values**. |
 
 ## Credentials

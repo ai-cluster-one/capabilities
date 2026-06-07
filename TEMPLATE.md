@@ -38,7 +38,7 @@ The bottom-right cell is nearly empty on purpose: authoring guidance does not va
 
 | Slot | Lives in | Altitude | Holds |
 |---|---|---|---|
-| 1. Global context | the **stub** (`~/.capabilities/<name>/stub.md`, surfaced as a skill) | global | tool awareness + how to load the full contract (`<name> help`) |
+| 1. Global context | the **stub** (`~/.capabilities/<name>/stub.md`, `@`-imported into the session) | global | tool awareness + how to load the full contract (`<name> help`) |
 | 2. Project context | the **capability file** (`.capabilities/<ns>/CAPABILITY.md`, surfaced by the project loader) | project | role/purpose **in this project** + a pointer list. Lightweight. |
 | 3. Pointers | the pointer list *inside* slot 2 | project | links to slots 4–5, loaded on demand — **the single home for those asset paths** (consumers address assets by role, not literal path; DOCTRINE rule 7) |
 | 4. Identifiers | `.capabilities/<ns>/identifiers.md` | project | **non-secret structural** values only: paths, folders, variable names, gids |
@@ -53,8 +53,8 @@ There is no usage-guide slot. Procedure does not live with the capability: an *e
 
 A capability is *declared* in the registry and *surfaced* by a host-specific **injection**: the declaration is host-neutral, the injection is the host's job. For the Claude Code host:
 
-- **Global — skill.** The stub is symlinked to `~/.claude/skills/<name>/SKILL.md`. Claude Code auto-discovers every skill and surfaces its front-matter `name` + `description` into every session; the body loads on demand. No central file is edited.
-- **Project — generated rule.** A capability-agnostic `SessionStart` hook, `.claude/hooks/build-capabilities-rule.sh`, writes `.claude/rules/CAPABILITIES.md` — a manifest of `@`-imports, one per `.capabilities/<ns>/CAPABILITY.md`. The harness auto-loads the rule file and expands the imports inline, so each stub loads **in full, uncapped** (a `SessionStart` hook echoing into the session is capped at ~10k characters; a rule file is not). Wired once per project; after that, every capability is drop-the-folder.
+- **Global — `@`-imported stub.** The stub markdown installs to `~/.claude/tools/<name>.md` and is listed once in the host's global `CLAUDE.md`; the harness expands that `@`-import inline into every session, so the stub's awareness line loads machine-wide. The stub carries **no front-matter** — an `@`-imported file expands verbatim, so it is a plain awareness paragraph, not a skill header. It is **awareness only**: what the tool is and to run `<name> help`. Whether the tool is *ready* in the current project is `<name> doctor`'s answer, never the stub's.
+- **Project — generated rule.** A capability-agnostic `SessionStart` **script**, `.claude/hooks/build-capabilities-rule.sh`, writes `.claude/rules/CAPABILITIES.md` — a manifest of `@`-imports, one per `.capabilities/<ns>/CAPABILITY.md`. The harness auto-loads the rule file and expands the imports inline, so each stub loads **in full, uncapped** (a `SessionStart` hook echoing into the session is capped at ~10k characters; a rule file is not). That manifest is **written by the script, never authored or edited by the agent** — a capability is added by dropping its folder, and the script picks it up next session.
 
 The CLI reaches the agent by a third, host-neutral route: the executable is symlinked from `~/.capabilities/<name>/bin/<name>` onto `PATH`, so any session invokes `<name>` directly. A consuming project never copies the CLI — it calls the one centralized executable by name.
 

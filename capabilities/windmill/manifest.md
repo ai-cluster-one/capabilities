@@ -8,6 +8,7 @@ The declarative spec the [procedures](../../procedures/) read to install / updat
 - **Summary**: drive a Windmill instance (deploy scripts, attach cron schedules, run jobs, read run history/logs, manage secret variables and folders) over its REST API.
 - **Underlying service**: a Windmill instance (Community or EE). Not bundled — the user supplies one.
 - **Has authored artifacts**: yes — example scripts under `project/scripts/`.
+- **Config dependency**: `global` — resolves the instance URL + token from `~/.config/windmill/` (or a project `.env`); usable from any project once installed.
 
 ## Dependencies
 
@@ -20,7 +21,7 @@ The capability folder installs, immutable, at `~/.capabilities/windmill/`; the r
 | Source (repo) | Destination (requirement) |
 |---|---|
 | `bin/windmill` | `~/.capabilities/windmill/bin/windmill`, **executable** (`chmod +x`), symlinked into a `PATH` dir (`~/bin` or `~/.local/bin`) so `windmill` resolves by name. |
-| `stub.md` | `~/.capabilities/windmill/stub.md`, surfaced by symlinking it as `~/.claude/skills/windmill/SKILL.md` — front-matter `name` + `description` load every session, body on demand. |
+| `stub.md` | `~/.capabilities/windmill/stub.md`, installed as `~/.claude/tools/windmill.md` and `@`-imported in the host `CLAUDE.md` — a front-matter-free awareness line, loaded every session. |
 | `credentials.env.example` | copied to `~/.config/windmill/credentials.env` **with empty values**. |
 
 ## Credentials

@@ -1,8 +1,3 @@
----
-name: Mailbox
-description: The project's IMAP/SMTP mailbox access — read incoming mail, save attachments, flag/move messages, and send, via the `mailbox` CLI. A thin adapter; this project's own drain/triage/routing lives in its operations layer, not in the tool. Profiles in mailbox.json, the app-password in .env.
----
-
 # Mailbox
 
 The project's **IMAP/SMTP mailbox access** — reading incoming mail (and its attachments), flagging and moving messages, and **sending** — through the `mailbox` CLI. A thin adapter: the tool itself is project-agnostic, so any drain / triage / invoice-routing this project does lives in its **own operations layer** that reads the tool's JSON, never in the tool.

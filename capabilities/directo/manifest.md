@@ -8,6 +8,7 @@ The declarative spec the [procedures](../../procedures/) read to install / updat
 - **Summary**: drive a Directo ERP instance (login.directo.ee) over the browser-session endpoints its web UI uses — login ceremony, location selection, and authed reads of the `components_api.asp` / `*.asp` surface.
 - **Underlying service**: a Directo ERP database, hosted at `https://login.directo.ee/<db>/`. Not bundled — the user supplies the database and a login. No public API exists; the CLI reproduces the authenticated browser session.
 - **Has authored artifacts**: no.
+- **Config dependency**: `global` — resolves its credentials/session from `~/.config/directo/` (or a project `.env`); usable from any project once the session is live.
 
 ## Dependencies
 
@@ -20,7 +21,7 @@ The capability folder installs, immutable, at `~/.capabilities/directo/`; the ro
 | Source (repo) | Destination (requirement) |
 |---|---|
 | `bin/directo` | `~/.capabilities/directo/bin/directo`, **executable** (`chmod +x`), symlinked into a `PATH` dir (`~/bin` or `~/.local/bin`) so `directo` resolves by name. |
-| `stub.md` | `~/.capabilities/directo/stub.md`, surfaced by symlinking it as `~/.claude/skills/directo/SKILL.md` — front-matter `name` + `description` load every session, body on demand. |
+| `stub.md` | `~/.capabilities/directo/stub.md`, installed as `~/.claude/tools/directo.md` and `@`-imported in the host `CLAUDE.md` — a front-matter-free awareness line, loaded every session. |
 | `credentials.env.example` | copied to `~/.config/directo/credentials.env` **with empty values**. |
 
 ## Credentials

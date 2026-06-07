@@ -23,7 +23,7 @@ The capability index there names each folder under `capabilities/`. Take the cho
 
 ## 2. Global layer — the machine, once per capability
 
-The capability lives, immutable, in a per-host-neutral registry at `~/.capabilities/<name>/`, and two symlinks surface it: one puts its CLI on PATH, one puts its stub into every session.
+The capability lives, immutable, in a per-host-neutral registry at `~/.capabilities/<name>/`; from there its CLI is symlinked onto PATH, and its stub is `@`-imported into every session via the host's global `CLAUDE.md`.
 
 **a. Fetch the capability folder into the registry.** No clone, no working tree — just the one folder:
 
@@ -42,11 +42,13 @@ chmod +x "$HOME/.capabilities/<name>/bin/<name>"
 ln -sf "$HOME/.capabilities/<name>/bin/<name>" "$HOME/bin/<name>"
 ```
 
-**c. Put the stub into every session.** The stub is a skill: `~/.claude/skills/<name>/SKILL.md` is auto-discovered each session and its front-matter `name` + `description` surface as the capability's awareness line; its body loads on demand. Symlink it to the immutable source — the registry stays the one home:
+**c. Put the stub into every session.** The stub surfaces by `@`-import. Install it to `~/.claude/tools/<name>.md` (a symlink to the immutable source — the registry stays the one home), then list it once in the host's global `~/.claude/CLAUDE.md` so the harness expands it inline every session. The stub is **awareness only**, no front-matter — what the tool is and to run `<name> help`; `<name> doctor` answers whether it is ready here.
 
 ```
-mkdir -p "$HOME/.claude/skills/<name>"
-ln -sf "$HOME/.capabilities/<name>/stub.md" "$HOME/.claude/skills/<name>/SKILL.md"
+mkdir -p "$HOME/.claude/tools"
+ln -sf "$HOME/.capabilities/<name>/stub.md" "$HOME/.claude/tools/<name>.md"
+# then, once, if absent, add this line to the host's global ~/.claude/CLAUDE.md:
+#   @./tools/<name>.md
 ```
 
 **d. Credentials.** Copy the example to the standard home **with empty values**, then resolve the capability's template variables: ask for **must-confirm** values (a self-hosted URL, a token) and write them; leave **breadcrumb** keys empty in place. Read `~/.capabilities/<name>/manifest.md` for the variable classes.
@@ -62,7 +64,7 @@ A real secret only ever lands in `~/.config/<name>/credentials.env` (or a projec
 
 The CLI is centralized (step 2) — a project never copies it; it calls `<name>` by PATH. The project layer is only the lightweight, project-specific knowledge, surfaced by two project-side loaders (one for capabilities, one for routines).
 
-**a. Lay down the assets.** Copy the project template into `<project>/.capabilities/<ns>/` (infer `<ns>` from the project; confirm if unsure). The template `~/.capabilities/<name>/project/` holds the entry file `CAPABILITY.md` (front-matter `name` + `description` + role prose) plus `identifiers.md` and a self-describing `reference.md` scaffold, and an optional `scripts/`:
+**a. Lay down the assets.** Copy the project template into `<project>/.capabilities/<ns>/` (infer `<ns>` from the project; confirm if unsure). The template `~/.capabilities/<name>/project/` holds the entry file `CAPABILITY.md` (a front-matter-free awareness stub — role prose + pointers) plus `identifiers.md` and a self-describing `reference.md` scaffold, and an optional `scripts/`:
 
 ```
 mkdir -p "<project>/.capabilities/<ns>"
@@ -239,7 +241,7 @@ A capability with no Post-install section needs nothing here.
 ## 5. Verify and report
 
 - Run the capability's health check (`<name> doctor` or `<name> help`) to confirm the CLI resolves on PATH and finds its credentials.
-- Confirm `~/.claude/skills/<name>/SKILL.md` resolves (the stub surfaces next session).
+- Confirm `~/.claude/tools/<name>.md` resolves and its `@./tools/<name>.md` line is in the host `CLAUDE.md` (the stub surfaces next session).
 - If you're in a project, confirm `.claude/hooks/build-capabilities-rule.sh` is executable, the `SessionStart` hook names it, and running it once produces `.claude/rules/CAPABILITIES.md` with an `@`-import for the capability.
 - Confirm `.claude/hooks/build-routines-rule.sh` is executable and named in the same `SessionStart` hook; running it produces `.claude/rules/ROUTINES.md` — an index line per `.routines/*.md`, or "No routines defined yet." when none exist.
 

@@ -1,8 +1,3 @@
----
-name: Stripe
-description: The project's Stripe access — read-only reads via the `stripe` CLI (REST API) emitting a neutral JSON contract of what happened on the account: doctor, sync-plan (the contract producer), contract (its shape), invoice list + PDF download, and balance-transaction / payout reads. The way this project reads what cleared on Stripe.
----
-
 # Stripe
 
 The project's **Stripe access** — reading what happened on its Stripe account through the read-only `stripe` CLI. The producer command `stripe sync-plan --from … --to …` emits a neutral JSON contract (charges with gross/fee/net + customer + invoice, standalone fees, payouts, refunds) that this project's own logic maps onto its domain. Every `stripe` command is a read.

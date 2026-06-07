@@ -8,6 +8,7 @@ The declarative spec the [procedures](../../procedures/) read to install / updat
 - **Summary**: a thin IMAP/SMTP adapter for one mailbox — list/show messages, save attachments, flag `\Seen`, move between folders, and send. It knows nothing about who owns the mailbox; any drain/triage/routing orchestration is a consuming project's operation layer that reads this tool's JSON.
 - **Underlying service**: any IMAP/SMTP mail server, named per-profile in the project's `mailbox.json`. Not bundled — the user supplies the server, address, and an app-password.
 - **Has authored artifacts**: a config template (`project/mailbox.json.example`); no scripts.
+- **Config dependency**: `project-required` — no global default; needs a project-local `mailbox.json` (+ the password in the project `.env`). `mailbox doctor` reports the path when it is missing, so a project is globally *aware* of mailbox but only *ready* once it provides that config.
 
 ## Dependencies
 
@@ -21,7 +22,7 @@ The capability folder installs, immutable, at `~/.capabilities/mailbox/`; the ro
 | Source (repo) | Destination (requirement) |
 |---|---|
 | `bin/mailbox` | `~/.capabilities/mailbox/bin/mailbox`, **executable** (`chmod +x`), symlinked into a `PATH` dir (`~/bin` or `~/.local/bin`) so `mailbox` resolves by name. |
-| `stub.md` | `~/.capabilities/mailbox/stub.md`, surfaced by symlinking it as `~/.claude/skills/mailbox/SKILL.md` — front-matter `name` + `description` load every session, body on demand. |
+| `stub.md` | `~/.capabilities/mailbox/stub.md`, installed as `~/.claude/tools/mailbox.md` and `@`-imported in the host `CLAUDE.md` — a front-matter-free awareness line, loaded every session. |
 
 There is **no `credentials.env.example`** — see Credentials. The install **skips step 2d** (global credentials) for this capability; its config and secret are both project-layer.
 

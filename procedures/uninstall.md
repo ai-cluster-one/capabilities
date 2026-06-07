@@ -21,7 +21,7 @@ Open `<capability>/manifest.md` for the full list of artifacts and their homes, 
 
 Only if the user asked for machine-level removal:
 
-- Remove the PATH symlink (`~/bin/<name>` or `~/.local/bin/<name>`), the skill symlink (`~/.claude/skills/<name>/`), and the registry folder (`~/.capabilities/<name>/`).
+- Remove the PATH symlink (`~/bin/<name>` or `~/.local/bin/<name>`), the stub install (`~/.claude/tools/<name>.md` and its `@./tools/<name>.md` line in the host `CLAUDE.md`), and the registry folder (`~/.capabilities/<name>/`).
 - **Credentials**: `~/.config/<name>/credentials.env` may hold real secrets. Show the user what you're about to remove and confirm explicitly before deleting it. Offer to keep it (orphaned but harmless) if they're unsure.
 
 ## 4. Record and report

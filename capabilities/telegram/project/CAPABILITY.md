@@ -1,8 +1,3 @@
----
-name: Telegram
-description: The project's Telegram access — read, search, send, export, and transcribe over a personal MTProto account via the `telegram` CLI. How this project reaches its Telegram chats: list dialogs, pull or search a chat's messages, send a message, dump a chat's full history to JSON, and transcribe voice/audio.
----
-
 # Telegram
 
 The project's **Telegram access** — reaching its chats through the `telegram` CLI on a personal MTProto account (a full user account). List dialogs, read or search a chat, send a message, export a chat's full history to JSON with voice/audio + photos/stickers downloaded, and fill voice/audio transcription placeholders via Deepgram.

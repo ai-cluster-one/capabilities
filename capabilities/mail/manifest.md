@@ -8,6 +8,7 @@ The declarative spec the [procedures](../../procedures/) read to install / updat
 - **Summary**: read and draft mail across Mail.app's already-configured accounts — list accounts/mailboxes, read, search, show a message, list its links, save attachments, fetch a linked URL to disk, draft (never send), and export a mailbox to JSON.
 - **Underlying service**: the local **Mail.app** on macOS, driven over macOS Automation (JXA). Not bundled and not a remote service — it reads whatever accounts the user's Mail.app is already signed into.
 - **Has authored artifacts**: no.
+- **Config dependency**: `none` — authenticates via macOS Automation (a one-time per-terminal grant); no credentials, no config file. Usable from any directory.
 
 ## Dependencies
 
@@ -22,7 +23,7 @@ The capability folder installs, immutable, at `~/.capabilities/mail/`; the rows 
 | Source (repo) | Destination (requirement) |
 |---|---|
 | `bin/mail` | `~/.capabilities/mail/bin/mail`, **executable** (`chmod +x`), symlinked into a `PATH` dir (`~/bin` or `~/.local/bin`) so `mail` resolves by name. |
-| `stub.md` | `~/.capabilities/mail/stub.md`, surfaced by symlinking it as `~/.claude/skills/mail/SKILL.md` — front-matter `name` + `description` load every session, body on demand. |
+| `stub.md` | `~/.capabilities/mail/stub.md`, installed as `~/.claude/tools/mail.md` and `@`-imported in the host `CLAUDE.md` — a front-matter-free awareness line, loaded every session. |
 
 There is **no `credentials.env.example`** — see Credentials. The install **skips step 2d** (credentials) for this capability.
 

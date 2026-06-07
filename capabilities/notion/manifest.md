@@ -8,6 +8,7 @@ The declarative spec the [procedures](../../procedures/) read to install / updat
 - **Summary**: publish markdown to Notion pages over the REST API — identity (`whoami`), list child pages, fetch a page as markdown, replace an existing page's body + title, create a page under a parent, and upsert by exact title under a parent. The local markdown H1 is the source of truth for the page title.
 - **Underlying service**: **Notion** (the SaaS), over its public REST API authenticated by an internal-integration token (PAT). Not bundled — the user supplies a Notion workspace, an integration, and the page-shares that grant it access.
 - **Has authored artifacts**: no.
+- **Config dependency**: `global` — resolves a token from `~/.config/notion/` (or a project `.env`); usable from any project. Project identifiers only pin page/parent UUIDs.
 
 ## Dependencies
 
@@ -21,7 +22,7 @@ The capability folder installs, immutable, at `~/.capabilities/notion/`; the row
 | Source (repo) | Destination (requirement) |
 |---|---|
 | `bin/notion` | `~/.capabilities/notion/bin/notion`, **executable** (`chmod +x`), symlinked into a `PATH` dir (`~/bin` or `~/.local/bin`) so `notion` resolves by name. |
-| `stub.md` | `~/.capabilities/notion/stub.md`, surfaced by symlinking it as `~/.claude/skills/notion/SKILL.md` — front-matter `name` + `description` load every session, body on demand. |
+| `stub.md` | `~/.capabilities/notion/stub.md`, installed as `~/.claude/tools/notion.md` and `@`-imported in the host `CLAUDE.md` — a front-matter-free awareness line, loaded every session. |
 | `credentials.env.example` | copied to `~/.config/notion/credentials.env` **with empty values**. |
 
 ## Credentials
