@@ -30,6 +30,7 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CONFIG_DIR = _CONFIG_HOME / "simplbooks"
 CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
 CLIENTS_CACHE = CONFIG_DIR / "clients.json"
+SALES_META_CACHE = CONFIG_DIR / "sales_meta.json"
 PIN_STATE_FILE = CONFIG_DIR / ".pin_pending"
 BASE = "https://app.simplbooks.com"
 LOGIN_URL = "https://secure.simplbooks.com/accounts/login"
@@ -51,6 +52,22 @@ Credentials live in ~/.config/simplbooks/credentials.env:
   SIMPLBOOKS_PASSWORD='...'                   (primary — for auto-login)
   SIMPLBOOKS_ACCOUNT=<32-char account hash>   (written by login/refresh)
   SIMPLBOOKS_COOKIE='SB_APP_CSRF=...; ...'    (written by login/refresh)
+
+Account-specific config (resolved by the cascade: flag > project .env(.local) >
+this credentials.env > process env — so a consuming project can set these in its
+own .env):
+  SIMPLBOOKS_WORKER=<name>                    (invoice issuer name)
+  SIMPLBOOKS_BANK_ACCOUNT=<id>                (own bank account on invoices)
+  SIMPLBOOKS_BANK_TARGET=<bank>               (bank integration for send-payment)
+  SIMPLBOOKS_INVOICE_FOOTER='...'             (optional invoice footer line)
+  SIMPLBOOKS_INCOMEACCT_EU_REVERSE=<id>       (optional: books-policy override —
+  SIMPLBOOKS_INCOMEACCT_NON_EU=<id>            a regime whose revenue books to a
+  SIMPLBOOKS_INCOMEACCT_EE_DOMESTIC=<id>       row other than the live default)
+Find the bank account id with `accounts list cashbook`. Sales VAT types + rates
+are read LIVE from SimpleBooks per invoice (`invoices meta` / `expenses meta`).
+The income account defaults to the live vat_types value; set a regime key above
+only to book it elsewhere. The issuer (`creator`) is the logged-in user, read
+from the form.
 
 There is no public SimpleBooks API. The CLI emulates a browser session.
 Sessions expire periodically. With EMAIL+PASSWORD present, expiry is
@@ -114,24 +131,66 @@ Then re-run `simplbooks doctor` to confirm.
                                                 List clients/partners. Caches
                                                 results to clients.json for
                                                 use by `invoices create`.
+  simplbooks clients search <query>             Search the EE business registry
+                                                by partial company name.
+  simplbooks clients lookup <reg_code>          Full company details from the EE
+                                                business registry by reg code.
+  simplbooks clients create
+        [--reg-code C] [--name N] [--reg-no R] [--vat-no V] [--country EE]
+        [--street/--city/--postal-code/--county T] [--email/--phone T]
+        [--language et_EE]
+                                                Create a client. --reg-code
+                                                auto-fills from the registry.
+                                                Set VAT defaults + IBAN/SWIFT with
+                                                `clients update`.
+  simplbooks clients update <client_id> [--<field> VALUE ...]
+                                                Edit a client; only the flags you
+                                                pass change. Common use: set
+                                                per-client VAT defaults
+                                                (--sales-vat-type, --purchase-vat-type,
+                                                --expense-account) so future
+                                                invoices inherit them.
 
   simplbooks invoices list [--search TERM] [--limit N]
                                                 List recent invoices.
+  simplbooks invoices show <invoice_id> [--json]
+                                                Read one invoice: line items +
+                                                client metadata.
+  simplbooks invoices meta [--json] [--refresh]
+                                                Live SALES vat types (id → rate,
+                                                income account), read from the
+                                                form + cached to sales_meta.json.
 
   simplbooks invoices create
         --client-id ID --description TEXT --price NUM
         [--tax-class ee-domestic|eu-reverse|non-eu]
-        [--number N] [--quantity N] [--unit U]
-        [--due-days D] [--worker W] [--reference TEXT]
+        [--vat-type-id ID] [--income-account-id ID] [--bank-account ID]
+        [--number N] [--quantity N] [--unit U] [--date YYYY-MM-DD]
+        [--due-days D] [--worker W] [--reference TEXT] [--creator ID]
+        [--dry-run]
                                                 Create an invoice. Client must
                                                 exist in the local cache —
-                                                run `clients list` first.
+                                                run `clients list` first. The
+                                                VAT rate + income account are read
+                                                LIVE from the account's vat_types
+                                                map (see `invoices meta`); creator
+                                                is the logged-in user. --dry-run
+                                                resolves + prints without creating.
+
+  simplbooks invoices update <invoice_id>
+        [--reference TEXT] [--append-reference TEXT] [--number N] [...]
+                                                Edit an invoice in place
+                                                (Lisainfo, number, lines …).
+                                                Scrapes the form, patches,
+                                                re-POSTs.
+  simplbooks invoices unbind <invoice_id>       Remove all incoming/payment
+                                                bindings from an invoice.
 
   simplbooks expenses list [--search TERM] [--limit N]
                                                 List purchase invoices.
-  simplbooks expenses meta                      Scrape /purchases/add to list
-                                                vat_type and expense_account
-                                                options. Cached to
+  simplbooks expenses meta [--json] [--refresh]
+                                                Live PURCHASE vat types, read from
+                                                /purchases/add + cached to
                                                 purchases_meta.json.
   simplbooks expenses show <id>                 Read a purchase invoice.
   simplbooks expenses create
@@ -143,10 +202,15 @@ Then re-run `simplbooks doctor` to confirm.
         [--vat-total AMT] [--rounding AMT]
         [--row-sum-with-vat/--row-sum-net]
         [--attachment PATH] [--reference TEXT]
+        [--currency EUR] [--comments TEXT] [--creator ID] [--dry-run]
                                                 Create a purchase invoice
                                                 (ostuarve). --line is
                                                 repeatable, one per row.
                                                 --attachment uploads a PDF.
+                                                Creator defaults to the logged-in
+                                                user (read from the form).
+                                                --dry-run resolves + prints
+                                                without creating.
 
   simplbooks expenses update <purchase_id>
         [--number STR] [--internal-number STR]
@@ -164,7 +228,7 @@ Then re-run `simplbooks doctor` to confirm.
 
   simplbooks expenses send-payment <purchase_id>
         [--amount AMT] [--from-account ID] [--date DD.MM.YYYY]
-        [--target swedbank]
+        [--target <bank>]
                                                 Stage a purchase invoice as a
                                                 payment order to the bank.
                                                 Scrapes the invoice's pre-filled
@@ -177,13 +241,13 @@ Then re-run `simplbooks doctor` to confirm.
                                                 own-account SWIFT + supplier IBAN
                                                 or the bank rejects it.
 
-  simplbooks accounts list bank | income | expense [--limit N]
-                                                List accounts. `bank` is the
-                                                financial/clearing accounts;
-                                                `income` and `expense` are
-                                                chart-of-accounts entries
-                                                referenced by vat_type and
-                                                income/expense_account_id.
+  simplbooks accounts list chart | cashbook [--limit N]
+                                                List accounts. `cashbook` is the
+                                                bank-like clearing accounts (Kassa /
+                                                bank accounts, used as --account-id);
+                                                `chart` is the full chart of accounts
+                                                (income 4xxx, expense 5xxx) referenced
+                                                by income/expense_account_id.
 
   simplbooks bank-transactions list
         [--direction in|out] [--status valid|invalid|warning|duplicate]
@@ -203,9 +267,9 @@ Then re-run `simplbooks doctor` to confirm.
   simplbooks bank-transactions delete <bt_id>
                                                 Drop a row from the worklist
                                                 without booking it. Use for
-                                                Stripe-payout duplicates
-                                                (already mirrored as a
-                                                kanne) or mis-imports.
+                                                payment-processor payout
+                                                duplicates (already mirrored
+                                                as a kanne) or mis-imports.
 
   simplbooks bank-transactions save <bt_id> --as incoming
         --client-id N [--invoice-id N ...]
@@ -233,8 +297,9 @@ Then re-run `simplbooks doctor` to confirm.
                                                 row; only the counter
                                                 account needs to be supplied.
 
-  Operational doctrine + decision tree for the worklist live in
-  .assets/simplbooks/bank-transactions.md. Read it before processing rows.
+  Operational doctrine + decision tree for the worklist are consumer-side:
+  see the consuming project's own simplbooks reference. Read it before
+  processing rows.
 
   simplbooks kanne list [--search T] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
         [--limit N] [--json]
@@ -283,11 +348,16 @@ Then re-run `simplbooks doctor` to confirm.
 
 ═══ Tax classes ════════════════════════════════════════════════════════════
 
-  ee-domestic   Estonia, 24% VAT          vat_type_id=32  income_acct=102
-  eu-reverse    EU B2B, 0% reverse-       vat_type_id=10  income_acct=106
-                charge (requires VAT no
-                on the client record)
-  non-eu        Export, 0%                vat_type_id=13  income_acct=110
+  A regime is a presentation choice (invoice language, reverse-charge mode,
+  footer) anchored to a sales vat_type_id. The VAT RATE is read LIVE from the
+  account's vat_types map for that type (`invoices meta`). The income ACCOUNT
+  defaults to the live map's value, overridable per regime by config (books
+  policy) or per invoice by --income-account-id; override the type --vat-type-id.
+
+  ee-domestic   Estonia, standard VAT          sales vat_type 32
+  eu-reverse    EU B2B, 0% reverse-charge      sales vat_type 10
+                (requires VAT no on client)
+  non-eu        Export, 0%                     sales vat_type 13
 
 ═══ Price format ═══════════════════════════════════════════════════════════
 
@@ -303,15 +373,37 @@ normalised to Estonian format ('1 234,50') for the SimpleBooks form.
 
 # ─── Tax classification map ─────────────────────────────────────────────────
 
+# A regime is a presentation choice (invoice language, reverse-charge row mode,
+# footer prefix) anchored to a SimpleBooks sales vat_type_id — part of the
+# platform's Estonian VAT-type taxonomy (the "Teenuste müük / EÜ teenused /
+# Teenuste eksport" service-sale types), not a consumer fingerprint. The VAT RATE
+# for each type is read live from the account's `vat_types` map (never baked). The
+# income ACCOUNT is a books-policy choice: the live map only carries SimpleBooks'
+# naive default (usually one revenue account for every type), so a regime that
+# books elsewhere — e.g. EU reverse-charge / export to their own 0% revenue rows —
+# is captured by an optional per-regime config key (TAX_CLASS_INCOME_KEYS), which
+# overrides the live default. No account id is baked into the tool.
 TAX_CLASSES: dict[str, dict[str, str | None]] = {
-    "ee-domestic": {"vat_rate": "24", "vat_type_id": "32", "income_account_id": "102",
+    "ee-domestic": {"vat_type_id": "32",
                     "language": "et_EE", "row_sum_with_vat": None, "footer_prefix": ""},
-    "eu-reverse":  {"vat_rate": "0",  "vat_type_id": "10", "income_account_id": "106",
+    "eu-reverse":  {"vat_type_id": "10",
                     "language": "en_GB", "row_sum_with_vat": "1",
                     "footer_prefix": "Reverse charge EU directive 2006/112\n\n"},
-    "non-eu":      {"vat_rate": "0",  "vat_type_id": "13", "income_account_id": "110",
+    "non-eu":      {"vat_type_id": "13",
                     "language": "et_EE", "row_sum_with_vat": None, "footer_prefix": ""},
 }
+
+# Optional per-regime income-account override of the live default — set only for a
+# regime whose revenue books to a different chart row than SimpleBooks' default
+# (e.g. EU reverse-charge / export). Resolved through the config cascade; unset =
+# use the live vat_types default.
+TAX_CLASS_INCOME_KEYS: dict[str, str] = {
+    "ee-domestic": "SIMPLBOOKS_INCOMEACCT_EE_DOMESTIC",
+    "eu-reverse":  "SIMPLBOOKS_INCOMEACCT_EU_REVERSE",
+    "non-eu":      "SIMPLBOOKS_INCOMEACCT_NON_EU",
+}
+
+# The invoice footer is a consumer-chosen courtesy line, overridable via config.
 DEFAULT_FOOTER = "Täname õigeaegselt tasutud arve eest!"
 
 # ─── Credentials I/O ────────────────────────────────────────────────────────
@@ -322,6 +414,16 @@ class AuthError(click.ClickException):
 
 # The four credential keys, in the order login/refresh persists them.
 CRED_KEYS = ("SIMPLBOOKS_EMAIL", "SIMPLBOOKS_PASSWORD", "SIMPLBOOKS_ACCOUNT", "SIMPLBOOKS_COOKIE")
+
+
+def _clean_env_value(v: str) -> str:
+    """Normalize an env-file value: a quoted value is kept literal (quotes stripped);
+    an unquoted value drops a trailing inline comment (whitespace + `#…`), matching
+    the common .env convention so a trailing comment never corrupts the value."""
+    v = v.strip()
+    if len(v) >= 2 and ((v[0] == "'" and v[-1] == "'") or (v[0] == '"' and v[-1] == '"')):
+        return v[1:-1]
+    return re.sub(r"\s+#.*$", "", v).strip()
 
 
 def load_credentials() -> dict[str, str]:
@@ -336,10 +438,7 @@ def load_credentials() -> dict[str, str]:
             if not s or s.startswith("#") or "=" not in s:
                 continue
             k, _, v = s.partition("=")
-            v = v.strip()
-            if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
-                v = v[1:-1]
-            out[k.strip()] = v
+            out[k.strip()] = _clean_env_value(v)
     for key in CRED_KEYS:
         if not out.get(key):
             env_v = os.environ.get(key)
@@ -364,24 +463,96 @@ def _read_cred(key: str) -> str | None:
                 continue
             k, _, v = s.partition("=")
             if k.strip() == key:
-                v = v.strip()
-                if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
-                    v = v[1:-1]
-                return v or None
+                return _clean_env_value(v) or None
     return None
 
 
 def _worker_name(override: str | None = None) -> str:
-    """Resolve the invoice worker name, identity-free, through the cascade:
-    explicit --worker > SIMPLBOOKS_WORKER in the process env > credentials.env.
-    No name is baked into the tool — absent a value the caller is told to set one."""
-    w = override or os.environ.get("SIMPLBOOKS_WORKER") or _read_cred("SIMPLBOOKS_WORKER")
-    if w and w.strip():
-        return w.strip()
+    """Resolve the invoice worker name, identity-free, through the config cascade
+    (--worker > project .env > credentials.env > process env). No name is baked
+    into the tool — absent a value the caller is told to set one."""
+    w = _cfg("SIMPLBOOKS_WORKER", override)
+    if w:
+        return w
     raise click.ClickException(
         "No worker name — SIMPLBOOKS_WORKER is unset and --worker was not given.\n"
-        "  → add SIMPLBOOKS_WORKER=<name> to credentials.env (or the env), or pass --worker"
+        "  → add SIMPLBOOKS_WORKER=<name> to a project .env or credentials.env, or pass --worker"
     )
+
+
+def _project_env_value(key: str) -> str | None:
+    """Read KEY from the consuming project's nearest .env.local / .env, walking up
+    from CWD and stopping at $HOME or the filesystem root (never above either). The
+    first directory that holds either file is the project root; .env.local wins over
+    .env there. This is tier-2 of the cascade — it lets a project supply its own
+    non-secret config without touching global config."""
+    home = Path.home()
+    cwd = Path.cwd()
+    for d in (cwd, *cwd.parents):
+        local, base = d / ".env.local", d / ".env"
+        if local.is_file() or base.is_file():
+            for f in (local, base):
+                if not f.is_file():
+                    continue
+                for line in f.read_text().splitlines():
+                    s = line.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    k, _, v = s.partition("=")
+                    if k.strip() == key:
+                        return _clean_env_value(v) or None
+            return None  # nearest project root found; its env doesn't set the key
+        if d == home or d == d.parent:  # stop at $HOME or filesystem root
+            break
+    return None
+
+
+def _cfg(key: str, override: str | None = None) -> str | None:
+    """Resolve a non-secret config value, identity-free, through the cascade:
+    explicit override > project .env(.local) > user config (credentials.env) >
+    process env. None if unset everywhere."""
+    v = override or _project_env_value(key) or _read_cred(key) or os.environ.get(key)
+    return v.strip() if v and v.strip() else None
+
+
+def _bank_account(override: str | None = None) -> str:
+    """Resolve this account's own bank/cashbook id used on sales invoices.
+    No id is baked in — it is an account-specific chart row."""
+    v = _cfg("SIMPLBOOKS_BANK_ACCOUNT", override)
+    if v:
+        return v
+    raise click.ClickException(
+        "No bank account — SIMPLBOOKS_BANK_ACCOUNT is unset.\n"
+        "  → add SIMPLBOOKS_BANK_ACCOUNT=<id> to a project .env or credentials.env.\n"
+        "    Find the id with `simplbooks accounts list cashbook`."
+    )
+
+
+def _resolve_tax(tax_class: str, vat_types: dict, vat_type: str | None = None,
+                 income_account: str | None = None) -> tuple[str, str, str]:
+    """Resolve (vat_type_id, income_account_id, vat_rate) for a regime against the
+    account's LIVE vat_types map. The vat_type is the regime anchor (override with
+    --vat-type-id) and the rate comes straight from the live map. The income
+    account resolves: --income-account-id > per-regime config (a books-policy
+    override, e.g. EU/export to a 0% revenue row) > the live map's default. No id
+    is baked into the tool."""
+    vt = str(vat_type or TAX_CLASSES[tax_class]["vat_type_id"])
+    meta = vat_types.get(vt) or {}
+    live_income = str(meta["income_account_id"]) if meta.get("income_account_id") is not None else None
+    income_key = TAX_CLASS_INCOME_KEYS.get(tax_class)
+    ia = income_account or (_cfg(income_key) if income_key else None) or live_income
+    rate = str(meta["vat_percent"]) if meta.get("vat_percent") is not None else None
+    if not ia:
+        raise click.ClickException(
+            f"No income account for vat_type {vt} — the live vat_types map gave none "
+            f"and no override is set.\n"
+            f"  → pass --income-account-id <id> (find it with `simplbooks accounts list chart`),\n"
+            f"    or set {income_key} in a project .env / credentials.env."
+        )
+    if rate is None:
+        # The live map should always carry the rate; fall back to 0 only defensively.
+        rate = "0"
+    return vt, ia, rate
 
 
 def parse_cookie_string(s: str) -> dict[str, str]:
@@ -684,7 +855,9 @@ def build_http(cookies: dict, account: str, ajax: bool = False) -> httpx.Client:
     return httpx.Client(cookies=cookies, headers=headers, follow_redirects=False, timeout=30)
 
 
-def fetch_fresh_csrf(http: httpx.Client, account: str, path: str = "invoices/add") -> str:
+def fetch_add_page(http: httpx.Client, account: str, path: str = "invoices/add") -> str:
+    """GET an add-form page, recovering once via auto-login if the session is
+    stale. Returns the page HTML — callers extract csrf / vat_types / creator."""
     r = http.get(f"{BASE}/{account}/{path}")
     if r.is_redirect or r.status_code in (301, 302):
         # Session is stale. Try auto-login + retry once with refreshed cookies.
@@ -700,12 +873,78 @@ def fetch_fresh_csrf(http: httpx.Client, account: str, path: str = "invoices/add
                 "  → fallback: simplbooks refresh /path/to/fresh-curl.txt"
             )
     if r.status_code != 200:
-        raise click.ClickException(f"GET /invoices/add returned {r.status_code}")
-    soup = BeautifulSoup(r.text, "html.parser")
-    inp = soup.find("input", {"name": "_csrfToken"})
+        raise click.ClickException(f"GET /{path} returned {r.status_code}")
+    return r.text
+
+
+def csrf_from_page(html: str, path: str = "invoices/add") -> str:
+    inp = BeautifulSoup(html, "html.parser").find("input", {"name": "_csrfToken"})
     if not inp or not inp.get("value"):
-        raise click.ClickException("No _csrfToken on /invoices/add — page layout changed?")
+        raise click.ClickException(f"No _csrfToken on /{path} — page layout changed?")
     return inp["value"]
+
+
+def fetch_fresh_csrf(http: httpx.Client, account: str, path: str = "invoices/add") -> str:
+    return csrf_from_page(fetch_add_page(http, account, path), path)
+
+
+def extract_vat_types(html: str) -> dict:
+    """Pull the live `vat_types` map SimpleBooks emits in the invoice-form JS:
+    { "<vat_type_id>": {"income_account_id": N, "vat_percent": N, "name": "…"}, … }.
+    This is the authoritative source for sales vat types AND their income accounts;
+    returns {} if the page doesn't carry it. The page emits valid JSON, so decode
+    it with raw_decode (string-aware — immune to braces inside a type name)."""
+    m = re.search(r"\bvat_types\s*=\s*", html)
+    if not m:
+        return {}
+    i = html.find("{", m.end())
+    if i < 0:
+        return {}
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(html, i)
+        return obj if isinstance(obj, dict) else {}
+    except (ValueError, json.JSONDecodeError):
+        return {}
+
+
+def creator_from_page(html: str) -> str | None:
+    """Read the logged-in user's id from an add form's creator field, so the issuer
+    attribution follows whoever is driving the CLI (no baked user id). The sales
+    form names the field `creator` and pre-fills the real id; the purchase form
+    names it `data[Purchase][creator]` and leaves it 0 (set client-side). Match
+    either, but treat a non-positive value as unset (None) so callers can fall back."""
+    soup = BeautifulSoup(html, "html.parser")
+    inp = soup.find("input", {"name": "creator"}) or soup.find("input", {"name": "data[Purchase][creator]"})
+    v = (inp.get("value") if inp else None) or ""
+    v = str(v).strip()
+    return v if (v.isdigit() and int(v) > 0) else None
+
+
+def logged_in_user_id(http: httpx.Client, account: str) -> str | None:
+    """The logged-in user's id, read from the invoice add form's `creator` field —
+    the reliable source (the purchase form leaves creator 0). Used to attribute a
+    purchase invoice to the real user. None if unreadable."""
+    try:
+        return creator_from_page(fetch_add_page(http, account, "invoices/add"))
+    except (click.ClickException, httpx.HTTPError):
+        return None
+
+
+def sales_vat_types(http: httpx.Client, account: str, refresh: bool = False) -> dict:
+    """The account's live sales vat_types map (id -> {income_account_id, vat_percent,
+    name}), scraped from /invoices/add and cached to sales_meta.json. Without
+    refresh the cache is used when present; refresh re-scrapes."""
+    if not refresh and SALES_META_CACHE.exists():
+        try:
+            cached = json.loads(SALES_META_CACHE.read_text())
+            if cached:
+                return cached
+        except (ValueError, json.JSONDecodeError):
+            pass
+    vt = extract_vat_types(fetch_add_page(http, account, "invoices/add"))
+    if vt:
+        SALES_META_CACHE.write_text(json.dumps(vt, ensure_ascii=False, indent=2))
+    return vt
 
 # ─── Utility helpers ────────────────────────────────────────────────────────
 
@@ -1105,7 +1344,7 @@ def clients_update(client_id, **overrides) -> None:
     Common use: set per-client VAT defaults so future invoices inherit them automatically.
 
       simplbooks clients update 407 --purchase-vat-type 11 --expense-account 141
-      simplbooks clients update 389 --sales-vat-type 32 --vat-no EE102941452
+      simplbooks clients update 389 --sales-vat-type 32 --vat-no EE123456789
     """
     cookies, account = session_or_die()
     overrides = {k: v for k, v in overrides.items() if v is not None}
@@ -1355,10 +1594,42 @@ def invoices_show(invoice_id: int, as_json: bool) -> None:
         )
 
 
+@invoices.command("meta")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON.")
+@click.option("--refresh", is_flag=True, help="Re-scrape /invoices/add for the live vat_types map.")
+def invoices_meta(as_json: bool, refresh: bool) -> None:
+    """Show the account's live SALES vat types (id → rate, income account, name).
+
+    Scraped from the /invoices/add `vat_types` map and cached to sales_meta.json.
+    This is the source `invoices create` resolves the income account + VAT rate
+    from — so the books-side mapping always comes from SimpleBooks, not a constant.
+    """
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        vt = sales_vat_types(http, account, refresh=refresh)
+    if not vt:
+        raise click.ClickException(
+            "Could not read the vat_types map from /invoices/add — page layout changed?"
+        )
+    if as_json:
+        click.echo(json.dumps(vt, ensure_ascii=False, indent=2))
+        return
+    click.secho(f"Sales VAT types ({len(vt)}):", bold=True)
+    click.echo(f"  {'ID':>4}  {'RATE':>5}  {'INCOME':>6}  NAME")
+    for vid in sorted(vt, key=lambda k: int(k)):
+        v = vt[vid]
+        pct = v.get("vat_percent")
+        pct = "—" if pct is None else f"{pct}%"
+        click.echo(f"  {vid:>4}  {pct:>5}  {str(v.get('income_account_id','') or ''):>6}  {v.get('name','')}")
+
+
 def build_invoice_fields(*, csrf, client_row, number, description, price,
                          tax_class, quantity, unit, due_days, worker, reference,
-                         invoice_date=None) -> list[tuple[str, str]]:
+                         vat_types, creator, invoice_date=None, vat_type=None,
+                         income_account=None, bank_account=None) -> list[tuple[str, str]]:
     tc = TAX_CLASSES[tax_class]
+    vt_id, inc_acct, vat_rate = _resolve_tax(tax_class, vat_types, vat_type, income_account)
+    bank_acct = _bank_account(bank_account)
     now = datetime.now()
     inv = invoice_date or now
     today_dot = inv.strftime("%d.%m.%Y")
@@ -1366,14 +1637,15 @@ def build_invoice_fields(*, csrf, client_row, number, description, price,
     due_dot = (inv + timedelta(days=due_days)).strftime("%d.%m.%Y")
     price_et = to_estonian_number(price)
     cid = str(client_row["id"])
-    footer = (tc["footer_prefix"] or "") + (reference or "") + ("\n\n" if reference else "") + DEFAULT_FOOTER
+    footer_line = _cfg("SIMPLBOOKS_INVOICE_FOOTER") or DEFAULT_FOOTER
+    footer = (tc["footer_prefix"] or "") + (reference or "") + ("\n\n" if reference else "") + footer_line
 
     fields: list[tuple[str, str]] = [
         ("_csrfToken", csrf), ("id", ""), ("draft_id", "0"), ("sales_order_id", "0"),
         ("price_offer_id", "0"), ("base_currency_id", "2"), ("base_currency_code", "EUR"),
         ("paid", "0000-00-00"), ("sent", "0000-00-00"), ("credit_invoice_for", "0"),
         ("proforma", "0"), ("proforma_percent", "0"), ("proforma_invoice_id", "0"),
-        ("not_subject_to_vat", "0"), ("creator", "1"), ("created_time", today_dash),
+        ("not_subject_to_vat", "0"), ("creator", str(creator or "")), ("created_time", today_dash),
         ("cash_accounting_method", "0"), ("row_based_vat", "0"),
         ("data[Invoice][client_data_needs_update]", "0"),
         ("data[Invoice][client_update_data]", "0"),
@@ -1384,16 +1656,16 @@ def build_invoice_fields(*, csrf, client_row, number, description, price,
         ("due", due_dot), ("currency_name", "EUR"), ("data[Invoice][currency_rate]", "1.0000"),
         ("overdue_charge_period", "day"), ("overdue_charge_percent", "0,50"),
         ("language", str(tc["language"])), ("document_template_id", "4"),
-        ("default_bank_account", "3"),
+        ("default_bank_account", bank_acct),
         ("Task[0][id]", ""), ("Task[0][invoice_id]", ""), ("Task[0][client_id]", cid),
         ("Task[0][warehouse_id]", "0"), ("Task[0][is_inventory]", "0"),
-        ("Task[0][vat]", str(tc["vat_rate"])), ("Task[0][article_id]", "0"),
+        ("Task[0][vat]", vat_rate), ("Task[0][article_id]", "0"),
         ("Task[0][code]", ""), ("Task[0][article]", ""),
-        ("Task[0][name]", description), ("Task[0][vat_type_id]", str(tc["vat_type_id"])),
+        ("Task[0][name]", description), ("Task[0][vat_type_id]", vt_id),
         ("Task[0][amount]", quantity), ("Task[0][unit]", unit), ("Task[0][discount]", "0"),
         ("Task[0][price_per_unit]", price_et),
         ("Task[0][Asset][id]", ""), ("Task[0][Asset][name]", ""), ("Task[0][contents]", ""),
-        ("Task[0][income_account_id]", str(tc["income_account_id"])),
+        ("Task[0][income_account_id]", inc_acct),
         ("Task[0][worker]", worker), ("Task[0][date_of_doing]", today_dot),
     ]
     if tc["row_sum_with_vat"]:
@@ -1738,8 +2010,19 @@ def invoices_unbind(invoice_id) -> None:
 @click.option("--worker", default=None, help="issuer name; defaults to SIMPLBOOKS_WORKER (env/credentials.env)")
 @click.option("--reference", default="")
 @click.option("--date", "invoice_date", default=None, help="Invoice date YYYY-MM-DD. Defaults to today.")
+@click.option("--vat-type-id", "vat_type_id", default=None,
+              help="Override the regime's sales vat_type_id (see `invoices meta`).")
+@click.option("--income-account-id", "income_account_id", default=None,
+              help="Override the income account (else read live from the vat_types map).")
+@click.option("--bank-account", "bank_account", default=None,
+              help="Own bank account id shown on the invoice (else SIMPLBOOKS_BANK_ACCOUNT).")
+@click.option("--creator", default=None,
+              help="Issuer user id (else the logged-in user, read from the form).")
+@click.option("--dry-run", is_flag=True,
+              help="Resolve everything and print the payload WITHOUT creating the invoice.")
 def invoices_create(client_id, description, price, tax_class, number,
-                    quantity, unit, due_days, worker, reference, invoice_date) -> None:
+                    quantity, unit, due_days, worker, reference, invoice_date,
+                    vat_type_id, income_account_id, bank_account, creator, dry_run) -> None:
     """Create a new invoice."""
     worker = _worker_name(worker)
     cookies, account = session_or_die()
@@ -1754,13 +2037,36 @@ def invoices_create(client_id, description, price, tax_class, number,
     parsed_date = datetime.strptime(invoice_date, "%Y-%m-%d") if invoice_date else None
 
     with build_http(cookies, account) as http:
-        csrf = fetch_fresh_csrf(http, account)
+        page = fetch_add_page(http, account, "invoices/add")
+        csrf = csrf_from_page(page)
+        vt_map = extract_vat_types(page)
+        if vt_map:
+            SALES_META_CACHE.write_text(json.dumps(vt_map, ensure_ascii=False, indent=2))
+        else:  # page didn't carry the map — fall back to the cache
+            vt_map = sales_vat_types(http, account)
+        creator_id = creator or creator_from_page(page)
         fields = build_invoice_fields(
             csrf=csrf, client_row=client_row, number=number, description=description,
             price=price, tax_class=tax_class, quantity=quantity, unit=unit,
             due_days=due_days, worker=worker, reference=reference,
-            invoice_date=parsed_date,
+            vat_types=vt_map, creator=creator_id,
+            invoice_date=parsed_date, vat_type=vat_type_id,
+            income_account=income_account_id, bank_account=bank_account,
         )
+        if dry_run:
+            fmap = dict(fields)
+            click.secho("DRY RUN — invoice NOT created. Resolved payload:", fg="yellow", bold=True)
+            click.echo(f"  Client        : {client_row.get('name')} [{client_id}]")
+            click.echo(f"  Number        : {number}")
+            click.echo(f"  Tax class     : {tax_class}")
+            click.echo(f"  vat_type_id   : {fmap.get('Task[0][vat_type_id]')}")
+            click.echo(f"  vat rate      : {fmap.get('Task[0][vat]')}")
+            click.echo(f"  income acct   : {fmap.get('Task[0][income_account_id]')}  (--flag > regime config > live default)")
+            click.echo(f"  bank account  : {fmap.get('default_bank_account')}")
+            click.echo(f"  creator       : {fmap.get('creator')}  (--creator > logged-in user)")
+            click.echo(f"  worker        : {fmap.get('Task[0][worker]')}")
+            click.echo(f"  price/unit    : {fmap.get('Task[0][price_per_unit]')} × {fmap.get('Task[0][amount]')} {fmap.get('Task[0][unit]')}")
+            return
         parts: list[tuple[str, tuple]] = [(n, (None, v)) for n, v in fields]
         parts.append(("copy", ("", b"", "application/octet-stream")))
         http.headers["Referer"] = f"{BASE}/{account}/invoices/add"
@@ -1788,14 +2094,17 @@ def invoices_create(client_id, description, price, tax_class, number,
 #                          covering 1xxx assets, 2xxx liabilities, 3xxx equity,
 #                          4xxx revenue, 5xxx expenses, 6xxx other.
 #   /income_accounts     → the small set of "Pangakontod ja kassad" cashbooks
-#                          (Kassa, SEB, Swedbank, …) used as payment landing spots.
+#                          (cash + the account's bank accounts) used as payment
+#                          landing spots.
 ACCOUNT_KINDS: dict[str, str] = {
     "chart":    "financial_accounts",   # full kontoplaan; default
     "cashbook": "income_accounts",      # 6 bank-like payment destinations
 }
 
-# Baked from /purchases/add inline JS. Stable across renders.
-# For Stripe fees from Ireland: use id 11 (0% intra-community service acquisition).
+# Baked from /purchases/add inline JS — the platform's Estonian VAT-type
+# taxonomy, stable across renders (refresh live with `expenses meta`).
+# For services bought from another EU member state (SaaS, hosting, a payment
+# processor): use id 11 (0% intra-community service acquisition, reverse-charge).
 PURCHASE_VAT_TYPES: dict[str, dict] = {
     "3":  {"vat_percent": 20,    "name": "20% Eesti"},
     "4":  {"vat_percent": 9,     "name": "9% Eesti"},
@@ -1847,11 +2156,12 @@ def _accounts_listdata(http: httpx.Client, account: str, endpoint: str, limit: i
 
 
 @accounts.command("list")
-@click.argument("kind", type=click.Choice(list(ACCOUNT_KINDS.keys())), default="bank")
+@click.argument("kind", type=click.Choice(list(ACCOUNT_KINDS.keys())), default="chart")
 @click.option("--limit", default=200, show_default=True, type=int)
 @click.option("--json", "as_json", is_flag=True)
 def accounts_list(kind: str, limit: int, as_json: bool) -> None:
-    """List accounts: bank | income | expense."""
+    """List accounts: `cashbook` (bank-like clearing accounts) or `chart` (the
+    full chart of accounts — income 4xxx, expense 5xxx)."""
     cookies, account = session_or_die()
     endpoint = ACCOUNT_KINDS[kind]
     with build_http(cookies, account, ajax=True) as http:
@@ -1933,31 +2243,37 @@ def _purchases_add_soup(http: httpx.Client, account: str) -> BeautifulSoup:
     return BeautifulSoup(r.text, "html.parser")
 
 
+def purchase_vat_types(http: httpx.Client, account: str, refresh: bool = False) -> dict:
+    """The account's live PURCHASE vat types (scraped from the /purchases/add
+    `vat_types` JS map, cached to purchases_meta.json). Cache-first unless refresh;
+    the baked PURCHASE_VAT_TYPES is only a last-resort fallback if the scrape fails."""
+    if not refresh and PURCHASES_META_CACHE.exists():
+        try:
+            cached = json.loads(PURCHASES_META_CACHE.read_text())
+            if cached:
+                return cached
+        except (ValueError, json.JSONDecodeError):
+            pass
+    vt = extract_vat_types(str(_purchases_add_soup(http, account)))
+    if vt:
+        PURCHASES_META_CACHE.write_text(json.dumps(vt, ensure_ascii=False, indent=2))
+        return vt
+    return PURCHASE_VAT_TYPES
+
+
 @expenses.command("meta")
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON.")
-@click.option("--refresh", is_flag=True, help="Re-scrape /purchases/add to refresh VAT types from inline JS.")
+@click.option("--refresh", is_flag=True, help="Re-scrape /purchases/add for the live vat_types map.")
 def expenses_meta(as_json: bool, refresh: bool) -> None:
-    """Print baked VAT types + how to look up expense_account_id options.
+    """Show the account's PURCHASE vat types, read live from SimpleBooks.
 
-    Expense account IDs are entries from the full chart of accounts —
+    Scraped from the /purchases/add `vat_types` map and cached; this is the live
+    set, not a constant. Expense account IDs are chart-of-accounts entries —
     use `simplbooks accounts list chart` and filter for 5xxx codes.
     """
-    if refresh:
-        cookies, account = session_or_die()
-        with build_http(cookies, account) as http:
-            soup = _purchases_add_soup(http, account)
-        scripts = "\n".join(s.text for s in soup.find_all("script") if s.text)
-        m = re.search(r"var\s+vat_types\s*=\s*(\{.*?\});", scripts, re.DOTALL)
-        if m:
-            parsed = json.loads(m.group(1))
-            PURCHASES_META_CACHE.write_text(json.dumps(parsed, ensure_ascii=False, indent=2))
-            click.secho(f"Refreshed → {PURCHASES_META_CACHE}", fg="cyan")
-            vat_data = parsed
-        else:
-            click.secho("Could not find var vat_types on /purchases/add", fg="yellow")
-            vat_data = PURCHASE_VAT_TYPES
-    else:
-        vat_data = PURCHASE_VAT_TYPES
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        vat_data = purchase_vat_types(http, account, refresh=refresh)
 
     if as_json:
         click.echo(json.dumps(vat_data, ensure_ascii=False, indent=2))
@@ -1970,14 +2286,12 @@ def expenses_meta(as_json: bool, refresh: bool) -> None:
         click.echo(f"  {vid:>4}  {pct:<4}  {v['name']}")
     click.echo()
     click.secho("Common usages:", bold=True)
-    click.echo("  11   → Stripe / hosting / any service from another EU country (reverse-charge)")
+    click.echo("  11   → SaaS / hosting / any service from another EU country (reverse-charge)")
     click.echo("  34   → 24% EE domestic purchase (current rate)")
-    click.echo("  25   → 22% EE domestic (transitional 2024-2025)")
     click.echo("   9   → 0% intra-community GOODS acquisition")
     click.echo("  14   → 0% Import (non-EU)")
     click.echo()
-    click.secho("Expense account IDs (5xxx range): `simplbooks accounts list chart --json | jq ...`", bold=True)
-    click.echo("  Examples already used: 126 (5200 Mitmesugused tegevuskulud), 141 (5350 Pangateenused).")
+    click.secho("Expense account IDs: `simplbooks accounts list chart` (filter for 5xxx codes).", bold=True)
 
 
 @expenses.command("show")
@@ -2083,7 +2397,7 @@ def build_purchase_fields(
     rounding: str = "0",
     reference: str = "",
     comments: str = "",
-    creator: str = "6",
+    creator: str | None = None,
 ) -> list[tuple[str, str]]:
     """Build the multipart text fields for /purchases/create.
 
@@ -2104,7 +2418,7 @@ def build_purchase_fields(
         ("data[Purchase][credit_purchase_for]", "0"),
         ("data[Purchase][not_subject_to_vat]", "0"),
         ("data[purchase_order_id]", "0"),
-        ("data[Purchase][creator]", creator),
+        ("data[Purchase][creator]", str(creator or "")),
         ("data[Purchase][created_time]", now_dash),
         ("data[Purchase][cash_accounting_method]", "0"),
         ("data[Purchase][email_attachment_id]", ""),
@@ -2187,15 +2501,18 @@ def build_purchase_fields(
 @click.option("--comments", "comments", default="",
               help='Lisainfo — free-text note shown on the invoice (the "Lisainfo" field, '
                    'the purchase-invoice equivalent of a sales invoice\'s Lisainfo).')
-@click.option("--creator", default="6", show_default=True)
+@click.option("--creator", default=None,
+              help="Issuer user id (else the logged-in user, read from the form).")
+@click.option("--dry-run", is_flag=True,
+              help="Resolve everything and print the payload WITHOUT creating the invoice.")
 def expenses_create(supplier_id: int, number: str, internal_number: str, invoice_date: str,
                     due_date: str | None, currency: str, vat_total: str, rounding: str,
                     row_sum_with_vat: bool, lines_raw: tuple[str, ...], attachment_path: str | None,
-                    reference: str, comments: str, creator: str) -> None:
+                    reference: str, comments: str, creator: str, dry_run: bool) -> None:
     """Create a purchase invoice (ostuarve), optionally attaching the source PDF.
 
     Each --line is a colon-separated set of `key=value` pairs:
-      acct=126:vat_type=34:vat=24:name=Stripe processing:sum=82,18
+      acct=126:vat_type=34:vat=24:name=Office supplies:sum=82,18
     """
     cookies, account = session_or_die()
     cache = load_clients_cache()
@@ -2232,7 +2549,10 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
     internal_number = internal_number or number
 
     with build_http(cookies, account) as http:
-        csrf = fetch_fresh_csrf(http, account, path="purchases/add")
+        page = fetch_add_page(http, account, "purchases/add")
+        csrf = csrf_from_page(page, "purchases/add")
+        # The purchase form leaves creator 0; fall back to the real logged-in user.
+        creator = creator or creator_from_page(page) or logged_in_user_id(http, account)
         fields = build_purchase_fields(
             csrf=csrf,
             supplier=supplier,
@@ -2249,6 +2569,17 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
             comments=comments,
             creator=creator,
         )
+        if dry_run:
+            fmap = dict(fields)
+            click.secho("DRY RUN — purchase invoice NOT created. Resolved payload:", fg="yellow", bold=True)
+            click.echo(f"  Supplier : {supplier.get('name')} [{supplier_id}]")
+            click.echo(f"  Number   : {number}  (internal {internal_number})")
+            click.echo(f"  Date     : {invoice_date}  due {due_date or invoice_date}")
+            click.echo(f"  creator  : {fmap.get('data[Purchase][creator]')}  (--creator > logged-in user)")
+            click.echo(f"  Lines    : {len(lines)}  VAT total: {vat_total}")
+            click.echo(f"  Attach   : {attachment_path or '(none)'}")
+            return
+
         parts: list[tuple[str, tuple]] = [(n, (None, v)) for n, v in fields]
 
         if attachment_path:
@@ -2491,7 +2822,7 @@ def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat
 
       # Fix a PAID invoice (locked): unbind its payment, fix number+period+PDF, re-bind.
       simplbooks expenses update 1764 --force-unbind \\
-        --number 3B6A7575-0016 --date 2026-05-03 --attach notion.pdf
+        --number 3B6A7575-0016 --date 2026-05-03 --attach invoice.pdf
 
       # Change the invoice date / due date.
       simplbooks expenses update 1731 --date 2026-05-18 --due 2026-05-25
@@ -2640,15 +2971,15 @@ def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat
 @click.option("--amount", default=None,
               help="Payment amount. Defaults to the invoice's pre-filled total.")
 @click.option("--from-account", "from_account", default=None,
-              help="Paying bank-cashbook id (3 = Swedbank). Defaults to the invoice's pre-selected account.")
+              help="Paying bank-cashbook id. Defaults to the invoice's pre-selected account.")
 @click.option("--date", "payment_date", default=None,
               help="Payment date dd.mm.yyyy. Defaults to today.")
-@click.option("--target", default="swedbank", show_default=True,
-              help="Bank integration target.")
+@click.option("--target", default=None,
+              help="Bank integration target (else SIMPLBOOKS_BANK_TARGET).")
 def expenses_send_payment(purchase_id, amount, from_account, payment_date, target) -> None:
     """Stage a purchase invoice as a payment order to the bank.
 
-    Pushes the invoice to the bank integration (Swedbank). On success the
+    Pushes the invoice to the configured bank integration. On success the
     invoice flips to "Pangas ootel" (pending in bank); the order then waits in
     the bank's netbank for an authorised person to confirm and sign — this
     never signs, only stages.
@@ -2660,6 +2991,12 @@ def expenses_send_payment(purchase_id, amount, from_account, payment_date, targe
       simplbooks expenses send-payment 1733
       simplbooks expenses send-payment 1733 --amount 166,82 --date 09.06.2026
     """
+    target = _cfg("SIMPLBOOKS_BANK_TARGET", target)
+    if not target:
+        raise click.ClickException(
+            "No bank target — SIMPLBOOKS_BANK_TARGET is unset and --target was not given.\n"
+            "  → add SIMPLBOOKS_BANK_TARGET=<bank> to credentials.env (or pass --target)."
+        )
     cookies, account = session_or_die()
     view_url = f"{BASE}/{account}/purchases/view/{purchase_id}"
     with build_http(cookies, account) as http:
@@ -3056,7 +3393,7 @@ def payments_list(search, account_id, limit, as_json) -> None:
 
 @payments.command("create")
 @click.option("--client-id", required=True, type=int, help="SB client id of the counter-party (supplier).")
-@click.option("--account-id", required=True, type=int, help="Bank/cashbook id (e.g. 7 = Stripe, 3 = Swedbank).")
+@click.option("--account-id", required=True, type=int, help="Bank/cashbook id (`accounts list cashbook` for ids).")
 @click.option("--sum", "sum_amount", required=True, help="Amount, plain or Estonian decimal (e.g. 10 or 10,85).")
 @click.option("--date", "date_str", required=True, help="Payment date YYYY-MM-DD.")
 @click.option("--description", default="")
@@ -3123,7 +3460,7 @@ def incomings_list(search, account_id, limit, as_json) -> None:
 
 @incomings.command("create")
 @click.option("--client-id", required=True, type=int, help="SB client id of the customer.")
-@click.option("--account-id", required=True, type=int, help="Bank/cashbook id (e.g. 7 = Stripe).")
+@click.option("--account-id", required=True, type=int, help="Bank/cashbook id (`accounts list cashbook` for ids).")
 @click.option("--sum", "sum_amount", required=True, help="Amount.")
 @click.option("--date", "date_str", required=True, help="YYYY-MM-DD.")
 @click.option("--description", default="")
@@ -3308,13 +3645,13 @@ def kanne_create(date_str, note, lines_raw) -> None:
 
     The sum of all `debit` lines must equal the sum of all `credit` lines.
 
-    Example — book a Stripe payout of €6 477,69 to Swedbank:
+    Example — move 1 000,00 between two cashbooks (ids from `accounts list cashbook`):
 
-        simplbooks kanne create --date 2026-01-02 --note 'Stripe payout' \\
-          --line 'side=debit:account=3:sum=6477,69:note=Stripe payout' \\
-          --line 'side=credit:account=7:sum=6477,69:note=Stripe payout'
+        simplbooks kanne create --date 2026-01-02 --note 'Inter-account transfer' \\
+          --line 'side=debit:account=<id-a>:sum=1000,00:note=transfer' \\
+          --line 'side=credit:account=<id-b>:sum=1000,00:note=transfer'
 
-    The `account` is the financial_account id (`simplbooks accounts list bank`
+    The `account` is the financial_account id (`simplbooks accounts list cashbook`
     for cashbook ids; full chart via `accounts list chart`).
     """
     cookies, account = session_or_die()
@@ -3504,7 +3841,7 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
 
     Other edits:
 
-        simplbooks kanne update 20046 --note 'VERCEL subscription — 24.80 USD'
+        simplbooks kanne update 20046 --note 'SaaS subscription - 24.80 USD'
         simplbooks kanne update 20046 --date 2026-05-29
         simplbooks kanne update 20046 --attach /path/to/receipt.pdf
     """
@@ -3633,14 +3970,14 @@ def kanne_delete(kanne_id) -> None:
 
 # ─── bank_transactions (PSD2 worklist) ──────────────────────────────────────
 #
-# The Swedbank PSD2 connector drops raw bank rows into SimpleBooks. They land
+# The bank's PSD2 connector drops raw bank rows into SimpleBooks. They land
 # in /bank_transactions/process as a worklist of un-saved entries, each one
 # representing one bank movement that needs to be turned into either:
 #   - incoming  (inflow bound to one or more sales invoices)
 #   - payment   (outflow bound to one or more purchase invoices)
 #   - financial_transaction (manual kanne, 2-sided double-entry)
 #   - payout / taxes_payout (salary + tax-office; not yet implemented here)
-#   - or deleted (Stripe-payout duplicates, mis-imports)
+#   - or deleted (payment-processor payout duplicates, mis-imports)
 #
 # The page is server-rendered HTML with one `<form class="transaction-form">`
 # per row. Each form contains:
@@ -3663,11 +4000,11 @@ def kanne_delete(kanne_id) -> None:
 #                                                    data[<Variant>][...]
 #   POST /<acct>/bank_transactions/save_processed_data   (partial / WIP; not used)
 #
-# Two ID-spaces (also documented in .assets/simplbooks/reference.md):
-#   - cashbook ids  → `Incoming.income_account_id`, `Payment.income_account_id`
-#     (3 = Swedbank, 7 = Stripe). What `accounts list cashbook` returns.
-#   - chart-of-accounts ids → `FinancialTransaction.transactions[<rid>][financial_account_id]`
-#     (211 = Swedbank, 248 = Stripe). For the kanne variant only.
+# Two ID-spaces (ids differ per account — list them, never assume):
+#   - cashbook ids  → `Incoming.income_account_id`, `Payment.income_account_id`.
+#     What `accounts list cashbook` returns.
+#   - chart-of-accounts ids → `FinancialTransaction.transactions[<rid>][financial_account_id]`.
+#     What `accounts list chart` returns. For the kanne variant only.
 
 BT_BASE_PATH = "bank_transactions/process"
 
@@ -3922,9 +4259,9 @@ def bank_transactions() -> None:
     The worklist is the SB-side staging area for raw bank rows imported via PSD2.
     Each row gets evaluated one at a time (counterparty, amount, period, description),
     then turned into a SimpleBooks incoming / payment / kanne — or deleted if it's
-    a duplicate (e.g. Stripe payouts already mirrored as a kanne).
+    a duplicate (e.g. a payment-processor payout already mirrored as a kanne).
 
-    See .assets/simplbooks/bank-transactions.md for the decision tree.
+    See the consuming project's simplbooks reference for the decision tree.
     """
 
 
@@ -4028,8 +4365,8 @@ def bt_show(bt_id, as_json) -> None:
 def bt_delete(bt_id) -> None:
     """Delete a bank-transaction row without saving it.
 
-    Use when the row is a duplicate (e.g. a Stripe payout already mirrored as a
-    kanne) or a mis-imported entry that should be discarded.
+    Use when the row is a duplicate (e.g. a payment-processor payout already
+    mirrored as a kanne) or a mis-imported entry that should be discarded.
 
     NOTE: this only removes the worklist entry; it does NOT touch any
     already-booked incoming / payment / kanne the row may correspond to.
@@ -4140,7 +4477,7 @@ def _bt_check_save_response(r: httpx.Response, kind: str) -> None:
               help="COA id of the offsetting account (for --as kanne).")
 @click.option("--account-id", type=int, default=None,
               help="Bank cashbook id for incoming/payment (default: the one SB pre-selected, "
-                   "usually 3 = Swedbank).")
+                   "usually the main bank cashbook).")
 @click.option("--sum", "sum_amount", default=None,
               help="Override amount. Defaults to the BT row's own sum.")
 @click.option("--date", "date_str", default=None,
@@ -4161,7 +4498,7 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
       simplbooks bank-transactions save 7090 --as incoming \\
         --client-id 257 --invoice-id 9876
 
-      # 2. Supplier paid via Swedbank, multiple purchase invoices in one transfer
+      # 2. Supplier paid via bank transfer, multiple purchase invoices in one transfer
       simplbooks bank-transactions save 6750 --as payment \\
         --client-id 368 --purchase-id 1685 --purchase-id 1686
 

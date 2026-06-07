@@ -1,0 +1,23 @@
+# simplbooks — deviations
+
+This file's sole purpose is to hold `simplbooks`'s deliberate, justified departures from the [SHEBANG](../../SHEBANG.md) defaults, kept apart so an audit reads them as choices, not drift (DOCTRINE — *[Deviations are allowed — and recorded](../../DOCTRINE.md#deviations-are-allowed--and-recorded)*). Each realizes the *intent* of the pattern in the terms of a service that has **no public API** — SimpleBooks is driven by emulating a logged-in browser session against a server-rendered CakePHP app.
+
+## Transport is a scraped browser session, not a JSON API
+
+There is no SimpleBooks API. Every command authenticates as a browser would (cookie + per-form `_csrfToken`), POSTs `x-www-form-urlencoded` / multipart form bodies to the same endpoints the web UI uses, and parses server-rendered HTML back. This is why the dependency set carries `beautifulsoup4` (HTML parsing) and `click` (command surface) beyond `httpx` — the protocol genuinely demands the parser. The intent of *resilient HTTP* holds in this transport's terms: a stale session is the dominant failure and is absorbed by re-login (see below); hard HTTP failures surface immediately with the status and a truncated body rather than a retry storm, because a single-user scraped session faces no rate-limit / 5xx-backoff regime worth a generic retry loop.
+
+## Stateful session; the secret is a persisted login, not a flat token
+
+Auth is a login *ceremony*, not a header value. The primary path is `SIMPLBOOKS_EMAIL` + `SIMPLBOOKS_PASSWORD`: the CLI logs in itself and persists the resulting `SIMPLBOOKS_ACCOUNT` (account hash) + `SIMPLBOOKS_COOKIE` (session cookie) back into `credentials.env`. A new IP/device triggers a PIN gate (`simplbooks login` saves pending state and exits 2; `simplbooks login --pin <code>` completes it). The fallback is a Copy-as-cURL paste (`simplbooks refresh`). Per SHEBANG's stateful-CLI guidance, `help` opens with the startup protocol and `doctor` doubles as the session-health/recovery point — on an expired session `doctor` re-logs in automatically when email+password are present, and exits 2 with the exact next step otherwise.
+
+The **session** credentials resolve through **two tiers only** — user config (`~/.config/simplbooks/credentials.env`) then process env — rather than the full four. There is no flags tier (the session is never passed on argv) and no project `.env` tier: the session is written *back* by `login`/`refresh` into the user-config file, and one machine drives one SimpleBooks login, so a per-project session is not a use case. The env tier is what lets a deployed box resolve the same session a laptop does.
+
+The non-secret **account-config** values (`SIMPLBOOKS_WORKER`, `SIMPLBOOKS_BANK_ACCOUNT`, `SIMPLBOOKS_BANK_TARGET`, the optional `SIMPLBOOKS_INCOMEACCT_*`, `SIMPLBOOKS_INVOICE_FOOTER`) resolve through the **full canonical cascade** — flag → project `.env(.local)` → user config → process env — so a consuming project supplies them from its own `.env`. (This is conformant, not a deviation; it is noted only to contrast with the session's reduced cascade above.)
+
+## Exit-code taxonomy collapsed to 0 / 1 / 2
+
+The surface uses `0` success, `2` auth (missing creds, login rejected, or PIN required), and `1` for every other error (validation, CSRF, not-found, transport). The finer 3/5/6 split SHEBANG reserves is not realized: against a scraped HTML app the failure signal is frequently a redirect-to-login or a re-rendered form with inline errors rather than a clean status class, so a not-found / validation / server fault cannot be told apart reliably enough to earn distinct codes. The intent — a stable, named, machine-checkable contract where **auth is always distinguishable so a caller knows to re-authenticate** — holds at the granularity the transport supports.
+
+## Output is human-first with `--json` where structure matters
+
+Default output is human-readable (often colorized) tables on stdout via `click.echo`; structured JSON is emitted by `--json` on the list/read commands (`bank-transactions`, `kanne`, `expenses meta`, `invoices show`, …). Errors go to stderr as `Error: <message>` via `click.ClickException`. There is no single neutral contract producer (the SimpleBooks domain is many shapes — clients, invoices, expenses, accounts, bank rows, kanne — not one event stream), so there is no keyless `contract` command; the shapes are documented in `simplbooks help` and surfaced live by the `--json` reads. The intent — an agent-legible surface whose contract is loadable on demand — holds via `help` as the single source of the surface.
