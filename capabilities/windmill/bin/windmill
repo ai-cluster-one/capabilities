@@ -76,6 +76,19 @@ Commands:
   windmill folder-ensure <name> [--owner U]   Idempotent create-or-update of a folder's
                                               owners/ACL (owners also granted in extra_perms).
 
+  HTTP triggers (custom routes that run a script/flow when called):
+  windmill triggers [--limit N]               List HTTP triggers.
+  windmill trigger-get <path>                 Show one trigger.
+  windmill trigger-set <path> --script SP     Create or update an HTTP route on a script.
+        --route inbound/webhook               --route is the URL path (no leading /). Returns
+        [--method post] [--auth none]         the public URL. Idempotent (create-or-update).
+        [--request-type sync] [--raw]         sync (default) returns the script's result, so a
+        [--wrap-body] [--no-workspaced]       sync route can echo a handshake header; async
+        [--flow] [--summary S]                returns a job id. auth=none is a public endpoint.
+        [--description D] [--off]             --raw passes the body unparsed; --no-workspaced
+                                              drops the workspace id from the URL; --off disables.
+  windmill trigger-delete <path>              Delete a trigger.
+
   Users (workspace membership — the isolation identity):
   windmill users                              List workspace users (email, operator, admin).
   windmill user-ensure --email E [--operator] Idempotent: ensure a global user exists and is
@@ -535,6 +548,65 @@ def cmd_folder_ensure(c, ws, name, owners):
     return {"folder": f"f/{name}", "owners": owners, "updated": True}
 
 
+# --- HTTP triggers (custom routes that run a script/flow on request) ----------
+
+def _route_url(url: str, ws: str, route_path: str, workspaced: bool) -> str:
+    """The public URL a caller hits. Workspaced routes carry the workspace id."""
+    rp = route_path.lstrip("/")
+    return f"{url}/api/r/{ws}/{rp}" if workspaced else f"{url}/api/r/{rp}"
+
+
+def cmd_triggers(c, ws, limit):
+    return _request(c, "GET", W(ws, "http_triggers/list"), params={"per_page": limit})
+
+
+def cmd_trigger_get(c, ws, path):
+    return _request(c, "GET", W(ws, f"http_triggers/get/{path}"))
+
+
+def cmd_trigger_set(c, ws, url, path, script, route, method, auth, request_type,
+                    raw_string, wrap_body, workspaced, is_flow, summary, description, off):
+    """Idempotent create-or-update of an HTTP route that runs a script/flow.
+
+    `route` is the URL path (no leading /). `request_type` sync makes the response
+    carry the script's return value (needed for handshake/echo webhooks); async
+    returns a job id immediately. auth=none is a public endpoint."""
+    route = route.lstrip("/")
+    body = {
+        "path": path,
+        "script_path": script,
+        "route_path": route,
+        "is_flow": is_flow,
+        "http_method": method,
+        "authentication_method": auth,
+        "request_type": request_type,
+        "is_static_website": False,
+        "workspaced_route": workspaced,
+        "wrap_body": wrap_body,
+        "raw_string": raw_string,
+    }
+    if summary is not None:
+        body["summary"] = summary
+    if description is not None:
+        body["description"] = description
+    if off:
+        body["mode"] = "disabled"
+    exists = not _is_err(_request(c, "GET", W(ws, f"http_triggers/get/{path}"), soft=True))
+    public = _route_url(url, ws, route, workspaced)
+    if exists:
+        _request(c, "POST", W(ws, f"http_triggers/update/{path}"), json_body=body, raw=True)
+        return {"path": path, "updated": True, "route": public, "method": method,
+                "request_type": request_type, "auth": auth}
+    _request(c, "POST", W(ws, "http_triggers/create"), json_body=body, raw=True)
+    return {"path": path, "created": True, "route": public, "method": method,
+            "request_type": request_type, "auth": auth}
+
+
+def cmd_trigger_delete(c, ws, path):
+    _request(c, "DELETE", W(ws, f"http_triggers/delete/{path}"), raw=True)
+    return {"path": path, "deleted": True}
+
+
 # --- Users (workspace membership + the isolation identity) -------------------
 
 def _username_for(email: str) -> str:
@@ -853,6 +925,31 @@ def main() -> None:
     sp = sub.add_parser("folder-ensure"); sp.add_argument("name")
     sp.add_argument("--owner", action="append", default=[])
 
+    sp = sub.add_parser("triggers"); sp.add_argument("--limit", type=int, default=100)
+    sp = sub.add_parser("trigger-get"); sp.add_argument("path")
+    sp = sub.add_parser("trigger-set"); sp.add_argument("path")
+    sp.add_argument("--script", required=True, help="script/flow path to run (f/..)")
+    sp.add_argument("--route", required=True, help="URL route path, no leading / (e.g. inbound/webhook)")
+    sp.add_argument("--method", default="post",
+                    choices=["get", "post", "put", "delete", "patch"])
+    sp.add_argument("--auth", default="none",
+                    choices=["none", "windmill", "api_key", "basic_http", "custom_script", "signature"],
+                    help="none = public endpoint (default)")
+    sp.add_argument("--request-type", dest="request_type", default="sync",
+                    choices=["sync", "async", "sync_sse"],
+                    help="sync (default) returns the script result; async returns a job id")
+    sp.add_argument("--raw", action="store_true",
+                    help="pass the body as a raw string (no JSON parse)")
+    sp.add_argument("--wrap-body", dest="wrap_body", action="store_true",
+                    help="wrap the request body in a 'body' parameter")
+    sp.add_argument("--no-workspaced", dest="no_workspaced", action="store_true",
+                    help="omit the workspace id from the route URL")
+    sp.add_argument("--flow", action="store_true", help="script path points to a flow")
+    sp.add_argument("--summary", default=None, help="human label for the trigger")
+    sp.add_argument("--description", default=None, help="longer description of the trigger")
+    sp.add_argument("--off", action="store_true", help="create disabled")
+    sp = sub.add_parser("trigger-delete"); sp.add_argument("path")
+
     sub.add_parser("users")
     sp = sub.add_parser("user-ensure"); sp.add_argument("--email", required=True)
     sp.add_argument("--operator", action="store_true"); sp.add_argument("--admin", action="store_true")
@@ -921,6 +1018,17 @@ def main() -> None:
             _emit(cmd_folder_create(c, ws, args.name, args.owner))
         elif args.cmd == "folder-ensure":
             _emit(cmd_folder_ensure(c, ws, args.name, args.owner))
+        elif args.cmd == "triggers":
+            _emit(cmd_triggers(c, ws, args.limit))
+        elif args.cmd == "trigger-get":
+            _emit(cmd_trigger_get(c, ws, args.path))
+        elif args.cmd == "trigger-set":
+            _emit(cmd_trigger_set(c, ws, url, args.path, args.script, args.route,
+                                  args.method, args.auth, args.request_type, args.raw,
+                                  args.wrap_body, not args.no_workspaced, args.flow,
+                                  args.summary, args.description, args.off))
+        elif args.cmd == "trigger-delete":
+            _emit(cmd_trigger_delete(c, ws, args.path))
         elif args.cmd == "users":
             _emit(cmd_users(c, ws))
         elif args.cmd == "user-ensure":

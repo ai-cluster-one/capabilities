@@ -184,6 +184,27 @@ Commands:
   asana attachment-delete <attachment> --yes  Delete an attachment. IRREVERSIBLE
                                               — refuses without --yes (the gate;
                                               confirm with the human first).
+  asana webhooks [--workspace GID]            List webhooks (defaults to the token's
+        [--resource GID]                      first workspace; --resource filters to
+                                              one watched resource).
+  asana webhook <webhook>                     Show one webhook (target, active,
+                                              filters, last success/failure).
+  asana webhook-create --resource P           Register a webhook on a project/task
+        --target URL [--filter F ...]         delivering to the public HTTPS URL.
+                                              Asana runs the X-Hook-Secret handshake
+                                              against --target synchronously inside
+                                              this call — the target must answer 200
+                                              and echo the secret or the create is
+                                              rejected (a failed handshake surfaces as
+                                              exit 6 invalid_request; check the target
+                                              answers 200 and echoes X-Hook-Secret).
+                                              --filter is repeatable, form
+                                              resource_type:action[:fields] (e.g.
+                                              task:changed:assignee  task:added
+                                              story:added); omit for all events.
+  asana webhook-delete <webhook> --yes        Delete a webhook. IRREVERSIBLE (stops
+                                              event delivery) — refuses without --yes
+                                              (the gate; confirm with the human first).
 
 References:
   <task>, --project, --workspace, --assignee, --follower, --mention all
@@ -206,6 +227,7 @@ Exit codes:
   3  not found
   5  server / network (5xx, timeout, rate-limit exhausted)
   6  input / validation
+  7  blocked (task has open dependencies; see `complete`)
 
 Notes:
   - @mentions: Asana only delivers a notification when the mention is sent
@@ -1074,6 +1096,65 @@ def cmd_attachment_delete(c: httpx.Client, attachment: str) -> dict:
     return {"deleted": _gid(attachment)}
 
 
+# --- Webhooks (event subscriptions; create does a synchronous handshake) ------
+
+_WEBHOOK_FIELDS = ("resource.name,target,active,filters,"
+                   "last_success_at,last_failure_at,last_failure_content")
+
+
+def _default_workspace(c: httpx.Client) -> str:
+    """First workspace the token sees — the implicit scope when --workspace is omitted."""
+    me = _request(c, "GET", "/users/me", params={"opt_fields": "workspaces.name"})["data"]
+    ws = me.get("workspaces") or []
+    if not ws:
+        _die(6, "no_workspace", "the token sees no workspace", "pass --workspace explicitly")
+    return ws[0]["gid"]
+
+
+def _parse_filter(spec: str) -> dict:
+    """A --filter mini-spec `resource_type:action[:f1,f2]` -> an Asana filter object.
+    e.g. `task:changed:assignee,due_at`, `task:added`, `story:added` (comments)."""
+    parts = spec.split(":")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        _die(6, "bad_filter", f"--filter expects resource_type:action[:fields], got {spec!r}",
+             "e.g. task:changed:assignee,due_at  |  task:added  |  story:added")
+    f = {"resource_type": parts[0], "action": parts[1]}
+    if len(parts) >= 3 and parts[2]:
+        f["fields"] = [x for x in parts[2].split(",") if x]
+    return f
+
+
+def cmd_webhooks(c: httpx.Client, workspace: str | None, resource: str | None) -> list:
+    params = {"workspace": _gid(workspace) if workspace else _default_workspace(c),
+              "opt_fields": _WEBHOOK_FIELDS}
+    if resource:
+        params["resource"] = _gid(resource)
+    return _request(c, "GET", "/webhooks", params=params)["data"]
+
+
+def cmd_webhook_get(c: httpx.Client, webhook: str) -> dict:
+    return _request(c, "GET", f"/webhooks/{_gid(webhook)}",
+                    params={"opt_fields": _WEBHOOK_FIELDS})["data"]
+
+
+def cmd_webhook_create(c: httpx.Client, resource: str, target: str,
+                       filters: list[str]) -> dict:
+    """Register a webhook on `resource` (a project/task gid) delivering to `target`.
+    Asana runs the X-Hook-Secret handshake against `target` synchronously inside
+    this call: the target must answer 200 and echo the secret, or Asana rejects the
+    create (surfaces here as an invalid_request error). No --filter = all events."""
+    data: dict = {"resource": _gid(resource), "target": target}
+    if filters:
+        data["filters"] = [_parse_filter(f) for f in filters]
+    return _request(c, "POST", "/webhooks", json_body={"data": data},
+                    params={"opt_fields": _WEBHOOK_FIELDS})["data"]
+
+
+def cmd_webhook_delete(c: httpx.Client, webhook: str) -> dict:
+    _request(c, "DELETE", f"/webhooks/{_gid(webhook)}")
+    return {"webhook": _gid(webhook), "deleted": True}
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def main() -> None:
@@ -1266,6 +1347,23 @@ def main() -> None:
     sp.add_argument("--with-state", action="store_true",
                     help="include external + section membership")
 
+    sp = sub.add_parser("webhooks", help="list webhooks in a workspace")
+    sp.add_argument("--workspace", help="workspace GID (default: the token's first)")
+    sp.add_argument("--resource", help="filter to webhooks on this resource GID")
+
+    sp = sub.add_parser("webhook", help="show one webhook")
+    sp.add_argument("webhook", help="webhook GID")
+
+    sp = sub.add_parser("webhook-create", help="register a webhook (synchronous handshake)")
+    sp.add_argument("--resource", required=True, help="project/task GID or URL to watch")
+    sp.add_argument("--target", required=True, help="public HTTPS URL Asana delivers to")
+    sp.add_argument("--filter", action="append", default=[],
+                    help="resource_type:action[:fields] (repeatable); omit for all events")
+
+    sp = sub.add_parser("webhook-delete", help="delete a webhook (stops deliveries; needs --yes)")
+    sp.add_argument("webhook", help="webhook GID")
+    sp.add_argument("--yes", action="store_true", help="confirm the irreversible delete")
+
     sp = sub.add_parser("deps", help="list a task's dependencies (or --dependents)")
     sp.add_argument("task", help="task GID or URL")
     sp.add_argument("--dependents", action="store_true",
@@ -1416,6 +1514,19 @@ def main() -> None:
             _emit(cmd_section_tasks(c, args.section, args.limit, args.with_state))
         elif args.cmd == "subtasks":
             _emit(cmd_subtasks(c, args.parent, args.limit, args.with_state))
+        elif args.cmd == "webhooks":
+            _emit(cmd_webhooks(c, args.workspace, args.resource))
+        elif args.cmd == "webhook":
+            _emit(cmd_webhook_get(c, args.webhook))
+        elif args.cmd == "webhook-create":
+            _emit(cmd_webhook_create(c, args.resource, args.target, args.filter))
+        elif args.cmd == "webhook-delete":
+            if not args.yes:
+                _die(6, "delete_requires_confirmation",
+                     "webhook-delete is destructive and needs --yes",
+                     "deleting a webhook stops all event delivery — confirm with the "
+                     "human, then re-run with --yes")
+            _emit(cmd_webhook_delete(c, args.webhook))
         elif args.cmd == "deps":
             _emit(cmd_deps(c, args.task, args.dependents))
         elif args.cmd == "dep-add":
