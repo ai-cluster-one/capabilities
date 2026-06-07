@@ -1,0 +1,847 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "telethon>=1.36",
+# ]
+# ///
+"""
+telegram — agent-first CLI for a personal Telegram account (MTProto, full account).
+
+This tool is designed to be invoked by agents. Run `telegram help` to load the full
+usage contract on demand — do not rely on memorised knowledge of its surface.
+
+Agent startup protocol (this is a STATEFUL CLI — it holds a login session):
+  1. Run `telegram doctor` first. It proves the chain: credentials resolve, Telegram
+     is reachable, and the session is authorized.
+  2. Exit 2 from doctor means the session is missing or expired — run
+     `telegram login` (interactive: prompts for phone, the code Telegram sends, and a
+     2FA password if set). Login persists the session file; later commands reuse
+     it with no prompt.
+  3. A healthy `telegram doctor` (exit 0) means ready to work.
+
+Credentials resolve through the standard four-tier cascade (first non-empty
+wins): the global `--session` flag (session path only) > a project .env(.local)
+> ~/.config/telegram/credentials.env > the process environment. Secret values
+(TELEGRAM_API_ID, TELEGRAM_API_HASH, DEEPGRAM_API_KEY) have no flag — they never travel on
+the command line, only their env-var NAME resolves them.
+
+  TELEGRAM_API_ID          Numeric app id from my.telegram.org/apps.
+  TELEGRAM_API_HASH        App hash paired with the id (identifies the app).
+  TELEGRAM_SESSION         Path to the session, no extension — Telethon writes
+                           <path>.session on disk. Optional — defaults to
+                           ~/.config/telegram/session (so the file is session.session).
+  DEEPGRAM_API_KEY         Required only by `transcribe`.
+
+  --session <PATH>         Global override for the session-file path, accepted
+                           anywhere on the line. Names a path, not a secret.
+
+Commands:
+  telegram help                                Print this document.
+  telegram doctor                              Health check: creds + reachability + session.
+  telegram login                               Interactive first-time auth (phone + code).
+  telegram whoami                              Identity of the signed-in account.
+  telegram chats [--limit N]                   List recent dialogs.
+  telegram read <chat> [--limit N] [--since ISO] [--json]
+                                               Read messages from a chat.
+  telegram search <chat> <query> [--limit N] [--json]
+                                               Search messages inside a chat.
+  telegram send <chat> <text>                  Send a message.
+  telegram export <chat> --out PATH [--media-dir PATH] [--limit N] [--since ISO]
+            [--no-photos] [--no-stickers] [--videos] [--documents]
+                                               Dump full history to JSON; download
+                                               voice/audio (+photos/stickers by
+                                               default) to media-dir; leave
+                                               transcription placeholders.
+  telegram transcribe <json_path> [--force] [--model nova-3]
+                                               Fill transcription placeholders in an
+                                               exported JSON via Deepgram (audio
+                                               referenced by media.file_path).
+
+Chat references:
+  <chat> can be @username, a phone (+1555…), a numeric id, or a chat title
+  (case-insensitive substring matched against your dialog list).
+
+I/O contract:
+  - Success: JSON on stdout, exit 0. (`read`/`search` without --json emit a
+    human-readable transcript as a single text block.)
+  - Progress for long runs (export, transcribe) goes to STDERR; stdout stays
+    clean for the final result.
+  - Error:   {"error": {"code", "message", "hint"?, "status"?}} on stderr,
+             non-zero exit.
+
+Exit codes:
+  0  success
+  2  auth — missing/invalid credentials, session expired, not logged in
+  3  not found — the chat or entity could not be resolved
+  5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx
+  6  input / validation — a malformed argument, a bad date
+
+Quirks worth knowing:
+  - This is a full-account MTProto session — a personal user account, so it
+    sees everything that account sees. The session file is auth material — it
+    grants account access; keep it out of the repo.
+  - A flood-wait (too many requests) surfaces as exit 5 with the wait seconds
+    in the message; back off and retry later.
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import NoReturn
+
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError, RPCError
+from telethon.errors.rpcerrorlist import (
+    ApiIdInvalidError,
+    AuthKeyUnregisteredError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+)
+from telethon.tl.types import Channel, Chat, User
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CONFIG_DIR = _CONFIG_HOME / "telegram"
+CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
+DEFAULT_SESSION = CONFIG_DIR / "session"
+
+
+# --- I/O contract ------------------------------------------------------------
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _log(message: str) -> None:
+    """Progress / diagnostics — stderr only, so stdout stays clean for data."""
+    sys.stderr.write(message + "\n")
+    sys.stderr.flush()
+
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+# --- Credentials -------------------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_env() -> dict:
+    """Nearest project .env(.local), walking up from $CLAUDE_PROJECT_DIR (else cwd).
+    .env.local overrides .env. Stops at the first dir holding either, or a .git root."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    for d in (here, *here.parents):
+        if (d / ".env").exists() or (d / ".env.local").exists():
+            merged = _parse_env_file(d / ".env")
+            merged.update(_parse_env_file(d / ".env.local"))  # .local wins
+            return merged
+        if (d / ".git").is_dir():
+            break  # project root reached, no env file here
+    return {}
+
+
+def _resolve(env_key: str, flag_val: str | None = None) -> str | None:
+    """First non-empty wins across the cascade: flag > project .env(.local) >
+    user config > process env. Secrets pass flag_val=None — they have no flag and
+    resolve from the env tiers only, never touching argv."""
+    project = _project_env()
+    user = _parse_env_file(CREDENTIALS_ENV)
+    for v in (flag_val, project.get(env_key), user.get(env_key), os.environ.get(env_key)):
+        if v:
+            return v.strip()
+    return None
+
+
+def make_client(session_flag: str | None = None) -> TelegramClient:
+    """Resolve the app credentials + session path through the cascade and build a
+    client. The session value is not a flat token: TELEGRAM_API_ID/TELEGRAM_API_HASH identify
+    the app, and the session FILE (named by TELEGRAM_SESSION, default
+    ~/.config/telegram/session) holds the persisted login — but the tiers and their
+    order are preserved."""
+    api_id = _resolve("TELEGRAM_API_ID")
+    api_hash = _resolve("TELEGRAM_API_HASH")
+    if not api_id or not api_hash:
+        _die(2, "missing_credentials",
+             f"TELEGRAM_API_ID / TELEGRAM_API_HASH not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+             "create an app at my.telegram.org/apps, then set both in the user config or a project .env")
+    try:
+        api_id_int = int(api_id)
+    except ValueError:
+        _die(6, "bad_api_id", "TELEGRAM_API_ID must be an integer",
+             "copy the numeric App api_id from my.telegram.org/apps")
+    session = session_flag or _resolve("TELEGRAM_SESSION") or str(DEFAULT_SESSION)
+    session_path = Path(session).expanduser()
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    return TelegramClient(str(session_path), api_id_int, api_hash)
+
+
+def load_deepgram_key() -> str:
+    key = _resolve("DEEPGRAM_API_KEY")
+    if not key:
+        _die(2, "missing_deepgram_key",
+             f"DEEPGRAM_API_KEY not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+             "add DEEPGRAM_API_KEY=<key> to the user config or a project .env to use `telegram transcribe`")
+    return key
+
+
+# --- Entities ----------------------------------------------------------------
+
+def entity_label(ent) -> str:
+    if isinstance(ent, User):
+        name = " ".join(filter(None, [ent.first_name, ent.last_name])) or "(no name)"
+        uname = f" @{ent.username}" if ent.username else ""
+        return f"{name}{uname}"
+    if isinstance(ent, (Chat, Channel)):
+        return getattr(ent, "title", None) or "(untitled)"
+    return str(ent)
+
+
+async def resolve_chat(client: TelegramClient, chat: str):
+    try:
+        if chat.lstrip("-").isdigit():
+            return await client.get_entity(int(chat))
+        if chat.startswith("@") or chat.startswith("+"):
+            return await client.get_entity(chat)
+        lowered = chat.lower()
+        async for dialog in client.iter_dialogs():
+            if dialog.name and lowered in dialog.name.lower():
+                return dialog.entity
+        return await client.get_entity(chat)
+    except (ValueError, UsernameNotOccupiedError, UsernameInvalidError):
+        _die(3, "chat_not_found",
+             f"could not resolve chat: {chat!r}",
+             "pass an @username, +phone, numeric id, or a title from `telegram chats`")
+
+
+async def _require_auth(client: TelegramClient) -> None:
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        _die(2, "not_authorized", "not logged in to Telegram", "run: telegram login")
+
+
+def _parse_since(since: str | None) -> datetime | None:
+    if not since:
+        return None
+    try:
+        return datetime.fromisoformat(since).astimezone(timezone.utc)
+    except ValueError:
+        _die(6, "bad_date", f"--since is not an ISO datetime: {since!r}",
+             "use e.g. 2026-06-01 or 2026-06-01T09:00")
+
+
+# --- Commands ----------------------------------------------------------------
+
+async def cmd_doctor(session_flag: str | None) -> dict:
+    """Cheapest authenticated round-trip — proves creds resolved, Telegram
+    reachable, session authorized. Exit 2 if missing/expired, 5 if unreachable."""
+    client = make_client(session_flag)
+    await _require_auth(client)
+    me = await client.get_me()
+    await client.disconnect()
+    return {"ok": True, "reachable": True,
+            "account": entity_label(me), "id": me.id}
+
+
+async def cmd_login(session_flag: str | None) -> dict:
+    client = make_client(session_flag)
+    await client.start()  # interactive: phone + code (+ 2FA password if set)
+    me = await client.get_me()
+    await client.disconnect()
+    return {"ok": True, "logged_in_as": entity_label(me), "id": me.id}
+
+
+async def cmd_whoami(session_flag: str | None) -> dict:
+    client = make_client(session_flag)
+    await _require_auth(client)
+    me = await client.get_me()
+    await client.disconnect()
+    return {"account": entity_label(me), "id": me.id,
+            "phone": f"+{me.phone}" if me.phone else None,
+            "username": me.username}
+
+
+async def cmd_chats(session_flag: str | None, limit: int) -> list[dict]:
+    client = make_client(session_flag)
+    await _require_auth(client)
+    out: list[dict] = []
+    async for dialog in client.iter_dialogs(limit=limit):
+        ent = dialog.entity
+        out.append({
+            "id": dialog.id,
+            "kind": type(ent).__name__,
+            "name": dialog.name or "(untitled)",
+            "unread": dialog.unread_count or 0,
+        })
+    await client.disconnect()
+    return out
+
+
+def msg_to_dict(m) -> dict:
+    return {
+        "id": m.id,
+        "date": m.date.astimezone(timezone.utc).isoformat() if m.date else None,
+        "sender_id": m.sender_id,
+        "sender": entity_label(m.sender) if m.sender else None,
+        "text": m.message or "",
+        "reply_to": m.reply_to_msg_id,
+    }
+
+
+def _render_transcript(header: str, messages: list) -> str:
+    lines = [header]
+    for m in messages:
+        ts = m.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M") if m.date else "?"
+        who = entity_label(m.sender) if m.sender else f"id={m.sender_id}"
+        text = (m.message or "").replace("\n", " ⏎ ")
+        lines.append(f"[{ts}] {who}: {text}")
+    return "\n".join(lines)
+
+
+async def cmd_read(session_flag, chat: str, limit: int, since: str | None, as_json: bool):
+    client = make_client(session_flag)
+    await _require_auth(client)
+    entity = await resolve_chat(client, chat)
+    since_dt = _parse_since(since)
+    messages = []
+    async for m in client.iter_messages(entity, limit=limit):
+        if since_dt and m.date and m.date < since_dt:
+            break
+        messages.append(m)
+    messages.reverse()
+    await client.disconnect()
+    if as_json:
+        return [msg_to_dict(m) for m in messages]
+    return _render_transcript(
+        f"# {entity_label(entity)}  ({len(messages)} messages)", messages)
+
+
+async def cmd_search(session_flag, chat: str, query: str, limit: int, as_json: bool):
+    client = make_client(session_flag)
+    await _require_auth(client)
+    entity = await resolve_chat(client, chat)
+    messages = []
+    async for m in client.iter_messages(entity, search=query, limit=limit):
+        messages.append(m)
+    messages.reverse()
+    await client.disconnect()
+    if as_json:
+        return [msg_to_dict(m) for m in messages]
+    return _render_transcript(
+        f"# {entity_label(entity)}  search: {query!r}  ({len(messages)} hits)", messages)
+
+
+async def cmd_send(session_flag, chat: str, text: str) -> dict:
+    client = make_client(session_flag)
+    await _require_auth(client)
+    entity = await resolve_chat(client, chat)
+    sent = await client.send_message(entity, text)
+    await client.disconnect()
+    return {"sent_id": sent.id, "to": entity_label(entity)}
+
+
+# --- Export ------------------------------------------------------------------
+
+def _classify_media(m):
+    """Return (kind, details_dict_or_None). Kind is one of:
+    text, voice, audio, photo, video, video_note, sticker, document, webpage, poll, contact, geo, other, service.
+    """
+    if m.action is not None:
+        return "service", {"action": type(m.action).__name__}
+    if m.voice:
+        doc = m.document
+        return "voice", {
+            "mime_type": getattr(doc, "mime_type", None),
+            "size_bytes": getattr(doc, "size", None),
+            "duration_sec": next(
+                (a.duration for a in (doc.attributes if doc else []) if hasattr(a, "duration")),
+                None,
+            ),
+        }
+    if m.audio:
+        doc = m.document
+        title = None
+        performer = None
+        for a in doc.attributes if doc else []:
+            title = getattr(a, "title", None) or title
+            performer = getattr(a, "performer", None) or performer
+        return "audio", {
+            "mime_type": getattr(doc, "mime_type", None),
+            "size_bytes": getattr(doc, "size", None),
+            "title": title,
+            "performer": performer,
+        }
+    if m.video_note:
+        return "video_note", {"size_bytes": getattr(m.document, "size", None)}
+    if m.video:
+        return "video", {
+            "mime_type": getattr(m.document, "mime_type", None),
+            "size_bytes": getattr(m.document, "size", None),
+        }
+    if m.sticker:
+        return "sticker", {"mime_type": getattr(m.document, "mime_type", None)}
+    if m.photo:
+        return "photo", {"photo_id": getattr(m.photo, "id", None)}
+    if m.document:
+        doc = m.document
+        filename = None
+        for a in doc.attributes:
+            filename = getattr(a, "file_name", None) or filename
+        return "document", {
+            "mime_type": getattr(doc, "mime_type", None),
+            "size_bytes": getattr(doc, "size", None),
+            "filename": filename,
+        }
+    if m.web_preview:
+        return "webpage", {"url": getattr(m.web_preview, "url", None)}
+    if m.poll:
+        return "poll", {"question": getattr(m.poll.poll, "question", None)}
+    if m.contact:
+        return "contact", {}
+    if m.geo:
+        return "geo", {}
+    if m.media is not None:
+        return "other", {"type": type(m.media).__name__}
+    return "text", None
+
+
+def _find_existing_media(media_dir: Path, msg_id: int) -> Path | None:
+    for p in media_dir.glob(f"{msg_id}.*"):
+        if p.is_file():
+            return p
+    return None
+
+
+async def cmd_export(session_flag, chat: str, out_path: str, media_dir: str | None,
+                     limit: int | None, since: str | None,
+                     download_photos: bool, download_stickers: bool,
+                     download_videos: bool, download_documents: bool) -> dict:
+    client = make_client(session_flag)
+    await _require_auth(client)
+
+    entity = await resolve_chat(client, chat)
+    out = Path(out_path).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if media_dir is None:
+        media_dir_path = out.parent / "media"
+    else:
+        media_dir_path = Path(media_dir).expanduser().resolve()
+    media_dir_path.mkdir(parents=True, exist_ok=True)
+
+    download_types = {"voice", "audio"}
+    if download_photos:
+        download_types.add("photo")
+    if download_stickers:
+        download_types.add("sticker")
+    if download_videos:
+        download_types.update({"video", "video_note"})
+    if download_documents:
+        download_types.add("document")
+
+    prior_transcriptions: dict[int, dict] = {}
+    if out.exists():
+        try:
+            prev = json.loads(out.read_text())
+            for pm in prev.get("messages", []):
+                tr = pm.get("transcription")
+                if tr and isinstance(tr, dict) and "text" in tr and pm.get("id") is not None:
+                    prior_transcriptions[pm["id"]] = tr
+        except Exception:
+            pass
+
+    since_dt = _parse_since(since)
+    me = await client.get_me()
+
+    chat_meta = {
+        "id": getattr(entity, "id", None),
+        "title": entity_label(entity),
+        "type": type(entity).__name__,
+        "username": getattr(entity, "username", None),
+    }
+
+    messages_out: list[dict] = []
+    iter_kwargs: dict = {}
+    if limit:
+        iter_kwargs["limit"] = limit
+
+    count = 0
+    dl_counts: dict[str, int] = {}
+    progress_every = 100
+    _log(f"Exporting from: {chat_meta['title']}  ({chat_meta['type']}, id={chat_meta['id']})")
+    _log(f"Output:       {out}")
+    _log(f"Media dir:    {media_dir_path}")
+    _log(f"Downloading:  {sorted(download_types)}")
+    if prior_transcriptions:
+        _log(f"Preserving:   {len(prior_transcriptions)} existing transcription(s)")
+
+    async for m in client.iter_messages(entity, **iter_kwargs):
+        if since_dt and m.date and m.date < since_dt:
+            break
+
+        kind, media_meta = _classify_media(m)
+
+        sender = None
+        if m.sender is not None:
+            sender = {
+                "id": m.sender_id,
+                "name": entity_label(m.sender),
+                "username": getattr(m.sender, "username", None),
+                "type": type(m.sender).__name__,
+            }
+        elif m.sender_id is not None:
+            sender = {"id": m.sender_id, "name": None, "username": None, "type": None}
+
+        fwd = None
+        if m.forward is not None:
+            fwd_name = None
+            try:
+                if m.forward.sender is not None:
+                    fwd_name = entity_label(m.forward.sender)
+                elif m.forward.chat is not None:
+                    fwd_name = entity_label(m.forward.chat)
+            except Exception:
+                pass
+            fwd = {
+                "date": m.forward.date.astimezone(timezone.utc).isoformat() if m.forward.date else None,
+                "from_id": getattr(m.forward, "sender_id", None) or getattr(m.forward, "chat_id", None),
+                "from_name": fwd_name,
+            }
+
+        entry: dict = {
+            "id": m.id,
+            "date": m.date.astimezone(timezone.utc).isoformat() if m.date else None,
+            "edited_at": m.edit_date.astimezone(timezone.utc).isoformat() if m.edit_date else None,
+            "sender": sender,
+            "reply_to_msg_id": m.reply_to_msg_id,
+            "forward": fwd,
+            "type": kind,
+            "text": m.message or None,
+            "media": media_meta,
+        }
+
+        if kind in download_types:
+            existing = _find_existing_media(media_dir_path, m.id)
+            try:
+                if existing:
+                    entry["media"] = entry["media"] or {}
+                    entry["media"]["file_path"] = str(existing.resolve())
+                else:
+                    downloaded = await m.download_media(file=str(media_dir_path / str(m.id)))
+                    if downloaded:
+                        entry["media"] = entry["media"] or {}
+                        entry["media"]["file_path"] = str(Path(downloaded).resolve())
+                        dl_counts[kind] = dl_counts.get(kind, 0) + 1
+                if kind in ("voice", "audio") and entry["media"] and entry["media"].get("file_path"):
+                    entry["transcription"] = prior_transcriptions.get(m.id)
+            except Exception as e:
+                entry["media"] = entry["media"] or {}
+                entry["media"]["download_error"] = repr(e)
+                if kind in ("voice", "audio"):
+                    entry["transcription"] = prior_transcriptions.get(m.id)
+
+        messages_out.append(entry)
+        count += 1
+        if count % progress_every == 0:
+            _log(f"  ... {count} messages  downloads so far: {dl_counts}")
+
+    messages_out.reverse()
+
+    payload = {
+        "chat": chat_meta,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "exported_by": {"id": me.id, "name": entity_label(me), "username": me.username},
+        "message_count": len(messages_out),
+        "media_dir": str(media_dir_path),
+        "media_policy": {
+            "voice": True,
+            "audio": True,
+            "photos": download_photos,
+            "stickers": download_stickers,
+            "videos": download_videos,
+            "documents": download_documents,
+        },
+        "schema_version": 2,
+        "notes": (
+            "Messages are stored newest-last. Voice/audio entries have a "
+            "'transcription' field filled by `telegram transcribe`. Photos, stickers, "
+            "videos, and documents (when downloaded per media_policy) have "
+            "'media.file_path' pointing to local binary. Multimodal tools can "
+            "read images directly; videos/documents are stored as-is for "
+            "on-demand processing."
+        ),
+        "messages": messages_out,
+    }
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    await client.disconnect()
+    _log(f"Done. {len(messages_out)} messages written. New downloads: {dl_counts}")
+    return {
+        "out": str(out),
+        "media_dir": str(media_dir_path),
+        "message_count": len(messages_out),
+        "new_downloads": dl_counts,
+    }
+
+
+# --- Transcribe (Deepgram) ---------------------------------------------------
+
+def _content_type_for(path: Path) -> str:
+    ext = path.suffix.lower()
+    return {
+        ".ogg": "audio/ogg",
+        ".oga": "audio/ogg",
+        ".opus": "audio/ogg",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".wav": "audio/wav",
+        ".webm": "audio/webm",
+        ".flac": "audio/flac",
+    }.get(ext, "application/octet-stream")
+
+
+def _deepgram_transcribe(audio_path: Path, api_key: str, model: str = "nova-3") -> dict:
+    """Send one audio file to Deepgram; return a structured transcription dict.
+    Maps an HTTP failure onto the exit-code taxonomy (2 auth, 5 server/network)."""
+    import urllib.error
+    import urllib.request
+
+    params = (
+        f"model={model}&detect_language=true&smart_format=true"
+        f"&punctuate=true&paragraphs=true"
+    )
+    url = f"https://api.deepgram.com/v1/listen?{params}"
+    data = audio_path.read_bytes()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Token {api_key}",
+            "Content-Type": _content_type_for(audio_path),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Deepgram HTTP {e.code}: {detail}") from e
+
+    dg = json.loads(body)
+    channels = dg.get("results", {}).get("channels", [])
+    if not channels:
+        raise RuntimeError(f"Deepgram returned no channels: {body[:500]}")
+    alt = channels[0].get("alternatives", [{}])[0]
+    text = (alt.get("paragraphs", {}) or {}).get("transcript") or alt.get("transcript") or ""
+    detected_language = channels[0].get("detected_language")
+    confidence = alt.get("confidence")
+
+    return {
+        "text": text.strip(),
+        "language": detected_language,
+        "confidence": confidence,
+        "model": model,
+        "provider": "deepgram",
+        "transcribed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def cmd_transcribe(json_path: str, force: bool, model: str) -> dict:
+    api_key = load_deepgram_key()
+    p = Path(json_path).expanduser().resolve()
+    if not p.exists():
+        _die(6, "file_not_found", f"export JSON does not exist: {p}",
+             "pass the path to a JSON produced by `telegram export`")
+    payload = json.loads(p.read_text())
+    messages = payload.get("messages", [])
+
+    to_do = []
+    for idx, m in enumerate(messages):
+        if m.get("type") not in ("voice", "audio"):
+            continue
+        file_path = (m.get("media") or {}).get("file_path")
+        if not file_path:
+            continue
+        if not force and m.get("transcription") is not None:
+            continue
+        to_do.append((idx, m, Path(file_path)))
+
+    if not to_do:
+        _log("Nothing to transcribe (use --force to re-run).")
+        return {"file": str(p), "transcribed": 0, "failed": 0, "pending": 0}
+
+    _log(f"Transcribing {len(to_do)} file(s) with Deepgram (model={model})...")
+    failures = 0
+    for n, (idx, m, ap) in enumerate(to_do, 1):
+        if not ap.exists():
+            _log(f"  [{n}/{len(to_do)}] SKIP missing file: {ap}")
+            m["transcription"] = {"error": f"file not found: {ap}"}
+            failures += 1
+            continue
+        _log(f"  [{n}/{len(to_do)}] id={m['id']}  {ap.name}  ({ap.stat().st_size // 1024} KB)")
+        try:
+            result = _deepgram_transcribe(ap, api_key, model=model)
+            m["transcription"] = result
+            preview = (result["text"][:80] + "…") if len(result["text"]) > 80 else result["text"]
+            _log(f"       → [{result.get('language')}] {preview}")
+        except Exception as e:
+            m["transcription"] = {"error": str(e)}
+            failures += 1
+            _log(f"       → ERROR: {e}")
+        # incremental save so a crash doesn't lose prior work
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    _log(f"Done. {len(to_do) - failures}/{len(to_do)} transcribed. File: {p}")
+    return {
+        "file": str(p),
+        "transcribed": len(to_do) - failures,
+        "failed": failures,
+    }
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="telegram",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("help", help="print the full usage contract")
+    sub.add_parser("doctor", help="health check: creds + reachability + session")
+    sub.add_parser("login", help="interactive first-time auth (phone + code)")
+    sub.add_parser("whoami", help="identity of the signed-in account")
+
+    pc = sub.add_parser("chats", help="list recent dialogs")
+    pc.add_argument("--limit", type=int, default=50)
+
+    pr = sub.add_parser("read", help="read messages from a chat")
+    pr.add_argument("chat")
+    pr.add_argument("--limit", type=int, default=50)
+    pr.add_argument("--since", help="ISO datetime; stop at this date")
+    pr.add_argument("--json", action="store_true")
+
+    ps = sub.add_parser("search", help="search inside a chat")
+    ps.add_argument("chat")
+    ps.add_argument("query")
+    ps.add_argument("--limit", type=int, default=50)
+    ps.add_argument("--json", action="store_true")
+
+    pn = sub.add_parser("send", help="send a message")
+    pn.add_argument("chat")
+    pn.add_argument("text")
+
+    pe = sub.add_parser("export", help="dump full chat history to JSON and download media")
+    pe.add_argument("chat")
+    pe.add_argument("--out", required=True, help="output JSON path")
+    pe.add_argument("--media-dir", help="directory for downloaded media (default: alongside --out)")
+    pe.add_argument("--limit", type=int, help="max messages (default: all)")
+    pe.add_argument("--since", help="ISO datetime; stop at this date")
+    pe.add_argument("--photos", action=argparse.BooleanOptionalAction, default=True,
+                    help="download photos (default: on; --no-photos to skip)")
+    pe.add_argument("--stickers", action=argparse.BooleanOptionalAction, default=True,
+                    help="download stickers (default: on; --no-stickers to skip)")
+    pe.add_argument("--videos", action="store_true",
+                    help="also download videos + video-notes (default: off)")
+    pe.add_argument("--documents", action="store_true",
+                    help="also download documents (default: off)")
+
+    pt = sub.add_parser("transcribe", help="fill transcription placeholders via Deepgram")
+    pt.add_argument("json_path")
+    pt.add_argument("--force", action="store_true", help="re-transcribe even if already filled")
+    pt.add_argument("--model", default="nova-3", help="Deepgram model (default: nova-3)")
+
+    # `--session <PATH>` is a global override accepted anywhere on the line
+    # (extracted before argparse so it works after the subcommand). It names the
+    # session-file path — not a secret — and is the flag tier of the cascade.
+    argv = sys.argv[1:]
+    session_flag: str | None = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--session" and i + 1 < len(argv):
+            session_flag = argv[i + 1]; i += 2; continue
+        if a.startswith("--session="):
+            session_flag = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+
+    args = p.parse_args(cleaned)
+
+    if args.cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+
+    try:
+        if args.cmd == "doctor":
+            _emit(asyncio.run(cmd_doctor(session_flag)))
+        elif args.cmd == "login":
+            _emit(asyncio.run(cmd_login(session_flag)))
+        elif args.cmd == "whoami":
+            _emit(asyncio.run(cmd_whoami(session_flag)))
+        elif args.cmd == "chats":
+            _emit(asyncio.run(cmd_chats(session_flag, args.limit)))
+        elif args.cmd == "read":
+            _emit(asyncio.run(cmd_read(session_flag, args.chat, args.limit, args.since, args.json)))
+        elif args.cmd == "search":
+            _emit(asyncio.run(cmd_search(session_flag, args.chat, args.query, args.limit, args.json)))
+        elif args.cmd == "send":
+            _emit(asyncio.run(cmd_send(session_flag, args.chat, args.text)))
+        elif args.cmd == "export":
+            _emit(asyncio.run(cmd_export(
+                session_flag, args.chat, args.out, args.media_dir, args.limit, args.since,
+                args.photos, args.stickers, args.videos, args.documents,
+            )))
+        elif args.cmd == "transcribe":
+            _emit(cmd_transcribe(args.json_path, args.force, args.model))
+    except (ApiIdInvalidError, AuthKeyUnregisteredError) as e:
+        _die(2, "auth_failed", f"Telegram rejected the session/credentials: {e.__class__.__name__}",
+             "run `telegram login` to re-authenticate; verify TELEGRAM_API_ID / TELEGRAM_API_HASH")
+    except FloodWaitError as e:
+        _die(5, "flood_wait", f"Telegram rate limit — wait {e.seconds}s before retrying",
+             "back off and retry later", status=420)
+    except RPCError as e:
+        _die(5, "rpc_error", f"Telegram RPC error: {e.__class__.__name__}: {e}",
+             status=getattr(e, "code", None))
+    except (ConnectionError, OSError) as e:
+        _die(5, "network_error", f"network error reaching Telegram: {e}", "check connectivity")
+
+
+if __name__ == "__main__":
+    main()

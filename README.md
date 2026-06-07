@@ -15,6 +15,7 @@ Each capability is one folder under [`capabilities/`](capabilities/) — the cat
 | [capabilities/directo/](capabilities/directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) | no |
 | [capabilities/mail/](capabilities/mail/) | read and draft mail across Mail.app's configured accounts over macOS Automation (read/search/show/links/attachments/draft/export; never sends) | no |
 | [capabilities/mailbox/](capabilities/mailbox/) | IMAP/SMTP adapter for one mailbox — list/show/fetch/flag/move and **send**; profiles in mailbox.json, app-password in .env | no |
+| [capabilities/telegram/](capabilities/telegram/) | drive a personal Telegram account over MTProto (a full user account) — read/search a chat, send, export a chat's full history to JSON with voice/audio + photos/stickers, and transcribe voice/audio via Deepgram; stateful login session | no |
 
 *(more get appended as they're extracted.)*
 
@@ -56,6 +57,7 @@ Capabilities exist to be *used*, and their primary consumer is the **routine**: 
 
 Point an agent at the relevant file and let it run. Each is environment-aware and interactive (it asks before it guesses).
 
+- [procedures/package.md](procedures/package.md) — **the authoring entry point.** Turn a working shebang script into a full capability here: conform the executable to SHEBANG.md, scrub consumer specifics, author the doc slots, audit clean.
 - [INSTALL.md](INSTALL.md) — **the install entry point.** Give an agent this one link; it asks which capability and places everything (registry folder, CLI on PATH, stub, project assets, the loader). The only file a consumer needs to start.
 - [procedures/update.md](procedures/update.md) — pull newer versions of already-installed capabilities.
 - [procedures/uninstall.md](procedures/uninstall.md) — remove a capability cleanly.
