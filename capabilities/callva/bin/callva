@@ -1,0 +1,1713 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""callva — agent-first CLI for the CallVA voice-AI platform.
+
+This tool is designed to be invoked by agents. Run `callva help` to load the
+full usage contract on demand — do not rely on memorised knowledge of its
+surface. It is a pure CRUD / I/O adapter over the CallVA External API: voice
+agents, assets (prompts), calls, transcripts, recordings, analytics, custom
+fields, webhook schedules, automations (Windmill scripts), webhook logs,
+variables, settings, projects, phone numbers, and providers.
+
+Credentials resolve through the standard cascade — flags > a project
+.env(.local) > $XDG_CONFIG_HOME/callva/credentials.env > the process env;
+first non-empty wins:
+  CALLVA_API_KEY=<your CallVA API key>   secret — never passed on argv
+  CALLVA_API_URL=<base URL>              optional; default
+                                         https://api.callva.one/api/v1
+
+Global options (accepted anywhere on the line — before or after the command):
+  --full              return the full, unfiltered API response (list endpoints
+                      are slimmed to the agent-useful fields by default)
+  --key-env <KEY>     resolve the API key from a different env/cred KEY (default
+                      CALLVA_API_KEY) — act as a different CallVA account/tenant.
+                      Only the key NAME travels; the value never touches argv.
+  --api-url <URL>     override the base URL for this invocation
+
+Output is JSON on stdout. List endpoints are slimmed to the fields an agent
+needs; pass --full for the raw API response. `get` / detail commands always
+return the full resource. `recordings stream` writes binary audio.
+
+Commands (`-f key=value` is repeatable for list filters):
+
+  doctor                              authenticated round-trip — proves the key
+                                      resolves, the API is reachable, and what
+                                      project the key sees
+  help                                print this contract
+
+  agents list [--is-active B]
+  agents default
+  agents get <id>
+  agents update <id> [--name N] [--voice V] [--prompt T | --prompt-file F]
+                     [--greeting-type prompt|exact|instruction]
+                     [--greeting-exact T] [--greeting-instruction T]
+                     [--agent-speaks-first B] [--config JSON | --data JSON]
+  agents delete <id>
+
+  assets list [--type prompt|schema|payload] [--per-page N]
+  assets get <id>
+  assets create --name N --type T (--content C | --content-file F) [--inactive]
+  assets update <id> [--name N] [--content C | --content-file F] [--is-active B]
+  assets delete <id>
+
+  calls list [--per-page N] [--page N] [--sort F] [-f k=v ...]
+  calls get <id>
+  calls create --data JSON
+  calls update <id> --data JSON
+  calls delete <id>
+  calls batch <id> [<id> ...] --data JSON
+  calls webhook-logs <call_id> [--per-page N] [--page N] [--sort F] [-f k=v ...]
+  calls automation-runs <call_id> [--per-page N] [--page N] [-f k=v ...]
+                        [--no-include-args]
+
+  transcripts get <call_id>
+  transcripts store <call_id> (--data JSON | --data-file F)
+  transcripts delete <call_id>
+  transcripts url <call_id>
+
+  call <destination> --agent-id ID [--phone-number-id ID] [--call-id ID]
+                     [--overrides JSON]
+
+  stats aggregate --op count|sum|avg|min|max [--field F] [--group-by F]
+                  [--interval day|week|month] [-f k=v ...]
+  stats trends --from DATE --to DATE
+
+  recordings stream <call_id> --url URL [--output FILE]   (binary; stdout if no
+                                                           --output)
+
+  fields list [--entity-type T]
+  fields create --data JSON
+  fields update <id> --data JSON
+  fields delete <id>
+  fields impact <id>
+
+  field-groups list
+  field-groups create --data JSON
+  field-groups update <id> --data JSON
+  field-groups delete <id>
+  field-groups reorder --data JSON
+  field-groups add-field <id> <field_id>
+  field-groups remove-field <id> <field_id>
+  field-groups reorder-fields <id> --data JSON
+  field-groups update-field <id> <field_id> --data JSON
+
+  schedules list
+  schedules get <id>
+  schedules create --data JSON
+  schedules update <id> --data JSON      (full PUT — send the complete payload,
+                                          all rules included)
+  schedules delete <id>
+  schedules preview <id> <datetime>
+  schedules executions <id> [--per-page N]
+
+  automations list [--per-page N]
+  automations get <id>
+  automations create --name N [--description D]
+  automations update <id> [--name N] [--description D] [--is-active B]
+                          [--settings JSON | --data JSON]
+  automations delete <id>
+  automations code <id>
+  automations deploy <id> (--file F | --code C) [--language deno]
+  automations run <id> [--args JSON | --args-file F]
+  automations runs <id> [--per-page N]
+  automations all-runs [--per-page N] [--page N] [-f k=v ...]
+                       [--args-filter JSON] [--result-filter JSON]
+                       [--include-args]
+  automations run-detail <id> <job_id>
+  automations runtime-info
+
+  webhook-logs list [--per-page N] [--page N] [--sort F] [-f k=v ...]
+  webhook-logs get <id>
+  webhook-logs filters
+
+  variables list
+  variables create --name N --value V [--description D] [--is-secret B]
+  variables update <path> --value V
+  variables delete <path>
+
+  settings list
+  settings get <key>
+
+  projects list [--is-active B] [--per-page N]
+  projects get <id>
+
+  phone-numbers list [--is-active B] [--per-page N]
+  phone-numbers get <id>
+
+  providers list [--is-active B] [--provider-type T] [--per-page N]
+  providers types
+
+Conventions:
+  - Filtering on list/stats commands is always `-f key=value` (repeatable):
+    e.g. `calls list -f status=complete -f result=confirmed`. There are no bare
+    per-field flags like `--status`.
+  - `stats aggregate` filters dates with `-f created_at_gte=<date>`; `--from` /
+    `--to` belong to `stats trends` only.
+  - Use file flags (`--content-file`, `--prompt-file`, `--file`, `--data-file`,
+    `--args-file`) for large content; `-` reads stdin.
+  - `--data` / `--overrides` / `--settings` take a JSON object.
+
+I/O contract:
+  - Success: JSON on stdout, exit 0.
+  - Error:   {"error": {"code", "message", "hint"?, "status"?}} on stderr,
+             non-zero exit.
+
+Exit codes:
+  0  success
+  2  auth (missing / rejected credentials, 401 / 403)
+  3  not found (404)
+  5  server / network (timeout, connection error, 429 after retries, 5xx)
+  6  input / validation (malformed argument, bad payload, 400 / 422)
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+from typing import NoReturn
+
+import httpx
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_API_URL = "https://api.callva.one/api/v1"
+TIMEOUT = httpx.Timeout(60.0)
+MAX_RETRIES = 3
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CONFIG_DIR = _CONFIG_HOME / "callva"
+CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
+
+# Set by --full; list endpoints slim to agent-useful fields unless True.
+FULL = False
+
+# Holds the live client + resolved base URL, so handlers call api() freely.
+_STATE: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Credential cascade  (flags > project .env(.local) > user config > process env)
+# ---------------------------------------------------------------------------
+
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_env() -> dict:
+    """Nearest project .env(.local), walking up from $CLAUDE_PROJECT_DIR (else cwd).
+    .env.local overrides .env. Stops at the first dir holding either, or a .git root."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    for d in (here, *here.parents):
+        if (d / ".env").exists() or (d / ".env.local").exists():
+            merged = _parse_env_file(d / ".env")
+            merged.update(_parse_env_file(d / ".env.local"))  # .local wins
+            return merged
+        if (d / ".git").is_dir():
+            break  # project root reached, no env file here
+    return {}
+
+
+def _resolve(key: str, default: str | None = None) -> str | None:
+    """Resolve a non-secret value by key name through the cascade."""
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or default)
+
+
+def _load_api_key(key_name: str) -> str:
+    """Resolve the CallVA API key by env-var NAME through the cascade — a project
+    .env(.local), then ~/.config/callva/credentials.env, then the process env;
+    first non-empty wins. The key value never travels on the command line; only
+    --key-env selects which NAME holds it (default CALLVA_API_KEY)."""
+    tok = (_project_env().get(key_name)
+           or _parse_env_file(CREDENTIALS_ENV).get(key_name)
+           or os.environ.get(key_name)
+           or "").strip()
+    if tok:
+        return tok
+    if key_name == "CALLVA_API_KEY":
+        _die(2, "missing_api_key",
+             f"CALLVA_API_KEY not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+             "add CALLVA_API_KEY=<your CallVA API key> to the user config or a project .env")
+    _die(2, "missing_api_key",
+         f"{key_name} not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+         f"add {key_name}=<key> to the user config or a project .env to use --key-env {key_name}")
+
+
+# ---------------------------------------------------------------------------
+# Output / errors  (success = JSON on stdout; failure = envelope on stderr)
+# ---------------------------------------------------------------------------
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+# ---------------------------------------------------------------------------
+# HTTP client
+# ---------------------------------------------------------------------------
+
+
+def _client(api_key: str, base_url: str) -> httpx.Client:
+    return httpx.Client(
+        base_url=base_url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=TIMEOUT,
+    )
+
+
+def _api_message(data) -> str | None:
+    """Best-effort human message from a CallVA error body."""
+    if isinstance(data, dict):
+        if data.get("message"):
+            return data["message"]
+        errs = data.get("errors")
+        if isinstance(errs, dict):
+            for v in errs.values():
+                if isinstance(v, list) and v:
+                    return str(v[0])
+                return str(v)
+        if isinstance(errs, list) and errs:
+            first = errs[0]
+            return first.get("message") if isinstance(first, dict) else str(first)
+    if isinstance(data, str) and data:
+        return data
+    return None
+
+
+def _map_4xx(status: int, data, path: str, allow_404: bool):
+    if allow_404 and status == 404:
+        return None
+    msg = _api_message(data) or f"HTTP {status}"
+    if status in (401, 403):
+        _die(2, "unauthorized", msg,
+             "CALLVA_API_KEY may be invalid or lack access to this resource", status=status)
+    if status == 404:
+        _die(3, "not_found", msg,
+             "verify the id exists and the key can see it", status=status)
+    if status in (400, 422):
+        _die(6, "invalid_request", msg, None, status=status)
+    _die(5, "api_error", msg, None, status=status)
+
+
+def _request(client: httpx.Client, method: str, path: str,
+             params: dict | None = None, json_body: dict | None = None,
+             allow_404: bool = False):
+    """Authenticated request with bounded, backed-off retries. Returns parsed JSON."""
+    clean = {k: v for k, v in (params or {}).items() if v is not None}
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, path, params=clean or None, json=json_body)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "timeout", f"request timed out: {method} {path}",
+                 "the CallVA API was unresponsive")
+        except httpx.RequestError as e:
+            _die(5, "network_error", f"network error: {e}", "check connectivity")
+
+        last_status = resp.status_code
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", str(attempt * 1.5)))
+            if attempt < MAX_RETRIES:
+                time.sleep(retry_after)
+                continue
+            _die(5, "rate_limited", f"rate-limited after {MAX_RETRIES} attempts",
+                 "back off and retry later", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "server_error", f"CallVA returned {resp.status_code}",
+                 None, status=resp.status_code)
+
+        raw = resp.text
+        if not raw:
+            if resp.status_code >= 400:
+                return _map_4xx(resp.status_code, {}, path, allow_404)
+            return {"success": True}
+        try:
+            data = resp.json()
+        except ValueError:
+            if resp.status_code >= 400:
+                _map_4xx(resp.status_code, raw, path, allow_404)
+            _die(5, "invalid_response", f"non-JSON response from {method} {path}",
+                 status=resp.status_code)
+
+        if resp.status_code >= 400:
+            return _map_4xx(resp.status_code, data, path, allow_404)
+        return data
+
+    _die(5, "exhausted_retries", f"exhausted {MAX_RETRIES} attempts on {method} {path}",
+         status=last_status)
+
+
+def _download(client: httpx.Client, path: str, params: dict | None, output: str | None):
+    """Stream binary content (recordings) to a file or stdout."""
+    clean = {k: v for k, v in (params or {}).items() if v is not None}
+    try:
+        with client.stream("GET", path, params=clean or None) as resp:
+            if resp.status_code >= 400:
+                body = resp.read()
+                try:
+                    parsed = json.loads(body.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    parsed = body.decode("utf-8", "replace")
+                return _map_4xx(resp.status_code, parsed, path, False)
+            ctype = resp.headers.get("Content-Type", "audio/mpeg")
+            length = resp.headers.get("Content-Length", "unknown")
+            if output:
+                with open(output, "wb") as f:
+                    for chunk in resp.iter_bytes(8192):
+                        f.write(chunk)
+                return {"file": output, "content_type": ctype, "size": length}
+            for chunk in resp.iter_bytes(8192):
+                sys.stdout.buffer.write(chunk)
+            return None
+    except httpx.TimeoutException:
+        _die(5, "timeout", f"recording download timed out: {path}",
+             "the CallVA API was unresponsive")
+    except httpx.RequestError as e:
+        _die(5, "network_error", f"network error: {e}", "check connectivity")
+
+
+def api(method, path, data=None, query=None, allow_404=False):
+    return _request(_STATE["client"], method, path,
+                    params=query, json_body=data, allow_404=allow_404)
+
+
+def api_download(path, output, query=None):
+    return _download(_STATE["client"], path, query, output)
+
+
+# ---------------------------------------------------------------------------
+# Result shaping — slim list responses to agent-useful fields unless --full
+# ---------------------------------------------------------------------------
+
+
+def _result(result, slim=None):
+    """Apply a slim projection unless --full was given."""
+    return slim(result) if (slim and not FULL) else result
+
+
+def _pick(obj, keys):
+    """Extract only the specified keys from a dict."""
+    return {k: obj[k] for k in keys if k in obj}
+
+
+def _slim_options(options):
+    """Collapse options to just values: [{"value":"a","label":"A"}] -> ["a"]."""
+    if not options or not isinstance(options, list):
+        return options
+    return [o.get("value", o) for o in options if isinstance(o, dict)]
+
+
+def _apply_slim(result, item_fn):
+    """Apply a per-item slim function to the `data` array of a list response.
+    Preserves pagination, meta, success, and message keys."""
+    data = result.get("data")
+    if isinstance(data, list):
+        filtered = dict(result)
+        filtered["data"] = [item_fn(item) for item in data]
+        return filtered
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Argument helpers
+# ---------------------------------------------------------------------------
+
+
+def resolve_content(args):
+    """Resolve content from --content or --content-file flags."""
+    cf = getattr(args, "content_file", None)
+    c = getattr(args, "content", None)
+    if cf:
+        return sys.stdin.read() if cf == "-" else open(cf).read()
+    return c
+
+
+def parse_bool(value):
+    if value.lower() in ("true", "1", "yes"):
+        return True
+    if value.lower() in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean: {value}")
+
+
+def parse_json_arg(value):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"Invalid JSON: {e}")
+
+
+def parse_json_file(value):
+    if value == "-":
+        return json.loads(sys.stdin.read())
+    with open(value) as f:
+        return json.load(f)
+
+
+def _data(value):
+    """A non-empty --data/--payload object, or die with a validation error."""
+    if not value:
+        _die(6, "missing_payload", "provide the payload as --data '{...}'")
+    return value
+
+
+# ===================================================================
+# AGENTS
+# ===================================================================
+
+
+def agents_list(args):
+    query = {}
+    if getattr(args, "is_active", None) is not None:
+        query["is_active"] = str(args.is_active).lower()
+    result = api("GET", "/external/agents", query=query)
+    slim = lambda r: _apply_slim(r, lambda a: _pick(a, [
+        "id", "name", "project_name", "is_active", "is_default"]))
+    return _result(result, slim=slim)
+
+
+def agents_default(_args):
+    return api("GET", "/external/agents/default").get("data")
+
+
+def agents_get(args):
+    r = api("GET", f"/external/agents/{args.id}")
+    return r.get("data", r)
+
+
+def agents_update(args):
+    data = {}
+    if args.payload:
+        data = args.payload
+    else:
+        if args.name is not None:
+            data["name"] = args.name
+        if args.voice is not None:
+            data["voice"] = args.voice
+        if args.prompt is not None:
+            data["prompt"] = args.prompt
+        if args.prompt_file is not None:
+            data["prompt"] = open(args.prompt_file).read()
+        if args.greeting_type is not None:
+            data["greeting_type"] = args.greeting_type
+        if args.greeting_exact is not None:
+            data["greeting_exact"] = args.greeting_exact
+        if args.greeting_instruction is not None:
+            data["greeting_instruction"] = args.greeting_instruction
+        if args.agent_speaks_first is not None:
+            data["agent_speaks_first"] = args.agent_speaks_first
+        if args.config_json:
+            data["config"] = args.config_json
+    if not data:
+        _die(6, "nothing_to_update", "no fields to update; use flags or --data '{...}'")
+    r = api("PATCH", f"/external/agents/{args.id}", data)
+    return r.get("data", r)
+
+
+def agents_delete(args):
+    api("DELETE", f"/external/agents/{args.id}")
+    return {"deleted": args.id}
+
+
+# ===================================================================
+# ASSETS
+# ===================================================================
+
+
+def assets_list(args):
+    query = {}
+    if args.type:
+        query["type"] = args.type
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    result = api("GET", "/external/assets", query=query)
+    slim = lambda r: _apply_slim(r, lambda a: _pick(a, [
+        "id", "name", "type", "is_active", "created_at", "updated_at"]))
+    return _result(result, slim=slim)
+
+
+def assets_get(args):
+    r = api("GET", f"/external/assets/{args.id}")
+    return r.get("data", r)
+
+
+def assets_create(args):
+    data = {
+        "name": args.name,
+        "type": args.type,
+        "content": resolve_content(args),
+        "is_active": not args.inactive,
+    }
+    r = api("POST", "/external/assets", data)
+    return r.get("data", r)
+
+
+def assets_update(args):
+    content = resolve_content(args)
+    data = {}
+    if args.name is not None:
+        data["name"] = args.name
+    if content is not None:
+        data["content"] = content
+    if args.is_active is not None:
+        data["is_active"] = args.is_active
+    if not data:
+        _die(6, "nothing_to_update",
+             "no fields to update; use --name, --content/--content-file, or --is-active")
+    r = api("PATCH", f"/external/assets/{args.id}", data)
+    return r.get("data", r)
+
+
+def assets_delete(args):
+    api("DELETE", f"/external/assets/{args.id}")
+    return {"deleted": args.id}
+
+
+# ===================================================================
+# CALLS
+# ===================================================================
+
+
+def _apply_filters(query, filters):
+    """Fold repeatable -f key=value filters into a query dict."""
+    for filt in filters or []:
+        k, _, v = filt.partition("=")
+        if v:
+            query[k] = v
+
+
+def calls_list(args):
+    query = {"sort": args.sort}
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    if args.page:
+        query["page"] = str(args.page)
+    _apply_filters(query, args.filter)
+    result = api("GET", "/external/calls", query=query)
+
+    def slim_call(c):
+        core = ["id", "name", "phone", "status", "result", "direction",
+                "duration", "created_at", "company_name", "invoice_amount"]
+        s = _pick(c, core)
+        for k, v in c.items():
+            if k not in s and v is not None and k not in (
+                "tenant_id", "project_id", "updated_at"
+            ):
+                s[k] = v
+        return s
+
+    return _result(result, slim=lambda r: _apply_slim(r, slim_call))
+
+
+def calls_get(args):
+    r = api("GET", f"/external/calls/{args.id}")
+    return r.get("data", r)
+
+
+def calls_create(args):
+    r = api("POST", "/external/calls", args.payload or {})
+    return r.get("data", r)
+
+
+def calls_update(args):
+    r = api("PATCH", f"/external/calls/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def calls_delete(args):
+    api("DELETE", f"/external/calls/{args.id}")
+    return {"deleted": args.id}
+
+
+def calls_batch(args):
+    data = {"ids": args.ids, "updates": _data(args.payload)}
+    r = api("PATCH", "/external/calls/batch", data)
+    return r.get("data", r)
+
+
+def calls_webhook_logs(args):
+    query = {}
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    if args.page:
+        query["page"] = str(args.page)
+    if args.sort:
+        query["sort"] = args.sort
+    for filt in args.filter or []:
+        k, _, v = filt.partition("=")
+        if v and k != "related_call_id":  # forced by route
+            query[k] = v
+    result = api("GET", f"/external/calls/{args.call_id}/webhook-logs", query=query)
+    return _result(result, slim=lambda r: _apply_slim(
+        r, lambda log: _slim_webhook_log(log, include_call=False)))
+
+
+def calls_automation_runs(args):
+    query = {}
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    if args.page:
+        query["page"] = str(args.page)
+    _apply_filters(query, args.filter)
+    if args.no_include_args:
+        query["include_args"] = "false"
+    result = api("GET", f"/external/calls/{args.call_id}/automation-runs", query=query)
+    return _result(result, slim=lambda r: _apply_slim(r, lambda run: _pick(run, [
+        "id", "automation_id", "automation_name", "status",
+        "triggered_by", "duration_ms", "started_at", "args"])))
+
+
+# ===================================================================
+# TRANSCRIPTS
+# ===================================================================
+
+
+def transcripts_get(args):
+    r = api("GET", f"/external/calls/{args.call_id}/transcript")
+    return r.get("data", r)
+
+
+def transcripts_store(args):
+    data = _data(args.payload)
+    api("POST", f"/external/calls/{args.call_id}/transcript", data)
+    return {"stored": args.call_id}
+
+
+def transcripts_delete(args):
+    api("DELETE", f"/external/calls/{args.call_id}/transcript")
+    return {"deleted": args.call_id}
+
+
+def transcripts_url(args):
+    r = api("GET", f"/external/calls/{args.call_id}/transcript/url")
+    return r.get("data", r)
+
+
+# ===================================================================
+# OUTBOUND CALL
+# ===================================================================
+
+
+def call_initiate(args):
+    data = {"destination": args.destination, "agent_id": args.agent_id}
+    if args.phone_number_id:
+        data["phone_number_id"] = args.phone_number_id
+    if args.call_id:
+        data["call_id"] = args.call_id
+    if args.overrides:
+        data["agent_overrides"] = args.overrides
+    r = api("POST", "/external/call", data)
+    return r.get("data", r)
+
+
+# ===================================================================
+# STATS
+# ===================================================================
+
+
+def stats_aggregate(args):
+    query = {"operation": args.op}
+    if args.field:
+        query["field"] = args.field
+    if args.group_by:
+        query["group_by"] = args.group_by
+    if args.interval:
+        query["interval"] = args.interval
+    _apply_filters(query, args.filter)
+    r = api("GET", "/external/calls/aggregate", query=query)
+    return r.get("data", r)
+
+
+def stats_trends(args):
+    r = api("GET", "/external/calls/trends",
+            query={"date_from": args.date_from, "date_to": args.date_to})
+    return r.get("data", r)
+
+
+# ===================================================================
+# RECORDINGS
+# ===================================================================
+
+
+def recordings_stream(args):
+    # Returns a dict when saved to --output, None when streamed to stdout.
+    return api_download(f"/external/calls/{args.call_id}/recording",
+                        args.output, query={"url": args.url})
+
+
+# ===================================================================
+# CUSTOM FIELDS
+# ===================================================================
+
+
+def fields_list(args):
+    query = {}
+    if args.entity_type:
+        query["entity_type"] = args.entity_type
+    result = api("GET", "/external/custom-fields", query=query)
+
+    def slim_field(f):
+        s = _pick(f, ["id", "field_key", "field_label", "field_type",
+                      "is_required", "is_system"])
+        opts = f.get("options")
+        if opts:
+            s["options"] = _slim_options(opts)
+        return s
+
+    return _result(result, slim=lambda r: _apply_slim(r, slim_field))
+
+
+def fields_create(args):
+    r = api("POST", "/external/custom-fields", _data(args.payload))
+    return r.get("data", r)
+
+
+def fields_update(args):
+    r = api("PUT", f"/external/custom-fields/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def fields_delete(args):
+    api("DELETE", f"/external/custom-fields/{args.id}")
+    return {"deleted": args.id}
+
+
+def fields_impact(args):
+    r = api("GET", f"/external/custom-fields/{args.id}/delete-impact")
+    return r.get("data", r)
+
+
+# ===================================================================
+# CUSTOM FIELD GROUPS
+# ===================================================================
+
+
+def field_groups_list(_args):
+    result = api("GET", "/external/custom-field-groups")
+
+    def slim_group(g):
+        s = _pick(g, ["id", "name", "entity_type", "sort_order", "show_title"])
+        fields = g.get("custom_fields") or g.get("fields") or []
+        s["fields"] = [
+            {
+                "field_key": f.get("field_key"),
+                "field_label": f.get("field_label"),
+                "field_type": f.get("field_type"),
+                "position": f.get("pivot", {}).get("position"),
+            }
+            for f in fields
+        ]
+        return s
+
+    return _result(result, slim=lambda r: _apply_slim(r, slim_group))
+
+
+def field_groups_create(args):
+    r = api("POST", "/external/custom-field-groups", _data(args.payload))
+    return r.get("data", r)
+
+
+def field_groups_update(args):
+    r = api("PUT", f"/external/custom-field-groups/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def field_groups_delete(args):
+    api("DELETE", f"/external/custom-field-groups/{args.id}")
+    return {"deleted": args.id}
+
+
+def field_groups_reorder(args):
+    api("POST", "/external/custom-field-groups/reorder", _data(args.payload))
+    return {"reordered": True}
+
+
+def field_groups_add_field(args):
+    api("POST", f"/external/custom-field-groups/{args.id}/fields",
+        {"custom_field_id": args.field_id})
+    return {"group": args.id, "added_field": args.field_id}
+
+
+def field_groups_remove_field(args):
+    api("DELETE", f"/external/custom-field-groups/{args.id}/fields/{args.field_id}")
+    return {"group": args.id, "removed_field": args.field_id}
+
+
+def field_groups_reorder_fields(args):
+    api("POST", f"/external/custom-field-groups/{args.id}/fields/reorder",
+        _data(args.payload))
+    return {"group": args.id, "reordered": True}
+
+
+def field_groups_update_field(args):
+    api("PATCH", f"/external/custom-field-groups/{args.id}/fields/{args.field_id}",
+        _data(args.payload))
+    return {"group": args.id, "updated_field": args.field_id}
+
+
+# ===================================================================
+# WEBHOOK SCHEDULES
+# ===================================================================
+
+
+def schedules_list(_args):
+    result = api("GET", "/external/webhook-schedule")
+
+    def slim_schedule(s):
+        slimmed = _pick(s, ["id", "name", "webhook_url", "webhook_method", "is_active"])
+        slimmed["rules"] = [
+            _pick(rl, ["name", "action", "days_of_week", "time_from", "time_to",
+                       "execution_interval", "is_active", "is_exclusive"])
+            for rl in (s.get("rules") or [])
+        ]
+        return slimmed
+
+    return _result(result, slim=lambda r: _apply_slim(r, slim_schedule))
+
+
+def schedules_get(args):
+    r = api("GET", f"/external/webhook-schedule/{args.id}")
+    return r.get("data", r)
+
+
+def schedules_create(args):
+    r = api("POST", "/external/webhook-schedule", _data(args.payload))
+    return r.get("data", r)
+
+
+def schedules_update(args):
+    r = api("PUT", f"/external/webhook-schedule/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def schedules_delete(args):
+    api("DELETE", f"/external/webhook-schedule/{args.id}")
+    return {"deleted": args.id}
+
+
+def schedules_preview(args):
+    r = api("POST", f"/external/webhook-schedule/{args.id}/preview",
+            {"datetime": args.datetime})
+    return r.get("data", r)
+
+
+def schedules_executions(args):
+    query = {}
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    return api("GET", f"/external/webhook-schedule/{args.id}/execution", query=query)
+
+
+# ===================================================================
+# AUTOMATIONS
+# ===================================================================
+
+
+def automations_list(args):
+    query = {}
+    if getattr(args, "per_page", None):
+        query["per_page"] = str(args.per_page)
+    result = api("GET", "/external/automations", query=query)
+    slim = lambda r: _apply_slim(r, lambda a: _pick(a, [
+        "id", "name", "description", "is_active", "windmill_path",
+        "windmill_script_hash", "timeout_seconds", "created_at", "updated_at"]))
+    return _result(result, slim=slim)
+
+
+def automations_get(args):
+    r = api("GET", f"/external/automations/{args.id}")
+    return r.get("data", r)
+
+
+def automations_create(args):
+    data = {"name": args.name}
+    if args.description:
+        data["description"] = args.description
+    r = api("POST", "/external/automations", data)
+    return r.get("data", r)
+
+
+def automations_update(args):
+    data = {}
+    if args.payload:
+        data = args.payload
+    else:
+        if args.name is not None:
+            data["name"] = args.name
+        if args.description is not None:
+            data["description"] = args.description
+        if args.is_active is not None:
+            data["is_active"] = args.is_active
+        if getattr(args, "settings_json", None) is not None:
+            data["settings"] = args.settings_json
+    if not data:
+        _die(6, "nothing_to_update",
+             "no fields to update; use --name, --description, --is-active, --settings, or --data")
+    r = api("PUT", f"/external/automations/{args.id}", data)
+    return r.get("data", r)
+
+
+def automations_delete(args):
+    api("DELETE", f"/external/automations/{args.id}")
+    return {"deleted": args.id}
+
+
+def automations_code(args):
+    r = api("GET", f"/external/automations/{args.id}/code")
+    return r.get("data", r)
+
+
+def automations_deploy(args):
+    if args.code_file:
+        code = sys.stdin.read() if args.code_file == "-" else open(args.code_file).read()
+    elif args.code:
+        code = args.code
+    else:
+        _die(6, "missing_code", "provide code via --file or --code")
+    r = api("PUT", f"/external/automations/{args.id}/code",
+            {"code": code, "language": args.language})
+    return r.get("data", r)
+
+
+def automations_run(args):
+    run_args = getattr(args, "run_args", None)
+    body = {"input": run_args} if run_args is not None else None
+    r = api("POST", f"/external/automations/{args.id}/run", data=body)
+    return r.get("data", r)
+
+
+def automations_runs(args):
+    query = {}
+    if getattr(args, "per_page", None):
+        query["per_page"] = str(args.per_page)
+    result = api("GET", f"/external/automations/{args.id}/runs", query=query)
+    slim = lambda r: _apply_slim(r, lambda run: _pick(run, [
+        "id", "success", "duration_ms", "job_kind", "created_at"]))
+    return _result(result, slim=slim)
+
+
+def automations_run_detail(args):
+    r = api("GET", f"/external/automations/{args.id}/runs/{args.job_id}")
+    return r.get("data", r)
+
+
+def automations_runtime_info(_args):
+    r = api("GET", "/external/automations/runtime-info")
+    return r.get("data", r)
+
+
+def automations_all_runs(args):
+    query = {}
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    if args.page:
+        query["page"] = str(args.page)
+    _apply_filters(query, args.filter)
+    if args.args_filter:
+        query["args"] = args.args_filter
+    if args.result_filter:
+        query["result"] = args.result_filter
+    if args.include_args:
+        query["include_args"] = "true"
+    result = api("GET", "/external/automations/runs", query=query)
+    slim = lambda r: _apply_slim(r, lambda run: _pick(run, [
+        "id", "automation_id", "automation_name", "status",
+        "triggered_by", "duration_ms", "started_at", "args"]))
+    return _result(result, slim=slim)
+
+
+# ===================================================================
+# WEBHOOK LOGS
+# ===================================================================
+
+
+def _slim_webhook_log(log, include_call=True):
+    keys = ["id", "type", "event_type", "processing_status", "response_status",
+            "response_time_ms", "agent_id", "received_at", "error_message"]
+    if include_call:
+        keys.insert(7, "related_call_id")
+    return _pick(log, keys)
+
+
+def webhook_logs_list(args):
+    query = {}
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    if args.page:
+        query["page"] = str(args.page)
+    if args.sort:
+        query["sort"] = args.sort
+    _apply_filters(query, args.filter)
+    result = api("GET", "/external/webhook-logs", query=query)
+    return _result(result, slim=lambda r: _apply_slim(
+        r, lambda log: _slim_webhook_log(log, include_call=True)))
+
+
+def webhook_logs_get(args):
+    r = api("GET", f"/external/webhook-logs/{args.id}")
+    return r.get("data", r)
+
+
+def webhook_logs_filters(_args):
+    r = api("GET", "/external/webhook-logs/filters")
+    return r.get("data", r)
+
+
+# ===================================================================
+# VARIABLES
+# ===================================================================
+
+
+def variables_list(_args):
+    result = api("GET", "/external/variables")
+    slim = lambda r: _apply_slim(r, lambda v: _pick(v, [
+        "name", "path", "is_secret", "description"]))
+    return _result(result, slim=slim)
+
+
+def variables_create(args):
+    data = {"name": args.name, "value": args.value}
+    if args.description:
+        data["description"] = args.description
+    if args.is_secret is not None:
+        data["is_secret"] = args.is_secret
+    r = api("POST", "/external/variables", data)
+    return r.get("data", r)
+
+
+def variables_update(args):
+    path = urllib.parse.quote(args.path, safe="")
+    api("PATCH", f"/external/variables/{path}", {"value": args.value})
+    return {"updated": args.path}
+
+
+def variables_delete(args):
+    path = urllib.parse.quote(args.path, safe="")
+    api("DELETE", f"/external/variables/{path}")
+    return {"deleted": args.path}
+
+
+# ===================================================================
+# SETTINGS
+# ===================================================================
+
+
+def settings_list(_args):
+    result = api("GET", "/external/settings/project")
+
+    def slim(r):
+        data = r.get("data", {})
+        settings = data.get("settings", []) if isinstance(data, dict) else []
+        filtered = dict(r)
+        filtered_data = dict(data)
+        filtered_data["settings"] = [
+            _pick(s, ["key", "label", "category", "effective_value", "inherited_from"])
+            for s in settings
+        ]
+        filtered_data.pop("sections", None)
+        filtered["data"] = filtered_data
+        return filtered
+
+    return _result(result, slim=slim)
+
+
+def settings_get(args):
+    result = api("GET", "/external/settings/project")
+    data = result.get("data", {})
+    settings = data.get("settings", []) if isinstance(data, dict) else []
+    match = next((s for s in settings if s.get("key") == args.key), None)
+    if not match:
+        _die(3, "not_found", f"setting not found: {args.key}",
+             "run `callva settings list` to see available keys")
+    return match
+
+
+# ===================================================================
+# PROJECTS
+# ===================================================================
+
+
+def projects_list(args):
+    query = {}
+    if getattr(args, "is_active", None) is not None:
+        query["is_active"] = str(args.is_active).lower()
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    result = api("GET", "/external/projects", query=query)
+    slim = lambda r: _apply_slim(r, lambda p: _pick(p, [
+        "id", "name", "description", "is_active", "is_default"]))
+    return _result(result, slim=slim)
+
+
+def projects_get(args):
+    r = api("GET", f"/external/projects/{args.id}")
+    return r.get("data", r)
+
+
+# ===================================================================
+# PHONE NUMBERS
+# ===================================================================
+
+
+def phone_numbers_list(args):
+    query = {}
+    if getattr(args, "is_active", None) is not None:
+        query["is_active"] = str(args.is_active).lower()
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    result = api("GET", "/external/phone-numbers", query=query)
+    # Excludes sip_outbound_password and other provider/livekit internals.
+    slim = lambda r: _apply_slim(r, lambda n: _pick(n, [
+        "id", "phone_number", "label", "number_type", "provider_type",
+        "status", "is_active", "assigned_project_id", "assigned_agent_id"]))
+    return _result(result, slim=slim)
+
+
+def phone_numbers_get(args):
+    r = api("GET", f"/external/phone-numbers/{args.id}")
+    return r.get("data", r)
+
+
+# ===================================================================
+# PHONE PROVIDERS
+# ===================================================================
+
+
+def providers_list(args):
+    query = {}
+    if getattr(args, "is_active", None) is not None:
+        query["is_active"] = str(args.is_active).lower()
+    if args.provider_type:
+        query["provider_type"] = args.provider_type
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    result = api("GET", "/external/phone-providers", query=query)
+    slim = lambda r: _apply_slim(r, lambda p: _pick(p, [
+        "id", "name", "provider_type", "is_active", "is_verified",
+        "phone_numbers_count"]))
+    return _result(result, slim=slim)
+
+
+def providers_types(_args):
+    r = api("GET", "/external/phone-providers/types")
+    return r.get("data", r)
+
+
+# ===================================================================
+# DOCTOR
+# ===================================================================
+
+
+def cmd_doctor(_args):
+    """Cheapest authenticated round-trip: prove the key resolves and the API is reachable."""
+    data = api("GET", "/external/projects", query={"per_page": "1"})
+    projects = data.get("data") or []
+    return {
+        "ok": True,
+        "base_url": _STATE["base"],
+        "key_env": _STATE["key_env"],
+        "projects_visible": len(projects),
+        "sample_project": (projects[0].get("name") if projects else None),
+    }
+
+
+# ===================================================================
+# CLI Parser
+# ===================================================================
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="callva",
+        description="CallVA External API client — agent-first CRUD over the voice-AI platform.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subs = parser.add_subparsers(dest="resource", required=True)
+
+    subs.add_parser("help", help="Print the full usage contract")
+    subs.add_parser("doctor", help="Authenticated round-trip — prove readiness")
+
+    # --- agents ---
+    ag = subs.add_parser("agents", help="Manage voice agents")
+    ag_sub = ag.add_subparsers(dest="action", required=True)
+    ag_ls = ag_sub.add_parser("list", help="List all agents")
+    ag_ls.add_argument("--is-active", type=parse_bool, default=None, help="Filter by active status")
+    ag_sub.add_parser("default", help="Get or create the default agent")
+    ag_get = ag_sub.add_parser("get", help="Get agent by ID")
+    ag_get.add_argument("id", help="Agent UUID")
+    ag_upd = ag_sub.add_parser("update", help="Update agent")
+    ag_upd.add_argument("id", help="Agent UUID")
+    ag_upd.add_argument("--name", help="Agent name")
+    ag_upd.add_argument("--voice", help="Voice identifier")
+    ag_upd.add_argument("--prompt", help="Prompt text (inline)")
+    ag_upd.add_argument("--prompt-file", help="Read prompt from file")
+    ag_upd.add_argument("--greeting-type", choices=["prompt", "exact", "instruction"])
+    ag_upd.add_argument("--greeting-exact", help="Exact greeting text")
+    ag_upd.add_argument("--greeting-instruction", help="Greeting instruction")
+    ag_upd.add_argument("--agent-speaks-first", type=parse_bool, default=None)
+    ag_upd.add_argument("--config", dest="config_json", type=parse_json_arg, help="Config JSON (partial merge)")
+    ag_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Full update payload as JSON")
+    ag_del = ag_sub.add_parser("delete", help="Delete agent")
+    ag_del.add_argument("id", help="Agent UUID")
+
+    # --- assets ---
+    ast = subs.add_parser("assets", help="Manage assets (prompts, schemas, payloads)")
+    ast_sub = ast.add_subparsers(dest="action", required=True)
+    ast_ls = ast_sub.add_parser("list", help="List assets")
+    ast_ls.add_argument("--type", choices=["prompt", "schema", "payload"], help="Filter by type")
+    ast_ls.add_argument("--per-page", type=int, help="Results per page")
+    ast_get = ast_sub.add_parser("get", help="Get asset by ID")
+    ast_get.add_argument("id", help="Asset UUID")
+    ast_cr = ast_sub.add_parser("create", help="Create asset")
+    ast_cr.add_argument("--name", required=True, help="Asset name")
+    ast_cr.add_argument("--type", required=True, choices=["prompt", "schema", "payload"])
+    ast_cr.add_argument("--content", help="Content inline")
+    ast_cr.add_argument("--content-file", help="Read content from file (- for stdin)")
+    ast_cr.add_argument("--inactive", action="store_true")
+    ast_upd = ast_sub.add_parser("update", help="Update asset")
+    ast_upd.add_argument("id", help="Asset UUID")
+    ast_upd.add_argument("--name", help="New name")
+    ast_upd.add_argument("--content", help="New content inline")
+    ast_upd.add_argument("--content-file", help="Read content from file (- for stdin)")
+    ast_upd.add_argument("--is-active", type=parse_bool, default=None)
+    ast_del = ast_sub.add_parser("delete", help="Delete asset")
+    ast_del.add_argument("id", help="Asset UUID")
+
+    # --- calls ---
+    cl = subs.add_parser("calls", help="Manage call records")
+    cl_sub = cl.add_subparsers(dest="action", required=True)
+    cl_ls = cl_sub.add_parser("list", help="List calls")
+    cl_ls.add_argument("--per-page", type=int, help="Results per page")
+    cl_ls.add_argument("--page", type=int, help="Page number")
+    cl_ls.add_argument("--sort", default="-created_at", help="Sort field (prefix - for desc)")
+    cl_ls.add_argument("--filter", "-f", action="append",
+                       help="Filter as key=value, e.g. -f status=complete (repeatable)")
+    cl_get = cl_sub.add_parser("get", help="Get call details (full payload — dynamic fields)")
+    cl_get.add_argument("id", help="Call UUID")
+    cl_cr = cl_sub.add_parser("create", help="Create call record")
+    cl_cr.add_argument("--data", dest="payload", type=parse_json_arg, help="Call fields as JSON")
+    cl_upd = cl_sub.add_parser("update", help="Update call")
+    cl_upd.add_argument("id", help="Call UUID")
+    cl_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Fields to update as JSON")
+    cl_del = cl_sub.add_parser("delete", help="Delete call")
+    cl_del.add_argument("id", help="Call UUID")
+    cl_batch = cl_sub.add_parser("batch", help="Batch update calls")
+    cl_batch.add_argument("ids", nargs="+", help="Call UUIDs")
+    cl_batch.add_argument("--data", dest="payload", type=parse_json_arg, help="Update fields as JSON")
+    cl_wl = cl_sub.add_parser("webhook-logs", help="List webhook logs received for a specific call")
+    cl_wl.add_argument("call_id", help="Call UUID")
+    cl_wl.add_argument("--per-page", type=int, help="Results per page")
+    cl_wl.add_argument("--page", type=int, help="Page number")
+    cl_wl.add_argument("--sort", default="-received_at", help="Sort field (default: -received_at)")
+    cl_wl.add_argument("--filter", "-f", action="append",
+                       help="Extra filter as key=value (repeatable); related_call_id is forced from the route")
+    cl_ar = cl_sub.add_parser("automation-runs",
+                              help="List automation runs triggered for a specific call (include_args=true by default)")
+    cl_ar.add_argument("call_id", help="Call UUID")
+    cl_ar.add_argument("--per-page", type=int, help="Results per page")
+    cl_ar.add_argument("--page", type=int, help="Page number")
+    cl_ar.add_argument("--filter", "-f", action="append",
+                       help="Filter as key=value, e.g. -f status=success -f triggered_by=webhook (repeatable)")
+    cl_ar.add_argument("--no-include-args", action="store_true",
+                       help="Disable the default include_args=true")
+
+    # --- transcripts ---
+    tr = subs.add_parser("transcripts", help="Manage call transcripts")
+    tr_sub = tr.add_subparsers(dest="action", required=True)
+    tr_get = tr_sub.add_parser("get", help="Get transcript (messages)")
+    tr_get.add_argument("call_id", help="Call UUID")
+    tr_store = tr_sub.add_parser("store", help="Store/update transcript")
+    tr_store.add_argument("call_id", help="Call UUID")
+    tr_store.add_argument("--data", dest="payload", type=parse_json_arg, help="Transcript JSON")
+    tr_store.add_argument("--data-file", dest="payload", type=parse_json_file, help="Read payload from JSON file (- for stdin)")
+    tr_del = tr_sub.add_parser("delete", help="Delete transcript")
+    tr_del.add_argument("call_id", help="Call UUID")
+    tr_url = tr_sub.add_parser("url", help="Get presigned download URL")
+    tr_url.add_argument("call_id", help="Call UUID")
+
+    # --- call (outbound) ---
+    oc = subs.add_parser("call", help="Initiate outbound call")
+    oc.add_argument("destination", help="Phone number in E.164 format (e.g. +15551234567)")
+    oc.add_argument("--agent-id", required=True, help="Agent UUID")
+    oc.add_argument("--phone-number-id", help="Phone number UUID (optional)")
+    oc.add_argument("--call-id", help="Existing call UUID to reuse (optional)")
+    oc.add_argument("--overrides", type=parse_json_arg, help="Agent overrides as JSON")
+
+    # --- stats ---
+    st = subs.add_parser("stats", help="Call analytics and trends")
+    st_sub = st.add_subparsers(dest="action", required=True)
+    st_agg = st_sub.add_parser("aggregate", help="Aggregate operations on calls")
+    st_agg.add_argument("--op", required=True, choices=["count", "sum", "avg", "min", "max"])
+    st_agg.add_argument("--field", help="Field to aggregate (required for sum/avg/min/max)")
+    st_agg.add_argument("--group-by", help="Group results by field")
+    st_agg.add_argument("--interval", choices=["day", "week", "month"], help="Time interval for grouping")
+    st_agg.add_argument("--filter", "-f", action="append",
+                        help="Filter as key=value, e.g. -f created_at_gte=2026-01-01 (repeatable)")
+    st_tr = st_sub.add_parser("trends", help="Daily call trend data")
+    st_tr.add_argument("--from", dest="date_from", required=True, help="Start date (ISO)")
+    st_tr.add_argument("--to", dest="date_to", required=True, help="End date (ISO, max 365 days)")
+
+    # --- recordings ---
+    rec = subs.add_parser("recordings", help="Download call recordings")
+    rec_sub = rec.add_subparsers(dest="action", required=True)
+    rec_dl = rec_sub.add_parser("stream", help="Download recording to file or stdout")
+    rec_dl.add_argument("call_id", help="Call UUID")
+    rec_dl.add_argument("--url", required=True, help="Recording URL (from the call's recording_url field)")
+    rec_dl.add_argument("--output", help="Output file path (omit for stdout)")
+
+    # --- fields ---
+    fld = subs.add_parser("fields", help="Manage custom field definitions")
+    fld_sub = fld.add_subparsers(dest="action", required=True)
+    fld_ls = fld_sub.add_parser("list", help="List custom fields")
+    fld_ls.add_argument("--entity-type", default=None, help="Filter by entity type (default: all)")
+    fld_cr = fld_sub.add_parser("create", help="Create custom field")
+    fld_cr.add_argument("--data", dest="payload", type=parse_json_arg, required=True, help="Field definition as JSON")
+    fld_upd = fld_sub.add_parser("update", help="Update custom field")
+    fld_upd.add_argument("id", help="Field UUID")
+    fld_upd.add_argument("--data", dest="payload", type=parse_json_arg, required=True, help="Fields to update as JSON")
+    fld_del = fld_sub.add_parser("delete", help="Delete custom field")
+    fld_del.add_argument("id", help="Field UUID")
+    fld_imp = fld_sub.add_parser("impact", help="Preview deletion impact")
+    fld_imp.add_argument("id", help="Field UUID")
+
+    # --- field-groups ---
+    fg = subs.add_parser("field-groups", help="Manage custom field groups")
+    fg_sub = fg.add_subparsers(dest="action", required=True)
+    fg_sub.add_parser("list", help="List field groups with fields")
+    fg_cr = fg_sub.add_parser("create", help="Create field group")
+    fg_cr.add_argument("--data", dest="payload", type=parse_json_arg, required=True, help="Group definition as JSON")
+    fg_upd = fg_sub.add_parser("update", help="Update field group")
+    fg_upd.add_argument("id", help="Group UUID")
+    fg_upd.add_argument("--data", dest="payload", type=parse_json_arg, required=True, help="Fields to update as JSON")
+    fg_del = fg_sub.add_parser("delete", help="Delete field group")
+    fg_del.add_argument("id", help="Group UUID")
+    fg_reorder = fg_sub.add_parser("reorder", help="Reorder groups")
+    fg_reorder.add_argument("--data", dest="payload", type=parse_json_arg, required=True,
+                            help='Order as JSON: {"groups": [{"id": "...", "sort_order": 0}]}')
+    fg_af = fg_sub.add_parser("add-field", help="Add field to group")
+    fg_af.add_argument("id", help="Group UUID")
+    fg_af.add_argument("field_id", help="Custom field UUID to add")
+    fg_rf = fg_sub.add_parser("remove-field", help="Remove field from group")
+    fg_rf.add_argument("id", help="Group UUID")
+    fg_rf.add_argument("field_id", help="Custom field UUID to remove")
+    fg_rof = fg_sub.add_parser("reorder-fields", help="Reorder fields within group")
+    fg_rof.add_argument("id", help="Group UUID")
+    fg_rof.add_argument("--data", dest="payload", type=parse_json_arg, required=True,
+                        help='Order as JSON: {"fields": [{"id": "...", "sort_order": 0}]}')
+    fg_uf = fg_sub.add_parser("update-field", help="Update field display settings in group")
+    fg_uf.add_argument("id", help="Group UUID")
+    fg_uf.add_argument("field_id", help="Custom field UUID")
+    fg_uf.add_argument("--data", dest="payload", type=parse_json_arg, required=True, help="Display settings as JSON")
+
+    # --- schedules ---
+    sch = subs.add_parser("schedules", help="Manage webhook schedules")
+    sch_sub = sch.add_subparsers(dest="action", required=True)
+    sch_sub.add_parser("list", help="List schedules with rules")
+    sch_get = sch_sub.add_parser("get", help="Get schedule with rules")
+    sch_get.add_argument("id", help="Schedule UUID")
+    sch_cr = sch_sub.add_parser("create", help="Create schedule")
+    sch_cr.add_argument("--data", dest="payload", type=parse_json_arg, required=True, help="Schedule definition as JSON")
+    sch_upd = sch_sub.add_parser("update", help="Update schedule (full PUT — syncs rules)")
+    sch_upd.add_argument("id", help="Schedule UUID")
+    sch_upd.add_argument("--data", dest="payload", type=parse_json_arg, required=True, help="Complete payload as JSON")
+    sch_del = sch_sub.add_parser("delete", help="Delete schedule")
+    sch_del.add_argument("id", help="Schedule UUID")
+    sch_prev = sch_sub.add_parser("preview", help="Preview rule evaluation at datetime")
+    sch_prev.add_argument("id", help="Schedule UUID")
+    sch_prev.add_argument("datetime", help="ISO datetime to evaluate")
+    sch_exec = sch_sub.add_parser("executions", help="Get execution history")
+    sch_exec.add_argument("id", help="Schedule UUID")
+    sch_exec.add_argument("--per-page", type=int, help="Results per page")
+
+    # --- automations ---
+    aut = subs.add_parser("automations", help="Manage automations (Windmill scripts)")
+    aut_sub = aut.add_subparsers(dest="action", required=True)
+    aut_ls = aut_sub.add_parser("list", help="List automations")
+    aut_ls.add_argument("--per-page", type=int, help="Results per page")
+    aut_get = aut_sub.add_parser("get", help="Get automation details")
+    aut_get.add_argument("id", help="Automation UUID")
+    aut_cr = aut_sub.add_parser("create", help="Create automation")
+    aut_cr.add_argument("--name", required=True, help="Automation name")
+    aut_cr.add_argument("--description", help="Description")
+    aut_upd = aut_sub.add_parser("update", help="Update automation metadata")
+    aut_upd.add_argument("id", help="Automation UUID")
+    aut_upd.add_argument("--name", help="New name")
+    aut_upd.add_argument("--description", help="New description")
+    aut_upd.add_argument("--is-active", type=parse_bool, default=None, help="Active status")
+    aut_upd.add_argument("--settings", dest="settings_json", type=parse_json_arg, help="Settings as JSON")
+    aut_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Full update payload as JSON")
+    aut_del = aut_sub.add_parser("delete", help="Delete automation")
+    aut_del.add_argument("id", help="Automation UUID")
+    aut_code = aut_sub.add_parser("code", help="Get deployed script code")
+    aut_code.add_argument("id", help="Automation UUID")
+    aut_dep = aut_sub.add_parser("deploy", help="Deploy new script code")
+    aut_dep.add_argument("id", help="Automation UUID")
+    aut_dep.add_argument("--file", dest="code_file", help="Script file path (- for stdin)")
+    aut_dep.add_argument("--code", help="Inline script code")
+    aut_dep.add_argument("--language", default="deno", choices=["deno"], help="Script language (default: deno)")
+    aut_run = aut_sub.add_parser("run", help="Trigger execution")
+    aut_run.add_argument("id", help="Automation UUID")
+    aut_run.add_argument("--args", dest="run_args", type=parse_json_arg,
+                         help="Input parameters as JSON. Keys must match main() parameter names.")
+    aut_run.add_argument("--args-file", dest="run_args", type=parse_json_file,
+                         help="Read input parameters from a JSON file (- for stdin)")
+    aut_runs = aut_sub.add_parser("runs", help="List completed runs for one automation")
+    aut_runs.add_argument("id", help="Automation UUID")
+    aut_runs.add_argument("--per-page", type=int, help="Results per page")
+    aut_arl = aut_sub.add_parser("all-runs",
+                                 help="List runs across all automations, with scalar and JSONB filters")
+    aut_arl.add_argument("--per-page", type=int, help="Results per page (default 30, max 1000)")
+    aut_arl.add_argument("--page", type=int, help="Page number")
+    aut_arl.add_argument("--filter", "-f", action="append",
+                         help="Scalar filter as key=value (repeatable): automation, status, triggered_by, started_after, started_before")
+    aut_arl.add_argument("--args-filter", help="JSONB containment filter on the triggering payload")
+    aut_arl.add_argument("--result-filter", help="JSONB containment filter on the run result")
+    aut_arl.add_argument("--include-args", action="store_true", help="Include the full args payload in each run")
+    aut_rd = aut_sub.add_parser("run-detail", help="Get run detail (result, logs)")
+    aut_rd.add_argument("id", help="Automation UUID")
+    aut_rd.add_argument("job_id", help="Job UUID")
+    aut_sub.add_parser("runtime-info", help="Get runtime environment info")
+
+    # --- webhook-logs ---
+    wl = subs.add_parser("webhook-logs", help="Inspect inbound webhook activity")
+    wl_sub = wl.add_subparsers(dest="action", required=True)
+    wl_ls = wl_sub.add_parser("list", help="List webhook logs with filters")
+    wl_ls.add_argument("--per-page", type=int, help="Results per page (default 30, max 100)")
+    wl_ls.add_argument("--page", type=int, help="Page number")
+    wl_ls.add_argument("--sort", default="-received_at", help="Sort field (default: -received_at)")
+    wl_ls.add_argument("--filter", "-f", action="append",
+                       help=("Filter as key=value (repeatable): search, type (call|config_request), "
+                             "event_type, processing_status, agent_id, related_call_id, received_from, "
+                             "received_to, response_status, response_time_min, response_time_max"))
+    wl_get = wl_sub.add_parser("get", help="Get full payload for a webhook log")
+    wl_get.add_argument("id", help="Webhook log UUID")
+    wl_sub.add_parser("filters", help="List available filter values for the project")
+
+    # --- variables ---
+    var = subs.add_parser("variables", help="Manage project variables (secrets)")
+    var_sub = var.add_subparsers(dest="action", required=True)
+    var_sub.add_parser("list", help="List project variables")
+    var_cr = var_sub.add_parser("create", help="Create variable")
+    var_cr.add_argument("--name", required=True, help="Variable name (UPPERCASE, e.g. MY_API_KEY)")
+    var_cr.add_argument("--value", required=True, help="Variable value")
+    var_cr.add_argument("--description", help="Description")
+    var_cr.add_argument("--is-secret", type=parse_bool, default=None, help="Mark as secret (encrypted at rest)")
+    var_upd = var_sub.add_parser("update", help="Update variable value")
+    var_upd.add_argument("path", help="Full variable path (e.g. f/proj_xxx/MY_VAR)")
+    var_upd.add_argument("--value", required=True, help="New value")
+    var_del = var_sub.add_parser("delete", help="Delete variable")
+    var_del.add_argument("path", help="Full variable path (e.g. f/proj_xxx/MY_VAR)")
+
+    # --- settings ---
+    stg = subs.add_parser("settings", help="Project-level settings")
+    stg_sub = stg.add_subparsers(dest="action", required=True)
+    stg_sub.add_parser("list", help="List all settings")
+    stg_get = stg_sub.add_parser("get", help="Get a single setting by key")
+    stg_get.add_argument("key", help="Setting key (e.g. timezone, date_format)")
+
+    # --- projects ---
+    proj = subs.add_parser("projects", help="List and inspect projects")
+    proj_sub = proj.add_subparsers(dest="action", required=True)
+    proj_ls = proj_sub.add_parser("list", help="List projects")
+    proj_ls.add_argument("--is-active", type=parse_bool, default=None, help="Filter by active status")
+    proj_ls.add_argument("--per-page", type=int, help="Results per page")
+    proj_get = proj_sub.add_parser("get", help="Get project details")
+    proj_get.add_argument("id", help="Project UUID")
+
+    # --- phone-numbers ---
+    pn = subs.add_parser("phone-numbers", help="List and inspect phone numbers")
+    pn_sub = pn.add_subparsers(dest="action", required=True)
+    pn_ls = pn_sub.add_parser("list", help="List phone numbers")
+    pn_ls.add_argument("--is-active", type=parse_bool, default=None, help="Filter by active status")
+    pn_ls.add_argument("--per-page", type=int, help="Results per page")
+    pn_get = pn_sub.add_parser("get", help="Get phone number details")
+    pn_get.add_argument("id", help="Phone number UUID")
+
+    # --- providers ---
+    prov = subs.add_parser("providers", help="List phone providers and types")
+    prov_sub = prov.add_subparsers(dest="action", required=True)
+    prov_ls = prov_sub.add_parser("list", help="List provider credentials")
+    prov_ls.add_argument("--is-active", type=parse_bool, default=None, help="Filter by active status")
+    prov_ls.add_argument("--provider-type", help="Filter by provider type")
+    prov_ls.add_argument("--per-page", type=int, help="Results per page")
+    prov_sub.add_parser("types", help="Get supported provider types")
+
+    return parser
+
+
+# ===================================================================
+# Dispatch
+# ===================================================================
+
+DISPATCH = {
+    "doctor": cmd_doctor,
+    "agents": {
+        "list": agents_list, "default": agents_default, "get": agents_get,
+        "update": agents_update, "delete": agents_delete,
+    },
+    "assets": {
+        "list": assets_list, "get": assets_get, "create": assets_create,
+        "update": assets_update, "delete": assets_delete,
+    },
+    "calls": {
+        "list": calls_list, "get": calls_get, "create": calls_create,
+        "update": calls_update, "delete": calls_delete, "batch": calls_batch,
+        "webhook-logs": calls_webhook_logs, "automation-runs": calls_automation_runs,
+    },
+    "transcripts": {
+        "get": transcripts_get, "store": transcripts_store,
+        "delete": transcripts_delete, "url": transcripts_url,
+    },
+    "call": call_initiate,
+    "stats": {"aggregate": stats_aggregate, "trends": stats_trends},
+    "recordings": {"stream": recordings_stream},
+    "fields": {
+        "list": fields_list, "create": fields_create, "update": fields_update,
+        "delete": fields_delete, "impact": fields_impact,
+    },
+    "field-groups": {
+        "list": field_groups_list, "create": field_groups_create,
+        "update": field_groups_update, "delete": field_groups_delete,
+        "reorder": field_groups_reorder, "add-field": field_groups_add_field,
+        "remove-field": field_groups_remove_field,
+        "reorder-fields": field_groups_reorder_fields,
+        "update-field": field_groups_update_field,
+    },
+    "schedules": {
+        "list": schedules_list, "get": schedules_get, "create": schedules_create,
+        "update": schedules_update, "delete": schedules_delete,
+        "preview": schedules_preview, "executions": schedules_executions,
+    },
+    "automations": {
+        "list": automations_list, "get": automations_get, "create": automations_create,
+        "update": automations_update, "delete": automations_delete,
+        "code": automations_code, "deploy": automations_deploy, "run": automations_run,
+        "runs": automations_runs, "all-runs": automations_all_runs,
+        "run-detail": automations_run_detail, "runtime-info": automations_runtime_info,
+    },
+    "webhook-logs": {
+        "list": webhook_logs_list, "get": webhook_logs_get, "filters": webhook_logs_filters,
+    },
+    "variables": {
+        "list": variables_list, "create": variables_create,
+        "update": variables_update, "delete": variables_delete,
+    },
+    "settings": {"list": settings_list, "get": settings_get},
+    "projects": {"list": projects_list, "get": projects_get},
+    "phone-numbers": {"list": phone_numbers_list, "get": phone_numbers_get},
+    "providers": {"list": providers_list, "types": providers_types},
+}
+
+
+def _extract_globals(argv):
+    """Pull --full / --key-env / --api-url (and a legacy --json no-op) out of argv so
+    they work in any position. The API key value never appears here — only its NAME."""
+    full = False
+    key_env = "CALLVA_API_KEY"
+    api_url = None
+    cleaned = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--full":
+            full = True; i += 1; continue
+        if a == "--json":  # legacy no-op: JSON is the default output now
+            i += 1; continue
+        if a == "--key-env" and i + 1 < len(argv):
+            key_env = argv[i + 1]; i += 2; continue
+        if a.startswith("--key-env="):
+            key_env = a.split("=", 1)[1]; i += 1; continue
+        if a == "--api-url" and i + 1 < len(argv):
+            api_url = argv[i + 1]; i += 2; continue
+        if a.startswith("--api-url="):
+            api_url = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+    return cleaned, full, key_env, api_url
+
+
+def main():
+    global FULL
+    cleaned, FULL, key_env, api_url = _extract_globals(sys.argv[1:])
+
+    if not cleaned or cleaned[0] == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+
+    args = build_parser().parse_args(cleaned)
+
+    api_key = _load_api_key(key_env)
+    base = (api_url or _resolve("CALLVA_API_URL") or DEFAULT_API_URL).rstrip("/")
+
+    with _client(api_key, base) as client:
+        _STATE["client"] = client
+        _STATE["base"] = base
+        _STATE["key_env"] = key_env
+
+        handler = DISPATCH.get(args.resource)
+        if callable(handler):
+            value = handler(args)
+        elif isinstance(handler, dict):
+            fn = handler.get(getattr(args, "action", None))
+            if not fn:
+                _die(6, "unknown_action", f"unknown action: {args.resource} {getattr(args, 'action', None)}")
+            value = fn(args)
+        else:
+            _die(6, "unknown_resource", f"unknown resource: {args.resource}")
+
+        if value is not None:
+            _emit(value)
+
+
+if __name__ == "__main__":
+    main()
