@@ -1,0 +1,262 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""railwayc — a credential harness around the official `railway` CLI. It resolves a
+PROJECT-SCOPED Railway token, injects it, and forwards your command verbatim to
+`railway`. railwayc owns auth and readiness; the command surface stays railway's own.
+
+USAGE
+  railwayc <command> [args...]   Forward to `railway <command> [args...]`, authenticated
+                                 with the resolved project token.
+  railwayc doctor                Prove the token resolves and report the project.
+  railwayc help                  Print this contract.
+
+Agent-invoked. Run `railwayc help` to reload this contract; run `railway help` (the
+real CLI) for the full command surface — railwayc does NOT re-document or re-map it.
+
+MODEL
+  railwayc is not a wrapper around railway's command surface — it never maps, renames,
+  or enumerates railway commands. It is a thin auth shim: it puts a project token in
+  front of `railway` and execs it. `railwayc logs -s web` runs `railway logs -s web`
+  with RAILWAY_TOKEN set; stdout, stderr, and the exit code are railway's, passed
+  through untouched, so streaming, --json, and colors behave exactly as in railway
+  itself. Only `help` and `doctor` are railwayc's own; every other word forwards
+  (`railwayc help <cmd>` forwards too, so railway's own help stays reachable).
+
+  It REQUIRES a project token and never falls back to interactive login or this
+  machine's account session — that refusal is the point: access stays scoped to the
+  one Railway project + environment the token was minted for, never the whole account.
+
+CREDENTIALS
+  RAILWAY_TOKEN — a Railway PROJECT token (project → Settings → Tokens), scoped to ONE
+  project and ONE environment. Because it is project-scoped, its home is the CONSUMING
+  PROJECT's .env, not a global file. Resolved (first non-empty wins):
+    1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
+    2. process env   RAILWAY_TOKEN (deployed box, or one-shot `RAILWAY_TOKEN=… railwayc …`)
+  There is deliberately no token flag (a secret must not touch argv) and no user-config
+  tier (a global token would mis-scope every project). One token = one project + one
+  environment; a project with prod + staging uses one token per environment.
+
+  Optional, non-secret — RAILWAYC_EXPECT_PROJECT (project .env): if set, `doctor`
+  asserts the token resolves to that project (by name or id) and exits 7 on mismatch.
+  The safety net against pasting the wrong project's token into a project's .env.
+
+COMMANDS railwayc owns
+  doctor
+      Resolve RAILWAY_TOKEN and run `railway status --json` with it injected. On
+      success emits {ok, project:{id,name}, workspace, environments:[…], services:[…]}.
+      Exit 0 healthy / 2 token missing or rejected / 5 railway not installed or
+      unreachable / 7 token resolved to a project other than RAILWAYC_EXPECT_PROJECT.
+      Use this for health — `railway whoami` does NOT work under a project token.
+
+  help
+      Print this document. (`railway help` is the real CLI's surface, a separate
+      thing; railwayc reserves a bare `help` for itself but forwards `help <cmd>`.)
+
+EVERYTHING ELSE — forwarded verbatim to `railway`, token injected, I/O transparent.
+  Run `railway <cmd> --help` for each; railwayc adds nothing to them. Common reaches:
+    status [--json]                  project + services + deployment state
+    logs [-s SVC] [-e ENV] [--json]  deploy / build logs
+    variables [-s SVC] [--json]      read service variables
+    variables --set "K=V" [-s SVC]   set a variable (triggers a deploy)
+    redeploy [-s SVC]  /  restart    redeploy / restart the latest deployment
+    up [-c]  /  down                 deploy from cwd / remove the latest deploy
+    domain                           add / generate / list domains
+    run -- <cmd>                     run a local command with the environment's vars
+
+EXIT CODES (railwayc's own layer)
+  0 success · 2 auth (RAILWAY_TOKEN missing or rejected) · 5 environment (railway not
+  on PATH, or unreachable) · 6 input (bad use of a railwayc-owned command) · 7 wrong
+  project (doctor: token ≠ RAILWAYC_EXPECT_PROJECT).
+  Forwarded commands return RAILWAY's own exit code, not these — railwayc is
+  transparent for everything it forwards.
+
+EXAMPLES
+  railwayc doctor
+  railwayc status --json
+  railwayc logs -s web --json
+  railwayc variables -s web --json
+  railwayc variables --set "FEATURE_X=1" -s web
+  railwayc redeploy -s web
+  RAILWAY_TOKEN=… railwayc status        # one-shot, run from outside a project .env
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+TOKEN_NAME = "RAILWAY_TOKEN"
+EXPECT_PROJECT = "RAILWAYC_EXPECT_PROJECT"
+DOCTOR_TIMEOUT = 60.0
+
+
+# ── output helpers ──────────────────────────────────────────────────────────
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value if value.endswith("\n") else value + "\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# ── credentials (project .env(.local) → process env) ────────────────────────
+# A project-scoped token has no global home: the flag tier (a secret on argv) and
+# the user-config tier (one token leaking onto every project) are both dropped.
+# The cascade order is preserved — project files win over process env.
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_env() -> dict:
+    """Nearest project .env(.local), walking up from $CLAUDE_PROJECT_DIR (else cwd).
+    .env.local overrides .env. Stops at the first dir holding either, or a .git root."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    for d in (here, *here.parents):
+        if (d / ".env").exists() or (d / ".env.local").exists():
+            merged = _parse_env_file(d / ".env")
+            merged.update(_parse_env_file(d / ".env.local"))  # .local wins
+            return merged
+        if (d / ".git").is_dir():
+            break
+    return {}
+
+
+def _resolve(key: str) -> str | None:
+    return _project_env().get(key) or os.environ.get(key) or None
+
+
+# ── railway invocation ──────────────────────────────────────────────────────
+
+def _child_env(token: str) -> dict:
+    env = dict(os.environ)
+    env[TOKEN_NAME] = token
+    # railway errors if both token vars are set; the project token is authoritative here.
+    env.pop("RAILWAY_API_TOKEN", None)
+    return env
+
+
+def _capture(argv: list[str], token: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["railway", *argv], env=_child_env(token),
+                              capture_output=True, text=True, timeout=DOCTOR_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _die(5, "timeout", "railway was unresponsive", "check connectivity to railway.com")
+    except OSError as e:
+        _die(5, "railway_exec_failed", f"could not run railway: {e}")
+
+
+def _edges(obj) -> list:
+    return obj.get("edges") or [] if isinstance(obj, dict) else []
+
+
+def cmd_doctor(token: str) -> dict:
+    proc = _capture(["status", "--json"], token)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        low = err.lower()
+        if any(s in low for s in ("token", "unauthor", "not found", "log in", "login")):
+            _die(2, "token_rejected", err or "railway rejected the token",
+                 "RAILWAY_TOKEN is invalid, revoked, or for a deleted project/environment")
+        _die(5, "railway_error", err or "`railway status` failed")
+    try:
+        st = json.loads(proc.stdout)
+    except ValueError:
+        return {"ok": True, "note": "status returned non-JSON", "raw": proc.stdout[:500]}
+
+    project = {"id": st.get("id"), "name": st.get("name")}
+    result = {
+        "ok": True,
+        "project": project,
+        "workspace": (st.get("workspace") or {}).get("name"),
+        "environments": [e["node"]["name"] for e in _edges(st.get("environments"))
+                         if e.get("node") and e["node"].get("name")],
+        "services": [e["node"]["name"] for e in _edges(st.get("services"))
+                     if e.get("node") and e["node"].get("name")],
+    }
+    expect = _resolve(EXPECT_PROJECT)
+    if expect:
+        if expect not in (project.get("name"), project.get("id")):
+            _die(7, "wrong_project",
+                 f"token resolves to {project.get('name')!r} ({project.get('id')}), "
+                 f"expected {expect!r}",
+                 f"the {TOKEN_NAME} in this project points at the wrong Railway project; "
+                 f"check the token and {EXPECT_PROJECT}")
+        result["expected"] = expect
+    return result
+
+
+def _forward(argv: list[str], token: str) -> NoReturn:
+    # Inherit stdio so streaming, prompts, --json, and colors pass straight through;
+    # railway's own exit code is the result.
+    try:
+        proc = subprocess.run(["railway", *argv], env=_child_env(token))
+    except OSError as e:
+        _die(5, "railway_exec_failed", f"could not run railway: {e}")
+    sys.exit(proc.returncode)
+
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if not argv or (len(argv) == 1 and argv[0] in ("help", "-h", "--help")):
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+
+    if not shutil.which("railway"):
+        _die(5, "railway_not_found", "the `railway` CLI is not on PATH",
+             "install it: `brew install railway` or `npm i -g @railway/cli` "
+             "(https://docs.railway.com/cli)")
+
+    token = _resolve(TOKEN_NAME)
+    if not token:
+        _die(2, "missing_credentials",
+             f"{TOKEN_NAME} is required (a project-scoped Railway token)",
+             f"set {TOKEN_NAME} in this project's .env(.local) or export it; "
+             f"create one in Railway → your project → Settings → Tokens")
+
+    if argv[0] == "doctor":
+        _emit(cmd_doctor(token))
+        return
+
+    _forward(argv, token)
+
+
+if __name__ == "__main__":
+    main()
