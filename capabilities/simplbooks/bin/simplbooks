@@ -191,6 +191,10 @@ Then re-run `simplbooks doctor` to confirm.
                                                 re-POSTs.
   simplbooks invoices unbind <invoice_id>       Remove all incoming/payment
                                                 bindings from an invoice.
+  simplbooks invoices delete <invoice_id>       Delete a sales invoice by id.
+                                                Irreversible — frees its number
+                                                from the sequence. Unbind first
+                                                if it has incomings/payments.
 
   simplbooks expenses list [--search TERM] [--limit N]
                                                 List purchase invoices.
@@ -2112,6 +2116,15 @@ def invoices_unbind(invoice_id) -> None:
     """Remove all bindings (incomings/payments) from an invoice."""
     _invoice_remove_all_bindings(invoice_id)
     click.secho(f"✓ Removed all bindings from invoice {invoice_id}", fg="green")
+
+
+@invoices.command("delete")
+@click.argument("invoice_id", type=int)
+def invoices_delete(invoice_id) -> None:
+    """Delete a sales invoice by id. Irreversible — removes the document and its
+    number from the sequence. Any bound incomings/payments should be unbound first."""
+    _do_delete("invoices", invoice_id, csrf_path="invoices/add")
+    click.secho(f"✓ Deleted invoice {invoice_id}", fg="green")
 
 
 @invoices.command("create")
