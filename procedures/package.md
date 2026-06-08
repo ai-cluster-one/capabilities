@@ -1,46 +1,61 @@
-# Procedure: package a capability (raw script → canonical)
+# Procedure: package your own tool into a capability
 
-You are an LLM agent. The user has a working shebang script and wants it formalized into a full capability in **this repo** — the authoring side of the loop, not an install. You produce the capability folder under `capabilities/<name>/`: a SHEBANG-conformant executable plus the doc slots, leak-free and audit-clean. Reason about the script; ask before guessing a name or namespace. This repo is public — **never commit a real secret**, and scrub every consumer specific.
+You are an LLM agent. The user has something they already use — a script, a notebook, a pile of API calls, a routine they run by hand — and wants it turned into a capability they own. This procedure is the **discovery-first funnel**: it works out *what they actually have*, decides honestly *whether it should be a capability at all*, and only then builds one — handing the mechanical authoring to [conform.md](conform.md) and the install to [INSTALL.md](../INSTALL.md). It is interactive: **ask, don't assume.** Its authority is **capabilities only** — on a "no" it says so and points politely elsewhere, nothing more.
 
-## 0. Inputs
+## 0. Discover what they have
 
-- The **raw script** (its path) and the **`<name>`** the capability takes — the command users will type and the folder name.
-- **What it wraps**: the underlying service and how it authenticates (this shapes the credential keys and the cascade).
+Ask — don't guess:
 
-## 1. Seat the executable
+- **What is the thing?** A working script; a notebook; a set of `curl`/API calls; a Node or other-language program; steps you do by hand; or nothing executable yet but a service you keep reaching for.
+- **What do you actually do with it?** The two or three operations that matter — this becomes the *smallest useful surface*, not everything the underlying API can do.
+- **What does it touch, and how does it authenticate?** The service/system, and the auth shape (a token, a login session, OAuth, none).
+- **Where will it be used?** One project, several, or machine-wide — this shapes the config-dependency class.
 
-Place the script at `capabilities/<name>/bin/<name>`. The folder is the install image — flat, copied verbatim by [INSTALL.md](../INSTALL.md).
+## 1. Decide if it should be a capability at all — the honest gate
 
-## 2. Conform the executable to SHEBANG.md
+A capability is a specific thing: a self-contained CLI an agent drives to read or act on a system, installed once and self-describing. Not everything belongs in that shape. Judge honestly against the boundaries the convention already draws:
 
-Read [../SHEBANG.md](../SHEBANG.md) — it is the authority and holds every pattern. Bring the script to it, point by point: the PEP-723 `uv run --script` shebang with inline deps; agent-first `<name> help` as the single source of the surface (the module docstring, emitted verbatim); the four-tier credential cascade in order (flags → project `.env(.local)` → user config → process env, first non-empty wins) using the shared code shape; identity-free (no consumer value baked in, placeholders in help examples); the I/O contract (`_emit`/`_die` — JSON on stdout, error envelope on stderr); the exit-code taxonomy (0/2/3/5/6, plus 7+ for a domain outcome, each named in the help table); resilient HTTP (bounded backoff, 429 `Retry-After`, 4xx → 2/3/6); and a `doctor` — the cheapest authenticated round-trip that proves the chain. If the tool emits structured output, add a keyless command that prints its shape from the producer's own builders so it cannot drift (DOCTRINE rule 3 — e.g. `<name> contract`).
+- A recurring *procedure* — "do these steps in order, every morning" — is a **routine**, and it lives in the consuming project, not as a capability ([../ROUTINES.md](../ROUTINES.md); DOCTRINE rules 9/11). Capability is the noun, routine is the verb.
+- A stable but light set of *instructions* with no real tool to drive is better as a **skill / prompt**.
+- A shared, always-on, structured/streaming integration meant for many clients may fit an **MCP server** better.
+- A genuine one-off needs no packaging at all.
 
-Realize the *intent* where the protocol genuinely differs, and record any deliberate departure in the capability's own **deviation file** ([../DOCTRINE.md](../DOCTRINE.md#deviations-are-allowed--and-recorded)) so the audit reads it as a choice, not drift.
+A capability is the right shape when there is a **system to reach** and a **small surface of operations** worth giving an agent, with credentials and a tool to run.
 
-## 3. Scrub for leaks — the public-repo gate
+**If it is not a good capability candidate, say so — plainly and early.** State the one-line reason and a polite pointer ("this reads like a routine — you are better off keeping it as a project routine"; "this is closer to a skill"; "this looks like a job for an MCP server"), then **stop**. This convention has authority over *capabilities*; it does not teach how to build those other things — that is the user's call, and a brief pointer is the whole of our advice. Don't force a poor fit into the capability shape just to produce something.
 
-A script parked from a real machine usually carries its consumer's fingerprints. Run the [sanitize-project](../.claude/skills/sanitize-project/SKILL.md) sweep over the script **and** every file you author, and apply DOCTRINE rules 8–10: strip the consumer's name, any routine or caller that invokes it, account/tenant/host values, and terms from the *consumer's* domain; refer to the consumer by role and let specifics resolve from env. A source capability keeps only how the system is read and what its output represents — consumer-side mapping is not its to hold (rule 9).
+## 2. Shape the capability
 
-## 4. Author the doc slots
+Once it's a yes, pin the design before writing code:
 
-Read [../TEMPLATE.md](../TEMPLATE.md) and fill the slots, modeling on a canonical capability (e.g. `capabilities/notion/`). Keep neutrality tiered — the declaration slots carry no specifics; values live in the asset slots.
+- **Surface** — the smallest set of subcommands worth exposing (the verbs from step 0), each agent-drivable.
+- **Credentials** — the secret/connection it needs, which cascade tier holds it, and the **config-dependency class** (`none` / `global` / `project-required`): usable from any project once installed, or needing project-side config.
+- **I/O** — JSON on stdout, a structured error envelope on stderr; if it emits a structured payload, plan a keyless `contract` command that prints the shape.
+- **doctor** — the cheapest authenticated round-trip that will prove readiness.
 
-- `manifest.md` — the declarative spec the procedures read: identity (including the **config-dependency class** — `none` / `global` / `project-required`), dependencies, global + project artifacts, credentials (keys, which are secret), template variables (discoverable / must-confirm / leave-breadcrumb), and capability-specific validator notes.
-- `stub.md` — the global stub: a front-matter-free awareness paragraph (the `@`-imported, always-loaded line) — what the tool is and "run `<name> help`", nothing about credentials, readiness, or usage. Consumer-neutral.
-- `credentials.env.example` — the env keys with **empty** values and the cascade header; never a real secret.
-- `project/CAPABILITY.md` — a **front-matter-free** lightweight entry: a role-in-the-project paragraph + a pointer list, no re-teaching of the surface.
-- `project/identifiers.md` — non-secret structural placeholders only; secrets point to env.
-- `project/reference.md` — ships as the self-describing scaffold; empty is conformant.
+This is the contract. [../SHEBANG.md](../SHEBANG.md) is where it gets realized — name it by role here, don't restate it.
 
-## 5. Audit in fresh, independent context — then fix and re-audit
+## 3. Make it a single runnable script
 
-The author is blind to its own drift: an agent that just wrote the capability while following every guideline will still pass its own review, yet a reader given only the doctrine and the files, cold, reliably surfaces what the author glossed. So the audit is **always run by an independent reading with fresh context — never self-run**. The principle this leans on: *detection runs in fresh, independent context; the agent running this procedure decides and writes* — which is why authoring stays here and the check goes out. The host supplies the fresh context however it can (a sub-agent in Claude Code; a separate session or a second reviewer elsewhere).
+A capability's executable is one `uv`/PEP-723 Python file. Bring the raw material to *a* single runnable script of that shape:
 
-1. **Smoke-test first** — `<name> help`, any shape command, and `<name> doctor` if a credential resolves. A broken executable isn't worth auditing.
-2. **Hand off the audit** — give [audit.md](audit.md) to a fresh, independent context to run against the new capability. It reads cold and returns an advisory findings list; it touches no files.
-3. **Apply the findings** — back here, fix what that audit surfaced. In this packaging pass you may apply them directly, no per-finding say-so: invoking this procedure *is* the standing consent to converge on conformance (the deliberate departure from audit.md's advisory default, which holds everywhere outside packaging). A finding the user calls intentional is recorded as a deviation instead of fixed.
-4. **Re-audit in fresh context again** to confirm the fixes hold and nothing major was introduced or remains. Repeat 3–4 until a clean validating pass — no structural findings (cosmetics are the user's call). Use a new context each round, not the one that found the previous findings.
+- a working Python script → a light touch.
+- a notebook, a `curl`/API pile, a bash script, a Node/other-language program → **port** the operations from step 0 into one Python CLI, reusing the logic and dropping the rest.
+- nothing executable yet → write the thin CLI against the service's API from the surface you defined.
 
-## 6. Land it
+If the thing genuinely cannot become a non-interactive CLI (it needs a GUI, a human mid-call, something not automatable), that is a late "not a capability" — return to step 1's off-ramp. The output of this step is a script that **runs**; making it **conformant** is the next step's job.
 
-Add the capability to the catalogue in [../README.md](../README.md). Report what you created, which template variables are breadcrumbs the user must still fill, the audit rounds it took to converge, and any recorded deviations. The capability is now installable by [INSTALL.md](../INSTALL.md) and pullable by [update.md](update.md).
+## 4. Conform and author the capability folder
+
+Hand the runnable script to [conform.md](conform.md) — the mechanical authoring step: it brings the executable to the SHEBANG.md standard, scrubs every consumer specific and secret, authors the doc slots, and audits in fresh, independent context until clean.
+
+Two things are yours to hold across that hand-off:
+
+- **Stay in the loop.** Review the audit verdicts; don't rubber-stamp. The standing consent to auto-converge belongs to *conformance*, not to design choices — those are the user's.
+- **Check worth, not just conformance.** The audit proves the capability matches the doctrine; it does not prove the capability is worth having. Sanity-check it yourself: is the surface minimal-and-useful, does `doctor` actually prove something, is any subcommand dead weight. A structurally-valid but thin or pointless capability is not the goal.
+
+## 5. Install it into your own project
+
+The folder is now a complete capability. Install it where it'll be used with [INSTALL.md](../INSTALL.md) — for a capability you authored locally, use its **local-source** path (copy the folder from disk into the registry; no GitHub fetch). That places the CLI on `PATH`, the stub into every session, and the project layer into the consuming repo, then runs `doctor` to confirm it's ready. You now own a working capability built from what you already had.
+
+Contributing it to the public catalogue is entirely optional — a PR that adds the folder and lists it in the catalogue index. A private capability simply stays yours.

@@ -13,19 +13,27 @@ If you are **Claude Code**, continue below.
 
 ## 1. Pick the capability
 
-List the catalogue and ask the user which one to install (and whether they want the project layer too — see step 3):
+The capability comes from one of two sources — establish which first:
+
+- **From the catalogue.** List it and ask the user which one to install (and whether they want the project layer too — see step 3):
 
 ```
 curl -fsSL https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/README.md
 ```
 
-The capability index there names each folder under `capabilities/`. Take the chosen name as `<name>` for the rest of this file.
+The capability index there names each folder under `capabilities/`; take the chosen name as `<name>`.
+
+- **From a local folder.** A capability the user authored themselves with [procedures/package.md](procedures/package.md) lives on disk, not in the catalogue. There is nothing to list — take `<name>` and the folder path straight from that folder, and note the path (step 2a copies from it).
+
+`<name>` carries through the rest of this file.
 
 ## 2. Global layer — the machine, once per capability
 
 The capability lives, immutable, in a per-host-neutral registry at `~/.capabilities/<name>/`; from there its CLI is symlinked onto PATH, and its stub is `@`-imported into every session via the host's global `CLAUDE.md`.
 
-**a. Fetch the capability folder into the registry.** No clone, no working tree — just the one folder:
+**a. Place the capability folder into the registry.** No clone, no working tree — just the one folder. It comes from one of two sources:
+
+- **From the catalogue** — a capability listed in this repo:
 
 ```
 mkdir -p "$HOME/.capabilities"
@@ -34,6 +42,15 @@ curl -fsSL https://codeload.github.com/ai-cluster-one/capabilities/tar.gz/refs/h
 ```
 
 (If the repo is private, use `gh` with the user's auth instead.) Re-running this is how an update lands — it overwrites the immutable folder in place.
+
+- **From a local folder** — a capability the user authored themselves with [procedures/package.md](procedures/package.md), living on disk and not in the public catalogue. Copy it straight in:
+
+```
+mkdir -p "$HOME/.capabilities"
+cp -R "<path-to-capability-folder>/." "$HOME/.capabilities/<name>/"
+```
+
+The registry copy is the install image either way; nothing downstream cares which source filled it.
 
 **b. Put the CLI on PATH.** The executable is at `~/.capabilities/<name>/bin/<name>`. Make it executable and symlink it into a directory already on `PATH` (prefer `~/bin`, else `~/.local/bin`; if neither is on `PATH`, create `~/.local/bin`, symlink there, and tell the user to add it to `PATH` once):
 
