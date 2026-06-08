@@ -47,7 +47,11 @@ This tool is designed to be invoked by agents. Run `simplbooks help` to load
 the full usage contract on demand — do not rely on memorised knowledge of
 its surface.
 
-Credentials live in ~/.config/simplbooks/credentials.env:
+Credentials resolve from ONE store: the nearest project .env(.local) when it carries
+the login keys, else ~/.config/simplbooks/credentials.env (process env fills any gap —
+the deployed-box path). login/refresh persist ACCOUNT/COOKIE back to that same store, so
+a project that supplies its own EMAIL/PASSWORD keeps a self-contained session that never
+collides with another consumer's:
   SIMPLBOOKS_EMAIL='user@example.com'         (primary — for auto-login)
   SIMPLBOOKS_PASSWORD='...'                   (primary — for auto-login)
   SIMPLBOOKS_ACCOUNT=<32-char account hash>   (written by login/refresh)
@@ -56,7 +60,7 @@ Credentials live in ~/.config/simplbooks/credentials.env:
 Account-specific config (resolved by the cascade: flag > project .env(.local) >
 this credentials.env > process env — so a consuming project can set these in its
 own .env):
-  SIMPLBOOKS_WORKER=<name>                    (invoice issuer name)
+  SIMPLBOOKS_WORKER=<name>                    (optional pin; else the logged-in user)
   SIMPLBOOKS_BANK_ACCOUNT=<id>                (own bank account on invoices)
   SIMPLBOOKS_BANK_TARGET=<bank>               (bank integration for send-payment)
   SIMPLBOOKS_INVOICE_FOOTER='...'             (optional invoice footer line)
@@ -66,8 +70,10 @@ own .env):
 Find the bank account id with `accounts list cashbook`. Sales VAT types + rates
 are read LIVE from SimpleBooks per invoice (`invoices meta` / `expenses meta`).
 The income account defaults to the live vat_types value; set a regime key above
-only to book it elsewhere. The issuer (`creator`) is the logged-in user, read
-from the form.
+only to book it elsewhere. The issuer (`creator`) and line worker both follow the
+logged-in user, derived live from the form per invoice (nothing persisted; set
+SIMPLBOOKS_WORKER only to pin a fixed name), and the invoice number defaults to
+SimpleBooks' next sequential — pass --number to override.
 
 There is no public SimpleBooks API. The CLI emulates a browser session.
 Sessions expire periodically. With EMAIL+PASSWORD present, expiry is
@@ -427,18 +433,26 @@ def _clean_env_value(v: str) -> str:
 
 
 def load_credentials() -> dict[str, str]:
-    # Deterministic cascade: ~/.config/simplbooks/credentials.env first, then process env
-    # for any key the file does not supply. The env fallback is what lets the deployed box
-    # (global env injected by the platform, often no credentials.env) resolve creds the same
-    # way a laptop does — same discovery order, pure code, no model lookup.
+    # Resolve the login keys from a single credential store, chosen by _cred_store_target:
+    # the project .env(.local) when that project supplies the login, else the global
+    # credentials.env. Process env then fills any key the store omits — the path the
+    # deployed box uses (creds injected as env vars, no file). Reading from one store keeps
+    # a project's identity from mixing with the global one.
     out: dict[str, str] = {}
-    if CREDENTIALS_ENV.exists():
-        for line in CREDENTIALS_ENV.read_text().splitlines():
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, _, v = s.partition("=")
-            out[k.strip()] = _clean_env_value(v)
+    store = _cred_store_target()
+    if store == CREDENTIALS_ENV:
+        if CREDENTIALS_ENV.exists():
+            for line in CREDENTIALS_ENV.read_text().splitlines():
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, _, v = s.partition("=")
+                out[k.strip()] = _clean_env_value(v)
+    else:
+        for key in CRED_KEYS:
+            v = _project_env_value(key)
+            if v:
+                out[key] = v
     for key in CRED_KEYS:
         if not out.get(key):
             env_v = os.environ.get(key)
@@ -467,16 +481,24 @@ def _read_cred(key: str) -> str | None:
     return None
 
 
-def _worker_name(override: str | None = None) -> str:
-    """Resolve the invoice worker name, identity-free, through the config cascade
-    (--worker > project .env > credentials.env > process env). No name is baked
-    into the tool — absent a value the caller is told to set one."""
-    w = _cfg("SIMPLBOOKS_WORKER", override)
+def _worker_name(override: str | None = None, page_html: str | None = None) -> str:
+    """Resolve the invoice line worker (issuer) name, identity-free, through the
+    cascade: --worker > SIMPLBOOKS_WORKER (optional project .env pin) > the logged-in
+    user's name read live from the add/edit form. Derived synchronously from the page
+    the caller already holds — nothing persisted, so it always reflects the active
+    session and never collides across consumers of the shared tool."""
+    if override and override.strip():
+        return override.strip()
+    w = _cfg("SIMPLBOOKS_WORKER")
     if w:
         return w
+    if page_html:
+        derived = worker_from_page(page_html)
+        if derived:
+            return derived
     raise click.ClickException(
-        "No worker name — SIMPLBOOKS_WORKER is unset and --worker was not given.\n"
-        "  → add SIMPLBOOKS_WORKER=<name> to a project .env or credentials.env, or pass --worker"
+        "No worker name — couldn't derive it from the logged-in user; "
+        "set SIMPLBOOKS_WORKER or pass --worker."
     )
 
 
@@ -505,6 +527,57 @@ def _project_env_value(key: str) -> str | None:
         if d == home or d == d.parent:  # stop at $HOME or filesystem root
             break
     return None
+
+
+def _project_env_path() -> Path | None:
+    """The nearest project env file walking up from CWD to $HOME/root: .env.local if
+    present at that root, else .env. None if neither exists in range. This is the file
+    a project-scoped login reads from and writes its session back to."""
+    home = Path.home()
+    cwd = Path.cwd()
+    for d in (cwd, *cwd.parents):
+        local, base = d / ".env.local", d / ".env"
+        if local.is_file():
+            return local
+        if base.is_file():
+            return base
+        if d == home or d == d.parent:
+            break
+    return None
+
+
+def _cred_store_target() -> Path:
+    """The single credential store for this invocation: the nearest project .env(.local)
+    when that project opts into SimpleBooks login (carries SIMPLBOOKS_EMAIL or _COOKIE),
+    else the global credentials.env. Reads and session writes both use this one file, so
+    a project's login identity stays self-contained and never collides with another
+    consumer's in the shared global store."""
+    if _project_env_value("SIMPLBOOKS_EMAIL") or _project_env_value("SIMPLBOOKS_COOKIE"):
+        p = _project_env_path()
+        if p:
+            return p
+    return CREDENTIALS_ENV
+
+
+def _upsert_env_keys(path: Path, updates: dict[str, str]) -> None:
+    """Insert/replace `KEY='value'` lines in an existing env file, preserving every
+    other line, comment, and the file's order. Keys not already present are appended.
+    Used to write a session back into a project .env without disturbing its config."""
+    lines = path.read_text().splitlines() if path.exists() else []
+    remaining = dict(updates)
+    out: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k = s.split("=", 1)[0].strip()
+            if k in remaining:
+                out.append(f"{k}='{remaining.pop(k)}'")
+                continue
+        out.append(line)
+    for k, v in remaining.items():
+        out.append(f"{k}='{v}'")
+    path.write_text("\n".join(out) + "\n")
+    os.chmod(path, 0o600)
 
 
 def _cfg(key: str, override: str | None = None) -> str | None:
@@ -693,7 +766,22 @@ def _clear_pin_state() -> None:
 
 
 def _persist_session(cookies: dict[str, str], account: str) -> None:
-    """Rewrite credentials.env with fresh cookie/account; preserve EMAIL/PASSWORD."""
+    """Persist the refreshed session (account hash + cookie) to the active credential
+    store — the project .env(.local) when the project supplies the login identity, else
+    the global credentials.env. Writing back to the same store the identity came from
+    keeps a project's session self-contained, so concurrent consumers of the shared tool
+    never overwrite each other's session."""
+    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    store = _cred_store_target()
+    if store == CREDENTIALS_ENV:
+        _persist_session_global(account, cookie_str)
+    else:
+        _upsert_env_keys(store, {"SIMPLBOOKS_ACCOUNT": account, "SIMPLBOOKS_COOKIE": cookie_str})
+
+
+def _persist_session_global(account: str, cookie_str: str) -> None:
+    """Rewrite the global credentials.env with fresh account/cookie; preserve EMAIL/PASSWORD.
+    This file is dedicated to SimpleBooks creds, so a clean rewrite (with the header) is safe."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     existing: dict[str, str] = {}
     if CREDENTIALS_ENV.exists():
@@ -707,7 +795,7 @@ def _persist_session(cookies: dict[str, str], account: str) -> None:
                 v = v[1:-1]
             existing[k.strip()] = v
     existing["SIMPLBOOKS_ACCOUNT"] = account
-    existing["SIMPLBOOKS_COOKIE"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    existing["SIMPLBOOKS_COOKIE"] = cookie_str
 
     lines = [
         "# simplbooks credentials.",
@@ -918,6 +1006,34 @@ def creator_from_page(html: str) -> str | None:
     v = (inp.get("value") if inp else None) or ""
     v = str(v).strip()
     return v if (v.isdigit() and int(v) > 0) else None
+
+
+def worker_from_page(html: str) -> str | None:
+    """The line worker SimpleBooks defaults a new row to — the logged-in user's
+    display name. Primary source is the add/edit form's row-init JS
+    (`$('#TaskWorker' + taskRowId).val('<name>')`); falls back to the account
+    menu's name. None if neither is present."""
+    m = re.search(r"#TaskWorker'\s*\+\s*taskRowId\)\.val\('([^']*)'\)", html)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    soup = BeautifulSoup(html, "html.parser")
+    el = (soup.select_one("[aria-labelledby='user-profile-link'] .fw-bold")
+          or soup.select_one(".dropdown-item .fw-bold"))
+    if el:
+        name = el.get_text(strip=True)
+        if name:
+            return name
+    return None
+
+
+def default_invoice_number(html: str) -> str | None:
+    """The next sequential invoice number SimpleBooks pre-fills into the add form's
+    `number` input — the account's own numbering, not an invented one. None if the
+    field can't be read."""
+    soup = BeautifulSoup(html, "html.parser")
+    inp = soup.find("input", {"name": "number"})
+    v = str((inp.get("value") if inp else None) or "").strip()
+    return v or None
 
 
 def logged_in_user_id(http: httpx.Client, account: str) -> str | None:
@@ -1909,7 +2025,7 @@ def invoices_update(invoice_id, additional_info, append_reference, new_number,
                 (f"Task[{key}][Asset][name]", ""),
                 (f"Task[{key}][contents]", ""),
                 (f"Task[{key}][income_account_id]", str(ln["account"])),
-                (f"Task[{key}][worker]", _worker_name()),
+                (f"Task[{key}][worker]", _worker_name(page_html=r.text)),
                 (f"Task[{key}][date_of_doing]", txn_date_val),
             ]
 
@@ -2003,11 +2119,13 @@ def invoices_unbind(invoice_id) -> None:
 @click.option("--description", required=True)
 @click.option("--price", required=True)
 @click.option("--tax-class", type=click.Choice(list(TAX_CLASSES.keys())), default="ee-domestic", show_default=True)
-@click.option("--number", default=None)
+@click.option("--number", default=None,
+              help="Invoice number; defaults to SimpleBooks' next sequential number.")
 @click.option("--quantity", default="1", show_default=True)
 @click.option("--unit", default="tk", show_default=True)
 @click.option("--due-days", default=7, show_default=True, type=int)
-@click.option("--worker", default=None, help="issuer name; defaults to SIMPLBOOKS_WORKER (env/credentials.env)")
+@click.option("--worker", default=None,
+              help="Line worker (issuer) name; defaults to the logged-in user (read from the form).")
 @click.option("--reference", default="")
 @click.option("--date", "invoice_date", default=None, help="Invoice date YYYY-MM-DD. Defaults to today.")
 @click.option("--vat-type-id", "vat_type_id", default=None,
@@ -2024,7 +2142,6 @@ def invoices_create(client_id, description, price, tax_class, number,
                     quantity, unit, due_days, worker, reference, invoice_date,
                     vat_type_id, income_account_id, bank_account, creator, dry_run) -> None:
     """Create a new invoice."""
-    worker = _worker_name(worker)
     cookies, account = session_or_die()
     cache = load_clients_cache()
     if str(client_id) not in cache:
@@ -2032,8 +2149,6 @@ def invoices_create(client_id, description, price, tax_class, number,
             f"Client {client_id} not in cache. Refresh with `simplbooks clients list`."
         )
     client_row = cache[str(client_id)]
-    if number is None:
-        number = str(random.randint(900000, 999999))
     parsed_date = datetime.strptime(invoice_date, "%Y-%m-%d") if invoice_date else None
 
     with build_http(cookies, account) as http:
@@ -2045,6 +2160,14 @@ def invoices_create(client_id, description, price, tax_class, number,
         else:  # page didn't carry the map — fall back to the cache
             vt_map = sales_vat_types(http, account)
         creator_id = creator or creator_from_page(page)
+        worker = _worker_name(worker, page)
+        if number is None:
+            number = default_invoice_number(page)
+            if not number:
+                raise click.ClickException(
+                    "Couldn't read SimpleBooks' suggested invoice number from the add "
+                    "form. → pass --number explicitly."
+                )
         fields = build_invoice_fields(
             csrf=csrf, client_row=client_row, number=number, description=description,
             price=price, tax_class=tax_class, quantity=quantity, unit=unit,
