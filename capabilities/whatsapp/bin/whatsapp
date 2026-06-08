@@ -1,55 +1,121 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+#     "httpx>=0.27",
+# ]
 # ///
 """
-whatsapp — read-only WhatsApp CLI via WAHA (WhatsApp HTTP API).
+whatsapp — WhatsApp CLI over a self-hosted WAHA (WhatsApp HTTP API) bridge.
 
-Config: ~/.config/whatsapp/credentials.env
-        WAHA_WHATSAPP_API_KEY      — API key for X-Api-Key header
-        WAHA_DASHBOARD_USERNAME    — Basic auth username
-        WAHA_DASHBOARD_PASSWORD    — Basic auth password
-        WAHA_BASE_URL              — (optional) defaults to https://waha.callva.one
+Agent-invoked. Reads WhatsApp conversations through a WAHA instance: list chats,
+fetch and export message history to JSON, download media, transcribe voice notes,
+and render a readable log. Run `whatsapp doctor` first to confirm the chain.
 
-A cwd-local .env or .env.local takes precedence over the credentials file
-when present (matches the behaviour of the previous in-tree script).
+Profiles
+  A profile is one WhatsApp identity = a (WAHA instance + session). Profiles live
+  in a project-side whatsapp.json, discovered the way the mailbox capability finds
+  its config:
+        $WHATSAPP_CONFIG                                explicit path to the json, else
+        <project>/.capabilities/whatsapp/whatsapp.json  walked up from $CLAUDE_PROJECT_DIR / cwd
+  Each profile carries: base_url, session, secret_env (the env-var NAME holding
+  that instance's X-Api-Key), mode ("read" | "send"), an optional number, an
+  optional messages_dir, and an optional expected engine ("GOWS", the default) /
+  tier ("CORE" | "PLUS") that `health` validates the live instance against.
+  Select one with --profile NAME (else $WHATSAPP_PROFILE, the config's "default"
+  key, or the lone profile). --session overrides the profile's session for a
+  single call.
 
-Commands:
+Credentials (4-tier cascade; first non-empty wins)
+  flags > project .env(.local) > ~/.config/whatsapp/credentials.env > process env.
+  The secret is named indirectly by the profile's secret_env and never travels on
+  argv. With no whatsapp.json anywhere, the CLI falls back to single-instance env:
+        WAHA_BASE_URL                            instance URL (required)
+        WAHA_WHATSAPP_API_KEY                    X-Api-Key
+        WAHA_DASHBOARD_USERNAME / WAHA_DASHBOARD_PASSWORD   dashboard basic auth
+        DEEPGRAM_API_KEY                         only `whatsapp transcribe` reads it
+
+Commands
   whatsapp help                        Print this usage block
-  whatsapp status [--session NAME]     Show session status, account, engine
-  whatsapp chats [--search TERM] [--limit N] [--session NAME]
+  whatsapp doctor [--session NAME]     Profile readiness — creds resolve, WAHA
+                                       reachable, the active session linked with an
+                                       account. The cheap "can I read now?" probe.
+                                       JSON on stdout.
+  whatsapp health [--session NAME]     Instance readiness — the WAHA server is up,
+                                       the engine is in the expected mode (GOWS by
+                                       default), the tier matches if pinned, and the
+                                       active session is linked with an account. A
+                                       per-check report ({ready, checks:[…]}); answers
+                                       "is the instance ready to be consumed?". All on
+                                       the same X-Api-Key — no extra credential.
+  whatsapp status [--session NAME]     Human-readable session / account / engine view
+  whatsapp pair [--number DIGITS] [--qr] [--wait] [--recreate --yes] [--session NAME]
+                                       Onboard / link a session via the GOWS phone-
+                                       number pairing code: pass a number (default:
+                                       the profile's), get an XXXX-XXXX code to enter
+                                       in WhatsApp (Settings → Linked Devices → Link a
+                                       Device → "Link with phone number"). No QR scan.
+                                       --wait polls until WORKING; --qr returns the QR
+                                       value instead; --recreate --yes re-links an
+                                       existing session (DELETE + recreate). Connection-
+                                       level — works from any profile (you link before
+                                       you can read). Needs the WAHA server's default
+                                       engine set to GOWS (WHATSAPP_DEFAULT_ENGINE=GOWS);
+                                       pair asserts it but cannot set it per-session.
+  whatsapp chats [--search TERM] [--limit N] [--json] [--session NAME]
                                        List chats sorted by last activity
   whatsapp messages <chat_id> [--limit N] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
-                              [--format conversation|table] [--session NAME]
-                                       Fetch messages from a chat
-  whatsapp contact <contact_id> [--session NAME]
+                              [--format conversation|table] [--json] [--session NAME]
+                                       Fetch messages from a chat. --limit caps the
+                                       fetch; --from/--to then filter within that
+                                       fetched window (raise --limit to reach back).
+  whatsapp contact <contact_id> [--json] [--session NAME]
                                        Show contact name, number, business flag
-  whatsapp export <chat_id> --out PATH [--media-dir PATH] [--page-size N]
+  whatsapp export <chat_id> [--out PATH] [--media-dir PATH] [--page-size N]
                             [--max-pages N] [--no-photos] [--no-stickers]
                             [--videos] [--documents] [--session NAME]
                                        Dump full chat history to JSON; download
                                        voice/audio + photos/stickers by default;
-                                       videos/documents opt-in. Idempotent —
-                                       re-runs preserve existing transcriptions
-                                       and skip already-downloaded media.
+                                       videos/documents opt-in. Idempotent — re-runs
+                                       preserve existing transcriptions and skip
+                                       already-downloaded media. Without --out,
+                                       writes to the config's messages_dir
+                                       (<messages_dir>/<slug>/messages.json). Progress
+                                       streams to stderr; a JSON summary lands on stdout.
   whatsapp transcribe <json_path> [--force] [--model nova-3]
-                                       Fill transcription placeholders for
-                                       voice/audio messages in an exported JSON
-                                       using Deepgram (requires DEEPGRAM_API_KEY
-                                       in ~/.config/whatsapp/credentials.env).
+                                       Fill transcription placeholders for voice/audio
+                                       messages in an exported JSON using Deepgram
+                                       (requires DEEPGRAM_API_KEY).
   whatsapp render <json_path> [--out PATH]
-                                       Pretty-print an exported messages.json
-                                       as a markdown conversation log (date
-                                       headers, sender names, voice
-                                       transcriptions inlined). stdout by
+                                       Pretty-print an exported messages.json as a
+                                       markdown conversation log (date headers, sender
+                                       names, voice transcriptions inlined). stdout by
                                        default; --out writes to a file.
+  whatsapp send <chat_id> <text>       [planned, not implemented] Send a message —
+                                       send-capable profiles only (mode: "send").
 
-Chat IDs:
-  DMs    — <number>@c.us            e.g. 64225623750@c.us
-  Groups — <id>@g.us                e.g. 120363409111496450@g.us
+Chat IDs
+  DMs    — <number>@c.us        e.g. 15551234567@c.us
+  Groups — <group-id>@g.us
 
-Read-only by design. There is no send capability.
+I/O contract
+  Success → stdout: JSON for structured results (doctor, --json, the export /
+  transcribe summaries) or a human-readable view for the read / render commands.
+  Failure → a one-line JSON envelope on stderr:
+        {"error": {"code", "message", "hint"?, "status"?}}
+  Progress chatter from export / transcribe goes to stderr; stdout stays clean.
+
+Exit codes
+  0  success
+  2  auth — missing / rejected credentials (401/403); a session not linked
+     (`doctor`); or WAHA not in the expected ready mode (`health`)
+  3  not found — the addressed chat / contact / resource does not exist (404)
+  5  server / network — timeout, connection error, 429 after retries, 5xx
+  6  input / validation — a malformed argument or date, or an unsupported op
+     (sending today; sending from a non-"send" profile)
+
+Reads run from any profile. Sending is gated on mode: "send" and is intentionally
+not implemented yet — see cmd_send.
 """
 
 import argparse
@@ -57,68 +123,222 @@ import base64
 import datetime
 import json
 import os
+import re
 import sys
-import urllib.error
+import time
 import urllib.parse
-import urllib.request
 from pathlib import Path
+from typing import NoReturn
 
-DEFAULT_BASE_URL = "https://waha.callva.one"
+import httpx
+
 DEFAULT_SESSION = "default"
-CREDS_PATH = Path.home() / ".config" / "whatsapp" / "credentials.env"
-NEEDED_KEYS = ("WAHA_WHATSAPP_API_KEY", "WAHA_DASHBOARD_USERNAME",
-               "WAHA_DASHBOARD_PASSWORD", "WAHA_BASE_URL")
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDS_PATH = _CONFIG_HOME / "whatsapp" / "credentials.env"
+
+# Project-side profile config, discovered like the mailbox capability does.
+CONFIG_REL = Path(".capabilities") / "whatsapp" / "whatsapp.json"
+
+
+# ── I/O contract ──────────────────────────────────────────────────────────────
+
+
+def _emit(value) -> None:
+    """Success on stdout: a string verbatim, anything else as indented JSON."""
+    if isinstance(value, str):
+        sys.stdout.write(value if value.endswith("\n") else value + "\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    """Failure on stderr: one {"error": {...}} line; the exit code carries the category."""
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _log(message: str) -> None:
+    """Progress / diagnostics to stderr, keeping stdout clean for the result."""
+    sys.stderr.write(message + "\n")
+
+
+# ── Credential cascade (profile-indirect; see deviations.md) ──────────────────
 
 
 def _parse_env_file(path: Path) -> dict:
-    vals = {}
-    for line in path.read_text().splitlines():
+    vals: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return vals
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        vals[key.strip()] = value.strip().strip("'\"")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        vals[key] = value.strip().strip("'\"")
     return vals
 
 
-def load_env():
-    """Load WAHA env vars. Precedence: cwd .env(.local) > ~/.config > shell env."""
-    for filename in (".env", ".env.local"):
-        candidate = Path.cwd() / filename
-        if candidate.is_file():
-            for k, v in _parse_env_file(candidate).items():
-                if k in NEEDED_KEYS and not os.environ.get(k):
-                    os.environ[k] = v
-    if CREDS_PATH.is_file():
-        for k, v in _parse_env_file(CREDS_PATH).items():
-            if k in NEEDED_KEYS and not os.environ.get(k):
-                os.environ[k] = v
+def _load_env_file(path: Path) -> None:
+    """Load every KEY=VALUE from path into os.environ without overriding existing keys."""
+    if not path.is_file():
+        return
+    for k, v in _parse_env_file(path).items():
+        if k and not os.environ.get(k):
+            os.environ[k] = v
 
 
-def get_config():
-    load_env()
+def _find_config():
+    """Locate (project_dir, config_path) for whatsapp.json, or (None, None).
+
+    Precedence mirrors the mailbox capability:
+      1. $WHATSAPP_CONFIG — explicit path (absolute, or relative to the start dir).
+      2. Walk up from $CLAUDE_PROJECT_DIR (else cwd) to the first dir holding
+         .capabilities/whatsapp/whatsapp.json. That dir anchors the .env load.
+    No config → (None, None): the CLI falls back to single-instance env vars.
+    """
+    start = Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path.cwd()).resolve()
+    override = os.environ.get("WHATSAPP_CONFIG")
+    if override:
+        cfg = Path(override).expanduser()
+        cfg = cfg if cfg.is_absolute() else (start / cfg)
+        cfg = cfg.resolve()
+        if not cfg.is_file():
+            _die(6, "bad_config_path",
+                 f"$WHATSAPP_CONFIG points to {cfg}, which is not a file",
+                 "set $WHATSAPP_CONFIG to an existing whatsapp.json, or unset it")
+        return cfg.parent, cfg
+    for d in (start, *start.parents):
+        if (d / CONFIG_REL).is_file():
+            return d, d / CONFIG_REL
+    return None, None
+
+
+def _load_secrets(project_dir=None) -> None:
+    """Load secrets into os.environ (no override): the discovered project's
+    .env(.local) first, then cwd .env(.local), then ~/.config creds."""
+    if project_dir:
+        _load_env_file(project_dir / ".env")
+        _load_env_file(project_dir / ".env.local")
+    _load_env_file(Path.cwd() / ".env")
+    _load_env_file(Path.cwd() / ".env.local")
+    _load_env_file(CREDS_PATH)
+
+
+def _select_profile(profiles: dict, requested):
+    """Pick (name, profile_dict) from a whatsapp.json map. A reserved "default"
+    string key may name the fallback; else $WHATSAPP_PROFILE, else the lone one."""
+    names = [k for k, v in profiles.items() if isinstance(v, dict)]
+    default_name = profiles.get("default") if isinstance(profiles.get("default"), str) else None
+    chosen = requested or os.environ.get("WHATSAPP_PROFILE") or default_name
+    if not chosen and len(names) == 1:
+        chosen = names[0]
+    if not chosen:
+        _die(6, "ambiguous_profile",
+             "multiple profiles in config; pass --profile NAME",
+             f"available: {', '.join(sorted(names))}")
+    if chosen not in profiles or not isinstance(profiles[chosen], dict):
+        _die(6, "profile_not_found",
+             f"profile '{chosen}' not found",
+             f"available: {', '.join(sorted(names))}")
+    return chosen, profiles[chosen]
+
+
+def get_config(args=None):
+    """Resolve connection config. With a project whatsapp.json, the active
+    profile supplies base_url + session + secret + mode; without one, falls back
+    to single-instance env vars (WAHA_BASE_URL / WAHA_WHATSAPP_API_KEY)."""
+    requested_session = getattr(args, "session", None)
+    requested_profile = getattr(args, "profile", None)
+
+    project_dir, cfg_path = _find_config()
+    _load_secrets(project_dir)
+
+    if cfg_path:
+        try:
+            profiles = json.loads(cfg_path.read_text())
+        except Exception as e:
+            _die(6, "bad_config", f"could not parse {cfg_path}: {e}",
+                 "fix the JSON in whatsapp.json")
+        name, prof = _select_profile(profiles, requested_profile)
+        secret_env = prof.get("secret_env")
+        api_key = os.environ.get(secret_env) if secret_env else None
+        if not api_key:
+            _die(2, "missing_secret",
+                 f"profile '{name}': secret env '{secret_env}' is empty",
+                 f"set it in the project .env(.local) or {CREDS_PATH}")
+        base_url = prof.get("base_url")
+        if not base_url:
+            _die(6, "missing_base_url",
+                 f"profile '{name}' has no base_url",
+                 "add the WAHA instance URL as base_url in whatsapp.json")
+        # Capability-local message store: per-profile or top-level `messages_dir`,
+        # else <config dir>/messages. Relative paths resolve against the config dir.
+        config_dir = cfg_path.parent
+        md = prof.get("messages_dir") or profiles.get("messages_dir")
+        if md:
+            md_path = Path(md).expanduser()
+            messages_dir = str(md_path if md_path.is_absolute() else (config_dir / md_path))
+        else:
+            messages_dir = str(config_dir / "messages")
+        return {
+            "api_key": api_key,
+            "username": os.environ.get(prof.get("dashboard_user_env", "")) or os.environ.get("WAHA_DASHBOARD_USERNAME"),
+            "password": os.environ.get(prof.get("dashboard_pass_env", "")) or os.environ.get("WAHA_DASHBOARD_PASSWORD"),
+            "base_url": base_url.rstrip("/"),
+            "session": requested_session or prof.get("session") or DEFAULT_SESSION,
+            "mode": prof.get("mode") or "read",
+            "profile": name,
+            "number": prof.get("number"),
+            "expected_engine": (prof.get("engine") or "GOWS"),
+            "expected_tier": prof.get("tier"),
+            "config_dir": str(config_dir),
+            "messages_dir": messages_dir,
+        }
+
+    # Single-instance fallback (no whatsapp.json found).
     api_key = os.environ.get("WAHA_WHATSAPP_API_KEY")
     username = os.environ.get("WAHA_DASHBOARD_USERNAME")
     password = os.environ.get("WAHA_DASHBOARD_PASSWORD")
-    base_url = os.environ.get("WAHA_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-
+    base_url = os.environ.get("WAHA_BASE_URL")
+    if not base_url:
+        _die(6, "missing_base_url",
+             "no whatsapp.json found and WAHA_BASE_URL is unset",
+             f"add a profile to .capabilities/whatsapp/whatsapp.json, or set "
+             f"WAHA_BASE_URL in {CREDS_PATH}")
     if not api_key and not (username and password):
-        sys.exit(
-            f"Missing credentials. Populate {CREDS_PATH} with "
-            "WAHA_WHATSAPP_API_KEY and/or WAHA_DASHBOARD_USERNAME + "
-            "WAHA_DASHBOARD_PASSWORD."
-        )
-
+        _die(2, "missing_credentials",
+             "no WAHA credentials resolved",
+             f"set WAHA_WHATSAPP_API_KEY (and/or WAHA_DASHBOARD_USERNAME + "
+             f"WAHA_DASHBOARD_PASSWORD) in {CREDS_PATH} or the project .env")
     return {
         "api_key": api_key,
         "username": username,
         "password": password,
-        "base_url": base_url,
+        "base_url": base_url.rstrip("/"),
+        "session": requested_session or DEFAULT_SESSION,
+        "mode": "read",
+        "profile": None,
+        "number": None,
+        "expected_engine": "GOWS",
+        "expected_tier": None,
+        "config_dir": None,
+        "messages_dir": None,
     }
 
 
-def _auth_headers(config):
-    headers = {}
+def _auth_headers(config) -> dict:
+    headers: dict = {}
     if config.get("api_key"):
         headers["X-Api-Key"] = config["api_key"]
     if config.get("username") and config.get("password"):
@@ -128,39 +348,149 @@ def _auth_headers(config):
     return headers
 
 
-def make_request(path, config=None, timeout=60):
+# ── Resilient HTTP ────────────────────────────────────────────────────────────
+
+
+TIMEOUT = httpx.Timeout(60.0)
+MAX_RETRIES = 3
+_CLIENT: httpx.Client | None = None
+
+
+class HttpFailure(Exception):
+    """A handled request failure, carrying the _die taxonomy. Raised by
+    `_request` so a caller decides whether to die (hard) or recover (soft)."""
+
+    def __init__(self, exit_code, code, message, hint=None, status=None):
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.code = code
+        self.message = message
+        self.hint = hint
+        self.status = status
+
+
+def _client() -> httpx.Client:
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = httpx.Client(timeout=TIMEOUT, follow_redirects=True)
+    return _CLIENT
+
+
+def _http_error_message(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            return body.get("message") or body.get("error") or resp.text
+    except Exception:
+        pass
+    return resp.text or f"HTTP {resp.status_code}"
+
+
+def _request(method: str, url: str, *, headers: dict | None = None,
+             json_body=None, content: bytes | None = None,
+             timeout: float | None = None, raw: bool = False,
+             service: str = "WAHA"):
+    """One request through the shared client with bounded, backed-off retries.
+
+    429 honours Retry-After; timeouts and 5xx back off attempt*1.5s. After
+    MAX_RETRIES a transient failure raises HttpFailure(5, …). A 4xx is not
+    retried — it raises HttpFailure 2 (auth), 3 (not found), or 6 (validation).
+    2xx returns parsed JSON, or raw bytes when raw=True. The caller (make_request)
+    turns HttpFailure into _die when hard, or None when soft.
+    """
+    client = _client()
+    to = httpx.Timeout(timeout) if timeout is not None else TIMEOUT
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, url, headers=headers,
+                                  json=json_body, content=content, timeout=to)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            raise HttpFailure(5, "timeout", f"request timed out: {method} {url}",
+                              f"{service} was unresponsive")
+        except httpx.RequestError as e:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            raise HttpFailure(5, "network_error",
+                              f"network error reaching {service}: {e}",
+                              "check the base_url and connectivity")
+
+        if resp.status_code == 429:
+            if attempt < MAX_RETRIES:
+                time.sleep(float(resp.headers.get("Retry-After", attempt * 1.5)))
+                continue
+            raise HttpFailure(5, "rate_limited",
+                              f"{service} rate-limited the request", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            raise HttpFailure(5, "server_error",
+                              f"{service} returned {resp.status_code}",
+                              status=resp.status_code)
+        if resp.status_code >= 400:
+            msg = _http_error_message(resp)
+            if resp.status_code in (401, 403):
+                raise HttpFailure(2, "auth_rejected",
+                                  f"{service} rejected the request: {msg}",
+                                  "check the API key / dashboard credentials",
+                                  status=resp.status_code)
+            if resp.status_code == 404:
+                raise HttpFailure(3, "not_found", f"{service}: {msg}", status=404)
+            raise HttpFailure(6, "bad_request",
+                              f"{service} rejected the request: {msg}",
+                              status=resp.status_code)
+
+        if raw:
+            return resp.content
+        text = resp.text
+        if not text:
+            return {}
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+    # Unreachable: every branch above returns, continues, or raises.
+    raise HttpFailure(5, "unreachable",
+                      f"{service} request exhausted retries: {method} {url}")
+
+
+def api_request(method, path, config=None, *, json_body=None, timeout=60, soft=False):
+    """A WAHA API call on the active instance through the resilient layer. Hard by
+    default — a handled failure becomes _die. soft=True returns None instead, for
+    best-effort calls whose failure the caller recovers from (a missing contact
+    name, an unreachable page, an absent session)."""
     if config is None:
         config = get_config()
-
     url = f"{config['base_url']}{path}"
-    req = urllib.request.Request(url, headers=_auth_headers(config), method="GET")
-
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8")
-        try:
-            msg = json.loads(body).get("message", str(e))
-        except json.JSONDecodeError:
-            msg = body or str(e)
-        sys.exit(f"HTTP {e.code} — {msg}")
-    except urllib.error.URLError as e:
-        sys.exit(f"Connection failed — {e.reason}")
+        return _request(method, url, headers=_auth_headers(config),
+                        json_body=json_body, timeout=timeout)
+    except HttpFailure as e:
+        if soft:
+            return None
+        _die(e.exit_code, e.code, e.message, e.hint, e.status)
+
+
+def make_request(path, config=None, timeout=60, soft=False):
+    """GET path on the active WAHA instance (see api_request)."""
+    return api_request("GET", path, config, timeout=timeout, soft=soft)
 
 
 def download_media(media_url, config, dest_path, timeout=120):
     """Fetch a WAHA media file. Translates the container-internal localhost
-    URL back to the public WAHA_BASE_URL and writes to dest_path."""
+    URL back to the public base_url and writes to dest_path. Raises HttpFailure
+    on a request failure — `export` catches it per-message and records it."""
     parsed = urllib.parse.urlparse(media_url)
     public_url = f"{config['base_url']}{parsed.path}"
     if parsed.query:
         public_url += f"?{parsed.query}"
-
-    req = urllib.request.Request(public_url, headers=_auth_headers(config), method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        dest_path.write_bytes(response.read())
+    data = _request("GET", public_url, headers=_auth_headers(config),
+                    timeout=timeout, raw=True)
+    dest_path.write_bytes(data)
 
 
 def ts_to_dt(ts):
@@ -179,40 +509,167 @@ def parse_date(date_str):
         dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
         return int(dt.timestamp())
     except ValueError:
-        sys.exit(f"Invalid date format '{date_str}'. Use YYYY-MM-DD.")
+        _die(6, "bad_date", f"invalid date format '{date_str}'", "use YYYY-MM-DD")
 
 
 # ── Commands ────────────────────────────────────────────────────────────────
 
 
 def cmd_help(_args):
-    print(__doc__.strip())
+    return (__doc__ or "").strip()
+
+
+def _session_facts(config):
+    """The cheapest authenticated round-trip: the session object + engine."""
+    session = config["session"]
+    result = make_request(f"/api/sessions/{session}", config)
+    me = result.get("me") or {}
+    # GOWS doesn't carry the engine in the session object; it's at server/version.
+    engine = _engine_str(result)
+    if not engine:
+        version = make_request("/api/server/version", config, soft=True)
+        engine = _engine_str(version) if isinstance(version, dict) else None
+    return {
+        "session": session,
+        "status": result.get("status", "UNKNOWN"),
+        "me_id": me.get("id"),
+        "me_name": me.get("pushName"),
+        "engine": engine,
+    }
+
+
+# WAHA reports a linked, ready session as WORKING (the only "ready" status);
+# a connected account shows up as a non-null `me`.
+SESSION_READY = "WORKING"
+
+
+def cmd_doctor(args):
+    config = get_config(args)
+    facts = _session_facts(config)
+    ready = facts["status"] == SESSION_READY and bool(facts["me_id"])
+    out = {
+        "ok": ready,
+        "base_url": config["base_url"],
+        "session": facts["session"],
+        "status": facts["status"],
+        "account": {"id": facts["me_id"], "name": facts["me_name"]},
+        "engine": facts["engine"],
+    }
+    if config.get("profile"):
+        out["profile"] = config["profile"]
+        out["mode"] = config.get("mode")
+    _emit(out)
+    if not ready:
+        _die(2, "session_not_ready",
+             f"session '{facts['session']}' is {facts['status']}, not linked",
+             "pair the session in the WAHA dashboard (Linked Devices), then retry")
+    return None
 
 
 def cmd_status(args):
-    config = get_config()
-    session = args.session
-    result = make_request(f"/api/sessions/{session}", config)
-    status = result.get("status", "UNKNOWN")
-    me = result.get("me") or {}
-    me_id = me.get("id", "—")
-    me_name = me.get("pushName", "—")
-    engine = (result.get("engine") or {}).get("engine", "—")
+    config = get_config(args)
+    facts = _session_facts(config)
+    lines = []
+    if config.get("profile"):
+        lines.append(f"Profile:  {config['profile']} (mode: {config.get('mode')})")
+    lines.append(f"Session:  {facts['session']}")
+    lines.append(f"Status:   {facts['status']}")
+    lines.append(f"Account:  {facts['me_name'] or '—'} ({facts['me_id'] or '—'})")
+    lines.append(f"Engine:   {facts['engine'] or '—'}")
+    return "\n".join(lines)
 
-    print(f"Session:  {session}")
-    print(f"Status:   {status}")
-    print(f"Account:  {me_name} ({me_id})")
-    print(f"Engine:   {engine}")
+
+def _engine_str(version):
+    """Pull the engine name from /api/server/version, tolerating the bare-string
+    and nested {engine:{engine}} shapes WAHA has used."""
+    eng = version.get("engine")
+    if isinstance(eng, str):
+        return eng
+    if isinstance(eng, dict):
+        return eng.get("engine")
+    return None
+
+
+def cmd_health(args):
+    """Infrastructure-level readiness: is the WAHA instance operational and in the
+    expected mode (engine, tier), with the active session linked to an account?
+    A per-check report (windmill-style), all on the existing X-Api-Key."""
+    config = get_config(args)
+    session = config["session"]
+
+    # Hard gate: can we reach + authenticate to the instance at all? This maps
+    # creds/unreachable to _die(2/5) before any per-check reporting.
+    version = make_request("/api/server/version", config)
+    version = version if isinstance(version, dict) else {}
+    live_engine = _engine_str(version)
+    tier = version.get("tier")
+    expected_engine = config.get("expected_engine") or "GOWS"
+    expected_tier = config.get("expected_tier")
+
+    status_obj = make_request("/api/server/status", config, soft=True)
+    uptime_ms = status_obj.get("uptime") if isinstance(status_obj, dict) else None
+
+    # Active session: soft, so an absent/unlinked session is a failed check, not a die.
+    sess = make_request(f"/api/sessions/{session}", config, soft=True)
+    if isinstance(sess, dict):
+        sess_status = sess.get("status", "UNKNOWN")
+        me = sess.get("me") or {}
+    else:
+        sess_status = "ABSENT"
+        me = {}
+    me_id = me.get("id")
+    me_name = me.get("pushName")
+
+    engine_ok = bool(live_engine) and live_engine.upper() == expected_engine.upper()
+    tier_ok = (expected_tier is None) or ((tier or "").upper() == expected_tier.upper())
+
+    uptime_note = f", up {round(uptime_ms / 3600000, 1)}h" if uptime_ms else ""
+    checks = [
+        {"item": "server", "ok": True,
+         "detail": f"version {version.get('version') or '?'}{uptime_note}"},
+        {"item": "engine", "ok": engine_ok,
+         "detail": (live_engine or "?") + ("" if engine_ok else f" (expected {expected_engine})")},
+        {"item": "session", "ok": sess_status == SESSION_READY,
+         "detail": f"{session}: {sess_status}"},
+        {"item": "account", "ok": bool(me_id),
+         "detail": f"{me_name or '?'} ({me_id})" if me_id else "not connected"},
+    ]
+    if expected_tier is not None:
+        checks.insert(2, {"item": "tier", "ok": tier_ok,
+                          "detail": (tier or "?") + ("" if tier_ok else f" (expected {expected_tier})")})
+    elif tier:
+        checks.insert(2, {"item": "tier", "ok": True, "detail": tier})
+
+    ready = all(c["ok"] for c in checks)
+    out = {
+        "ready": ready,
+        "base_url": config["base_url"],
+        "engine": live_engine,
+        "expected_engine": expected_engine,
+        "tier": tier,
+        "session": session,
+        "status": sess_status,
+        "account": {"id": me_id, "name": me_name},
+        "checks": checks,
+    }
+    if config.get("profile"):
+        out["profile"] = config["profile"]
+        out["mode"] = config.get("mode")
+    _emit(out)
+    if not ready:
+        failed = "; ".join(f"{c['item']}: {c['detail']}" for c in checks if not c["ok"])
+        _die(2, "not_ready", "WAHA is not in the expected ready mode", failed)
+    return None
 
 
 def cmd_chats(args):
-    config = get_config()
-    session = args.session
+    config = get_config(args)
+    session = config["session"]
     data = make_request(f"/api/{session}/chats?limit=500", config)
 
     if not isinstance(data, list):
-        msg = data.get("message", "Unexpected response") if isinstance(data, dict) else str(data)
-        sys.exit(f"Error: {msg}")
+        msg = data.get("message", "unexpected response") if isinstance(data, dict) else str(data)
+        _die(5, "unexpected_response", f"chats: {msg}")
 
     search = (args.search or "").lower()
 
@@ -221,9 +678,11 @@ def cmd_chats(args):
         cid = chat.get("id", {})
         serialized = cid.get("_serialized", "") if isinstance(cid, dict) else str(cid)
         name = chat.get("name", "") or ""
-        is_group = chat.get("isGroup", False)
+        # GOWS chat objects are {id, name, conversationTimestamp} — derive the
+        # rest: isGroup from the id suffix, activity from conversationTimestamp.
+        is_group = chat.get("isGroup", serialized.endswith("@g.us"))
         unread = chat.get("unreadCount", 0)
-        ts = chat.get("timestamp", 0)
+        ts = chat.get("conversationTimestamp") or chat.get("timestamp", 0)
 
         if search and search not in name.lower() and search not in serialized.lower():
             continue
@@ -236,56 +695,53 @@ def cmd_chats(args):
             "last_activity": ts,
         })
 
-    if not results:
-        print("No chats found." + (f" (search: '{args.search}')" if args.search else ""))
-        return
-
     results.sort(key=lambda x: x["last_activity"], reverse=True)
     if args.limit:
         results = results[:args.limit]
 
-    print("| # | Name | ID | Group | Unread | Last Activity |")
-    print("|---|------|-----|-------|--------|---------------|")
+    if getattr(args, "json", False):
+        return results
+
+    if not results:
+        return "No chats found." + (f" (search: '{args.search}')" if args.search else "")
+
+    lines = ["| # | Name | ID | Group | Unread | Last Activity |",
+             "|---|------|-----|-------|--------|---------------|"]
     for i, r in enumerate(results, 1):
         group_str = "Yes" if r["group"] else "—"
         unread_str = str(r["unread"]) if r["unread"] else "—"
         last = format_dt(r["last_activity"])
-        print(f"| {i} | {r['name']} | `{r['id']}` | {group_str} | {unread_str} | {last} |")
-
+        lines.append(f"| {i} | {r['name']} | `{r['id']}` | {group_str} | {unread_str} | {last} |")
     suffix = f" (filtered by '{args.search}')" if args.search else ""
-    print(f"\n{len(results)} chat(s) shown{suffix}")
+    lines.append(f"\n{len(results)} chat(s) shown{suffix}")
+    return "\n".join(lines)
 
 
 def cmd_messages(args):
-    config = get_config()
-    session = args.session
+    config = get_config(args)
+    session = config["session"]
     chat_id = args.chat_id
     limit = args.limit
+
+    # Validate inputs before any network call.
+    from_ts = parse_date(args.from_date) if args.from_date else None
+    to_ts = parse_date(args.to_date) + 86400 if args.to_date else None
 
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
 
     chat_name = None
     if "@c.us" in chat_id:
-        try:
-            chat_info = make_request(f"/api/{session}/contacts/{encoded_chat_id}", config)
-            if isinstance(chat_info, dict):
-                chat_name = chat_info.get("name") or chat_info.get("pushname") or None
-        except SystemExit:
-            pass
+        chat_info = make_request(f"/api/{session}/contacts/{encoded_chat_id}",
+                                 config, soft=True)
+        if isinstance(chat_info, dict):
+            chat_name = chat_info.get("name") or chat_info.get("pushname") or None
 
     url = f"/api/{session}/chats/{encoded_chat_id}/messages?limit={limit}"
     data = make_request(url, config)
 
     if not isinstance(data, list):
-        msg = data.get("message", "Unexpected response") if isinstance(data, dict) else str(data)
-        sys.exit(f"Error: {msg}")
-
-    if not data:
-        print("No messages found.")
-        return
-
-    from_ts = parse_date(args.from_date) if args.from_date else None
-    to_ts = parse_date(args.to_date) + 86400 if args.to_date else None
+        msg = data.get("message", "unexpected response") if isinstance(data, dict) else str(data)
+        _die(5, "unexpected_response", f"messages: {msg}")
 
     filtered = []
     for msg in data:
@@ -296,29 +752,35 @@ def cmd_messages(args):
             continue
         filtered.append(msg)
 
-    if not filtered:
-        print("No messages in the specified date range.")
-        return
-
     filtered.sort(key=lambda m: m.get("timestamp", 0))
     is_group = "@g.us" in chat_id
 
+    if getattr(args, "json", False):
+        return filtered
+    if not filtered:
+        return "No messages found." if not (args.from_date or args.to_date) \
+            else "No messages in the specified date range."
     if args.format == "table":
-        _print_messages_table(filtered, is_group, chat_name)
-    else:
-        _print_messages_conversation(filtered, is_group, chat_name)
+        return _render_messages_table(filtered, is_group, chat_name)
+    return _render_messages_conversation(filtered, is_group, chat_name)
 
 
 def _resolve_sender(msg, is_group, chat_name=None):
     if msg.get("fromMe"):
         return "You"
 
-    notify_name = msg.get("_data", {}).get("notifyName", "")
+    data = msg.get("_data") or {}
+    info = data.get("Info") or {}
+    # Push name: GOWS exposes _data.Info.PushName; WEBJS used _data.notifyName.
+    notify_name = info.get("PushName") or data.get("notifyName") or ""
     if notify_name:
         return notify_name
 
     if is_group:
-        return msg.get("author", "") or msg.get("from", "")
+        # GOWS: the sender is `participant` (top-level `from` is the group id).
+        # WEBJS: `author`. Never fall back to `from` for groups — that's the group.
+        return (msg.get("participant") or msg.get("author")
+                or info.get("Sender") or "Group member")
 
     if chat_name:
         return chat_name
@@ -326,8 +788,9 @@ def _resolve_sender(msg, is_group, chat_name=None):
     return msg.get("from", "Contact")
 
 
-def _print_messages_conversation(messages, is_group, chat_name=None):
+def _render_messages_conversation(messages, is_group, chat_name=None):
     current_date = None
+    lines = []
 
     for msg in messages:
         ts = msg.get("timestamp", 0)
@@ -337,11 +800,11 @@ def _print_messages_conversation(messages, is_group, chat_name=None):
 
         if date_str != current_date:
             current_date = date_str
-            print(f"\n── {date_str} ──\n")
+            lines.append(f"\n── {date_str} ──\n")
 
         sender = _resolve_sender(msg, is_group, chat_name)
         body = msg.get("body", "") or ""
-        msg_type = msg.get("type", "")
+        msg_type = _msg_type(msg)
 
         if not body:
             placeholder = {
@@ -357,54 +820,67 @@ def _print_messages_conversation(messages, is_group, chat_name=None):
             }.get(msg_type)
             body = placeholder or (f"[{msg_type}]" if msg_type else "[Empty]")
 
-        lines = body.split("\n")
-        if len(lines) > 1:
+        body_lines = body.split("\n")
+        if len(body_lines) > 1:
             indent = " " * (len(time_str) + 2 + len(sender) + 2)
-            body = lines[0] + "\n" + "\n".join(indent + line for line in lines[1:])
+            body = body_lines[0] + "\n" + "\n".join(indent + line for line in body_lines[1:])
 
-        print(f"[{time_str}] {sender}: {body}")
+        lines.append(f"[{time_str}] {sender}: {body}")
 
-    print(f"\n--- {len(messages)} message(s) ---")
+    lines.append(f"\n--- {len(messages)} message(s) ---")
+    return "\n".join(lines)
 
 
-def _print_messages_table(messages, is_group, chat_name=None):
-    print("| # | Time | Sender | Type | Message |")
-    print("|---|------|--------|------|---------|")
+def _render_messages_table(messages, is_group, chat_name=None):
+    lines = ["| # | Time | Sender | Type | Message |",
+             "|---|------|--------|------|---------|"]
 
     for i, msg in enumerate(messages, 1):
         ts = msg.get("timestamp", 0)
         time_str = format_dt(ts)
         sender = _resolve_sender(msg, is_group, chat_name)
         body = (msg.get("body", "") or "")[:120].replace("\n", " ").replace("|", "\\|")
-        msg_type = msg.get("type", "")
+        msg_type = _msg_type(msg)
         if not body and msg_type:
             body = f"[{msg_type}]"
-        print(f"| {i} | {time_str} | {sender} | {msg_type} | {body} |")
+        lines.append(f"| {i} | {time_str} | {sender} | {msg_type} | {body} |")
 
-    print(f"\n{len(messages)} message(s)")
+    lines.append(f"\n{len(messages)} message(s)")
+    return "\n".join(lines)
 
 
 def cmd_contact(args):
-    config = get_config()
-    session = args.session
+    config = get_config(args)
+    session = config["session"]
     contact_id = urllib.parse.quote(args.contact_id, safe="")
     data = make_request(f"/api/{session}/contacts/{contact_id}", config)
 
-    if isinstance(data, dict):
-        name = data.get("name") or data.get("pushname") or "—"
-        number = data.get("number", "—") or "—"
-        cid = data.get("id", {})
-        serialized = cid.get("_serialized", "") if isinstance(cid, dict) else str(cid)
-        is_business = data.get("isBusiness", False)
-        is_blocked = data.get("isBlocked", False)
+    if not isinstance(data, dict):
+        return data
 
-        print(f"Name:      {name}")
-        print(f"Number:    {number}")
-        print(f"ID:        {serialized}")
-        print(f"Business:  {'Yes' if is_business else 'No'}")
-        print(f"Blocked:   {'Yes' if is_blocked else 'No'}")
-    else:
-        print(json.dumps(data, indent=2))
+    name = data.get("name") or data.get("pushname") or None
+    number = data.get("number") or None
+    cid = data.get("id", {})
+    serialized = cid.get("_serialized", "") if isinstance(cid, dict) else str(cid)
+    is_business = bool(data.get("isBusiness", False))
+    is_blocked = bool(data.get("isBlocked", False))
+
+    if getattr(args, "json", False):
+        return {
+            "id": serialized,
+            "name": name,
+            "number": number,
+            "business": is_business,
+            "blocked": is_blocked,
+        }
+
+    return "\n".join([
+        f"Name:      {name or '—'}",
+        f"Number:    {number or '—'}",
+        f"ID:        {serialized}",
+        f"Business:  {'Yes' if is_business else 'No'}",
+        f"Blocked:   {'Yes' if is_blocked else 'No'}",
+    ])
 
 
 # ── Export / sync ───────────────────────────────────────────────────────────
@@ -418,28 +894,47 @@ VOICE_TYPES = {"ptt", "audio"}
 
 
 def _msg_type(msg):
-    """Resolve canonical message type. WAHA leaves top-level `type` empty for
-    many messages; the truth is in _data.type."""
-    return msg.get("type") or msg.get("_data", {}).get("type") or "text"
+    """Resolve canonical message type. GOWS leaves top-level `type` (and often
+    _data.Info.MediaType) empty, so fall back to inferring from the media
+    mimetype; WEBJS populated `type`/_data.type directly."""
+    data = msg.get("_data") or {}
+    explicit = (msg.get("type")
+                or (data.get("Info") or {}).get("MediaType")
+                or data.get("type"))
+    if explicit:
+        return explicit
+    mime = ((msg.get("media") or {}).get("mimetype") or "").lower()
+    if mime:
+        major = mime.split("/", 1)[0]
+        if major == "audio":
+            return "ptt" if ("ogg" in mime or "opus" in mime) else "audio"
+        return {"image": "image", "video": "video",
+                "application": "document"}.get(major, "media")
+    return "text"
 
 
 def _msg_author(msg, is_group):
-    """Author of a single message. For groups, the real sender is in
-    _data.author._serialized; top-level `from` is the group id."""
+    """Sender id of a single message. For groups the real sender is in
+    `participant` (GOWS) or _data.author (WEBJS); top-level `from` is the group id."""
     if msg.get("fromMe"):
         return None
     if is_group:
+        # GOWS: top-level `participant`. WEBJS: _data.author (dict or str).
+        participant = msg.get("participant")
+        if participant:
+            return participant
         author = msg.get("_data", {}).get("author")
         if isinstance(author, dict):
             return author.get("_serialized") or author.get("user")
         if isinstance(author, str):
             return author
-        return msg.get("author") or msg.get("from")
+        return (msg.get("_data", {}).get("Info", {}) or {}).get("Sender") or msg.get("author")
     return msg.get("from")
 
 
 def _msg_author_name(msg, is_group, chat_name):
-    notify = msg.get("_data", {}).get("notifyName") or ""
+    data = msg.get("_data") or {}
+    notify = (data.get("Info") or {}).get("PushName") or data.get("notifyName") or ""
     if notify:
         return notify
     if msg.get("fromMe"):
@@ -485,13 +980,43 @@ def _find_existing_media(media_dir, message_id):
     return None
 
 
+def _slugify(text):
+    """Kebab-case slug for a chat folder name (e.g. 'Project Team' →
+    'project-team')."""
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:60]
+
+
 def cmd_export(args):
-    config = get_config()
-    session = args.session
+    config = get_config(args)
+    session = config["session"]
     chat_id = args.chat_id
     is_group = "@g.us" in chat_id
+    encoded_chat = urllib.parse.quote(chat_id, safe="")
 
-    out = Path(args.out).expanduser().resolve()
+    # Resolve a human-readable chat name first — used for the default slug and
+    # the export header.
+    chat_name = chat_id
+    chats = make_request(f"/api/{session}/chats?limit=500", config, soft=True)
+    if isinstance(chats, list):
+        for c in chats:
+            cid = c.get("id", {})
+            serialized = cid.get("_serialized", "") if isinstance(cid, dict) else str(cid)
+            if serialized == chat_id:
+                chat_name = c.get("name") or chat_id
+                break
+
+    # Output path: explicit --out wins; otherwise default to the capability-local
+    # store from config — <messages_dir>/<slug>/messages.json (relocate by setting
+    # messages_dir in whatsapp.json).
+    if args.out:
+        out = Path(args.out).expanduser().resolve()
+    elif config.get("messages_dir"):
+        slug = _slugify(chat_name) or _slugify(chat_id) or "chat"
+        out = Path(config["messages_dir"]).expanduser().resolve() / slug / "messages.json"
+    else:
+        _die(6, "no_output_path",
+             "no --out given and no messages_dir resolved",
+             "pass --out PATH, or add a whatsapp.json profile so the default store applies")
     out.parent.mkdir(parents=True, exist_ok=True)
 
     media_dir = (Path(args.media_dir).expanduser().resolve()
@@ -508,21 +1033,6 @@ def cmd_export(args):
     if args.documents:
         download_kinds.add("document")
 
-    # Resolve chat metadata
-    chat_name = chat_id
-    encoded_chat = urllib.parse.quote(chat_id, safe="")
-    try:
-        chats = make_request(f"/api/{session}/chats?limit=500", config)
-        if isinstance(chats, list):
-            for c in chats:
-                cid = c.get("id", {})
-                serialized = cid.get("_serialized", "") if isinstance(cid, dict) else str(cid)
-                if serialized == chat_id:
-                    chat_name = c.get("name") or chat_id
-                    break
-    except SystemExit:
-        pass
-
     # Load prior export (preserve transcriptions, skip already-downloaded media)
     prior_messages_by_id = {}
     if out.exists():
@@ -534,16 +1044,16 @@ def cmd_export(args):
         except Exception:
             pass
 
-    print(f"Exporting:    {chat_name}  ({chat_id})")
-    print(f"Output:       {out}")
-    print(f"Media dir:    {media_dir}")
-    print(f"Downloading:  {sorted(download_kinds)}")
+    _log(f"Exporting:    {chat_name}  ({chat_id})")
+    _log(f"Output:       {out}")
+    _log(f"Media dir:    {media_dir}")
+    _log(f"Downloading:  {sorted(download_kinds)}")
     if prior_messages_by_id:
         prior_tx = sum(1 for m in prior_messages_by_id.values()
                        if isinstance(m.get("transcription"), dict)
                        and m["transcription"].get("text"))
-        print(f"Prior export: {len(prior_messages_by_id)} messages, "
-              f"{prior_tx} transcription(s) preserved")
+        _log(f"Prior export: {len(prior_messages_by_id)} messages, "
+             f"{prior_tx} transcription(s) preserved")
 
     # Paginate from newest to oldest. Stop when a page is fully composed of
     # already-seen IDs and the page returns less than page_size.
@@ -552,18 +1062,17 @@ def cmd_export(args):
     page = 0
     while True:
         if args.max_pages and page >= args.max_pages:
-            print(f"Reached --max-pages={args.max_pages}, stopping.")
+            _log(f"Reached --max-pages={args.max_pages}, stopping.")
             break
         offset = page * args.page_size
         path = (f"/api/{session}/chats/{encoded_chat}/messages"
                 f"?limit={args.page_size}&offset={offset}&downloadMedia=true")
-        try:
-            batch = make_request(path, config, timeout=240)
-        except SystemExit:
-            print(f"Page {page+1} (offset={offset}) failed; stopping.")
+        batch = make_request(path, config, timeout=240, soft=True)
+        if batch is None:
+            _log(f"Page {page+1} (offset={offset}) failed; stopping.")
             break
         if not isinstance(batch, list) or not batch:
-            print(f"Page {page+1}: empty, stopping.")
+            _log(f"Page {page+1}: empty, stopping.")
             break
 
         new_ids = 0
@@ -576,7 +1085,7 @@ def cmd_export(args):
                 if mid not in seen_in_prior:
                     new_ids += 1
 
-        print(f"Page {page+1} (offset={offset}): fetched {len(batch)}, new {new_ids}")
+        _log(f"Page {page+1} (offset={offset}): fetched {len(batch)}, new {new_ids}")
 
         # Stop heuristic: short page means we hit the end of history.
         if len(batch) < args.page_size:
@@ -584,11 +1093,11 @@ def cmd_export(args):
         # Incremental stop: if every msg in this page was already in prior export,
         # we're past the cutoff — no need to keep paging.
         if prior_messages_by_id and new_ids == 0:
-            print("All messages in this page already in prior export; stopping.")
+            _log("All messages in this page already in prior export; stopping.")
             break
         page += 1
 
-    print(f"Total messages collected: {len(all_messages)}")
+    _log(f"Total messages collected: {len(all_messages)}")
 
     # Process each message into our schema, downloading media as needed
     processed = []
@@ -651,6 +1160,9 @@ def cmd_export(args):
                         download_media(media_meta["url"], config, dest)
                         media_entry["file_path"] = str(dest.resolve())
                         dl_counts[kind] = dl_counts.get(kind, 0) + 1
+                    except HttpFailure as e:
+                        media_entry["download_error"] = f"{e.code}: {e.message}"
+                        dl_errors += 1
                     except Exception as e:
                         media_entry["download_error"] = repr(e)
                         dl_errors += 1
@@ -660,8 +1172,8 @@ def cmd_export(args):
         processed.append(entry)
 
     # Preserve messages that exist in prior export but were not returned by this
-    # API call. WAHA's WEBJS store rotates aggressively after restarts/re-auths;
-    # without this merge the file would lose history every time the store thins.
+    # API call. WAHA's store can rotate after restarts/re-auths; without this
+    # merge the file would lose history every time the store thins.
     processed_ids = {p["id"] for p in processed}
     carried_over = 0
     for pid, prior_msg in prior_messages_by_id.items():
@@ -670,8 +1182,8 @@ def cmd_export(args):
             carried_over += 1
     if carried_over:
         processed.sort(key=lambda m: m.get("timestamp", 0))
-        print(f"Carried over {carried_over} message(s) from prior export "
-              f"not present in current API result.")
+        _log(f"Carried over {carried_over} message(s) from prior export "
+             f"not present in current API result.")
 
     payload = {
         "chat": {
@@ -694,19 +1206,33 @@ def cmd_export(args):
         "messages": processed,
     }
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-    print(f"Done. {len(processed)} messages written.")
-    print(f"New downloads: {dl_counts}" + (f"  errors: {dl_errors}" if dl_errors else ""))
+    _log(f"Done. {len(processed)} messages written.")
+    return {
+        "ok": True,
+        "chat": payload["chat"],
+        "out": str(out),
+        "media_dir": str(media_dir),
+        "message_count": len(processed),
+        "carried_over": carried_over,
+        "new_downloads": dl_counts,
+        "download_errors": dl_errors,
+    }
 
 
 # ── Transcribe ──────────────────────────────────────────────────────────────
 
 
 def _load_deepgram_key():
+    key = os.environ.get("DEEPGRAM_API_KEY")
+    if key:
+        return key
     if CREDS_PATH.is_file():
         vals = _parse_env_file(CREDS_PATH)
         if vals.get("DEEPGRAM_API_KEY"):
             return vals["DEEPGRAM_API_KEY"]
-    sys.exit(f"DEEPGRAM_API_KEY not found in {CREDS_PATH}.")
+    _die(2, "missing_deepgram_key",
+         "DEEPGRAM_API_KEY not resolved",
+         f"set it in the project .env(.local) or {CREDS_PATH}")
 
 
 def _content_type_for(path):
@@ -728,26 +1254,19 @@ def _deepgram_transcribe(audio_path, api_key, model):
         f"&punctuate=true&paragraphs=true"
     )
     url = f"https://api.deepgram.com/v1/listen?{params}"
-    req = urllib.request.Request(
-        url,
-        data=audio_path.read_bytes(),
-        method="POST",
+    dg = _request(
+        "POST", url,
         headers={
             "Authorization": f"Token {api_key}",
             "Content-Type": _content_type_for(audio_path),
         },
+        content=audio_path.read_bytes(),
+        timeout=300,
+        service="Deepgram",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Deepgram HTTP {e.code}: {detail}") from e
-
-    dg = json.loads(body)
     channels = dg.get("results", {}).get("channels", [])
     if not channels:
-        raise RuntimeError(f"Deepgram returned no channels: {body[:500]}")
+        raise RuntimeError(f"Deepgram returned no channels: {json.dumps(dg)[:500]}")
     alt = channels[0].get("alternatives", [{}])[0]
     text = (alt.get("paragraphs", {}) or {}).get("transcript") or alt.get("transcript") or ""
 
@@ -765,8 +1284,15 @@ def cmd_transcribe(args):
     api_key = _load_deepgram_key()
     p = Path(args.json_path).expanduser().resolve()
     if not p.exists():
-        sys.exit(f"Not found: {p}")
-    payload = json.loads(p.read_text())
+        _die(3, "file_not_found", f"export JSON does not exist: {p}")
+    try:
+        payload = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        _die(6, "bad_export_json", f"{p} is not valid export JSON: {e}",
+             "re-run `whatsapp export` to regenerate it")
+    if not isinstance(payload, dict):
+        _die(6, "bad_export_json", f"{p} is not a messages.json object",
+             "re-run `whatsapp export` to regenerate it")
     messages = payload.get("messages", [])
 
     to_do = []
@@ -782,32 +1308,38 @@ def cmd_transcribe(args):
         to_do.append((idx, m, Path(file_path)))
 
     if not to_do:
-        print("Nothing to transcribe (use --force to re-run).")
-        return
+        _log("Nothing to transcribe (use --force to re-run).")
+        return {"ok": True, "transcribed": 0, "failed": 0, "file": str(p)}
 
-    print(f"Transcribing {len(to_do)} file(s) with Deepgram (model={args.model})...")
+    _log(f"Transcribing {len(to_do)} file(s) with Deepgram (model={args.model})...")
     failures = 0
     for n, (idx, m, ap) in enumerate(to_do, 1):
         if not ap.exists():
-            print(f"  [{n}/{len(to_do)}] SKIP missing file: {ap}")
+            _log(f"  [{n}/{len(to_do)}] SKIP missing file: {ap}")
             m["transcription"] = {"error": f"file not found: {ap}"}
             failures += 1
             continue
         size_kb = ap.stat().st_size // 1024
-        print(f"  [{n}/{len(to_do)}] id={m['id']}  {ap.name}  ({size_kb} KB)")
+        _log(f"  [{n}/{len(to_do)}] id={m['id']}  {ap.name}  ({size_kb} KB)")
         try:
             result = _deepgram_transcribe(ap, api_key, args.model)
             m["transcription"] = result
             preview = (result["text"][:80] + "…") if len(result["text"]) > 80 else result["text"]
-            print(f"       → [{result.get('language')}] {preview}")
+            _log(f"       → [{result.get('language')}] {preview}")
         except Exception as e:
             m["transcription"] = {"error": str(e)}
             failures += 1
-            print(f"       → ERROR: {e}")
+            _log(f"       → ERROR: {e}")
         # Incremental save so a crash doesn't lose prior work
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
-    print(f"Done. {len(to_do) - failures}/{len(to_do)} transcribed. File: {p}")
+    _log(f"Done. {len(to_do) - failures}/{len(to_do)} transcribed. File: {p}")
+    return {
+        "ok": failures == 0,
+        "transcribed": len(to_do) - failures,
+        "failed": failures,
+        "file": str(p),
+    }
 
 
 # ── Render ──────────────────────────────────────────────────────────────────
@@ -892,16 +1424,205 @@ def _render_export(payload):
 def cmd_render(args):
     p = Path(args.json_path).expanduser().resolve()
     if not p.exists():
-        sys.exit(f"Not found: {p}")
-    payload = json.loads(p.read_text())
+        _die(3, "file_not_found", f"export JSON does not exist: {p}")
+    try:
+        payload = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        _die(6, "bad_export_json", f"{p} is not valid export JSON: {e}",
+             "re-run `whatsapp export` to regenerate it")
+    if not isinstance(payload, dict):
+        _die(6, "bad_export_json", f"{p} is not a messages.json object",
+             "re-run `whatsapp export` to regenerate it")
     rendered = _render_export(payload)
     if args.out:
         out = Path(args.out).expanduser().resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(rendered)
-        print(f"Wrote {out}", file=sys.stderr)
-    else:
-        sys.stdout.write(rendered)
+        _log(f"Wrote {out}")
+        return None
+    return rendered
+
+
+# ── Send (planned) ───────────────────────────────────────────────────────────
+
+
+def _require_send(config):
+    """Gate for write operations. Reads run from any profile; only a profile
+    with mode == 'send' may transmit. This keeps a read identity structurally
+    incapable of sending, even once send lands."""
+    if config.get("mode") != "send":
+        _die(6, "send_not_allowed",
+             f"profile '{config.get('profile') or '(env)'}' is mode "
+             f"'{config.get('mode')}', not 'send'",
+             "only a mode:'send' profile may transmit")
+
+
+def cmd_send(args):
+    # ── PLACEHOLDER — NOT IMPLEMENTED ────────────────────────────────────────
+    # Sending is intentionally absent. This stub marks where outbound messaging
+    # will live once the agent has its own WhatsApp identity: a send-capable
+    # profile (mode: "send") on its own WAHA session/instance.
+    #
+    # When implemented, this must:
+    #   • build config via get_config(args) and pass _require_send(config), so
+    #     only a mode:"send" profile can ever transmit;
+    #   • POST /api/sendText (and /api/sendImage, …) on WAHA — text sends on
+    #     WAHA Core; sending media requires WAHA Plus;
+    #   • carry a human-in-the-loop confirmation for outbound to real people,
+    #     the same gate used elsewhere for messages sent on someone's behalf.
+    config = get_config(args)
+    _require_send(config)  # enforce the gate even while the body is a stub
+    _die(6, "not_implemented",
+         "`whatsapp send` is not implemented yet — planned (the agent's own "
+         "send-capable WhatsApp identity)",
+         "reads run from any profile; sending awaits a mode:'send' profile")
+
+
+# ── Pair / onboard (session-linking ceremony) ────────────────────────────────
+
+
+def _normalize_number(raw):
+    """A WhatsApp number for request-code: country code + number, digits only
+    (the `+`, spaces, and dashes are stripped — WAHA's examples take bare digits)."""
+    digits = re.sub(r"\D", "", raw or "")
+    if not (7 <= len(digits) <= 15):
+        _die(6, "bad_number",
+             f"phone number must be 7-15 digits incl. country code, got {raw!r}",
+             "pass --number with the full international number (e.g. 15551234567), "
+             "or set `number` on the profile in whatsapp.json")
+    return digits
+
+
+# Bounded waits (seconds): drain a DELETE, startup to a pairable state, code-entry to linked.
+_PAIR_DELETE_TIMEOUT = 30
+_PAIR_READY_TIMEOUT = 90
+_PAIR_LINK_TIMEOUT = 180
+
+
+def _poll_session(config, want, timeout_s):
+    """Poll GET /api/sessions/{name} until status is in `want`; _die on FAILED or
+    timeout. Returns the session object once it reaches a wanted state."""
+    session = config["session"]
+    start = time.monotonic()
+    last = None
+    while time.monotonic() - start < timeout_s:
+        sess = make_request(f"/api/sessions/{session}", config, soft=True)
+        status = sess.get("status") if isinstance(sess, dict) else None
+        if status != last:
+            _log(f"  session {session}: {status or 'unreachable'}")
+            last = status
+        if isinstance(sess, dict) and status in want:
+            return sess
+        if status == "FAILED":
+            _die(5, "session_failed", f"session '{session}' entered FAILED",
+                 "re-run `whatsapp pair --recreate --yes`, or pair via the WAHA dashboard")
+        time.sleep(2)
+    _die(5, "pair_timeout",
+         f"session '{session}' did not reach {sorted(want)} within {timeout_s}s",
+         "retry, or pair via the WAHA dashboard")
+
+
+def cmd_pair(args):
+    """Onboard / link a session via the GOWS phone-number pairing code: pass a
+    number, get an XXXX-XXXX code to enter in WhatsApp (Linked Devices) — no QR.
+    Connection-level, available to any profile (you link before you can read)."""
+    config = get_config(args)
+    session = config["session"]
+    expected_engine = config.get("expected_engine") or "GOWS"
+    number = _normalize_number(args.number or config.get("number") or "")
+
+    existing = make_request(f"/api/sessions/{session}", config, soft=True)
+    status = existing.get("status") if isinstance(existing, dict) else None
+    me = (existing.get("me") or {}) if isinstance(existing, dict) else {}
+
+    # Refuse to disrupt a live session unless explicitly re-linking.
+    if status == "WORKING" and me.get("id") and not args.recreate:
+        _die(6, "already_paired",
+             f"session '{session}' is already WORKING ({me.get('id')})",
+             "nothing to do — run `whatsapp doctor`; pass --recreate --yes to re-link")
+
+    if args.recreate and existing is not None:
+        if not args.yes:
+            detail = f" (currently WORKING as {me.get('id')})" if me.get("id") else ""
+            _die(6, "confirm_recreate",
+                 f"--recreate will DELETE and re-link session '{session}'{detail}",
+                 "re-run with --yes to confirm")
+        _log(f"Deleting session '{session}' …")
+        api_request("DELETE", f"/api/sessions/{session}", config, soft=True)
+        # Wait until it's actually gone — DELETE is async; creating too soon races
+        # it and the new session gets wiped (a 404 on the next start).
+        start = time.monotonic()
+        while time.monotonic() - start < _PAIR_DELETE_TIMEOUT:
+            if make_request(f"/api/sessions/{session}", config, soft=True) is None:
+                break
+            time.sleep(1)
+        existing, status = None, None
+
+    # Bring the session into existence and start it.
+    if existing is None:
+        _log(f"Creating session '{session}' (start:true) …")
+        api_request("POST", "/api/sessions", config,
+                    json_body={"name": session, "start": True, "config": {}})
+    elif status in ("STOPPED", "FAILED"):
+        _log(f"Starting session '{session}' …")
+        api_request("POST", f"/api/sessions/{session}/start", config, soft=True)
+
+    _log("Waiting for the session to be ready to pair …")
+    sess = _poll_session(config, {"SCAN_QR_CODE", "WORKING"}, _PAIR_READY_TIMEOUT)
+
+    # Already linked (credentials persisted server-side) — nothing to pair.
+    me = sess.get("me") or {}
+    if sess.get("status") == "WORKING" and me.get("id"):
+        _emit({"ok": True, "session": session, "status": "WORKING",
+               "account": {"id": me.get("id"), "name": me.get("pushName")},
+               "note": "session linked from existing credentials; no new code needed"})
+        return None
+
+    # Engine is the server default captured at session creation — assert, can't set.
+    live_engine = _engine_str(sess)
+    if not live_engine:
+        live_engine = _engine_str(make_request("/api/server/version", config, soft=True) or {})
+    if live_engine and live_engine.upper() != expected_engine.upper():
+        _die(6, "engine_mismatch",
+             f"session engine is {live_engine}, expected {expected_engine}",
+             f"set WHATSAPP_DEFAULT_ENGINE={expected_engine} on the WAHA server, "
+             "then re-run `whatsapp pair --recreate --yes`")
+
+    if args.qr:
+        qr = make_request(f"/api/{session}/auth/qr?format=raw", config, soft=True)
+        value = qr.get("value") if isinstance(qr, dict) else None
+        _emit({"ok": True, "session": session, "method": "qr", "qr_value": value,
+               "instructions": "Render qr_value as a QR and scan it in WhatsApp → "
+                               "Linked Devices → Link a Device (or scan in the WAHA dashboard)."})
+        return None
+
+    _log(f"Requesting a pairing code for +{number} …")
+    resp = api_request("POST", f"/api/{session}/auth/request-code", config,
+                       json_body={"phoneNumber": number})
+    code = resp.get("code") if isinstance(resp, dict) else None
+    if not code:
+        _die(5, "no_code", "WAHA did not return a pairing code",
+             "retry, or use --qr / the WAHA dashboard (pairing codes aren't always available)")
+
+    instructions = ("On the phone for this number, in WhatsApp: Settings → Linked "
+                    "Devices → Link a Device → 'Link with phone number instead' → "
+                    "enter this code")
+    _log(f"\n  Pairing code for +{number}:  {code}\n  {instructions}.\n")
+    result = {"ok": True, "session": session, "method": "pairing_code",
+              "number": number, "code": code, "instructions": f"{instructions}: {code}"}
+
+    if not args.wait:
+        result["next"] = "after entering it, run `whatsapp doctor` to confirm WORKING"
+        _emit(result)
+        return None
+
+    _log("Waiting for the device to link (enter the code on the phone) …")
+    sess = _poll_session(config, {"WORKING"}, _PAIR_LINK_TIMEOUT)
+    me = sess.get("me") or {}
+    result["status"] = "WORKING"
+    result["account"] = {"id": me.get("id"), "name": me.get("pushName")}
+    _emit(result)
+    return None
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -910,37 +1631,61 @@ def cmd_render(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="whatsapp",
-        description="WAHA WhatsApp API client — read chats and messages (read-only).",
+        description="WAHA WhatsApp API client — read chats, messages, and export history.",
     )
     parser.add_argument(
-        "--session", default=DEFAULT_SESSION,
-        help="WAHA session name (default: 'default')",
+        "--profile", "-p",
+        help="whatsapp.json profile (default: $WHATSAPP_PROFILE, the config's "
+             "\"default\" key, or the lone profile)",
+    )
+    parser.add_argument(
+        "--session", default=None,
+        help="Override the profile's WAHA session name (default: the profile's, "
+             "else 'default')",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("help", help="Print full usage block")
-    sub.add_parser("status", help="Check connection and session status")
+    sub.add_parser("doctor", help="Readiness probe (creds, reachability, session)")
+    sub.add_parser("status", help="Human-readable session / account status")
+    sub.add_parser("health", help="Instance-level readiness (server, engine/mode, session)")
+
+    pp = sub.add_parser("pair", help="Onboard / link a session via phone-number pairing code")
+    pp.add_argument("--number", help="WhatsApp number incl. country code (default: the "
+                    "profile's `number`). Digits; `+`/spaces stripped.")
+    pp.add_argument("--qr", action="store_true",
+                    help="Return the QR value instead of requesting a pairing code")
+    pp.add_argument("--wait", action="store_true",
+                    help="After showing the code, poll until the session is WORKING")
+    pp.add_argument("--recreate", action="store_true",
+                    help="Delete and re-link an existing session (requires --yes)")
+    pp.add_argument("--yes", action="store_true",
+                    help="Confirm a destructive --recreate")
 
     pc = sub.add_parser("chats", help="List chats")
     pc.add_argument("--search", "-s", help="Filter chats by name (case-insensitive)")
     pc.add_argument("--limit", "-n", type=int, help="Max chats to show")
+    pc.add_argument("--json", action="store_true", help="Emit JSON instead of a table")
 
     pm = sub.add_parser("messages", help="Fetch messages from a chat")
-    pm.add_argument("chat_id", help="Chat ID (e.g. 64225623750@c.us or 120363...@g.us)")
+    pm.add_argument("chat_id", help="Chat ID (e.g. 15551234567@c.us or <group-id>@g.us)")
     pm.add_argument("--limit", "-n", type=int, default=50,
                     help="Max messages to fetch from API (default: 50)")
     pm.add_argument("--from", dest="from_date", help="Start date filter (YYYY-MM-DD)")
     pm.add_argument("--to", dest="to_date", help="End date filter (YYYY-MM-DD)")
     pm.add_argument("--format", "-f", choices=["conversation", "table"],
                     default="conversation", help="Output format (default: conversation)")
+    pm.add_argument("--json", action="store_true", help="Emit raw JSON messages")
 
     pk = sub.add_parser("contact", help="Get contact info")
-    pk.add_argument("contact_id", help="Contact ID (e.g. 64225623750@c.us)")
+    pk.add_argument("contact_id", help="Contact ID (e.g. 15551234567@c.us)")
+    pk.add_argument("--json", action="store_true", help="Emit JSON instead of a table")
 
     pe = sub.add_parser("export", help="Dump full chat history to JSON; download media")
-    pe.add_argument("chat_id", help="Chat ID (e.g. 120363409111496450@g.us)")
-    pe.add_argument("--out", required=True, help="Output JSON path")
+    pe.add_argument("chat_id", help="Chat ID (e.g. <group-id>@g.us)")
+    pe.add_argument("--out", help="Output JSON path (default: the config's "
+                    "messages_dir → <messages_dir>/<slug>/messages.json)")
     pe.add_argument("--media-dir", help="Media output dir (default: <out>/../media)")
     pe.add_argument("--page-size", type=int, default=PAGE_SIZE_DEFAULT,
                     help=f"Messages per WAHA page (default: {PAGE_SIZE_DEFAULT})")
@@ -968,18 +1713,31 @@ def main():
     pr.add_argument("json_path", help="Path to a messages.json produced by `whatsapp export`")
     pr.add_argument("--out", help="Write to file instead of stdout")
 
+    psend = sub.add_parser(
+        "send",
+        help="[planned, not implemented] Send a message (send-capable profiles only)")
+    psend.add_argument("chat_id", nargs="?", help="Recipient chat ID")
+    psend.add_argument("text", nargs="?", help="Message text")
+
     args = parser.parse_args()
 
-    {
+    result = {
         "help": cmd_help,
+        "doctor": cmd_doctor,
         "status": cmd_status,
+        "health": cmd_health,
+        "pair": cmd_pair,
         "chats": cmd_chats,
         "messages": cmd_messages,
         "contact": cmd_contact,
         "export": cmd_export,
         "transcribe": cmd_transcribe,
         "render": cmd_render,
+        "send": cmd_send,
     }[args.command](args)
+
+    if result is not None:
+        _emit(result)
 
 
 if __name__ == "__main__":
