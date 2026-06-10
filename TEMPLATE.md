@@ -24,21 +24,23 @@ Neutrality is a property of the declaration, not of the whole capability. (Enfor
 
 Two questions place any piece of knowledge, and crossing them leaves no blurry middle:
 
-1. **Altitude** — is it *agnostic* (true for every project; ships once, in the framework or the CLI) or *project-specific* (true only here; a project asset)?
+1. **Altitude** — at what scope is it true? *Framework* (every capability; ships once in the doctrine, this template, the procedures), *capability* (this tool, every project; ships once with the capability — the CLI and its guides), or *project* (only here; a project asset).
 2. **Register** — is it *the product* (the knowledge itself, read and consumed) or *the meta* (how to author the product)?
 
-|  | The product | The meta — how to author it |
+|  | The product — read and consumed | The meta — how to author it |
 |---|---|---|
-| **Agnostic** | the CLI + `<name> help`; the global stub | the doctrine, this template, the procedures |
-| **Project-specific** | identifiers (values), reference (model), routines (procedure) | *— nearly empty —* |
+| **Framework** — every capability | *(none — the framework is meta)* | the doctrine, this template, the procedures, [SHEBANG.md](SHEBANG.md) |
+| **Capability** — this tool, every project | the CLI + `<name> help`; the global stub | the **guide** — `<name> guide [topic]`, fetched live (DOCTRINE rule 14) |
+| **Project** — only here | identifiers (values), reference (model), routines (procedure) | *— empty: authoring guidance is never project-specific —* |
 
-The bottom-right cell is nearly empty on purpose: authoring guidance does not vary by project — *how to write a good reference* is the same everywhere — so it collapses **up** into agnostic meta, written once by asset-type, never per capability. This is why there is **no usage-guide slot**: a per-capability "how to use this for my project" file straddles that empty cell, and its content is always really either the product (→ identifiers / reference / a routine) or agnostic meta (→ the framework). Procedure that is *executable* is a **routine**; procedure that is *the tool's surface* is the CLI's `help`; everything declarative is the **reference**.
+The project-meta cell is empty on purpose: authoring guidance never varies by project, so it always rises to one of the two agnostic homes — to **framework** meta when it holds for every capability (*how to write any reference* → this template), or to **capability** meta when it is specific to one tool (*how to author X with this tool* → that capability's guide, DOCTRINE rule 14). What does **not** exist is a *project-altitude* usage-guide: a per-project "how to use this here" file is always really the product (→ identifiers / reference / a routine) or it rises to one of those two meta homes. Procedure that is *executable* is a **routine**; procedure that is *the tool's surface* is the CLI's `help`; everything declarative and project-specific is the **reference**.
 
-## The five slots (+ one optional)
+## The five slots (+ two optional)
 
 | Slot | Lives in | Altitude | Holds |
 |---|---|---|---|
 | 1. Global context | the **stub** (`~/.capabilities/<name>/stub.md`, `@`-imported into the session) | global | tool awareness + how to load the full contract (`<name> help`) |
+| (opt) Guides | `~/.capabilities/<name>/guides/<topic>.md` in the registry, surfaced by `<name> guide` (fetched live) | capability | consumer-neutral *how to author X with this tool* docs; single upstream home (DOCTRINE rule 14); present only when the tool has authoring depth |
 | 2. Project context | the **capability file** (`.capabilities/<ns>/CAPABILITY.md`, surfaced by the project loader) | project | role/purpose **in this project** + a pointer list. Lightweight. |
 | 3. Pointers | the pointer list *inside* slot 2 | project | links to slots 4–5, loaded on demand — **the single home for those asset paths** (consumers address assets by role, not literal path; DOCTRINE rule 7) |
 | 4. Identifiers | `.capabilities/<ns>/identifiers.md` | project | **non-secret structural** values only: paths, folders, variable names, gids |
@@ -47,7 +49,7 @@ The bottom-right cell is nearly empty on purpose: authoring guidance does not va
 
 Reference (slot 5) **ships by default as a self-describing scaffold** — a body that states its own purpose — so the home is always present and labeled, and no agent has to rediscover whether it should exist or what belongs in it. Its resting state is empty: populate it only when genuine project context accrues, replacing the scaffold note with that content. An empty reference is conformant, not a gap; never invent content to fill it.
 
-There is no usage-guide slot. Procedure does not live with the capability: an *executable, repeatable* procedure is a **routine** in the consuming project, and a procedure that is merely *the tool's surface* is the CLI's own `<name> help`; the static model it applies stays in the reference (DOCTRINE rule 11). The always-present project assets are the capability file (slot 2), identifiers (slot 4), and the reference scaffold (slot 5); scripts are added only when the capability authors any.
+There is no *project-altitude* usage-guide slot — consumer-neutral *how to author X with this tool* guidance lives in the capability's **guide**, fetched live from its upstream home (DOCTRINE rule 14), never copied into a project. Procedure does not live with the capability either: an *executable, repeatable* procedure is a **routine** in the consuming project, and a procedure that is merely *the tool's surface* is the CLI's own `<name> help`; the static model it applies stays in the reference (DOCTRINE rule 11). The always-present project assets are the capability file (slot 2), identifiers (slot 4), and the reference scaffold (slot 5); scripts and guides are added only when the capability has them.
 
 ## How each altitude reaches the agent
 
@@ -57,6 +59,8 @@ A capability is *declared* in the registry and *surfaced* by a host-specific **i
 - **Project — generated rule.** A capability-agnostic `SessionStart` **script**, `.claude/hooks/build-capabilities-rule.sh`, writes `.claude/rules/CAPABILITIES.md` — a manifest of `@`-imports, one per `.capabilities/<ns>/CAPABILITY.md`. The harness auto-loads the rule file and expands the imports inline, so each stub loads **in full, uncapped** (a `SessionStart` hook echoing into the session is capped at ~10k characters; a rule file is not). That manifest is **written by the script, never authored or edited by the agent** — a capability is added by dropping its folder, and the script picks it up next session.
 
 The CLI reaches the agent by a third, host-neutral route: the executable is symlinked from `~/.capabilities/<name>/bin/<name>` onto `PATH`, so any session invokes `<name>` directly. A consuming project never copies the CLI — it calls the one centralized executable by name.
+
+Through that same CLI route, a capability's **guides** reach the agent: `<name> guide [topic]` resolves against the capability's upstream repo and prints the doc, fetched **live** (the request, cache, and fallback mechanics are the executable standard's — [SHEBANG.md](SHEBANG.md#guides)). The guide installs to the registry only and is never copied into a consuming project; a project's reference points to it by role (DOCTRINE rule 14).
 
 Another host swaps the two injections for its own equivalents; the registry folder and the CLI-on-PATH route stay the same.
 
