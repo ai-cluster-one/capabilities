@@ -2465,18 +2465,110 @@ def expenses_meta(as_json: bool, refresh: bool) -> None:
     click.secho("Expense account IDs: `simplbooks accounts list chart` (filter for 5xxx codes).", bold=True)
 
 
+def _expenses_show_view(html: str, as_json: bool) -> None:
+    """Render a purchase from its /purchases/view page — the read surface for
+    payment-locked invoices. The page shows display values: row account and
+    vat-type ids are not in its markup (the vat-type name rides in a tooltip)."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    pairs: dict[str, str] = {}
+    for grid in soup.select("div.summary-grid"):
+        cells = [d.get_text(" ", strip=True) for d in grid.find_all("div", recursive=False)]
+        for lab, val in zip(cells[::2], cells[1::2]):
+            pairs.setdefault(lab, val)
+
+    titles = [d.get_text(" ", strip=True) for d in soup.select("div.text-success.card-title")]
+    supplier_name = titles[0] if titles else ""
+    status = titles[2] if len(titles) > 2 else ""
+    link = soup.find("a", href=re.compile(r"/clients/view/(\d+)"))
+    supplier_id = re.search(r"/clients/view/(\d+)", link["href"]).group(1) if link else ""
+
+    rows: list[dict] = []
+    for t in soup.find_all("table"):
+        heads = [th.get_text(" ", strip=True) for th in t.find_all("th")]
+        if heads[:2] != ["Artikkel", "Kirjeldus"]:
+            continue
+        for tr in t.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 6:
+                continue
+            vat_el = tds[4].find(attrs={"title": True})
+            rows.append({
+                "name": tds[1].get_text(" ", strip=True),
+                "amount": tds[2].get_text(" ", strip=True),
+                "gross": tds[3].get_text(" ", strip=True),
+                "vat": tds[4].get_text(" ", strip=True),
+                "vat_type_name": vat_el["title"] if vat_el else "",
+                "net": tds[5].get_text(" ", strip=True),
+            })
+        break
+
+    info = {
+        "supplier_id": supplier_id,
+        "supplier_name": supplier_name,
+        "status": status,
+        "number": pairs.get("Arve number", ""),
+        "internal_number": pairs.get("Dokumendi number", ""),
+        "created": pairs.get("Arve kuupäev", ""),
+        "transaction_date": pairs.get("Kande kuupäev", ""),
+        "due": pairs.get("Maksetähtaeg", ""),
+        "currency": pairs.get("Valuuta", ""),
+        "net_total": pairs.get("Arve summa", ""),
+        "vat_total": pairs.get("Arve käibemaks", ""),
+        "gross_total": pairs.get("Arve kokku", ""),
+        "source": "view page (payment-locked; row account/vat-type ids not exposed)",
+    }
+
+    if as_json:
+        click.echo(json.dumps({**info, "rows": rows}, indent=2, ensure_ascii=False))
+        return
+
+    click.echo(f"Supplier : {info['supplier_name']} [{info['supplier_id']}]   status: {info['status']}")
+    click.echo(f"Number   : {info['number']}   (internal: {info['internal_number']})")
+    click.echo(f"Dates    : created {info['created']}  txn {info['transaction_date']}  due {info['due']}")
+    click.echo(
+        f"Totals   : net {info['net_total']}  VAT {info['vat_total']}  "
+        f"gross {info['gross_total']} {info['currency']}"
+    )
+    click.echo()
+    click.secho(f"{'#':<3} {'NAME':<40} {'VAT TYPE':<22} {'VAT%':<5} {'AMT':>6} {'NET':>12}", bold=True)
+    for i, rw in enumerate(rows, 1):
+        click.echo(
+            f"{i:<3} {rw['name'][:40]:<40} {rw['vat_type_name'][:22]:<22} {rw['vat']:<5} "
+            f"{rw['amount']:>6} {rw['net']:>12}"
+        )
+    click.echo()
+    click.echo("(read from the view page — invoice is payment-locked; "
+               "row account / vat-type ids are not exposed there)")
+
+
 @expenses.command("show")
 @click.argument("expense_id", type=int)
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
 def expenses_show(expense_id: int, as_json: bool) -> None:
-    """Read an existing purchase invoice's header + line items."""
+    """Read an existing purchase invoice's header + line items.
+
+    Reads the edit form, which carries the exact stored values including each
+    row's account and vat-type ids. A payment-bound invoice is locked out of
+    editing (SB redirects to its view page), so it is read from the rendered
+    view instead — same header data, but rows expose display values only.
+    """
     cookies, account = session_or_die()
     with build_http(cookies, account) as http:
-        r = http.get(f"{BASE}/{account}/purchases/add/{expense_id}")
+        r = http.get(f"{BASE}/{account}/purchases/edit/{expense_id}")
         if r.status_code in (301, 302):
-            raise click.ClickException(
-                f"Purchase {expense_id} not accessible (redirect → {r.headers.get('location','')})."
-            )
+            loc = r.headers.get("location", "")
+            if f"/purchases/view/{expense_id}" not in loc:
+                raise click.ClickException(
+                    f"Purchase {expense_id} not accessible (redirect → {loc})."
+                )
+            rv = http.get(f"{BASE}/{account}/purchases/view/{expense_id}")
+            if rv.status_code != 200:
+                raise click.ClickException(
+                    f"GET /purchases/view/{expense_id} → HTTP {rv.status_code}"
+                )
+            _expenses_show_view(rv.text, as_json)
+            return
         if r.status_code != 200:
             raise click.ClickException(f"HTTP {r.status_code}")
         soup = BeautifulSoup(r.text, "html.parser")
