@@ -45,6 +45,19 @@ Commands:
   asana task <task> [--with-subtasks]         Show one task in full; the flags
         [--with-deps]                         attach its subtasks and/or its
                                               dependencies + dependents inline.
+  asana task-context <task> [--json]          One call → the task plus everything
+                                              adjacent: description, comment
+                                              thread, attachment pointers,
+                                              dependencies one level deep (each
+                                              with its own description, thread,
+                                              attachments), dependents as state
+                                              lines. Emits a prompt-ready
+                                              markdown envelope stamped with its
+                                              assembly time (UTC); --json emits
+                                              the same tree structured. Built for
+                                              dispatch engines that hand a worker
+                                              its context instead of having it
+                                              discover the task by hand.
   asana create --name NAME --project P [...]  Create a task.
         [--project P ...]                     Add to more projects (repeatable).
         [--notes TEXT|-] [--assignee GID]     --notes '-' reads the body from
@@ -588,6 +601,100 @@ def cmd_task(c: httpx.Client, task: str, with_subtasks: bool = False,
         obj["dependencies"] = cmd_deps(c, tgid, dependents=False)
         obj["dependents"] = cmd_deps(c, tgid, dependents=True)
     return obj
+
+
+def _ts(iso: str | None) -> str:
+    """ISO8601 → compact minute-precision UTC: 2026-06-10T14:40:13.748Z → 2026-06-10 14:40Z."""
+    if not iso:
+        return "?"
+    return iso[:16].replace("T", " ") + "Z"
+
+
+def cmd_task_context(c: httpx.Client, task: str, as_json: bool = False):
+    """The task plus everything adjacent, in one call: description, comment thread,
+    attachment pointers, dependencies one level deep (each with its own description,
+    thread, attachments), dependents as state lines. Default output is a prompt-ready
+    markdown envelope stamped with its assembly time; --json emits the same tree.
+
+    Verbatim and complete by design — descriptions and comments are never truncated
+    (the thread is the durable trail a worker rebuilds from); attachments are
+    pointers (gid · name · uploaded), never content. One level of dependency depth:
+    a blocker's own blockers are out of scope."""
+    tgid = _gid(task)
+    fields = ("name,notes,completed,completed_at,assignee.name,due_on,due_at,"
+              "created_at,modified_at,external,"
+              "memberships.section.name,memberships.project.name")
+    obj = _request(c, "GET", f"/tasks/{tgid}", params={"opt_fields": fields})["data"]
+    obj["comments"] = cmd_comments(c, tgid, 100)
+    obj["attachments"] = cmd_attachments(c, tgid)
+    deps = cmd_deps(c, tgid, dependents=False)
+    for d in deps:
+        detail = _request(c, "GET", f"/tasks/{d['gid']}",
+                          params={"opt_fields": "name,notes,completed,completed_at,"
+                                  "assignee.name,due_on,created_at,modified_at"})["data"]
+        d.update(detail)
+        d["comments"] = cmd_comments(c, d["gid"], 100)
+        d["attachments"] = cmd_attachments(c, d["gid"])
+    obj["dependencies"] = deps
+    obj["dependents"] = cmd_deps(c, tgid, dependents=True)
+    assembled = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if as_json:
+        return {"assembled_at": assembled, "task": obj}
+    return _render_task_context(obj, assembled)
+
+
+def _render_task_context(t: dict, assembled: str) -> str:
+    def state(o: dict) -> str:
+        return f"DONE {_ts(o.get('completed_at'))}" if o.get("completed") else "OPEN"
+
+    def comment_block(comments: list, h: str) -> list[str]:
+        lines = [f"{h} Comments ({len(comments)})"]
+        for s in comments:
+            body = (s.get("text") or "").strip() or "(no text — see attachments)"
+            who = (s.get("created_by") or {}).get("name", "?")
+            lines += ["", f"[{_ts(s.get('created_at'))} · {who}] {body}"]
+        return lines
+
+    def attachment_block(atts: list, h: str) -> list[str]:
+        lines = [f"{h} Attachments ({len(atts)})"]
+        lines += [f"{a['gid']} · {a.get('name', '?')} · uploaded {_ts(a.get('created_at'))}"
+                  for a in atts]
+        return lines
+
+    out = [f"# Task {t['gid']} — {t.get('name', '')}"]
+    boards = [f"{(m.get('project') or {}).get('name', '?')} · Section: "
+              f"{(m.get('section') or {}).get('name', '?')}"
+              for m in t.get("memberships", [])]
+    if boards:
+        out.append(f"Board: {' / '.join(boards)} · {state(t)}")
+    else:
+        out.append(state(t))
+    meta = (f"Assignee: {(t.get('assignee') or {}).get('name', '—')}"
+            f" · Created: {_ts(t.get('created_at'))}"
+            f" · Modified: {_ts(t.get('modified_at'))}")
+    due = t.get("due_at") or t.get("due_on")
+    if due:
+        meta += f" · Due: {due}"
+    out.append(meta)
+    out.append(f"Assembled: {assembled} (UTC) — tracker snapshot at pickup; "
+               "live state may have moved since")
+    ext_data = (t.get("external") or {}).get("data")
+    if ext_data:
+        out.append(f"Machine state: {ext_data}")
+    out += ["", "## Description", (t.get("notes") or "").strip() or "(empty)"]
+    out += [""] + comment_block(t.get("comments", []), "##")
+    out += [""] + attachment_block(t.get("attachments", []), "##")
+    for d in t.get("dependencies", []):
+        out += ["", f"## Dependency {d['gid']} — {d.get('name', '')}",
+                f"{state(d)} · Assignee: {(d.get('assignee') or {}).get('name', '—')}",
+                "", "### Description", (d.get("notes") or "").strip() or "(empty)"]
+        out += [""] + comment_block(d.get("comments", []), "###")
+        out += [""] + attachment_block(d.get("attachments", []), "###")
+    dependents = t.get("dependents", [])
+    if dependents:
+        out += ["", f"## Dependents ({len(dependents)})"]
+        out += [f"- {x['gid']} — {x.get('name', '')} — {state(x)}" for x in dependents]
+    return "\n".join(out) + "\n"
 
 
 def cmd_create(c: httpx.Client, name: str, projects: list[str], notes: str | None,
@@ -1191,6 +1298,12 @@ def main() -> None:
     sp.add_argument("--with-deps", action="store_true",
                     help="attach the task's dependencies + dependents")
 
+    sp = sub.add_parser("task-context",
+                        help="task + comments + attachments + deps, one shaped envelope")
+    sp.add_argument("task", help="task GID or URL")
+    sp.add_argument("--json", action="store_true",
+                    help="emit the assembled tree as JSON instead of markdown")
+
     sp = sub.add_parser("create", help="create a task")
     sp.add_argument("--name", required=True)
     sp.add_argument("--project", action="append", required=True,
@@ -1452,6 +1565,8 @@ def main() -> None:
             _emit(cmd_tasks(c, args.project, args.all, args.limit))
         elif args.cmd == "task":
             _emit(cmd_task(c, args.task, args.with_subtasks, args.with_deps))
+        elif args.cmd == "task-context":
+            _emit(cmd_task_context(c, args.task, args.json))
         elif args.cmd == "create":
             notes_mode = "html" if args.html else "plain" if args.plain else "markdown"
             _emit(cmd_create(c, args.name, args.project, args.notes,
