@@ -23,6 +23,7 @@ from urllib.parse import urlencode, urlparse
 import click
 import httpx
 from bs4 import BeautifulSoup
+from decimal import Decimal, ROUND_HALF_UP
 
 # ─── Paths ──────────────────────────────────────────────────────────────────
 
@@ -216,6 +217,11 @@ Then re-run `simplbooks doctor` to confirm.
                                                 Create a purchase invoice
                                                 (ostuarve). --line is
                                                 repeatable, one per row.
+                                                --vat-total defaults to the
+                                                row-derived VAT total (0 when
+                                                all rows are 0%-rate); pass it
+                                                only to correct supplier
+                                                rounding gaps.
                                                 --attachment uploads a PDF.
                                                 Creator defaults to the logged-in
                                                 user (read from the form).
@@ -235,6 +241,10 @@ Then re-run `simplbooks doctor` to confirm.
                                                 Ümardamine cent-gap fixes
                                                 when the supplier's KOKKU
                                                 doesn't tie to net+VAT.
+
+  simplbooks expenses delete <purchase_id>      Delete a purchase invoice by id.
+                                                Irreversible; unbind bound
+                                                payments first.
 
   simplbooks expenses send-payment <purchase_id>
         [--amount AMT] [--from-account ID] [--date DD.MM.YYYY]
@@ -1068,7 +1078,8 @@ def sales_vat_types(http: httpx.Client, account: str, refresh: bool = False) -> 
 
 # ─── Utility helpers ────────────────────────────────────────────────────────
 
-def to_estonian_number(price) -> str:
+def normalize_number(price) -> str:
+    """Accept Estonian (comma-decimal) or plain numeric input; return a dot-decimal string."""
     s = str(price).strip()
     if "," in s and "." not in s:
         s = s.replace(" ", "").replace(",", ".")
@@ -1076,8 +1087,32 @@ def to_estonian_number(price) -> str:
         s = s.replace(",", "").replace(" ", "")
     else:
         s = s.replace(" ", "")
-    val = float(s)
+    return s
+
+
+def to_estonian_number(price) -> str:
+    val = float(normalize_number(price))
     return f"{val:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", " ")
+
+
+def compute_vat_total(lines: list[dict], row_sum_with_vat: bool) -> str:
+    """Row-derived VAT total: gross rows → sum·rate/(100+rate), net rows → sum·rate/100.
+
+    SB validates the posted Purchase[vat] against its own recalculation and rejects
+    values off by more than rounding (the field is meant for cent corrections only),
+    so the default must land on the row-derived figure, never 0.
+    """
+    total = Decimal("0")
+    for ln in lines:
+        rate = Decimal(normalize_number(ln.get("vat", "0") or "0"))
+        if rate == 0:
+            continue
+        s = Decimal(normalize_number(ln["sum"]))
+        if row_sum_with_vat:
+            total += s * rate / (100 + rate)
+        else:
+            total += s * rate / 100
+    return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def strip_html(value) -> str:
@@ -2621,7 +2656,10 @@ def build_purchase_fields(
 @click.option("--date", "invoice_date", required=True, help="Invoice date YYYY-MM-DD.")
 @click.option("--due", "due_date", default=None, help="Due date YYYY-MM-DD. Defaults to invoice date.")
 @click.option("--currency", default="EUR", show_default=True)
-@click.option("--vat-total", default="0", show_default=True, help="Total VAT amount, e.g. 0 for reverse-charge.")
+@click.option("--vat-total", default=None,
+              help="Total VAT amount. Defaults to the row-derived total (0 when all rows "
+                   "are 0%-rate, e.g. reverse-charge). Pass explicitly only to correct "
+                   "supplier rounding gaps.")
 @click.option("--rounding", default="0", show_default=True,
               help="Supplier's own rounding adjustment (the 'Ümardamine' row on the PDF). "
                    "Positive means SB's net+VAT total under-shoots the supplier's stated gross "
@@ -2642,7 +2680,7 @@ def build_purchase_fields(
 @click.option("--dry-run", is_flag=True,
               help="Resolve everything and print the payload WITHOUT creating the invoice.")
 def expenses_create(supplier_id: int, number: str, internal_number: str, invoice_date: str,
-                    due_date: str | None, currency: str, vat_total: str, rounding: str,
+                    due_date: str | None, currency: str, vat_total: str | None, rounding: str,
                     row_sum_with_vat: bool, lines_raw: tuple[str, ...], attachment_path: str | None,
                     reference: str, comments: str, creator: str, dry_run: bool) -> None:
     """Create a purchase invoice (ostuarve), optionally attaching the source PDF.
@@ -2684,6 +2722,12 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
 
     internal_number = internal_number or number
 
+    if vat_total is None:
+        vat_total = compute_vat_total(lines, row_sum_with_vat)
+        vat_label = f"{vat_total} (computed from rows)"
+    else:
+        vat_label = vat_total
+
     with build_http(cookies, account) as http:
         page = fetch_add_page(http, account, "purchases/add")
         csrf = csrf_from_page(page, "purchases/add")
@@ -2712,7 +2756,7 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
             click.echo(f"  Number   : {number}  (internal {internal_number})")
             click.echo(f"  Date     : {invoice_date}  due {due_date or invoice_date}")
             click.echo(f"  creator  : {fmap.get('data[Purchase][creator]')}  (--creator > logged-in user)")
-            click.echo(f"  Lines    : {len(lines)}  VAT total: {vat_total}")
+            click.echo(f"  Lines    : {len(lines)}  VAT total: {vat_label}")
             click.echo(f"  Attach   : {attachment_path or '(none)'}")
             return
 
@@ -2736,14 +2780,24 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
         click.secho(f"✓ Created expense {pid} (number {number})", fg="green", bold=True)
         click.echo(f"  Supplier : {supplier.get('name')} [{supplier_id}]")
         click.echo(f"  Date     : {invoice_date}")
-        click.echo(f"  Lines    : {len(lines)}  VAT total: {vat_total}")
+        click.echo(f"  Lines    : {len(lines)}  VAT total: {vat_label}")
         if attachment_path:
             click.echo(f"  Attached : {attachment_path}")
         click.echo(f"  URL      : {BASE}/{account}/purchases/view/{pid}")
         return
     fail = CONFIG_DIR / "last_expense_create_failure.html"
     fail.write_text(r.text)
-    raise click.ClickException(f"Create failed: HTTP {r.status_code}. Response saved → {fail}")
+    msgs = []
+    for raw_msg in re.findall(r'Flash\.(?:error|notice)\("([^"]*)"\)', r.text):
+        try:
+            msgs.append(json.loads(f'"{raw_msg}"'))
+        except ValueError:
+            msgs.append(raw_msg)
+    raise click.ClickException(
+        f"Create failed: HTTP {r.status_code}."
+        + (" SB says: " + " | ".join(msgs) if msgs else "")
+        + f" Response saved → {fail}"
+    )
 
 
 # ─── expenses update (edit existing purchase invoice) ───────────────────────
@@ -3100,6 +3154,15 @@ def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat
             _do_bind(kind, bid, [purchase_id])
             click.echo(f"  re-bound {kind.lower()} {bid} → purchase {purchase_id}")
     click.echo(f"  URL: {BASE}/{account}/purchases/view/{purchase_id}")
+
+
+@expenses.command("delete")
+@click.argument("purchase_id", type=int)
+def expenses_delete(purchase_id) -> None:
+    """Delete a purchase invoice (ostuarve) by id. Irreversible — removes the
+    document. Any bound payments should be unbound first."""
+    _do_delete("purchases", purchase_id, csrf_path="purchases/add")
+    click.secho(f"✓ Deleted expense {purchase_id}", fg="green")
 
 
 @expenses.command("send-payment")
