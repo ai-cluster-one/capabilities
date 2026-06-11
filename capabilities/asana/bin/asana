@@ -87,8 +87,10 @@ Commands:
                                               posts literal text; --html if the
                                               body is already Asana-subset HTML.
   asana comments <task> [--limit N]           List a task's comment stories
-                                              (text + created_at + author gid),
-                                              oldest first. The "did they reply?"
+                                              (text + created_at + author gid):
+                                              the N most recent, in chronological
+                                              order, from a walk of the FULL
+                                              story thread. The "did they reply?"
                                               read for the HITL resume check.
   asana follower-add <task> <user> [<user>…]  Subscribe users to a task (Asana
                                               `addFollowers`). This is what
@@ -782,10 +784,29 @@ def cmd_comment(c: httpx.Client, task: str, text: str, mentions: list[str],
 
 
 def cmd_comments(c: httpx.Client, task: str, limit: int) -> list:
-    stories = _request(c, "GET", f"/tasks/{_gid(task)}/stories",
-                       params={"opt_fields": "text,created_at,created_by.name,created_by.gid,type",
-                               "limit": limit})["data"]
-    return [s for s in stories if s.get("type") == "comment"]
+    """The N most recent comments, in chronological order.
+
+    Asana serves stories oldest-first with no sort option, so this walks the
+    full thread page by page before taking the tail. A first-page-only read
+    silently drops the newest comments once a task accumulates more stories
+    than one page holds (section moves, likes, attachments all count) — a
+    reader keyed on "did they reply?" then goes blind to exactly the replies
+    it is waiting for.
+    """
+    comments: list = []
+    offset: str | None = None
+    while True:
+        params: dict = {"opt_fields": "text,created_at,created_by.name,created_by.gid,type",
+                        "limit": 100}
+        if offset:
+            params["offset"] = offset
+        page = _request(c, "GET", f"/tasks/{_gid(task)}/stories", params=params)
+        comments += [s for s in page["data"] if s.get("type") == "comment"]
+        nxt = page.get("next_page")
+        if not nxt:
+            break
+        offset = nxt["offset"]
+    return comments[-limit:] if limit > 0 else comments
 
 
 def _followers(c: httpx.Client, task: str, users: list[str], op: str) -> dict:
