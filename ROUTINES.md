@@ -36,7 +36,7 @@ When in doubt: a *fact or model* is a capability's; a *sequence of actions* is a
 
 The doctrine ([DOCTRINE.md](DOCTRINE.md)) governs the shared ones: a routine is **self-contained and resolved by role** (rules 7, 8), holds **procedure, not model** (rule 11), and is **affirmative and self-contained** (rule 12). Two are routine-specific:
 
-1. **The description is load-bearing.** A routine's one-line description is surfaced into every session before its body is ever opened. It must state what the routine *does* and where its scope ends — affirmatively, in one line. It is how an agent decides whether to load the body. The surfacing is mechanical: a project-side `SessionStart` loader (`build-routines-rule.sh`, shipped and wired by [INSTALL.md](INSTALL.md)) regenerates an always-on `.claude/rules/ROUTINES.md` index from each `.routines/*.md` front matter — so dropping a routine file declares it next session, with no registry to edit and bodies staying on-demand.
+1. **The description is load-bearing.** A routine's one-line description is surfaced into every session before its body is ever opened. It must state what the routine *does* and where its scope ends — affirmatively, in one line. It is how an agent decides whether to load the body. The surfacing is mechanical: a project-side `SessionStart` loader (`build-routines-rule.sh`) regenerates an always-on `.claude/rules/ROUTINES.md` index from each `.routines/*.md` front matter — so dropping a routine file declares it next session, with no registry to edit and bodies staying on-demand.
 2. **Idempotent from the source.** A routine that mutates state derives "already done" from the system of record, not a local file, so re-running over an overlapping range is safe.
 
 ## The formalization ladder
@@ -72,4 +72,4 @@ model by role; resolve identifiers through the capability. State each step as an
 <What is done deterministically vs. what is escalated for a human decision, and how.>
 ```
 
-**Naming.** Capability-bound procedures take `<capability>-<verb>-<object>` (e.g. `gmail-mail-worker`); cross-cutting ones take a bare `<verb>-<object>` or a domain noun (e.g. `daily-digest`). The prefix groups routines in the sorted index by the system they drive.
+**Naming.** Capability-bound procedures take `<capability>-<verb>-<object>` (e.g. `mailbox-triage-inbox`); cross-cutting ones take a bare `<verb>-<object>` or a domain noun (e.g. `daily-digest`). The prefix groups routines in the sorted index by the system they drive.

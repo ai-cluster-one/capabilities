@@ -1,22 +1,23 @@
 # The capability template
 
-What a capability is **comprised of** — the slots it fills and how they are shaped. This is the doctrine ([DOCTRINE.md](DOCTRINE.md)) applied to structure: a case study in where each kind of knowledge lives. It is deliberately **abstract** — slots, not any one capability — so a new capability slots in without re-deciding the shape, and the validator has a fixed thing to check against. The behavioural invariants and how to validate them live in the doctrine; this file holds the form.
+What a capability is **comprised of** — the artifact it ships and the envelope it manages. This is the doctrine ([DOCTRINE.md](DOCTRINE.md)) applied to structure: a case study in where each kind of knowledge lives. It is deliberately **abstract** — slots, not any one capability — so a new capability slots in without re-deciding the shape, and `capabilities audit` has a fixed thing to check against. The behavioural invariants and how to validate them live in the doctrine; this file holds the form.
 
-## The mental model: two layers, hierarchical
+## The mental model: one artifact, two altitudes
+
+The **script is the sole shipped artifact**. Everything a capability declares about itself — its domain verbs, its awareness line, its machine-readable manifest, its documentation access, its identifier management, its gate — is a verb on that one file (the contract, [SHEBANG.md](SHEBANG.md#the-contract-verbs)). What surrounds the script is *managed*, not shipped: the manager snapshots its declaration into the registry at install, and the script maintains its project envelope where it is used. One artifact, one version, no skew between the pieces.
 
 A capability exists at two altitudes, and the split is the whole point:
 
-- **Global (machine-level)** — declared *just enough to be visible*. The agent learns the capability exists, what it broadly does, and how to load its full contract on demand. One install per host.
-- **Project (repo-level)** — *expansion*. A consuming project says how **it** uses the capability, stores **its** identifiers and mappings, and adds project-specific context or scripts. Per consuming project.
+- **Global (machine-level)** — declared *just enough to be visible*. One generated skill carries awareness of every installed capability; the full contract loads on demand (`<name> help`). One install per machine.
+- **Project (repo-level)** — *expansion*. A consuming project enables the capability, holds **its** settings and identifiers, and accrues **its** references. Per consuming project.
 
 Global is the introduction; project is the elaboration. A fact lives at exactly one altitude and is never restated at the other (DOCTRINE rules 1–2).
 
 **Neutrality is tiered.** Specifics earn their way *down* the slots; the declaration stays clean.
 
-- The **spec** (the doctrine, this template, the procedures) is **domain-neutral** — slots and rules, no example domain's fingerprints.
-- The **global stub** (slot 1) is **consumer-neutral** — install-once, identical for every project; it names the system and how to load its contract, nothing about any one consumer.
-- The **project capability file** (slot 2) carries the project's *framing* — what the capability is for this project, plus pointers — but not its detail.
-- **identifiers** (slot 4) and **reference** (slot 5) are where the **specifics live** — concrete values and the operational model. Domain terms here are not bleed; they are the point.
+- The **spec** (the doctrine, this template, [SHEBANG.md](SHEBANG.md)) is **domain-neutral** — slots and rules, no example domain's fingerprints.
+- The **declaration** (the `stub` line, the manifest) is **consumer-neutral** — identical for every project; it names the system and how to load its contract, nothing about any one consumer.
+- The **project envelope** (settings, identifiers, references) is where the **specifics live** — concrete values and the operational model. Domain terms here are not bleed; they are the point.
 
 Neutrality is a property of the declaration, not of the whole capability. (Enforced by DOCTRINE rules 2 and 10.)
 
@@ -24,77 +25,71 @@ Neutrality is a property of the declaration, not of the whole capability. (Enfor
 
 Two questions place any piece of knowledge, and crossing them leaves no blurry middle:
 
-1. **Altitude** — at what scope is it true? *Framework* (every capability; ships once in the doctrine, this template, the procedures), *capability* (this tool, every project; ships once with the capability — the CLI and its guides), or *project* (only here; a project asset).
+1. **Altitude** — at what scope is it true? *Framework* (every capability; ships once in the doctrine, this template, the executable standard), *capability* (this tool, every project; ships once in the script and its guides), or *project* (only here; the project envelope).
 2. **Register** — is it *the product* (the knowledge itself, read and consumed) or *the meta* (how to author the product)?
 
 |  | The product — read and consumed | The meta — how to author it |
 |---|---|---|
-| **Framework** — every capability | *(none — the framework is meta)* | the doctrine, this template, the procedures, [SHEBANG.md](SHEBANG.md) |
-| **Capability** — this tool, every project | the CLI + `<name> help`; the global stub | the **guide** — `<name> guide [topic]`, fetched live (DOCTRINE rule 14) |
-| **Project** — only here | identifiers (values), reference (model), routines (procedure) | *— empty: authoring guidance is never project-specific —* |
+| **Framework** — every capability | *(none — the framework is meta)* | the doctrine, this template, [SHEBANG.md](SHEBANG.md); the authoring procedures the manager emits (`capabilities new` / `conform` / `groom`) |
+| **Capability** — this tool, every project | the CLI + `<name> help`; the `stub` line | the **guide** — `<name> guide [topic]`, fetched live (DOCTRINE rule 14) |
+| **Project** — only here | settings + identifiers (values), references (model), routines (procedure) | *— empty: authoring guidance is never project-specific —* |
 
-The project-meta cell is empty on purpose: authoring guidance never varies by project, so it always rises to one of the two agnostic homes — to **framework** meta when it holds for every capability (*how to write any reference* → this template), or to **capability** meta when it is specific to one tool (*how to author X with this tool* → that capability's guide, DOCTRINE rule 14). What does **not** exist is a *project-altitude* usage-guide: a per-project "how to use this here" file is always really the product (→ identifiers / reference / a routine) or it rises to one of those two meta homes. Procedure that is *executable* is a **routine**; procedure that is *the tool's surface* is the CLI's `help`; everything declarative and project-specific is the **reference**.
+The project-meta cell is empty on purpose: authoring guidance never varies by project, so it always rises to one of the two agnostic homes — to **framework** meta when it holds for every capability (*how to write any reference* → this template), or to **capability** meta when it is specific to one tool (*how to author X with this tool* → that capability's guide, DOCTRINE rule 14). What does **not** exist is a *project-altitude* usage-guide: a per-project "how to use this here" file is always really the product (→ settings / identifiers / a reference / a routine) or it rises to one of those two meta homes. Procedure that is *executable* is a **routine**; procedure that is *the tool's surface* is the CLI's `help`; everything declarative and project-specific is a **reference**.
 
-## The five slots (+ two optional)
+## The slots
 
 | Slot | Lives in | Altitude | Holds |
 |---|---|---|---|
-| 1. Global context | the **stub** (`~/.capabilities/<name>/stub.md`, `@`-imported into the session) | global | tool awareness + how to load the full contract (`<name> help`) |
-| (opt) Guides | `~/.capabilities/<name>/guides/<topic>.md` in the registry, surfaced by `<name> guide` (fetched live) | capability | consumer-neutral *how to author X with this tool* docs; single upstream home (DOCTRINE rule 14); present only when the tool has authoring depth |
-| 2. Project context | the **capability file** (`.capabilities/<ns>/CAPABILITY.md`, surfaced by the project loader) | project | role/purpose **in this project** + a pointer list. Lightweight. |
-| 3. Pointers | the pointer list *inside* slot 2 | project | links to slots 4–5, loaded on demand — **the single home for those asset paths** (consumers address assets by role, not literal path; DOCTRINE rule 7) |
-| 4. Identifiers | `.capabilities/<ns>/identifiers.md` | project | **non-secret structural** values only: paths, folders, variable names, gids |
-| 5. Reference | `.capabilities/<ns>/reference.md` | project | project-specific operational **context** — the model (see below). Ships as a self-describing scaffold; populated on demand. |
-| (opt) Artifacts | `.capabilities/<ns>/scripts/` etc. | project | sources the capability authors (most have none) |
+| The script | `bin/<name>` upstream → registry copy at `~/.capabilities/<name>/bin/<name>`, symlinked onto `PATH` | capability | the whole shipped artifact: domain verbs + the contract verbs |
+| The declaration | verbs on the script — `stub`, `manifest --json` — snapshotted by the manager at install | capability | the one-line awareness text; the machine-readable manifest (name, summary, credential scope and keys, docs base, state flag) |
+| Guides *(opt)* | `guides/<topic>.md` beside the script upstream, surfaced by `<name> guide` fetched live | capability | consumer-neutral *how to author X with this tool* docs (DOCTRINE rule 14); present only when the tool has authoring depth |
+| Settings | `.capabilities/<name>/settings.json` — capability-owned, free shape | project | the non-secret values someone **chose**: base URLs, tenants, profiles, behavioural defaults |
+| Identifiers | `.capabilities/<name>/identifiers.json` — CLI-managed envelope, surfaced by `<name> ids` | project | the non-secret structural values the CLI **discovered**: ids, labels, classifications, breadcrumbs |
+| References | `.capabilities/<name>/*.md` — front-matter envelope + free prose, surfaced by `<name> refs` | project | the project-specific operational **model**: mappings, treatments, what output means here |
+| State | `.capabilities/<name>/state/` or `$XDG_STATE_HOME/<name>/`, per declared scope | project / user | what credentials mint: sessions, caches, pending logins. Never committed (DOCTRINE rule 16) |
+| Deviations *(opt)* | `deviations.md` beside the script upstream | capability | recorded, justified departures from the standard, kept apart so an audit reads them as choices |
 
-Reference (slot 5) **ships by default as a self-describing scaffold** — a body that states its own purpose — so the home is always present and labeled, and no agent has to rediscover whether it should exist or what belongs in it. Its resting state is empty: populate it only when genuine project context accrues, replacing the scaffold note with that content. An empty reference is conformant, not a gap; never invent content to fill it.
-
-There is no *project-altitude* usage-guide slot — consumer-neutral *how to author X with this tool* guidance lives in the capability's **guide**, fetched live from its upstream home (DOCTRINE rule 14), never copied into a project. Procedure does not live with the capability either: an *executable, repeatable* procedure is a **routine** in the consuming project, and a procedure that is merely *the tool's surface* is the CLI's own `<name> help`; the static model it applies stays in the reference (DOCTRINE rule 11). The always-present project assets are the capability file (slot 2), identifiers (slot 4), and the reference scaffold (slot 5); scripts and guides are added only when the capability has them.
+The project envelope's resting state is **empty**: `capabilities enable` writes the gate entry and nothing else. Settings appear when the project chooses values, identifiers when the CLI discovers them, references when genuine project context accrues. An empty envelope is conformant, not a gap; never invent content to fill it.
 
 ## How each altitude reaches the agent
 
-A capability is *declared* in the registry and *surfaced* by a host-specific **injection**: the declaration is host-neutral, the injection is the host's job. For the Claude Code host:
+The capability declares itself host-neutrally; the **manager owns the injection** (DOCTRINE rule 13). For the Claude Code host:
 
-- **Global — `@`-imported stub.** The stub markdown installs to `~/.claude/tools/<name>.md` and is listed once in the host's global `CLAUDE.md`; the harness expands that `@`-import inline into every session, so the stub's awareness line loads machine-wide. The stub carries **no front-matter** — an `@`-imported file expands verbatim, so it is a plain awareness paragraph, not a skill header. It is **awareness only**: what the tool is and to run `<name> help`. Whether the tool is *ready* in the current project is `<name> doctor`'s answer, never the stub's.
-- **Project — generated rule.** A capability-agnostic `SessionStart` **script**, `.claude/hooks/build-capabilities-rule.sh`, writes `.claude/rules/CAPABILITIES.md` — a manifest of `@`-imports, one per `.capabilities/<ns>/CAPABILITY.md`. The harness auto-loads the rule file and expands the imports inline, so each stub loads **in full, uncapped** (a `SessionStart` hook echoing into the session is capped at ~10k characters; a rule file is not). That manifest is **written by the script, never authored or edited by the agent** — a capability is added by dropping its folder, and the script picks it up next session.
+- **Global — the generated skill.** `~/.claude/skills/capabilities/SKILL.md`, regenerated on every install/uninstall/update, with the installed capability names embedded in its description — so naming a capability trigger-matches the skill in any session, with zero project context. The body teaches the protocol: the manager verbs, the contract verbs, the exit-4 rule.
+- **Project — the generated rule.** `capabilities context --claude`, wired by `capabilities init` as the project's single `SessionStart` hook line, composes `.claude/rules/CAPABILITIES.md` from the gate, the registry snapshots, and the project envelopes: per enabled capability, the stub line, the identifiers menu, the references menu, and the discovery pointers. Composition is files-only — no subprocess fan-out at session start — and degradation is per-capability, never whole: a broken envelope renders as a warning line, an enabled-but-not-installed capability as a one-line install pointer.
+- **CLI on `PATH`** — the host-neutral third route: the registry copy is symlinked onto `PATH`, so any session invokes `<name>` directly. A consuming project never copies the CLI.
 
-The CLI reaches the agent by a third, host-neutral route: the executable is symlinked from `~/.capabilities/<name>/bin/<name>` onto `PATH`, so any session invokes `<name>` directly. A consuming project never copies the CLI — it calls the one centralized executable by name.
+Through that same CLI route a capability's **guides** reach the agent: `<name> guide [topic]` resolves against the capability's declared docs base and prints the doc, fetched **live** (the request, cache, and fallback mechanics are the executable standard's — [SHEBANG.md](SHEBANG.md#guides)). A guide is never copied into a consuming project; a project's reference points to it by role (DOCTRINE rule 14).
 
-Through that same CLI route, a capability's **guides** reach the agent: `<name> guide [topic]` resolves against the capability's upstream repo and prints the doc, fetched **live** (the request, cache, and fallback mechanics are the executable standard's — [SHEBANG.md](SHEBANG.md#guides)). The guide installs to the registry only and is never copied into a consuming project; a project's reference points to it by role (DOCTRINE rule 14).
+The Codex host swaps the placement, not the composition: the same skill file at `~/.agents/skills/capabilities/`, and `capabilities context --codex` upserting the managed block in `AGENTS.md`. Another host swaps the injection while the registry and the CLI-on-`PATH` route stay the same.
 
-Another host swaps the two injections for its own equivalents; the registry folder and the CLI-on-PATH route stay the same.
+## Settings vs identifiers vs reference
 
-## What lives in identifiers vs. reference
+The three project homes split by **provenance and shape**:
 
-The two project assets split by *shape of knowledge*:
+- **settings — the values someone chose.** Configuration a human or agent decided at setup: base URLs, tenant handles, profiles, behavioural defaults, `secret_env` indirection. Free shape — the standard names the location; the capability owns the schema. Written at configuration time, by whoever configures.
+- **identifiers — the values the CLI discovered.** Discrete, lookup-able structural facts: ids, codes, account handles, labels, classifications, and breadcrumbs for values not yet pinned. The answer to *"what is the handle for X?"* Thin standard envelope (`{label: {value, note}}`) so the manager renders every capability's menu without understanding any of them; the CLI writes through `<name> ids set`. No prose narrative, no treatment (DOCTRINE rule 4).
+- **reference — the model and context.** The prose that is neither a value nor a step: how the system behaves, what its output represents, the mapping or treatment the consumer applies. The answer to *"how does this work, what does it mean, how is it handled?"* Domain-specific terms belong here freely — this is the slot that holds them.
 
-- **identifiers (slot 4) — the values.** Discrete, lookup-able structural facts: ids, codes, account/tenant handles, gids, paths, folder and variable names, the label or classification of each, and breadcrumbs for values not yet pinned. The answer to *"what is the handle for X?"* If it belongs in a key–value list or a table row, it's an identifier. No prose narrative, no how-to, no treatment (DOCTRINE rule 4).
-- **reference (slot 5) — the model and context.** The prose that is neither a value nor a step: how the system behaves, what its output represents, the operational model, the mapping or treatment the consumer applies. The answer to *"how does this work, what does it mean, how is it handled?"* Domain-specific terms belong here freely — this is the slot that holds them.
+Settings vs identifiers is a provenance split — different writer, different cadence, different git-diff meaning — never merged. The line for the rest: a **value** is settings' or identifiers'; an **explanation or model** is a reference's; a **step-by-step to perform a task** is a routine's — never a reference's (DOCTRINE rule 11).
 
-The line: a **value** (or a labelled set of values) is identifiers'; an **explanation or model** is the reference's; a **step-by-step to perform a task** is a routine's — never the reference's (DOCTRINE rule 11).
+## References: the envelope and growth
 
-## Project layout
+A reference is a markdown file in the capability's project folder, carrying a two-key front-matter envelope:
 
-In a consuming project, capability assets live under `.capabilities/<ns>/` — one folder per installed capability: the entry file `CAPABILITY.md` (slot 2) beside the slot assets (`identifiers.md`, `reference.md`, optional `scripts/`). `ls .capabilities/` lists the installed capabilities. At `SessionStart` the project's `.claude/hooks/build-capabilities-rule.sh` regenerates `.claude/rules/CAPABILITIES.md` — an `@`-import manifest the harness expands inline, so each `CAPABILITY.md` loads in full. Dropping a folder is the whole install.
+```markdown
+---
+name: <kebab-slug>
+description: <one line — what this reference holds>
+---
+```
 
-## When a slot outgrows one file
+`<name> refs` and the context build read only the front-matter; the body is free prose, loaded on demand. References are **per-topic files by design**: growth adds a sibling file with its own front-matter, and the menu grows with it — no index file to maintain, no slot to branch. The front-matter `description` is load-bearing the way a skill description is: it is how an agent decides whether to load the body.
 
-The slots above are **flat by default** — one `identifiers.md`, one `reference.md`. A capability whose project usage is small keeps them that way.
+## Credentials at install
 
-When a single slot's content grows past one coherent file, **branch that slot into a sibling `<slot>/` folder** of focused files, and keep the slot's `<slot>.md` at its canonical path as a **thin index** — a pointer list into the sub-files, nothing more. (So `reference.md` stays put and gains a `reference/` folder beside it; `reference/<topic>.md` holds the detail.) This is DOCTRINE rule 7 applied one level down:
+The manifest declares each credential key as `{key, secret, required, note}` and the capability's **scope** (`project` / `user`). `capabilities install` scaffolds accordingly — the key names with empty values land in the scope's home (project `.env` / user `credentials.env`), placeholders never secrets (DOCTRINE rule 6):
 
-- The capability file (slot 2) still addresses the slot **by role** ("the reference") — it never learns the sub-file names. Only the slot's index knows them.
-- Sub-files **within** a slot may link each other directly — they're declared together (the sibling allowance).
-- `(capability, slot)` stays a **computable address**: the index's path never moved, so every consumer that named "the X reference" keeps resolving — the index absorbs the fan-out. A sub-file's literal path must never leak past its index.
-
-Branch on genuine growth, not anticipation: a two-paragraph reference doesn't need a folder; a reference that has become five distinct topics does. Identifiers branch the same way when they earn it.
-
-## Template variables
-
-A capability declares its variables in its `manifest.md`, each classed by how it's resolved:
-
-- **discoverable** — the procedure can find it (e.g. infer the namespace from the project dir). Resolve and fill.
-- **must-confirm** — required, not safely guessable (e.g. a self-hosted service's base URL). The procedure **asks the user** before writing.
-- **leave-breadcrumb** — can't be discovered now and isn't blocking. Write the empty env key in its proper place so a future run / first real use stumbles on it with context nearby.
-
-A capability is **dysfunctional without its must-haves** — those are resolved (discovered or confirmed) at install; the rest become breadcrumbs.
+- A **required** key left empty is dysfunction `doctor` names at use-time — the remediation is discovered from the tool, not asserted in a doc.
+- An **optional** key scaffolds as a breadcrumb: the empty key sits in its proper place with its note nearby, so a future need stumbles on it with context.
+- A declared **post-install** step (e.g. a login ceremony) is offered at install, idempotent, never forced.

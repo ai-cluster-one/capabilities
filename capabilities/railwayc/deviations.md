@@ -15,7 +15,7 @@ For everything except `help` and `doctor`, railwayc inherits stdio and execs `ra
 A Railway project token is scoped to one project + one environment, so it has no sensible global home. Two of the four canonical tiers are dropped, and the **order of those that remain is preserved** (project files win over process env):
 
 - **No flag tier.** The token is a secret; per SHEBANG it simply omits its flag and resolves from the tiers below, so it never lands on `argv`.
-- **No user-config tier.** A token in `~/.config/railwayc/` would apply to *every* project as a fallback and silently mis-scope them — the opposite of the per-project isolation that is the whole point. So the token's home is the **consuming project's `.env`**, and there is no global credentials file to populate (the shipped `credentials.env.example` is a snippet for a project `.env`, documented as such).
+- **No user-config tier.** A token in `~/.config/railwayc/` would apply to *every* project as a fallback and silently mis-scope them — the opposite of the per-project isolation that is the whole point. So the token's home is the **consuming project's `.env`**, and there is no global credentials file to populate — the manifest declares `project` scope, and install scaffolds the key into the project `.env`.
 
 A one-shot override is therefore `RAILWAY_TOKEN=… railwayc …` (process env, tier 2), not a flag.
 

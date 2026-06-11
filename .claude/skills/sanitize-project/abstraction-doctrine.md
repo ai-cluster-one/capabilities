@@ -11,11 +11,11 @@ A concrete name is allowed **only** when it is the subject of a capability that 
 
 A name that **looks like it leaked from another project** is the thing to catch — it names something this repo does not itself contain.
 
-Even the native capability name stays out of files that declare themselves **capability-agnostic** — `TEMPLATE.md` and `procedures/**` describe slots and rules, not any one capability, so their examples use placeholders. The real name lives in the catalogue (`README.md`) and the capability's own folder.
+Even the native capability name stays out of files that declare themselves **capability-agnostic** — `TEMPLATE.md`, `SHEBANG.md`, and `DOCTRINE.md` describe slots and rules, not any one capability, so their examples use placeholders. The real name lives in the catalogue (`README.md`) and the capability's own folder.
 
 ## Values never appear
 
-No real token, key, URL-with-tenant, workspace id, gid, account number, IP, host, tax id, namespace, or person name lands anywhere in the tree. Instance templates carry placeholders (`<namespace>`, `<AGENT_IMAGE>`); credentials ship as `*.example` with empty values. (This reinforces `TEMPLATE.md` rules 4 and 6 — secrets to env, placeholders never secrets.)
+No real token, key, URL-with-tenant, workspace id, gid, account number, IP, host, tax id, namespace, or person name lands anywhere in the tree. Instance templates carry placeholders (`<namespace>`, `<AGENT_IMAGE>`); credentials ship as `*.example` with empty values. (This reinforces `DOCTRINE.md` rules 4 and 6 — secrets to env, placeholders never secrets.)
 
 ## Depersonalize
 
@@ -23,7 +23,7 @@ Examples speak of **a consuming project**, **the agent**, **the user** — never
 
 ## Affirmative and self-contained
 
-Say what a thing **is**, in the present. No defining by contrast ("unlike X", "never through Y"), no history ("formerly", "moved from"), no reaching over to explain a neighbouring system. Each file declares itself. (The audit procedure already checks this for capability instances; it holds for the doctrine surface too.)
+Say what a thing **is**, in the present. No defining by contrast ("unlike X", "never through Y"), no history ("formerly", "moved from"), no reaching over to explain a neighbouring system. Each file declares itself. (The doctrine's rule 12 Validate clause already checks this for capability instances; it holds for the doctrine surface too.)
 
 ## Placeholder vocabulary
 
@@ -34,5 +34,5 @@ Say what a thing **is**, in the present. No defining by contrast ("unlike X", "n
 
 ## Zones
 
-- **Public surface — abstract, and what this skill scrubs.** `README.md`, `TEMPLATE.md`, `LICENSE`, `procedures/**`, and every `<capability>/**` file. Capability files carry placeholders and name only their own subject service.
+- **Public surface — abstract, and what this skill scrubs.** `README.md`, `TEMPLATE.md`, `SHEBANG.md`, `DOCTRINE.md`, `ROUTINES.md`, `LICENSE`, `install.sh`, `bin/capabilities`, and every `<capability>/**` file. Capability files carry placeholders and name only their own subject service.
 - **Private working notes — left untouched.** `.assets/**` (backlog, plans, session recaps) is scratch, deliberately grounded in the cross-project conversations that produced it. It is **gitignored** so the published tree never carries it. The skill verifies that boundary; it does not rewrite the notes, because anonymizing a record of a real conversation would destroy the record.

@@ -2,24 +2,24 @@
 name: sanitize-project
 description: >-
   Keep this public, capability-agnostic repo free of specifics that leaked from
-  other projects. Scans the shipped doctrine surface (README, TEMPLATE,
-  procedures, capability folders) for foreign product/service/company/person/
+  other projects. Scans the shipped doctrine surface (README, TEMPLATE, SHEBANG,
+  the manager, capability folders) for foreign product/service/company/person/
   place names, domain terms, and real values used as illustrations — then
   anonymizes them to placeholders and role-nouns. Use when asked to "sanitize",
   "depersonalize", "anonymize the docs", "scrub leaks", or "check for leaked
   references"; and proactively before committing or pushing edits to README.md,
-  TEMPLATE.md, procedures/**, or any <capability>/** file.
+  TEMPLATE.md, SHEBANG.md, bin/capabilities, or any <capability>/** file.
 ---
 
 # Sanitize the project surface
 
-You are a **kind reviewer**, like the audit procedure: advisory by default, surgical when fixing. You keep the repo's shipped doctrine abstract and free of anything that looks like it leaked from another project. You surface findings, explain each, and propose the anonymization; you apply fixes only on the user's say-so (or when they invoked you to fix directly).
+You are a **kind reviewer**, like the audit: advisory by default, surgical when fixing. You keep the repo's shipped doctrine abstract and free of anything that looks like it leaked from another project. You surface findings, explain each, and propose the anonymization; you apply fixes only on the user's say-so (or when they invoked you to fix directly).
 
 The rules you enforce live in **[abstraction-doctrine.md](abstraction-doctrine.md)** — load it first. This file is the *procedure*; that file is the *invariant*.
 
 ## 0. Scope
 
-Sanitize the **public surface** only: `README.md`, `TEMPLATE.md`, `LICENSE`, `procedures/**`, and every `<capability>/**` file. Leave `.assets/**` alone — it is private, gitignored working notes (see the doctrine's Zones section).
+Sanitize the **public surface** only: `README.md`, `TEMPLATE.md`, `SHEBANG.md`, `DOCTRINE.md`, `ROUTINES.md`, `LICENSE`, `install.sh`, `bin/capabilities`, and every `<capability>/**` file. Leave `.assets/**` alone — it is private, gitignored working notes (see the doctrine's Zones section).
 
 ## 1. Sweep for specifics
 
@@ -36,7 +36,7 @@ Beyond the seed, read for: any product/company/service name, person or seat name
 
 Apply the doctrine's one judgment call:
 
-- **Native subject** — a capability that exists in this repo (catalogue + its own folder), or the service that capability wraps named *inside that folder*. **Allowed** — leave it. (In `TEMPLATE.md` / `procedures/**`, which declare themselves capability-agnostic, even the native name should become a placeholder — flag it as cosmetic.)
+- **Native subject** — a capability that exists in this repo (catalogue + its own folder), or the service that capability wraps named *inside that folder*. **Allowed** — leave it. (In `TEMPLATE.md` / `SHEBANG.md` / `DOCTRINE.md`, which declare themselves capability-agnostic, even the native name should become a placeholder — flag it as cosmetic.)
 - **Foreign leak** — a specific name used as an illustration that this repo does not itself contain. **Anonymize** to a placeholder (`<name>`, `<other>`, `<ns>`) or a role-noun ("a workflow engine", "a task tracker").
 - **Real value** — a token, key, URL-with-tenant, id, account, host, namespace, person. **Replace** with a placeholder; if it is a secret, confirm it belongs in env (`*.example` / `.env`), never a committed file.
 
