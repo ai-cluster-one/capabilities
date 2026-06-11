@@ -13,6 +13,14 @@ USAGE
   railwayc doctor                Prove the token resolves and report the project.
   railwayc help                  Print this contract.
 
+Contract commands (the same on every capability; railwayc's own, never forwarded):
+  railwayc stub                                 One-line awareness text.
+  railwayc manifest --json                      Machine-readable declaration.
+  railwayc guide [<topic>]                      Guide topics / one guide body.
+  railwayc ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
+           [--note <text>]                      (.capabilities/railwayc/identifiers.json).
+  railwayc refs                                 Menu of the project's reference files.
+
 Agent-invoked. Run `railwayc help` to reload this contract; run `railway help` (the
 real CLI) for the full command surface — railwayc does NOT re-document or re-map it.
 
@@ -22,8 +30,9 @@ MODEL
   front of `railway` and execs it. `railwayc logs -s web` runs `railway logs -s web`
   with RAILWAY_TOKEN set; stdout, stderr, and the exit code are railway's, passed
   through untouched, so streaming, --json, and colors behave exactly as in railway
-  itself. Only `help` and `doctor` are railwayc's own; every other word forwards
-  (`railwayc help <cmd>` forwards too, so railway's own help stays reachable).
+  itself. Only `help`, `doctor`, and the contract commands are railwayc's own; every
+  other word forwards (`railwayc help <cmd>` forwards too, so railway's own help
+  stays reachable).
 
   It REQUIRES a project token and never falls back to interactive login or this
   machine's account session — that refusal is the point: access stays scoped to the
@@ -67,7 +76,8 @@ EVERYTHING ELSE — forwarded verbatim to `railway`, token injected, I/O transpa
     run -- <cmd>                     run a local command with the environment's vars
 
 EXIT CODES (railwayc's own layer)
-  0 success · 2 auth (RAILWAY_TOKEN missing or rejected) · 5 environment (railway not
+  0 success · 2 auth (RAILWAY_TOKEN missing or rejected) · 4 disabled by project
+  policy (.capabilities/settings.json — ask the user) · 5 environment (railway not
   on PATH, or unreachable) · 6 input (bad use of a railwayc-owned command) · 7 wrong
   project (doctor: token ≠ RAILWAYC_EXPECT_PROJECT).
   Forwarded commands return RAILWAY's own exit code, not these — railwayc is
@@ -92,6 +102,32 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import NoReturn
+
+# --- Capability declaration (protocol 1) — one home for every contract fact --
+
+NAME = "railwayc"
+PROTOCOL = 1
+SUMMARY = ("Credential harness around the official `railway` CLI — resolves "
+           "a project-scoped Railway token, injects it, and forwards your "
+           "command straight to `railway` (everything but railwayc's own "
+           "verbs passes through untouched); the command surface is "
+           "`railway help`.")
+SCOPE = "project"   # credential scope: "project" | "user"
+CRED_KEYS = [
+    {"key": "RAILWAY_TOKEN", "secret": True, "required": True,
+     "note": "project-scoped token; lives in the consuming project's .env"},
+    {"key": "RAILWAYC_EXPECT_PROJECT", "secret": False, "required": False,
+     "note": "doctor asserts the token resolves to this project (name or id)"},
+]
+DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
+TOPICS: list = []   # shipped guide topics
+STATE = False       # True when the capability writes session/cache state
+POST_INSTALL: list = []
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / "railwayc" / "credentials.env"  # contract verbs only;
+# the token itself has no user-config tier (see deviations.md)
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
 TOKEN_NAME = "RAILWAY_TOKEN"
 EXPECT_PROJECT = "RAILWAYC_EXPECT_PROJECT"
@@ -142,23 +178,212 @@ def _parse_env_file(path: Path) -> dict:
     return out
 
 
-def _project_env() -> dict:
-    """Nearest project .env(.local), walking up from $CLAUDE_PROJECT_DIR (else cwd).
-    .env.local overrides .env. Stops at the first dir holding either, or a .git root."""
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding .capabilities/, .env(.local), or .git."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
     for d in (here, *here.parents):
-        if (d / ".env").exists() or (d / ".env.local").exists():
-            merged = _parse_env_file(d / ".env")
-            merged.update(_parse_env_file(d / ".env.local"))  # .local wins
-            return merged
-        if (d / ".git").is_dir():
-            break
-    return {}
+        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
 
 
 def _resolve(key: str) -> str | None:
     return _project_env().get(key) or os.environ.get(key) or None
+
+
+# --- Capability contract (protocol 1) — shared verbatim across capabilities --
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = root / ".capabilities" / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    root = _project_root()
+    return (root / ".capabilities" / NAME) if root is not None else None
+
+
+def _project_settings() -> dict:
+    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
+    envdir = _env_dir()
+    if envdir is None:
+        return {}
+    try:
+        return json.loads((envdir / "settings.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where .capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None and (root / ".capabilities").is_dir():
+            return root / ".capabilities" / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import httpx as _hx
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        resp = _hx.get(url, headers=headers, timeout=10.0, follow_redirects=True)
+        if resp.status_code == 200:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(resp.text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(resp.text); return
+        if resp.status_code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if resp.status_code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        raise _hx.HTTPError(f"upstream returned {resp.status_code}")
+    except _hx.HTTPError as e:
+        if cache.exists():
+            sys.stderr.write(json.dumps(
+                {"warning": f"upstream unreachable; serving cached copy ({e})"},
+                ensure_ascii=False) + "\n")
+            _emit(cache.read_text()); return
+        _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not envdir.parent.is_dir():
+            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    out = []
+    if envdir and envdir.is_dir():
+        for md in sorted(envdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    else:
+        return
+    sys.exit(0)
 
 
 # ── railway invocation ──────────────────────────────────────────────────────
@@ -234,6 +459,8 @@ def _forward(argv: list[str], token: str) -> NoReturn:
 # ── dispatch ────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    _gate()                      # every verb passes the project gate first
+    _contract(sys.argv[1:])      # contract verbs; everything else forwards
     argv = sys.argv[1:]
     if not argv or (len(argv) == 1 and argv[0] in ("help", "-h", "--help")):
         sys.stdout.write((__doc__ or "").lstrip("\n"))

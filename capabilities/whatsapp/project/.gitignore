@@ -1,5 +1,0 @@
-# Synced WhatsApp message data is project-owned runtime data, not capability
-# definition: personal history + media, mutable and potentially large/sensitive.
-# Kept out of version control. The definition around it (whatsapp.json, the docs)
-# is committed.
-messages/
