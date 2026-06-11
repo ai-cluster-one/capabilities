@@ -2645,6 +2645,29 @@ def _random_row_key() -> str:
     return str(random.randint(10**19, 10**20 - 1))
 
 
+def _page_errors(html: str) -> list[str]:
+    """SB's rendered error/warning banners: <div class="alert alert-danger|-warning">.
+
+    These banners are the server's real message channel for refused mutations
+    (rendered into an HTTP 200 page, or via session flash onto the next page
+    loaded). Flash.error("…") strings in page JS are static callback handlers
+    — never parse those for server outcomes. Hidden template banners (d-none /
+    display:none) don't count.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    out: list[str] = []
+    for div in soup.select("div.alert"):
+        classes = set(div.get("class") or [])
+        if not ({"alert-danger", "alert-warning"} & classes):
+            continue
+        if "d-none" in classes or "none" in (div.get("style") or ""):
+            continue
+        text = div.get_text(" ", strip=True)
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def build_purchase_fields(
     *,
     csrf: str,
@@ -2658,7 +2681,7 @@ def build_purchase_fields(
     vat_total: str,
     row_sum_with_vat: bool,
     rounding: str = "0",
-    reference: str = "",
+    payment_description: str = "",
     comments: str = "",
     creator: str | None = None,
 ) -> list[tuple[str, str]]:
@@ -2698,8 +2721,11 @@ def build_purchase_fields(
         ("data[Purchase][due]", due_dot),
         ("data[Purchase][currency_name]", currency_code),
         ("data[Purchase][currency_rate]", "1.0000"),
-        ("data[Purchase][reference]", reference),
-        ("data[Purchase][payment_description]", ""),
+        # reference is SB's Viitenumber — a checksummed numeric payment-reference
+        # field; free text in it makes the save fail. Free-form text belongs in
+        # payment_description (Makse kirjeldus).
+        ("data[Purchase][reference]", ""),
+        ("data[Purchase][payment_description]", payment_description),
         ("data[Purchase][client_account_no]", ""),
         ("data[Purchase][client_swift_code]", ""),
         ("data[Purchase][client_fill_missing_data]", "1"),
@@ -2763,7 +2789,9 @@ def build_purchase_fields(
               help="Repeatable. Format: acct=<account_id>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>")
 @click.option("--attachment", "attachment_path", type=click.Path(exists=True, dir_okay=False), default=None,
               help="PDF / image of the source invoice to attach.")
-@click.option("--reference", default="", help="Supplier reference text (free-form).")
+@click.option("--reference", default="",
+              help='Free-form supplier reference / payment note — lands in the form\'s '
+                   '"Makse kirjeldus" (payment description) field.')
 @click.option("--comments", "comments", default="",
               help='Lisainfo — free-text note shown on the invoice (the "Lisainfo" field, '
                    'the purchase-invoice equivalent of a sales invoice\'s Lisainfo).')
@@ -2837,7 +2865,7 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
             vat_total=vat_total,
             row_sum_with_vat=row_sum_with_vat,
             rounding=rounding,
-            reference=reference,
+            payment_description=reference,
             comments=comments,
             creator=creator,
         )
@@ -2879,12 +2907,7 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
         return
     fail = CONFIG_DIR / "last_expense_create_failure.html"
     fail.write_text(r.text)
-    msgs = []
-    for raw_msg in re.findall(r'Flash\.(?:error|notice)\("([^"]*)"\)', r.text):
-        try:
-            msgs.append(json.loads(f'"{raw_msg}"'))
-        except ValueError:
-            msgs.append(raw_msg)
+    msgs = _page_errors(r.text)
     raise click.ClickException(
         f"Create failed: HTTP {r.status_code}."
         + (" SB says: " + " | ".join(msgs) if msgs else "")
@@ -3058,7 +3081,8 @@ def _purchase_remove_all_bindings(purchase_id: int) -> None:
 @click.option("--rounding", default=None,
               help="Set the supplier's rounding-adjustment cents (positive or negative). "
                    "Use to close cent gaps when supplier's KOKKU doesn't tie to net+VAT.")
-@click.option("--reference", default=None, help="Replace the reference text.")
+@click.option("--reference", default=None,
+              help='Replace the free-form payment note (the "Makse kirjeldus" field).')
 @click.option("--add-line", "add_lines", multiple=True,
               help="Append a new line. Same format as `expenses create --line`: "
                    "acct=<id>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>[:amount=N][:unit=tk]")
@@ -3150,7 +3174,7 @@ def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat
         if rounding is not None:
             _set_field(fields, "data[Purchase][rounding]", to_estonian_number(rounding))
         if reference is not None:
-            _set_field(fields, "data[Purchase][reference]", reference)
+            _set_field(fields, "data[Purchase][payment_description]", reference)
 
         for raw in add_lines:
             ln = _parse_kv_line(raw)
@@ -3233,8 +3257,11 @@ def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat
         # 200 with a body might mean validation errors — sniff for them.
         fail = CONFIG_DIR / "last_expense_update_failure.html"
         fail.write_text(r.text)
+        msgs = _page_errors(r.text)
         raise click.ClickException(
-            f"Update may have failed silently (HTTP {r.status_code}, loc={loc!r}). Response → {fail}"
+            f"Update may have failed silently (HTTP {r.status_code}, loc={loc!r})."
+            + (" SB says: " + " | ".join(msgs) if msgs else "")
+            + f" Response → {fail}"
         )
     click.secho(f"✓ Updated purchase {purchase_id}", fg="green", bold=True)
     if set_lines:
@@ -3590,8 +3617,14 @@ def _list_kanne(search: str = "", limit: int = 200,
 
 
 def _do_delete(controller: str, obj_id: int, csrf_path: str) -> None:
-    """POST /<controller>/delete/<id> with CSRF — used by payments, incomings, kanne."""
+    """POST /<controller>/delete/<id> with CSRF — used by payments, incomings, kanne.
+
+    SB answers a refused delete (e.g. a payment-locked ostuarve) with an error
+    banner behind HTTP 200, so the status code proves nothing. Truth comes from
+    reading the object back: if its page still renders, the delete didn't happen.
+    """
     cookies, account = session_or_die()
+    probe_path = "edit" if controller == "financial_transactions" else "view"
     with build_http(cookies, account) as http:
         csrf = fetch_fresh_csrf(http, account, path=csrf_path)
         http.headers["Referer"] = f"{BASE}/{account}/{controller}"
@@ -3602,15 +3635,57 @@ def _do_delete(controller: str, obj_id: int, csrf_path: str) -> None:
             content=body,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-    if r.status_code not in (200, 302):
+        if r.status_code not in (200, 302):
+            fail = CONFIG_DIR / f"last_{controller}_delete_failure.html"
+            fail.write_text(r.text)
+            raise click.ClickException(
+                f"Delete failed: HTTP {r.status_code}. Response → {fail}"
+            )
+        errs = _page_errors(r.text)
+        rb = http.get(f"{BASE}/{account}/{controller}/{probe_path}/{obj_id}")
+    if rb.status_code == 200:
+        errs += [m for m in _page_errors(rb.text) if m not in errs]
         fail = CONFIG_DIR / f"last_{controller}_delete_failure.html"
-        fail.write_text(r.text)
+        fail.write_text(rb.text)
         raise click.ClickException(
-            f"Delete failed: HTTP {r.status_code}. Response → {fail}"
+            f"Delete refused — {controller}/{obj_id} still exists."
+            + (" SB says: " + " | ".join(errs) if errs else "")
+            + f" Response → {fail}"
+        )
+    if "accounts/login" in rb.headers.get("location", ""):
+        raise click.ClickException(
+            f"Delete unverified — session expired on the read-back of "
+            f"{controller}/{obj_id}; check its state by hand."
         )
 
 
-def _do_bind(direction: str, money_id: int, bind_ids: list[int]) -> None:
+def _parse_bound_docs(html: str, doc_path: str) -> dict[int, str]:
+    """Parse a payment/incoming view's bound-documents table.
+
+    Returns {document id: 'Katte summa' cell text} for each row linking to
+    /<doc_path>/view/<id> ('' if the column isn't found).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    href_re = re.compile(rf"/{doc_path}/view/(\d+)")
+    out: dict[int, str] = {}
+    for a in soup.find_all("a", href=href_re):
+        row = a.find_parent("tr")
+        table = a.find_parent("table")
+        if not (row and table):
+            continue
+        doc_id = int(href_re.search(a["href"]).group(1))
+        headers = [th.get_text(strip=True) for th in table.find_all("th")]
+        tds = row.find_all("td")
+        katte = ""
+        if "Katte summa" in headers:
+            idx = headers.index("Katte summa")
+            if idx < len(tds):
+                katte = tds[idx].get_text(strip=True).replace("\xa0", " ")
+        out[doc_id] = katte
+    return out
+
+
+def _do_bind(direction: str, money_id: int, bind_ids: list[int]) -> dict[int, str]:
     cookies, account = session_or_die()
     is_payment = direction == "Payment"
     money_key = "payment_id" if is_payment else "incoming_id"
@@ -3641,12 +3716,47 @@ def _do_bind(direction: str, money_id: int, bind_ids: list[int]) -> None:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
 
-    if r.status_code not in (200, 302):
-        fail = CONFIG_DIR / f"last_{direction.lower()}_bind_failure.html"
-        fail.write_text(r.text)
+        if r.status_code not in (200, 302):
+            fail = CONFIG_DIR / f"last_{direction.lower()}_bind_failure.html"
+            fail.write_text(r.text)
+            raise click.ClickException(
+                f"Bind failed: HTTP {r.status_code}. Response → {fail}"
+            )
+
+        # SB accepts a no-op binding (e.g. no free remainder) with HTTP 200 and
+        # at most an error banner, so read the money document back and verify
+        # each requested id actually got an allocation.
+        view_path = "payments" if is_payment else "incomings"
+        doc_path = "purchases" if is_payment else "invoices"
+        errs = _page_errors(r.text)
+        rb = http.get(f"{BASE}/{account}/{view_path}/view/{money_id}")
+
+    if rb.status_code != 200:
         raise click.ClickException(
-            f"Bind failed: HTTP {r.status_code}. Response → {fail}"
+            f"Bind unverified — GET {view_path}/view/{money_id} returned "
+            f"HTTP {rb.status_code}; check the binding by hand."
         )
+    errs += [m for m in _page_errors(rb.text) if m not in errs]
+    bound = _parse_bound_docs(rb.text, doc_path)
+
+    def _is_zero(text: str) -> bool:
+        try:
+            return _amount_float(text) == 0.0
+        except (ValueError, click.ClickException):
+            return False
+
+    missing = [b for b in bind_ids if b not in bound or _is_zero(bound[b])]
+    if missing:
+        fail = CONFIG_DIR / f"last_{direction.lower()}_bind_failure.html"
+        fail.write_text(rb.text)
+        raise click.ClickException(
+            f"Bind not applied — no allocation for {doc_path} {missing} on "
+            f"{view_path[:-1]} {money_id}."
+            + (" SB says: " + " | ".join(errs) if errs
+               else " (Typical cause: the money document has no free remainder.)")
+            + f" Response → {fail}"
+        )
+    return {b: bound[b] for b in bind_ids}
 
 
 @cli.group()
@@ -3704,8 +3814,10 @@ def payments_create(client_id, account_id, sum_amount, date_str, description, ob
               help="Purchase invoice id(s) to bind. Repeatable.")
 def payments_bind(payment_id, purchase_ids) -> None:
     """Link an outgoing payment to one or more purchase invoices."""
-    _do_bind("Payment", payment_id, list(purchase_ids))
-    click.secho(f"✓ Bound payment {payment_id} → purchases {list(purchase_ids)}", fg="green")
+    bound = _do_bind("Payment", payment_id, list(purchase_ids))
+    click.secho(f"✓ Bound payment {payment_id}", fg="green")
+    for pid, katte in bound.items():
+        click.echo(f"  purchase {pid}: allocated {katte or '?'}")
 
 
 @payments.command("delete")
@@ -3769,8 +3881,10 @@ def incomings_create(client_id, account_id, sum_amount, date_str, description) -
               help="Sales invoice id(s) to bind. Repeatable.")
 def incomings_bind(incoming_id, invoice_ids) -> None:
     """Link an incoming payment to one or more sales invoices."""
-    _do_bind("Incoming", incoming_id, list(invoice_ids))
-    click.secho(f"✓ Bound incoming {incoming_id} → invoices {list(invoice_ids)}", fg="green")
+    bound = _do_bind("Incoming", incoming_id, list(invoice_ids))
+    click.secho(f"✓ Bound incoming {incoming_id}", fg="green")
+    for iid, katte in bound.items():
+        click.echo(f"  invoice {iid}: allocated {katte or '?'}")
 
 
 @incomings.command("delete")
