@@ -10,6 +10,7 @@
 """simplbooks — agent-first CLI for the SimpleBooks accounting app."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -30,15 +31,305 @@ from decimal import Decimal, ROUND_HALF_UP
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CONFIG_DIR = _CONFIG_HOME / "simplbooks"
 CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
-CLIENTS_CACHE = CONFIG_DIR / "clients.json"
-SALES_META_CACHE = CONFIG_DIR / "sales_meta.json"
-PIN_STATE_FILE = CONFIG_DIR / ".pin_pending"
 BASE = "https://app.simplbooks.com"
 LOGIN_URL = "https://secure.simplbooks.com/accounts/login"
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/18.5 Safari/605.1.15"
 )
+
+# ─── Capability declaration (protocol 1) — one home for every contract fact ──
+
+NAME = "simplbooks"
+PROTOCOL = 1
+SUMMARY = ("SimpleBooks accounting CLI over a browser session (no public "
+           "API) — read clients/invoices/expenses/accounts/bank-transactions/"
+           "kanne, create invoices & purchase invoices, record payments/"
+           "incomings, post balanced journal entries, stage bank payment "
+           "orders, and process the PSD2 bank worklist. Stateful — run "
+           "`simplbooks doctor` first.")
+SCOPE = "project"   # credential scope: "project" | "user"
+CRED_KEYS = [
+    {"key": "SIMPLBOOKS_EMAIL", "secret": False, "required": True,
+     "note": "login email (primary — enables auto-recovery)"},
+    {"key": "SIMPLBOOKS_PASSWORD", "secret": True, "required": True,
+     "note": "login password (primary — enables auto-recovery)"},
+    {"key": "SIMPLBOOKS_BANK_ACCOUNT", "secret": False, "required": False,
+     "note": "own bank/cashbook id on sales invoices"},
+    {"key": "SIMPLBOOKS_WORKER", "secret": False, "required": False,
+     "note": "optional pin for the invoice line worker; else the logged-in user"},
+]
+DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
+TOPICS: list = []   # shipped guide topics
+STATE = True        # the live session + scrape caches live in the state home
+POST_INSTALL: list = []
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
+# ─── I/O contract (contract verbs; domain verbs are click-based) ─────────────
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value if value.endswith("\n") else value + "\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _die(exit_code: int, code: str, message: str, hint: str | None = None,
+         status: int | None = None):
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding .capabilities/, .env(.local), or .git."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    for d in (here, *here.parents):
+        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+# --- Capability contract (protocol 1) — shared verbatim across capabilities --
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = root / ".capabilities" / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    root = _project_root()
+    return (root / ".capabilities" / NAME) if root is not None else None
+
+
+def _project_settings() -> dict:
+    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
+    envdir = _env_dir()
+    if envdir is None:
+        return {}
+    try:
+        return json.loads((envdir / "settings.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where .capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None and (root / ".capabilities").is_dir():
+            return root / ".capabilities" / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import httpx as _hx
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        resp = _hx.get(url, headers=headers, timeout=10.0, follow_redirects=True)
+        if resp.status_code == 200:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(resp.text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(resp.text); return
+        if resp.status_code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if resp.status_code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        raise _hx.HTTPError(f"upstream returned {resp.status_code}")
+    except _hx.HTTPError as e:
+        if cache.exists():
+            sys.stderr.write(json.dumps(
+                {"warning": f"upstream unreachable; serving cached copy ({e})"},
+                ensure_ascii=False) + "\n")
+            _emit(cache.read_text()); return
+        _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not envdir.parent.is_dir():
+            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    out = []
+    if envdir and envdir.is_dir():
+        for md in sorted(envdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    else:
+        return
+    sys.exit(0)
+
+
+# ─── State homes (session, caches) ───────────────────────────────────────────
+
+def _identity_email() -> str:
+    """The login identity this invocation resolves to (no side effects)."""
+    return (_project_env_value("SIMPLBOOKS_EMAIL") or _read_cred("SIMPLBOOKS_EMAIL")
+            or os.environ.get("SIMPLBOOKS_EMAIL") or "")
+
+
+def _session_file(email: str | None = None) -> Path:
+    """The minted session's one home: a per-identity file in the state home, so
+    two identities sharing a fallback state dir never overwrite each other."""
+    if email is None:
+        email = _identity_email()
+    tag = hashlib.sha256(email.encode()).hexdigest()[:8] if email else "default"
+    return _state_dir() / f"session.{tag}.env"
+
+
+CLIENTS_CACHE = _state_dir() / "clients.json"
+SALES_META_CACHE = _state_dir() / "sales_meta.json"
+PIN_STATE_FILE = _state_dir() / ".pin_pending"
+
 
 # ─── Help (full agent contract) ─────────────────────────────────────────────
 
@@ -48,15 +339,15 @@ This tool is designed to be invoked by agents. Run `simplbooks help` to load
 the full usage contract on demand — do not rely on memorised knowledge of
 its surface.
 
-Credentials resolve from ONE store: the nearest project .env(.local) when it carries
-the login keys, else ~/.config/simplbooks/credentials.env (process env fills any gap —
-the deployed-box path). login/refresh persist ACCOUNT/COOKIE back to that same store, so
-a project that supplies its own EMAIL/PASSWORD keeps a self-contained session that never
-collides with another consumer's:
+Identity resolves through the cascade — project .env(.local), then
+~/.config/simplbooks/credentials.env, then process env:
   SIMPLBOOKS_EMAIL='user@example.com'         (primary — for auto-login)
   SIMPLBOOKS_PASSWORD='...'                   (primary — for auto-login)
-  SIMPLBOOKS_ACCOUNT=<32-char account hash>   (written by login/refresh)
-  SIMPLBOOKS_COOKIE='SB_APP_CSRF=...; ...'    (written by login/refresh)
+The minted session lives in its per-identity file in the state home
+(.capabilities/simplbooks/state/ in an initialized project, else
+$XDG_STATE_HOME/simplbooks/) — written by login/refresh, never into an env
+file. SIMPLBOOKS_ACCOUNT / SIMPLBOOKS_COOKIE stay readable from the cascade
+as the one-shot injection path (the deployed box).
 
 Account-specific config (resolved by the cascade: flag > project .env(.local) >
 this credentials.env > process env — so a consuming project can set these in its
@@ -384,11 +675,23 @@ Then re-run `simplbooks doctor` to confirm.
 Accepts '100', '100.00', '1234.50', '1234,50', '1 234,50'. Internally
 normalised to Estonian format ('1 234,50') for the SimpleBooks form.
 
+═══ Contract commands (the same on every capability) ═══════════════════════
+
+  simplbooks stub                                 one-line awareness text
+  simplbooks manifest --json                      machine-readable declaration
+  simplbooks guide [<topic>]                      guide topics / one guide body
+  simplbooks ids list|get <l>|set <l> <v>|rm <l>  the project identifiers envelope
+             [--note <text>]                      (.capabilities/simplbooks/identifiers.json)
+  simplbooks refs                                 menu of the project's reference files
+
 ═══ Exit codes ═════════════════════════════════════════════════════════════
 
   0  success
   1  generic error (validation, network, CSRF)
   2  auth (missing creds, login rejected, or PIN required — see message)
+  4  disabled by project policy (.capabilities/settings.json — ask the user,
+     never enable it yourself)
+  (contract verbs add 3 not-found / 5 network / 6 input)
 """
 
 # ─── Tax classification map ─────────────────────────────────────────────────
@@ -433,7 +736,7 @@ class AuthError(click.ClickException):
 
 
 # The four credential keys, in the order login/refresh persists them.
-CRED_KEYS = ("SIMPLBOOKS_EMAIL", "SIMPLBOOKS_PASSWORD", "SIMPLBOOKS_ACCOUNT", "SIMPLBOOKS_COOKIE")
+CASCADE_KEYS = ("SIMPLBOOKS_EMAIL", "SIMPLBOOKS_PASSWORD", "SIMPLBOOKS_ACCOUNT", "SIMPLBOOKS_COOKIE")
 
 
 def _clean_env_value(v: str) -> str:
@@ -447,31 +750,22 @@ def _clean_env_value(v: str) -> str:
 
 
 def load_credentials() -> dict[str, str]:
-    # Resolve the login keys from a single credential store, chosen by _cred_store_target:
-    # the project .env(.local) when that project supplies the login, else the global
-    # credentials.env. Process env then fills any key the store omits — the path the
-    # deployed box uses (creds injected as env vars, no file). Reading from one store keeps
-    # a project's identity from mixing with the global one.
+    """Identity (EMAIL/PASSWORD) resolves through the cascade — project .env(.local),
+    then the global credentials.env, then process env. The minted session
+    (ACCOUNT/COOKIE) resolves from its per-identity session file in the state home
+    first; the cascade stays available as the one-shot injection path (the deployed
+    box, an env-prefix invocation)."""
     out: dict[str, str] = {}
-    store = _cred_store_target()
-    if store == CREDENTIALS_ENV:
-        if CREDENTIALS_ENV.exists():
-            for line in CREDENTIALS_ENV.read_text().splitlines():
-                s = line.strip()
-                if not s or s.startswith("#") or "=" not in s:
-                    continue
-                k, _, v = s.partition("=")
-                out[k.strip()] = _clean_env_value(v)
-    else:
-        for key in CRED_KEYS:
-            v = _project_env_value(key)
-            if v:
-                out[key] = v
-    for key in CRED_KEYS:
-        if not out.get(key):
-            env_v = os.environ.get(key)
-            if env_v:
-                out[key] = env_v
+    for key in ("SIMPLBOOKS_EMAIL", "SIMPLBOOKS_PASSWORD"):
+        v = (_project_env_value(key) or _read_cred(key) or os.environ.get(key))
+        if v:
+            out[key] = v
+    session = _parse_env_file(_session_file(out.get("SIMPLBOOKS_EMAIL", "")))
+    for key in ("SIMPLBOOKS_ACCOUNT", "SIMPLBOOKS_COOKIE"):
+        v = (session.get(key) or _project_env_value(key) or _read_cred(key)
+             or os.environ.get(key))
+        if v:
+            out[key] = v
     if not out.get("SIMPLBOOKS_EMAIL") and not out.get("SIMPLBOOKS_COOKIE"):
         raise AuthError(
             f"No SimpleBooks credentials — neither {CREDENTIALS_ENV} nor the SIMPLBOOKS_*\n"
@@ -541,57 +835,6 @@ def _project_env_value(key: str) -> str | None:
         if d == home or d == d.parent:  # stop at $HOME or filesystem root
             break
     return None
-
-
-def _project_env_path() -> Path | None:
-    """The nearest project env file walking up from CWD to $HOME/root: .env.local if
-    present at that root, else .env. None if neither exists in range. This is the file
-    a project-scoped login reads from and writes its session back to."""
-    home = Path.home()
-    cwd = Path.cwd()
-    for d in (cwd, *cwd.parents):
-        local, base = d / ".env.local", d / ".env"
-        if local.is_file():
-            return local
-        if base.is_file():
-            return base
-        if d == home or d == d.parent:
-            break
-    return None
-
-
-def _cred_store_target() -> Path:
-    """The single credential store for this invocation: the nearest project .env(.local)
-    when that project opts into SimpleBooks login (carries SIMPLBOOKS_EMAIL or _COOKIE),
-    else the global credentials.env. Reads and session writes both use this one file, so
-    a project's login identity stays self-contained and never collides with another
-    consumer's in the shared global store."""
-    if _project_env_value("SIMPLBOOKS_EMAIL") or _project_env_value("SIMPLBOOKS_COOKIE"):
-        p = _project_env_path()
-        if p:
-            return p
-    return CREDENTIALS_ENV
-
-
-def _upsert_env_keys(path: Path, updates: dict[str, str]) -> None:
-    """Insert/replace `KEY='value'` lines in an existing env file, preserving every
-    other line, comment, and the file's order. Keys not already present are appended.
-    Used to write a session back into a project .env without disturbing its config."""
-    lines = path.read_text().splitlines() if path.exists() else []
-    remaining = dict(updates)
-    out: list[str] = []
-    for line in lines:
-        s = line.strip()
-        if s and not s.startswith("#") and "=" in s:
-            k = s.split("=", 1)[0].strip()
-            if k in remaining:
-                out.append(f"{k}='{remaining.pop(k)}'")
-                continue
-        out.append(line)
-    for k, v in remaining.items():
-        out.append(f"{k}='{v}'")
-    path.write_text("\n".join(out) + "\n")
-    os.chmod(path, 0o600)
 
 
 def _cfg(key: str, override: str | None = None) -> str | None:
@@ -780,47 +1023,17 @@ def _clear_pin_state() -> None:
 
 
 def _persist_session(cookies: dict[str, str], account: str) -> None:
-    """Persist the refreshed session (account hash + cookie) to the active credential
-    store — the project .env(.local) when the project supplies the login identity, else
-    the global credentials.env. Writing back to the same store the identity came from
-    keeps a project's session self-contained, so concurrent consumers of the shared tool
-    never overwrite each other's session."""
+    """Write the minted session (account hash + cookie) to its one home — the
+    per-identity session file in the state home. credentials.env and the project
+    .env are human-written only; a script never writes back into them."""
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    store = _cred_store_target()
-    if store == CREDENTIALS_ENV:
-        _persist_session_global(account, cookie_str)
-    else:
-        _upsert_env_keys(store, {"SIMPLBOOKS_ACCOUNT": account, "SIMPLBOOKS_COOKIE": cookie_str})
-
-
-def _persist_session_global(account: str, cookie_str: str) -> None:
-    """Rewrite the global credentials.env with fresh account/cookie; preserve EMAIL/PASSWORD.
-    This file is dedicated to SimpleBooks creds, so a clean rewrite (with the header) is safe."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    existing: dict[str, str] = {}
-    if CREDENTIALS_ENV.exists():
-        for line in CREDENTIALS_ENV.read_text().splitlines():
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, _, v = s.partition("=")
-            v = v.strip()
-            if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
-                v = v[1:-1]
-            existing[k.strip()] = v
-    existing["SIMPLBOOKS_ACCOUNT"] = account
-    existing["SIMPLBOOKS_COOKIE"] = cookie_str
-
-    lines = [
-        "# simplbooks credentials.",
-        "# Auto-login (primary): SIMPLBOOKS_EMAIL + SIMPLBOOKS_PASSWORD → `simplbooks login`.",
-        "# Fallback: paste a 'Copy as cURL' from DevTools → `simplbooks refresh PATH`.",
-    ]
-    for key in ("SIMPLBOOKS_EMAIL", "SIMPLBOOKS_PASSWORD", "SIMPLBOOKS_ACCOUNT", "SIMPLBOOKS_COOKIE"):
-        if key in existing:
-            lines.append(f"{key}='{existing[key]}'")
-    CREDENTIALS_ENV.write_text("\n".join(lines) + "\n")
-    os.chmod(CREDENTIALS_ENV, 0o600)
+    sf = _session_file()
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    sf.write_text(
+        "# simplbooks live session — written by login/refresh. Never commit.\n"
+        f"SIMPLBOOKS_ACCOUNT='{account}'\n"
+        f"SIMPLBOOKS_COOKIE='{cookie_str}'\n")
+    os.chmod(sf, 0o600)
 
 
 def auto_login_attempt(interactive: bool = False) -> bool:
@@ -5035,5 +5248,11 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
     click.echo(f"  Counter    : COA {counter_account} ({counter_side})  {effective_sum} EUR")
 
 
-if __name__ == "__main__":
+def main() -> None:
+    _gate()                      # every verb passes the project gate first
+    _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
     cli()
+
+
+if __name__ == "__main__":
+    main()
