@@ -134,10 +134,14 @@ def _warn(message: str) -> None:
 
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding .capabilities/, .env(.local), or .git."""
+    the first directory holding .capabilities/, .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
+    home = Path.home().resolve()
     for d in (here, *here.parents):
+        if d == home:
+            return None
         if ((d / ".capabilities").is_dir() or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
@@ -708,7 +712,8 @@ def _wire_claude_hook(root: Path) -> bool:
 
 
 def cmd_init(claude: bool, codex: bool) -> None:
-    root = _require_project()
+    # init ESTABLISHES the project root: an existing root wins, else cwd.
+    root = _project_root() or Path.cwd().resolve()
     _ensure_envelope(root)
     result: dict = {"project": str(root),
                     "gate": str(root / GATE_REL)}

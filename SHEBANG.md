@@ -180,10 +180,14 @@ Every verb — `help` and `doctor` included — passes the project gate before d
 ```python
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding .capabilities/, .env(.local), or .git."""
+    the first directory holding .capabilities/, .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
+    home = Path.home().resolve()
     for d in (here, *here.parents):
+        if d == home:
+            return None
         if ((d / ".capabilities").is_dir() or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
