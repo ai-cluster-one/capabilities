@@ -15,6 +15,8 @@ ssh -i <key> <user>@<host> "docker exec -i $(docker ps -q --filter ancestor=<AGE
 
 Whatever the box can do, the script consumes through the box's CLI.
 
+**This extends to reasoning, not just service calls.** A script whose step needs judgment must not re-encode that judgment in its own TypeScript — that duplicates doctrine into the harness, where it rots out of sync with the routine that owns it. Instead it **boots the box's `claude` headless with a high-level orientation prompt** and lets the agent load the routine and do the step. The harness stays thin — transport, a budget cap, optionally a session resume — and reconciles only the facts the agent can't self-measure from inside its run (the run's cost, its own session id). The second example below is this shape in code.
+
 ## The SSH bridge
 
 Every script connects with the `ssh2` library, reading three folder-scoped variables — `agent_ssh_host`, `agent_ssh_user`, `agent_ssh_key` — then `docker exec -i`s into the container.
@@ -28,6 +30,8 @@ Every script connects with the `ssh2` library, reading three folder-scoped varia
 - **Self-contained per file.** Windmill has no cross-script imports — the SSH/quoting/`box` helpers are duplicated in each script by design. Don't factor them into a shared module.
 - **Stable non-secret ids are constants at the top.** They aren't secrets, and a script can't read the project's reference files at runtime.
 - **Secrets only via Windmill variables.** Read at runtime with `await wmill.getVariable("f/<namespace>/<name>")`. Never inline a key in source.
+- **Bounded step, deliberate timeout.** A job runs one step to completion with no mid-execution yielding; pick `--timeout` at deploy to fit the job's real worst case (it hard-kills overruns). Never poll-and-wait inside a job.
+- **Language is `bun`** by default — match what the script is written for at deploy.
 
 ## Example — the minimal SSH-dispatch skeleton
 
