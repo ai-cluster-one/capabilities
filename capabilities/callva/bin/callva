@@ -14,19 +14,58 @@ agents, assets (prompts), calls, transcripts, recordings, analytics, custom
 fields, webhook schedules, automations (Windmill scripts), webhook logs,
 variables, settings, projects, phone numbers, and providers.
 
-Credentials resolve through the standard cascade — flags > a project
-.env(.local) > $XDG_CONFIG_HOME/callva/credentials.env > the process env;
-first non-empty wins:
-  CALLVA_API_KEY=<your CallVA API key>   secret — never passed on argv
-  CALLVA_API_URL=<base URL>              optional; default
-                                         https://api.callva.one/api/v1
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`, resolved by the cascade (first non-empty wins):
+    1. flags          --api-url (non-secret only; a secret never has a flag)
+    2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
+    3. settings       .capabilities/callva/settings.json (flat key: api_url —
+                      non-secret keys only; the API key never resolves here)
+    4. user config    $XDG_CONFIG_HOME/callva/credentials.env (default ~/.config/callva/)
+    5. process env    CALLVA_API_KEY / CALLVA_API_URL
+  Same CALLVA_* keys at every tier; the project you're in wins, process env is
+  the fallback (so a deployed host's injected env governs when no config file
+  is present). Never pass the key on the command line.
+    CALLVA_API_KEY=<your CallVA API key>   secret — never passed on argv
+    CALLVA_API_URL=<base URL>              optional; default
+                                           https://api.callva.one/api/v1
+
+  A project that talks to several CallVA tenants declares them in
+  <project>/.capabilities/callva/connections.json:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "api_url": "https://api.example.com/api/v1",
+          "secret_env": "CALLVA_<ID>_API_KEY",
+          "allow_write": true
+        }
+      }
+    }
+  Only the API key is secret: the entry names the env var holding it
+  ("secret_env"); the value resolves through the cascade (project .env(.local)
+  → user credentials.env → process env). "api_url" is optional — absent, the
+  default base URL applies. "allow_write": false makes the connection
+  read-only: every mutating verb (the create/update/delete/batch/store/
+  reorder/deploy/run actions on agents, assets, calls, transcripts, fields,
+  field-groups, schedules, automations, and variables, plus the outbound
+  `call`) exits 4, and no flag lifts the gate.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
 
 Global options (accepted anywhere on the line — before or after the command):
   --full              return the full, unfiltered API response (list endpoints
                       are slimmed to the agent-useful fields by default)
+  --connection <id>   select a registry connection (optional with a default
+                      pointer or a sole entry)
   --key-env <KEY>     resolve the API key from a different env/cred KEY (default
-                      CALLVA_API_KEY) — act as a different CallVA account/tenant.
-                      Only the key NAME travels; the value never touches argv.
+                      CALLVA_API_KEY; with a registry connection it overrides
+                      that entry's secret_env) — act as a different CallVA
+                      account/tenant. Only the key NAME travels; the value
+                      never touches argv. It never lifts a connection's write
+                      gate.
   --api-url <URL>     override the base URL for this invocation
 
 Output is JSON on stdout. List endpoints are slimmed to the fields an agent
@@ -35,9 +74,13 @@ return the full resource. `recordings stream` writes binary audio.
 
 Commands (`-f key=value` is repeatable for list filters):
 
-  doctor                              authenticated round-trip — proves the key
+  connections                         where every connection's values resolve
+                                      from (tier, source, secrets masked).
+                                      Local only — no network.
+  doctor [--connection <id>]          authenticated round-trip — proves the key
                                       resolves, the API is reachable, and what
-                                      project the key sees
+                                      project the key sees — every connection,
+                                      or one
   help                                print this contract
 
   agents list [--is-active B]
@@ -162,9 +205,6 @@ Contract commands (the same on every capability):
   callva refs                                 Menu of the project's reference
                                               files for this capability.
 
-Project settings: non-secret config (e.g. api_url) may live in
-.capabilities/callva/settings.json; a project .env still overrides it.
-
 I/O contract:
   - Success: JSON on stdout, exit 0.
   - Error:   {"error": {"code", "message", "hint"?, "status"?}} on stderr,
@@ -174,8 +214,9 @@ Exit codes:
   0  success
   2  auth (missing / rejected credentials, 401 / 403)
   3  not found (404)
-  4  disabled by project policy (.capabilities/settings.json — ask the user,
-     never enable it yourself)
+  4  policy refusal — the project gate (.capabilities/settings.json) on any
+     verb, or a write verb on a read-only connection (allow_write: false).
+     Ask the user; never lift a gate yourself.
   5  server / network (timeout, connection error, 429 after retries, 5xx)
   6  input / validation (malformed argument, bad payload, 400 / 422)
 """
@@ -202,7 +243,7 @@ MAX_RETRIES = 3
 # --- Capability declaration (protocol 1) — one home for every contract fact --
 
 NAME = "callva"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("CallVA voice-AI platform CLI over the External API — "
            "read/create/update/delete agents, assets (prompts), calls, "
            "transcripts, recordings, call analytics, custom fields, webhook "
@@ -215,6 +256,22 @@ CRED_KEYS = [
     {"key": "CALLVA_API_URL", "secret": False, "required": False,
      "note": "API base URL; default https://api.callva.one/api/v1"},
 ]
+WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platform
+    "agents update", "agents delete",
+    "assets create", "assets update", "assets delete",
+    "calls create", "calls update", "calls delete", "calls batch",
+    "transcripts store", "transcripts delete",
+    "call",
+    "fields create", "fields update", "fields delete",
+    "field-groups create", "field-groups update", "field-groups delete",
+    "field-groups reorder", "field-groups add-field", "field-groups remove-field",
+    "field-groups reorder-fields", "field-groups update-field",
+    "schedules create", "schedules update", "schedules delete",
+    "automations create", "automations update", "automations delete",
+    "automations deploy", "automations run",
+    "variables create", "variables update", "variables delete",
+}
+WRITE_DEFAULT = True    # writes stay inside a tenant the consumer owns
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = False       # True when the capability writes session/cache state
@@ -280,37 +337,6 @@ def _project_env() -> dict:
     merged = _parse_env_file(root / ".env")
     merged.update(_parse_env_file(root / ".env.local"))  # .local wins
     return merged
-
-
-def _resolve(key: str, default: str | None = None) -> str | None:
-    """Resolve a non-secret value by key name: project .env(.local), then the
-    project settings envelope (key minus the NAME_ prefix, lowercased), then
-    user config, then process env."""
-    return (_project_env().get(key)
-            or _project_settings().get(key.removeprefix(NAME.upper() + "_").lower())
-            or _parse_env_file(CREDENTIALS_ENV).get(key)
-            or os.environ.get(key)
-            or default)
-
-
-def _load_api_key(key_name: str) -> str:
-    """Resolve the CallVA API key by env-var NAME through the cascade — a project
-    .env(.local), then ~/.config/callva/credentials.env, then the process env;
-    first non-empty wins. The key value never travels on the command line; only
-    --key-env selects which NAME holds it (default CALLVA_API_KEY)."""
-    tok = (_project_env().get(key_name)
-           or _parse_env_file(CREDENTIALS_ENV).get(key_name)
-           or os.environ.get(key_name)
-           or "").strip()
-    if tok:
-        return tok
-    if key_name == "CALLVA_API_KEY":
-        _die(2, "missing_api_key",
-             f"CALLVA_API_KEY not found in a project .env, {CREDENTIALS_ENV}, or the environment",
-             "add CALLVA_API_KEY=<your CallVA API key> to the user config or a project .env")
-    _die(2, "missing_api_key",
-         f"{key_name} not found in a project .env, {CREDENTIALS_ENV}, or the environment",
-         f"add {key_name}=<key> to the user config or a project .env to use --key-env {key_name}")
 
 
 # --- Capability contract (protocol 1) — shared verbatim across capabilities --
@@ -490,9 +516,204 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Connections  (named, complete resolutions of the credential keys)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _resolve_key_default(key: str) -> tuple[str | None, str | None, Path | None]:
+    """The implicit default connection's resolution for non-secret keys:
+    project .env(.local) → settings envelope (flat keys — callva's recorded
+    extension) → user credentials.env → process env. Returns (value, tier,
+    source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    sval = _project_settings().get(key.removeprefix("CALLVA_").lower())
+    if sval:
+        envdir = _env_dir()
+        return str(sval), "settings", (envdir / "settings.json") if envdir else None
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
+                api_url_flag: str | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection. Returns (conn, problem) — problem is an
+    error dict ({"exit", "code", "message", "hint"?}) instead of a die, so
+    doctor can report every connection rather than stopping at the first."""
+    if entry is None:   # the implicit default — flat keys through the cascade
+        key_env = key_env_override or "CALLVA_API_KEY"
+        api_key = _resolve_env_key(key_env)[0]
+        if not api_key:
+            return None, {
+                "exit": 2, "code": "missing_api_key",
+                "message": f"{key_env} not found in a project .env, "
+                           f"{CREDENTIALS_ENV}, or the environment",
+                "hint": f"set {key_env} in a project .env(.local), "
+                        f"{CREDENTIALS_ENV}, or the environment — or declare a "
+                        f"connections registry (.capabilities/{NAME}/connections.json)"}
+        base = (api_url_flag or _resolve_key_default("CALLVA_API_URL")[0]
+                or DEFAULT_API_URL)
+        return {"id": cid, "allow_write": WRITE_DEFAULT, "key_env": key_env,
+                "api_key": api_key, "base": base.rstrip("/")}, None
+    key_env = key_env_override or entry.get("secret_env")
+    if not key_env:
+        return None, {"exit": 6, "code": "no_secret_env",
+                      "message": f"connection {cid!r} is missing 'secret_env'"}
+    api_key = _resolve_env_key(key_env)[0]
+    if not api_key:
+        return None, {
+            "exit": 2, "code": "missing_secret",
+            "message": f"env var {key_env} (for connection {cid!r}) is unset",
+            "hint": f"set {key_env} in the project's .env / .env.local, "
+                    f"{CREDENTIALS_ENV}, or the environment"}
+    base = api_url_flag or entry.get("api_url") or DEFAULT_API_URL
+    return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "key_env": key_env, "api_key": api_key, "base": base.rstrip("/")}, None
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            resolver = _resolve_env_key if k["secret"] else _resolve_key_default
+            value, tier, source = resolver(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        value = entry.get("api_url")
+        keys.append(_key_report("api_url", False, False,
+                                str(value) if value is not None else None,
+                                "connection", reg_path))
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys.append(_key_report(secret_env, True, True, value, tier, source))
+        else:
+            keys.append(_key_report("secret_env", False, True, None, None, None))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
 
 
 # ---------------------------------------------------------------------------
@@ -1482,17 +1703,56 @@ def providers_types(_args):
 # ===================================================================
 
 
-def cmd_doctor(_args):
-    """Cheapest authenticated round-trip: prove the key resolves and the API is reachable."""
-    data = api("GET", "/external/projects", query={"per_page": "1"})
-    projects = data.get("data") or []
-    return {
-        "ok": True,
-        "base_url": _STATE["base"],
-        "key_env": _STATE["key_env"],
-        "projects_visible": len(projects),
-        "sample_project": (projects[0].get("name") if projects else None),
-    }
+def _check_connection(conn: dict) -> dict:
+    """One connection's round-trip, reported rather than died — doctor covers
+    every connection, so a broken one becomes a finding, not a stop."""
+    out: dict = {"base_url": conn["base"], "key_env": conn["key_env"]}
+    try:
+        resp = httpx.get(conn["base"] + "/external/projects",
+                         params={"per_page": "1"},
+                         headers={"Authorization": f"Bearer {conn['api_key']}"},
+                         timeout=TIMEOUT)
+        if resp.status_code >= 400:
+            cat = 2 if resp.status_code in (401, 403) else 5
+            return out | {"ok": False, "category": cat,
+                          "error": f"/external/projects returned {resp.status_code}"}
+        projects = resp.json().get("data") or []
+        return out | {"ok": True, "projects_visible": len(projects),
+                      "sample_project": (projects[0].get("name") if projects else None)}
+    except httpx.RequestError as e:
+        return out | {"ok": False, "category": 5, "error": f"network error: {e}"}
+    except ValueError as e:
+        return out | {"ok": False, "category": 5, "error": f"bad response: {e}"}
+
+
+def cmd_doctor(reg: dict | None, wanted: str | None,
+               key_env_override: str | None, api_url_flag: str | None) -> None:
+    """Every connection bare; one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category.
+    key_env_override (--key-env) feeds _build_conn, overriding each examined
+    entry's secret_env."""
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        conn, problem = _build_conn(cid, entry, key_env_override, api_url_flag)
+        if problem:
+            res = {"ok": False, "category": problem["exit"],
+                   "error": problem["message"]}
+            if problem.get("hint"):
+                res["hint"] = problem["hint"]
+        else:
+            res = _check_connection(conn)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
 
 
 # ===================================================================
@@ -1824,7 +2084,6 @@ def build_parser():
 # ===================================================================
 
 DISPATCH = {
-    "doctor": cmd_doctor,
     "agents": {
         "list": agents_list, "default": agents_default, "get": agents_get,
         "update": agents_update, "delete": agents_delete,
@@ -1884,11 +2143,13 @@ DISPATCH = {
 
 
 def _extract_globals(argv):
-    """Pull --full / --key-env / --api-url (and a legacy --json no-op) out of argv so
-    they work in any position. The API key value never appears here — only its NAME."""
+    """Pull --full / --key-env / --api-url / --connection (and a legacy --json
+    no-op) out of argv so they work in any position. The API key value never
+    appears here — only its NAME."""
     full = False
-    key_env = "CALLVA_API_KEY"
+    key_env = None       # --key-env override; None = not passed
     api_url = None
+    connection = None    # --connection; accepted anywhere on argv
     cleaned = []
     i = 0
     while i < len(argv):
@@ -1905,15 +2166,19 @@ def _extract_globals(argv):
             api_url = argv[i + 1]; i += 2; continue
         if a.startswith("--api-url="):
             api_url = a.split("=", 1)[1]; i += 1; continue
+        if a == "--connection" and i + 1 < len(argv):
+            connection = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            connection = a.split("=", 1)[1]; i += 1; continue
         cleaned.append(a); i += 1
-    return cleaned, full, key_env, api_url
+    return cleaned, full, key_env, api_url, connection
 
 
 def main():
     global FULL
     _gate()                      # every verb passes the project gate first
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
-    cleaned, FULL, key_env, api_url = _extract_globals(sys.argv[1:])
+    cleaned, FULL, key_env, api_url, wanted_conn = _extract_globals(sys.argv[1:])
 
     if not cleaned or cleaned[0] == "help":
         sys.stdout.write((__doc__ or "").lstrip("\n"))
@@ -1921,13 +2186,24 @@ def main():
 
     args = build_parser().parse_args(cleaned)
 
-    api_key = _load_api_key(key_env)
-    base = (api_url or _resolve("CALLVA_API_URL") or DEFAULT_API_URL).rstrip("/")
+    reg, _ = _connections_registry()
+    if args.resource == "doctor":
+        cmd_doctor(reg, wanted_conn, key_env, api_url)
+        return
 
-    with _client(api_key, base) as client:
+    cid, entry = _select_connection(reg, wanted_conn)
+    verb = (f"{args.resource} {args.action}"
+            if getattr(args, "action", None) else args.resource)
+    conn, problem = _build_conn(cid, entry, key_env, api_url)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"],
+             problem.get("hint"))
+    _write_gate(cid, conn["allow_write"], verb)   # before any client exists
+
+    with _client(conn["api_key"], conn["base"]) as client:
         _STATE["client"] = client
-        _STATE["base"] = base
-        _STATE["key_env"] = key_env
+        _STATE["base"] = conn["base"]
+        _STATE["key_env"] = conn["key_env"]
 
         handler = DISPATCH.get(args.resource)
         if callable(handler):

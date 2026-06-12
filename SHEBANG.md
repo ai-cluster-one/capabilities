@@ -1,6 +1,6 @@
 # The shebang CLI
 
-What a capability's **executable** is comprised of — the code shape every `bin/<name>` fills. The script is the capability's **sole distributed artifact**: one self-contained file carrying its domain verbs and the **contract verbs** that make it self-describing and self-gating. This file is the contract's specification — the verbs and their output shapes, the shared code patterns (the project walk, the gate, the credential cascade, state resolution), the I/O envelope, and the exit codes. The behavioural invariants — the credential cascade, identity-freedom, discoverable knowledge, host-neutrality — and how to validate them live in the doctrine ([DOCTRINE.md](DOCTRINE.md)); this file holds the **code patterns that realize them**, distilled from the CLIs that already embody them so a new executable slots in without re-deriving the house style.
+What a capability's **executable** is comprised of — the code shape every `bin/<name>` fills. The script is the capability's **sole distributed artifact**: one self-contained file carrying its domain verbs and the **contract verbs** that make it self-describing and self-gating. This file is the contract's specification — the verbs and their output shapes, the shared code patterns (the project walk, the gate, the credential cascade, connection selection, state resolution), the I/O envelope, and the exit codes. The behavioural invariants — the credential cascade, identity-freedom, discoverable knowledge, host-neutrality — and how to validate them live in the doctrine ([DOCTRINE.md](DOCTRINE.md)); this file holds the **code patterns that realize them**, distilled from the CLIs that already embody them so a new executable slots in without re-deriving the house style.
 
 A capability's CLI is the **only** thing a consuming project runs — symlinked onto `PATH` by the manager, knowing nothing of hosts or sibling capabilities — so its surface, its contract, and its failure behaviour are the capability's public API. The patterns below are what make that API uniform across every tool an agent picks up.
 
@@ -22,12 +22,13 @@ The `-S` passes `--script` through `env`; the `# /// script` block is PEP-723 in
 
 ## The contract verbs
 
-Every script implements the same contract verbs alongside its domain verbs. The contract is **protocol 1** — this document is its specification — and it is a **spec, never a shared runtime library**: each script realizes it by copying the patterns in this file, and `capabilities audit` verifies conformance by calling the verbs and validating output shapes. No script imports from the manager, so a manager update can never break a deployed script.
+Every script implements the same contract verbs alongside its domain verbs. The contract is **protocol 2** — this document is its specification — and it is a **spec, never a shared runtime library**: each script realizes it by copying the patterns in this file, and `capabilities audit` verifies conformance by calling the verbs and validating output shapes. No script imports from the manager, so a manager update can never break a deployed script.
 
 | Verb | Returns |
 |---|---|
 | `help` | The full usage contract (the module docstring), verbatim. |
-| `doctor` | The cheapest authenticated round-trip; proves credentials, reachability, identity. |
+| `doctor` | The cheapest authenticated round-trip, per connection; proves credentials, reachability, identity. |
+| `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no network. |
 | `stub` | The one-line awareness text. |
 | `manifest --json` | The machine-readable declaration (schema below). |
 | `guide` / `guide <topic>` | The menu of upstream guides / one guide's body, fetched live from the docs base. |
@@ -38,12 +39,14 @@ The declaration facts feed the contract from **constants at the top of the scrip
 
 ```python
 NAME = "asana"
-PROTOCOL = 1        # contract version this script implements
+PROTOCOL = 2        # contract version this script implements
 SUMMARY = "Asana CLI over the REST API — list/read/create tasks, comment, complete."
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "ASANA_TOKEN", "secret": True, "required": True, "note": "personal access token"},
 ]
+WRITE_VERBS = {"create", "comment", "complete"}   # domain verbs that mutate the remote system
+WRITE_DEFAULT = True    # a connection's allow_write when its entry is silent; False when writes leave the system
 DOCS_BASE = "https://raw.githubusercontent.com/<org>/capabilities/main/capabilities/asana/guides/"
 TOPICS = ["authoring", "boards"]    # [] when no guides ship; DOCS_BASE "" likewise
 STATE = False       # True when the capability writes session/cache state
@@ -85,7 +88,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 ```json
 {
   "name": "asana",
-  "protocol": 1,
+  "protocol": 2,
   "summary": "Asana CLI over the REST API — list/read/create tasks, comment, complete.",
   "credentials": {
     "scope": "project",
@@ -130,7 +133,8 @@ Everything the capability reads and writes in a consuming project lives under `.
 
 ```
 .capabilities/<name>/
-  settings.json       # capability-owned, free shape: non-secret project config
+  settings.json       # capability-owned, free shape: connection-independent project config
+  connections.json    # the connections registry — standard envelope (see Connections)
   identifiers.json    # the identifiers envelope, managed by the ids verbs
   state/              # capability-written; never committed
   *.md                # references: front-matter envelope + free prose
@@ -138,7 +142,7 @@ Everything the capability reads and writes in a consuming project lives under `.
 
 (`.capabilities/settings.json` — one level up — is the manager-owned gate; the script only ever reads it.)
 
-- **`settings.json`** — the non-secret values that drive this capability in this project: base URLs, tenants, workspace/folder, profiles, behavioral defaults, `secret_env` indirection where the secret's *key name* is configurable. The standard names the location and the file name; the capability owns the schema.
+- **`settings.json`** — the non-secret, connection-independent values that drive this capability in this project: behavioral defaults, default folders, tuning. The standard names the location and the file name; the capability owns the schema. Per-connection wiring is the connections registry's ([below](#connections)).
 
 - **`identifiers.json`** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). A thin standard envelope — label → `{ value, note }` — so any reader can render the menu without understanding the capability; capability-specific structure lives inside values:
 
@@ -173,7 +177,7 @@ The `ids` verbs manage the identifiers envelope:
 
 `ids set` creates `.capabilities/<name>/` on demand **inside an existing `.capabilities/`**; in a project with no `.capabilities/` envelope it exits 6, naming `capabilities init` as the remediation.
 
-## The gate
+## The project gate
 
 Every verb — `help` and `doctor` included — passes the project gate before dispatch. The gate reads one file, the manager-owned `.capabilities/settings.json` at the project root, resolved by the same walk everything project-scoped shares:
 
@@ -285,6 +289,139 @@ A missing required value fails through `_die` with the exact remediation for bot
 
 A capability whose secret is not a flat token resolves it in its own shape — keyed indirectly through a config file, or persisted after a login exchange — but the **tiers and their order are preserved**: an explicit override beats project config beats user config beats process env, resolved by deterministic code. The shape may vary; the order may not.
 
+## Connections
+
+Every capability resolves its configuration as **connections** — named, complete resolutions of its credential keys. The model is universal; cardinality is a runtime fact of the consuming project, never a declared trait. A project with no registry has exactly **one implicit connection, `default`**, resolved by the bare cascade above — which is what keeps a deployed box, where only injected env exists, resolving with zero files.
+
+More than one endpoint or identity is declared in the **connections registry** — a standard envelope, written at configuration time by whoever configures, read by the script. The registry resolves through two homes, **first found wins, never merged**:
+
+1. **Project** — `.capabilities/<name>/connections.json`: the project's own endpoints and identities.
+2. **User** — `$XDG_CONFIG_HOME/<name>/connections.json` (default `~/.config/<name>/`): machine-level identities, the shape for personal-account tools whose connections are a fact of the machine, not of any one project.
+
+Whichever registry is found is **authoritative**: it fully defines the connection set, the implicit default does not exist beside it, and the other home is not consulted.
+
+```json
+{
+  "default": "billing",
+  "connections": {
+    "billing": { "address": "billing@example.com", "imap_host": "mail.example.com",
+                 "secret_env": "MAILBOX_BILLING_APP_PASSWORD" },
+    "intake":  { "address": "intake@example.com",  "imap_host": "mail.example.com",
+                 "secret_env": "MAILBOX_INTAKE_APP_PASSWORD", "allow_write": false }
+  }
+}
+```
+
+The envelope is the standard's; the entry **interior** is the capability's (hosts and ports for an IMAP tool; url and workspace for a REST tool). Two field names are reserved in every entry:
+
+- **`secret_env`** — a secret never sits in the registry. The entry names the env key holding it, and that key's *value* resolves through cascade tiers 2–4 exactly as any secret does — the registry namespaces the key, the cascade resolves it. A capability with several secrets names each through its own `*_env` field.
+- **`allow_write`** — the connection's write gate ([below](#the-write-gate)). Absent falls to the capability's declared `WRITE_DEFAULT`.
+
+Non-secret values sit literally in the entry: they are chosen, committed, per-connection project config — the per-connection counterpart of settings.
+
+### Selection
+
+One flag selects, accepted by every domain verb: `--connection <id>`. A capability may accept a native alias beside it (`--mailbox <id|address>`); the standard flag always works. Resolution is deterministic, refusing ambiguity rather than guessing:
+
+```python
+def _connections_registry() -> dict | None:
+    """The connections envelope: project envelope first, else the user config
+    home. First found wins; None when neither declares one."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            reg = json.loads(path.read_text())
+        except (OSError, ValueError) as e:
+            _die(6, "bad_config", f"cannot read {path}: {e}")
+        if not isinstance(reg.get("connections"), dict) or not reg["connections"]:
+            _die(6, "bad_config", f"{path} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return reg
+    return None
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 f"no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; pass --connection <id>",
+         f"known: {', '.join(conns)}")
+```
+
+`default` is a **pointer, not an entry**: connection ids are stable identities — state keys, log lines, `--connection` arguments — and which one is default is policy that moves without renaming anything. The pointer makes two defaults structurally impossible.
+
+### The write gate
+
+A connection without `"allow_write": true` resolves its writability from two declarations: the entry's own `allow_write`, else the capability's **`WRITE_DEFAULT`**. A connection that resolves to `false` is a **source**: read verbs run, write verbs exit 4. The script declares which of its domain verbs mutate the remote system in one constant — `WRITE_VERBS` — and refuses at dispatch, after selection, before any credential resolves:
+
+```python
+def _write_gate(conn_id: str, conn: dict | None, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not (conn or {}).get("allow_write", WRITE_DEFAULT):
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+```
+
+`WRITE_DEFAULT` is the capability's word on what silence means, declared once in the script: `True` for tools whose writes stay inside a system the consumer owns (a task tracker, an automation instance); **`False` when a write leaves the system** — messages a human, sends mail, moves money. Under `WRITE_DEFAULT = False`, writing is granted per connection, deliberately, in a committed registry entry — the implicit default connection cannot write at all, so a deployed box that must send carries a registry naming its writing identity. The refused write is the ceremony: exit 4 at the moment of intent routes the grant decision to the human with the exact remediation in hand.
+
+The principle: **the cascade resolves values; a gate is not a value.** No flag, no env var, no tier overrides the gate — it reads from the two declarations alone, and the exit-4 envelope routes the decision to the human, exactly as the project gate does. Exit 4 is the policy-refusal code in both.
+
+### `connections` — the resolution report
+
+`<name> connections` prints where every value of every connection resolves from — the programmatic answer to *"which credentials is this using, and from where?"*. It is **purely local**: resolution only, no network, no authentication attempt (readiness stays `doctor`'s question). The report always carries the same shape, the implicit default included, so a consumer never branches on cardinality:
+
+```json
+{
+  "default": "billing",
+  "connections": {
+    "billing": {
+      "allow_write": true,
+      "keys": [
+        { "key": "address", "secret": false, "required": true, "set": true,
+          "tier": "connection", "source": "/path/.capabilities/mailbox/connections.json",
+          "value": "billing@example.com" },
+        { "key": "MAILBOX_BILLING_APP_PASSWORD", "secret": true, "required": true, "set": true,
+          "tier": "project", "source": "/path/.env.local", "value": "…k9f3" }
+      ]
+    }
+  }
+}
+```
+
+Per key: `set` — a non-empty value resolved; `tier` — `connection` (literal in the registry entry), `project` (`.env`/`.env.local`), `user` (`credentials.env`), or `env` (process env); `source` — the winning file's absolute path, `null` for process env. A flag override is per-invocation and never part of the report. An unset required key reports `"set": false` with the same remediation `doctor` would name. `allow_write` is the **effective** value — the entry's, else `WRITE_DEFAULT` applied.
+
+A non-secret value prints in full. A secret prints **masked** — `…` plus the last 4 characters, fully masked (`"****"`) when shorter than 8 — one fixed rule, never a per-capability choice:
+
+```python
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+```
+
 ## Identity-free
 
 A shared tool bakes in no consumer's identity — no person, company, tenant, account, or host-with-tenant **value** (DOCTRINE rule 10). The consumer supplies those through the cascade; the tool refers to them by role. Config-key *names* (`<NAME>_API_KEY`, `<NAME>_WORKSPACE`) are structural and belong in the script; the *values* never do. This holds in the help text too: examples use placeholders (`user@example.com`, `<PERSON>`), never a real name or address. A default that would otherwise hardcode a consumer (an author or actor name, a default identity) is sourced from env/config with no baked-in fallback — absent the value, the tool asks for it rather than assuming one.
@@ -306,6 +443,10 @@ def _state_dir() -> Path:
 
 - **Project scope** → `<root>/.capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, session maps, each project isolated to its own account session. The manager-owned `.capabilities/.gitignore` is what guarantees `*/state/` never commits — a session cookie is a secret, so the guard is a precondition: project state lands inside the envelope only where `.capabilities/` already exists. Anywhere else — a home directory, a server, cron, an unwired repo — state falls back to the user state home and ad-hoc use keeps working.
 - **User scope** → `$XDG_STATE_HOME/<name>/` (default `~/.local/state/<name>/`).
+
+A stateful capability keys its state **per connection** — `<state-dir>/<connection-id>/…` — so two connections of one capability never share a session. The guides cache is the exception: guide content is capability-scoped and connection-independent, so it stays unkeyed at the user state home.
+
+**Bulk data stores are relocatable at the root, fixed inside.** A capability that syncs bulk data (message archives, exports) defaults the store to `<state-dir>/<connection-id>/…` like any state — and MAY expose the **root** as a settings key (e.g. `messages_dir`: absolute, or relative to the project root) for a consumer who wants the data elsewhere. Only the root moves: the structure beneath it is the CLI's contract, documented in its help, identical wherever the root points. The `*/state/` gitignore guard covers only the default location, so the guard travels as a responsibility: `doctor` verifies the active root is git-ignored and warns when it is not (DOCTRINE rule 16 — synced data is minted by credentials and never commits).
 
 Known limitation, recorded for fast diagnosis: two projects driving the *same* account of a single-session service thrash each other's cookies (login here invalidates the cookie there). Per-project state trades that for account isolation — the right trade where re-logins are cheap.
 
@@ -342,7 +483,7 @@ The code tells the caller *which kind* of failure without parsing the message:
 | `0` | success |
 | `2` | auth — missing/rejected credentials, 401/403 |
 | `3` | not found — the addressed resource does not exist, 404 |
-| `4` | disabled by project policy — the gate, on every verb |
+| `4` | policy refusal — the project gate (every verb), or a write verb on a read-only connection |
 | `5` | server / network — timeout, connection error, 429 after retries, 5xx |
 | `6` | input / validation — a malformed argument, a bad date, a conflicting flag |
 
@@ -382,10 +523,10 @@ A 429 honours the server's `Retry-After` header (falling back to the linear sche
 
 ## `doctor`
 
-Every CLI has a `doctor` subcommand: the cheapest authenticated round-trip that proves the whole chain — credentials resolved, endpoint reachable, identity confirmed. It returns `{"ok": true, …}` on stdout with a few cheap facts (the service version, the authenticated identity, a reachability flag) and rides the same exit-code taxonomy — `0` healthy, `2` if credentials are missing or rejected, `5` if the service is unreachable. It is the first thing an agent runs against a tool, and for a stateful CLI it is also the recovery point: `doctor` detects an expired session and attempts re-authentication before reporting, so a healthy exit means *ready to work*, not merely *configured*.
+Every CLI has a `doctor` subcommand: the cheapest authenticated round-trip that proves the whole chain — credentials resolved, endpoint reachable, identity confirmed. It examines **every connection**: bare, it round-trips each configured connection and reports per id — `{"ok": <all healthy>, "connections": {"<id>": {…}}}` — exiting `0` only when every connection is healthy, else with the first failure's category; `doctor --connection <id>` checks one. Per connection it carries a few cheap facts (the service version, the authenticated identity, a reachability flag) and rides the same exit-code taxonomy — `0` healthy, `2` if credentials are missing or rejected, `5` if the service is unreachable. It is the first thing an agent runs against a tool, and for a stateful CLI it is also the recovery point: `doctor` detects an expired session and attempts re-authentication before reporting, so a healthy exit means *ready to work*, not merely *configured*.
 
 `doctor` is the **readiness oracle**. The stub only announces that a tool exists, so "is it wired up *here*?" is `doctor`'s question to answer — at use-time, per context, never inferred from the stub's presence. A failing `doctor` does not just report "not configured"; it names the exact remediation, including *where* the missing config goes — derived from the declared credential scope and `CRED_KEYS`: the project `.env`, or `~/.config/<name>/credentials.env` — so an agent learns how to wire the tool up from the tool itself. A capability whose required config is global (or nil) is usable from any project the moment it is installed; one that needs project-side config is globally *aware* but only *ready* where that config exists, and `doctor` makes the difference explicit.
 
 ## Conformance and deviation
 
-These patterns are a strong default, not a cage — the same standing allowance the doctrine grants ([DOCTRINE.md](DOCTRINE.md#deviations-are-allowed--and-recorded)). A capability whose protocol or interaction model genuinely differs realizes the *intent* of a pattern in its own form. Such a deviation is **recorded in the capability's own dedicated deviation file** — a file whose sole purpose is to describe it, kept apart so it is never commingled with other content or accidentally dropped — never here: this standard states the rule, a capability states its own exception, in its own folder. `capabilities audit` reads that file first and treats the deviation as a deliberate choice, not drift to fix. The bar is realizing the intent: a deterministic cascade, a clean stdout/stderr split, a stable exit-code contract, the contract verbs, the gate, a `doctor`, an agent-first help, and no consumer identity baked in.
+These patterns are a strong default, not a cage — the same standing allowance the doctrine grants ([DOCTRINE.md](DOCTRINE.md#deviations-are-allowed--and-recorded)). A capability whose protocol or interaction model genuinely differs realizes the *intent* of a pattern in its own form. Such a deviation is **recorded in the capability's own dedicated deviation file** — a file whose sole purpose is to describe it, kept apart so it is never commingled with other content or accidentally dropped — never here: this standard states the rule, a capability states its own exception, in its own folder. `capabilities audit` reads that file first and treats the deviation as a deliberate choice, not drift to fix. The bar is realizing the intent: a deterministic cascade, deterministic connection selection with a hard write gate, a clean stdout/stderr split, a stable exit-code contract, the contract verbs, the gate, a `doctor`, an agent-first help, and no consumer identity baked in.

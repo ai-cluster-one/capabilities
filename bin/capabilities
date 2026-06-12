@@ -74,7 +74,7 @@ VERIFICATION VERBS
 
 AUTHORING VERBS (emit agent-executable instructions; judgment stays with the agent)
   new            The procedure for creating a capability from scratch.
-  conform <ref>  The procedure for bringing an existing script to protocol 1.
+  conform <ref>  The procedure for bringing an existing script to the protocol.
   groom <name>   The procedure for reviewing an installed capability.
 
 I/O CONTRACT
@@ -99,7 +99,7 @@ from typing import NoReturn
 
 import httpx
 
-PROTOCOL = 1
+PROTOCOL = 2
 SOURCE = os.environ.get("CAPABILITIES_SOURCE") or \
     "https://raw.githubusercontent.com/ai-cluster-one/capabilities/main"
 CAP_HOME = Path(os.environ.get("CAPABILITIES_HOME") or (Path.home() / ".capabilities"))
@@ -605,9 +605,10 @@ def _compose_context(root: Path) -> str:
     else:
         lines += ["Each enabled capability is a CLI on PATH. "
                   "`<name> help` is the full contract; `<name> doctor` proves "
-                  "readiness; `<name> guide` lists its how-to guides. "
-                  "A capability that exits 4 is disabled by project policy — "
-                  "ask the user, never enable it yourself.", ""]
+                  "readiness; `<name> connections` shows where credentials "
+                  "resolve from; `<name> guide` lists its how-to guides. "
+                  "Exit 4 is policy — a disabled capability or a read-only "
+                  "connection; ask the user, never lift a gate yourself.", ""]
     for name in enabled:
         stub, manifest = _load_snapshots(name)
         lines.append(f"## {name}")
@@ -618,6 +619,19 @@ def _compose_context(root: Path) -> str:
         lines += [_md_escape(stub), ""]
         bullet: list[str] = []
         envdir = root / ".capabilities" / name
+        conns = _read_json(envdir / "connections.json")
+        if isinstance(conns, dict) and isinstance(conns.get("connections"), dict) \
+                and conns["connections"]:
+            default = conns.get("default")
+            items = "; ".join(
+                cid + ("*" if cid == default else "")
+                + (" (read-only)" if isinstance(entry, dict)
+                   and entry.get("allow_write") is False else "")
+                for cid, entry in sorted(conns["connections"].items()))
+            bullet.append(f"- Connections (`--connection <id>`; * = default): {items}")
+        elif conns is not None:
+            bullet.append(f"- Connections file present but not a valid envelope — "
+                          f"fix .capabilities/{name}/connections.json")
         ids = _read_json(envdir / "identifiers.json")
         if isinstance(ids, dict) and ids:
             items = "; ".join(
@@ -738,7 +752,9 @@ Capabilities are self-contained CLIs installed on PATH, managed by the
 verbs:
 
 - `<name> help` — the full usage contract (always start here)
-- `<name> doctor` — proves credentials, reachability, identity
+- `<name> doctor` — proves credentials, reachability, identity, per connection
+- `<name> connections` — where every value resolves from (tier, source,
+  secrets masked) — local only, no network
 - `<name> guide [<topic>]` — its how-to guides, fetched live
 - `<name> ids list|get|set|rm` — the project's identifiers envelope
 - `<name> refs` — the project's reference files for it
@@ -749,14 +765,20 @@ per-project gate), `capabilities init` (wire a project), `capabilities
 doctor` / `capabilities audit <name>` (verify), `capabilities help` (full
 contract).
 
-THE GATE: a capability that exits 4 is disabled by this project's policy
-(.capabilities/settings.json). Do not enable it yourself and do not work
-around it — ask the user whether to enable it, then stop. Enabling is always
-the user's decision.
+THE GATES (both exit 4 — ask the user, never lift one yourself): a capability
+disabled by project policy (.capabilities/settings.json) refuses every verb;
+a connection that does not allow writes (its entry's allow_write, else the
+capability's declared default — false where writes leave the system) refuses
+write verbs. Do not work around either — ask, then stop; granting a write is
+`allow_write: true` on that connection in connections.json.
 
-Credentials resolve by cascade: flags → project .env(.local) → user
-~/.config/<name>/credentials.env → process env. Secrets never go on argv;
-an inline secret is an env-prefix invocation (`KEY=value <name> …`).
+Configuration resolves as connections. With no registry there is one implicit
+connection, `default`, from the cascade: flags → project .env(.local) → user
+~/.config/<name>/credentials.env → process env. A registry names more —
+project .capabilities/<name>/connections.json, else machine-level
+~/.config/<name>/connections.json, first found wins (`--connection <id>`
+selects; a `default` pointer covers unflagged calls). Secrets never go on
+argv; an inline secret is an env-prefix invocation (`KEY=value <name> …`).
 """
 
 
@@ -766,7 +788,7 @@ def _skill_text() -> str:
     description = (
         f"Operate installed capability CLIs ({listed}) and the capabilities "
         f"manager — contract verbs, per-project enable/disable gate, exit-4 "
-        f"rule, credential cascade.")
+        f"rule, credential cascade, connections.")
     return (f"---\nname: capabilities\ndescription: {description}\n---\n\n"
             f"# Capabilities\n\n{SKILL_BODY}")
 
@@ -785,6 +807,29 @@ def _regen_skills(force_claude: bool = False, force_codex: bool = False) -> list
     return written
 
 # ---------------------------------------------------------------- doctor
+
+def _check_registry(findings: list[str], owner: str, conn_file: Path) -> None:
+    """Validate one connections envelope; append findings."""
+    reg = _read_json(conn_file)
+    if not isinstance(reg, dict) or not isinstance(reg.get("connections"), dict) \
+            or not reg["connections"]:
+        findings.append(f"{owner}: {conn_file} is not a connections envelope "
+                        f"(needs a non-empty 'connections' object)")
+        return
+    entries = reg["connections"]
+    default = reg.get("default")
+    if default is not None and default not in entries:
+        findings.append(f"{owner}: connections default {default!r} names no entry "
+                        f"(known: {', '.join(sorted(entries))}) — {conn_file}")
+    for cid, entry in entries.items():
+        if not isinstance(entry, dict):
+            findings.append(f"{owner}: connection {cid!r} is not an object — {conn_file}")
+            continue
+        aw = entry.get("allow_write")
+        if aw is not None and not isinstance(aw, bool):
+            findings.append(f"{owner}: connection {cid!r} allow_write is not a "
+                            f"boolean — {conn_file}")
+
 
 def cmd_doctor() -> None:
     findings: list[str] = []
@@ -808,6 +853,9 @@ def cmd_doctor() -> None:
         if recorded and script.exists() and _sha256(script) != recorded:
             findings.append(f"{name}: script hash differs from snapshot key — "
                             f"run `capabilities update {name}` to refresh snapshots")
+        user_reg = _CONFIG_HOME / name / "connections.json"
+        if user_reg.exists():
+            _check_registry(findings, name, user_reg)
     root = _project_root()
     if root and (root / ".capabilities").is_dir():
         gate_file = root / GATE_REL
@@ -827,6 +875,8 @@ def cmd_doctor() -> None:
         if not gi.exists() or "*/state/" not in gi.read_text():
             findings.append("project: .capabilities/.gitignore missing the */state/ "
                             "guard — session state could be committed")
+        for conn_file in sorted((root / ".capabilities").glob("*/connections.json")):
+            _check_registry(findings, "project", conn_file)
         settings = _read_json(root / ".claude" / "settings.json") or {}
         deny = (settings.get("permissions") or {}).get("deny") or []
         for n, g in caps.items():
@@ -873,7 +923,7 @@ def _audit_script(name: str, script: Path) -> list[str]:
     if rc != 0:
         failures.append(f"help: exit {rc}")
     else:
-        for verb in ("doctor", "stub", "manifest", "guide", "ids", "refs"):
+        for verb in ("doctor", "connections", "stub", "manifest", "guide", "ids", "refs"):
             if verb not in out:
                 failures.append(f"help: contract verb {verb!r} undocumented")
 
@@ -946,6 +996,46 @@ def _audit_script(name: str, script: Path) -> list[str]:
             if rc != 0:
                 failures.append(f"ids rm: exit {rc}")
 
+        # connections — the resolution report, implicit default then registry-driven
+        def _check_connections(expect_ids: set[str], label: str,
+                               expect_default: str | None = None) -> None:
+            rc, out, errs = _run_script(script, ["connections"], cwd=sandbox, env=genv)
+            if rc != 0:
+                failures.append(f"connections/{label}: exit {rc} "
+                                f"(the report renders even unconfigured)")
+                return
+            try:
+                report = json.loads(out)
+            except ValueError:
+                failures.append(f"connections/{label}: not JSON")
+                return
+            conns = report.get("connections")
+            if not isinstance(conns, dict) or set(conns) != expect_ids:
+                failures.append(f"connections/{label}: ids {sorted(conns or [])} != "
+                                f"{sorted(expect_ids)}")
+                return
+            if expect_default is not None and report.get("default") != expect_default:
+                failures.append(f"connections/{label}: default is "
+                                f"{report.get('default')!r}, expected {expect_default!r}")
+            for cid, entry in conns.items():
+                keys = (entry or {}).get("keys")
+                if not isinstance(keys, list):
+                    failures.append(f"connections/{label}: {cid} carries no keys list")
+                    continue
+                for k in keys:
+                    if k.get("secret") and k.get("set") and not str(
+                            k.get("value", "")).startswith(("…", "****")):
+                        failures.append(f"connections/{label}: secret "
+                                        f"{k.get('key')!r} not masked")
+
+        _check_connections({"default"}, "implicit", expect_default="default")
+        conn_file = capdir / name / "connections.json"
+        conn_file.parent.mkdir(exist_ok=True)
+        _write_json(conn_file, {"default": "a",
+                                "connections": {"a": {}, "b": {"allow_write": False}}})
+        _check_connections({"a", "b"}, "registry", expect_default="a")
+        conn_file.unlink()
+
         # guide menu agrees with the manifest
         if manifest is not None:
             topics = (manifest.get("docs") or {}).get("topics") or []
@@ -1014,21 +1104,26 @@ Say no plainly when it is not a capability.
 
 ## 2. Shape before code
 
-- Surface: the smallest set of domain verbs.
+- Surface: the smallest set of domain verbs; which of them mutate the remote
+  system (WRITE_VERBS — the per-connection write gate refuses these), and
+  what silence means (WRITE_DEFAULT — False when a write leaves the system:
+  messages a human, sends mail, moves money).
 - Credentials: keys, which are secret, and the scope — `project` (service /
   tenant tools, the default) or `user` (personal-account tools only).
 - State: does it mint sessions or caches? Then `STATE = True` and state
-  lands per the state-resolution rules.
+  lands per the state-resolution rules, keyed per connection.
 - I/O: JSON on stdout, the error envelope on stderr, the exit-code taxonomy.
 
 ## 3. Write the script
 
 Copy the SHEBANG patterns verbatim: the declaration constants (NAME,
-PROTOCOL, SUMMARY, SCOPE, CRED_KEYS, DOCS_BASE, TOPICS, STATE, POST_INSTALL),
-`_project_root`/`_gate` (every verb gated), the credential cascade, `_emit`/
-`_die`, the contract verbs (help, doctor, stub, manifest --json, guide, ids,
-refs), resilient HTTP, an agent-first docstring. No consumer identity baked
-in — placeholders in examples, values from the cascade.
+PROTOCOL, SUMMARY, SCOPE, CRED_KEYS, WRITE_VERBS, WRITE_DEFAULT, DOCS_BASE,
+TOPICS, STATE, POST_INSTALL), `_project_root`/`_gate` (every verb gated), the credential
+cascade, connection selection + the write gate (`--connection`, the registry,
+`_select_connection`/`_write_gate`), `_emit`/`_die`, the contract verbs (help,
+doctor, connections, stub, manifest --json, guide, ids, refs), resilient
+HTTP, an agent-first docstring. No consumer identity baked in — placeholders
+in examples, values from the cascade.
 
 ## 4. Verify mechanically, then by judgment
 
@@ -1058,13 +1153,19 @@ verbs do. The spec is SHEBANG.md in the capability repo — read it first.
 Check for each, in this order:
 
 - Declaration constants: NAME, PROTOCOL, SUMMARY, SCOPE, CRED_KEYS,
-  DOCS_BASE, TOPICS, STATE, POST_INSTALL — one home each, top of script.
+  WRITE_VERBS, WRITE_DEFAULT, DOCS_BASE, TOPICS, STATE, POST_INSTALL — one
+  home each, top of script.
 - `_project_root()` + `_gate()` called before any verb dispatch; exit 4 with
   the `disabled` envelope; fail-open on unreadable gate.
-- Contract verbs: help, doctor, stub, manifest --json, guide, ids
-  (list/get/set/rm), refs. Render stub/manifest from the constants.
+- Contract verbs: help, doctor, connections, stub, manifest --json, guide,
+  ids (list/get/set/rm), refs. Render stub/manifest from the constants.
 - Credential cascade in SHEBANG order; secrets have no flags; scripts never
   write credentials.env.
+- Connections: `--connection <id>` on every domain verb, the registry
+  (project .capabilities/<name>/connections.json, else the user config
+  home's) selected per SHEBANG order, the write gate (entry allow_write,
+  else WRITE_DEFAULT; read-only → write verbs exit 4, nothing lifts it),
+  `connections` reporting resolution with secrets masked, no network.
 - State: minted sessions/caches move to the state dir (project scope:
   .capabilities/<name>/state/ where the envelope exists, else
   $XDG_STATE_HOME/<name>/; user scope: $XDG_STATE_HOME/<name>/).
@@ -1111,7 +1212,9 @@ A periodic review of one capability: drift, dead weight, sharpening.
 - Guides: do declared topics still match upstream files? Anything learned
   repeatedly in sessions that belongs in a guide?
 - Identifiers/references in consuming projects: still non-secret, still
-  provenance-split (chosen → settings.json, discovered → identifiers.json)?
+  provenance-split (chosen → settings.json / connections.json, discovered →
+  identifiers.json)? Connections registries: no secret in an entry, default
+  pointer names a real entry, read-only entries still correct?
 
 ## 3. Close
 

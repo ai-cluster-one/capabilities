@@ -12,19 +12,50 @@ This tool is designed to be invoked by agents. Run `notion help` to load
 the full usage contract on demand — do not rely on memorised knowledge of
 its surface.
 
-Credentials resolve through the standard four-tier cascade (first non-empty
-wins): a project .env(.local) > ~/.config/notion/credentials.env > the
-process environment. The token is read by env-var NAME (NOTION_TOKEN =
-<Notion Personal Access Token>) and never travels on the command line.
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`: NOTION_TOKEN (a Notion integration token)
+  resolved through the standard cascade — a project .env(.local), then
+  ~/.config/notion/credentials.env, then the process env. Never pass the
+  token on the command line.
 
+  A project that publishes to several Notion workspaces declares them in
+  <project>/.capabilities/notion/connections.json:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "secret_env": "NOTION_<ID>_TOKEN", "allow_write": true }
+      }
+    }
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/notion/connections.json; first found wins, never merged.
+
+  The entry names the env var holding its token ("secret_env"); the value
+  resolves through the cascade above. "allow_write": false makes the
+  connection read-only: every mutating verb (publish, create, upsert)
+  exits 4, and no flag lifts the gate. Writes default to allowed (a
+  workspace the consumer owns).
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+Global option (accepted anywhere on the line):
   --token-env <KEY>   Act as a different identity by naming the env/cred KEY
-                      that holds the PAT (default NOTION_TOKEN). Names the key,
-                      never the value — a global option accepted anywhere on
-                      the line (e.g. notion publish <page> --token-env NOTION_ALT_TOKEN).
+                      that holds the token (default NOTION_TOKEN; with a
+                      registry connection it overrides that entry's
+                      secret_env). Names the key, never the value (e.g.
+                      notion publish <page> --token-env NOTION_ALT_TOKEN).
+                      It never lifts a connection's write gate.
 
 Commands:
   notion help                                 Print this document.
-  notion doctor                               Health check: creds + reachability + identity.
+  notion connections                          Where every connection's values
+                                              resolve from (tier, source,
+                                              secrets masked). Local only.
+  notion doctor [--connection <id>]           Health check — resolve token,
+                                              confirm identity + workspace —
+                                              every connection, or one.
   notion whoami                               Identity + workspace.
   notion children <parent>                    List direct child pages.
   notion get <page>                           Fetch page as markdown (incl. title).
@@ -73,8 +104,9 @@ Exit codes:
   0  success
   2  auth (unauthorized / restricted_resource / missing credentials)
   3  not found (object_not_found)
-  4  disabled by project policy (.capabilities/settings.json — ask the user,
-     never enable it yourself)
+  4  policy refusal — the project gate (.capabilities/settings.json) on any
+     verb, or a write verb on a read-only connection (allow_write: false).
+     Ask the user; never lift a gate yourself.
   5  server / network (5xx, timeout, rate-limit exhausted)
   6  input / validation
   7  conflict (domain-specific: ambiguous title in upsert, concurrent edit)
@@ -106,7 +138,7 @@ MAX_RETRIES = 3
 # --- Capability declaration (protocol 1) — one home for every contract fact --
 
 NAME = "notion"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("Notion CLI over the REST API — publish markdown to pages: list "
            "child pages, fetch a page as markdown, replace a page's body and "
            "title, create under a parent, and upsert by exact title.")
@@ -115,6 +147,8 @@ CRED_KEYS = [
     {"key": "NOTION_TOKEN", "secret": True, "required": True,
      "note": "integration token (default identity; alternates via --token-env)"},
 ]
+WRITE_VERBS = {"publish", "create", "upsert"}   # domain verbs that mutate Notion
+WRITE_DEFAULT = True    # writes stay inside a workspace the consumer owns
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = False       # True when the capability writes session/cache state
@@ -367,6 +401,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
@@ -392,6 +428,128 @@ def _load_token(key: str = "NOTION_TOKEN") -> str:
     _die(2, "missing_token",
          f"{key} not found in a project .env, {CREDENTIALS_ENV}, or the environment",
          f"add {key}=<PAT> to the user config or a project .env to use --token-env {key}")
+
+
+# --- Connections ---------------------------------------------------------------
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, _ = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        value, tier, source = _resolve_env_key("NOTION_TOKEN")
+        report["default"] = "default"
+        report["connections"]["default"] = {
+            "allow_write": WRITE_DEFAULT,
+            "keys": [_key_report("NOTION_TOKEN", True, True, value, tier, source)]}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys = [_key_report(secret_env, True, True, value, tier, source)]
+        else:
+            keys = [_key_report("secret_env", False, True, None, None, None)]
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
 
 
 # --- Reference parsing -------------------------------------------------------
@@ -571,11 +729,57 @@ def _page_summary(page: dict, action: str | None = None) -> dict:
 
 # --- Commands ----------------------------------------------------------------
 
-def cmd_doctor(c: httpx.Client) -> dict:
-    """Cheapest authenticated round-trip — proves creds resolved, endpoint
-    reachable, identity confirmed. Rides the same exit codes (2 if the token is
-    missing/rejected, 5 if Notion is unreachable)."""
-    return {"ok": True, "reachable": True, **cmd_whoami(c)}
+def _check_connection(token: str) -> dict:
+    """One connection's round-trip, reported rather than died — doctor covers
+    every connection, so a broken one becomes a finding, not a stop."""
+    try:
+        with _client(token) as c:
+            r = c.get("/users/me")
+            if r.status_code >= 400:
+                cat = 2 if r.status_code in (401, 403) else 5
+                return {"ok": False, "category": cat,
+                        "error": f"/users/me returned {r.status_code}"}
+            data = r.json()
+            bot = data.get("bot", {}) or {}
+            return {"ok": True, "name": data.get("name"),
+                    "workspace_name": bot.get("workspace_name")}
+    except httpx.RequestError as e:
+        return {"ok": False, "category": 5, "error": f"network error: {e}"}
+    except (ValueError, KeyError) as e:
+        return {"ok": False, "category": 5, "error": f"bad response: {e}"}
+
+
+def cmd_doctor(reg: dict | None, wanted: str | None,
+               token_key_override: str | None) -> None:
+    """Every connection bare; one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category."""
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        key = token_key_override or \
+            ("NOTION_TOKEN" if entry is None else entry.get("secret_env"))
+        if not key:
+            res = {"ok": False, "category": 6,
+                   "error": f"connection {cid!r} is missing 'secret_env'"}
+        else:
+            token = _resolve_env_key(key)[0]
+            if not token:
+                res = {"ok": False, "category": 2,
+                       "error": f"{key} not found in a project .env, "
+                                f"{CREDENTIALS_ENV}, or the environment"}
+            else:
+                res = _check_connection(token)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
 
 
 def cmd_whoami(c: httpx.Client) -> dict:
@@ -743,7 +947,8 @@ def main() -> None:
     # `notion publish <page> --token-env NOTION_ALT_TOKEN`). It names the env/cred
     # key holding the PAT to act as — never the token value itself.
     argv = sys.argv[1:]
-    token_key = "NOTION_TOKEN"
+    token_key: str | None = None     # --token-env override; None = not passed
+    wanted_conn: str | None = None   # --connection; both accepted anywhere on argv
     cleaned: list[str] = []
     i = 0
     while i < len(argv):
@@ -752,6 +957,10 @@ def main() -> None:
             token_key = argv[i + 1]; i += 2; continue
         if a.startswith("--token-env="):
             token_key = a.split("=", 1)[1]; i += 1; continue
+        if a == "--connection" and i + 1 < len(argv):
+            wanted_conn = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            wanted_conn = a.split("=", 1)[1]; i += 1; continue
         cleaned.append(a); i += 1
 
     args = p.parse_args(cleaned)
@@ -760,12 +969,25 @@ def main() -> None:
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
 
-    token = _load_token(token_key)
+    reg, _ = _connections_registry()
+    if args.cmd == "doctor":
+        cmd_doctor(reg, wanted_conn, token_key)
+        return
+
+    cid, entry = _select_connection(reg, wanted_conn)
+    allow_write = WRITE_DEFAULT if entry is None else \
+        bool(entry.get("allow_write", WRITE_DEFAULT))
+    _write_gate(cid, allow_write, args.cmd)
+    if entry is None:
+        token = _load_token(token_key or "NOTION_TOKEN")
+    else:
+        key = token_key or entry.get("secret_env")
+        if not key:
+            _die(6, "no_secret_env", f"connection {cid!r} is missing 'secret_env'")
+        token = _load_token(key)
 
     with _client(token) as c:
-        if args.cmd == "doctor":
-            _emit(cmd_doctor(c))
-        elif args.cmd == "whoami":
+        if args.cmd == "whoami":
             _emit(cmd_whoami(c))
         elif args.cmd == "children":
             _emit(cmd_children(c, args.parent))

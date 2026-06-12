@@ -18,17 +18,43 @@ Read-only: every command is a GET against the Stripe REST API. All structured
 reads emit JSON to stdout. Date ranges are --from inclusive, --to exclusive
 (YYYY-MM-DD, interpreted at local-midnight).
 
-CREDENTIALS
-  STRIPE_SECRET_KEY resolves in a cascade (first non-empty wins):
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`: STRIPE_SECRET_KEY resolved in a cascade (first
+  non-empty wins):
     1. flag           --api-key
     2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
     3. user config    $XDG_CONFIG_HOME/stripe/credentials.env (default ~/.config/stripe/)
     4. process env    STRIPE_SECRET_KEY
 
+  A project that reads several Stripe accounts declares them in
+  <project>/.capabilities/stripe/connections.json:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "secret_env": "STRIPE_<ID>_SECRET_KEY" }
+      }
+    }
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/stripe/connections.json; first found wins, never merged.
+
+  The entry names the env var holding its key ("secret_env"); the value
+  resolves through cascade tiers 2-4 above. Every command is a read, so
+  "allow_write": false changes nothing here — the write gate guards a
+  surface this CLI does not have.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
 COMMANDS
-  doctor
-      Validate STRIPE_SECRET_KEY + API reachability (GET /v1/balance).
-      Exit 0 healthy / 2 missing-or-rejected key / 5 unreachable.
+  connections
+      Where every connection's values resolve from (tier, source, secrets
+      masked). Local only — no network.
+
+  doctor [--connection <id>]
+      Validate key + API reachability (GET /v1/balance) — every connection,
+      or one. Exit 0 all healthy / 2 missing-or-rejected key / 5 unreachable.
 
   sync-plan --from YYYY-MM-DD --to YYYY-MM-DD [--only-type T]
       THE contract producer. Walks balance_transactions over [from, to),
@@ -77,9 +103,10 @@ Contract commands (the same on every capability):
                                                files for this capability.
 
 EXIT CODES
-  0 success · 2 auth/credentials · 3 not found · 4 disabled by project
-  policy (.capabilities/settings.json — ask the user) · 5 server/network ·
-  6 input
+  0 success · 2 auth/credentials · 3 not found · 4 policy refusal — the
+  project gate (.capabilities/settings.json) on any verb, or a write verb
+  on a read-only connection; ask the user, never lift a gate yourself ·
+  5 server/network · 6 input
 """
 
 from __future__ import annotations
@@ -102,7 +129,7 @@ MAX_RETRIES = 3
 # --- Capability declaration (protocol 1) — one home for every contract fact --
 
 NAME = "stripe"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("Read-only Stripe CLI over the REST API — emit a neutral JSON "
            "contract of account activity (sync-plan), check "
            "identity/reachability (doctor), list invoices and download their "
@@ -112,6 +139,8 @@ CRED_KEYS = [
     {"key": "STRIPE_SECRET_KEY", "secret": True, "required": True,
      "note": "API key; a restricted read-only key is preferred"},
 ]
+WRITE_VERBS: set = set()   # every command is a GET — nothing mutates Stripe
+WRITE_DEFAULT = True    # protocol default; this CLI has no write verbs to gate
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = False       # True when the capability writes session/cache state
@@ -367,20 +396,158 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
 
 
-def _resolve_key(args) -> str:
-    key = (getattr(args, "api_key", None)
-           or _project_env().get(KEY_NAME)
-           or _parse_env_file(CREDENTIALS_ENV).get(KEY_NAME)
-           or os.environ.get(KEY_NAME))
+# --- Connections ---------------------------------------------------------------
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, _ = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        value, tier, source = _resolve_env_key(KEY_NAME)
+        report["default"] = "default"
+        report["connections"]["default"] = {
+            "allow_write": WRITE_DEFAULT,
+            "keys": [_key_report(KEY_NAME, True, True, value, tier, source)]}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys = [_key_report(secret_env, True, True, value, tier, source)]
+        else:
+            keys = [_key_report("secret_env", False, True, None, None, None)]
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
+
+
+def _resolve_key(args, entry: dict | None, cid: str) -> str:
+    """The selected connection's key: the --api-key flag (tier 1) wins; an
+    entry resolves its named secret_env; the implicit default the flat key."""
+    flag = getattr(args, "api_key", None)
+    if flag:
+        return flag
+    if entry is None:
+        key = _resolve_env_key(KEY_NAME)[0]
+        if not key:
+            _die(2, "missing_credentials",
+                 f"{KEY_NAME} is required",
+                 f"set it in a project .env(.local), {CREDENTIALS_ENV}, "
+                 f"the environment, or via --api-key")
+        return key
+    secret_env = entry.get("secret_env")
+    if not secret_env:
+        _die(6, "no_secret_env", f"connection {cid!r} is missing 'secret_env'")
+    key = _resolve_env_key(secret_env)[0]
     if not key:
         _die(2, "missing_credentials",
-             f"{KEY_NAME} is required",
-             f"set it in a project .env(.local), {CREDENTIALS_ENV}, the environment, or via --api-key")
+             f"env var {secret_env} (for connection {cid!r}) is unset",
+             f"set {secret_env} in the project's .env / .env.local, "
+             f"{CREDENTIALS_ENV}, or the environment")
     return key
 
 
@@ -629,11 +796,57 @@ def _contract_envelope(from_date: str, to_date: str, events: list[dict]) -> dict
 
 # ── commands ────────────────────────────────────────────────────────────────
 
-def cmd_doctor(client: httpx.Client) -> dict:
-    bal = _request(client, "GET", "/balance")
-    available = bal.get("available", []) if isinstance(bal, dict) else []
-    currencies = sorted({b.get("currency") for b in available if b.get("currency")})
-    return {"ok": True, "livemode": bool(bal.get("livemode")), "currencies": currencies}
+def _check_connection(key: str) -> dict:
+    """One connection's round-trip, reported rather than died — doctor covers
+    every connection, so a broken one becomes a finding, not a stop."""
+    try:
+        with _client(key) as c:
+            r = c.get("/balance")
+            if r.status_code >= 400:
+                cat = 2 if r.status_code in (401, 403) else 5
+                return {"ok": False, "category": cat,
+                        "error": f"/v1/balance returned {r.status_code}"}
+            bal = r.json()
+            available = bal.get("available", []) if isinstance(bal, dict) else []
+            currencies = sorted({b.get("currency") for b in available
+                                 if b.get("currency")})
+            return {"ok": True, "livemode": bool(bal.get("livemode")),
+                    "currencies": currencies}
+    except httpx.RequestError as e:
+        return {"ok": False, "category": 5, "error": f"network error: {e}"}
+    except ValueError as e:
+        return {"ok": False, "category": 5, "error": f"bad response: {e}"}
+
+
+def cmd_doctor(args, reg: dict | None, wanted: str | None) -> None:
+    """Every connection bare; one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category."""
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        secret_env = KEY_NAME if entry is None else entry.get("secret_env")
+        if not secret_env:
+            res = {"ok": False, "category": 6,
+                   "error": f"connection {cid!r} is missing 'secret_env'"}
+        else:
+            key = getattr(args, "api_key", None) or _resolve_env_key(secret_env)[0]
+            if not key:
+                res = {"ok": False, "category": 2,
+                       "error": f"{secret_env} not found in a project .env, "
+                                f"{CREDENTIALS_ENV}, or the environment"}
+            else:
+                res = _check_connection(key)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
 
 
 def cmd_sync_plan(client: httpx.Client, from_date: str, to_date: str, only_type: str | None) -> dict:
@@ -848,7 +1061,21 @@ def main() -> None:
     pl.add_argument("--from", dest="from_date", required=True)
     pl.add_argument("--to", dest="to_date", required=True)
 
-    args = p.parse_args()
+    # `--connection <id>` is a global selector accepted anywhere on the line
+    # (extracted before argparse so it works after the subcommand too).
+    argv = sys.argv[1:]
+    wanted_conn: str | None = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--connection" and i + 1 < len(argv):
+            wanted_conn = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            wanted_conn = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+
+    args = p.parse_args(cleaned)
     if args.cmd == "help":
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
@@ -856,12 +1083,19 @@ def main() -> None:
         _emit(cmd_contract())
         return
 
-    key = _resolve_key(args)
+    reg, _ = _connections_registry()
+    if args.cmd == "doctor":
+        cmd_doctor(args, reg, wanted_conn)
+        return
+
+    cid, entry = _select_connection(reg, wanted_conn)
+    allow_write = WRITE_DEFAULT if entry is None else \
+        bool(entry.get("allow_write", WRITE_DEFAULT))
+    _write_gate(cid, allow_write, args.cmd)
+    key = _resolve_key(args, entry, cid)
     try:
         with _client(key) as c:
-            if args.cmd == "doctor":
-                _emit(cmd_doctor(c))
-            elif args.cmd == "sync-plan":
+            if args.cmd == "sync-plan":
                 _emit(cmd_sync_plan(c, args.from_date, args.to_date, args.only_type))
             elif args.cmd == "invoices" and args.subcmd == "list":
                 _emit(cmd_invoices_list(c, args.from_date, args.to_date, args.status))

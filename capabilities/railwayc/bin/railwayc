@@ -10,7 +10,11 @@ PROJECT-SCOPED Railway token, injects it, and forwards your command verbatim to
 USAGE
   railwayc <command> [args...]   Forward to `railway <command> [args...]`, authenticated
                                  with the resolved project token.
-  railwayc doctor                Prove the token resolves and report the project.
+  railwayc connections           Where every connection's values resolve from
+                                 (tier, source, secrets masked). Local only.
+  railwayc doctor [--connection <id>]
+                                 Prove the token resolves and report the project —
+                                 every connection, or one.
   railwayc help                  Print this contract.
 
 Contract commands (the same on every capability; railwayc's own, never forwarded):
@@ -38,27 +42,60 @@ MODEL
   machine's account session — that refusal is the point: access stays scoped to the
   one Railway project + environment the token was minted for, never the whole account.
 
-CREDENTIALS
-  RAILWAY_TOKEN — a Railway PROJECT token (project → Settings → Tokens), scoped to ONE
-  project and ONE environment. Because it is project-scoped, its home is the CONSUMING
-  PROJECT's .env, not a global file. Resolved (first non-empty wins):
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`: RAILWAY_TOKEN — a Railway PROJECT token (project →
+  Settings → Tokens), scoped to ONE project and ONE environment. Because it is
+  project-scoped, its home is the CONSUMING PROJECT's .env, not a global file.
+  Resolved (first non-empty wins):
     1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
     2. process env   RAILWAY_TOKEN (deployed box, or one-shot `RAILWAY_TOKEN=… railwayc …`)
   There is deliberately no token flag (a secret must not touch argv) and no user-config
   tier (a global token would mis-scope every project). One token = one project + one
-  environment; a project with prod + staging uses one token per environment.
+  environment; a project with prod + staging uses one token per environment — and
+  declares them as connections in <project>/.capabilities/railwayc/connections.json:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "secret_env": "RAILWAY_<ID>_TOKEN",
+                  "expect_project": "<project name or id>",
+                  "allow_write": true }
+      }
+    }
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/railwayc/connections.json; first found wins, never merged.
+
+  The entry names the env var holding its token ("secret_env"); the value
+  resolves through the same two tiers above. "expect_project" is the optional
+  per-connection counterpart of RAILWAYC_EXPECT_PROJECT. "allow_write": false
+  makes the connection read-only: every forwarded command that mutates the
+  Railway project (up, down, redeploy, restart, add, deploy, domain,
+  environment, init, service, volume, scale, connect, ssh, shell, and
+  `variables --set`) exits 4, and no flag lifts the gate. Writes default to
+  allowed (a project the consumer owns).
+
+  Selection: --connection <id> (accepted anywhere on the command line; consumed
+  by railwayc, never forwarded). Unflagged, the registry's "default" pointer
+  applies, else the sole entry; several entries without a pointer is refused
+  as ambiguous.
 
   Optional, non-secret — RAILWAYC_EXPECT_PROJECT (project .env): if set, `doctor`
   asserts the token resolves to that project (by name or id) and exits 7 on mismatch.
   The safety net against pasting the wrong project's token into a project's .env.
 
 COMMANDS railwayc owns
-  doctor
-      Resolve RAILWAY_TOKEN and run `railway status --json` with it injected. On
-      success emits {ok, project:{id,name}, workspace, environments:[…], services:[…]}.
-      Exit 0 healthy / 2 token missing or rejected / 5 railway not installed or
-      unreachable / 7 token resolved to a project other than RAILWAYC_EXPECT_PROJECT.
-      Use this for health — `railway whoami` does NOT work under a project token.
+  connections
+      The resolution report — every connection, every value, its winning tier
+      and source, secrets masked. Local only: no network, no token use.
+
+  doctor [--connection <id>]
+      Per connection (every configured one bare; one with --connection): resolve
+      its token and run `railway status --json` with it injected. Emits
+      {ok, connections: {<id>: {project:{id,name}, workspace, environments:[…],
+      services:[…]}}}. Exit 0 all healthy / 2 token missing or rejected /
+      5 railway not installed or unreachable / 7 token resolved to a project
+      other than the expected one. Use this for health — `railway whoami` does
+      NOT work under a project token.
 
   help
       Print this document. (`railway help` is the real CLI's surface, a separate
@@ -76,12 +113,14 @@ EVERYTHING ELSE — forwarded verbatim to `railway`, token injected, I/O transpa
     run -- <cmd>                     run a local command with the environment's vars
 
 EXIT CODES (railwayc's own layer)
-  0 success · 2 auth (RAILWAY_TOKEN missing or rejected) · 4 disabled by project
-  policy (.capabilities/settings.json — ask the user) · 5 environment (railway not
-  on PATH, or unreachable) · 6 input (bad use of a railwayc-owned command) · 7 wrong
-  project (doctor: token ≠ RAILWAYC_EXPECT_PROJECT).
+  0 success · 2 auth (token missing or rejected) · 4 policy refusal — the
+  project gate (.capabilities/settings.json) on any verb, or a write verb on a
+  read-only connection (allow_write: false); ask the user, never lift a gate
+  yourself · 5 environment (railway not on PATH, or unreachable) · 6 input (bad
+  use of a railwayc-owned command, or an unknown/ambiguous connection) · 7 wrong
+  project (doctor: token ≠ the expected project).
   Forwarded commands return RAILWAY's own exit code, not these — railwayc is
-  transparent for everything it forwards.
+  transparent for everything it forwards (after the gate).
 
 EXAMPLES
   railwayc doctor
@@ -106,7 +145,7 @@ from typing import NoReturn
 # --- Capability declaration (protocol 1) — one home for every contract fact --
 
 NAME = "railwayc"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("Credential harness around the official `railway` CLI — resolves "
            "a project-scoped Railway token, injects it, and forwards your "
            "command straight to `railway` (everything but railwayc's own "
@@ -119,6 +158,12 @@ CRED_KEYS = [
     {"key": "RAILWAYC_EXPECT_PROJECT", "secret": False, "required": False,
      "note": "doctor asserts the token resolves to this project (name or id)"},
 ]
+WRITE_VERBS = {     # forwarded railway commands that mutate the Railway project
+    "up", "down", "redeploy", "restart", "add", "deploy", "domain",
+    "environment", "init", "service", "volume", "scale", "connect",
+    "ssh", "shell",
+}   # `variables` is gated only with --set (read otherwise) — see deviations.md
+WRITE_DEFAULT = True    # writes stay inside a project the consumer owns
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = False       # True when the capability writes session/cache state
@@ -204,8 +249,161 @@ def _project_env() -> dict:
     return merged
 
 
-def _resolve(key: str) -> str | None:
-    return _project_env().get(key) or os.environ.get(key) or None
+# --- Connections ---------------------------------------------------------------
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through railwayc's reduced cascade — project
+    .env(.local) → process env; the user-config tier is deliberately absent
+    (a global token would mis-scope every project; see deviations.md).
+    Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no token use."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_env_key(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        value = entry.get("expect_project")
+        keys.append(_key_report("expect_project", False, False,
+                                str(value) if value is not None else None,
+                                "connection", reg_path))
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys.append(_key_report(secret_env, True, True, value, tier, source))
+        else:
+            keys.append(_key_report("secret_env", False, True, None, None, None))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
+
+
+def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection. Returns (cfg, problem) — problem is an
+    error dict ({"exit", "code", "message", "hint"?}) instead of a die, so
+    doctor can report every connection rather than stopping at the first."""
+    if entry is None:   # the implicit default — flat keys through the cascade
+        token = _resolve_env_key(TOKEN_NAME)[0]
+        if not token:
+            return None, {
+                "exit": 2, "code": "missing_credentials",
+                "message": f"{TOKEN_NAME} is required (a project-scoped Railway token)",
+                "hint": f"set {TOKEN_NAME} in this project's .env(.local) or export it; "
+                        f"create one in Railway → your project → Settings → Tokens"}
+        return {"id": cid, "allow_write": WRITE_DEFAULT, "token": token,
+                "expect": _resolve_env_key(EXPECT_PROJECT)[0]}, None
+    secret_env = entry.get("secret_env")
+    if not secret_env:
+        return None, {"exit": 6, "code": "no_secret_env",
+                      "message": f"connection {cid!r} is missing 'secret_env'"}
+    token = _resolve_env_key(secret_env)[0]
+    if not token:
+        return None, {
+            "exit": 2, "code": "missing_secret",
+            "message": f"env var {secret_env} (for connection {cid!r}) is unset",
+            "hint": f"set {secret_env} in the project's .env / .env.local "
+                    f"or the environment"}
+    return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "token": token, "expect": entry.get("expect_project")}, None
 
 
 # --- Capability contract (protocol 1) — shared verbatim across capabilities --
@@ -385,6 +583,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
@@ -400,29 +600,32 @@ def _child_env(token: str) -> dict:
     return env
 
 
-def _capture(argv: list[str], token: str) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(["railway", *argv], env=_child_env(token),
-                              capture_output=True, text=True, timeout=DOCTOR_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        _die(5, "timeout", "railway was unresponsive", "check connectivity to railway.com")
-    except OSError as e:
-        _die(5, "railway_exec_failed", f"could not run railway: {e}")
-
-
 def _edges(obj) -> list:
     return obj.get("edges") or [] if isinstance(obj, dict) else []
 
 
-def cmd_doctor(token: str) -> dict:
-    proc = _capture(["status", "--json"], token)
+def _check_connection(cfg: dict) -> dict:
+    """One connection's round-trip (`railway status --json` under its token),
+    reported rather than died — doctor covers every connection, so a broken
+    one becomes a finding, not a stop."""
+    try:
+        proc = subprocess.run(["railway", "status", "--json"],
+                              env=_child_env(cfg["token"]),
+                              capture_output=True, text=True, timeout=DOCTOR_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "category": 5,
+                "error": "railway was unresponsive (status timed out)"}
+    except OSError as e:
+        return {"ok": False, "category": 5, "error": f"could not run railway: {e}"}
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
         low = err.lower()
         if any(s in low for s in ("token", "unauthor", "not found", "log in", "login")):
-            _die(2, "token_rejected", err or "railway rejected the token",
-                 "RAILWAY_TOKEN is invalid, revoked, or for a deleted project/environment")
-        _die(5, "railway_error", err or "`railway status` failed")
+            return {"ok": False, "category": 2,
+                    "error": err or "railway rejected the token",
+                    "hint": "the token is invalid, revoked, or for a deleted "
+                            "project/environment"}
+        return {"ok": False, "category": 5, "error": err or "`railway status` failed"}
     try:
         st = json.loads(proc.stdout)
     except ValueError:
@@ -438,16 +641,43 @@ def cmd_doctor(token: str) -> dict:
         "services": [e["node"]["name"] for e in _edges(st.get("services"))
                      if e.get("node") and e["node"].get("name")],
     }
-    expect = _resolve(EXPECT_PROJECT)
+    expect = cfg.get("expect")
     if expect:
         if expect not in (project.get("name"), project.get("id")):
-            _die(7, "wrong_project",
-                 f"token resolves to {project.get('name')!r} ({project.get('id')}), "
-                 f"expected {expect!r}",
-                 f"the {TOKEN_NAME} in this project points at the wrong Railway project; "
-                 f"check the token and {EXPECT_PROJECT}")
+            return {"ok": False, "category": 7,
+                    "error": f"token resolves to {project.get('name')!r} "
+                             f"({project.get('id')}), expected {expect!r}",
+                    "hint": "the token for this connection points at the wrong "
+                            "Railway project; check the token and the expected project"}
         result["expected"] = expect
     return result
+
+
+def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
+    """Every connection bare; one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category."""
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        cfg, problem = _build_cfg(cid, entry)
+        if problem:
+            res = {"ok": False, "category": problem["exit"],
+                   "error": problem["message"]}
+            if problem.get("hint"):
+                res["hint"] = problem["hint"]
+        else:
+            res = _check_connection(cfg)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
 
 
 def _forward(argv: list[str], token: str) -> NoReturn:
@@ -464,29 +694,58 @@ def _forward(argv: list[str], token: str) -> NoReturn:
 
 def main() -> None:
     _gate()                      # every verb passes the project gate first
-    _contract(sys.argv[1:])      # contract verbs; everything else forwards
+
+    # `--connection <id>` is railwayc's own selector, accepted anywhere on the
+    # line, consumed here and never forwarded to `railway`.
     argv = sys.argv[1:]
-    if not argv or (len(argv) == 1 and argv[0] in ("help", "-h", "--help")):
+    wanted_conn: str | None = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--connection" and i + 1 < len(argv):
+            wanted_conn = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            wanted_conn = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+
+    _contract(cleaned)           # contract verbs; everything else forwards
+    if not cleaned or (len(cleaned) == 1 and cleaned[0] in ("help", "-h", "--help")):
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
+
+    reg, _ = _connections_registry()
+    if cleaned[0] == "doctor":
+        cmd_doctor(reg, wanted_conn)     # railway-absence is reported per connection
+        return
+
+    # Select and gate BEFORE resolving the token or touching `railway`, so a
+    # write verb on a read-only connection refuses (exit 4) and an unknown id
+    # refuses (exit 6) regardless of whether the token resolves or railway is
+    # installed (the gate is policy, decided before any credential or exec).
+    cid, entry = _select_connection(reg, wanted_conn)
+    verb = cleaned[0]
+    allow_write = WRITE_DEFAULT if entry is None else \
+        bool(entry.get("allow_write", WRITE_DEFAULT))
+    _write_gate(cid, allow_write, verb)
+    if verb == "variables" and "--set" in cleaned and not allow_write:
+        _die(4, "read_only",
+             f"connection {cid!r} does not allow writes; `variables --set` "
+             f"mutates the project",
+             "drop --set, or ask the user; granting is `allow_write: true` on "
+             "this connection in connections.json.")
+
+    cfg, problem = _build_cfg(cid, entry)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"],
+             problem.get("hint"))
 
     if not shutil.which("railway"):
         _die(5, "railway_not_found", "the `railway` CLI is not on PATH",
              "install it: `brew install railway` or `npm i -g @railway/cli` "
              "(https://docs.railway.com/cli)")
 
-    token = _resolve(TOKEN_NAME)
-    if not token:
-        _die(2, "missing_credentials",
-             f"{TOKEN_NAME} is required (a project-scoped Railway token)",
-             f"set {TOKEN_NAME} in this project's .env(.local) or export it; "
-             f"create one in Railway → your project → Settings → Tokens")
-
-    if argv[0] == "doctor":
-        _emit(cmd_doctor(token))
-        return
-
-    _forward(argv, token)
+    _forward(cleaned, cfg["token"])
 
 
 if __name__ == "__main__":

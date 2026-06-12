@@ -25,7 +25,9 @@ Credentials resolve in a 4-tier cascade (first non-empty wins):
   4. process env    DIRECTO_USERNAME / DIRECTO_PASSWORD / DIRECTO_DB / DIRECTO_KOHT / DIRECTO_COOKIE
 Same DIRECTO_* keys at every tier; the project you're in wins, process env is the
 fallback (so a deployed host's injected env governs when no config file is present).
-Never pass the password on the command line outside a throwaway shell.
+Configuration resolves as named connections — a project's connections.json registry
+plus `--connection <id>`; `directo help` documents them. Never pass the password on
+the command line outside a throwaway shell.
 """
 from __future__ import annotations
 
@@ -57,10 +59,17 @@ CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
 CASCADE_KEYS = ("DIRECTO_USERNAME", "DIRECTO_PASSWORD", "DIRECTO_DB", "DIRECTO_KOHT", "DIRECTO_COOKIE")
 SESSION_KEYS = ("DIRECTO_COOKIE", "DIRECTO_KOHT")
 
-# --- Capability declaration (protocol 1) — one home for every contract fact --
+# Connection selection — `--connection <id>` is extracted from argv in main()
+# (click would reject an unknown option); selection itself stays lazy, resolved
+# when config is first needed, so `help` works even with a broken registry.
+_WANTED_CONN: str | None = None   # --connection, extracted from argv in main()
+_ACTIVE_VERB: str = ""            # the verb on the line, for the write gate
+_SELECTED: tuple[str, dict | None] | None = None   # memoized (cid, entry)
+
+# --- Capability declaration (protocol 2) — one home for every contract fact --
 
 NAME = "directo"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("Directo ERP CLI over the browser-session endpoints its web UI "
            "uses — log in, select a location, and read the authed `*.asp` "
            "surface (sales, purchases, stock, ledger). Stateful — run "
@@ -76,6 +85,8 @@ CRED_KEYS = [
     {"key": "DIRECTO_KOHT", "secret": False, "required": False,
      "note": "place/location code; the session binds to it"},
 ]
+WRITE_VERBS: set = set()   # every domain verb is an authed read; login mints a session, it mutates no domain data
+WRITE_DEFAULT = True    # protocol default; this CLI's domain verbs are all reads
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = True        # the live session cookie lives in the state home
@@ -94,8 +105,8 @@ AUTH — the three-step ceremony (login mints the session):
   3. POST /<db>/keeks_koht.asp  koht=<CODE>      pick a location → authenticated session
 The session is (chuser + ASPSESSIONID); it is bound to the chosen location (koht).
 `login` runs all three and persists the session (cookie + location) in the state
-home — .capabilities/directo/state/ in an initialized project, else
-$XDG_STATE_HOME/directo/.
+home, keyed per connection — .capabilities/directo/state/<connection>/ in an
+initialized project, else $XDG_STATE_HOME/directo/<connection>/.
 
 LOCATION (koht) is a per-session selection, not a fixed preset. Pass --koht to choose;
 if omitted, the last-selected DIRECTO_KOHT is reused, else the default ({default}).
@@ -108,7 +119,40 @@ User config: {cfg}
 Once minted, the live DIRECTO_COOKIE/DIRECTO_KOHT resolve from the session file in
 the state home first; the cascade remains the one-shot override path.
 
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`, resolved from the cascade above. A project with
+  several Directo instances (or several logins on one) declares them in
+  <project>/.capabilities/directo/connections.json:
+    {{
+      "default": "<id>",
+      "connections": {{
+        "<id>": {{
+          "db":   "<db>",
+          "koht": "{default}",
+          "username_env": "DIRECTO_<ID>_USERNAME",
+          "password_env": "DIRECTO_<ID>_PASSWORD",
+          "allow_write": true
+        }}
+      }}
+    }}
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/directo/connections.json; first found wins, never merged.
+  Only username/password are secret: the entry names the env keys holding them
+  ("username_env"/"password_env"), and the values resolve through the cascade —
+  project .env(.local) → user config → process env. "allow_write": false is
+  accepted, but this CLI's surface is read-only, so no verb is gated by it.
+  Sessions are kept per connection in the state home, so two connections never
+  share a session.
+
+  Selection: --connection <id>, accepted anywhere on the line, on every
+  command. Unflagged, the registry's "default" pointer applies, else the sole
+  entry; several entries without a pointer is refused as ambiguous.
+
 CONTRACT COMMANDS (the same on every capability):
+  directo connections                          where every connection's values
+                                               resolve from (tier, source,
+                                               secrets masked); local only
   directo stub                                 one-line awareness text
   directo manifest --json                      machine-readable declaration
   directo guide [<topic>]                      guide topics / one guide body
@@ -116,15 +160,18 @@ CONTRACT COMMANDS (the same on every capability):
           [--note <text>]                      (.capabilities/directo/identifiers.json)
   directo refs                                 menu of the project's reference files
 
-EXIT CODES: 0 success · 2 auth/session · 4 disabled by project policy
-(.capabilities/settings.json — ask the user, never enable it yourself) · contract
-verbs add 3 not-found / 5 network / 6 input; domain commands otherwise exit 1 via
+EXIT CODES: 0 success · 2 auth/session · 4 policy refusal — the project gate
+(.capabilities/settings.json) on any verb, or a write verb on a read-only
+connection. Ask the user; never lift a gate yourself. · contract verbs add
+3 not-found / 5 network / 6 input; domain commands otherwise exit 1 via
 click (recorded deviation).
 
 COMMANDS:
   directo help                       this contract
-  directo doctor                     validate the session (auto-login on expiry); show active
-                                     db/koht — start here on the first call of a session
+  directo doctor [--connection <id>] per-connection health — every connection, or one.
+                                     JSON: ok + per-connection findings (db, koht, user,
+                                     session); auto-login on expiry. Start here on the
+                                     first call of a session
   directo login [--koht CODE]        run the full ceremony; persist session + location
   directo kohts                      list the locations this login offers (code + label)
   directo api <action> [-p k=v ...]  authed GET of components_api.asp?action=<action>&...; prints JSON
@@ -213,41 +260,238 @@ def _project_env() -> dict[str, str]:
     return merged
 
 
-def resolve_config(overrides: dict[str, str] | None = None) -> dict[str, str]:
-    """First non-empty wins per key: flag > project .env(.local) > user config >
-    process env. Session keys consult the minted session (the state home) right
-    after flags — the session file is the live session's one home."""
+def _materialize_cfg(cid: str, entry: dict | None,
+                     overrides: dict[str, str] | None) -> dict[str, str]:
+    """First non-empty wins per key. The implicit default: flag > minted session
+    (session keys) > project .env(.local) > user config > process env. A named
+    entry: flag > minted session > entry literals (db/koht) > the entry's named
+    env keys (username/password via username_env/password_env, cascade tiers
+    2-4) — the bare DIRECTO_* cascade does not bleed in; the registry is
+    authoritative. The per-connection session file is the live session's one
+    home in both shapes."""
     overrides = {k: v for k, v in (overrides or {}).items() if v}
-    session = _parse_env_file(_session_file())
-    project = _project_env()
-    user = _parse_env_file(CREDENTIALS_ENV)
+    session = _parse_env_file(_session_file(cid))
     out: dict[str, str] = {}
+    if entry is None:
+        project = _project_env()
+        user = _parse_env_file(CREDENTIALS_ENV)
+        for key in CASCADE_KEYS:
+            minted = session.get(key) if key in SESSION_KEYS else None
+            out[key] = (overrides.get(key)
+                        or minted
+                        or project.get(key)
+                        or user.get(key)
+                        or os.environ.get(key)
+                        or "")
+        return out
+    named = {
+        "DIRECTO_USERNAME": (_resolve_env_key(entry["username_env"])[0]
+                             if entry.get("username_env") else None),
+        "DIRECTO_PASSWORD": (_resolve_env_key(entry["password_env"])[0]
+                             if entry.get("password_env") else None),
+        "DIRECTO_DB": entry.get("db"),
+        "DIRECTO_KOHT": entry.get("koht"),
+    }
     for key in CASCADE_KEYS:
         minted = session.get(key) if key in SESSION_KEYS else None
-        out[key] = (overrides.get(key)
-                    or minted
-                    or project.get(key)
-                    or user.get(key)
-                    or os.environ.get(key)
-                    or "")
+        out[key] = overrides.get(key) or minted or named.get(key) or ""
     return out
 
 
-def _session_file() -> Path:
-    """The live session's one home, in the state dir for the declared scope."""
-    return _state_dir() / "session.env"
+def resolve_config(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """The active connection's config: select → gate → resolve. Selection is
+    memoized (`_connection()`); the write gate is structural here — WRITE_VERBS
+    is empty — but keeps the protocol's dispatch order."""
+    cid, entry = _connection()
+    return _materialize_cfg(cid, entry, overrides)
 
 
-def _persist_session(cookie_str: str, koht: str) -> None:
-    """Write the live session to the state home — credentials.env is human-written
-    only and never receives a minted value."""
-    sf = _session_file()
+def _build_cfg(cid: str, entry: dict | None,
+               overrides: dict[str, str] | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection's config. Returns (cfg, problem) — problem is
+    an error dict ({"exit", "code", "message", "hint"?}) instead of a die, so
+    doctor can report every connection rather than stopping at the first.
+    Missing username/password is not an immediate problem (the persisted cookie
+    may still be live); they ride along as empty strings and the login path
+    names what's missing."""
+    cfg = _materialize_cfg(cid, entry, overrides)
+    if not cfg["DIRECTO_DB"]:
+        if entry is None:
+            hint = (f"set DIRECTO_DB in the project .env(.local), "
+                    f"{CREDENTIALS_ENV}, or the environment — or declare a "
+                    f"connections registry (.capabilities/{NAME}/connections.json)")
+        else:
+            hint = f'set "db" on connection {cid!r} in connections.json'
+        return None, {"exit": 6, "code": "missing_db",
+                      "message": f"connection {cid!r} resolves no DIRECTO_DB",
+                      "hint": hint}
+    return cfg, None
+
+
+def _session_file(cid: str) -> Path:
+    """The live session's one home — keyed per connection, in the state dir
+    for the declared scope."""
+    return _state_dir() / cid / "session.env"
+
+
+def _persist_session(cid: str, cookie_str: str, koht: str) -> None:
+    """Write the live session to the state home (keyed per connection) —
+    credentials.env is human-written only and never receives a minted value."""
+    sf = _session_file(cid)
     sf.parent.mkdir(parents=True, exist_ok=True)
     sf.write_text(
         "# directo live session — written by `directo login`. Never commit.\n"
         f"DIRECTO_COOKIE='{cookie_str}'\n"
         f"DIRECTO_KOHT='{koht}'\n")
     os.chmod(sf, 0o600)
+
+
+# ─── Connections ─────────────────────────────────────────────────────────────
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _connection() -> tuple[str, dict | None]:
+    """Resolve the active connection once: select → write-gate → memoize.
+    Lazy — first called when config is needed, so `help` works even with a
+    broken or ambiguous registry."""
+    global _SELECTED
+    if _SELECTED is None:
+        reg, _ = _connections_registry()
+        cid, entry = _select_connection(reg, _WANTED_CONN)
+        allow_write = WRITE_DEFAULT if entry is None else \
+            bool(entry.get("allow_write", WRITE_DEFAULT))
+        _write_gate(cid, allow_write, _ACTIVE_VERB)
+        _SELECTED = (cid, entry)
+    return _SELECTED
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt, no
+    session-file reads (the report covers configuration tiers, not minted
+    state — readiness stays doctor's question)."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_env_key(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        for field, required in (("db", True), ("koht", False)):
+            value = entry.get(field)
+            keys.append(_key_report(field, False, required,
+                                    str(value) if value is not None else None,
+                                    "connection", reg_path))
+        for field in ("username_env", "password_env"):
+            env_key = entry.get(field)
+            if env_key:
+                value, tier, source = _resolve_env_key(env_key)
+                keys.append(_key_report(env_key, True, True, value, tier, source))
+            else:
+                keys.append(_key_report(field, False, True, None, None, None))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
 
 
 # ─── I/O contract (contract verbs; domain verbs are click-based) ─────────────
@@ -270,7 +514,7 @@ def _die(exit_code: int, code: str, message: str, hint: str | None = None,
     sys.exit(exit_code)
 
 
-# --- Capability contract (protocol 1) — shared verbatim across capabilities --
+# --- Capability contract (protocol 2) — shared verbatim across capabilities --
 
 def _gate() -> None:
     """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
@@ -447,6 +691,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
@@ -494,6 +740,20 @@ def _base_headers() -> dict[str, str]:
     }
 
 
+def _login_remedy() -> str:
+    """The exact remediation for missing login primaries — the connection's
+    named *_env keys when a registry entry is active, the bare cascade
+    otherwise."""
+    cid, entry = _SELECTED or ("default", None)
+    if entry is not None:
+        u_env = entry.get("username_env") or '"username_env" (unset on the entry)'
+        p_env = entry.get("password_env") or '"password_env" (unset on the entry)'
+        return (f"connection {cid!r} names its login keys in connections.json — "
+                f"username_env: {u_env}, password_env: {p_env}; set those keys in "
+                f"the project .env(.local), {CREDENTIALS_ENV}, or the environment.")
+    return f"set them in {CREDENTIALS_ENV} (or a project .env / the environment)."
+
+
 def do_login(username: str, password: str, db: str, koht: str) -> tuple[str, str]:
     """Run the three-step ceremony. Returns (cookie_string, selected_koht).
 
@@ -501,7 +761,7 @@ def do_login(username: str, password: str, db: str, koht: str) -> tuple[str, str
     if not username or not password:
         raise AuthError(
             "Auto-login needs DIRECTO_USERNAME + DIRECTO_PASSWORD.\n"
-            f"  → set them in {CREDENTIALS_ENV} (or a project .env / the environment)."
+            f"  → {_login_remedy()}"
         )
     if not db:
         raise AuthError("DIRECTO_DB is required (the database segment in login.directo.ee/<db>/).")
@@ -606,7 +866,7 @@ def authed_get(cfg: dict[str, str], path: str, params: dict[str, str]) -> httpx.
 
     koht = cfg.get("DIRECTO_KOHT") or DEFAULT_KOHT
     cookie_str, koht = do_login(cfg["DIRECTO_USERNAME"], cfg["DIRECTO_PASSWORD"], db, koht)
-    _persist_session(cookie_str, koht)
+    _persist_session(_connection()[0], cookie_str, koht)
     return hit(parse_cookie_string(cookie_str))
 
 
@@ -630,26 +890,61 @@ def help_cmd():
     click.echo(HELP)
 
 
+def _check_connection(cid: str, cfg: dict) -> dict:
+    """One connection's round-trip, reported rather than died — doctor covers
+    every connection, so a broken one becomes a finding, not a stop. The
+    recovery point: an expired session triggers a re-login before reporting."""
+    out: dict = {"db": cfg["DIRECTO_DB"],
+                 "koht": cfg.get("DIRECTO_KOHT") or DEFAULT_KOHT,
+                 "user": cfg.get("DIRECTO_USERNAME") or None}
+    cookies = parse_cookie_string(cfg.get("DIRECTO_COOKIE", ""))
+    if cookies and _session_ok(cfg["DIRECTO_DB"], cookies):
+        return out | {"ok": True, "session": "live"}
+    try:
+        cookie_str, koht = do_login(cfg["DIRECTO_USERNAME"], cfg["DIRECTO_PASSWORD"],
+                                    cfg["DIRECTO_DB"], out["koht"])
+    except AuthError as e:
+        return out | {"ok": False, "category": 2, "error": str(e)}
+    except (httpx.HTTPError, OSError) as e:
+        return out | {"ok": False, "category": 5, "error": str(e)}
+    _persist_session(cid, cookie_str, koht)
+    return out | {"ok": True, "koht": koht, "session": "re-authenticated"}
+
+
 @cli.command()
 @click.option("--username")
 @click.option("--password")
 @click.option("--db")
 def doctor(username, password, db):
-    """Validate the session; show active db / location; auto-login on expiry."""
-    cfg = resolve_config(_common_overrides(username, password, db, None))
-    click.echo(f"config file : {CREDENTIALS_ENV}{'' if CREDENTIALS_ENV.exists() else '  (missing)'}")
-    click.echo(f"database    : {cfg['DIRECTO_DB'] or '(unset)'}")
-    click.echo(f"location    : {cfg['DIRECTO_KOHT'] or '(unset → default ' + DEFAULT_KOHT + ')'}")
-    click.echo(f"username    : {cfg['DIRECTO_USERNAME'] or '(unset)'}")
-    cookies = parse_cookie_string(cfg.get("DIRECTO_COOKIE", ""))
-    if cookies and _session_ok(cfg["DIRECTO_DB"], cookies):
-        click.secho("session     : ✓ live", fg="green")
-        return
-    click.secho("session     : stale or missing — attempting auto-login…", fg="yellow")
-    koht = cfg.get("DIRECTO_KOHT") or DEFAULT_KOHT
-    cookie_str, koht = do_login(cfg["DIRECTO_USERNAME"], cfg["DIRECTO_PASSWORD"], cfg["DIRECTO_DB"], koht)
-    _persist_session(cookie_str, koht)
-    click.secho(f"session     : ✓ re-authenticated (location {koht})", fg="green")
+    """Per-connection health: validate the session (auto-login on expiry) —
+    every connection bare, one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category."""
+    global _SELECTED
+    overrides = _common_overrides(username, password, db, None)
+    reg, _ = _connections_registry()
+    if _WANTED_CONN is not None or reg is None:
+        targets = [_select_connection(reg, _WANTED_CONN)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        _SELECTED = (cid, entry)   # the loop's connection is the active one
+        cfg, problem = _build_cfg(cid, entry, overrides)
+        if problem:
+            res = {"ok": False, "category": problem["exit"],
+                   "error": problem["message"]}
+            if problem.get("hint"):
+                res["hint"] = problem["hint"]
+        else:
+            res = _check_connection(cid, cfg)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
 
 
 @cli.command()
@@ -662,9 +957,10 @@ def login(koht, username, password, db):
     cfg = resolve_config(_common_overrides(username, password, db, koht))
     chosen = koht or cfg.get("DIRECTO_KOHT") or DEFAULT_KOHT
     cookie_str, chosen = do_login(cfg["DIRECTO_USERNAME"], cfg["DIRECTO_PASSWORD"], cfg["DIRECTO_DB"], chosen)
-    _persist_session(cookie_str, chosen)
+    cid, _ = _connection()
+    _persist_session(cid, cookie_str, chosen)
     click.secho(f"✓ logged in to {cfg['DIRECTO_DB']} at location {chosen}", fg="green")
-    click.echo(f"  session written to {CREDENTIALS_ENV}")
+    click.echo(f"  session written to {_session_file(cid)}")
 
 
 @cli.command()
@@ -1157,8 +1453,25 @@ def cache_clear():
 
 
 def main() -> None:
+    global _WANTED_CONN, _ACTIVE_VERB
     _gate()                      # every verb passes the project gate first
-    _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
+    # `--connection <id>` is a global selector accepted anywhere on the line,
+    # extracted before click (which would reject an unknown option). Selection
+    # itself stays lazy — `_connection()` resolves it when config is first
+    # needed — so `help` works even with a broken or ambiguous registry.
+    argv = sys.argv[1:]
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--connection" and i + 1 < len(argv):
+            _WANTED_CONN = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            _WANTED_CONN = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+    _ACTIVE_VERB = cleaned[0] if cleaned else ""
+    _contract(cleaned)           # contract verbs; domain verbs fall through
+    sys.argv = [sys.argv[0]] + cleaned   # click parses the cleaned argv
     cli()
 
 

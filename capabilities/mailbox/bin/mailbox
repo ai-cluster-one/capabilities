@@ -6,7 +6,7 @@
 # ]
 # ///
 """
-mailbox — agent-first IMAP/SMTP CLI for one mailbox.
+mailbox — agent-first IMAP/SMTP CLI for mailboxes.
 
 This tool is designed to be invoked by agents. Run `mailbox help` to load
 the full usage contract on demand — do not rely on memorised knowledge of
@@ -15,37 +15,62 @@ its surface.
 This is a THIN, project-agnostic adapter: read, fetch attachments, flag, send.
 Any orchestration (invoice-drain, triage, routing) is a CONSUMER's operation
 layer that reads this tool's JSON — it does NOT live here. The tool knows
-nothing about who owns the mailbox; that lives in the consuming project.
+nothing about who owns a mailbox; that lives in the consuming project.
 
-Mailboxes are defined in a project's committed config:
-  <project>/.capabilities/mailbox/settings.json
-mapping a profile id to its non-secret wiring:
-  {
-    "<id>": {
-      "address":    "user@example.com",
-      "imap_host":  "mail.example.com", "imap_port": 993,
-      "smtp_host":  "mail.example.com", "smtp_port": 587,
-      "secret_env": "MAILBOX_<ID>_APP_PASSWORD"
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`, resolved from the credential cascade (flat keys
+  below). A project with several mailboxes declares them in
+  <project>/.capabilities/mailbox/connections.json:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "address":    "user@example.com",
+          "imap_host":  "mail.example.com", "imap_port": 993,
+          "smtp_host":  "mail.example.com", "smtp_port": 587,
+          "secret_env": "MAILBOX_<ID>_APP_PASSWORD",
+          "allow_write": true
+        }
+      }
     }
-  }
-Only the password is secret: the profile names the env var holding it
-("secret_env"); the value lives in the project's .env / .env.local (gitignored).
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/mailbox/connections.json; first found wins, never merged.
 
-Discovery: $MAILBOX_CONFIG (if set) is the explicit config path and wins over
-everything — absolute, or relative to $CLAUDE_PROJECT_DIR/cwd; it must come from
-the real environment, not a project .env (the .env loads only after the config
-is located). Otherwise, start at $CLAUDE_PROJECT_DIR (else cwd) and walk up to
-the nearest dir holding the config — that dir is the project root. Its .env then .env.local are
-loaded into the environment (never overriding what's already set, so a
-cron-injected secret wins). Pick the profile with --mailbox <id|address>, or
-omit it when the config defines exactly one mailbox.
+  Only the password is secret: the entry names the env var holding it
+  ("secret_env"); the value resolves through the cascade — project
+  .env/.env.local → ~/.config/mailbox/credentials.env → process env.
 
-Every command accepts [--mailbox <id|address>] to pick the profile.
+  WRITES ARE OFF BY DEFAULT: mailbox writes leave the system (mail reaches
+  real people), so send/move/seen (and fetch --mark-seen) exit 4 unless the
+  connection carries an explicit "allow_write": true. No flag lifts the
+  gate; granting it is a deliberate registry edit, made after asking the
+  user. The implicit default connection can never write.
+
+  Selection: --connection <id|address> on every command (--mailbox is an
+  alias). Unflagged, the registry's "default" pointer applies, else the sole
+  entry; several entries without a pointer is refused as ambiguous.
+
+  Credential keys for the implicit default connection (no registry):
+    MAILBOX_ADDRESS       mailbox address                  (required)
+    MAILBOX_IMAP_HOST     IMAP host                        (required)
+    MAILBOX_IMAP_PORT     IMAP port                        (default 993)
+    MAILBOX_SMTP_HOST     SMTP host                        (required)
+    MAILBOX_SMTP_PORT     SMTP port                        (default 587)
+    MAILBOX_APP_PASSWORD  app password (secret)            (required)
+
+  $MAILBOX_CONFIG (real environment only, never a project .env) is an
+  explicit registry path that wins over the project walk — absolute, or
+  relative to $CLAUDE_PROJECT_DIR/cwd.
 
 Commands:
   mailbox help                                Print this document.
-  mailbox mailboxes                           List configured mailbox profiles.
-  mailbox doctor                              Validate IMAP + SMTP login.
+  mailbox connections                         Where every connection's values
+                                              resolve from (tier, source,
+                                              secrets masked). Local only.
+  mailbox mailboxes                           Alias of `mailbox connections`.
+  mailbox doctor [--connection <id>]          Validate IMAP + SMTP login —
+                                              every connection, or one.
   mailbox list [--unread] [--folder F]        List messages (headers only).
         [--since YYYY-MM-DD] [--limit N]      JSON: uid, message_id, date,
                                               from, subject, seen.
@@ -94,8 +119,9 @@ Exit codes:
   0  success
   2  auth (missing credentials, login rejected)
   3  not found (no message with that uid)
-  4  disabled by project policy (.capabilities/settings.json — ask the user,
-     never enable it yourself)
+  4  policy refusal — the project gate (.capabilities/settings.json) on any
+     verb, or a write verb on a read-only connection (allow_write: false).
+     Ask the user; never lift a gate yourself.
   5  server / network (IMAP/SMTP unreachable, timeout)
   6  input / validation
 """
@@ -118,11 +144,20 @@ from imap_tools import AND, MailBox, MailboxLoginError, MailMessageFlags
 # --- Capability declaration (protocol 1) — one home for every contract fact --
 
 NAME = "mailbox"
-PROTOCOL = 1
-SUMMARY = ("Thin IMAP/SMTP CLI for one mailbox — list/show messages, save "
+PROTOCOL = 2
+SUMMARY = ("Thin IMAP/SMTP CLI for mailboxes — list/show messages, save "
            "attachments, flag `\\Seen`, move between folders, and send.")
 SCOPE = "project"   # credential scope: "project" | "user"
-CRED_KEYS: list = []   # the secret key NAME is per-profile (settings.json "secret_env")
+CRED_KEYS = [       # the implicit default connection; a registry entry supplies these per id
+    {"key": "MAILBOX_ADDRESS", "secret": False, "required": True, "note": "mailbox address"},
+    {"key": "MAILBOX_IMAP_HOST", "secret": False, "required": True, "note": "IMAP host"},
+    {"key": "MAILBOX_IMAP_PORT", "secret": False, "required": False, "note": "IMAP port (default 993)"},
+    {"key": "MAILBOX_SMTP_HOST", "secret": False, "required": True, "note": "SMTP host"},
+    {"key": "MAILBOX_SMTP_PORT", "secret": False, "required": False, "note": "SMTP port (default 587)"},
+    {"key": "MAILBOX_APP_PASSWORD", "secret": True, "required": True, "note": "app password"},
+]
+WRITE_VERBS = {"send", "move", "seen"}   # domain verbs that mutate the mailbox
+WRITE_DEFAULT = False   # mailbox writes leave the system (mail to real people) — granted per connection, explicitly
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = False       # True when the capability writes session/cache state
@@ -132,11 +167,6 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CREDENTIALS_ENV = _CONFIG_HOME / "mailbox" / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
-CONFIG_REL = Path(".capabilities") / "mailbox" / "settings.json"
-LEGACY_CONFIG_RELS = (
-    Path(".capabilities") / "mailbox" / "mailbox.json",
-    Path(".assets") / "config" / "mailbox.json",
-)
 PORT_DEFAULTS = {"imap_port": 993, "smtp_port": 587}
 
 
@@ -374,133 +404,241 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd in ("connections", "mailboxes"):   # mailboxes — the native alias
+        _cmd_connections()
     else:
         return
     sys.exit(0)
 
 
-# --- Config / credentials ----------------------------------------------------
+# --- Connections / credentials ------------------------------------------------
 
-def _find_project_dir() -> tuple[Path, Path]:
-    """Locate the config file and the project dir whose .env holds the secret.
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
 
-    Returns (project_dir, config_path). Precedence:
-      1. $MAILBOX_CONFIG — explicit path override (absolute, or relative to
-         $CLAUDE_PROJECT_DIR/cwd); the start dir is the .env anchor. Must come
-         from the real environment, not a project .env (.env loads only after
-         the config is located).
-      2. Walk up from $CLAUDE_PROJECT_DIR (else cwd) to the first dir holding
-         .capabilities/mailbox/settings.json. That dir is the .env anchor.
-    """
-    start = Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path.cwd()).resolve()
 
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _registry_envelope(raw, path: Path) -> dict:
+    if not isinstance(raw, dict):
+        _die(6, "bad_config", f"{path} is not a JSON object")
+    if isinstance(raw.get("connections"), dict) and raw["connections"]:
+        return raw
+    if raw and all(isinstance(v, dict) for v in raw.values()):
+        _die(6, "legacy_config",
+             f"{path} holds a flat profile map, which this version no longer reads",
+             'wrap it in the connections envelope: '
+             '{"default": "<id>", "connections": { ... }}')
+    _die(6, "empty_config", f"{path} defines no connections")
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path, or (None, None) when the project
+    declares none (the implicit default connection applies). $MAILBOX_CONFIG —
+    real environment only — is an explicit registry path that wins."""
     override = os.environ.get("MAILBOX_CONFIG")
     if override:
+        start = Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path.cwd()).resolve()
         cfg = Path(override).expanduser()
-        cfg = cfg if cfg.is_absolute() else (start / cfg)
-        cfg = cfg.resolve()
+        cfg = (cfg if cfg.is_absolute() else start / cfg).resolve()
         if not cfg.is_file():
             _die(6, "no_config",
                  f"$MAILBOX_CONFIG points to {cfg}, which is not a file",
-                 "unset MAILBOX_CONFIG or point it at the mailbox json")
-        return start, cfg
-
-    for d in (start, *start.parents):
-        if (d / CONFIG_REL).is_file():
-            return d, d / CONFIG_REL
-    for d in (start, *start.parents):
-        for rel in LEGACY_CONFIG_RELS:
-            if (d / rel).is_file():
-                _die(6, "no_config",
-                     f"found {d / rel}, which this version no longer reads",
-                     f"rename it to {d / CONFIG_REL}")
-    _die(6, "no_config",
-         f"no {CONFIG_REL} found from {start} upward",
-         "create the mailbox settings in the project's .capabilities/mailbox/, "
-         "or set $MAILBOX_CONFIG to its path")
-
-
-def _load_env_into_environ(project_dir: Path) -> None:
-    """Load .env then .env.local into os.environ without overriding existing keys."""
-    for name in (".env", ".env.local"):
-        path = project_dir / name
-        if not path.is_file():
-            continue
-        for line in path.read_text().splitlines():
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, _, v = s.partition("=")
-            k = k.strip()
-            if k and not os.environ.get(k):
-                os.environ[k] = v.strip().strip('"').strip("'")
+                 "unset MAILBOX_CONFIG or point it at a connections.json")
+        try:
+            raw = json.loads(cfg.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {cfg}: {e}")
+        return _registry_envelope(raw, cfg), cfg
+    envdir = _env_dir()
+    if envdir is not None:
+        reg_file = envdir / "connections.json"
+        if reg_file.is_file():
+            try:
+                raw = json.loads(reg_file.read_text())
+            except (ValueError, OSError) as e:
+                _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+            return _registry_envelope(raw, reg_file), reg_file
+        legacy = _project_settings()
+        if legacy and all(isinstance(v, dict) and "secret_env" in v
+                          for v in legacy.values()):
+            _die(6, "legacy_config",
+                 f"{envdir / 'settings.json'} holds mailbox profiles, which this "
+                 f"version reads from connections.json",
+                 'move them: {"default": "<id>", "connections": { ...profiles... }}')
+    user_reg = _CONFIG_HOME / NAME / "connections.json"
+    if user_reg.is_file():
+        try:
+            raw = json.loads(user_reg.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {user_reg}: {e}")
+        return _registry_envelope(raw, user_reg), user_reg
+    return None, None
 
 
-def _select_profile(profiles: dict, wanted: str | None) -> tuple[str, dict]:
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. Native matching: an entry's address selects it too."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
     if wanted:
-        if wanted in profiles:
-            return wanted, profiles[wanted]
-        for pid, p in profiles.items():
-            if p.get("address", "").lower() == wanted.lower():
-                return pid, p
-        _die(6, "unknown_mailbox", f"no mailbox profile matches {wanted!r}",
-             f"known: {', '.join(profiles) or '(none)'}")
-    if len(profiles) == 1:
-        pid = next(iter(profiles))
-        return pid, profiles[pid]
-    _die(6, "ambiguous_mailbox",
-         f"config defines {len(profiles)} mailboxes; pass --mailbox <id|address>",
-         f"known: {', '.join(profiles)}")
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection's config. Returns (cfg, problem) — problem is
+    an error dict ({"exit", "code", "message", "hint"?}) instead of a die, so
+    doctor can report every connection rather than stopping at the first."""
+    if entry is None:   # the implicit default — flat keys through the cascade
+        vals = {k["key"]: _resolve_env_key(k["key"])[0] for k in CRED_KEYS}
+        missing = [k["key"] for k in CRED_KEYS if k["required"] and not vals[k["key"]]]
+        if missing:
+            return None, {
+                "exit": 2, "code": "missing_credentials",
+                "message": f"unset: {', '.join(missing)}",
+                "hint": f"set them in the project .env(.local), {CREDENTIALS_ENV}, "
+                        f"or the environment — or declare a connections registry "
+                        f"(.capabilities/{NAME}/connections.json)"}
+        return {
+            "id": cid, "allow_write": WRITE_DEFAULT,
+            "user": vals["MAILBOX_ADDRESS"],
+            "password": vals["MAILBOX_APP_PASSWORD"],
+            "imap_host": vals["MAILBOX_IMAP_HOST"],
+            "imap_port": int(vals["MAILBOX_IMAP_PORT"] or PORT_DEFAULTS["imap_port"]),
+            "smtp_host": vals["MAILBOX_SMTP_HOST"],
+            "smtp_port": int(vals["MAILBOX_SMTP_PORT"] or PORT_DEFAULTS["smtp_port"]),
+        }, None
+    secret_env = entry.get("secret_env")
+    if not secret_env:
+        return None, {"exit": 6, "code": "no_secret_env",
+                      "message": f"connection {cid!r} is missing 'secret_env'"}
+    password, _, _ = _resolve_env_key(secret_env)
+    if not password:
+        return None, {
+            "exit": 2, "code": "missing_secret",
+            "message": f"env var {secret_env} (for connection {cid!r}) is unset",
+            "hint": f"set {secret_env} in the project's .env / .env.local, "
+                    f"{CREDENTIALS_ENV}, or the environment"}
+    missing = [k for k in ("address", "imap_host", "smtp_host") if not entry.get(k)]
+    if missing:
+        return None, {"exit": 6, "code": "incomplete_connection",
+                      "message": f"connection {cid!r} missing: {', '.join(missing)}"}
+    return {
+        "id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+        "user": entry["address"],
+        "password": password,
+        "imap_host": entry["imap_host"],
+        "imap_port": int(entry.get("imap_port", PORT_DEFAULTS["imap_port"])),
+        "smtp_host": entry["smtp_host"],
+        "smtp_port": int(entry.get("smtp_port", PORT_DEFAULTS["smtp_port"])),
+    }, None
 
 
 def _load_config(wanted: str | None) -> dict:
-    project_dir, config_path = _find_project_dir()
-    try:
-        profiles = json.loads(config_path.read_text())
-    except (ValueError, OSError) as e:
-        _die(6, "bad_config", f"cannot read {config_path}: {e}")
-    if not isinstance(profiles, dict) or not profiles:
-        _die(6, "empty_config", f"{config_path} defines no mailbox profiles")
-
-    pid, prof = _select_profile(profiles, wanted)
-    _load_env_into_environ(project_dir)
-
-    secret_env = prof.get("secret_env")
-    if not secret_env:
-        _die(6, "no_secret_env", f"profile {pid!r} is missing 'secret_env'")
-    password = os.environ.get(secret_env)
-    if not password:
-        _die(2, "missing_secret",
-             f"env var {secret_env} (for mailbox {pid!r}) is unset",
-             f"set {secret_env} in the project's .env / .env.local")
-
-    user = prof.get("address")
-    imap_host, smtp_host = prof.get("imap_host"), prof.get("smtp_host")
-    missing = [k for k, v in {"address": user, "imap_host": imap_host,
-                              "smtp_host": smtp_host}.items() if not v]
-    if missing:
-        _die(6, "incomplete_profile",
-             f"profile {pid!r} missing: {', '.join(missing)}")
-
-    return {
-        "id": pid,
-        "user": user,
-        "password": password,
-        "imap_host": imap_host,
-        "imap_port": int(prof.get("imap_port", PORT_DEFAULTS["imap_port"])),
-        "smtp_host": smtp_host,
-        "smtp_port": int(prof.get("smtp_port", PORT_DEFAULTS["smtp_port"])),
-    }
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    cfg, problem = _build_cfg(cid, entry)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"],
+             problem.get("hint"))
+    return cfg
 
 
-def _list_mailboxes() -> list:
-    project_dir, config_path = _find_project_dir()
-    profiles = json.loads(config_path.read_text())
-    return [
-        {"id": pid, "address": p.get("address"),
-         "imap_host": p.get("imap_host"), "smtp_host": p.get("smtp_host")}
-        for pid, p in profiles.items()
-    ]
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes (mailbox writes "
+             f"are off unless a connection grants them)",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_env_key(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        for field in ("address", "imap_host", "imap_port", "smtp_host", "smtp_port"):
+            value = entry.get(field)
+            keys.append(_key_report(
+                field, False, field in ("address", "imap_host", "smtp_host"),
+                str(value) if value is not None else None,
+                "connection", reg_path))
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys.append(_key_report(secret_env, True, True, value, tier, source))
+        else:
+            keys.append(_key_report("secret_env", False, True, None, None, None))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
 
 
 # --- Output ------------------------------------------------------------------
@@ -592,26 +730,61 @@ def _locate_by_message_id(mb: MailBox, message_id: str):
 
 # --- Commands ----------------------------------------------------------------
 
-def cmd_doctor(cfg: dict) -> dict:
-    with _imap(cfg) as mb:
-        mb.folder.set("INBOX")
-        total = len(mb.uids("ALL"))
-        unseen = len(mb.uids(AND(seen=False)))
-    # SMTP check
+def _check_connection(cfg: dict) -> dict:
+    """One connection's round-trip, reported rather than died — doctor covers
+    every connection, so a broken one becomes a finding, not a stop."""
+    out: dict = {"user": cfg["user"],
+                 "imap": f"{cfg['imap_host']}:{cfg['imap_port']}"}
+    try:
+        mb = MailBox(cfg["imap_host"], port=cfg["imap_port"])
+        mb.login(cfg["user"], cfg["password"], initial_folder="INBOX")
+        with mb:
+            out["inbox_total"] = len(mb.uids("ALL"))
+            out["inbox_unseen"] = len(mb.uids(AND(seen=False)))
+    except MailboxLoginError as e:
+        return out | {"ok": False, "category": 2, "error": f"IMAP login failed: {e}"}
+    except (OSError, ssl.SSLError) as e:
+        return out | {"ok": False, "category": 5,
+                      "error": f"cannot reach IMAP {cfg['imap_host']}:{cfg['imap_port']}: {e}"}
     try:
         with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=30) as s:
             s.starttls(context=ssl.create_default_context())
             s.login(cfg["user"], cfg["password"])
-        smtp_ok = True
+        out["smtp_ok"] = True
     except smtplib.SMTPAuthenticationError as e:
-        _die(2, "smtp_auth", f"SMTP login failed: {e}")
+        return out | {"ok": False, "category": 2, "error": f"SMTP login failed: {e}"}
     except (OSError, smtplib.SMTPException) as e:
-        _die(5, "smtp_unreachable", f"cannot reach SMTP {cfg['smtp_host']}:{cfg['smtp_port']}: {e}")
-    return {
-        "ok": True, "user": cfg["user"],
-        "imap": f"{cfg['imap_host']}:{cfg['imap_port']}", "smtp_ok": smtp_ok,
-        "inbox_total": total, "inbox_unseen": unseen,
-    }
+        return out | {"ok": False, "category": 5,
+                      "error": f"cannot reach SMTP {cfg['smtp_host']}:{cfg['smtp_port']}: {e}"}
+    return out | {"ok": True}
+
+
+def cmd_doctor(wanted: str | None) -> None:
+    """Every connection bare; one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category."""
+    reg, _ = _connections_registry()
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        cfg, problem = _build_cfg(cid, entry)
+        if problem:
+            res = {"ok": False, "category": problem["exit"],
+                   "error": problem["message"]}
+            if problem.get("hint"):
+                res["hint"] = problem["hint"]
+        else:
+            res = _check_connection(cfg)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
 
 
 def cmd_list(cfg: dict, folder: str, unread: bool, since: str | None, limit: int) -> list:
@@ -751,13 +924,13 @@ def main() -> None:
         prog="mailbox", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--mailbox", default=None,
-                   help="profile id or address (optional if config has one mailbox)")
+    p.add_argument("--connection", "--mailbox", dest="connection", default=None,
+                   help="connection id or address (optional with a default "
+                        "pointer or a sole connection)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("help", help="print the full usage contract")
-    sub.add_parser("mailboxes", help="list configured mailbox profiles")
-    sub.add_parser("doctor", help="validate IMAP + SMTP login")
+    sub.add_parser("doctor", help="validate IMAP + SMTP login, per connection")
     sub.add_parser("folders", help="list IMAP folders")
 
     sp = sub.add_parser("list", help="list messages (headers only)")
@@ -804,14 +977,17 @@ def main() -> None:
     if args.cmd == "help":
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
-    if args.cmd == "mailboxes":
-        _emit(_list_mailboxes())
+    if args.cmd == "doctor":
+        cmd_doctor(args.connection)
         return
 
-    cfg = _load_config(args.mailbox)
-    if args.cmd == "doctor":
-        _emit(cmd_doctor(cfg))
-    elif args.cmd == "folders":
+    cfg = _load_config(args.connection)
+    _write_gate(cfg["id"], cfg["allow_write"], args.cmd)
+    if args.cmd == "fetch" and args.mark_seen and cfg["allow_write"] is False:
+        _die(4, "read_only",
+             f"connection {cfg['id']!r} is read-only; --mark-seen mutates the mailbox",
+             "drop --mark-seen, or ask the user whether to allow writes")
+    if args.cmd == "folders":
         _emit(cmd_folders(cfg))
     elif args.cmd == "move":
         _emit(cmd_move(cfg, args.uid, args.folder, args.to_folder))

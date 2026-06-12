@@ -14,14 +14,44 @@ It is identity-free: it knows nothing about any consuming project. Connection +
 workspace come from config/env/flags; project-specific paths (folders, script
 paths, variable paths) are supplied by the caller.
 
-Credentials resolve in a 4-tier cascade (first non-empty wins):
-  1. flags          --url / --token / --workspace
-  2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-  3. user config    $XDG_CONFIG_HOME/windmill/credentials.env (default ~/.config/windmill/)
-  4. process env    WINDMILL_URL / WINDMILL_API_TOKEN / WINDMILL_WORKSPACE
-Same WINDMILL_* keys at every tier; the project you're in wins, process env is the
-fallback (so a deployed host's injected env governs when no config file is present).
-Never pass the token on the command line.
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`, resolved by the cascade (first non-empty wins):
+    1. flags          --url / --token / --workspace
+    2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
+    3. settings       .capabilities/windmill/settings.json (flat keys: url, workspace, folder)
+    4. user config    $XDG_CONFIG_HOME/windmill/credentials.env (default ~/.config/windmill/)
+    5. process env    WINDMILL_URL / WINDMILL_API_TOKEN / WINDMILL_WORKSPACE
+  Same WINDMILL_* keys at every tier; the project you're in wins, process env is
+  the fallback (so a deployed host's injected env governs when no config file is
+  present). Never pass the token on the command line.
+
+  A project that talks to several Windmill instances declares them in
+  <project>/.capabilities/windmill/connections.json:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "url": "https://wm.example.com", "workspace": "main",
+          "secret_env": "WINDMILL_<ID>_API_TOKEN",
+          "allow_write": true
+        }
+      }
+    }
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/windmill/connections.json; first found wins, never merged.
+
+  Only the token is secret: the entry names the env var holding it
+  ("secret_env"); the value resolves through the cascade (project .env(.local)
+  → user credentials.env → process env). "allow_write": false makes the
+  connection read-only: every mutating verb (deploy, run, *-set, *-delete,
+  *-ensure, *-create, provision) exits 4, and no flag lifts the gate.
+  Writes default to allowed (a Windmill instance is the consumer's own).
+
+  Selection: --connection <id> on every command. Unflagged, the registry's
+  "default" pointer applies, else the sole entry; several entries without a
+  pointer is refused as ambiguous. --workspace still switches workspaces
+  within the selected connection's instance.
 
 Acting as another user (isolation): the stored token is the workspace admin's.
   windmill --as <email> <cmd ...>             Run the call AS that workspace user, by
@@ -32,8 +62,11 @@ Acting as another user (isolation): the stored token is the workspace admin's.
 
 Commands:
   windmill help                               Print this document.
-  windmill doctor                             Version + whoami + workspace reachability
-                                              (the health check).
+  windmill connections                        Where every connection's values resolve
+                                              from (tier, source, secrets masked).
+                                              Local only — no network.
+  windmill doctor [--connection <id>]         Version + whoami + workspace reachability —
+                                              every connection, or one.
 
   Scripts (Windmill versions by content hash; no PUT — update = archive+create):
   windmill scripts [--prefix f/x] [--limit N] List scripts (optionally by path prefix).
@@ -134,9 +167,9 @@ Contract commands (the same on every capability):
                                                  files for this capability.
 
 Exit codes:
-  0 success | 2 auth | 3 not found | 4 disabled by project policy
-  (.capabilities/settings.json — ask the user) | 5 server/network |
-  6 input/validation
+  0 success | 2 auth | 3 not found | 4 policy refusal (the project gate, or a
+  write verb on a read-only connection — ask the user, never lift a gate
+  yourself) | 5 server/network | 6 input/validation
 
 Notes:
   - Worker model: a worker runs ONE job at a time for its whole duration; long jobs
@@ -172,7 +205,7 @@ MAX_RETRIES = 3
 # --- Capability declaration (protocol 1) — one home for every contract fact --
 
 NAME = "windmill"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("Windmill CLI over the REST API — deploy scripts, attach cron "
            "schedules, run jobs, read run history/logs, and manage secret "
            "variables and folders.")
@@ -187,6 +220,13 @@ CRED_KEYS = [
     {"key": "WINDMILL_FOLDER", "secret": False, "required": False,
      "note": "default folder for deploys"},
 ]
+WRITE_VERBS = {     # domain verbs that mutate the instance
+    "deploy", "script-delete", "schedule-set", "schedule-enable",
+    "schedule-delete", "run", "var-set", "var-delete", "folder-create",
+    "folder-ensure", "trigger-set", "trigger-delete", "user-ensure",
+    "provision",
+}
+WRITE_DEFAULT = True    # writes stay inside an instance the consumer owns
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/windmill/guides/")
 TOPICS = ["operational", "provisioning", "script-authoring"]
@@ -437,39 +477,218 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
 
 
-def _resolve_conn(args) -> tuple[str, str, str]:
-    project = _project_env()       # tier 2
-    user = _parse_env_file(CREDENTIALS_ENV)  # tier 3
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
 
-    settings = _project_settings()  # the capability's project settings envelope
 
-    def pick(flag, env_key):
-        # First non-empty wins: flag > project .env(.local) > project settings
-        # envelope > user config > process env.
-        return (getattr(args, flag, None)
-                or project.get(env_key)
-                or settings.get(env_key.removeprefix("WINDMILL_").lower())
-                or user.get(env_key)
-                or os.environ.get(env_key))
+def _resolve_key_default(key: str) -> tuple[str | None, str | None, Path | None]:
+    """The implicit default connection's resolution: project .env(.local) →
+    settings envelope (flat keys — windmill's recorded extension) → user
+    credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    sval = _project_settings().get(key.removeprefix("WINDMILL_").lower())
+    if sval:
+        envdir = _env_dir()
+        return str(sval), "settings", (envdir / "settings.json") if envdir else None
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
 
-    url = pick("url", "WINDMILL_URL")
-    token = pick("token", "WINDMILL_API_TOKEN")
-    workspace = pick("workspace", "WINDMILL_WORKSPACE")
 
-    if not url or not token:
-        _die(2, "missing_credentials",
-             "WINDMILL_URL and WINDMILL_API_TOKEN are required",
-             f"set them in a project .env(.local), {CREDENTIALS_ENV}, the environment, or via --url/--token")
-    if not workspace:
-        _die(6, "missing_workspace",
-             "WINDMILL_WORKSPACE is required",
-             "set WINDMILL_WORKSPACE in a project .env, the user config, the environment, or pass --workspace")
-    return url.rstrip("/"), token, workspace
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _build_conn(cid: str, entry: dict | None, args) -> tuple[dict | None, dict | None]:
+    """Materialize one connection. Returns (conn, problem) — problem is an
+    error dict ({"exit", "code", "message", "hint"?}) instead of a die, so
+    doctor can report every connection rather than stopping at the first."""
+    if entry is None:   # the implicit default — flat keys through the cascade
+        url = getattr(args, "url", None) or _resolve_key_default("WINDMILL_URL")[0]
+        token = (getattr(args, "token", None)
+                 or _resolve_key_default("WINDMILL_API_TOKEN")[0])
+        workspace = (getattr(args, "workspace", None)
+                     or _resolve_key_default("WINDMILL_WORKSPACE")[0])
+        if not url or not token:
+            return None, {
+                "exit": 2, "code": "missing_credentials",
+                "message": "WINDMILL_URL and WINDMILL_API_TOKEN are required",
+                "hint": f"set them in a project .env(.local), {CREDENTIALS_ENV}, "
+                        f"the environment, or via --url/--token — or declare a "
+                        f"connections registry (.capabilities/{NAME}/connections.json)"}
+        if not workspace:
+            return None, {
+                "exit": 6, "code": "missing_workspace",
+                "message": "WINDMILL_WORKSPACE is required",
+                "hint": "set WINDMILL_WORKSPACE in a project .env, the user "
+                        "config, the environment, or pass --workspace"}
+        return {"id": cid, "allow_write": WRITE_DEFAULT, "url": url.rstrip("/"),
+                "token": token, "workspace": workspace}, None
+    url = getattr(args, "url", None) or entry.get("url")
+    workspace = getattr(args, "workspace", None) or entry.get("workspace")
+    secret_env = entry.get("secret_env")
+    if not secret_env:
+        return None, {"exit": 6, "code": "no_secret_env",
+                      "message": f"connection {cid!r} is missing 'secret_env'"}
+    token = _resolve_env_key(secret_env)[0]
+    if not token:
+        return None, {
+            "exit": 2, "code": "missing_secret",
+            "message": f"env var {secret_env} (for connection {cid!r}) is unset",
+            "hint": f"set {secret_env} in the project's .env / .env.local, "
+                    f"{CREDENTIALS_ENV}, or the environment"}
+    missing = [k for k, v in {"url": url, "workspace": workspace}.items() if not v]
+    if missing:
+        return None, {"exit": 6, "code": "incomplete_connection",
+                      "message": f"connection {cid!r} missing: {', '.join(missing)}"}
+    return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "url": url.rstrip("/"), "token": token, "workspace": workspace}, None
+
+
+def _resolve_conn(args) -> dict:
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, getattr(args, "connection", None))
+    conn, problem = _build_conn(cid, entry, args)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"],
+             problem.get("hint"))
+    return conn
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_key_default(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        for field, required in (("url", True), ("workspace", True), ("folder", False)):
+            value = entry.get(field)
+            keys.append(_key_report(field, False, required,
+                                    str(value) if value is not None else None,
+                                    "connection", reg_path))
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys.append(_key_report(secret_env, True, True, value, tier, source))
+        else:
+            keys.append(_key_report("secret_env", False, True, None, None, None))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
 
 
 # --- HTTP --------------------------------------------------------------------
@@ -613,14 +832,62 @@ def W(ws: str, suffix: str) -> str:
 
 # --- Commands ----------------------------------------------------------------
 
-def cmd_doctor(c, ws):
-    version = _request(c, "GET", "/api/version", raw=True)
-    whoami = _request(c, "GET", W(ws, "users/whoami"))
-    # cheap reachability: list one script in the workspace
-    scripts = _request(c, "GET", W(ws, "scripts/list"), params={"per_page": 1})
-    name = whoami.get("username") or whoami.get("email") if isinstance(whoami, dict) else whoami
-    return {"ok": True, "version": version, "workspace": ws, "whoami": name,
-            "scripts_reachable": isinstance(scripts, list)}
+def _check_connection(conn: dict) -> dict:
+    """One connection's round-trip, reported rather than died — doctor covers
+    every connection, so a broken one becomes a finding, not a stop."""
+    out: dict = {"url": conn["url"], "workspace": conn["workspace"]}
+    try:
+        with _client(conn["url"], conn["token"]) as c:
+            r = c.get("/api/version")
+            if r.status_code >= 400:
+                cat = 2 if r.status_code in (401, 403) else 5
+                return out | {"ok": False, "category": cat,
+                              "error": f"/api/version returned {r.status_code}"}
+            out["version"] = r.text.strip()
+            r = c.get(f"/api/w/{conn['workspace']}/users/whoami")
+            if r.status_code >= 400:
+                cat = 2 if r.status_code in (401, 403) else 5
+                return out | {"ok": False, "category": cat,
+                              "error": f"whoami returned {r.status_code}"}
+            who = r.json()
+            out["whoami"] = (who.get("username") or who.get("email")
+                             if isinstance(who, dict) else who)
+            r = c.get(f"/api/w/{conn['workspace']}/scripts/list",
+                      params={"per_page": 1})
+            out["scripts_reachable"] = r.status_code < 400
+    except httpx.RequestError as e:
+        return out | {"ok": False, "category": 5, "error": f"network error: {e}"}
+    except ValueError as e:
+        return out | {"ok": False, "category": 5, "error": f"bad response: {e}"}
+    return out | {"ok": True}
+
+
+def cmd_doctor(args) -> None:
+    """Every connection bare; one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category."""
+    reg, _ = _connections_registry()
+    if args.connection is not None or reg is None:
+        targets = [_select_connection(reg, args.connection)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        conn, problem = _build_conn(cid, entry, args)
+        if problem:
+            res = {"ok": False, "category": problem["exit"],
+                   "error": problem["message"]}
+            if problem.get("hint"):
+                res["hint"] = problem["hint"]
+        else:
+            res = _check_connection(conn)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
 
 
 def cmd_scripts(c, ws, prefix, limit):
@@ -1112,6 +1379,9 @@ def main() -> None:
     p = argparse.ArgumentParser(
         prog="windmill", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--connection", default=None,
+                   help="connection id (optional with a default pointer or a "
+                        "sole connection)")
     p.add_argument("--url", default=None, help="Windmill base URL (overrides env/config)")
     p.add_argument("--token", default=None, help="API token (prefer config/env; avoid CLI)")
     p.add_argument("--workspace", default=None, help="workspace id (overrides env/config)")
@@ -1208,15 +1478,17 @@ def main() -> None:
     args = p.parse_args()
     if args.cmd == "help":
         sys.stdout.write((__doc__ or "").lstrip("\n")); return
+    if args.cmd == "doctor":
+        cmd_doctor(args); return
 
-    url, token, ws = _resolve_conn(args)
+    conn = _resolve_conn(args)
+    _write_gate(conn["id"], conn["allow_write"], args.cmd)
+    url, token, ws = conn["url"], conn["token"], conn["workspace"]
     admin_token = token
     if args.as_user:
         token = _impersonate(url, admin_token, ws, args.as_user)
     with _client(url, token) as c:
-        if args.cmd == "doctor":
-            _emit(cmd_doctor(c, ws))
-        elif args.cmd == "scripts":
+        if args.cmd == "scripts":
             _emit(cmd_scripts(c, ws, args.prefix, args.limit))
         elif args.cmd == "script-get":
             _emit(cmd_script_get(c, ws, args.path))
