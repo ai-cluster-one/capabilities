@@ -187,8 +187,9 @@ CRED_KEYS = [
     {"key": "WINDMILL_FOLDER", "secret": False, "required": False,
      "note": "default folder for deploys"},
 ]
-DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
-TOPICS: list = []   # shipped guide topics
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/windmill/guides/")
+TOPICS = ["operational", "provisioning", "script-authoring"]
 STATE = False       # True when the capability writes session/cache state
 POST_INSTALL: list = []
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
