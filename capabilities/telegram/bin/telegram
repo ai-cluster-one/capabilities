@@ -20,21 +20,46 @@ Agent startup protocol (this is a STATEFUL CLI — it holds a login session):
      it with no prompt.
   3. A healthy `telegram doctor` (exit 0) means ready to work.
 
-Credentials resolve through the standard four-tier cascade (first non-empty
-wins): the global `--session` flag (session path only) > a project .env(.local)
-> ~/.config/telegram/credentials.env > the process environment. Secret values
-(TELEGRAM_API_ID, TELEGRAM_API_HASH, DEEPGRAM_API_KEY) have no flag — they never travel on
-the command line, only their env-var NAME resolves them.
+Configuration resolves as connections — named, complete resolutions of the app
+credentials and the session. With no registry there is one implicit connection,
+`default`, resolved by the cascade (first non-empty wins): the `--session` flag
+(session path only) > a project .env(.local) > ~/.config/telegram/credentials.env
+> the process environment. Secrets (TELEGRAM_API_HASH, DEEPGRAM_API_KEY) have no
+flag — only their env-var NAME resolves them, never the command line.
 
-  TELEGRAM_API_ID          Numeric app id from my.telegram.org/apps.
-  TELEGRAM_API_HASH        App hash paired with the id (identifies the app).
-  TELEGRAM_SESSION         Path to the session, no extension — Telethon writes
-                           <path>.session on disk. Optional — defaults to
-                           $XDG_STATE_HOME/telegram/session (the file is
-                           session.session; ~/.local/state by default).
-  DEEPGRAM_API_KEY         Required only by `transcribe`.
+More than one account is declared in a connections registry — project
+.capabilities/telegram/connections.json, else the machine-level
+~/.config/telegram/connections.json (the natural home for a personal account),
+first found wins. Each entry names its app id literally and its app hash by
+env-key indirection, and owns a per-connection session:
 
-  --session <PATH>         Global override for the session-file path, accepted
+  {
+    "default": "main",
+    "connections": {
+      "main": { "api_id": 1234567, "secret_env": "TELEGRAM_API_HASH" },
+      "work": { "api_id": 7654321, "secret_env": "TELEGRAM_WORK_HASH",
+                "allow_write": true }
+    }
+  }
+
+The write gate: a `send` leaves the system (a message to a person), so it is off
+unless a connection grants it. The implicit default cannot send; grant it with
+`"allow_write": true` on a connection in connections.json. A refused write exits
+4 — ask the user, never lift the gate yourself.
+
+  --connection <id>        Select a connection; accepted by every verb. Optional
+                           with a default pointer or a sole connection.
+  TELEGRAM_API_ID          Numeric app id from my.telegram.org/apps (implicit
+                           default; a registry entry names `api_id` instead).
+  TELEGRAM_API_HASH        App hash paired with the id (secret).
+  TELEGRAM_SESSION         Session path, no extension — Telethon writes
+                           <path>.session on disk. Optional one-shot override; the
+                           default connection's session defaults to
+                           $XDG_STATE_HOME/telegram/session, a named connection's
+                           to <state-dir>/<id>/session.
+  DEEPGRAM_API_KEY         Required only by `transcribe` (secret).
+
+  --session <PATH>         One-shot override of the session-file path, accepted
                            anywhere on the line. Names a path, not a secret.
 
 Commands:
@@ -74,6 +99,9 @@ I/O contract:
 Contract commands (the same on every capability):
   telegram stub                                 One-line awareness text.
   telegram manifest --json                      Machine-readable declaration.
+  telegram connections                          Where every connection's values
+                                                 resolve from — tier, source,
+                                                 secrets masked (local, no network).
   telegram guide [<topic>]                      Guide topics / one guide body,
                                                  fetched live from the docs base.
   telegram ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
@@ -85,8 +113,9 @@ Exit codes:
   0  success
   2  auth — missing/invalid credentials, session expired, not logged in
   3  not found — the chat or entity could not be resolved
-  4  disabled by project policy (.capabilities/settings.json — ask the user,
-     never enable it yourself)
+  4  policy refusal — disabled by project policy (.capabilities/settings.json),
+     or `send` on a read-only connection — ask the user, never lift the gate
+     yourself
   5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx
   6  input / validation — a malformed argument, a bad date
 
@@ -117,15 +146,15 @@ from telethon.errors.rpcerrorlist import (
 )
 from telethon.tl.types import Channel, Chat, User
 
-# --- Capability declaration (protocol 1) — one home for every contract fact --
+# --- Capability declaration (protocol 2) — one home for every contract fact --
 
 NAME = "telegram"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("Telegram CLI over a personal MTProto account — read/search a chat, "
            "send, export history to JSON, transcribe voice/audio. Stateful — "
            "run `telegram doctor` first.")
 SCOPE = "user"   # credential scope: "project" | "user"
-CRED_KEYS = [
+CRED_KEYS = [    # the implicit default connection; a registry entry supplies these per id
     {"key": "TELEGRAM_API_ID", "secret": False, "required": True,
      "note": "numeric app id from my.telegram.org/apps"},
     {"key": "TELEGRAM_API_HASH", "secret": True, "required": True,
@@ -135,6 +164,8 @@ CRED_KEYS = [
     {"key": "DEEPGRAM_API_KEY", "secret": True, "required": False,
      "note": "voice/audio transcription"},
 ]
+WRITE_VERBS = {"send"}   # the only domain verb that leaves the system — a message to a person
+WRITE_DEFAULT = False    # a send leaves the system; granted per connection, explicitly
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = True       # True when the capability writes session/cache state
@@ -225,7 +256,7 @@ def _project_env() -> dict:
     return merged
 
 
-# --- Capability contract (protocol 1) — shared verbatim across capabilities --
+# --- Capability contract (protocol 2) — shared verbatim across capabilities --
 
 def _gate() -> None:
     """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
@@ -402,48 +433,216 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
 
 
-def _resolve(env_key: str, flag_val: str | None = None) -> str | None:
-    """First non-empty wins across the cascade: flag > project .env(.local) >
-    user config > process env. Secrets pass flag_val=None — they have no flag and
-    resolve from the env tiers only, never touching argv."""
-    project = _project_env()
-    user = _parse_env_file(CREDENTIALS_ENV)
-    for v in (flag_val, project.get(env_key), user.get(env_key), os.environ.get(env_key)):
-        if v:
-            return v.strip()
-    return None
+# --- Connections / credentials ----------------------------------------------
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
 
 
-def make_client(session_flag: str | None = None) -> TelegramClient:
-    """Resolve the app credentials + session path through the cascade and build a
-    client. The session value is not a flat token: TELEGRAM_API_ID/TELEGRAM_API_HASH identify
-    the app, and the session FILE (named by TELEGRAM_SESSION, default
-    $XDG_STATE_HOME/telegram/session) holds the persisted login — but the tiers and their
-    order are preserved."""
-    api_id = _resolve("TELEGRAM_API_ID")
-    api_hash = _resolve("TELEGRAM_API_HASH")
-    if not api_id or not api_hash:
-        _die(2, "missing_credentials",
-             f"TELEGRAM_API_ID / TELEGRAM_API_HASH not found in a project .env, {CREDENTIALS_ENV}, or the environment",
-             "create an app at my.telegram.org/apps, then set both in the user config or a project .env")
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home (the natural home for a personal account). First found
+    wins; (None, None) when neither declares one (the implicit default applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            reg = json.loads(path.read_text())
+        except (OSError, ValueError) as e:
+            _die(6, "bad_config", f"cannot read {path}: {e}")
+        if not isinstance(reg.get("connections"), dict) or not reg["connections"]:
+            _die(6, "bad_config", f"{path} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return reg, path
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _build_cfg(cid: str, entry: dict | None,
+               session_flag: str | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection's client config. Returns (cfg, problem) —
+    problem is an error dict rather than a die, so doctor reports every
+    connection instead of stopping at the first. The session is not a flat
+    token: api id + app hash identify the app, a per-connection session FILE
+    holds the login. The implicit default keeps its established session
+    location; a named connection's session lives at <state-dir>/<id>/session.
+    --session / TELEGRAM_SESSION is the one-shot override either way."""
+    if entry is None:   # the implicit default — flat keys through the cascade
+        api_id = _resolve_env_key("TELEGRAM_API_ID")[0]
+        api_hash = _resolve_env_key("TELEGRAM_API_HASH")[0]
+        missing = [k for k, v in (("TELEGRAM_API_ID", api_id),
+                                   ("TELEGRAM_API_HASH", api_hash)) if not v]
+        if missing:
+            return None, {
+                "exit": 2, "code": "missing_credentials",
+                "message": f"unset: {', '.join(missing)}",
+                "hint": f"create an app at my.telegram.org/apps, then set them in a "
+                        f"project .env(.local), {CREDENTIALS_ENV}, or the environment "
+                        f"— or declare a connections registry "
+                        f"(.capabilities/{NAME}/connections.json)"}
+        session = (session_flag or _resolve_env_key("TELEGRAM_SESSION")[0]
+                   or str(DEFAULT_SESSION))
+        allow_write = WRITE_DEFAULT
+    else:
+        api_id = entry.get("api_id")
+        if api_id is None:
+            return None, {"exit": 6, "code": "incomplete_connection",
+                          "message": f"connection {cid!r} is missing 'api_id'"}
+        secret_env = entry.get("secret_env")
+        if not secret_env:
+            return None, {"exit": 6, "code": "no_secret_env",
+                          "message": f"connection {cid!r} is missing 'secret_env'"}
+        api_hash = _resolve_env_key(secret_env)[0]
+        if not api_hash:
+            return None, {
+                "exit": 2, "code": "missing_secret",
+                "message": f"env var {secret_env} (for connection {cid!r}) is unset",
+                "hint": f"set {secret_env} in a project .env / .env.local, "
+                        f"{CREDENTIALS_ENV}, or the environment"}
+        session = (session_flag or entry.get("session")
+                   or str(_state_dir() / cid / "session"))
+        allow_write = bool(entry.get("allow_write", WRITE_DEFAULT))
     try:
-        api_id_int = int(api_id)
-    except ValueError:
-        _die(6, "bad_api_id", "TELEGRAM_API_ID must be an integer",
-             "copy the numeric App api_id from my.telegram.org/apps")
-    session = session_flag or _resolve("TELEGRAM_SESSION") or str(DEFAULT_SESSION)
-    session_path = Path(session).expanduser()
+        api_id_int = int(str(api_id))
+    except (TypeError, ValueError):
+        return None, {"exit": 6, "code": "bad_api_id",
+                      "message": f"api id for connection {cid!r} must be an integer",
+                      "hint": "copy the numeric App api_id from my.telegram.org/apps"}
+    return {"id": cid, "api_id": api_id_int, "api_hash": api_hash,
+            "session": session, "allow_write": allow_write}, None
+
+
+def _load_config(wanted: str | None, session_flag: str | None) -> dict:
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    cfg, problem = _build_cfg(cid, entry, session_flag)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"], problem.get("hint"))
+    return cfg
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes (a Telegram send "
+             f"leaves the system, so it is off unless a connection grants it)",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_env_key(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        api_id = entry.get("api_id")
+        keys.append(_key_report("api_id", False, True,
+                                str(api_id) if api_id is not None else None,
+                                "connection", reg_path))
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys.append(_key_report(secret_env, True, True, value, tier, source))
+        else:
+            keys.append(_key_report("secret_env", False, True, None, None, None))
+        session = entry.get("session") or str(_state_dir() / cid / "session")
+        keys.append(_key_report("session", False, False, session, "connection", reg_path))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
+
+
+def make_client(cfg: dict) -> TelegramClient:
+    """Build a client from a resolved connection config — the api id + app hash
+    identify the app, the session FILE holds the persisted login."""
+    session_path = Path(cfg["session"]).expanduser()
     session_path.parent.mkdir(parents=True, exist_ok=True)
-    return TelegramClient(str(session_path), api_id_int, api_hash)
+    return TelegramClient(str(session_path), cfg["api_id"], cfg["api_hash"])
 
 
 def load_deepgram_key() -> str:
-    key = _resolve("DEEPGRAM_API_KEY")
+    key = _resolve_env_key("DEEPGRAM_API_KEY")[0]
     if not key:
         _die(2, "missing_deepgram_key",
              f"DEEPGRAM_API_KEY not found in a project .env, {CREDENTIALS_ENV}, or the environment",
@@ -499,27 +698,71 @@ def _parse_since(since: str | None) -> datetime | None:
 
 # --- Commands ----------------------------------------------------------------
 
-async def cmd_doctor(session_flag: str | None) -> dict:
-    """Cheapest authenticated round-trip — proves creds resolved, Telegram
-    reachable, session authorized. Exit 2 if missing/expired, 5 if unreachable."""
-    client = make_client(session_flag)
-    await _require_auth(client)
-    me = await client.get_me()
-    await client.disconnect()
-    return {"ok": True, "reachable": True,
-            "account": entity_label(me), "id": me.id}
+async def _check_connection(cfg: dict) -> dict:
+    """One connection's authenticated round-trip, reported rather than died —
+    doctor covers every connection, so a broken one becomes a finding, not a
+    stop. Proves creds resolved, Telegram reachable, session authorized."""
+    client = make_client(cfg)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return {"ok": False, "category": 2, "error": "not logged in",
+                    "hint": f"run: telegram login --connection {cfg['id']}"}
+        me = await client.get_me()
+        return {"ok": True, "reachable": True,
+                "account": entity_label(me), "id": me.id}
+    except (ApiIdInvalidError, AuthKeyUnregisteredError) as e:
+        return {"ok": False, "category": 2,
+                "error": f"Telegram rejected the session/credentials: {e.__class__.__name__}",
+                "hint": "run `telegram login` to re-authenticate"}
+    except FloodWaitError as e:
+        return {"ok": False, "category": 5,
+                "error": f"flood wait — wait {e.seconds}s before retrying"}
+    except (RPCError, ConnectionError, OSError) as e:
+        return {"ok": False, "category": 5, "error": f"cannot reach Telegram: {e}"}
+    finally:
+        await client.disconnect()
 
 
-async def cmd_login(session_flag: str | None) -> dict:
-    client = make_client(session_flag)
+def cmd_doctor(wanted: str | None) -> None:
+    """Every connection's cheapest authenticated round-trip — the bare cascade,
+    or just the one named by --connection. Exit 0 only when every examined
+    connection is healthy, else the first failure's category."""
+    reg, _ = _connections_registry()
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        cfg, problem = _build_cfg(cid, entry, None)
+        if problem:
+            res = {"ok": False, "category": problem["exit"], "error": problem["message"]}
+            if problem.get("hint"):
+                res["hint"] = problem["hint"]
+        else:
+            res = asyncio.run(_check_connection(cfg))
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
+
+
+async def cmd_login(cfg: dict) -> dict:
+    client = make_client(cfg)
     await client.start()  # interactive: phone + code (+ 2FA password if set)
     me = await client.get_me()
     await client.disconnect()
-    return {"ok": True, "logged_in_as": entity_label(me), "id": me.id}
+    return {"ok": True, "connection": cfg["id"],
+            "logged_in_as": entity_label(me), "id": me.id}
 
 
-async def cmd_whoami(session_flag: str | None) -> dict:
-    client = make_client(session_flag)
+async def cmd_whoami(cfg: dict) -> dict:
+    client = make_client(cfg)
     await _require_auth(client)
     me = await client.get_me()
     await client.disconnect()
@@ -528,8 +771,8 @@ async def cmd_whoami(session_flag: str | None) -> dict:
             "username": me.username}
 
 
-async def cmd_chats(session_flag: str | None, limit: int) -> list[dict]:
-    client = make_client(session_flag)
+async def cmd_chats(cfg: dict, limit: int) -> list[dict]:
+    client = make_client(cfg)
     await _require_auth(client)
     out: list[dict] = []
     async for dialog in client.iter_dialogs(limit=limit):
@@ -565,8 +808,8 @@ def _render_transcript(header: str, messages: list) -> str:
     return "\n".join(lines)
 
 
-async def cmd_read(session_flag, chat: str, limit: int, since: str | None, as_json: bool):
-    client = make_client(session_flag)
+async def cmd_read(cfg, chat: str, limit: int, since: str | None, as_json: bool):
+    client = make_client(cfg)
     await _require_auth(client)
     entity = await resolve_chat(client, chat)
     since_dt = _parse_since(since)
@@ -583,8 +826,8 @@ async def cmd_read(session_flag, chat: str, limit: int, since: str | None, as_js
         f"# {entity_label(entity)}  ({len(messages)} messages)", messages)
 
 
-async def cmd_search(session_flag, chat: str, query: str, limit: int, as_json: bool):
-    client = make_client(session_flag)
+async def cmd_search(cfg, chat: str, query: str, limit: int, as_json: bool):
+    client = make_client(cfg)
     await _require_auth(client)
     entity = await resolve_chat(client, chat)
     messages = []
@@ -598,8 +841,8 @@ async def cmd_search(session_flag, chat: str, query: str, limit: int, as_json: b
         f"# {entity_label(entity)}  search: {query!r}  ({len(messages)} hits)", messages)
 
 
-async def cmd_send(session_flag, chat: str, text: str) -> dict:
-    client = make_client(session_flag)
+async def cmd_send(cfg, chat: str, text: str) -> dict:
+    client = make_client(cfg)
     await _require_auth(client)
     entity = await resolve_chat(client, chat)
     sent = await client.send_message(entity, text)
@@ -679,11 +922,11 @@ def _find_existing_media(media_dir: Path, msg_id: int) -> Path | None:
     return None
 
 
-async def cmd_export(session_flag, chat: str, out_path: str, media_dir: str | None,
+async def cmd_export(cfg, chat: str, out_path: str, media_dir: str | None,
                      limit: int | None, since: str | None,
                      download_photos: bool, download_stickers: bool,
                      download_videos: bool, download_documents: bool) -> dict:
-    client = make_client(session_flag)
+    client = make_client(cfg)
     await _require_auth(client)
 
     entity = await resolve_chat(client, chat)
@@ -1022,11 +1265,13 @@ def main() -> None:
     pt.add_argument("--force", action="store_true", help="re-transcribe even if already filled")
     pt.add_argument("--model", default="nova-3", help="Deepgram model (default: nova-3)")
 
-    # `--session <PATH>` is a global override accepted anywhere on the line
-    # (extracted before argparse so it works after the subcommand). It names the
-    # session-file path — not a secret — and is the flag tier of the cascade.
+    # `--connection <id>` selects a connection; `--session <PATH>` overrides the
+    # session-file path. Both are global, accepted anywhere on the line (extracted
+    # before argparse so they work after the subcommand). `--session` is the flag
+    # tier of the cascade and names a path, not a secret.
     argv = sys.argv[1:]
     session_flag: str | None = None
+    connection_flag: str | None = None
     cleaned: list[str] = []
     i = 0
     while i < len(argv):
@@ -1035,6 +1280,10 @@ def main() -> None:
             session_flag = argv[i + 1]; i += 2; continue
         if a.startswith("--session="):
             session_flag = a.split("=", 1)[1]; i += 1; continue
+        if a == "--connection" and i + 1 < len(argv):
+            connection_flag = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            connection_flag = a.split("=", 1)[1]; i += 1; continue
         cleaned.append(a); i += 1
 
     args = p.parse_args(cleaned)
@@ -1042,29 +1291,33 @@ def main() -> None:
     if args.cmd == "help":
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
+    if args.cmd == "doctor":
+        cmd_doctor(connection_flag)   # per-connection; emits and sets the exit code itself
+        return
+    if args.cmd == "transcribe":      # connection-independent: a local file + Deepgram
+        _emit(cmd_transcribe(args.json_path, args.force, args.model))
+        return
 
+    cfg = _load_config(connection_flag, session_flag)
+    _write_gate(cfg["id"], cfg["allow_write"], args.cmd)
     try:
-        if args.cmd == "doctor":
-            _emit(asyncio.run(cmd_doctor(session_flag)))
-        elif args.cmd == "login":
-            _emit(asyncio.run(cmd_login(session_flag)))
+        if args.cmd == "login":
+            _emit(asyncio.run(cmd_login(cfg)))
         elif args.cmd == "whoami":
-            _emit(asyncio.run(cmd_whoami(session_flag)))
+            _emit(asyncio.run(cmd_whoami(cfg)))
         elif args.cmd == "chats":
-            _emit(asyncio.run(cmd_chats(session_flag, args.limit)))
+            _emit(asyncio.run(cmd_chats(cfg, args.limit)))
         elif args.cmd == "read":
-            _emit(asyncio.run(cmd_read(session_flag, args.chat, args.limit, args.since, args.json)))
+            _emit(asyncio.run(cmd_read(cfg, args.chat, args.limit, args.since, args.json)))
         elif args.cmd == "search":
-            _emit(asyncio.run(cmd_search(session_flag, args.chat, args.query, args.limit, args.json)))
+            _emit(asyncio.run(cmd_search(cfg, args.chat, args.query, args.limit, args.json)))
         elif args.cmd == "send":
-            _emit(asyncio.run(cmd_send(session_flag, args.chat, args.text)))
+            _emit(asyncio.run(cmd_send(cfg, args.chat, args.text)))
         elif args.cmd == "export":
             _emit(asyncio.run(cmd_export(
-                session_flag, args.chat, args.out, args.media_dir, args.limit, args.since,
+                cfg, args.chat, args.out, args.media_dir, args.limit, args.since,
                 args.photos, args.stickers, args.videos, args.documents,
             )))
-        elif args.cmd == "transcribe":
-            _emit(cmd_transcribe(args.json_path, args.force, args.model))
     except (ApiIdInvalidError, AuthKeyUnregisteredError) as e:
         _die(2, "auth_failed", f"Telegram rejected the session/credentials: {e.__class__.__name__}",
              "run `telegram login` to re-authenticate; verify TELEGRAM_API_ID / TELEGRAM_API_HASH")

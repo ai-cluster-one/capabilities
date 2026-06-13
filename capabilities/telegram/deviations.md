@@ -10,4 +10,10 @@ The intent holds: fail fast and clearly, absorb transient rate-limits, a stable 
 
 ## Stateful session; the secret is not a flat token
 
-Auth is a login *ceremony*, not a header value: `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` identify the app and a persisted **session file** holds the account login. The cascade's tiers and order are preserved (flag → project `.env` → user config → process env), but what they resolve is the app id/hash and the session *path*; the session *file* is produced by `telegram login`. Per SHEBANG's stateful-CLI guidance, `help` opens with the startup protocol and `doctor` doubles as the session-health/recovery point (`doctor` exit 2 → `telegram login`).
+Auth is a login *ceremony*, not a header value. A connection identifies the app — `api_id` literally, the app hash by `secret_env` indirection (the implicit default rides the bare `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` cascade) — and a persisted **session file** holds the account login. So a connection resolves the app id/hash and a session *path*; the session *file* itself is produced by `telegram login`, not by any cascade tier. Per SHEBANG's stateful-CLI guidance, `help` opens with the startup protocol and `doctor` doubles as the session-health/recovery point (`doctor` exit 2 → `telegram login`).
+
+## Per-connection sessions; the implicit default's is un-keyed
+
+A named connection keys its session per id at `<state-dir>/<id>/session`, per the standard, so two accounts never share a login. The **implicit default** connection keeps its session at the un-keyed `$XDG_STATE_HOME/telegram/session` (with a `~/.config/telegram/session.session` fallback an existing login already occupies) rather than `<state-dir>/default/session` — login continuity for the sole-account case, where inserting the `default/` segment would orphan a session already on disk. `--session` / `TELEGRAM_SESSION` is the one-shot path override for either.
+
+Re-authenticating a login anywhere (another host, a phone sign-in) rotates the account session and can invalidate the prior file — one concurrent actor per login. Keying per connection isolates distinct accounts; it does not divide one account across hosts.
