@@ -62,6 +62,10 @@ PROJECT VERBS (run inside a consuming project)
         .claude/rules/CAPABILITIES.md; --codex: a managed block in AGENTS.md).
         Reads files only — no subprocess fan-out; degradation is
         per-capability, never whole.
+  ids <name>
+        Render <name>'s project identifiers as markdown — the full labelled
+        list the session context points to. (`<name> ids get|set|rm` is the
+        per-value data interface on the capability itself.)
 
 VERIFICATION VERBS
   doctor
@@ -634,10 +638,9 @@ def _compose_context(root: Path) -> str:
                           f"fix .capabilities/{name}/connections.json")
         ids = _read_json(envdir / "identifiers.json")
         if isinstance(ids, dict) and ids:
-            items = "; ".join(
-                f"{label} — {(entry or {}).get('note', '')}".rstrip(" —")
-                for label, entry in sorted(ids.items()))
-            bullet.append(f"- Identifiers (`{name} ids get <label>`): {items}")
+            bullet.append(f"- Identifiers ({len(ids)}): run `capabilities ids {name}` "
+                          f"for the full labelled list; `{name} ids get <label>` "
+                          f"for a single value")
         elif ids is not None:
             bullet.append(f"- Identifiers file present but not a JSON object — "
                           f"fix .capabilities/{name}/identifiers.json")
@@ -691,6 +694,39 @@ def _place_codex(root: Path) -> Path:
     else:
         agents_file.write_text("# Capabilities\n\n" + block + "\n")
     return agents_file
+
+
+def _id_value(v) -> str:
+    """A string inlines bare; anything else as compact JSON — both in a code span."""
+    return f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+
+
+def cmd_ids(name: str) -> None:
+    """Render <name>'s project identifiers envelope as markdown.
+
+    The full labelled list the session context points to: the manager renders
+    the standard `{label: {value, note}}` envelope without the capability's
+    help (DOCTRINE rule 4). `<name> ids get/set/rm` stays the per-value data
+    interface on the capability itself.
+    """
+    root = _require_project()
+    ids = _read_json(root / ".capabilities" / name / "identifiers.json")
+    if not isinstance(ids, dict) or not ids:
+        _emit(f"# {name} identifiers\n\n"
+              f"None recorded for `{name}` in this project ({root}). The CLI "
+              f"discovers and writes them with `{name} ids set <label> <value>`.")
+        return
+    lines = [f"# {name} identifiers", "",
+             f"Structural lookups for `{name}` in this project ({root}). "
+             f"Fetch a single raw value with `{name} ids get <label>`.", ""]
+    for label, entry in sorted(ids.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        line = f"- **{label}**: {_id_value(entry.get('value'))}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    _emit("\n".join(lines) + "\n")
 
 
 def cmd_context(host: str) -> None:
@@ -761,9 +797,9 @@ verbs:
 
 Manager surface: `capabilities list` (what is installed and gated where),
 `capabilities install <name>`, `capabilities enable|disable <name>` (the
-per-project gate), `capabilities init` (wire a project), `capabilities
-doctor` / `capabilities audit <name>` (verify), `capabilities help` (full
-contract).
+per-project gate), `capabilities init` (wire a project), `capabilities ids
+<name>` (render a capability's project identifiers), `capabilities doctor` /
+`capabilities audit <name>` (verify), `capabilities help` (full contract).
 
 THE GATES (both exit 4 — ask the user, never lift one yourself): a capability
 disabled by project policy (.capabilities/settings.json) refuses every verb;
@@ -1288,6 +1324,10 @@ def main() -> None:
             cmd_context("codex")
         else:
             _die(6, "input", "context needs --claude or --codex")
+    elif cmd == "ids":
+        if not pos:
+            _die(6, "input", "ids needs a capability name")
+        cmd_ids(pos[0])
     elif cmd == "doctor":
         cmd_doctor()
     elif cmd == "audit":
