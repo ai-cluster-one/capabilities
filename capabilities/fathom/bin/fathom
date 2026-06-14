@@ -39,6 +39,7 @@ CONNECTIONS
     FATHOM_DB_PORT        optional; default 5432
     FATHOM_DB_USER        optional; default postgres
     FATHOM_DB_NAME        optional; default postgres
+    FATHOM_DB_SSLMODE     optional; default require (disable for local Postgres)
 
   A machine that talks to several Fathom accounts / databases declares them in
   ~/.config/fathom/connections.json (or a project's
@@ -51,6 +52,7 @@ CONNECTIONS
           "db_port": "5432",
           "db_user": "postgres",
           "db_name": "postgres",
+          "db_sslmode": "require",
           "fathom_key_env": "FATHOM_API_KEY_<ID>",
           "db_password_env": "FATHOM_DB_PASSWORD_<ID>",
           "allow_write": true
@@ -79,6 +81,8 @@ DATABASE
   share_url, duration_minutes, corrections_applied [{wrong,right,count}].
   `fathom schema` creates both tables if absent (idempotent). `fathom doctor`
   proves the API key, the database credentials, and that the tables exist.
+  Standing the store up from scratch — provisioning Postgres, wiring the
+  connection, the failure ladder — is the runbook `fathom guide setup`.
 
 COMMANDS
   sync [--created-after ISO] [--force]
@@ -176,6 +180,8 @@ CRED_KEYS = [       # the implicit default connection; a registry entry supplies
      "note": "Postgres user (default postgres)"},
     {"key": "FATHOM_DB_NAME", "secret": False, "required": False,
      "note": "Postgres database (default postgres)"},
+    {"key": "FATHOM_DB_SSLMODE", "secret": False, "required": False,
+     "note": "SSL mode (default require; disable for a local non-TLS Postgres)"},
 ]
 WRITE_VERBS = {     # verbs that mutate the consumer's database
     "sync", "update", "transcript", "schema", "vocab-add", "vocab-remove",
@@ -183,9 +189,13 @@ WRITE_VERBS = {     # verbs that mutate the consumer's database
 WRITE_DEFAULT = True    # writes stay inside a database the consumer owns
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/fathom/guides/")
-TOPICS = ["enrichment"]
+TOPICS = ["enrichment", "setup"]
 STATE = False       # data lives in the remote DB; only the guides cache is local
-POST_INSTALL: list = []
+POST_INSTALL = [
+    {"cmd": f"{NAME} guide setup",
+     "note": "storage-engine setup runbook: provision Postgres, wire creds, "
+             "create the tables, verify with doctor"},
+]
 
 BASE_URL = "https://api.fathom.ai/external/v1"
 TIMEOUT = httpx.Timeout(60.0)
@@ -324,6 +334,7 @@ DB_FIELDS = (   # (entry field, env key for the implicit default, default, requi
     ("db_port", "FATHOM_DB_PORT", "5432", False),
     ("db_user", "FATHOM_DB_USER", "postgres", False),
     ("db_name", "FATHOM_DB_NAME", "postgres", False),
+    ("db_sslmode", "FATHOM_DB_SSLMODE", "require", False),
 )
 
 
@@ -402,7 +413,8 @@ def _build_conn(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]
                 "message": f"unset: {', '.join(missing)}",
                 "hint": f"set them in the project .env(.local), {CREDENTIALS_ENV}, "
                         f"or the environment — or declare a connections registry "
-                        f"(~/.config/{NAME}/connections.json)"}
+                        f"(~/.config/{NAME}/connections.json). Full runbook: "
+                        f"`{NAME} guide setup`"}
         return {"id": cid, "allow_write": WRITE_DEFAULT, "fathom_key": fathom_key,
                 "db_password": db_password, **db}, None
     # registry entry — non-secret DB fields literal, secrets by env-key indirection
@@ -692,15 +704,17 @@ def _db_connect(conn: dict):
         return psycopg2.connect(
             host=conn["db_host"], port=conn["db_port"], dbname=conn["db_name"],
             user=conn["db_user"], password=conn["db_password"],
-            sslmode="require", connect_timeout=15,
+            sslmode=conn["db_sslmode"], connect_timeout=15,
         )
     except psycopg2.OperationalError as e:
         msg = str(e).lower()
         if "password" in msg or "authentication" in msg or "role" in msg:
             _die(2, "db_auth", f"database authentication failed: {e}".strip(),
-                 f"check FATHOM_DB_USER / FATHOM_DB_PASSWORD for connection {conn['id']!r}")
+                 f"check FATHOM_DB_USER / FATHOM_DB_PASSWORD for connection {conn['id']!r} "
+                 f"— `{NAME} guide setup`")
         _die(5, "db_unreachable", f"cannot reach database: {e}".strip(),
-             f"check FATHOM_DB_HOST / FATHOM_DB_PORT for connection {conn['id']!r}")
+             f"check FATHOM_DB_HOST / FATHOM_DB_PORT / FATHOM_DB_SSLMODE for "
+             f"connection {conn['id']!r} — `{NAME} guide setup`")
 
 
 # ── Domain logic (ported) ────────────────────────────────────────────────────────
@@ -1247,7 +1261,7 @@ def _check_connection(conn: dict) -> dict:
         db = psycopg2.connect(
             host=conn["db_host"], port=conn["db_port"], dbname=conn["db_name"],
             user=conn["db_user"], password=conn["db_password"],
-            sslmode="require", connect_timeout=15)
+            sslmode=conn["db_sslmode"], connect_timeout=15)
     except psycopg2.OperationalError as e:
         msg = str(e).lower()
         cat = 2 if ("password" in msg or "authentication" in msg or "role" in msg) else 5
@@ -1262,7 +1276,8 @@ def _check_connection(conn: dict) -> dict:
         except psycopg2.errors.UndefinedTable:
             return out | {"ok": False, "category": 3, "schema": "missing",
                           "error": "the fathom table does not exist",
-                          "hint": f"run `{NAME} schema` to create it"}
+                          "hint": f"run `{NAME} schema` to create it "
+                                  f"(`{NAME} guide setup` for the full runbook)"}
         finally:
             cur.close()
             db.close()
