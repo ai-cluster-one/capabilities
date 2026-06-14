@@ -382,7 +382,11 @@ def _scaffold_credentials(name: str, manifest: dict) -> list[str]:
             for k in keys:
                 if k["key"] not in existing:
                     note = k.get("note", "")
-                    f.write(f"{k['key']}=  # {note}\n" if note else f"{k['key']}=\n")
+                    # The note is a full-line comment, never inline after `=`:
+                    # the cascade parser does not strip inline comments (a `#`
+                    # can be a legitimate secret character), so an inline note
+                    # would be read as the value.
+                    f.write(f"# {note}\n{k['key']}=\n" if note else f"{k['key']}=\n")
                     added.append(k["key"])
         if added:
             notes.append(f"fill {', '.join(added)} in {cred_file}")
