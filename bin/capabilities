@@ -81,6 +81,12 @@ VERIFICATION VERBS
         fenced regions (`capability core`, `connections`) of every
         capabilities/*/bin/*. The manager never participates. Idempotent.
         --check reports drift and exits 7 without writing.
+  selfcheck
+        Prove the repo's own wholeness (the inward companion to audit): the
+        enforcer parses, every capability audits clean, both audit branches
+        (core-only / connection-bearing) have a living green example and fire on
+        a deliberate break, every standing rule names an enforcement the manager
+        actually has, and every doc link resolves. Exit 0 whole, 7 otherwise.
 
 AUTHORING VERBS (emit agent-executable instructions; judgment stays with the agent)
   new            The procedure for creating a capability from scratch.
@@ -1260,6 +1266,195 @@ def cmd_audit(name: str, from_ref: str | None) -> None:
     if failures:
         sys.exit(7)
 
+# ---------------------------------------------------------------- selfcheck
+
+# The stable ids of the checks `audit` performs — the executable vocabulary a
+# DOCTRINE.md rule names in its `Validate (audit: <id>)` tag. Each id is the
+# leading token of the failures it raises, so a deliberate break can assert its
+# check is live, not vacuous — the failure mode that let the core-only gap hide.
+_AUDIT_CHECKS = {
+    "contract-drift", "stub", "manifest", "help", "gate",
+    "refs", "ids", "connections", "connections/core-only", "guide",
+}
+
+
+def _stamp_regions(text: str, canonical: dict[str, str]) -> str:
+    """Set every present fenced region's interior to canonical — a fresh stamp."""
+    for region, canon in canonical.items():
+        split = _split_region(text, region)
+        if split is not None:
+            head, _old, tail = split
+            text = head + canon + tail
+    return text
+
+
+def _check_id(failure: str) -> str:
+    """The audit check-id a failure string belongs to (its leading token)."""
+    head = failure.split(":", 1)[0].strip()
+    if head.startswith("connections/core-only"):
+        return "connections/core-only"
+    return head.split("/", 1)[0].split()[0]
+
+
+def _inject_before_main(text: str, snippet: str) -> str | None:
+    """Insert `snippet` just above the `__main__` guard so it binds before main."""
+    marker = '\nif __name__ == "__main__":'
+    i = text.rfind(marker)
+    return None if i == -1 else text[:i] + "\n\n" + snippet + "\n" + text[i:]
+
+
+def _selfcheck_negatives(canonical: dict[str, str]) -> list[str]:
+    """Prove the high-value audit checks BITE. Stamp a real capability fresh,
+    apply one targeted break, and require the expected check to fire; a check that
+    stays silent on its own break is vacuous (how the core-only gap survived)."""
+    findings: list[str] = []
+    src = _REPO_ROOT / "capabilities"
+    core = conn = None
+    for capdir in sorted(p for p in src.iterdir() if p.is_dir()):
+        script = capdir / "bin" / capdir.name
+        if not script.is_file():
+            continue
+        if _split_region(script.read_text(), "connections") is None:
+            core = core or (capdir.name, script)
+        else:
+            conn = conn or (capdir.name, script)
+    if core is None:
+        findings.append("coverage: no core-only capability — the core-only audit "
+                        "branch has no living green example")
+    if conn is None:
+        findings.append("coverage: no connection-bearing capability — the "
+                        "connections audit branch has no living green example")
+
+    report_conn = ('def _cmd_connections() -> None:\n'
+                   '    _emit({"connections": {"x": {"keys": []}}, "default": "x"})')
+    report_unmasked = (
+        'def _cmd_connections() -> None:\n'
+        '    _emit({"default": "default", "connections": {"default": {'
+        '"allow_write": True, "keys": [{"key": "SECRET", "secret": True, '
+        '"required": True, "set": True, "value": "plaintext-unmasked"}]}}})')
+
+    def break_fence(text: str):
+        s = _split_region(text, "capability core")
+        if s is None:
+            return None
+        head, interior, tail = s
+        return head + interior + "# injected drift\n" + tail
+
+    cases = []
+    if core:
+        cases.append(("connections/core-only", core,
+                      lambda t: _inject_before_main(t, report_conn)))
+        cases.append(("contract-drift", core, break_fence))
+    if conn:
+        cases.append(("connections", conn,
+                      lambda t: _inject_before_main(t, report_unmasked)))
+
+    with tempfile.TemporaryDirectory() as td:
+        for expect, (name, script), mutate in cases:
+            base = _stamp_regions(script.read_text(), canonical)
+            broken = mutate(base)
+            if not broken or broken == base:
+                findings.append(f"negative/{expect}: could not build the break on {name}")
+                continue
+            p = Path(td) / name
+            p.write_text(broken)
+            p.chmod(0o755)
+            if not any(_check_id(f) == expect for f in _audit_script(name, p)):
+                findings.append(f"negative/{expect}: audit missed a deliberate break "
+                                f"on {name} — the check is absent or vacuous")
+    return findings
+
+
+def _selfcheck_doctrine() -> list[str]:
+    """Every standing rule names how it is enforced; every Validate(audit: id)
+    names a check the audit performs; every audit check backs some rule."""
+    import re
+    doc = _REPO_ROOT / "DOCTRINE.md"
+    if not doc.is_file():
+        return ["doctrine: DOCTRINE.md not found"]
+    findings: list[str] = []
+    claimed: set[str] = set()
+    clause_re = re.compile(r"\*Validate \(([^)]*)\):\*")
+    seg_re = re.compile(r"(audit|doctor|review)(?::\s*(.*))?$")
+    for ln in doc.read_text().splitlines():
+        if not ln.lstrip().startswith("*Validate"):
+            continue
+        m = clause_re.search(ln)
+        if not m:
+            findings.append("doctrine: a Validate clause carries no "
+                            f"(audit:…|doctor|review:…) tag: {ln.strip()[:55]}…")
+            continue
+        for seg in m.group(1).split(";"):
+            sm = seg_re.match(seg.strip())
+            if not sm:
+                findings.append(f"doctrine: malformed Validate tag {seg.strip()!r}")
+                continue
+            if sm.group(1) == "audit":
+                ids = [v.strip() for v in (sm.group(2) or "").split(",") if v.strip()]
+                if not ids:
+                    findings.append("doctrine: an audit tag names no check id")
+                for cid in ids:
+                    claimed.add(cid)
+                    if cid not in _AUDIT_CHECKS:
+                        findings.append(f"doctrine: Validate(audit: {cid}) names a "
+                                        "check the audit does not perform")
+    for cid in sorted(_AUDIT_CHECKS - claimed):
+        findings.append(f"doctrine: audit check {cid!r} backs no standing rule "
+                        f"(tag one Validate(audit: {cid}))")
+    return findings
+
+
+def _selfcheck_doclinks() -> list[str]:
+    """Every relative markdown link in the doctrine surface resolves to a file."""
+    import re
+    findings: list[str] = []
+    link_re = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+    docs = [_REPO_ROOT / n for n in
+            ("DOCTRINE.md", "SHEBANG.md", "TEMPLATE.md", "ROUTINES.md", "README.md")]
+    docs += sorted((_REPO_ROOT / ".claude" / "rules").glob("*.md"))
+    for doc in docs:
+        if not doc.is_file():
+            continue
+        for m in link_re.finditer(doc.read_text()):
+            target = m.group(1).strip()
+            if target.startswith(("http://", "https://", "mailto:", "#")):
+                continue
+            target = target.split("#", 1)[0]
+            if target and not (doc.parent / target).resolve().exists():
+                findings.append(f"doclink: {doc.name} → {target} does not resolve")
+    return findings
+
+
+def cmd_selfcheck() -> None:
+    """Prove the repo's own wholeness: the enforcer parses, every capability
+    audits clean (zero drift), both audit branches have a living green example and
+    fire on a deliberate break, every standing rule names an enforcement the
+    manager actually has, and every doc link resolves. Exit 0 whole, 7 otherwise."""
+    import ast as _ast
+    findings: list[str] = []
+
+    for f in (_REPO_ROOT / "bin" / "capabilities", _PREAMBLE):
+        try:
+            _ast.parse(f.read_text())
+        except (OSError, SyntaxError) as e:
+            findings.append(f"parse: {f.name}: {e}")
+
+    canonical = _canonical_regions()
+    for capdir in sorted(p for p in (_REPO_ROOT / "capabilities").iterdir() if p.is_dir()):
+        script = capdir / "bin" / capdir.name
+        if not script.is_file():
+            continue
+        for fail in _audit_script(capdir.name, script):
+            findings.append(f"audit: {capdir.name}: {fail}")
+
+    findings += _selfcheck_negatives(canonical)
+    findings += _selfcheck_doctrine()
+    findings += _selfcheck_doclinks()
+
+    _emit({"ok": not findings, "checks": sorted(_AUDIT_CHECKS), "findings": findings})
+    if findings:
+        sys.exit(7)
+
 # ---------------------------------------------------------------- authoring
 
 def _instructions_new() -> str:
@@ -1481,6 +1676,8 @@ def main() -> None:
         cmd_audit(pos[0], opt("--from"))
     elif cmd == "sync-contract":
         cmd_sync_contract(check_only=flag("--check"))
+    elif cmd == "selfcheck":
+        cmd_selfcheck()
     elif cmd == "new":
         _emit(_instructions_new())
     elif cmd == "conform":
