@@ -2036,7 +2036,7 @@ def main() -> None:
 
     # `--token-env <KEY>` is a global override accepted anywhere on the line
     # (extracted before argparse so it works after the subcommand, e.g.
-    # `asana comment <task> --token-env ASANA_KZ_TOKEN`). It names the env/cred
+    # `asana comment <task> --token-env ASANA_ALT_TOKEN`). It names the env/cred
     # key holding the PAT to act as — never the token value itself.
     argv = sys.argv[1:]
     token_key: str | None = None     # --token-env override; None = not passed

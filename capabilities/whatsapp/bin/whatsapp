@@ -209,7 +209,6 @@ POST_INSTALL: list = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / "whatsapp" / "credentials.env"
-CREDS_PATH = CREDENTIALS_ENV  # legacy alias used by the Deepgram key loader
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
 
@@ -1639,16 +1638,12 @@ def cmd_export(args):
 
 
 def _load_deepgram_key():
-    key = os.environ.get("DEEPGRAM_API_KEY")
+    key, _, _ = _resolve_env_key("DEEPGRAM_API_KEY")
     if key:
         return key
-    if CREDS_PATH.is_file():
-        vals = _parse_env_file(CREDS_PATH)
-        if vals.get("DEEPGRAM_API_KEY"):
-            return vals["DEEPGRAM_API_KEY"]
     _die(2, "missing_deepgram_key",
          "DEEPGRAM_API_KEY not resolved",
-         f"set it in the project .env(.local) or {CREDS_PATH}")
+         f"set it in the project .env(.local), {CREDENTIALS_ENV}, or the environment")
 
 
 def _content_type_for(path):
