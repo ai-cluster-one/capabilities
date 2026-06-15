@@ -19,6 +19,7 @@ import shlex
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import urlencode, urlparse
 
 import click
@@ -38,10 +39,10 @@ UA = (
     "(KHTML, like Gecko) Version/18.5 Safari/605.1.15"
 )
 
-# ─── Capability declaration (protocol 1) — one home for every contract fact ──
+# ─── Capability declaration (protocol 2) — one home for every contract fact ──
 
 NAME = "simplbooks"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("SimpleBooks accounting CLI over a browser session (no public "
            "API) — read clients/invoices/expenses/accounts/bank-transactions/"
            "kanne, create invoices & purchase invoices, record payments/"
@@ -59,6 +60,9 @@ CRED_KEYS = [
     {"key": "SIMPLBOOKS_WORKER", "secret": False, "required": False,
      "note": "optional pin for the invoice line worker; else the logged-in user"},
 ]
+WRITE_VERBS = {"create", "update", "delete", "unbind", "bind", "send-payment", "save"}
+WRITE_DEFAULT = False    # writes create legal invoices / stage real bank payments;
+                         # granted per connection, explicitly, via allow_write: true
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = True        # the live session + scrape caches live in the state home
@@ -66,17 +70,12 @@ POST_INSTALL: list = []
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
 
-# ─── I/O contract (contract verbs; domain verbs are click-based) ─────────────
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
-def _emit(value) -> None:
-    if isinstance(value, str):
-        sys.stdout.write(value if value.endswith("\n") else value + "\n")
-    else:
-        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+# --- Error reporting ---------------------------------------------------------
 
-
-def _die(exit_code: int, code: str, message: str, hint: str | None = None,
-         status: int | None = None):
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
     err: dict = {"code": code, "message": message}
     if hint:
         err["hint"] = hint
@@ -85,6 +84,17 @@ def _die(exit_code: int, code: str, message: str, hint: str | None = None,
     sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
     sys.exit(exit_code)
 
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
 
 def _parse_env_file(path: Path) -> dict:
     """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
@@ -131,8 +141,6 @@ def _project_env() -> dict:
     return merged
 
 
-# --- Capability contract (protocol 1) — shared verbatim across capabilities --
-
 def _gate() -> None:
     """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
     root = _project_root()
@@ -155,17 +163,6 @@ def _env_dir() -> Path | None:
     return (root / ".capabilities" / NAME) if root is not None else None
 
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where .capabilities/ already exists."""
@@ -175,6 +172,8 @@ def _state_dir() -> Path:
             return root / ".capabilities" / NAME / "state"
     return _STATE_HOME / NAME
 
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -270,9 +269,10 @@ def _cmd_ids(argv: list[str]) -> None:
 
 def _cmd_refs() -> None:
     envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
     out = []
-    if envdir and envdir.is_dir():
-        for md in sorted(envdir.glob("*.md")):
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
             name = desc = None
             try:
                 lines = md.read_text().splitlines()
@@ -308,26 +308,188 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
 
+# <<< contract: capability core <<<
+
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+# <<< contract: connections <<<
+
+
+# ─── Connections report (per-capability; outside the fences) ─────────────────
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt. With
+    no registry, one implicit `default` resolved from CRED_KEYS via the cascade;
+    with a registry, each named connection (its email + password-by-secret_env +
+    allow_write). Never dies on missing credentials — readiness is doctor's."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_env_key(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        email = entry.get("email")
+        keys.append(_key_report("email", False, True, email, "connection", reg_path))
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys.append(_key_report(secret_env, True, True, value, tier, source))
+        else:
+            keys.append(_key_report("secret_env", False, True, None, None, None))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
+
 
 # ─── State homes (session, caches) ───────────────────────────────────────────
 
+# The connection resolved for this invocation, set once in main() before the
+# click CLI runs. None until then (and for the contract verbs, which never
+# resolve a connection). The implicit default carries entry=None.
+_CONN: dict | None = None
+
+
+def _conn_session_dir() -> Path:
+    """Where the resolved connection's minted session lives. The implicit
+    default keeps its established home (the bare state dir); a named connection
+    gets its own subdir so two connections never share a session."""
+    if _CONN and _CONN.get("id") and _CONN.get("entry") is not None:
+        return _state_dir() / _CONN["id"]
+    return _state_dir()
+
+
 def _identity_email() -> str:
-    """The login identity this invocation resolves to (no side effects)."""
+    """The login identity this invocation resolves to (no side effects). The
+    resolved connection's email when one is selected; else the flat cascade."""
+    if _CONN and _CONN.get("email"):
+        return _CONN["email"]
     return (_project_env_value("SIMPLBOOKS_EMAIL") or _read_cred("SIMPLBOOKS_EMAIL")
             or os.environ.get("SIMPLBOOKS_EMAIL") or "")
 
 
 def _session_file(email: str | None = None) -> Path:
-    """The minted session's one home: a per-identity file in the state home, so
-    two identities sharing a fallback state dir never overwrite each other."""
+    """The minted session's one home: a per-identity file in the connection's
+    state dir, so two identities sharing a fallback state dir never overwrite
+    each other."""
     if email is None:
         email = _identity_email()
     tag = hashlib.sha256(email.encode()).hexdigest()[:8] if email else "default"
-    return _state_dir() / f"session.{tag}.env"
+    return _conn_session_dir() / f"session.{tag}.env"
 
 
 CLIENTS_CACHE = _state_dir() / "clients.json"
@@ -343,15 +505,44 @@ This tool is designed to be invoked by agents. Run `simplbooks help` to load
 the full usage contract on demand — do not rely on memorised knowledge of
 its surface.
 
-Identity resolves through the cascade — project .env(.local), then
-~/.config/simplbooks/credentials.env, then process env:
+Configuration resolves as connections — named, complete resolutions of the
+login identity and its minted session. With no registry there is one implicit
+connection, `default`, whose identity resolves through the cascade — project
+.env(.local), then ~/.config/simplbooks/credentials.env, then process env:
   SIMPLBOOKS_EMAIL='user@example.com'         (primary — for auto-login)
   SIMPLBOOKS_PASSWORD='...'                   (primary — for auto-login)
-The minted session lives in its per-identity file in the state home
-(.capabilities/simplbooks/state/ in an initialized project, else
-$XDG_STATE_HOME/simplbooks/) — written by login/refresh, never into an env
-file. SIMPLBOOKS_ACCOUNT / SIMPLBOOKS_COOKIE stay readable from the cascade
-as the one-shot injection path (the deployed box).
+
+More than one accounting identity is declared in a connections registry —
+project .capabilities/simplbooks/connections.json, else
+~/.config/simplbooks/connections.json, first found wins. Each entry names its
+login `email` literally and its password by env-key indirection (`secret_env`),
+and carries the write gate (`allow_write`):
+
+  {
+    "default": "juko",
+    "connections": {
+      "juko":  { "email": "ops@example.com", "secret_env": "SIMPLBOOKS_JUKO_PASSWORD",
+                 "allow_write": true },
+      "audit": { "email": "view@example.com", "secret_env": "SIMPLBOOKS_AUDIT_PASSWORD" }
+    }
+  }
+
+  --connection <id>, -c <id>   Select a connection; accepted anywhere on the
+                               line. Optional with a default pointer or a sole
+                               connection.
+
+The write gate: a write creates a legal invoice or stages a real bank payment,
+so writes are OFF unless a connection grants them. The implicit default cannot
+write; grant it with "allow_write": true on a connection in connections.json.
+A refused write exits 4 — ask the user, never lift the gate yourself.
+
+The minted session (the SimpleBooks account hash + cookie) is per-connection
+state, NOT a credential in the registry. It lives in a per-identity file in the
+state home (.capabilities/simplbooks/state/ in an initialized project, else
+$XDG_STATE_HOME/simplbooks/; a named connection under <state-dir>/<id>/) —
+written by login/refresh, never into an env file. SIMPLBOOKS_ACCOUNT /
+SIMPLBOOKS_COOKIE stay readable from the cascade as the one-shot injection path
+(the deployed box) and are distinct from connection selection.
 
 Account-specific config (resolved by the cascade: flag > project .env(.local) >
 this credentials.env > process env — so a consuming project can set these in its
@@ -683,6 +874,9 @@ normalised to Estonian format ('1 234,50') for the SimpleBooks form.
 
   simplbooks stub                                 one-line awareness text
   simplbooks manifest --json                      machine-readable declaration
+  simplbooks connections                          where every connection's values
+                                                  resolve from — tier, source,
+                                                  secrets masked (local, no network)
   simplbooks guide [<topic>]                      guide topics / one guide body
   simplbooks ids list|get <l>|set <l> <v>|rm <l>  the project identifiers envelope
              [--note <text>]                      (.capabilities/simplbooks/identifiers.json)
@@ -693,8 +887,9 @@ normalised to Estonian format ('1 234,50') for the SimpleBooks form.
   0  success
   1  generic error (validation, network, CSRF)
   2  auth (missing creds, login rejected, or PIN required — see message)
-  4  disabled by project policy (.capabilities/settings.json — ask the user,
-     never enable it yourself)
+  4  policy refusal — disabled by project policy (.capabilities/settings.json),
+     or a write verb on a read-only connection (ask the user, never lift the
+     gate or enable the capability yourself)
   (contract verbs add 3 not-found / 5 network / 6 input)
 """
 
@@ -760,10 +955,19 @@ def load_credentials() -> dict[str, str]:
     first; the cascade stays available as the one-shot injection path (the deployed
     box, an env-prefix invocation)."""
     out: dict[str, str] = {}
-    for key in ("SIMPLBOOKS_EMAIL", "SIMPLBOOKS_PASSWORD"):
-        v = (_project_env_value(key) or _read_cred(key) or os.environ.get(key))
-        if v:
-            out[key] = v
+    if _CONN and _CONN.get("entry") is not None:
+        # A named registry connection supplies the identity: email literally,
+        # password through its secret_env. The implicit default (entry=None)
+        # keeps the flat cascade below.
+        if _CONN.get("email"):
+            out["SIMPLBOOKS_EMAIL"] = _CONN["email"]
+        if _CONN.get("password"):
+            out["SIMPLBOOKS_PASSWORD"] = _CONN["password"]
+    else:
+        for key in ("SIMPLBOOKS_EMAIL", "SIMPLBOOKS_PASSWORD"):
+            v = (_project_env_value(key) or _read_cred(key) or os.environ.get(key))
+            if v:
+                out[key] = v
     session = _parse_env_file(_session_file(out.get("SIMPLBOOKS_EMAIL", "")))
     for key in ("SIMPLBOOKS_ACCOUNT", "SIMPLBOOKS_COOKIE"):
         v = (session.get(key) or _project_env_value(key) or _read_cred(key)
@@ -778,6 +982,38 @@ def load_credentials() -> dict[str, str]:
             "  → deployed box: inject SIMPLBOOKS_EMAIL + SIMPLBOOKS_PASSWORD (+ ACCOUNT/COOKIE) in the env"
         )
     return out
+
+
+def _resolve_connection(wanted: str | None) -> dict:
+    """Select the connection for this invocation and fold in its identity. The
+    implicit default (no registry) carries entry=None and resolves email/password
+    from the flat cascade exactly as before; a named registry connection supplies
+    the email literally and the password through secret_env (cascade tiers 2-4).
+    Returns {id, entry, email, password, allow_write}. Stored in _CONN so the
+    session and credential helpers source the right identity and key the session
+    per-connection. The resolve-for-use path (this) may die on a malformed entry;
+    the connections report (`_cmd_connections`) never does."""
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    if entry is None:
+        email = (_project_env_value("SIMPLBOOKS_EMAIL") or _read_cred("SIMPLBOOKS_EMAIL")
+                 or os.environ.get("SIMPLBOOKS_EMAIL") or "")
+        return {"id": cid, "entry": None, "email": email or None,
+                "password": None, "allow_write": WRITE_DEFAULT}
+    email = entry.get("email")
+    if not email:
+        _die(6, "incomplete_connection",
+             f"connection {cid!r} is missing 'email'",
+             f"add the login email to this connection in connections.json")
+    secret_env = entry.get("secret_env")
+    if not secret_env:
+        _die(6, "no_secret_env",
+             f"connection {cid!r} is missing 'secret_env'",
+             "name the env var that holds this identity's SimpleBooks password")
+    password = _resolve_env_key(secret_env)[0]
+    return {"id": cid, "entry": entry, "email": email,
+            "password": password,
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT))}
 
 
 def _read_cred(key: str) -> str | None:
@@ -1363,7 +1599,30 @@ def load_clients_cache() -> dict[str, dict]:
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
-@click.group()
+class _GatedCommand(click.Command):
+    """Every leaf command passes the per-connection write gate at dispatch —
+    before its body runs, so the gate is independent of any per-command
+    pre-validation. The leaf name is this command's own name (e.g. `create`),
+    so reads (whose names are not in WRITE_VERBS) pass untouched and exactly the
+    write leaves are refused (exit 4) on a connection without allow_write."""
+    def invoke(self, ctx: click.Context):
+        if _CONN is not None:
+            _write_gate(_CONN["id"], _CONN["allow_write"], self.name)
+        return super().invoke(ctx)
+
+
+class _GatedGroup(click.Group):
+    """Propagates the gated classes through the whole command tree: a subgroup
+    declared with `@<group>.group()` is itself a _GatedGroup and its leaves are
+    _GatedCommands, so the gate is wired once here and inherited everywhere."""
+    command_class = _GatedCommand
+    group_class = type
+
+
+_GatedGroup.group_class = _GatedGroup
+
+
+@click.group(cls=_GatedGroup)
 def cli() -> None:
     """simplbooks — agent-first CLI for SimpleBooks."""
 
@@ -5253,8 +5512,31 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
 
 
 def main() -> None:
+    global _CONN
     _gate()                      # every verb passes the project gate first
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
+
+    # `--connection`/`-c <id>` is a global selector accepted anywhere on the
+    # line (extracted before click so it works after the subcommand, like every
+    # other capability's connection flag). It selects the registry entry; the
+    # minted SIMPLBOOKS_ACCOUNT hash is a distinct concept resolved from the
+    # session/cascade, not by this flag.
+    argv = sys.argv[1:]
+    connection_flag: str | None = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--connection", "-c") and i + 1 < len(argv):
+            connection_flag = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            connection_flag = a.split("=", 1)[1]; i += 1; continue
+        if a.startswith("-c="):
+            connection_flag = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+    sys.argv = [sys.argv[0], *cleaned]
+
+    _CONN = _resolve_connection(connection_flag)
     cli()
 
 
