@@ -19,9 +19,8 @@ CONNECTIONS
   connection is `default`, resolved by the cascade (first non-empty wins):
     1. flags          --url / --token / --workspace
     2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    3. settings       .capabilities/windmill/settings.json (flat keys: url, workspace, folder)
-    4. user config    $XDG_CONFIG_HOME/windmill/credentials.env (default ~/.config/windmill/)
-    5. process env    WINDMILL_URL / WINDMILL_API_TOKEN / WINDMILL_WORKSPACE
+    3. user config    $XDG_CONFIG_HOME/windmill/credentials.env (default ~/.config/windmill/)
+    4. process env    WINDMILL_URL / WINDMILL_API_TOKEN / WINDMILL_WORKSPACE
   Same WINDMILL_* keys at every tier; the project you're in wins, process env is
   the fallback (so a deployed host's injected env governs when no config file is
   present). Never pass the token on the command line.
@@ -502,29 +501,6 @@ def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
     return None, None, None
 
 
-def _resolve_key_default(key: str) -> tuple[str | None, str | None, Path | None]:
-    """The implicit default connection's resolution: project .env(.local) →
-    settings envelope (flat keys — windmill's recorded extension) → user
-    credentials.env → process env. Returns (value, tier, source)."""
-    root = _project_root()
-    if root is not None:
-        for fname in (".env.local", ".env"):
-            val = _parse_env_file(root / fname).get(key)
-            if val:
-                return val, "project", root / fname
-    sval = _project_settings().get(key.removeprefix("WINDMILL_").lower())
-    if sval:
-        envdir = _env_dir()
-        return str(sval), "settings", (envdir / "settings.json") if envdir else None
-    val = _parse_env_file(CREDENTIALS_ENV).get(key)
-    if val:
-        return val, "user", CREDENTIALS_ENV
-    val = os.environ.get(key)
-    if val:
-        return val, "env", None
-    return None, None, None
-
-
 def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 
@@ -585,11 +561,11 @@ def _build_conn(cid: str, entry: dict | None, args) -> tuple[dict | None, dict |
     error dict ({"exit", "code", "message", "hint"?}) instead of a die, so
     doctor can report every connection rather than stopping at the first."""
     if entry is None:   # the implicit default — flat keys through the cascade
-        url = getattr(args, "url", None) or _resolve_key_default("WINDMILL_URL")[0]
+        url = getattr(args, "url", None) or _resolve_env_key("WINDMILL_URL")[0]
         token = (getattr(args, "token", None)
-                 or _resolve_key_default("WINDMILL_API_TOKEN")[0])
+                 or _resolve_env_key("WINDMILL_API_TOKEN")[0])
         workspace = (getattr(args, "workspace", None)
-                     or _resolve_key_default("WINDMILL_WORKSPACE")[0])
+                     or _resolve_env_key("WINDMILL_WORKSPACE")[0])
         if not url or not token:
             return None, {
                 "exit": 2, "code": "missing_credentials",
@@ -661,7 +637,7 @@ def _cmd_connections() -> None:
     if reg is None:
         keys = []
         for k in CRED_KEYS:
-            value, tier, source = _resolve_key_default(k["key"])
+            value, tier, source = _resolve_env_key(k["key"])
             keys.append(_key_report(k["key"], k["secret"], k["required"],
                                     value, tier, source))
         report["default"] = "default"

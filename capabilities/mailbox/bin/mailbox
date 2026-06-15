@@ -59,10 +59,6 @@ CONNECTIONS
     MAILBOX_SMTP_PORT     SMTP port                        (default 587)
     MAILBOX_APP_PASSWORD  app password (secret)            (required)
 
-  $MAILBOX_CONFIG (real environment only, never a project .env) is an
-  explicit registry path that wins over the project walk — absolute, or
-  relative to $CLAUDE_PROJECT_DIR/cwd.
-
 Commands:
   mailbox help                                Print this document.
   mailbox connections                         Where every connection's values
@@ -251,17 +247,6 @@ def _env_dir() -> Path | None:
     return (root / ".capabilities" / NAME) if root is not None else None
 
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where .capabilities/ already exists."""
@@ -440,32 +425,14 @@ def _registry_envelope(raw, path: Path) -> dict:
         _die(6, "bad_config", f"{path} is not a JSON object")
     if isinstance(raw.get("connections"), dict) and raw["connections"]:
         return raw
-    if raw and all(isinstance(v, dict) for v in raw.values()):
-        _die(6, "legacy_config",
-             f"{path} holds a flat profile map, which this version no longer reads",
-             'wrap it in the connections envelope: '
-             '{"default": "<id>", "connections": { ... }}')
-    _die(6, "empty_config", f"{path} defines no connections")
+    _die(6, "bad_config", f"{path} is not a connections envelope",
+         'expected {"default": "<id>", "connections": { ... }}')
 
 
 def _connections_registry() -> tuple[dict | None, Path | None]:
-    """The connections envelope and its path, or (None, None) when the project
-    declares none (the implicit default connection applies). $MAILBOX_CONFIG —
-    real environment only — is an explicit registry path that wins."""
-    override = os.environ.get("MAILBOX_CONFIG")
-    if override:
-        start = Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path.cwd()).resolve()
-        cfg = Path(override).expanduser()
-        cfg = (cfg if cfg.is_absolute() else start / cfg).resolve()
-        if not cfg.is_file():
-            _die(6, "no_config",
-                 f"$MAILBOX_CONFIG points to {cfg}, which is not a file",
-                 "unset MAILBOX_CONFIG or point it at a connections.json")
-        try:
-            raw = json.loads(cfg.read_text())
-        except (ValueError, OSError) as e:
-            _die(6, "bad_config", f"cannot read {cfg}: {e}")
-        return _registry_envelope(raw, cfg), cfg
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
     envdir = _env_dir()
     if envdir is not None:
         reg_file = envdir / "connections.json"
@@ -475,13 +442,6 @@ def _connections_registry() -> tuple[dict | None, Path | None]:
             except (ValueError, OSError) as e:
                 _die(6, "bad_config", f"cannot read {reg_file}: {e}")
             return _registry_envelope(raw, reg_file), reg_file
-        legacy = _project_settings()
-        if legacy and all(isinstance(v, dict) and "secret_env" in v
-                          for v in legacy.values()):
-            _die(6, "legacy_config",
-                 f"{envdir / 'settings.json'} holds mailbox profiles, which this "
-                 f"version reads from connections.json",
-                 'move them: {"default": "<id>", "connections": { ...profiles... }}')
     user_reg = _CONFIG_HOME / NAME / "connections.json"
     if user_reg.is_file():
         try:

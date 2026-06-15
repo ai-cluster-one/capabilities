@@ -10,17 +10,6 @@ railwayc makes no network calls of its own. It resolves a token, sets it in the 
 
 For everything except `help` and `doctor`, railwayc inherits stdio and execs `railway` with the args verbatim: `railway`'s stdout, stderr, and **exit code pass through unchanged**. This is what lets streaming (`logs`), `--json`, prompts, and colors behave exactly as in `railway` itself, and it is why railwayc never maps or re-documents the surface (the surface is `railway help`). Consequently the `_emit`/`_die` JSON envelope and the exit-code taxonomy below apply **only to railwayc's own layer** — token resolution, `doctor`, and `railway`-not-on-PATH. A forwarded command returns a `railway` exit code, which is not drawn from railwayc's taxonomy. The intent — a stable, machine-checkable contract where auth is always distinguishable — holds for railwayc's own layer (exit 2 = token problem) and is delegated to `railway` for the rest.
 
-## Credential cascade reduced to two tiers — project `.env(.local)` → process env
-
-A Railway project token is scoped to one project + one environment, so it has no sensible global home. Two of the four canonical tiers are dropped, and the **order of those that remain is preserved** (project files win over process env):
-
-- **No flag tier.** The token is a secret; per SHEBANG it simply omits its flag and resolves from the tiers below, so it never lands on `argv`.
-- **No user-config tier.** A token in `~/.config/railwayc/` would apply to *every* project as a fallback and silently mis-scope them — the opposite of the per-project isolation that is the whole point. So the token's home is the **consuming project's `.env`**, and there is no global credentials file to populate — the manifest declares `project` scope, and install scaffolds the key into the project `.env`.
-
-A one-shot override is therefore `RAILWAY_TOKEN=… railwayc …` (process env, tier 2), not a flag.
-
-The reduction is preserved **inside connection resolution**: `_resolve_env_key` — the function that resolves the implicit default's `RAILWAY_TOKEN` and every registry connection's named `secret_env` — consults project `.env(.local)` then process env, and no user `credentials.env`. A connections registry may still live at the user home (`~/.config/railwayc/connections.json`, machine-level identities), but it is non-secret structure: each connection it names still resolves its token through these two tiers only, so a machine-level identity's token lives in the process env, never a user credentials file. `RAILWAYC_EXPECT_PROJECT` (non-secret) resolves the same two tiers.
-
 ## Write-verb classification over a forwarded surface
 
 railwayc forwards opaque commands to `railway`, yet a read-only connection (`allow_write: false`) must refuse the ones that mutate the Railway project. `WRITE_VERBS` is therefore railwayc's **best-effort classification of railway's mutating verbs** (up, down, redeploy, restart, add, deploy, domain, environment, init, service, volume, scale, connect, ssh, shell), plus the `variables --set` special case (bare `variables` reads). The gate is applied at dispatch — after connection selection, before the token resolves or `railway` is execed — so a write verb on a read-only connection exits 4 regardless of whether the token is present or railway is installed. A read verb passes the gate and forwards transparently; railway then owns its own exit code. The classification is the one place railwayc reasons about the surface it otherwise treats as opaque; a railway command outside the list is treated as a read.

@@ -49,11 +49,15 @@ CONNECTIONS
   project-scoped, its home is the CONSUMING PROJECT's .env, not a global file.
   Resolved (first non-empty wins):
     1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    2. process env   RAILWAY_TOKEN (deployed box, or one-shot `RAILWAY_TOKEN=… railwayc …`)
-  There is deliberately no token flag (a secret must not touch argv) and no user-config
-  tier (a global token would mis-scope every project). One token = one project + one
-  environment; a project with prod + staging uses one token per environment — and
-  declares them as connections in <project>/.capabilities/railwayc/connections.json:
+    2. user config   $XDG_CONFIG_HOME/railwayc/credentials.env (default ~/.config/railwayc/)
+    3. process env   RAILWAY_TOKEN (deployed box, or one-shot `RAILWAY_TOKEN=… railwayc …`)
+  There is deliberately no token flag — a secret must not touch argv. A Railway
+  PROJECT token is scoped to one project + one environment, so its natural home is
+  the consuming project's .env (where install scaffolds it); doctor's expect_project
+  check (exit 7) catches a token that points at the wrong project. One token = one
+  project + one environment; a project with prod + staging uses one token per
+  environment — and declares them as connections in
+  <project>/.capabilities/railwayc/connections.json:
     {
       "default": "<id>",
       "connections": {
@@ -66,7 +70,7 @@ CONNECTIONS
   ~/.config/railwayc/connections.json; first found wins, never merged.
 
   The entry names the env var holding its token ("secret_env"); the value
-  resolves through the same two tiers above. "expect_project" is the optional
+  resolves through the same cascade above. "expect_project" is the optional
   per-connection counterpart of RAILWAYC_EXPECT_PROJECT. "allow_write": false
   makes the connection read-only: every forwarded command that mutates the
   Railway project (up, down, redeploy, restart, add, deploy, domain,
@@ -170,8 +174,7 @@ STATE = False       # True when the capability writes session/cache state
 POST_INSTALL: list = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
-CREDENTIALS_ENV = _CONFIG_HOME / "railwayc" / "credentials.env"  # contract verbs only;
-# the token itself has no user-config tier (see deviations.md)
+CREDENTIALS_ENV = _CONFIG_HOME / "railwayc" / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
 TOKEN_NAME = "RAILWAY_TOKEN"
@@ -199,10 +202,9 @@ def _emit(value) -> None:
         sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
-# ── credentials (project .env(.local) → process env) ────────────────────────
-# A project-scoped token has no global home: the flag tier (a secret on argv) and
-# the user-config tier (one token leaking onto every project) are both dropped.
-# The cascade order is preserved — project files win over process env.
+# ── credentials (cascade: project .env(.local) → user config → process env) ──
+# A secret omits the flag tier (it must not touch argv); a Railway project token
+# is project-scoped, so install scaffolds it into the consuming project's .env.
 
 def _parse_env_file(path: Path) -> dict:
     """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
@@ -252,16 +254,17 @@ def _project_env() -> dict:
 # --- Connections ---------------------------------------------------------------
 
 def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
-    """Resolve one env key through railwayc's reduced cascade — project
-    .env(.local) → process env; the user-config tier is deliberately absent
-    (a global token would mis-scope every project; see deviations.md).
-    Returns (value, tier, source)."""
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
     root = _project_root()
     if root is not None:
         for fname in (".env.local", ".env"):
             val = _parse_env_file(root / fname).get(key)
             if val:
                 return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
     val = os.environ.get(key)
     if val:
         return val, "env", None
