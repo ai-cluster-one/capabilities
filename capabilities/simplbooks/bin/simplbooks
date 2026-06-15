@@ -55,8 +55,6 @@ CRED_KEYS = [
      "note": "login email (primary — enables auto-recovery)"},
     {"key": "SIMPLBOOKS_PASSWORD", "secret": True, "required": True,
      "note": "login password (primary — enables auto-recovery)"},
-    {"key": "SIMPLBOOKS_BANK_ACCOUNT", "secret": False, "required": False,
-     "note": "own bank/cashbook id on sales invoices"},
     {"key": "SIMPLBOOKS_WORKER", "secret": False, "required": False,
      "note": "optional pin for the invoice line worker; else the logged-in user"},
 ]
@@ -581,19 +579,17 @@ Account-specific config (resolved by the cascade: flag > project .env(.local) >
 this credentials.env > process env — so a consuming project can set these in its
 own .env):
   SIMPLBOOKS_WORKER=<name>                    (optional pin; else the logged-in user)
-  SIMPLBOOKS_BANK_ACCOUNT=<id>                (own bank account on invoices)
-  SIMPLBOOKS_BANK_TARGET=<bank>               (bank integration for send-payment)
   SIMPLBOOKS_INVOICE_FOOTER='...'             (optional invoice footer line)
-  SIMPLBOOKS_INCOMEACCT_EU_REVERSE=<id>       (optional: books-policy override —
-  SIMPLBOOKS_INCOMEACCT_NON_EU=<id>            a regime whose revenue books to a
-  SIMPLBOOKS_INCOMEACCT_EE_DOMESTIC=<id>       row other than the live default)
-Find the bank account id with `accounts list cashbook`. Sales VAT types + rates
-are read LIVE from SimpleBooks per invoice (`invoices meta` / `expenses meta`).
-The income account defaults to the live vat_types value; set a regime key above
-only to book it elsewhere. The issuer (`creator`) and line worker both follow the
-logged-in user, derived live from the form per invoice (nothing persisted; set
-SIMPLBOOKS_WORKER only to pin a fixed name), and the invoice number defaults to
-SimpleBooks' next sequential — pass --number to override.
+The own bank account (--bank-account), bank integration target (--target), and any
+per-regime income-account override (--income-account-id) are passed as flags per
+operation — the caller sources them from its own structural lookups; the CLI bakes
+no id and reads no env fallback for them. Sales VAT types + rates are read LIVE from
+SimpleBooks per invoice (`invoices meta` / `expenses meta`); the income account
+defaults to the live vat_types value unless --income-account-id overrides it. The
+issuer (`creator`) and line worker both follow the logged-in user, derived live from
+the form per invoice (nothing persisted; set SIMPLBOOKS_WORKER only to pin a fixed
+name), and the invoice number defaults to SimpleBooks' next sequential — pass
+--number to override.
 
 There is no public SimpleBooks API. The CLI emulates a browser session.
 Sessions expire periodically. With EMAIL+PASSWORD present, expiry is
@@ -936,8 +932,8 @@ normalised to Estonian format ('1 234,50') for the SimpleBooks form.
 # income ACCOUNT is a books-policy choice: the live map only carries SimpleBooks'
 # naive default (usually one revenue account for every type), so a regime that
 # books elsewhere — e.g. EU reverse-charge / export to their own 0% revenue rows —
-# is captured by an optional per-regime config key (TAX_CLASS_INCOME_KEYS), which
-# overrides the live default. No account id is baked into the tool.
+# is supplied per invoice via --income-account-id (the caller sources it from its
+# own books policy). No account id is baked into the tool and there is no env fallback.
 TAX_CLASSES: dict[str, dict[str, str | None]] = {
     "ee-domestic": {"vat_type_id": "32",
                     "language": "et_EE", "row_sum_with_vat": None, "footer_prefix": ""},
@@ -946,16 +942,6 @@ TAX_CLASSES: dict[str, dict[str, str | None]] = {
                     "footer_prefix": "Reverse charge EU directive 2006/112\n\n"},
     "non-eu":      {"vat_type_id": "13",
                     "language": "et_EE", "row_sum_with_vat": None, "footer_prefix": ""},
-}
-
-# Optional per-regime income-account override of the live default — set only for a
-# regime whose revenue books to a different chart row than SimpleBooks' default
-# (e.g. EU reverse-charge / export). Resolved through the config cascade; unset =
-# use the live vat_types default.
-TAX_CLASS_INCOME_KEYS: dict[str, str] = {
-    "ee-domestic": "SIMPLBOOKS_INCOMEACCT_EE_DOMESTIC",
-    "eu-reverse":  "SIMPLBOOKS_INCOMEACCT_EU_REVERSE",
-    "non-eu":      "SIMPLBOOKS_INCOMEACCT_NON_EU",
 }
 
 # The invoice footer is a consumer-chosen courtesy line, overridable via config.
@@ -1119,15 +1105,14 @@ def _cfg(key: str, override: str | None = None) -> str | None:
 
 
 def _bank_account(override: str | None = None) -> str:
-    """Resolve this account's own bank/cashbook id used on sales invoices.
-    No id is baked in — it is an account-specific chart row."""
-    v = _cfg("SIMPLBOOKS_BANK_ACCOUNT", override)
-    if v:
-        return v
+    """Resolve this account's own bank/cashbook id used on sales invoices from the
+    --bank-account flag. No id is baked in and there is no env fallback — it is an
+    account-specific chart row the caller supplies per invoice."""
+    if override and override.strip():
+        return override.strip()
     raise click.ClickException(
-        "No bank account — SIMPLBOOKS_BANK_ACCOUNT is unset.\n"
-        "  → add SIMPLBOOKS_BANK_ACCOUNT=<id> to a project .env or credentials.env.\n"
-        "    Find the id with `simplbooks accounts list cashbook`."
+        "No bank account — pass --bank-account <id> "
+        "(find it with `simplbooks accounts list cashbook`)."
     )
 
 
@@ -1136,21 +1121,19 @@ def _resolve_tax(tax_class: str, vat_types: dict, vat_type: str | None = None,
     """Resolve (vat_type_id, income_account_id, vat_rate) for a regime against the
     account's LIVE vat_types map. The vat_type is the regime anchor (override with
     --vat-type-id) and the rate comes straight from the live map. The income
-    account resolves: --income-account-id > per-regime config (a books-policy
-    override, e.g. EU/export to a 0% revenue row) > the live map's default. No id
-    is baked into the tool."""
+    account resolves: --income-account-id > the live map's default. The override is
+    supplied per invoice by the caller (a books-policy choice, e.g. EU/export to a
+    0% revenue row); no id is baked into the tool and there is no env fallback."""
     vt = str(vat_type or TAX_CLASSES[tax_class]["vat_type_id"])
     meta = vat_types.get(vt) or {}
     live_income = str(meta["income_account_id"]) if meta.get("income_account_id") is not None else None
-    income_key = TAX_CLASS_INCOME_KEYS.get(tax_class)
-    ia = income_account or (_cfg(income_key) if income_key else None) or live_income
+    ia = income_account or live_income
     rate = str(meta["vat_percent"]) if meta.get("vat_percent") is not None else None
     if not ia:
         raise click.ClickException(
             f"No income account for vat_type {vt} — the live vat_types map gave none "
-            f"and no override is set.\n"
-            f"  → pass --income-account-id <id> (find it with `simplbooks accounts list chart`),\n"
-            f"    or set {income_key} in a project .env / credentials.env."
+            f"and --income-account-id was not passed.\n"
+            f"  → pass --income-account-id <id> (find it with `simplbooks accounts list chart`)."
         )
     if rate is None:
         # The live map should always carry the rate; fall back to 0 only defensively.
@@ -2684,7 +2667,7 @@ def invoices_delete(invoice_id) -> None:
 @click.option("--income-account-id", "income_account_id", default=None,
               help="Override the income account (else read live from the vat_types map).")
 @click.option("--bank-account", "bank_account", default=None,
-              help="Own bank account id shown on the invoice (else SIMPLBOOKS_BANK_ACCOUNT).")
+              help="Own bank account id shown on the invoice (required; see `accounts list cashbook`).")
 @click.option("--creator", default=None,
               help="Issuer user id (else the logged-in user, read from the form).")
 @click.option("--dry-run", is_flag=True,
@@ -2735,7 +2718,7 @@ def invoices_create(client_id, description, price, tax_class, number,
             click.echo(f"  Tax class     : {tax_class}")
             click.echo(f"  vat_type_id   : {fmap.get('Task[0][vat_type_id]')}")
             click.echo(f"  vat rate      : {fmap.get('Task[0][vat]')}")
-            click.echo(f"  income acct   : {fmap.get('Task[0][income_account_id]')}  (--flag > regime config > live default)")
+            click.echo(f"  income acct   : {fmap.get('Task[0][income_account_id]')}  (--income-account-id > live default)")
             click.echo(f"  bank account  : {fmap.get('default_bank_account')}")
             click.echo(f"  creator       : {fmap.get('creator')}  (--creator > logged-in user)")
             click.echo(f"  worker        : {fmap.get('Task[0][worker]')}")
@@ -3796,7 +3779,7 @@ def expenses_delete(purchase_id) -> None:
 @click.option("--date", "payment_date", default=None,
               help="Payment date dd.mm.yyyy. Defaults to today.")
 @click.option("--target", default=None,
-              help="Bank integration target (else SIMPLBOOKS_BANK_TARGET).")
+              help="Bank integration target to push the order to (required).")
 def expenses_send_payment(purchase_id, amount, from_account, payment_date, target) -> None:
     """Stage a purchase invoice as a payment order to the bank.
 
@@ -3812,12 +3795,11 @@ def expenses_send_payment(purchase_id, amount, from_account, payment_date, targe
       simplbooks expenses send-payment 1733
       simplbooks expenses send-payment 1733 --amount 166,82 --date 09.06.2026
     """
-    target = _cfg("SIMPLBOOKS_BANK_TARGET", target)
-    if not target:
+    if not (target and target.strip()):
         raise click.ClickException(
-            "No bank target — SIMPLBOOKS_BANK_TARGET is unset and --target was not given.\n"
-            "  → add SIMPLBOOKS_BANK_TARGET=<bank> to credentials.env (or pass --target)."
+            "No bank target — pass --target <bank> (the bank integration to push the order to)."
         )
+    target = target.strip()
     cookies, account = session_or_die()
     view_url = f"{BASE}/{account}/purchases/view/{purchase_id}"
     with build_http(cookies, account) as http:
