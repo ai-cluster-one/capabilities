@@ -19,10 +19,8 @@ CONNECTIONS
   connection is `default`, resolved by the cascade (first non-empty wins):
     1. flags          --api-url (non-secret only; a secret never has a flag)
     2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    3. settings       .capabilities/callva/settings.json (flat key: api_url —
-                      non-secret keys only; the API key never resolves here)
-    4. user config    $XDG_CONFIG_HOME/callva/credentials.env (default ~/.config/callva/)
-    5. process env    CALLVA_API_KEY / CALLVA_API_URL
+    3. user config    $XDG_CONFIG_HOME/callva/credentials.env (default ~/.config/callva/)
+    4. process env    CALLVA_API_KEY / CALLVA_API_URL
   Same CALLVA_* keys at every tier; the project you're in wins, process env is
   the fallback (so a deployed host's injected env governs when no config file
   is present). Never pass the key on the command line.
@@ -363,17 +361,6 @@ def _env_dir() -> Path | None:
     return (root / ".capabilities" / NAME) if root is not None else None
 
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where .capabilities/ already exists."""
@@ -546,30 +533,6 @@ def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
     return None, None, None
 
 
-def _resolve_key_default(key: str) -> tuple[str | None, str | None, Path | None]:
-    """The implicit default connection's resolution for non-secret keys:
-    project .env(.local) → settings envelope (flat keys — callva's recorded
-    extension) → user credentials.env → process env. Returns (value, tier,
-    source)."""
-    root = _project_root()
-    if root is not None:
-        for fname in (".env.local", ".env"):
-            val = _parse_env_file(root / fname).get(key)
-            if val:
-                return val, "project", root / fname
-    sval = _project_settings().get(key.removeprefix("CALLVA_").lower())
-    if sval:
-        envdir = _env_dir()
-        return str(sval), "settings", (envdir / "settings.json") if envdir else None
-    val = _parse_env_file(CREDENTIALS_ENV).get(key)
-    if val:
-        return val, "user", CREDENTIALS_ENV
-    val = os.environ.get(key)
-    if val:
-        return val, "env", None
-    return None, None, None
-
-
 def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 
@@ -641,7 +604,7 @@ def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
                 "hint": f"set {key_env} in a project .env(.local), "
                         f"{CREDENTIALS_ENV}, or the environment — or declare a "
                         f"connections registry (.capabilities/{NAME}/connections.json)"}
-        base = (api_url_flag or _resolve_key_default("CALLVA_API_URL")[0]
+        base = (api_url_flag or _resolve_env_key("CALLVA_API_URL")[0]
                 or DEFAULT_API_URL)
         return {"id": cid, "allow_write": WRITE_DEFAULT, "key_env": key_env,
                 "api_key": api_key, "base": base.rstrip("/")}, None
@@ -686,8 +649,7 @@ def _cmd_connections() -> None:
     if reg is None:
         keys = []
         for k in CRED_KEYS:
-            resolver = _resolve_env_key if k["secret"] else _resolve_key_default
-            value, tier, source = resolver(k["key"])
+            value, tier, source = _resolve_env_key(k["key"])
             keys.append(_key_report(k["key"], k["secret"], k["required"],
                                     value, tier, source))
         report["default"] = "default"
