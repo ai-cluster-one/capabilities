@@ -644,8 +644,13 @@ def _compose_context(root: Path) -> str:
         bullet: list[str] = []
         envdir = root / ".capabilities" / name
         conns = _read_json(envdir / "connections.json")
-        if isinstance(conns, dict) and isinstance(conns.get("connections"), dict) \
-                and conns["connections"]:
+        valid = (isinstance(conns, dict)
+                 and isinstance(conns.get("connections"), dict)
+                 and conns["connections"])
+        single_ro = (valid and len(conns["connections"]) == 1
+                     and (next(iter(conns["connections"].values())) or {})
+                     .get("allow_write") is False)
+        if valid and (len(conns["connections"]) > 1 or single_ro):
             default = conns.get("default")
             items = "; ".join(
                 cid + ("*" if cid == default else "")
@@ -653,7 +658,7 @@ def _compose_context(root: Path) -> str:
                    and entry.get("allow_write") is False else "")
                 for cid, entry in sorted(conns["connections"].items()))
             bullet.append(f"- Connections (`--connection <id>`; * = default): {items}")
-        elif conns is not None:
+        elif conns is not None and not valid:
             bullet.append(f"- Connections file present but not a valid envelope — "
                           f"fix .capabilities/{name}/connections.json")
         ids = _read_json(envdir / "identifiers.json")
@@ -664,21 +669,27 @@ def _compose_context(root: Path) -> str:
         elif ids is not None:
             bullet.append(f"- Identifiers file present but not a JSON object — "
                           f"fix .capabilities/{name}/identifiers.json")
-        refs = []
-        refdir = envdir / "reference"
-        if refdir.is_dir():
-            for md in sorted(refdir.glob("*.md")):
-                fm = _front_matter(md)
-                if fm.get("name"):
-                    refs.append(f"{fm['name']} — {fm.get('description', '')}".rstrip(" —"))
-        if refs:
-            bullet.append(f"- References (`.capabilities/{name}/reference/`): " + "; ".join(refs))
         topics = ((manifest or {}).get("docs") or {}).get("topics") or []
         if topics:
             bullet.append(f"- Guides (`{name} guide <topic>`): " + ", ".join(sorted(topics)))
         settings = envdir / "settings.json"
         if settings.exists():
             bullet.append(f"- Project settings: .capabilities/{name}/settings.json")
+        refs = []
+        refdir = envdir / "reference"
+        if refdir.is_dir():
+            for md in sorted(refdir.glob("*.md")):
+                fm = _front_matter(md)
+                if fm.get("name"):
+                    rel = md.relative_to(root)
+                    desc = fm.get("description", "")
+                    refs.append(f"- `{rel}` — {desc}".rstrip(" —"))
+        if refs:
+            if bullet:
+                bullet.append("")
+            bullet.append("**References** (load on demand):")
+            bullet.append("")
+            bullet.extend(refs)
         if bullet:
             lines += bullet + [""]
     lines.append(CONTEXT_END)
