@@ -1037,9 +1037,14 @@ def cmd_sync_contract(check_only: bool) -> None:
 def _audit_script(name: str, script: Path) -> list[str]:
     failures: list[str] = []
     env = _snapshot_env()
+    script_text = script.read_text()
+    # A capability with no `connections` fence is core-only: it carries the
+    # capability-core declaration surface and stops (DOCTRINE — core-only is an
+    # absence, not a deviation). Its `connections` verb reports no connections.
+    core_only = _split_region(script_text, "connections") is None
 
     if _PREAMBLE.is_file():
-        for region in _contract_drift(script.read_text(), _canonical_regions()):
+        for region in _contract_drift(script_text, _canonical_regions()):
             failures.append(
                 f"contract-drift: {region} differs from contract/preamble.py "
                 f"— run `capabilities sync-contract`")
@@ -1185,13 +1190,32 @@ def _audit_script(name: str, script: Path) -> list[str]:
                         failures.append(f"connections/{label}: secret "
                                         f"{k.get('key')!r} not masked")
 
-        _check_connections({"default"}, "implicit", expect_default="default")
-        conn_file = capdir / name / "connections.json"
-        conn_file.parent.mkdir(exist_ok=True)
-        _write_json(conn_file, {"default": "a",
-                                "connections": {"a": {}, "b": {"allow_write": False}}})
-        _check_connections({"a", "b"}, "registry", expect_default="a")
-        conn_file.unlink()
+        if core_only:
+            # No connections fence: `connections` reports none, and no registry
+            # is consulted. An empty/absent 'connections' map is the contract.
+            rc, out, errs = _run_script(script, ["connections"], cwd=sandbox, env=genv)
+            if rc != 0:
+                failures.append(f"connections/core-only: exit {rc} "
+                                f"(the report renders even unconfigured)")
+            else:
+                try:
+                    report = json.loads(out)
+                except ValueError:
+                    failures.append("connections/core-only: not JSON")
+                else:
+                    if report.get("connections"):
+                        failures.append(
+                            "connections/core-only: a capability with no "
+                            "connections fence must report no connections "
+                            "(an empty 'connections' map)")
+        else:
+            _check_connections({"default"}, "implicit", expect_default="default")
+            conn_file = capdir / name / "connections.json"
+            conn_file.parent.mkdir(exist_ok=True)
+            _write_json(conn_file, {"default": "a",
+                                    "connections": {"a": {}, "b": {"allow_write": False}}})
+            _check_connections({"a", "b"}, "registry", expect_default="a")
+            conn_file.unlink()
 
         # guide menu agrees with the manifest
         if manifest is not None:

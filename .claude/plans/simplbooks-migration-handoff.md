@@ -66,11 +66,12 @@ PAUSE here and let the user confirm the pilot before Phase B.
 =================== PHASE B — THE REST ===================
 
 B1. Install + detach the remaining proper capabilities (machine-global):
-  For each of: asana callva directo mail mailbox notion simplbooks telegram whatsapp windmill
+  For each of: asana askproject callva directo mail mailbox notion simplbooks telegram whatsapp windmill
     capabilities install <name> --from /Users/kz/dev/capabilities
     rm -f ~/bin/<name>
   Then `capabilities list` to confirm all are installed.
-  DO NOT TOUCH: ~/bin/askproject (a non-formalized draft, not a capability), Fathom, or any other ~/bin script not in the list above. Leave them exactly as they are.
+  askproject is a core-only capability (no credentials, no connections — it drives the local `claude` CLI): install + detach it like the rest, but it has NO envelope to migrate (skip the B3 split for it). Enabling it in this project is optional — it is a machine-level meta-tool used to query OTHER projects.
+  DO NOT TOUCH: Fathom, or any other ~/bin script not in the list above. Leave them exactly as they are.
 
 B2. Enable the capabilities this project uses (it has envelopes for): asana directo mailbox simplbooks whatsapp windmill
     capabilities enable <name>   (for each)

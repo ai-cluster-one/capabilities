@@ -16,7 +16,7 @@
 - All 10 connection-bearing caps are migrated (✓ mailbox, fathom, asana, callva, directo, notion, railwayc, stripe, telegram, windmill) and the `PROTOCOL = 2` banner fixes are done.
 - **Install + migrate in the simplbooks consumer** — separate handoff: for each connection-bearing cap the consumer uses, reinstall from this repo's protocol-2 source and migrate its envelope. (User runs this in the simplbooks project from a handoff prompt.)
 - mail, whatsapp, and simplbooks are conformed to protocol 2 as well: mail is keyless (its connections tier reports a keyless implicit `default`); whatsapp's bespoke `whatsapp.json` profiles became the standard connections envelope (`mode` → `allow_write`, `--profile` → `--connection`); simplbooks gained the connections envelope plus a per-connection write gate (`WRITE_DEFAULT = False` over the create/update/delete/bind/unbind/send-payment/save verbs). Every capability under `capabilities/` now carries both vendored fences and audits green.
-- askproject stays a non-conformed meta-tool (no credentials, no connection concept — its target is a project path chosen per call), kin to the manager and excluded from the contract on the same grounds.
+- askproject is conformed as the first **core-only** capability: it carries the `capability core` fence and no `connections` fence (no credentials, no endpoint — it drives the local `claude` CLI), and its `connections` verb reports an empty map (`{"connections": {}, "default": null}`). The audit gained a core-only branch that accepts that report in place of the implicit-default-plus-registry checks; `capabilities audit askproject` is green.
 
 ---
 

@@ -423,6 +423,8 @@ def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 ```
 
+A **core-only** capability — one carrying the `capability core` fence and no `connections` fence, because it has nothing to resolve (it drives a local tool or the host, with no credentials or endpoint) — still answers `connections`, reporting an empty map: `{ "connections": {}, "default": null }`. That absence is the contract, not a gap: `audit` accepts the empty report in place of the implicit-default-plus-registry checks, and never writes a registry against such a capability.
+
 ## Identity-free
 
 A shared tool bakes in no consumer's identity — no person, company, tenant, account, or host-with-tenant **value** (DOCTRINE rule 10). The consumer supplies those through the cascade; the tool refers to them by role. Config-key *names* (`<NAME>_API_KEY`, `<NAME>_WORKSPACE`) are structural and belong in the script; the *values* never do. This holds in the help text too: examples use placeholders (`user@example.com`, `<PERSON>`), never a real name or address. A default that would otherwise hardcode a consumer (an author or actor name, a default identity) is sourced from env/config with no baked-in fallback — absent the value, the tool asks for it rather than assuming one.
