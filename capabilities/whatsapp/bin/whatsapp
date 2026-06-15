@@ -12,24 +12,53 @@ Agent-invoked. Reads WhatsApp conversations through a WAHA instance: list chats,
 fetch and export message history to JSON, download media, transcribe voice notes,
 and render a readable log. Run `whatsapp doctor` first to confirm the chain.
 
-Profiles
-  A profile is one WhatsApp identity = a (WAHA instance + session). Profiles live
-  in the project's capability settings, discovered the way the mailbox capability
-  finds its config:
-        $WHATSAPP_CONFIG                                 explicit path to the json, else
-        <project>/.capabilities/whatsapp/settings.json   walked up from $CLAUDE_PROJECT_DIR / cwd
-  Each profile carries: base_url, session, secret_env (the env-var NAME holding
-  that instance's X-Api-Key), mode ("read" | "send"), an optional number, an
-  optional messages_dir, and an optional expected engine ("GOWS", the default) /
-  tier ("CORE" | "PLUS") that `health` validates the live instance against.
-  Select one with --profile NAME (else $WHATSAPP_PROFILE, the config's "default"
-  key, or the lone profile). --session overrides the profile's session for a
-  single call.
+Connections
+  Configuration resolves as named connections. A connection is one WhatsApp
+  identity = a (WAHA instance + session). With no registry the sole connection is
+  `default`, resolved from the credential cascade (flat keys below). A project
+  with several WhatsApp identities declares them in
+  <project>/.capabilities/whatsapp/connections.json:
+        {
+          "default": "<id>",
+          "connections": {
+            "<id>": {
+              "base_url":    "https://waha.example.com",
+              "session":     "default",
+              "secret_env":  "WAHA_<ID>_API_KEY",
+              "dashboard_user_env": "WAHA_<ID>_DASHBOARD_USERNAME",
+              "dashboard_pass_env": "WAHA_<ID>_DASHBOARD_PASSWORD",
+              "number":      "15551234567",
+              "engine":      "GOWS",
+              "tier":        "CORE",
+              "messages_dir": "messages",
+              "allow_write": false
+            }
+          }
+        }
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/whatsapp/connections.json; first found wins, never merged.
+
+  Only the X-Api-Key is secret: the entry names the env var holding it
+  ("secret_env"); the value resolves through the cascade. base_url, session,
+  number, engine, tier, and messages_dir sit literally in the entry. The dashboard
+  basic-auth pair is named indirectly the same way ("dashboard_user_env" /
+  "dashboard_pass_env"). An optional expected engine ("GOWS", the default) / tier
+  ("CORE" | "PLUS") let `health` validate the live instance.
+
+  WRITES ARE OFF BY DEFAULT: a WhatsApp send leaves the system (a message reaches
+  a real person), so `send` exits 4 unless the connection carries an explicit
+  "allow_write": true. No flag lifts the gate; granting it is a deliberate registry
+  edit, made after asking the user. The implicit default connection can never write.
+
+  Selection: --connection <id> (-c) on every command. Unflagged, the registry's
+  "default" pointer applies, else the sole entry; several entries without a pointer
+  is refused as ambiguous. --session overrides the connection's session for one call.
 
 Credentials (4-tier cascade; first non-empty wins)
   flags > project .env(.local) > ~/.config/whatsapp/credentials.env > process env.
-  The secret is named indirectly by the profile's secret_env and never travels on
-  argv. With no settings.json anywhere, the CLI falls back to single-instance env:
+  The secret is named indirectly by the connection's secret_env and never travels
+  on argv. With no connections.json anywhere, the implicit `default` connection
+  resolves from single-instance env:
         WAHA_BASE_URL                            instance URL (required)
         WAHA_WHATSAPP_API_KEY                    X-Api-Key
         WAHA_DASHBOARD_USERNAME / WAHA_DASHBOARD_PASSWORD   dashboard basic auth
@@ -37,7 +66,7 @@ Credentials (4-tier cascade; first non-empty wins)
 
 Commands
   whatsapp help                        Print this usage block
-  whatsapp doctor [--session NAME]     Profile readiness — creds resolve, WAHA
+  whatsapp doctor [--session NAME]     Connection readiness — creds resolve, WAHA
                                        reachable, the active session linked with an
                                        account. The cheap "can I read now?" probe.
                                        JSON on stdout.
@@ -52,13 +81,13 @@ Commands
   whatsapp pair [--number DIGITS] [--qr] [--wait] [--recreate --yes] [--session NAME]
                                        Onboard / link a session via the GOWS phone-
                                        number pairing code: pass a number (default:
-                                       the profile's), get an XXXX-XXXX code to enter
+                                       the connection's), get an XXXX-XXXX code to enter
                                        in WhatsApp (Settings → Linked Devices → Link a
                                        Device → "Link with phone number"). No QR scan.
                                        --wait polls until WORKING; --qr returns the QR
                                        value instead; --recreate --yes re-links an
                                        existing session (DELETE + recreate). Connection-
-                                       level — works from any profile (you link before
+                                       level — works from any connection (you link before
                                        you can read). Needs the WAHA server's default
                                        engine set to GOWS (WHATSAPP_DEFAULT_ENGINE=GOWS);
                                        pair asserts it but cannot set it per-session.
@@ -92,7 +121,7 @@ Commands
                                        names, voice transcriptions inlined). stdout by
                                        default; --out writes to a file.
   whatsapp send <chat_id> <text>       [planned, not implemented] Send a message —
-                                       send-capable profiles only (mode: "send").
+                                       write-enabled connections only (allow_write: true).
 
 Chat IDs
   DMs    — <number>@c.us        e.g. 15551234567@c.us
@@ -106,6 +135,9 @@ I/O contract
   Progress chatter from export / transcribe goes to stderr; stdout stays clean.
 
 Contract commands (the same on every capability):
+  whatsapp connections                         Where every connection's values
+                                               resolve from (tier, source, secrets
+                                               masked). Local only — no network.
   whatsapp stub                                One-line awareness text.
   whatsapp manifest --json                     Machine-readable declaration.
   whatsapp guide [<topic>]                     Guide topics / one guide body,
@@ -120,14 +152,15 @@ Exit codes
   2  auth — missing / rejected credentials (401/403); a session not linked
      (`doctor`); or WAHA not in the expected ready mode (`health`)
   3  not found — the addressed chat / contact / resource does not exist (404)
-  4  disabled by project policy (.capabilities/settings.json — ask the user,
-     never enable it yourself)
+  4  policy refusal — the project gate (.capabilities/settings.json) on any verb,
+     or a write verb on a read-only connection (allow_write: false). Ask the user;
+     never lift a gate yourself.
   5  server / network — timeout, connection error, 429 after retries, 5xx
   6  input / validation — a malformed argument or date, or an unsupported op
-     (sending today; sending from a non-"send" profile)
+     (sending is not implemented yet)
 
-Reads run from any profile. Sending is gated on mode: "send" and is intentionally
-not implemented yet — see cmd_send.
+Reads run from any connection. Sending is gated on allow_write and is
+intentionally not implemented yet — see cmd_send.
 """
 
 import argparse
@@ -145,53 +178,47 @@ from typing import NoReturn
 import httpx
 
 DEFAULT_SESSION = "default"
-_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
-CREDS_PATH = _CONFIG_HOME / "whatsapp" / "credentials.env"
 
-# Project-side profile config, discovered like the mailbox capability does.
-# --- Capability declaration (protocol 1) — one home for every contract fact --
+# --- Capability declaration (protocol 2) — one home for every contract fact --
 
 NAME = "whatsapp"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("WhatsApp CLI over a self-hosted WAHA bridge — list chats, "
            "read/export a chat's history to JSON with voice/audio + photos, "
            "and transcribe voice notes. Run `whatsapp doctor` first to "
            "confirm the instance is reachable and the session is linked.")
 SCOPE = "project"   # credential scope: "project" | "user"
-CRED_KEYS = [
-    {"key": "WAHA_BASE_URL", "secret": False, "required": False,
-     "note": "single-instance fallback when no settings.json profile exists"},
+CRED_KEYS = [       # the implicit default connection; a registry entry supplies these per id
+    {"key": "WAHA_BASE_URL", "secret": False, "required": True,
+     "note": "WAHA instance URL"},
     {"key": "WAHA_WHATSAPP_API_KEY", "secret": True, "required": False,
-     "note": "X-Api-Key for the single-instance fallback; profiles name theirs via secret_env"},
+     "note": "X-Api-Key; a registry connection names its own via secret_env"},
+    {"key": "WAHA_DASHBOARD_USERNAME", "secret": False, "required": False,
+     "note": "dashboard basic-auth username"},
+    {"key": "WAHA_DASHBOARD_PASSWORD", "secret": True, "required": False,
+     "note": "dashboard basic-auth password"},
     {"key": "DEEPGRAM_API_KEY", "secret": True, "required": False,
      "note": "voice-note transcription"},
 ]
+WRITE_VERBS = ["send"]   # domain verbs that mutate the remote system
+WRITE_DEFAULT = False    # a WhatsApp send leaves the system — granted per connection, explicitly
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = False       # True when the capability writes session/cache state
 POST_INSTALL: list = []
 
-CREDENTIALS_ENV = CREDS_PATH  # the contract block's name for the user config
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / "whatsapp" / "credentials.env"
+CREDS_PATH = CREDENTIALS_ENV  # legacy alias used by the Deepgram key loader
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
-CONFIG_REL = Path(".capabilities") / "whatsapp" / "settings.json"
-LEGACY_CONFIG_REL = Path(".capabilities") / "whatsapp" / "whatsapp.json"
 
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
-# ── I/O contract ──────────────────────────────────────────────────────────────
-
-
-def _emit(value) -> None:
-    """Success on stdout: a string verbatim, anything else as indented JSON."""
-    if isinstance(value, str):
-        sys.stdout.write(value if value.endswith("\n") else value + "\n")
-    else:
-        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-
+# --- Error reporting ---------------------------------------------------------
 
 def _die(exit_code: int, code: str, message: str,
          hint: str | None = None, status: int | None = None) -> NoReturn:
-    """Failure on stderr: one {"error": {...}} line; the exit code carries the category."""
     err: dict = {"code": code, "message": message}
     if hint:
         err["hint"] = hint
@@ -201,73 +228,37 @@ def _die(exit_code: int, code: str, message: str,
     sys.exit(exit_code)
 
 
-def _log(message: str) -> None:
-    """Progress / diagnostics to stderr, keeping stdout clean for the result."""
-    sys.stderr.write(message + "\n")
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
-# ── Credential cascade (profile-indirect; see deviations.md) ──────────────────
-
+# --- Project / file plumbing -------------------------------------------------
 
 def _parse_env_file(path: Path) -> dict:
-    vals: dict = {}
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
     try:
         text = path.read_text()
     except OSError:
-        return vals
+        return out
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[len("export "):].strip()
-        vals[key] = value.strip().strip("'\"")
-    return vals
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
 
 
-def _load_env_file(path: Path) -> None:
-    """Load every KEY=VALUE from path into os.environ without overriding existing keys."""
-    if not path.is_file():
-        return
-    for k, v in _parse_env_file(path).items():
-        if k and not os.environ.get(k):
-            os.environ[k] = v
-
-
-def _find_config():
-    """Locate (project_dir, config_path) for the profile settings, or (None, None).
-
-    Precedence mirrors the mailbox capability:
-      1. $WHATSAPP_CONFIG — explicit path (absolute, or relative to the start dir).
-      2. Walk up from $CLAUDE_PROJECT_DIR (else cwd) to the first dir holding
-         .capabilities/whatsapp/settings.json. That dir anchors the .env load.
-    No config → (None, None): the CLI falls back to single-instance env vars.
-    """
-    start = Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path.cwd()).resolve()
-    override = os.environ.get("WHATSAPP_CONFIG")
-    if override:
-        cfg = Path(override).expanduser()
-        cfg = cfg if cfg.is_absolute() else (start / cfg)
-        cfg = cfg.resolve()
-        if not cfg.is_file():
-            _die(6, "bad_config_path",
-                 f"$WHATSAPP_CONFIG points to {cfg}, which is not a file",
-                 "set $WHATSAPP_CONFIG to an existing settings.json, or unset it")
-        return cfg.parent, cfg
-    for d in (start, *start.parents):
-        if (d / CONFIG_REL).is_file():
-            return d, d / CONFIG_REL
-    for d in (start, *start.parents):
-        if (d / LEGACY_CONFIG_REL).is_file():
-            _die(6, "no_config",
-                 f"found {d / LEGACY_CONFIG_REL}, which this version no longer reads",
-                 f"rename it to {d / CONFIG_REL}")
-    return None, None
-
-
-def _project_root():
+def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
     the first directory holding .capabilities/, .env(.local), or .git.
     $HOME is never a project root (the machine registry lives there)."""
@@ -293,8 +284,6 @@ def _project_env() -> dict:
     return merged
 
 
-# --- Capability contract (protocol 1) — shared verbatim across capabilities --
-
 def _gate() -> None:
     """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
     root = _project_root()
@@ -317,17 +306,6 @@ def _env_dir() -> Path | None:
     return (root / ".capabilities" / NAME) if root is not None else None
 
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where .capabilities/ already exists."""
@@ -337,6 +315,8 @@ def _state_dir() -> Path:
             return root / ".capabilities" / NAME / "state"
     return _STATE_HOME / NAME
 
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -432,9 +412,10 @@ def _cmd_ids(argv: list[str]) -> None:
 
 def _cmd_refs() -> None:
     envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
     out = []
-    if envdir and envdir.is_dir():
-        for md in sorted(envdir.glob("*.md")):
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
             name = desc = None
             try:
                 lines = md.read_text().splitlines()
@@ -470,122 +451,273 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
 
-
-def _load_secrets(project_dir=None) -> None:
-    """Load secrets into os.environ (no override): the discovered project's
-    .env(.local) first, then cwd .env(.local), then ~/.config creds."""
-    if project_dir:
-        _load_env_file(project_dir / ".env")
-        _load_env_file(project_dir / ".env.local")
-    _load_env_file(Path.cwd() / ".env")
-    _load_env_file(Path.cwd() / ".env.local")
-    _load_env_file(CREDS_PATH)
+# <<< contract: capability core <<<
 
 
-def _select_profile(profiles: dict, requested):
-    """Pick (name, profile_dict) from a whatsapp.json map. A reserved "default"
-    string key may name the fallback; else $WHATSAPP_PROFILE, else the lone one."""
-    names = [k for k, v in profiles.items() if isinstance(v, dict)]
-    default_name = profiles.get("default") if isinstance(profiles.get("default"), str) else None
-    chosen = requested or os.environ.get("WHATSAPP_PROFILE") or default_name
-    if not chosen and len(names) == 1:
-        chosen = names[0]
-    if not chosen:
-        _die(6, "ambiguous_profile",
-             "multiple profiles in config; pass --profile NAME",
-             f"available: {', '.join(sorted(names))}")
-    if chosen not in profiles or not isinstance(profiles[chosen], dict):
-        _die(6, "profile_not_found",
-             f"profile '{chosen}' not found",
-             f"available: {', '.join(sorted(names))}")
-    return chosen, profiles[chosen]
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
 
 
-def get_config(args=None):
-    """Resolve connection config. With a project whatsapp.json, the active
-    profile supplies base_url + session + secret + mode; without one, falls back
-    to single-instance env vars (WAHA_BASE_URL / WAHA_WHATSAPP_API_KEY)."""
-    requested_session = getattr(args, "session", None)
-    requested_profile = getattr(args, "profile", None)
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
 
-    project_dir, cfg_path = _find_config()
-    _load_secrets(project_dir)
 
-    if cfg_path:
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
         try:
-            profiles = json.loads(cfg_path.read_text())
-        except Exception as e:
-            _die(6, "bad_config", f"could not parse {cfg_path}: {e}",
-                 "fix the JSON in whatsapp.json")
-        name, prof = _select_profile(profiles, requested_profile)
-        secret_env = prof.get("secret_env")
-        api_key = os.environ.get(secret_env) if secret_env else None
-        if not api_key:
-            _die(2, "missing_secret",
-                 f"profile '{name}': secret env '{secret_env}' is empty",
-                 f"set it in the project .env(.local) or {CREDS_PATH}")
-        base_url = prof.get("base_url")
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+# <<< contract: connections <<<
+
+
+def _log(message: str) -> None:
+    """Progress / diagnostics to stderr, keeping stdout clean for the result."""
+    sys.stderr.write(message + "\n")
+
+
+# --- Connections (capability-specific) --------------------------------------
+
+
+def _build_cfg(cid: str, entry: dict | None,
+               session_flag: str | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection into the config dict every cmd_* consumes.
+    Returns (cfg, problem) — problem is an error dict ({"exit", "code",
+    "message", "hint"?}) instead of a die, so doctor can report every
+    connection rather than stopping at the first. The implicit default (no
+    registry entry) reads the flat WAHA_* keys through the cascade; a named
+    connection reads base_url/session/etc. literally and resolves its X-Api-Key
+    and dashboard pair through secret_env / *_env indirection."""
+    if entry is None:   # the implicit default — flat keys through the cascade
+        base_url = _resolve_env_key("WAHA_BASE_URL")[0]
+        api_key = _resolve_env_key("WAHA_WHATSAPP_API_KEY")[0]
+        username = _resolve_env_key("WAHA_DASHBOARD_USERNAME")[0]
+        password = _resolve_env_key("WAHA_DASHBOARD_PASSWORD")[0]
         if not base_url:
-            _die(6, "missing_base_url",
-                 f"profile '{name}' has no base_url",
-                 "add the WAHA instance URL as base_url in whatsapp.json")
-        # Capability-local message store: per-profile or top-level `messages_dir`,
-        # else <config dir>/messages. Relative paths resolve against the config dir.
-        config_dir = cfg_path.parent
-        md = prof.get("messages_dir") or profiles.get("messages_dir")
-        if md:
-            md_path = Path(md).expanduser()
-            messages_dir = str(md_path if md_path.is_absolute() else (config_dir / md_path))
-        else:
-            messages_dir = str(config_dir / "messages")
+            return None, {
+                "exit": 6, "code": "missing_base_url",
+                "message": "no connections registry and WAHA_BASE_URL is unset",
+                "hint": f"set WAHA_BASE_URL in the project .env(.local), "
+                        f"{CREDENTIALS_ENV}, or the environment — or declare a "
+                        f"connections registry (.capabilities/{NAME}/connections.json)"}
+        if not api_key and not (username and password):
+            return None, {
+                "exit": 2, "code": "missing_credentials",
+                "message": "no WAHA credentials resolved",
+                "hint": f"set WAHA_WHATSAPP_API_KEY (and/or WAHA_DASHBOARD_USERNAME + "
+                        f"WAHA_DASHBOARD_PASSWORD) in {CREDENTIALS_ENV} or the project .env"}
         return {
             "api_key": api_key,
-            "username": os.environ.get(prof.get("dashboard_user_env", "")) or os.environ.get("WAHA_DASHBOARD_USERNAME"),
-            "password": os.environ.get(prof.get("dashboard_pass_env", "")) or os.environ.get("WAHA_DASHBOARD_PASSWORD"),
+            "username": username,
+            "password": password,
             "base_url": base_url.rstrip("/"),
-            "session": requested_session or prof.get("session") or DEFAULT_SESSION,
-            "mode": prof.get("mode") or "read",
-            "profile": name,
-            "number": prof.get("number"),
-            "expected_engine": (prof.get("engine") or "GOWS"),
-            "expected_tier": prof.get("tier"),
-            "config_dir": str(config_dir),
-            "messages_dir": messages_dir,
-        }
+            "session": session_flag or _resolve_env_key("WHATSAPP_SESSION")[0] or DEFAULT_SESSION,
+            "allow_write": WRITE_DEFAULT,
+            "mode": "send" if WRITE_DEFAULT else "read",
+            "profile": cid,
+            "number": None,
+            "expected_engine": "GOWS",
+            "expected_tier": None,
+            "config_dir": None,
+            "messages_dir": None,
+        }, None
 
-    # Single-instance fallback (no whatsapp.json found).
-    api_key = os.environ.get("WAHA_WHATSAPP_API_KEY")
-    username = os.environ.get("WAHA_DASHBOARD_USERNAME")
-    password = os.environ.get("WAHA_DASHBOARD_PASSWORD")
-    base_url = os.environ.get("WAHA_BASE_URL")
+    base_url = entry.get("base_url")
     if not base_url:
-        _die(6, "missing_base_url",
-             "no whatsapp.json found and WAHA_BASE_URL is unset",
-             f"add a profile to .capabilities/whatsapp/whatsapp.json, or set "
-             f"WAHA_BASE_URL in {CREDS_PATH}")
+        return None, {"exit": 6, "code": "missing_base_url",
+                      "message": f"connection {cid!r} has no base_url",
+                      "hint": "add the WAHA instance URL as base_url in connections.json"}
+    secret_env = entry.get("secret_env")
+    api_key = _resolve_env_key(secret_env)[0] if secret_env else None
+    user_env = entry.get("dashboard_user_env")
+    pass_env = entry.get("dashboard_pass_env")
+    username = _resolve_env_key(user_env)[0] if user_env else None
+    password = _resolve_env_key(pass_env)[0] if pass_env else None
     if not api_key and not (username and password):
-        _die(2, "missing_credentials",
-             "no WAHA credentials resolved",
-             f"set WAHA_WHATSAPP_API_KEY (and/or WAHA_DASHBOARD_USERNAME + "
-             f"WAHA_DASHBOARD_PASSWORD) in {CREDS_PATH} or the project .env")
+        return None, {
+            "exit": 2, "code": "missing_secret",
+            "message": f"connection {cid!r}: no credentials resolved",
+            "hint": f"set the env var named by secret_env "
+                    f"({secret_env or 'unset'}) in the project .env(.local), "
+                    f"{CREDENTIALS_ENV}, or the environment"}
+    allow_write = bool(entry.get("allow_write", WRITE_DEFAULT))
+    # Capability-local message store: the entry's `messages_dir`, else
+    # <envelope dir>/messages. Relative paths resolve against the envelope dir.
+    envdir = _env_dir()
+    config_dir = envdir if envdir is not None else None
+    md = entry.get("messages_dir")
+    if md and config_dir is not None:
+        md_path = Path(md).expanduser()
+        messages_dir = str(md_path if md_path.is_absolute() else (config_dir / md_path))
+    elif md:
+        messages_dir = str(Path(md).expanduser())
+    elif config_dir is not None:
+        messages_dir = str(config_dir / "messages")
+    else:
+        messages_dir = None
     return {
         "api_key": api_key,
         "username": username,
         "password": password,
         "base_url": base_url.rstrip("/"),
-        "session": requested_session or DEFAULT_SESSION,
-        "mode": "read",
-        "profile": None,
-        "number": None,
-        "expected_engine": "GOWS",
-        "expected_tier": None,
-        "config_dir": None,
-        "messages_dir": None,
-    }
+        "session": session_flag or entry.get("session") or DEFAULT_SESSION,
+        "allow_write": allow_write,
+        "mode": "send" if allow_write else "read",
+        "profile": cid,
+        "number": entry.get("number"),
+        "expected_engine": entry.get("engine") or "GOWS",
+        "expected_tier": entry.get("tier"),
+        "config_dir": str(config_dir) if config_dir is not None else None,
+        "messages_dir": messages_dir,
+    }, None
+
+
+def get_config(args=None):
+    """Resolve the active connection into the config dict cmd_* code consumes.
+    Selects through the standard registry (.capabilities/whatsapp/connections.json,
+    else the user config home); with no registry the implicit `default` connection
+    resolves from single-instance env (WAHA_BASE_URL / WAHA_WHATSAPP_API_KEY)."""
+    requested_session = getattr(args, "session", None)
+    requested_conn = getattr(args, "connection", None)
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, requested_conn)
+    cfg, problem = _build_cfg(cid, entry, requested_session)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"], problem.get("hint"))
+    return cfg
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_env_key(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        for field in ("base_url", "session", "number", "engine", "tier", "messages_dir"):
+            value = entry.get(field)
+            keys.append(_key_report(
+                field, False, field == "base_url",
+                str(value) if value is not None else None,
+                "connection", reg_path))
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys.append(_key_report(secret_env, True, True, value, tier, source))
+        else:
+            keys.append(_key_report("secret_env", False, True, None, None, None))
+        for fld, env_key in (("dashboard_user_env", entry.get("dashboard_user_env")),
+                             ("dashboard_pass_env", entry.get("dashboard_pass_env"))):
+            if env_key:
+                value, tier, source = _resolve_env_key(env_key)
+                keys.append(_key_report(env_key, fld.endswith("pass_env"),
+                                        False, value, tier, source))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
 
 
 def _auth_headers(config) -> dict:
@@ -1258,7 +1390,7 @@ def cmd_export(args):
 
     # Output path: explicit --out wins; otherwise default to the capability-local
     # store from config — <messages_dir>/<slug>/messages.json (relocate by setting
-    # messages_dir in whatsapp.json).
+    # messages_dir on the connection in connections.json).
     if args.out:
         out = Path(args.out).expanduser().resolve()
     elif config.get("messages_dir"):
@@ -1267,7 +1399,7 @@ def cmd_export(args):
     else:
         _die(6, "no_output_path",
              "no --out given and no messages_dir resolved",
-             "pass --out PATH, or add a whatsapp.json profile so the default store applies")
+             "pass --out PATH, or declare a connection in connections.json so the default store applies")
     out.parent.mkdir(parents=True, exist_ok=True)
 
     media_dir = (Path(args.media_dir).expanduser().resolve()
@@ -1697,36 +1829,25 @@ def cmd_render(args):
 # ── Send (planned) ───────────────────────────────────────────────────────────
 
 
-def _require_send(config):
-    """Gate for write operations. Reads run from any profile; only a profile
-    with mode == 'send' may transmit. This keeps a read identity structurally
-    incapable of sending, even once send lands."""
-    if config.get("mode") != "send":
-        _die(6, "send_not_allowed",
-             f"profile '{config.get('profile') or '(env)'}' is mode "
-             f"'{config.get('mode')}', not 'send'",
-             "only a mode:'send' profile may transmit")
-
-
 def cmd_send(args):
     # ── PLACEHOLDER — NOT IMPLEMENTED ────────────────────────────────────────
     # Sending is intentionally absent. This stub marks where outbound messaging
-    # will live once the agent has its own WhatsApp identity: a send-capable
-    # profile (mode: "send") on its own WAHA session/instance.
+    # will live once the agent has its own WhatsApp identity: a write-enabled
+    # connection (allow_write: true) on its own WAHA session/instance.
     #
     # When implemented, this must:
-    #   • build config via get_config(args) and pass _require_send(config), so
-    #     only a mode:"send" profile can ever transmit;
+    #   • build config via get_config(args); the standard write gate in main()
+    #     already refuses send on a read-only connection (allow_write: false)
+    #     before any credential resolves;
     #   • POST /api/sendText (and /api/sendImage, …) on WAHA — text sends on
     #     WAHA Core; sending media requires WAHA Plus;
     #   • carry a human-in-the-loop confirmation for outbound to real people,
     #     the same gate used elsewhere for messages sent on someone's behalf.
-    config = get_config(args)
-    _require_send(config)  # enforce the gate even while the body is a stub
+    get_config(args)
     _die(6, "not_implemented",
          "`whatsapp send` is not implemented yet — planned (the agent's own "
-         "send-capable WhatsApp identity)",
-         "reads run from any profile; sending awaits a mode:'send' profile")
+         "write-enabled WhatsApp connection)",
+         "reads run from any connection; sending awaits an allow_write connection")
 
 
 # ── Pair / onboard (session-linking ceremony) ────────────────────────────────
@@ -1740,7 +1861,7 @@ def _normalize_number(raw):
         _die(6, "bad_number",
              f"phone number must be 7-15 digits incl. country code, got {raw!r}",
              "pass --number with the full international number (e.g. 15551234567), "
-             "or set `number` on the profile in whatsapp.json")
+             "or set `number` on the connection in connections.json")
     return digits
 
 
@@ -1776,7 +1897,7 @@ def _poll_session(config, want, timeout_s):
 def cmd_pair(args):
     """Onboard / link a session via the GOWS phone-number pairing code: pass a
     number, get an XXXX-XXXX code to enter in WhatsApp (Linked Devices) — no QR.
-    Connection-level, available to any profile (you link before you can read)."""
+    Connection-level, available to any connection (you link before you can read)."""
     config = get_config(args)
     session = config["session"]
     expected_engine = config.get("expected_engine") or "GOWS"
@@ -1887,14 +2008,14 @@ def main():
         description="WAHA WhatsApp API client — read chats, messages, and export history.",
     )
     parser.add_argument(
-        "--profile", "-p",
-        help="whatsapp.json profile (default: $WHATSAPP_PROFILE, the config's "
-             "\"default\" key, or the lone profile)",
+        "--connection", "-c", dest="connection", default=None,
+        help="connection id (default: the registry's \"default\" pointer, "
+             "the sole connection, else the implicit `default`)",
     )
     parser.add_argument(
         "--session", default=None,
-        help="Override the profile's WAHA session name (default: the profile's, "
-             "else 'default')",
+        help="Override the connection's WAHA session name (default: the "
+             "connection's, else 'default')",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1906,7 +2027,7 @@ def main():
 
     pp = sub.add_parser("pair", help="Onboard / link a session via phone-number pairing code")
     pp.add_argument("--number", help="WhatsApp number incl. country code (default: the "
-                    "profile's `number`). Digits; `+`/spaces stripped.")
+                    "connection's `number`). Digits; `+`/spaces stripped.")
     pp.add_argument("--qr", action="store_true",
                     help="Return the QR value instead of requesting a pairing code")
     pp.add_argument("--wait", action="store_true",
@@ -1968,11 +2089,21 @@ def main():
 
     psend = sub.add_parser(
         "send",
-        help="[planned, not implemented] Send a message (send-capable profiles only)")
+        help="[planned, not implemented] Send a message (write-enabled connections only)")
     psend.add_argument("chat_id", nargs="?", help="Recipient chat ID")
     psend.add_argument("text", nargs="?", help="Message text")
 
     args = parser.parse_args()
+
+    # The standard write gate: a write verb refuses on a read-only connection,
+    # after selection, before any credential resolves. Resolving the selected
+    # connection's allow_write costs no network and no secret — it reads the
+    # committed registry alone (the implicit default falls to WRITE_DEFAULT).
+    if args.command in WRITE_VERBS:
+        reg, _ = _connections_registry()
+        cid, entry = _select_connection(reg, args.connection)
+        allow_write = bool((entry or {}).get("allow_write", WRITE_DEFAULT))
+        _write_gate(cid, allow_write, args.command)
 
     result = {
         "help": cmd_help,
