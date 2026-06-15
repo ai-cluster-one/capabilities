@@ -136,8 +136,9 @@ Everything the capability reads and writes in a consuming project lives under `.
   settings.json       # capability-owned, free shape: connection-independent project config
   connections.json    # the connections registry — standard envelope (see Connections)
   identifiers.json    # the identifiers envelope, managed by the ids verbs
+  reference/          # the single home for references — one front-matter .md per topic
+    *.md              # front-matter envelope + free prose, surfaced by `<name> refs`
   state/              # capability-written; never committed
-  *.md                # references: front-matter envelope + free prose
 ```
 
 (`.capabilities/settings.json` — one level up — is the manager-owned gate; the script only ever reads it.)
@@ -155,7 +156,7 @@ Everything the capability reads and writes in a consuming project lives under `.
 
   Settings vs identifiers is a **provenance split**: settings hold values someone *chose*; identifiers hold values the CLI *discovered*. Different writer, different cadence, different git-diff meaning — never merged.
 
-- **References** — prose by nature (a model, a treatment, a taxonomy); the envelope is standardized, the content free:
+- **References** — prose by nature (a model, a treatment, a taxonomy); the envelope is standardized, the content free. Each is its own `.md` under `.capabilities/<name>/reference/` — the single home for references, kept apart from the JSON config files. Drop a file in with the front-matter below and the context build picks it up; no index to maintain:
 
   ```markdown
   ---
@@ -164,7 +165,7 @@ Everything the capability reads and writes in a consuming project lives under `.
   ---
   ```
 
-  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading **front-matter only**, never the bodies.
+  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading **front-matter only** from `.capabilities/<name>/reference/*.md`, never the bodies. References elsewhere in the envelope (loose `.md` beside the JSON files) are not read.
 
 The `ids` verbs manage the identifiers envelope:
 

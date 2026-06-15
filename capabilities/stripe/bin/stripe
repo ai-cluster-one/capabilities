@@ -351,9 +351,10 @@ def _cmd_ids(argv: list[str]) -> None:
 
 def _cmd_refs() -> None:
     envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
     out = []
-    if envdir and envdir.is_dir():
-        for md in sorted(envdir.glob("*.md")):
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
             name = desc = None
             try:
                 lines = md.read_text().splitlines()

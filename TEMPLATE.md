@@ -46,7 +46,7 @@ The project-meta cell is empty on purpose: authoring guidance never varies by pr
 | Settings | `.capabilities/<name>/settings.json` — capability-owned, free shape | project | the non-secret, connection-independent values someone **chose**: behavioural defaults, tuning |
 | Connections | `.capabilities/<name>/connections.json` — standard envelope (`default` pointer + `connections` map), entry interior capability-owned | project | the project's named endpoints and identities: per-connection non-secret wiring, secrets by env-key indirection (`secret_env`), the write gate (`allow_write`) |
 | Identifiers | `.capabilities/<name>/identifiers.json` — CLI-managed envelope, written by `<name> ids set` and rendered by `capabilities ids <name>` | project | the non-secret structural values the CLI **discovered**: ids, labels, classifications, breadcrumbs |
-| References | `.capabilities/<name>/*.md` — front-matter envelope + free prose, surfaced by `<name> refs` | project | the project-specific operational **model**: mappings, treatments, what output means here |
+| References | `.capabilities/<name>/reference/*.md` — front-matter envelope + free prose, surfaced by `<name> refs` | project | the project-specific operational **model**: mappings, treatments, what output means here |
 | State | `.capabilities/<name>/state/` or `$XDG_STATE_HOME/<name>/`, per declared scope | project / user | what credentials mint: sessions, caches, pending logins. Never committed (DOCTRINE rule 16) |
 | Deviations *(opt)* | `deviations.md` beside the script upstream | capability | recorded, justified departures from the standard, kept apart so an audit reads them as choices |
 
@@ -77,7 +77,7 @@ Settings and connections vs identifiers is a provenance split — different writ
 
 ## References: the envelope and growth
 
-A reference is a markdown file in the capability's project folder, carrying a two-key front-matter envelope:
+A reference is a markdown file in the capability's `reference/` folder (`.capabilities/<name>/reference/` — the single home for references, kept apart from the JSON config files), carrying a two-key front-matter envelope:
 
 ```markdown
 ---

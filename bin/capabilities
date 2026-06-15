@@ -659,13 +659,14 @@ def _compose_context(root: Path) -> str:
             bullet.append(f"- Identifiers file present but not a JSON object — "
                           f"fix .capabilities/{name}/identifiers.json")
         refs = []
-        if envdir.is_dir():
-            for md in sorted(envdir.glob("*.md")):
+        refdir = envdir / "reference"
+        if refdir.is_dir():
+            for md in sorted(refdir.glob("*.md")):
                 fm = _front_matter(md)
                 if fm.get("name"):
                     refs.append(f"{fm['name']} — {fm.get('description', '')}".rstrip(" —"))
         if refs:
-            bullet.append(f"- References (`.capabilities/{name}/`): " + "; ".join(refs))
+            bullet.append(f"- References (`.capabilities/{name}/reference/`): " + "; ".join(refs))
         topics = ((manifest or {}).get("docs") or {}).get("topics") or []
         if topics:
             bullet.append(f"- Guides (`{name} guide <topic>`): " + ", ".join(sorted(topics)))
@@ -1107,13 +1108,21 @@ def _audit_script(name: str, script: Path) -> list[str]:
                     {"capabilities": {name: {"enabled": True}}})
         genv = dict(env)
         genv["CLAUDE_PROJECT_DIR"] = str(sandbox)
+        refdir = capdir / name / "reference"
+        refdir.mkdir(parents=True, exist_ok=True)
+        (refdir / "audit-probe.md").write_text(
+            "---\nname: audit-probe\ndescription: audit probe reference\n---\n\nbody\n")
         rc, out, errs = _run_script(script, ["refs"], cwd=sandbox, env=genv)
         if rc != 0:
             failures.append(f"refs: exit {rc}")
         else:
             try:
-                if not isinstance(json.loads(out), list):
+                arr = json.loads(out)
+                if not isinstance(arr, list):
                     failures.append("refs: output is not a JSON array")
+                elif not any((r or {}).get("name") == "audit-probe" for r in arr):
+                    failures.append(
+                        "refs: a reference in .capabilities/<name>/reference/ is not surfaced")
             except ValueError:
                 failures.append("refs: not JSON")
         rc, out, errs = _run_script(script, ["ids", "list"], cwd=sandbox, env=genv)
