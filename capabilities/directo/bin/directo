@@ -214,10 +214,35 @@ class AuthError(click.ClickException):
     pass
 
 
-# ─── Config cascade (flags > project .env > user config > process env) ───────
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
-def _parse_env_file(path: Path) -> dict[str, str]:
-    out: dict[str, str] = {}
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
     try:
         text = path.read_text()
     except OSError:
@@ -250,7 +275,7 @@ def _project_root() -> Path | None:
     return None
 
 
-def _project_env() -> dict[str, str]:
+def _project_env() -> dict:
     """Project .env(.local) at the project root. .env.local overrides .env."""
     root = _project_root()
     if root is None:
@@ -259,262 +284,6 @@ def _project_env() -> dict[str, str]:
     merged.update(_parse_env_file(root / ".env.local"))  # .local wins
     return merged
 
-
-def _materialize_cfg(cid: str, entry: dict | None,
-                     overrides: dict[str, str] | None) -> dict[str, str]:
-    """First non-empty wins per key. The implicit default: flag > minted session
-    (session keys) > project .env(.local) > user config > process env. A named
-    entry: flag > minted session > entry literals (db/koht) > the entry's named
-    env keys (username/password via username_env/password_env, cascade tiers
-    2-4) — the bare DIRECTO_* cascade does not bleed in; the registry is
-    authoritative. The per-connection session file is the live session's one
-    home in both shapes."""
-    overrides = {k: v for k, v in (overrides or {}).items() if v}
-    session = _parse_env_file(_session_file(cid))
-    out: dict[str, str] = {}
-    if entry is None:
-        project = _project_env()
-        user = _parse_env_file(CREDENTIALS_ENV)
-        for key in CASCADE_KEYS:
-            minted = session.get(key) if key in SESSION_KEYS else None
-            out[key] = (overrides.get(key)
-                        or minted
-                        or project.get(key)
-                        or user.get(key)
-                        or os.environ.get(key)
-                        or "")
-        return out
-    named = {
-        "DIRECTO_USERNAME": (_resolve_env_key(entry["username_env"])[0]
-                             if entry.get("username_env") else None),
-        "DIRECTO_PASSWORD": (_resolve_env_key(entry["password_env"])[0]
-                             if entry.get("password_env") else None),
-        "DIRECTO_DB": entry.get("db"),
-        "DIRECTO_KOHT": entry.get("koht"),
-    }
-    for key in CASCADE_KEYS:
-        minted = session.get(key) if key in SESSION_KEYS else None
-        out[key] = overrides.get(key) or minted or named.get(key) or ""
-    return out
-
-
-def resolve_config(overrides: dict[str, str] | None = None) -> dict[str, str]:
-    """The active connection's config: select → gate → resolve. Selection is
-    memoized (`_connection()`); the write gate is structural here — WRITE_VERBS
-    is empty — but keeps the protocol's dispatch order."""
-    cid, entry = _connection()
-    return _materialize_cfg(cid, entry, overrides)
-
-
-def _build_cfg(cid: str, entry: dict | None,
-               overrides: dict[str, str] | None) -> tuple[dict | None, dict | None]:
-    """Materialize one connection's config. Returns (cfg, problem) — problem is
-    an error dict ({"exit", "code", "message", "hint"?}) instead of a die, so
-    doctor can report every connection rather than stopping at the first.
-    Missing username/password is not an immediate problem (the persisted cookie
-    may still be live); they ride along as empty strings and the login path
-    names what's missing."""
-    cfg = _materialize_cfg(cid, entry, overrides)
-    if not cfg["DIRECTO_DB"]:
-        if entry is None:
-            hint = (f"set DIRECTO_DB in the project .env(.local), "
-                    f"{CREDENTIALS_ENV}, or the environment — or declare a "
-                    f"connections registry (.capabilities/{NAME}/connections.json)")
-        else:
-            hint = f'set "db" on connection {cid!r} in connections.json'
-        return None, {"exit": 6, "code": "missing_db",
-                      "message": f"connection {cid!r} resolves no DIRECTO_DB",
-                      "hint": hint}
-    return cfg, None
-
-
-def _session_file(cid: str) -> Path:
-    """The live session's one home — keyed per connection, in the state dir
-    for the declared scope."""
-    return _state_dir() / cid / "session.env"
-
-
-def _persist_session(cid: str, cookie_str: str, koht: str) -> None:
-    """Write the live session to the state home (keyed per connection) —
-    credentials.env is human-written only and never receives a minted value."""
-    sf = _session_file(cid)
-    sf.parent.mkdir(parents=True, exist_ok=True)
-    sf.write_text(
-        "# directo live session — written by `directo login`. Never commit.\n"
-        f"DIRECTO_COOKIE='{cookie_str}'\n"
-        f"DIRECTO_KOHT='{koht}'\n")
-    os.chmod(sf, 0o600)
-
-
-# ─── Connections ─────────────────────────────────────────────────────────────
-
-def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
-    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
-    user credentials.env → process env. Returns (value, tier, source)."""
-    root = _project_root()
-    if root is not None:
-        for fname in (".env.local", ".env"):
-            val = _parse_env_file(root / fname).get(key)
-            if val:
-                return val, "project", root / fname
-    val = _parse_env_file(CREDENTIALS_ENV).get(key)
-    if val:
-        return val, "user", CREDENTIALS_ENV
-    val = os.environ.get(key)
-    if val:
-        return val, "env", None
-    return None, None, None
-
-
-def _mask(value: str) -> str:
-    return ("…" + value[-4:]) if len(value) >= 8 else "****"
-
-
-def _connections_registry() -> tuple[dict | None, Path | None]:
-    """The connections envelope and its path: project envelope first, else the
-    user config home. First found wins, never merged; (None, None) when neither
-    declares one (the implicit default connection applies)."""
-    envdir = _env_dir()
-    candidates = ([envdir / "connections.json"] if envdir else []) + \
-                 [_CONFIG_HOME / NAME / "connections.json"]
-    for reg_file in candidates:
-        if not reg_file.is_file():
-            continue
-        try:
-            raw = json.loads(reg_file.read_text())
-        except (ValueError, OSError) as e:
-            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
-        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
-                or not raw["connections"]:
-            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
-                 'expected {"default": "<id>", "connections": { ... }}')
-        return raw, reg_file
-    return None, None
-
-
-def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
-    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
-    if reg is None:
-        if wanted and wanted != "default":
-            _die(6, "unknown_connection",
-                 "no connections registry; the sole connection is 'default'",
-                 "the implicit default resolves from the credential cascade")
-        return "default", None
-    conns = reg["connections"]
-    if wanted:
-        if wanted in conns:
-            return wanted, conns[wanted]
-        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
-             f"known: {', '.join(conns)}")
-    default = reg.get("default")
-    if default:
-        if default not in conns:
-            _die(6, "bad_default", f"default points to unknown connection {default!r}",
-                 f"known: {', '.join(conns)}")
-        return default, conns[default]
-    if len(conns) == 1:
-        cid = next(iter(conns))
-        return cid, conns[cid]
-    _die(6, "ambiguous_connection",
-         f"registry defines {len(conns)} connections and no default; "
-         f"pass --connection <id>",
-         f"known: {', '.join(conns)}")
-
-
-def _connection() -> tuple[str, dict | None]:
-    """Resolve the active connection once: select → write-gate → memoize.
-    Lazy — first called when config is needed, so `help` works even with a
-    broken or ambiguous registry."""
-    global _SELECTED
-    if _SELECTED is None:
-        reg, _ = _connections_registry()
-        cid, entry = _select_connection(reg, _WANTED_CONN)
-        allow_write = WRITE_DEFAULT if entry is None else \
-            bool(entry.get("allow_write", WRITE_DEFAULT))
-        _write_gate(cid, allow_write, _ACTIVE_VERB)
-        _SELECTED = (cid, entry)
-    return _SELECTED
-
-
-def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
-    """Policy from the committed registry; nothing in the cascade lifts it."""
-    if verb in WRITE_VERBS and not allow_write:
-        _die(4, "read_only",
-             f"connection {conn_id!r} does not allow writes",
-             "Do not lift the gate yourself — ask the user; granting is "
-             "`allow_write: true` on this connection in connections.json.")
-
-
-def _key_report(key: str, secret: bool, required: bool,
-                value: str | None, tier: str | None, source) -> dict:
-    return {"key": key, "secret": secret, "required": required,
-            "set": bool(value), "tier": tier if value else None,
-            "source": str(source) if (value and source) else None,
-            "value": (_mask(value) if secret else value) if value else None}
-
-
-def _cmd_connections() -> None:
-    """The resolution report — every connection, every value, its winning tier
-    and source, secrets masked. Local only: no network, no login attempt, no
-    session-file reads (the report covers configuration tiers, not minted
-    state — readiness stays doctor's question)."""
-    reg, reg_path = _connections_registry()
-    report: dict = {"default": None, "connections": {}}
-    if reg is None:
-        keys = []
-        for k in CRED_KEYS:
-            value, tier, source = _resolve_env_key(k["key"])
-            keys.append(_key_report(k["key"], k["secret"], k["required"],
-                                    value, tier, source))
-        report["default"] = "default"
-        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
-        _emit(report)
-        return
-    conns = reg["connections"]
-    report["default"] = reg.get("default") or \
-        (next(iter(conns)) if len(conns) == 1 else None)
-    for cid, entry in conns.items():
-        entry = entry if isinstance(entry, dict) else {}
-        keys = []
-        for field, required in (("db", True), ("koht", False)):
-            value = entry.get(field)
-            keys.append(_key_report(field, False, required,
-                                    str(value) if value is not None else None,
-                                    "connection", reg_path))
-        for field in ("username_env", "password_env"):
-            env_key = entry.get(field)
-            if env_key:
-                value, tier, source = _resolve_env_key(env_key)
-                keys.append(_key_report(env_key, True, True, value, tier, source))
-            else:
-                keys.append(_key_report(field, False, True, None, None, None))
-        report["connections"][cid] = {
-            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "keys": keys}
-    _emit(report)
-
-
-# ─── I/O contract (contract verbs; domain verbs are click-based) ─────────────
-
-def _emit(value) -> None:
-    if isinstance(value, str):
-        sys.stdout.write(value if value.endswith("\n") else value + "\n")
-    else:
-        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-
-
-def _die(exit_code: int, code: str, message: str, hint: str | None = None,
-         status: int | None = None):
-    err: dict = {"code": code, "message": message}
-    if hint:
-        err["hint"] = hint
-    if status is not None:
-        err["status"] = status
-    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
-    sys.exit(exit_code)
-
-
-# --- Capability contract (protocol 2) — shared verbatim across capabilities --
 
 def _gate() -> None:
     """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
@@ -538,17 +307,6 @@ def _env_dir() -> Path | None:
     return (root / ".capabilities" / NAME) if root is not None else None
 
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where .capabilities/ already exists."""
@@ -558,6 +316,8 @@ def _state_dir() -> Path:
             return root / ".capabilities" / NAME / "state"
     return _STATE_HOME / NAME
 
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -696,6 +456,266 @@ def _contract(argv: list[str]) -> None:
     else:
         return
     sys.exit(0)
+
+# <<< contract: capability core <<<
+
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+# <<< contract: connections <<<
+
+
+# ─── Config cascade (flags > project .env > user config > process env) ───────
+
+def _materialize_cfg(cid: str, entry: dict | None,
+                     overrides: dict[str, str] | None) -> dict[str, str]:
+    """First non-empty wins per key. The implicit default: flag > minted session
+    (session keys) > project .env(.local) > user config > process env. A named
+    entry: flag > minted session > entry literals (db/koht) > the entry's named
+    env keys (username/password via username_env/password_env, cascade tiers
+    2-4) — the bare DIRECTO_* cascade does not bleed in; the registry is
+    authoritative. The per-connection session file is the live session's one
+    home in both shapes."""
+    overrides = {k: v for k, v in (overrides or {}).items() if v}
+    session = _parse_env_file(_session_file(cid))
+    out: dict[str, str] = {}
+    if entry is None:
+        project = _project_env()
+        user = _parse_env_file(CREDENTIALS_ENV)
+        for key in CASCADE_KEYS:
+            minted = session.get(key) if key in SESSION_KEYS else None
+            out[key] = (overrides.get(key)
+                        or minted
+                        or project.get(key)
+                        or user.get(key)
+                        or os.environ.get(key)
+                        or "")
+        return out
+    named = {
+        "DIRECTO_USERNAME": (_resolve_env_key(entry["username_env"])[0]
+                             if entry.get("username_env") else None),
+        "DIRECTO_PASSWORD": (_resolve_env_key(entry["password_env"])[0]
+                             if entry.get("password_env") else None),
+        "DIRECTO_DB": entry.get("db"),
+        "DIRECTO_KOHT": entry.get("koht"),
+    }
+    for key in CASCADE_KEYS:
+        minted = session.get(key) if key in SESSION_KEYS else None
+        out[key] = overrides.get(key) or minted or named.get(key) or ""
+    return out
+
+
+def resolve_config(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """The active connection's config: select → gate → resolve. Selection is
+    memoized (`_connection()`); the write gate is structural here — WRITE_VERBS
+    is empty — but keeps the protocol's dispatch order."""
+    cid, entry = _connection()
+    return _materialize_cfg(cid, entry, overrides)
+
+
+def _build_cfg(cid: str, entry: dict | None,
+               overrides: dict[str, str] | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection's config. Returns (cfg, problem) — problem is
+    an error dict ({"exit", "code", "message", "hint"?}) instead of a die, so
+    doctor can report every connection rather than stopping at the first.
+    Missing username/password is not an immediate problem (the persisted cookie
+    may still be live); they ride along as empty strings and the login path
+    names what's missing."""
+    cfg = _materialize_cfg(cid, entry, overrides)
+    if not cfg["DIRECTO_DB"]:
+        if entry is None:
+            hint = (f"set DIRECTO_DB in the project .env(.local), "
+                    f"{CREDENTIALS_ENV}, or the environment — or declare a "
+                    f"connections registry (.capabilities/{NAME}/connections.json)")
+        else:
+            hint = f'set "db" on connection {cid!r} in connections.json'
+        return None, {"exit": 6, "code": "missing_db",
+                      "message": f"connection {cid!r} resolves no DIRECTO_DB",
+                      "hint": hint}
+    return cfg, None
+
+
+def _session_file(cid: str) -> Path:
+    """The live session's one home — keyed per connection, in the state dir
+    for the declared scope."""
+    return _state_dir() / cid / "session.env"
+
+
+def _persist_session(cid: str, cookie_str: str, koht: str) -> None:
+    """Write the live session to the state home (keyed per connection) —
+    credentials.env is human-written only and never receives a minted value."""
+    sf = _session_file(cid)
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    sf.write_text(
+        "# directo live session — written by `directo login`. Never commit.\n"
+        f"DIRECTO_COOKIE='{cookie_str}'\n"
+        f"DIRECTO_KOHT='{koht}'\n")
+    os.chmod(sf, 0o600)
+
+
+# ─── Connections ─────────────────────────────────────────────────────────────
+
+def _connection() -> tuple[str, dict | None]:
+    """Resolve the active connection once: select → write-gate → memoize.
+    Lazy — first called when config is needed, so `help` works even with a
+    broken or ambiguous registry."""
+    global _SELECTED
+    if _SELECTED is None:
+        reg, _ = _connections_registry()
+        cid, entry = _select_connection(reg, _WANTED_CONN)
+        allow_write = WRITE_DEFAULT if entry is None else \
+            bool(entry.get("allow_write", WRITE_DEFAULT))
+        _write_gate(cid, allow_write, _ACTIVE_VERB)
+        _SELECTED = (cid, entry)
+    return _SELECTED
+
+
+def _cmd_connections() -> None:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt, no
+    session-file reads (the report covers configuration tiers, not minted
+    state — readiness stays doctor's question)."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_env_key(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        for field, required in (("db", True), ("koht", False)):
+            value = entry.get(field)
+            keys.append(_key_report(field, False, required,
+                                    str(value) if value is not None else None,
+                                    "connection", reg_path))
+        for field in ("username_env", "password_env"):
+            env_key = entry.get(field)
+            if env_key:
+                value, tier, source = _resolve_env_key(env_key)
+                keys.append(_key_report(env_key, True, True, value, tier, source))
+            else:
+                keys.append(_key_report(field, False, True, None, None, None))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
+
+
+# ─── Project settings (capability-owned, non-secret project config) ──────────
+
+def _project_settings() -> dict:
+    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
+    envdir = _env_dir()
+    if envdir is None:
+        return {}
+    try:
+        return json.loads((envdir / "settings.json").read_text())
+    except (OSError, ValueError):
+        return {}
 
 
 # ─── URLs ────────────────────────────────────────────────────────────────────

@@ -135,7 +135,7 @@ NOTION_VERSION = "2026-03-11"
 TIMEOUT = httpx.Timeout(30.0)
 MAX_RETRIES = 3
 
-# --- Capability declaration (protocol 1) — one home for every contract fact --
+# --- Capability declaration (protocol 2) — one home for every contract fact --
 
 NAME = "notion"
 PROTOCOL = 2
@@ -164,6 +164,8 @@ UUID_PLAIN = re.compile(r"[0-9a-f]{32}")
 H1_RE = re.compile(r"\A(?:[ \t]*\n)*[ \t]*#[ \t]+([^\n]+?)[ \t]*(?:\n|\Z)")
 
 
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
 # --- Error reporting ---------------------------------------------------------
 
 def _die(exit_code: int, code: str, message: str,
@@ -177,7 +179,16 @@ def _die(exit_code: int, code: str, message: str,
     sys.exit(exit_code)
 
 
-# --- Credentials -------------------------------------------------------------
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
 
 def _parse_env_file(path: Path) -> dict:
     """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
@@ -224,8 +235,6 @@ def _project_env() -> dict:
     return merged
 
 
-# --- Capability contract (protocol 1) — shared verbatim across capabilities --
-
 def _gate() -> None:
     """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
     root = _project_root()
@@ -248,17 +257,6 @@ def _env_dir() -> Path | None:
     return (root / ".capabilities" / NAME) if root is not None else None
 
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where .capabilities/ already exists."""
@@ -268,6 +266,8 @@ def _state_dir() -> Path:
             return root / ".capabilities" / NAME / "state"
     return _STATE_HOME / NAME
 
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -407,6 +407,23 @@ def _contract(argv: list[str]) -> None:
         return
     sys.exit(0)
 
+# <<< contract: capability core <<<
+
+
+# --- Capability-specific project config --------------------------------------
+
+def _project_settings() -> dict:
+    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
+    envdir = _env_dir()
+    if envdir is None:
+        return {}
+    try:
+        return json.loads((envdir / "settings.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+# --- Credentials -------------------------------------------------------------
 
 def _load_token(key: str = "NOTION_TOKEN") -> str:
     """Resolve a PAT by env-var NAME through the credential cascade — a project
@@ -430,7 +447,7 @@ def _load_token(key: str = "NOTION_TOKEN") -> str:
          f"add {key}=<PAT> to the user config or a project .env to use --token-env {key}")
 
 
-# --- Connections ---------------------------------------------------------------
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
 def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
     """Resolve one env key through cascade tiers 2-4: project .env(.local) →
@@ -477,7 +494,9 @@ def _connections_registry() -> tuple[dict | None, Path | None]:
 
 
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
-    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
     if reg is None:
         if wanted and wanted != "default":
             _die(6, "unknown_connection",
@@ -488,6 +507,9 @@ def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict 
     if wanted:
         if wanted in conns:
             return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
         _die(6, "unknown_connection", f"no connection matches {wanted!r}",
              f"known: {', '.join(conns)}")
     default = reg.get("default")
@@ -521,6 +543,10 @@ def _key_report(key: str, secret: bool, required: bool,
             "source": str(source) if (value and source) else None,
             "value": (_mask(value) if secret else value) if value else None}
 
+# <<< contract: connections <<<
+
+
+# --- Connections (capability-specific) ---------------------------------------
 
 def _cmd_connections() -> None:
     """The resolution report — every connection, every value, its winning tier
@@ -893,15 +919,6 @@ def cmd_upsert(c: httpx.Client, parent: str,
 
 
 # --- CLI ---------------------------------------------------------------------
-
-def _emit(value) -> None:
-    if isinstance(value, str):
-        sys.stdout.write(value)
-        if value and not value.endswith("\n"):
-            sys.stdout.write("\n")
-    else:
-        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-
 
 def main() -> None:
     _gate()                      # every verb passes the project gate first

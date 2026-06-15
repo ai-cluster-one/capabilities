@@ -238,7 +238,7 @@ DEFAULT_API_URL = "https://api.callva.one/api/v1"
 TIMEOUT = httpx.Timeout(60.0)
 MAX_RETRIES = 3
 
-# --- Capability declaration (protocol 1) — one home for every contract fact --
+# --- Capability declaration (protocol 2) — one home for every contract fact --
 
 NAME = "callva"
 PROTOCOL = 2
@@ -287,10 +287,31 @@ FULL = False
 _STATE: dict = {}
 
 
-# ---------------------------------------------------------------------------
-# Credential cascade  (flags > project .env(.local) > user config > process env)
-# ---------------------------------------------------------------------------
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
 
 def _parse_env_file(path: Path) -> dict:
     """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
@@ -337,8 +358,6 @@ def _project_env() -> dict:
     return merged
 
 
-# --- Capability contract (protocol 1) — shared verbatim across capabilities --
-
 def _gate() -> None:
     """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
     root = _project_root()
@@ -370,6 +389,8 @@ def _state_dir() -> Path:
             return root / ".capabilities" / NAME / "state"
     return _STATE_HOME / NAME
 
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -509,11 +530,10 @@ def _contract(argv: list[str]) -> None:
         return
     sys.exit(0)
 
+# <<< contract: capability core <<<
 
-# ---------------------------------------------------------------------------
-# Connections  (named, complete resolutions of the credential keys)
-# ---------------------------------------------------------------------------
 
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
 def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
     """Resolve one env key through cascade tiers 2-4: project .env(.local) →
@@ -560,7 +580,9 @@ def _connections_registry() -> tuple[dict | None, Path | None]:
 
 
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
-    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
     if reg is None:
         if wanted and wanted != "default":
             _die(6, "unknown_connection",
@@ -571,6 +593,9 @@ def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict 
     if wanted:
         if wanted in conns:
             return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
         _die(6, "unknown_connection", f"no connection matches {wanted!r}",
              f"known: {', '.join(conns)}")
     default = reg.get("default")
@@ -586,6 +611,30 @@ def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict 
          f"registry defines {len(conns)} connections and no default; "
          f"pass --connection <id>",
          f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+# <<< contract: connections <<<
+
+
+# ---------------------------------------------------------------------------
+# Connections  (named, complete resolutions of the credential keys)
+# ---------------------------------------------------------------------------
 
 
 def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
@@ -624,23 +673,6 @@ def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
             "key_env": key_env, "api_key": api_key, "base": base.rstrip("/")}, None
 
 
-def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
-    """Policy from the committed registry; nothing in the cascade lifts it."""
-    if verb in WRITE_VERBS and not allow_write:
-        _die(4, "read_only",
-             f"connection {conn_id!r} does not allow writes",
-             "Do not lift the gate yourself — ask the user; granting is "
-             "`allow_write: true` on this connection in connections.json.")
-
-
-def _key_report(key: str, secret: bool, required: bool,
-                value: str | None, tier: str | None, source) -> dict:
-    return {"key": key, "secret": secret, "required": required,
-            "set": bool(value), "tier": tier if value else None,
-            "source": str(source) if (value and source) else None,
-            "value": (_mask(value) if secret else value) if value else None}
-
-
 def _cmd_connections() -> None:
     """The resolution report — every connection, every value, its winning tier
     and source, secrets masked. Local only: no network, no login attempt."""
@@ -676,31 +708,6 @@ def _cmd_connections() -> None:
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
             "keys": keys}
     _emit(report)
-
-
-# ---------------------------------------------------------------------------
-# Output / errors  (success = JSON on stdout; failure = envelope on stderr)
-# ---------------------------------------------------------------------------
-
-
-def _emit(value) -> None:
-    if isinstance(value, str):
-        sys.stdout.write(value)
-        if value and not value.endswith("\n"):
-            sys.stdout.write("\n")
-    else:
-        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-
-
-def _die(exit_code: int, code: str, message: str,
-         hint: str | None = None, status: int | None = None) -> NoReturn:
-    err: dict = {"code": code, "message": message}
-    if hint:
-        err["hint"] = hint
-    if status is not None:
-        err["status"] = status
-    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
-    sys.exit(exit_code)
 
 
 # ---------------------------------------------------------------------------
