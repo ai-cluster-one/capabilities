@@ -1,7 +1,7 @@
 # Implementation handoff — `capabilities sync-contract` (vendor the shared contract preamble)
 
 **Branch:** `main` (protocol v2 is now the primary line).
-**Status:** mechanism built + all 10 connection-bearing caps migrated and pushed. A fresh session continues from "Remaining" below.
+**Status:** mechanism built; every capability under `capabilities/` is conformed to protocol 2 — the 10 connection-bearing caps plus mail, whatsapp, and simplbooks. A fresh session continues from "Remaining" below.
 
 ## Progress (current)
 
@@ -15,7 +15,8 @@
 
 - All 10 connection-bearing caps are migrated (✓ mailbox, fathom, asana, callva, directo, notion, railwayc, stripe, telegram, windmill) and the `PROTOCOL = 2` banner fixes are done.
 - **Install + migrate in the simplbooks consumer** — separate handoff: for each connection-bearing cap the consumer uses, reinstall from this repo's protocol-2 source and migrate its envelope. (User runs this in the simplbooks project from a handoff prompt.)
-- Core-only caps (`capability core` fence alone, no connections fence): mail; simplbooks + whatsapp join after Tasks S/W per `capability-contract-standard.md`. These stay protocol 1 until their own passes bump them.
+- mail, whatsapp, and simplbooks are conformed to protocol 2 as well: mail is keyless (its connections tier reports a keyless implicit `default`); whatsapp's bespoke `whatsapp.json` profiles became the standard connections envelope (`mode` → `allow_write`, `--profile` → `--connection`); simplbooks gained the connections envelope plus a per-connection write gate (`WRITE_DEFAULT = False` over the create/update/delete/bind/unbind/send-payment/save verbs). Every capability under `capabilities/` now carries both vendored fences and audits green.
+- askproject stays a non-conformed meta-tool (no credentials, no connection concept — its target is a project path chosen per call), kin to the manager and excluded from the contract on the same grounds.
 
 ---
 
