@@ -62,6 +62,10 @@ any of its configured email addresses.
 Contract commands (the same on every capability):
   mail stub                                 One-line awareness text.
   mail manifest --json                      Machine-readable declaration.
+  mail connections                          Connection resolution report. mail
+                                            holds no credential (auth is the
+                                            macOS Automation grant), so each
+                                            connection reports an empty key set.
   mail guide [<topic>]                      Guide topics / one guide body,
                                             fetched live from the docs base.
   mail ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
@@ -92,6 +96,7 @@ import urllib.request
 from email import policy
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import NoReturn
 
 
 JXA_PRELUDE = r"""
@@ -183,15 +188,17 @@ function accountSenderString(acct) {
 """
 
 
-# --- Capability declaration (protocol 1) — one home for every contract fact --
+# --- Capability declaration (protocol 2) — one home for every contract fact --
 
 NAME = "mail"
-PROTOCOL = 1
+PROTOCOL = 2
 SUMMARY = ("Mail.app CLI over macOS Automation — read/search mail across "
            "configured accounts, show a message, save attachments, draft "
            "(never send), and export a mailbox to JSON.")
 SCOPE = "user"      # credential scope: "project" | "user"
 CRED_KEYS: list = []   # no credentials — auth is the one-time macOS Automation grant
+WRITE_VERBS: list = []  # nothing leaves the machine (drafts never send) — the write gate never fires
+WRITE_DEFAULT = True
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
 STATE = False       # True when the capability writes session/cache state
@@ -202,17 +209,12 @@ CREDENTIALS_ENV = _CONFIG_HOME / "mail" / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
 
-# --- I/O contract + shared cascade shapes -------------------------------------
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
-def _emit(value) -> None:
-    if isinstance(value, str):
-        sys.stdout.write(value if value.endswith("\n") else value + "\n")
-    else:
-        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+# --- Error reporting ---------------------------------------------------------
 
-
-def _die(exit_code: int, code: str, message: str, hint: str | None = None,
-         status: int | None = None):
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
     err: dict = {"code": code, "message": message}
     if hint:
         err["hint"] = hint
@@ -221,6 +223,17 @@ def _die(exit_code: int, code: str, message: str, hint: str | None = None,
     sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
     sys.exit(exit_code)
 
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
 
 def _parse_env_file(path: Path) -> dict:
     """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
@@ -241,7 +254,7 @@ def _parse_env_file(path: Path) -> dict:
     return out
 
 
-def _project_root():
+def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
     the first directory holding .capabilities/, .env(.local), or .git.
     $HOME is never a project root (the machine registry lives there)."""
@@ -267,8 +280,6 @@ def _project_env() -> dict:
     return merged
 
 
-# --- Capability contract (protocol 1) — shared verbatim across capabilities --
-
 def _gate() -> None:
     """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
     root = _project_root()
@@ -291,17 +302,6 @@ def _env_dir() -> Path | None:
     return (root / ".capabilities" / NAME) if root is not None else None
 
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where .capabilities/ already exists."""
@@ -311,6 +311,8 @@ def _state_dir() -> Path:
             return root / ".capabilities" / NAME / "state"
     return _STATE_HOME / NAME
 
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -406,9 +408,10 @@ def _cmd_ids(argv: list[str]) -> None:
 
 def _cmd_refs() -> None:
     envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
     out = []
-    if envdir and envdir.is_dir():
-        for md in sorted(envdir.glob("*.md")):
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
             name = desc = None
             try:
                 lines = md.read_text().splitlines()
@@ -444,9 +447,142 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
     else:
         return
     sys.exit(0)
+
+# <<< contract: capability core <<<
+
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+# <<< contract: connections <<<
+
+
+# --- Connections (capability-specific) --------------------------------------
+
+def _cmd_connections() -> None:
+    """The resolution report. mail holds no credential and reaches no remote
+    service — auth is the one-time macOS Automation grant — so a registry, if
+    present, only names connections; each reports an empty key set (CRED_KEYS is
+    empty). With no registry the sole connection is the implicit `default`.
+    Local only: no network, no Mail.app call."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = [_key_report(k["key"], k["secret"], k["required"],
+                            *_resolve_env_key(k["key"])) for k in CRED_KEYS]
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        _emit(report)
+        return
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = [_key_report(k["key"], k["secret"], k["required"],
+                            *_resolve_env_key(k["key"])) for k in CRED_KEYS]
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    _emit(report)
 
 
 def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 600):
