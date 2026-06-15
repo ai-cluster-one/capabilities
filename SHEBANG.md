@@ -528,6 +528,19 @@ A 429 honours the server's `Retry-After` header (falling back to the linear sche
 
 Every CLI has a `doctor` subcommand: the cheapest authenticated round-trip that proves the whole chain — credentials resolved, endpoint reachable, identity confirmed. It examines **every connection**: bare, it round-trips each configured connection and reports per id — `{"ok": <all healthy>, "connections": {"<id>": {…}}}` — exiting `0` only when every connection is healthy, else with the first failure's category; `doctor --connection <id>` checks one. Per connection it carries a few cheap facts (the service version, the authenticated identity, a reachability flag) and rides the same exit-code taxonomy — `0` healthy, `2` if credentials are missing or rejected, `5` if the service is unreachable. It is the first thing an agent runs against a tool, and for a stateful CLI it is also the recovery point: `doctor` detects an expired session and attempts re-authentication before reporting, so a healthy exit means *ready to work*, not merely *configured*.
 
+Credential resolution is the **first gate, and it is network-free**: before any round-trip, `doctor` resolves the connection(s) under test through the cascade — the *same* resolution [`connections`](#connections--the-resolution-report) reports — and refuses with exit `2` when any **required** key is unset, naming the remediation from the credential scope and `CRED_KEYS`. The verdict is the cascade's, read across its resolution tiers (`connection` literal, `project`, `user`, `env`) from the connection's own report rows — **never the presence of any single file**. One resolver, two consumers: `doctor`'s readiness gate and `connections`' report answer *"are the credentials here?"* through the same per-key resolution, so they cannot diverge — the failure mode where a `doctor` preflight checks one tier while the real commands resolve through all of them is structurally precluded.
+
+```python
+def _missing_required(keys: list[dict]) -> list[str]:
+    """Required report rows (from `_key_report`) that did not resolve through the
+    cascade — empty ⇒ credentials present. `doctor`'s network-free gate, derived
+    from the same per-key resolution `connections` prints, so the readiness gate
+    and the resolution report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+```
+
+Only a connection that clears this gate proceeds to the live round-trip (the per-capability authenticated probe, conventionally `_check_connection`). A capability with nothing to resolve — core-only, empty `CRED_KEYS`, carrying no `connections` fence — has no gate to clear: `doctor` proves whatever local readiness it can (a host grant, a tool on `PATH`) and stops there.
+
 `doctor` is the **readiness oracle**. The stub only announces that a tool exists, so "is it wired up *here*?" is `doctor`'s question to answer — at use-time, per context, never inferred from the stub's presence. A failing `doctor` does not just report "not configured"; it names the exact remediation, including *where* the missing config goes — derived from the declared credential scope and `CRED_KEYS`: the project `.env`, or `~/.config/<name>/credentials.env` — so an agent learns how to wire the tool up from the tool itself. A capability whose required config is global (or nil) is usable from any project the moment it is installed; one that needs project-side config is globally *aware* but only *ready* where that config exists, and `doctor` makes the difference explicit.
 
 ## Conformance and deviation

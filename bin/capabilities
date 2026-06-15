@@ -1066,6 +1066,20 @@ def _audit_script(name: str, script: Path) -> list[str]:
                 f"contract-drift: {region} differs from contract/preamble.py "
                 f"— run `capabilities sync-contract`")
 
+    # doctor gates on the shared resolution before any round-trip: a
+    # connection-bearing capability's doctor consumes _doctor_gate — the cascade
+    # verdict the `connections` report reads — so readiness is judged through one
+    # resolver, never a parallel credential check. The call lives in the
+    # capability's own code, outside the vendored fence that defines the helper.
+    if not core_only:
+        _conn = _split_region(script_text, "connections")
+        _outside = script_text.replace(_conn[1], "") if _conn else script_text
+        if "_doctor_gate(" not in _outside:
+            failures.append(
+                "doctor: no _doctor_gate(...) call in the capability's own code "
+                "— readiness must be judged through the cascade resolution, not "
+                "a parallel check")
+
     rc, out, err = _run_script(script, ["stub"])
     if rc != 0:
         failures.append(f"stub: exit {rc}")
@@ -1285,7 +1299,7 @@ def cmd_audit(name: str, from_ref: str | None) -> None:
 # check is live, not vacuous — the failure mode that let the core-only gap hide.
 _AUDIT_CHECKS = {
     "contract-drift", "stub", "manifest", "help", "gate",
-    "refs", "ids", "connections", "connections/core-only", "guide",
+    "refs", "ids", "connections", "connections/core-only", "guide", "doctor",
 }
 
 
@@ -1351,6 +1365,17 @@ def _selfcheck_negatives(canonical: dict[str, str]) -> list[str]:
         head, interior, tail = s
         return head + interior + "# injected drift\n" + tail
 
+    def break_doctor_gate(text: str):
+        """Strip the doctor's _doctor_gate call from the capability's own code,
+        leaving the vendored definition intact, so only the `doctor` check fires."""
+        s = _split_region(text, "connections")
+        if s is None:
+            return None
+        head, interior, tail = s
+        broken = head.replace("_doctor_gate(", "_ungated(") + interior + \
+            tail.replace("_doctor_gate(", "_ungated(")
+        return None if broken == text else broken
+
     cases = []
     if core:
         cases.append(("connections/core-only", core,
@@ -1359,6 +1384,7 @@ def _selfcheck_negatives(canonical: dict[str, str]) -> list[str]:
     if conn:
         cases.append(("connections", conn,
                       lambda t: _inject_before_main(t, report_unmasked)))
+        cases.append(("doctor", conn, break_doctor_gate))
 
     with tempfile.TemporaryDirectory() as td:
         for expect, (name, script), mutate in cases:
