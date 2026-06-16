@@ -1,0 +1,2159 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""
+clickup — agent-first CLI for ClickUp spaces, lists & tasks.
+
+This tool is designed to be invoked by agents. Run `clickup help` to load
+the full usage contract on demand — do not rely on memorised knowledge of
+its surface.
+
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`: CLICKUP_API_TOKEN (a ClickUp personal API token,
+  `pk_…`) resolved through the standard cascade — a project .env(.local),
+  then ~/.config/clickup/credentials.env, then the process env. Never pass
+  the token on the command line.
+
+  A project that acts as several ClickUp identities declares them in
+  <project>/.capabilities/clickup/connections.json:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "secret_env": "CLICKUP_<ID>_TOKEN", "allow_write": true }
+      }
+    }
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/clickup/connections.json; first found wins, never merged.
+
+  The entry names the env var holding its token ("secret_env"); the value
+  resolves through the cascade above. "allow_write": false makes the
+  connection read-only: every mutating verb exits 4, and no flag lifts the
+  gate. Writes default to allowed (a workspace the consumer owns).
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+Global option (accepted after any subcommand):
+  --token-env <KEY>   Act as a different identity by naming the env/cred KEY
+                      that holds the token (default CLICKUP_API_TOKEN; with a
+                      registry connection it overrides that entry's secret_env).
+                      The value never touches the command line — only the key
+                      name. Drop the alternate token in the env/credentials
+                      (e.g. CLICKUP_ALT_TOKEN=…) and pass
+                      --token-env CLICKUP_ALT_TOKEN. It never lifts a
+                      connection's write gate.
+
+THE HIERARCHY
+  ClickUp nests Workspace (the API calls it a "team") > Space > Folder > List
+  > Task > Subtask. A List is the task container (the Asana "project" analog);
+  board columns are STATUSES set on the task (there is no section object);
+  tags are space-scoped and addressed by name.
+
+Commands:
+  clickup help                                Print this document.
+  clickup connections                         Where every connection's values
+                                              resolve from (tier, source,
+                                              secrets masked). Local only.
+  clickup doctor [--connection <id>]          Health check — resolve token,
+                                              confirm identity, list
+                                              workspaces — every connection,
+                                              or one.
+
+Contract commands (the same on every capability):
+  clickup stub                                One-line awareness text.
+  clickup manifest --json                     Machine-readable declaration.
+  clickup guide [<topic>]                     Guide topics / one guide body,
+                                              fetched live from the docs base.
+  clickup ids list|get <l>|set <l> <v>|rm <l> The project identifiers envelope
+        [--note <text>]                       (.capabilities/clickup/identifiers.json).
+  clickup refs                                Menu of the project's reference
+                                              files for this capability.
+
+Read:
+  clickup whoami                              Confirm token + identity.
+  clickup workspaces                          List workspaces (teams) the token sees.
+  clickup members [--workspace ID]            List a workspace's members (id +
+                                              username + email). Defaults to the
+                                              sole workspace when only one exists.
+  clickup spaces --workspace ID               List spaces in a workspace.
+  clickup folders --space ID                  List folders in a space.
+  clickup lists [--folder ID] [--space ID]    List lists. --folder lists a
+                                              folder's lists; --space lists the
+                                              folderless lists directly under a
+                                              space (they appear ONLY here).
+  clickup statuses --list ID                  List a list's statuses — the board
+                                              columns, each with its type
+                                              (open|custom|done|closed). The
+                                              "what columns exist?" read; moving
+                                              a task between columns is `update --status`.
+  clickup tags --space ID                     List a space's tags (name + colours).
+  clickup fields --list ID                    List a list's custom fields (id +
+                                              name + type) — resolve a field's
+                                              UUID before `field-set`.
+  clickup tasks --list ID [--all] [--archived]   List tasks in a list. Incomplete
+        [--subtasks] [--status NAME ...]      only unless --all (closed statuses
+        [--limit N] [--page N]                included). --status filters to named
+                                              statuses (repeatable). --subtasks
+                                              includes subtasks. Paginates to
+                                              --limit (default 100); --page reads
+                                              a single 0-indexed page of 100.
+  clickup task <task> [--with-subtasks]       Show one task in full (status,
+        [--custom-id --workspace ID]          assignees, tags, custom_fields,
+                                              dependencies, linked_tasks, url).
+                                              --with-subtasks attaches its
+                                              subtasks. --custom-id resolves
+                                              <task> as a Custom Task ID (needs
+                                              --workspace).
+  clickup task-context <task> [--json]        One call → the task plus everything
+                                              adjacent: description (markdown),
+                                              comment thread, attachment
+                                              pointers, dependencies one level
+                                              deep (each with its own description,
+                                              thread, attachments), dependents as
+                                              state lines. Emits a prompt-ready
+                                              markdown envelope stamped with its
+                                              assembly time (UTC); --json emits
+                                              the same tree structured.
+  clickup comments <task> [--limit N]         List a task's comments (text +
+                                              date + author), the N most recent
+                                              in chronological order.
+  clickup subtasks <task>                     List a task's subtasks.
+  clickup deps <task> [--dependents]          List what <task> waits on (or, with
+                                              --dependents, what waits on it).
+  clickup attachments <task>                  List a task's attachments (id +
+                                              title + url; read from the task).
+  clickup find --workspace ID                 Resolve a task by a dedup key —
+        --field UUID --value V                 task JSON on a hit, null + exit 0 on
+        | <custom-task-id>                     a miss. Two modes: --field/--value
+                                              matches a custom field workspace-wide
+                                              (the SETTABLE external-ID key — set it
+                                              with `create --field` or `field-set`);
+                                              a bare <custom-task-id> is the ClickApp
+                                              Custom Task ID lookup (read-only —
+                                              ClickUp assigns those, the API cannot
+                                              set them). Use --field for dedup.
+  clickup field-get <task> [<field>]          Read a task's custom field values —
+                                              all, or one addressed by UUID or name.
+  clickup assigned --workspace ID             The "what's waiting on my input, and
+        [--assignee ID] [--all]               for how long?" read: tasks assigned
+        [--status NAME ...] [--limit N]       to you (or --assignee), incomplete
+                                              unless --all, stalest first — each with
+                                              its last-touch timestamp and idle age.
+
+Write:
+  clickup create --list ID --name NAME        Create a task in a list.
+        [--desc TEXT|-] [--markdown TEXT|-]    --markdown (default) stores a
+        [--assignee ID ...] [--status NAME]   markdown body (ClickUp renders it);
+        [--tag NAME ...] [--priority N]        --desc stores literal plain text.
+        [--due-on YYYY-MM-DD]                  Pass at most one. '-' reads stdin.
+        [--due-at ISO8601] [--parent ID]      --assignee repeatable (user id).
+        [--field UUID=VALUE ...]              --priority 1=Urgent 2=High 3=Normal
+                                              4=Low. --due-on is all-day; --due-at
+                                              carries time-of-day; not both.
+                                              --parent makes it a SUBTASK (parent
+                                              must be in the same list). --field
+                                              sets a custom field at creation
+                                              (repeatable) — stamp an external-ID
+                                              key here, then `find --field` it.
+  clickup update <task> [--name N]            Update fields on a task. --markdown/
+        [--desc T|-] [--markdown T|-]          --desc as for create. --status moves
+        [--status NAME] [--priority N]         the column. --add-assignee /
+        [--due-on D] [--due-at ISO]            --rem-assignee add or remove
+        [--add-assignee ID ...]                assignees (ClickUp updates use an
+        [--rem-assignee ID ...] [--archive]    add/remove set, not a replace).
+                                              --archive archives the task.
+  clickup comment <task> [--text TEXT|-]      Add a comment to a task. --assignee
+        [--assignee ID] [--notify-all]        assigns + notifies that user;
+                                              --notify-all notifies everyone on
+                                              the task. (ClickUp comments are
+                                              plain text — no @mention segment.)
+  clickup complete <task> [--reopen]          Mark a task complete by setting its
+        [--force] [--no-rollup]               list's closed status (--reopen sets
+                                              the first open status). REFUSES
+                                              (exit 7) if the task has incomplete
+                                              dependencies — pass --force to
+                                              override. On success it cascades:
+                                              auto-completes any parent whose
+                                              subtasks are now all done, and
+                                              reports dependents this unblocked.
+                                              --no-rollup skips the cascade.
+                                              (To move a task to an arbitrary
+                                              column, use `update --status`.)
+  clickup assign <task> [--add ID ...]        Add and/or remove assignees on a
+        [--rem ID ...]                        task. <ID> is a user id.
+  clickup watch <task> [--add ID ...]         Add and/or remove watchers — the
+        [--rem ID ...]                        follower analog; a watcher is
+                                              notified of the task's activity.
+  clickup tag-create --space ID --name NAME   Create a tag in a space.
+        [--fg HEX] [--bg HEX]
+  clickup tag-add <task> <tag>                Add a tag to a task. <tag> is a
+                                              tag NAME (tags are name-addressed).
+  clickup tag-remove <task> <tag>             Remove a tag from a task.
+  clickup dep-add <task> --on ID [--on ...]   Mark <task> as depending on each
+                                              --on task (waits on them).
+  clickup dep-remove <task> --on ID [...]     Remove dependency links from <task>.
+  clickup field-set <task> <field> --value V  Set a custom field on a task.
+        [--json]                              <field> is the field UUID (`fields`
+                                              lists them). --value is the literal
+                                              value; --json parses it as JSON
+                                              first (for typed/relationship fields).
+  clickup field-clear <task> <field>          Clear a custom field on a task.
+  clickup deliverable --list ID               Create a PAIRED request + dependent:
+        --request-name N --agent-name N        a request task assigned to
+        --supervisor USER --agent USER         --supervisor (the human whose input
+        [--request-markdown T|-]               is needed) and an agent task assigned
+        [--agent-markdown T|-]                 to --agent that DEPENDS ON it, so
+        [--status NAME] [--parent ID]          completing the request unblocks the
+        [--state-field UUID]                   agent task. --state-field stamps
+                                              {phase,last_touch} JSON into a (UI-
+                                              created) custom field on both tasks.
+                                              Not idempotent — ClickUp has no
+                                              settable dedup key.
+  clickup task-delete <task> --yes            Delete a task. IRREVERSIBLE — refuses
+        [--custom-id --workspace ID]           without --yes (the gate; confirm with
+                                              the human first).
+  clickup attach <task> FILE [--name NAME]    Upload a local FILE to a task
+                                              (multipart). --name overrides the
+                                              display name. (File upload only —
+                                              ClickUp has no attach-by-URL.)
+  clickup list-create --name NAME             Create a list. --folder makes it a
+        [--folder ID] [--space ID]            folder list; --space makes it a
+        [--content TEXT]                      folderless list under the space.
+  clickup webhooks --workspace ID             List a workspace's webhooks.
+  clickup webhook-create --workspace ID       Register a webhook delivering to the
+        --endpoint URL [--event E ...]        HTTPS endpoint. --event is repeatable
+        [--space ID] [--folder ID]            (e.g. taskCreated taskStatusUpdated
+        [--list ID] [--task ID]               taskCommentPosted); omit for all
+                                              events. The scope flags narrow it to
+                                              one space/folder/list/task. The
+                                              response carries the signing secret
+                                              once — capture it. (No handshake.)
+  clickup webhook-delete <webhook> --yes      Delete a webhook (stops deliveries).
+                                              IRREVERSIBLE — refuses without --yes
+                                              (the gate; confirm with the human first).
+
+References:
+  <task> accepts a bare task id OR a full ClickUp URL (the id after /t/ is
+  extracted). User ids and the like are bare numeric ids.
+
+Input:
+  `comment --text`, `create/update --desc|--markdown` accept inline text, a
+  file path, or "-" for stdin (one '-' per command). List/space/folder/team
+  ids that are stable for a repo belong in that repo's own reference file, not
+  here, or in `clickup ids`.
+
+I/O contract:
+  - Success: JSON on stdout, exit 0.
+  - Error:   {"error": {"code", "message", "hint", "status"}} on stderr,
+             non-zero exit.
+
+Exit codes:
+  0  success
+  2  auth (unauthorized / forbidden / missing credentials)
+  3  not found
+  4  policy refusal — the project gate (.capabilities/settings.json) on any
+     verb, or a write verb on a read-only connection (allow_write: false).
+     Ask the user; never lift a gate yourself.
+  5  server / network (5xx, timeout, rate-limit exhausted)
+  6  input / validation
+  7  blocked (task has incomplete dependencies; see `complete`)
+
+Notes:
+  - Dates are epoch milliseconds on the wire; pass --due-on (all-day) or
+    --due-at (ISO8601, time-of-day) and the CLI converts.
+  - Completion is status-based: a task is "done" when its status type is
+    `done` or `closed`. `complete` discovers the list's closed status and sets
+    it; there is no boolean done flag.
+  - Board columns ARE statuses (no section object) — `statuses` lists them,
+    `update --status` moves a task. Statuses are UI-only: the API cannot create,
+    edit, or delete a status, so there is no status-management surface here.
+  - Custom field DEFINITIONS are UI-only too: the API reads them (`fields`,
+    `field-get`) and reads/writes their VALUES (`field-set`, `field-clear`) but
+    cannot create, retype, or delete the field itself. Provision a field once in
+    the UI, then drive its value from here (e.g. a machine-state field for
+    `deliverable --state-field`).
+  - External-ID / dedup parity: ClickUp Custom Task IDs are read-only via the
+    API, so the settable dedup key is a (UI-created) text custom field. Stamp it
+    at creation with `create --field <uuid>=<key>` and resolve it with
+    `find --field <uuid> --value <key>` — the analog of an external-id lookup.
+  - Tags are space-scoped and addressed by name (no tag ids).
+  - Custom Task IDs are assigned by ClickUp's ClickApp and are read-only via
+    the API: `find`/`task --custom-id` resolve by them, nothing sets them.
+  - Rate limit is per token (100 req/min on most plans); a 429 is absorbed by
+    waiting for the reset, then retried.
+  - Listing paginates to --limit (default 100). Raise --limit or filter by
+    --status to read more.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import NoReturn
+
+import httpx
+
+API_BASE = "https://api.clickup.com/api/v2"
+TIMEOUT = httpx.Timeout(30.0)
+MAX_RETRIES = 3
+
+# --- Capability declaration (protocol 2) — one home for every contract fact --
+
+NAME = "clickup"
+PROTOCOL = 2
+SUMMARY = ("ClickUp CLI over the REST API — read/create/update/comment-on tasks and "
+           "subtasks, complete via status, manage assignees, tags, dependencies, "
+           "custom fields, attachments, and webhooks across spaces and lists.")
+SCOPE = "project"   # credential scope: "project" | "user"
+CRED_KEYS = [
+    {"key": "CLICKUP_API_TOKEN", "secret": True, "required": True,
+     "note": "personal API token (pk_…; default identity, alternates via --token-env)"},
+]
+WRITE_VERBS = {     # domain verbs that mutate ClickUp
+    "create", "update", "comment", "complete", "assign", "watch",
+    "tag-create", "tag-add", "tag-remove", "dep-add", "dep-remove",
+    "field-set", "field-clear", "attach", "list-create", "deliverable",
+    "task-delete", "webhook-create", "webhook-delete",
+}
+WRITE_DEFAULT = True    # writes stay inside a workspace the consumer owns
+DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
+TOPICS: list = []   # shipped guide topics
+STATE = False       # True when the capability writes session/cache state
+POST_INSTALL: list = []
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CONFIG_DIR = _CONFIG_HOME / "clickup"
+CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding .capabilities/, .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = root / ".capabilities" / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    root = _project_root()
+    return (root / ".capabilities" / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where .capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None and (root / ".capabilities").is_dir():
+            return root / ".capabilities" / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import httpx as _hx
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        resp = _hx.get(url, headers=headers, timeout=10.0, follow_redirects=True)
+        if resp.status_code == 200:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(resp.text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(resp.text); return
+        if resp.status_code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if resp.status_code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        raise _hx.HTTPError(f"upstream returned {resp.status_code}")
+    except _hx.HTTPError as e:
+        if cache.exists():
+            sys.stderr.write(json.dumps(
+                {"warning": f"upstream unreachable; serving cached copy ({e})"},
+                ensure_ascii=False) + "\n")
+            _emit(cache.read_text()); return
+        _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not envdir.parent.is_dir():
+            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+
+# --- Credentials -------------------------------------------------------------
+
+def _load_token(key: str = "CLICKUP_API_TOKEN") -> str:
+    """Resolve a ClickUp token by env-var NAME through the credential cascade — a
+    project .env(.local), then ~/.config/clickup/credentials.env, then the process
+    env; first non-empty wins. `key` defaults to CLICKUP_API_TOKEN; the global
+    `--token-env <KEY>` flag selects an alternate key to act as another identity.
+    The token value never travels on the command line — only its name."""
+    tok = (_project_env().get(key)
+           or _parse_env_file(CREDENTIALS_ENV).get(key)
+           or os.environ.get(key)
+           or "").strip()
+    if tok:
+        return tok
+    if key == "CLICKUP_API_TOKEN":
+        _die(2, "missing_token",
+             f"CLICKUP_API_TOKEN not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+             "add CLICKUP_API_TOKEN=<your pk_ token> to the user config or a project .env")
+    _die(2, "missing_token",
+         f"{key} not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+         f"add {key}=<token> to the user config or a project .env to use --token-env {key}")
+
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+# <<< contract: connections <<<
+
+
+# --- Connections ---------------------------------------------------------------
+
+def _connections_report() -> dict:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, _ = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        value, tier, source = _resolve_env_key("CLICKUP_API_TOKEN")
+        report["default"] = "default"
+        report["connections"]["default"] = {
+            "allow_write": WRITE_DEFAULT,
+            "keys": [_key_report("CLICKUP_API_TOKEN", True, True, value, tier, source)]}
+        return report
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys = [_key_report(secret_env, True, True, value, tier, source)]
+        else:
+            keys = [_key_report("secret_env", False, True, None, None, None)]
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    return report
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+# --- Reference parsing -------------------------------------------------------
+
+def _ref(ref: str) -> str:
+    """Accept a bare ClickUp task id or a full ClickUp URL; return the task id.
+    ClickUp ids are opaque alphanumerics, so anything that is not clearly a URL
+    is returned as-is."""
+    ref = ref.strip()
+    m = re.search(r"/t/(?:[A-Za-z0-9_-]+/)?([A-Za-z0-9_-]+)", ref)
+    if m:
+        return m.group(1)
+    return ref
+
+
+# --- Dates -------------------------------------------------------------------
+
+def _epoch_ms_date(date: str) -> int:
+    """YYYY-MM-DD → epoch milliseconds at UTC midnight (an all-day due date)."""
+    try:
+        dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        _die(6, "bad_date", f"--due-on expects YYYY-MM-DD, got {date!r}")
+    return int(dt.timestamp() * 1000)
+
+
+def _epoch_ms_iso(iso: str) -> int:
+    """ISO8601 → epoch milliseconds. Accepts a trailing Z."""
+    raw = iso.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        _die(6, "bad_datetime", f"--due-at expects ISO8601, got {iso!r}",
+             "e.g. 2026-06-30T16:00:00Z")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _ts(epoch_ms) -> str:
+    """ClickUp epoch-ms string/int → compact minute-precision UTC: 2026-06-10 14:40Z."""
+    if not epoch_ms:
+        return "?"
+    try:
+        dt = datetime.fromtimestamp(int(epoch_ms) / 1000, tz=timezone.utc)
+    except (ValueError, TypeError, OSError):
+        return "?"
+    return dt.strftime("%Y-%m-%d %H:%M") + "Z"
+
+
+# --- HTTP --------------------------------------------------------------------
+
+def _client(token: str) -> httpx.Client:
+    return httpx.Client(
+        base_url=API_BASE,
+        timeout=TIMEOUT,
+        headers={
+            "Authorization": token,   # personal pk_ token: raw, no scheme prefix
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+
+
+def _request(client: httpx.Client, method: str, path: str,
+             params: dict | None = None, json_body: dict | None = None,
+             allow_404: bool = False) -> dict | None:
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, path, params=params, json=json_body)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "timeout", f"request timed out: {method} {path}",
+                 "ClickUp API was unresponsive; check status.clickup.com")
+        except httpx.RequestError as e:
+            _die(5, "network_error", f"network error: {e}", "check connectivity")
+
+        last_status = resp.status_code
+        if resp.status_code == 429:
+            # ClickUp carries no Retry-After; X-RateLimit-Reset is a Unix-seconds
+            # timestamp to wait until. Fall back to the linear backoff.
+            reset = resp.headers.get("X-RateLimit-Reset")
+            wait = attempt * 1.5
+            if reset:
+                try:
+                    wait = max(float(reset) - time.time(), 1.0)
+                except ValueError:
+                    pass
+            if attempt < MAX_RETRIES:
+                time.sleep(min(wait, 60.0))
+                continue
+            _die(5, "rate_limited", f"rate-limited after {MAX_RETRIES} attempts",
+                 "back off and retry later", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "server_error", f"ClickUp returned {resp.status_code}",
+                 "check status.clickup.com", status=resp.status_code)
+
+        if resp.status_code == 204 or not resp.content:
+            return {} if resp.status_code < 400 else None
+        try:
+            data = resp.json()
+        except ValueError:
+            if resp.status_code < 400:
+                return {}
+            _die(5, "invalid_response", f"non-JSON response from {method} {path}",
+                 status=resp.status_code)
+
+        if resp.status_code >= 400:
+            if allow_404 and resp.status_code == 404:
+                return None
+            msg = (data.get("err") or data.get("error")
+                   or data.get("message") or "unknown error") if isinstance(data, dict) else "error"
+            ecode = data.get("ECODE") if isinstance(data, dict) else None
+            if resp.status_code in (401, 403):
+                _die(2, "unauthorized", msg,
+                     "token may be invalid or lack access to this resource",
+                     status=resp.status_code)
+            if resp.status_code == 404:
+                _die(3, "not_found", msg,
+                     ecode or "verify the id and that the token can see it",
+                     status=resp.status_code)
+            if resp.status_code in (400, 402, 422):
+                _die(6, "invalid_request", msg, ecode, status=resp.status_code)
+            _die(5, "api_error", msg, ecode, status=resp.status_code)
+
+        return data
+
+    _die(5, "exhausted_retries", f"exhausted {MAX_RETRIES} attempts on {method} {path}",
+         status=last_status)
+
+
+# --- Input -------------------------------------------------------------------
+
+def _read_text(src: str | None) -> str:
+    if src is None or src == "-":
+        return sys.stdin.read()
+    if "\n" not in src:
+        try:
+            p = Path(src)
+            if p.exists():
+                return p.read_text()
+        except OSError:
+            pass
+    return src
+
+
+# --- Body helpers ------------------------------------------------------------
+
+def _body_field(text: str | None, mode: str) -> dict:
+    """A task body: markdown (default) → `markdown_content` (ClickUp renders it),
+    plain → literal `description`."""
+    if text is None:
+        return {}
+    return {"description": text} if mode == "plain" else {"markdown_content": text}
+
+
+def _ids(values) -> list[int]:
+    """Coerce user-id arguments to ints (ClickUp assignee/watcher ids are numeric)."""
+    out = []
+    for v in values:
+        try:
+            out.append(int(v))
+        except (TypeError, ValueError):
+            _die(6, "bad_user_id", f"expected a numeric user id, got {v!r}")
+    return out
+
+
+def _parse_fields(pairs: list[str]) -> list[dict]:
+    """`UUID=VALUE` pairs → the create body's custom_fields (key `id`, not
+    `field_id` — the create endpoint differs from the filter endpoint)."""
+    out = []
+    for p in pairs:
+        if "=" not in p:
+            _die(6, "bad_field", f"--field expects UUID=VALUE, got {p!r}")
+        uuid, val = p.split("=", 1)
+        out.append({"id": uuid.strip(), "value": val})
+    return out
+
+
+# --- Commands: identity & hierarchy ------------------------------------------
+
+def cmd_whoami(c: httpx.Client) -> dict:
+    return _request(c, "GET", "/user")["user"]
+
+
+def cmd_workspaces(c: httpx.Client) -> list:
+    return _request(c, "GET", "/team")["teams"]
+
+
+def _sole_workspace(c: httpx.Client) -> str:
+    teams = cmd_workspaces(c)
+    if not teams:
+        _die(3, "no_workspace", "the token sees no workspace")
+    if len(teams) > 1:
+        _die(6, "ambiguous_workspace",
+             "the token sees several workspaces; pass --workspace <id>",
+             "known: " + ", ".join(f"{t['id']} ({t.get('name')})" for t in teams))
+    return teams[0]["id"]
+
+
+def cmd_members(c: httpx.Client, workspace: str | None) -> list:
+    teams = cmd_workspaces(c)
+    if workspace:
+        teams = [t for t in teams if str(t.get("id")) == str(workspace)]
+        if not teams:
+            _die(3, "not_found", f"no workspace {workspace!r} the token can see")
+    elif len(teams) != 1:
+        _die(6, "ambiguous_workspace",
+             "several workspaces; pass --workspace <id>",
+             "known: " + ", ".join(f"{t['id']} ({t.get('name')})" for t in teams))
+    return [m.get("user", m) for m in (teams[0].get("members") or [])]
+
+
+def cmd_spaces(c: httpx.Client, workspace: str) -> list:
+    return _request(c, "GET", f"/team/{workspace}/space",
+                    params={"archived": "false"})["spaces"]
+
+
+def cmd_folders(c: httpx.Client, space: str) -> list:
+    return _request(c, "GET", f"/space/{space}/folder",
+                    params={"archived": "false"})["folders"]
+
+
+def cmd_lists(c: httpx.Client, folder: str | None, space: str | None) -> list:
+    if folder:
+        return _request(c, "GET", f"/folder/{folder}/list",
+                        params={"archived": "false"})["lists"]
+    if space:
+        return _request(c, "GET", f"/space/{space}/list",
+                        params={"archived": "false"})["lists"]
+    _die(6, "missing_parent", "lists requires --folder or --space",
+         "--folder lists a folder's lists; --space lists the folderless lists")
+
+
+def cmd_statuses(c: httpx.Client, list_id: str) -> list:
+    lst = _request(c, "GET", f"/list/{list_id}")
+    return lst.get("statuses") or []
+
+
+def cmd_tags(c: httpx.Client, space: str) -> list:
+    return _request(c, "GET", f"/space/{space}/tag")["tags"]
+
+
+def cmd_fields(c: httpx.Client, list_id: str) -> list:
+    return _request(c, "GET", f"/list/{list_id}/field")["fields"]
+
+
+# --- Commands: task reads ----------------------------------------------------
+
+def cmd_tasks(c: httpx.Client, list_id: str, show_all: bool, archived: bool,
+              subtasks: bool, statuses: list[str], limit: int,
+              page: int | None) -> list:
+    base: dict = {
+        "include_closed": "true" if show_all else "false",
+        "archived": "true" if archived else "false",
+    }
+    if subtasks:
+        base["subtasks"] = "true"
+    if statuses:
+        base["statuses[]"] = statuses
+    if page is not None:
+        base["page"] = page
+        return _request(c, "GET", f"/list/{list_id}/task", params=base)["tasks"]
+    # Paginate (0-indexed) until last_page, a short page, or the limit is reached.
+    out: list = []
+    pg = 0
+    while True:
+        params = dict(base, page=pg)
+        body = _request(c, "GET", f"/list/{list_id}/task", params=params)
+        batch = body.get("tasks") or []
+        out += batch
+        if body.get("last_page") or len(batch) < 100 or len(out) >= limit:
+            break
+        pg += 1
+    return out[:limit]
+
+
+def cmd_task(c: httpx.Client, task: str, with_subtasks: bool = False,
+             custom_id: bool = False, workspace: str | None = None) -> dict:
+    params: dict = {"include_markdown_description": "true"}
+    if with_subtasks:
+        params["include_subtasks"] = "true"
+    if custom_id:
+        if not workspace:
+            _die(6, "missing_workspace", "--custom-id requires --workspace <id>",
+                 "ClickUp resolves a Custom Task ID only within a workspace")
+        params["custom_task_ids"] = "true"
+        params["team_id"] = workspace
+        return _request(c, "GET", f"/task/{task}", params=params)
+    return _request(c, "GET", f"/task/{_ref(task)}", params=params)
+
+
+def cmd_comments(c: httpx.Client, task: str, limit: int) -> list:
+    """The N most recent comments, in chronological order.
+
+    ClickUp serves comments newest-first, 25 per page, paged backward by the
+    last item's date + id. Walk back until we have `limit` (or run dry), then
+    reverse to chronological order."""
+    tid = _ref(task)
+    collected: list = []
+    start: str | None = None
+    start_id: str | None = None
+    while True:
+        params: dict = {}
+        if start is not None:
+            params["start"] = start
+            params["start_id"] = start_id
+        page = _request(c, "GET", f"/task/{tid}/comment", params=params)
+        batch = page.get("comments") or []
+        if not batch:
+            break
+        collected += batch
+        if len(collected) >= limit or len(batch) < 25:
+            break
+        last = batch[-1]
+        start, start_id = last.get("date"), last.get("id")
+    collected = collected[:limit]
+    return list(reversed(collected))
+
+
+def cmd_subtasks(c: httpx.Client, task: str) -> list:
+    obj = cmd_task(c, task, with_subtasks=True)
+    return obj.get("subtasks") or []
+
+
+def _split_deps(task_obj: dict) -> tuple[list, list]:
+    """From a task's dependencies[], split into (blockers, dependents):
+    an entry links task_id → depends_on (task_id waits on depends_on)."""
+    tid = task_obj.get("id")
+    deps = task_obj.get("dependencies") or []
+    blockers = [d["depends_on"] for d in deps
+                if d.get("task_id") == tid and d.get("depends_on")]
+    dependents = [d["task_id"] for d in deps
+                  if d.get("depends_on") == tid and d.get("task_id")]
+    return blockers, dependents
+
+
+def cmd_deps(c: httpx.Client, task: str, dependents: bool) -> dict:
+    obj = cmd_task(c, task)
+    blockers, deps_of = _split_deps(obj)
+    ids = deps_of if dependents else blockers
+    return {"task": obj.get("id"),
+            "relation": "dependents" if dependents else "dependencies",
+            "task_ids": ids,
+            "linked_tasks": obj.get("linked_tasks") or []}
+
+
+def cmd_attachments(c: httpx.Client, task: str) -> list:
+    obj = cmd_task(c, task)
+    return obj.get("attachments") or []
+
+
+def cmd_find(c: httpx.Client, workspace: str, custom_task_id: str | None = None,
+             field: str | None = None, value: str | None = None) -> dict | None:
+    """Resolve a task by a dedup key, returning the task or None on a miss.
+
+    Two modes — the external-ID parity path is the custom-field one, because
+    ClickUp Custom Task IDs cannot be set via the API:
+      --field <uuid> --value <v>  → the first task whose custom field equals <v>
+                                     (workspace-wide; the settable dedup key).
+      <custom-task-id>            → the ClickApp Custom Task ID point lookup.
+    A dedup-key field is meant to be unique; only the first match is returned."""
+    if field is not None:
+        flt = json.dumps([{"field_id": field, "operator": "=", "value": value}])
+        body = _request(c, "GET", f"/team/{workspace}/task",
+                        params={"custom_fields": flt})
+        tasks = (body or {}).get("tasks") or []
+        return tasks[0] if tasks else None
+    res = _request(c, "GET", f"/task/{custom_task_id}",
+                   params={"custom_task_ids": "true", "team_id": workspace},
+                   allow_404=True)
+    return res or None
+
+
+def _idle(now_ms: int, updated) -> str:
+    """Human idle age since the last touch (date_updated, epoch-ms)."""
+    if not updated:
+        return "?"
+    try:
+        secs = max((now_ms - int(updated)) / 1000, 0)
+    except (ValueError, TypeError):
+        return "?"
+    d, h, m = int(secs // 86400), int((secs % 86400) // 3600), int((secs % 3600) // 60)
+    if d:
+        return f"{d}d{h}h"
+    if h:
+        return f"{h}h{m}m"
+    return f"{m}m"
+
+
+def cmd_assigned(c: httpx.Client, workspace: str, assignee: str | None,
+                 show_all: bool, statuses: list[str], limit: int) -> list:
+    """Tasks assigned to a user (default: the token's own identity), incomplete
+    unless show_all, stalest-first, each annotated with its last-touch timestamp
+    and idle age — the 'what is waiting on my input, and for how long?' read."""
+    if not assignee:
+        assignee = str(cmd_whoami(c).get("id"))
+    base: dict = {"assignees[]": [assignee],
+                  "include_closed": "true" if show_all else "false"}
+    if statuses:
+        base["statuses[]"] = statuses
+    out: list = []
+    pg = 0
+    while True:
+        body = _request(c, "GET", f"/team/{workspace}/task", params=dict(base, page=pg))
+        batch = body.get("tasks") or []
+        out += batch
+        # The team-tasks endpoint does not reliably return `last_page`; a short
+        # (<100) or empty page is the dependable end-of-pages signal.
+        if body.get("last_page") or len(batch) < 100 or len(out) >= limit:
+            break
+        pg += 1
+    out = out[:limit]
+    out.sort(key=lambda t: int(t.get("date_updated") or 0))   # stalest first
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return [{"id": t.get("id"), "name": t.get("name"),
+             "status": (t.get("status") or {}).get("status"),
+             "list": (t.get("list") or {}).get("name"),
+             "last_touch": _ts(t.get("date_updated")),
+             "idle": _idle(now_ms, t.get("date_updated")),
+             "url": t.get("url")} for t in out]
+
+
+# --- task-context ------------------------------------------------------------
+
+def cmd_task_context(c: httpx.Client, task: str, as_json: bool = False):
+    """The task plus everything adjacent, in one call: description, comment
+    thread, attachment pointers, dependencies one level deep (each with its own
+    description, thread, attachments), dependents as state lines."""
+    obj = cmd_task(c, task)
+    tid = obj.get("id")
+    obj["comments"] = cmd_comments(c, tid, 100)
+    blockers, dependents = _split_deps(obj)
+    deps_full = []
+    for dep_id in blockers:
+        detail = cmd_task(c, dep_id)
+        detail["comments"] = cmd_comments(c, dep_id, 100)
+        deps_full.append(detail)
+    obj["_dependencies_full"] = deps_full
+    obj["_dependent_ids"] = dependents
+    assembled = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if as_json:
+        return {"assembled_at": assembled, "task": obj}
+    return _render_task_context(obj, assembled)
+
+
+def _status_label(o: dict) -> str:
+    st = o.get("status") or {}
+    if isinstance(st, dict):
+        return (st.get("status") or "?").upper()
+    return str(st).upper()
+
+
+def _render_task_context(t: dict, assembled: str) -> str:
+    def comment_block(comments: list, h: str) -> list[str]:
+        lines = [f"{h} Comments ({len(comments)})"]
+        for s in comments:
+            body = (s.get("comment_text") or "").strip() or "(no text — see attachments)"
+            who = (s.get("user") or {}).get("username", "?")
+            lines += ["", f"[{_ts(s.get('date'))} · {who}] {body}"]
+        return lines
+
+    def attachment_block(atts: list, h: str) -> list[str]:
+        lines = [f"{h} Attachments ({len(atts)})"]
+        lines += [f"{a.get('id')} · {a.get('title', '?')} · {a.get('url', '')}"
+                  for a in atts]
+        return lines
+
+    out = [f"# Task {t.get('id')} — {t.get('name', '')}"]
+    loc = " / ".join(filter(None, [
+        (t.get("space") or {}).get("name") if isinstance(t.get("space"), dict) else None,
+        (t.get("folder") or {}).get("name") if isinstance(t.get("folder"), dict) else None,
+        (t.get("list") or {}).get("name") if isinstance(t.get("list"), dict) else None,
+    ]))
+    out.append(f"{loc + ' · ' if loc else ''}Status: {_status_label(t)}")
+    assignees = ", ".join(a.get("username", "?") for a in (t.get("assignees") or [])) or "—"
+    meta = (f"Assignees: {assignees}"
+            f" · Created: {_ts(t.get('date_created'))}"
+            f" · Updated: {_ts(t.get('date_updated'))}")
+    due = t.get("due_date")
+    if due:
+        meta += f" · Due: {_ts(due)}"
+    out.append(meta)
+    out.append(f"Assembled: {assembled} (UTC) — tracker snapshot at pickup; "
+               "live state may have moved since")
+    body = (t.get("markdown_description") or t.get("description") or "").strip()
+    out += ["", "## Description", body or "(empty)"]
+    out += [""] + comment_block(t.get("comments", []), "##")
+    out += [""] + attachment_block(t.get("attachments") or [], "##")
+    for d in t.get("_dependencies_full", []):
+        out += ["", f"## Dependency {d.get('id')} — {d.get('name', '')}",
+                f"Status: {_status_label(d)} · Assignees: "
+                + (", ".join(a.get("username", "?") for a in (d.get("assignees") or [])) or "—"),
+                "", "### Description",
+                (d.get("markdown_description") or d.get("description") or "").strip() or "(empty)"]
+        out += [""] + comment_block(d.get("comments", []), "###")
+    dependents = t.get("_dependent_ids", [])
+    if dependents:
+        out += ["", f"## Dependents ({len(dependents)})"]
+        out += [f"- {x}" for x in dependents]
+    return "\n".join(out) + "\n"
+
+
+# --- Commands: task writes ---------------------------------------------------
+
+def cmd_create(c: httpx.Client, list_id: str, name: str, body: str | None,
+               body_mode: str, assignees: list[str], status: str | None,
+               tags: list[str], priority: int | None, due_on: str | None,
+               due_at: str | None, parent: str | None,
+               custom_fields: list[dict] | None = None) -> dict:
+    if due_on and due_at:
+        _die(6, "conflicting_due", "pass only one of --due-on / --due-at",
+             "--due-at carries the time-of-day; --due-on is all-day")
+    data: dict = {"name": name}
+    data.update(_body_field(body, body_mode))
+    if assignees:
+        data["assignees"] = _ids(assignees)
+    if status:
+        data["status"] = status
+    if tags:
+        data["tags"] = tags
+    if priority is not None:
+        data["priority"] = priority
+    if due_on:
+        data["due_date"] = _epoch_ms_date(due_on)
+        data["due_date_time"] = False
+    if due_at:
+        data["due_date"] = _epoch_ms_iso(due_at)
+        data["due_date_time"] = True
+    if parent:
+        data["parent"] = _ref(parent)
+    if custom_fields:
+        data["custom_fields"] = custom_fields
+    return _request(c, "POST", f"/list/{list_id}/task", json_body=data)
+
+
+def cmd_update(c: httpx.Client, task: str, name: str | None, body: str | None,
+               body_mode: str, status: str | None, priority: int | None,
+               due_on: str | None, due_at: str | None,
+               add_assignees: list[str], rem_assignees: list[str],
+               archive: bool) -> dict:
+    if due_on and due_at:
+        _die(6, "conflicting_due", "pass only one of --due-on / --due-at",
+             "--due-at carries the time-of-day; --due-on is all-day")
+    data: dict = {}
+    if name is not None:
+        data["name"] = name
+    data.update(_body_field(body, body_mode))
+    if status:
+        data["status"] = status
+    if priority is not None:
+        data["priority"] = priority
+    if due_on:
+        data["due_date"] = _epoch_ms_date(due_on)
+        data["due_date_time"] = False
+    if due_at:
+        data["due_date"] = _epoch_ms_iso(due_at)
+        data["due_date_time"] = True
+    if add_assignees or rem_assignees:
+        data["assignees"] = {"add": _ids(add_assignees), "rem": _ids(rem_assignees)}
+    if archive:
+        data["archived"] = True
+    if not data:
+        _die(6, "no_changes", "update requires at least one field to change",
+             "pass --name / --desc / --markdown / --status / --priority / "
+             "--due-on / --due-at / --add-assignee / --rem-assignee / --archive")
+    return _request(c, "PUT", f"/task/{_ref(task)}", json_body=data)
+
+
+def cmd_comment(c: httpx.Client, task: str, text: str,
+                assignee: str | None, notify_all: bool) -> dict:
+    data: dict = {"comment_text": text, "notify_all": notify_all}
+    if assignee:
+        data["assignee"] = int(assignee) if str(assignee).isdigit() else assignee
+    return _request(c, "POST", f"/task/{_ref(task)}/comment", json_body=data)
+
+
+def cmd_assign(c: httpx.Client, task: str, add: list[str], rem: list[str]) -> dict:
+    if not add and not rem:
+        _die(6, "no_assignees", "assign requires --add and/or --rem")
+    return _request(c, "PUT", f"/task/{_ref(task)}",
+                    json_body={"assignees": {"add": _ids(add), "rem": _ids(rem)}})
+
+
+def cmd_watch(c: httpx.Client, task: str, add: list[str], rem: list[str]) -> dict:
+    if not add and not rem:
+        _die(6, "no_watchers", "watch requires --add and/or --rem")
+    return _request(c, "PUT", f"/task/{_ref(task)}",
+                    json_body={"watchers": {"add": _ids(add), "rem": _ids(rem)}})
+
+
+def cmd_tag_create(c: httpx.Client, space: str, name: str,
+                   fg: str | None, bg: str | None) -> dict:
+    tag: dict = {"name": name}
+    if fg:
+        tag["tag_fg"] = fg
+    if bg:
+        tag["tag_bg"] = bg
+    _request(c, "POST", f"/space/{space}/tag", json_body={"tag": tag})
+    return {"space": space, "tag": name, "created": True}
+
+
+def cmd_tag_add(c: httpx.Client, task: str, tag: str) -> dict:
+    _request(c, "POST", f"/task/{_ref(task)}/tag/{tag}")
+    return {"task": _ref(task), "tag": tag, "added": True}
+
+
+def cmd_tag_remove(c: httpx.Client, task: str, tag: str) -> dict:
+    _request(c, "DELETE", f"/task/{_ref(task)}/tag/{tag}")
+    return {"task": _ref(task), "tag": tag, "removed": True}
+
+
+def cmd_dep_add(c: httpx.Client, task: str, on: list[str]) -> dict:
+    tid = _ref(task)
+    for dep in on:
+        _request(c, "POST", f"/task/{tid}/dependency",
+                 json_body={"depends_on": _ref(dep)})
+    return {"task": tid, "depends_on": [_ref(d) for d in on]}
+
+
+def cmd_dep_remove(c: httpx.Client, task: str, on: list[str]) -> dict:
+    tid = _ref(task)
+    for dep in on:
+        _request(c, "DELETE", f"/task/{tid}/dependency",
+                 params={"depends_on": _ref(dep)})
+    return {"task": tid, "removed": [_ref(d) for d in on]}
+
+
+def cmd_field_set(c: httpx.Client, task: str, field: str,
+                  value, as_json: bool) -> dict:
+    if as_json:
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            _die(6, "bad_json", "--value is not valid JSON (omit --json for a literal)")
+    _request(c, "POST", f"/task/{_ref(task)}/field/{field}",
+             json_body={"value": value})
+    return {"task": _ref(task), "field": field, "set": True}
+
+
+def cmd_field_clear(c: httpx.Client, task: str, field: str) -> dict:
+    _request(c, "DELETE", f"/task/{_ref(task)}/field/{field}")
+    return {"task": _ref(task), "field": field, "cleared": True}
+
+
+def cmd_field_get(c: httpx.Client, task: str, field: str | None):
+    """Read a task's custom field values (the full definition + per-task value),
+    all of them or one addressed by UUID or name."""
+    fields = cmd_task(c, task).get("custom_fields") or []
+    rows = [{"id": f.get("id"), "name": f.get("name"), "type": f.get("type"),
+             "value": f.get("value")} for f in fields]
+    if field:
+        for r in rows:
+            if r["id"] == field or r["name"] == field:
+                return r
+        _die(3, "not_found", f"no custom field {field!r} on this task",
+             "`clickup fields --list <id>` lists the field definitions")
+    return rows
+
+
+def cmd_task_delete(c: httpx.Client, task: str, custom_id: bool,
+                    workspace: str | None) -> dict:
+    if custom_id:
+        if not workspace:
+            _die(6, "missing_workspace", "--custom-id requires --workspace <id>")
+        tid, params = task, {"custom_task_ids": "true", "team_id": workspace}
+    else:
+        tid, params = _ref(task), None
+    _request(c, "DELETE", f"/task/{tid}", params=params)
+    return {"task": tid, "deleted": True}
+
+
+def cmd_list_create(c: httpx.Client, folder: str | None, space: str | None,
+                    name: str, content: str | None) -> dict:
+    data: dict = {"name": name}
+    if content:
+        data["content"] = content
+    if folder:
+        return _request(c, "POST", f"/folder/{folder}/list", json_body=data)
+    if space:
+        return _request(c, "POST", f"/space/{space}/list", json_body=data)
+    _die(6, "missing_parent", "list-create requires --folder or --space")
+
+
+# --- Completion (status-based, with dependency gate + roll-up) ---------------
+
+_DONE_TYPES = ("done", "closed")
+
+
+def _is_done(task_obj: dict) -> bool:
+    st = task_obj.get("status") or {}
+    return isinstance(st, dict) and st.get("type") in _DONE_TYPES
+
+
+def _list_id_of(task_obj: dict) -> str | None:
+    lst = task_obj.get("list")
+    return lst.get("id") if isinstance(lst, dict) else None
+
+
+def _status_of_type(c: httpx.Client, list_id: str, types: tuple) -> str | None:
+    """The label of this list's first status whose type is in `types`."""
+    for st in cmd_statuses(c, list_id):
+        if st.get("type") in types:
+            return st.get("status")
+    return None
+
+
+def _incomplete_blockers(c: httpx.Client, task_obj: dict) -> list:
+    """Blocker task ids of task_obj that are not yet in a done/closed status."""
+    blockers, _ = _split_deps(task_obj)
+    out = []
+    for bid in blockers:
+        try:
+            bt = cmd_task(c, bid)
+        except SystemExit:
+            raise
+        if not _is_done(bt):
+            out.append({"id": bid, "name": bt.get("name"),
+                        "status": _status_label(bt)})
+    return out
+
+
+def _rollup_parents(c: httpx.Client, task_obj: dict) -> list:
+    """Walk up from a just-completed task; complete each parent whose subtasks
+    are ALL done. Returns the parents auto-completed."""
+    rolled: list = []
+    parent_id = task_obj.get("parent")
+    while parent_id:
+        parent = cmd_task(c, parent_id, with_subtasks=True)
+        subs = parent.get("subtasks") or []
+        if not subs or not all(_is_done(s) for s in subs):
+            break
+        plist = _list_id_of(parent)
+        done = _status_of_type(c, plist, _DONE_TYPES) if plist else None
+        if not done:
+            break
+        _request(c, "PUT", f"/task/{parent.get('id')}", json_body={"status": done})
+        rolled.append({"id": parent.get("id"), "name": parent.get("name")})
+        parent_id = parent.get("parent")
+    return rolled
+
+
+def _newly_unblocked(c: httpx.Client, task_obj: dict) -> list:
+    """Tasks that depended on this one and are now fully unblocked."""
+    _, dependents = _split_deps(task_obj)
+    out = []
+    for did in dependents:
+        dt = cmd_task(c, did)
+        if not _incomplete_blockers(c, dt):
+            out.append({"id": did, "name": dt.get("name")})
+    return out
+
+
+def cmd_complete(c: httpx.Client, task: str, reopen: bool,
+                 force: bool, no_rollup: bool) -> dict:
+    obj = cmd_task(c, task)
+    tid = obj.get("id")
+    list_id = _list_id_of(obj)
+    if not list_id:
+        _die(6, "no_list", f"task {tid} has no resolvable list to read statuses from")
+
+    if reopen:
+        target = _status_of_type(c, list_id, ("open",))
+        if not target:
+            _die(6, "no_open_status", "this task's list has no 'open' status to reopen into")
+        updated = _request(c, "PUT", f"/task/{tid}", json_body={"status": target})
+        return {"reopened": {"id": tid, "status": target}, "task": updated}
+
+    blockers = _incomplete_blockers(c, obj)
+    if blockers and not force:
+        names = ", ".join(f"{b.get('name','?')} ({b['id']})" for b in blockers)
+        _die(7, "blocked_by_dependencies",
+             f"{len(blockers)} incomplete dependenc{'y' if len(blockers)==1 else 'ies'}: {names}",
+             "resolve them first, or pass --force to complete anyway")
+
+    target = _status_of_type(c, list_id, _DONE_TYPES)
+    if not target:
+        _die(6, "no_done_status",
+             "this task's list has no 'done' or 'closed' status to complete into",
+             f"`clickup statuses --list {list_id}` shows the available columns")
+    completed = _request(c, "PUT", f"/task/{tid}", json_body={"status": target})
+
+    result: dict = {"completed": {"id": tid, "status": target}, "task": completed}
+    if not no_rollup:
+        rolled = _rollup_parents(c, obj)
+        unblocked = _newly_unblocked(c, obj)
+        if rolled:
+            result["rolled_up"] = rolled
+        if unblocked:
+            result["unblocked"] = unblocked
+    return result
+
+
+# --- Deliverable (paired human-request + dependent task) ---------------------
+
+def cmd_deliverable(c: httpx.Client, *, list_id: str, request_name: str,
+                    request_body: str | None, agent_name: str,
+                    agent_body: str | None, supervisor: str, agent: str,
+                    status: str | None = None, parent: str | None = None,
+                    state_field: str | None = None) -> dict:
+    """Create a paired request + dependent agent task. The request is assigned to
+    --supervisor (the human whose input is needed); the agent task is assigned to
+    --agent and DEPENDS ON the request, so completing the request unblocks it.
+    Not idempotent — ClickUp exposes no settable dedup key, so a re-run makes a
+    fresh pair."""
+    req = cmd_create(c, list_id, request_name, request_body, "markdown",
+                     [supervisor], status, [], None, None, None, None)
+    ag = cmd_create(c, list_id, agent_name, agent_body, "markdown",
+                    [agent], status, [], None, None, None, parent)
+    cmd_dep_add(c, ag["id"], [req["id"]])
+    out = {"request": {"id": req.get("id"), "name": req.get("name"), "url": req.get("url")},
+           "agent": {"id": ag.get("id"), "name": ag.get("name"), "url": ag.get("url")},
+           "dependency": {"dependent": ag.get("id"), "on": req.get("id")}}
+    if state_field:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        state = json.dumps({"phase": "waiting", "last_touch": now_ms})
+        cmd_field_set(c, req["id"], state_field, state, as_json=False)
+        cmd_field_set(c, ag["id"], state_field, state, as_json=False)
+        out["state_field"] = state_field
+    return out
+
+
+# --- Attachments (multipart upload) ------------------------------------------
+
+def cmd_attach(token: str, task: str, file_path: str, name: str | None) -> dict:
+    p = Path(file_path)
+    if not p.exists() or not p.is_file():
+        _die(6, "file_not_found", f"{file_path} is not a readable file",
+             "pass a path to a local file (ClickUp has no attach-by-URL)")
+    tid = _ref(task)
+    headers = {"Authorization": token, "Accept": "application/json"}
+    files = {"attachment": (name or p.name, p.read_bytes())}
+    with httpx.Client(base_url=API_BASE, timeout=httpx.Timeout(120.0),
+                      headers=headers) as c:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = c.post(f"/task/{tid}/attachment", files=files)
+            except httpx.TimeoutException:
+                if attempt < MAX_RETRIES:
+                    time.sleep(attempt * 1.5); continue
+                _die(5, "timeout", f"upload timed out: POST /task/{tid}/attachment",
+                     "ClickUp API was unresponsive; check status.clickup.com")
+            except httpx.RequestError as e:
+                _die(5, "network_error", f"network error: {e}", "check connectivity")
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < MAX_RETRIES:
+                    time.sleep(attempt * 1.5); continue
+            try:
+                body = resp.json()
+            except ValueError:
+                _die(5, "invalid_response",
+                     f"non-JSON response from POST /task/{tid}/attachment",
+                     status=resp.status_code)
+            if resp.status_code >= 400:
+                msg = body.get("err") or body.get("message") or "unknown error"
+                if resp.status_code in (401, 403):
+                    _die(2, "unauthorized", msg,
+                         "token may be invalid or lack access", status=resp.status_code)
+                if resp.status_code == 404:
+                    _die(3, "not_found", msg,
+                         "verify the task id and that the token can see it",
+                         status=resp.status_code)
+                _die(6, "invalid_request", msg, status=resp.status_code)
+            return body
+    _die(5, "exhausted_retries", f"exhausted {MAX_RETRIES} attempts on POST /task/{tid}/attachment")
+
+
+# --- Webhooks ----------------------------------------------------------------
+
+def cmd_webhooks(c: httpx.Client, workspace: str) -> list:
+    return _request(c, "GET", f"/team/{workspace}/webhook")["webhooks"]
+
+
+def cmd_webhook_create(c: httpx.Client, workspace: str, endpoint: str,
+                       events: list[str], space: str | None, folder: str | None,
+                       list_id: str | None, task: str | None) -> dict:
+    data: dict = {"endpoint": endpoint, "events": events or "*"}
+    if space:
+        data["space_id"] = space
+    if folder:
+        data["folder_id"] = folder
+    if list_id:
+        data["list_id"] = list_id
+    if task:
+        data["task_id"] = _ref(task)
+    return _request(c, "POST", f"/team/{workspace}/webhook", json_body=data)
+
+
+def cmd_webhook_delete(c: httpx.Client, webhook: str) -> dict:
+    _request(c, "DELETE", f"/webhook/{webhook}")
+    return {"webhook": webhook, "deleted": True}
+
+
+# --- doctor ------------------------------------------------------------------
+
+def _check_connection(token: str) -> dict:
+    """One connection's round-trip, reported rather than died — doctor covers
+    every connection, so a broken one becomes a finding, not a stop."""
+    try:
+        with _client(token) as c:
+            r = c.get("/user")
+            if r.status_code >= 400:
+                cat = 2 if r.status_code in (401, 403) else 5
+                return {"ok": False, "category": cat,
+                        "error": f"/user returned {r.status_code}"}
+            user = r.json()["user"]
+            tr = c.get("/team")
+            teams = tr.json().get("teams", []) if tr.status_code < 400 else []
+            return {"ok": True,
+                    "whoami": user.get("username") or user.get("email"),
+                    "workspaces": [t.get("name") for t in teams]}
+    except httpx.RequestError as e:
+        return {"ok": False, "category": 5, "error": f"network error: {e}"}
+    except (ValueError, KeyError) as e:
+        return {"ok": False, "category": 5, "error": f"bad response: {e}"}
+
+
+def cmd_doctor(reg: dict | None, wanted: str | None,
+               token_key_override: str | None) -> None:
+    """Every connection bare; one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category."""
+    _doctor_gate(_connections_report(), wanted)
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        key = token_key_override or \
+            ("CLICKUP_API_TOKEN" if entry is None else entry.get("secret_env"))
+        if not key:
+            res = {"ok": False, "category": 6,
+                   "error": f"connection {cid!r} is missing 'secret_env'"}
+        else:
+            token = _resolve_env_key(key)[0]
+            if not token:
+                res = {"ok": False, "category": 2,
+                       "error": f"{key} not found in a project .env, "
+                                f"{CREDENTIALS_ENV}, or the environment"}
+            else:
+                res = _check_connection(token)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def main() -> None:
+    _gate()                      # every verb passes the project gate first
+    _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
+    p = argparse.ArgumentParser(
+        prog="clickup",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("help", help="print the full usage contract")
+    sub.add_parser("doctor", help="health check — resolve token, confirm identity")
+    sub.add_parser("whoami", help="confirm token and return identity")
+    sub.add_parser("workspaces", help="list workspaces (teams)")
+
+    sp = sub.add_parser("members", help="list a workspace's members")
+    sp.add_argument("--workspace", default=None, help="workspace (team) id")
+
+    sp = sub.add_parser("spaces", help="list spaces in a workspace")
+    sp.add_argument("--workspace", required=True, help="workspace (team) id")
+
+    sp = sub.add_parser("folders", help="list folders in a space")
+    sp.add_argument("--space", required=True, help="space id")
+
+    sp = sub.add_parser("lists", help="list lists in a folder or space")
+    sp.add_argument("--folder", default=None, help="folder id (its lists)")
+    sp.add_argument("--space", default=None, help="space id (its folderless lists)")
+
+    sp = sub.add_parser("statuses", help="list a list's statuses (board columns)")
+    sp.add_argument("--list", required=True, dest="list_id", help="list id")
+
+    sp = sub.add_parser("tags", help="list a space's tags")
+    sp.add_argument("--space", required=True, help="space id")
+
+    sp = sub.add_parser("fields", help="list a list's custom fields")
+    sp.add_argument("--list", required=True, dest="list_id", help="list id")
+
+    sp = sub.add_parser("tasks", help="list tasks in a list")
+    sp.add_argument("--list", required=True, dest="list_id", help="list id")
+    sp.add_argument("--all", action="store_true", help="include closed tasks")
+    sp.add_argument("--archived", action="store_true", help="include archived tasks")
+    sp.add_argument("--subtasks", action="store_true", help="include subtasks")
+    sp.add_argument("--status", action="append", default=[],
+                    help="filter to a status name (repeatable)")
+    sp.add_argument("--limit", type=int, default=100, help="max tasks (paginates)")
+    sp.add_argument("--page", type=int, default=None,
+                    help="read a single 0-indexed page of 100 instead of paginating")
+
+    sp = sub.add_parser("task", help="show one task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--with-subtasks", action="store_true",
+                    help="attach the task's subtasks")
+    sp.add_argument("--custom-id", action="store_true",
+                    help="resolve <task> as a Custom Task ID (needs --workspace)")
+    sp.add_argument("--workspace", default=None, help="workspace id (for --custom-id)")
+
+    sp = sub.add_parser("task-context",
+                        help="task + comments + attachments + deps, one envelope")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--json", action="store_true",
+                    help="emit the assembled tree as JSON instead of markdown")
+
+    sp = sub.add_parser("comments", help="list a task's comments")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--limit", type=int, default=100)
+
+    sp = sub.add_parser("subtasks", help="list a task's subtasks")
+    sp.add_argument("task", help="task id or URL")
+
+    sp = sub.add_parser("deps", help="list a task's dependencies (or --dependents)")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--dependents", action="store_true",
+                    help="list what depends on this task instead of what it depends on")
+
+    sp = sub.add_parser("attachments", help="list a task's attachments")
+    sp.add_argument("task", help="task id or URL")
+
+    sp = sub.add_parser("find", help="resolve a task by Custom Task ID or custom-field key")
+    sp.add_argument("custom_id", nargs="?", default=None,
+                    help="a ClickApp Custom Task ID (omit when using --field)")
+    sp.add_argument("--field", default=None,
+                    help="custom field UUID to match on (the settable external-ID field)")
+    sp.add_argument("--value", default=None, help="the value to match (with --field)")
+    sp.add_argument("--workspace", required=True, help="workspace (team) id")
+
+    sp = sub.add_parser("field-get", help="read a task's custom field values")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("field", nargs="?", default=None,
+                    help="field UUID or name (optional; all fields if omitted)")
+
+    sp = sub.add_parser("assigned", help="tasks assigned to you, stalest first, with last-touch")
+    sp.add_argument("--workspace", required=True, help="workspace (team) id")
+    sp.add_argument("--assignee", default=None, help="user id (default: you)")
+    sp.add_argument("--all", action="store_true", help="include closed tasks")
+    sp.add_argument("--status", action="append", default=[],
+                    help="filter to a status name (repeatable)")
+    sp.add_argument("--limit", type=int, default=100)
+
+    sp = sub.add_parser("create", help="create a task in a list")
+    sp.add_argument("--list", required=True, dest="list_id", help="list id")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--desc", default=None, help="plain-text body; a file path, or '-'")
+    sp.add_argument("--markdown", default=None, help="markdown body; a file path, or '-'")
+    sp.add_argument("--assignee", action="append", default=[],
+                    help="assignee user id (repeatable)")
+    sp.add_argument("--status", default=None, help="initial status name")
+    sp.add_argument("--tag", action="append", default=[], help="tag name (repeatable)")
+    sp.add_argument("--priority", type=int, default=None,
+                    help="1=Urgent 2=High 3=Normal 4=Low")
+    sp.add_argument("--due-on", default=None, help="YYYY-MM-DD (all-day)")
+    sp.add_argument("--due-at", default=None, help="ISO8601 datetime")
+    sp.add_argument("--parent", default=None,
+                    help="parent task id — makes this a subtask (same list)")
+    sp.add_argument("--field", action="append", default=[], metavar="UUID=VALUE",
+                    help="set a custom field at creation (repeatable; e.g. an external-ID key)")
+
+    sp = sub.add_parser("update", help="update fields on a task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--name", default=None)
+    sp.add_argument("--desc", default=None, help="plain-text body; a file path, or '-'")
+    sp.add_argument("--markdown", default=None, help="markdown body; a file path, or '-'")
+    sp.add_argument("--status", default=None, help="status name")
+    sp.add_argument("--priority", type=int, default=None,
+                    help="1=Urgent 2=High 3=Normal 4=Low")
+    sp.add_argument("--due-on", default=None, help="YYYY-MM-DD (all-day)")
+    sp.add_argument("--due-at", default=None, help="ISO8601 datetime")
+    sp.add_argument("--add-assignee", action="append", default=[],
+                    help="user id to add as assignee (repeatable)")
+    sp.add_argument("--rem-assignee", action="append", default=[],
+                    help="user id to remove from assignees (repeatable)")
+    sp.add_argument("--archive", action="store_true", help="archive the task")
+
+    sp = sub.add_parser("comment", help="add a comment to a task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--text", default="-",
+                    help="comment text, a file path, or '-' for stdin")
+    sp.add_argument("--assignee", default=None,
+                    help="user id to assign + notify with the comment")
+    sp.add_argument("--notify-all", action="store_true",
+                    help="notify everyone on the task")
+
+    sp = sub.add_parser("complete", help="mark a task complete (via status)")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--reopen", action="store_true",
+                    help="set the first open status instead")
+    sp.add_argument("--force", action="store_true",
+                    help="complete even with incomplete dependencies")
+    sp.add_argument("--no-rollup", action="store_true",
+                    help="skip the parent roll-up + unblocked-dependent report")
+
+    sp = sub.add_parser("deliverable",
+                        help="create a paired request + dependent agent task")
+    sp.add_argument("--list", required=True, dest="list_id", help="list id")
+    sp.add_argument("--request-name", required=True,
+                    help="title of the human-owned request task")
+    sp.add_argument("--request-markdown", default=None,
+                    help="request body: markdown, a file path, or '-' for stdin")
+    sp.add_argument("--agent-name", required=True,
+                    help="title of the dependent agent task")
+    sp.add_argument("--agent-markdown", default=None,
+                    help="agent-task body: markdown, a file path, or '-' for stdin")
+    sp.add_argument("--supervisor", required=True,
+                    help="user id assigned the request (the human whose input is needed)")
+    sp.add_argument("--agent", required=True,
+                    help="user id assigned the dependent task")
+    sp.add_argument("--status", default=None, help="status name both tasks start in")
+    sp.add_argument("--parent", default=None,
+                    help="make the agent task a subtask of this task")
+    sp.add_argument("--state-field", default=None,
+                    help="custom field UUID to stamp {phase,last_touch} JSON into")
+
+    sp = sub.add_parser("assign", help="add/remove assignees on a task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--add", action="append", default=[], help="user id (repeatable)")
+    sp.add_argument("--rem", action="append", default=[], help="user id (repeatable)")
+
+    sp = sub.add_parser("watch", help="add/remove watchers on a task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--add", action="append", default=[], help="user id (repeatable)")
+    sp.add_argument("--rem", action="append", default=[], help="user id (repeatable)")
+
+    sp = sub.add_parser("tag-create", help="create a tag in a space")
+    sp.add_argument("--space", required=True, help="space id")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--fg", default=None, help="foreground colour hex")
+    sp.add_argument("--bg", default=None, help="background colour hex")
+
+    sp = sub.add_parser("tag-add", help="add a tag (by name) to a task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("tag", help="tag name")
+
+    sp = sub.add_parser("tag-remove", help="remove a tag from a task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("tag", help="tag name")
+
+    sp = sub.add_parser("dep-add", help="add dependency: <task> depends on --on ids")
+    sp.add_argument("task", help="the dependent task (waits on --on)")
+    sp.add_argument("--on", action="append", required=True,
+                    help="task id this task depends on (repeatable)")
+
+    sp = sub.add_parser("dep-remove", help="remove dependency links from <task>")
+    sp.add_argument("task", help="the dependent task")
+    sp.add_argument("--on", action="append", required=True,
+                    help="task id to unlink (repeatable)")
+
+    sp = sub.add_parser("field-set", help="set a custom field on a task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("field", help="custom field UUID (see `fields`)")
+    sp.add_argument("--value", required=True, help="the value to set")
+    sp.add_argument("--json", action="store_true",
+                    help="parse --value as JSON (typed/relationship fields)")
+
+    sp = sub.add_parser("field-clear", help="clear a custom field on a task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("field", help="custom field UUID")
+
+    sp = sub.add_parser("attach", help="upload a local file to a task")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("file", help="local file path to upload")
+    sp.add_argument("--name", default=None, help="override the attachment display name")
+
+    sp = sub.add_parser("list-create", help="create a list in a folder or space")
+    sp.add_argument("--folder", default=None, help="folder id")
+    sp.add_argument("--space", default=None, help="space id (folderless list)")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--content", default=None, help="list description")
+
+    sp = sub.add_parser("webhooks", help="list a workspace's webhooks")
+    sp.add_argument("--workspace", required=True, help="workspace (team) id")
+
+    sp = sub.add_parser("webhook-create", help="register a webhook")
+    sp.add_argument("--workspace", required=True, help="workspace (team) id")
+    sp.add_argument("--endpoint", required=True, help="HTTPS URL to deliver to")
+    sp.add_argument("--event", action="append", default=[],
+                    help="event name (repeatable); omit for all events")
+    sp.add_argument("--space", default=None, help="scope to a space id")
+    sp.add_argument("--folder", default=None, help="scope to a folder id")
+    sp.add_argument("--list", default=None, dest="list_id", help="scope to a list id")
+    sp.add_argument("--task", default=None, help="scope to a task id")
+
+    sp = sub.add_parser("webhook-delete",
+                        help="delete a webhook (stops deliveries; needs --yes)")
+    sp.add_argument("webhook", help="webhook id")
+    sp.add_argument("--yes", action="store_true", help="confirm the irreversible delete")
+
+    sp = sub.add_parser("task-delete", help="delete a task (irreversible; needs --yes)")
+    sp.add_argument("task", help="task id or URL")
+    sp.add_argument("--yes", action="store_true", help="confirm the irreversible delete")
+    sp.add_argument("--custom-id", action="store_true",
+                    help="resolve <task> as a Custom Task ID (needs --workspace)")
+    sp.add_argument("--workspace", default=None, help="workspace id (for --custom-id)")
+
+    # `--token-env <KEY>` and `--connection <id>` are global overrides accepted
+    # anywhere on the line (extracted before argparse so they work after the
+    # subcommand). --token-env names the env/cred key holding the token — never
+    # the value itself.
+    argv = sys.argv[1:]
+    token_key: str | None = None
+    wanted_conn: str | None = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--token-env" and i + 1 < len(argv):
+            token_key = argv[i + 1]; i += 2; continue
+        if a.startswith("--token-env="):
+            token_key = a.split("=", 1)[1]; i += 1; continue
+        if a == "--connection" and i + 1 < len(argv):
+            wanted_conn = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            wanted_conn = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+
+    args = p.parse_args(cleaned)
+
+    if args.cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+
+    reg, _ = _connections_registry()
+    if args.cmd == "doctor":
+        cmd_doctor(reg, wanted_conn, token_key)
+        return
+
+    cid, entry = _select_connection(reg, wanted_conn)
+    allow_write = WRITE_DEFAULT if entry is None else \
+        bool(entry.get("allow_write", WRITE_DEFAULT))
+    _write_gate(cid, allow_write, args.cmd)
+    if entry is None:
+        token = _load_token(token_key or "CLICKUP_API_TOKEN")
+    else:
+        key = token_key or entry.get("secret_env")
+        if not key:
+            _die(6, "no_secret_env", f"connection {cid!r} is missing 'secret_env'")
+        token = _load_token(key)
+
+    with _client(token) as c:
+        if args.cmd == "whoami":
+            _emit(cmd_whoami(c))
+        elif args.cmd == "workspaces":
+            _emit(cmd_workspaces(c))
+        elif args.cmd == "members":
+            _emit(cmd_members(c, args.workspace))
+        elif args.cmd == "spaces":
+            _emit(cmd_spaces(c, args.workspace))
+        elif args.cmd == "folders":
+            _emit(cmd_folders(c, args.space))
+        elif args.cmd == "lists":
+            _emit(cmd_lists(c, args.folder, args.space))
+        elif args.cmd == "statuses":
+            _emit(cmd_statuses(c, args.list_id))
+        elif args.cmd == "tags":
+            _emit(cmd_tags(c, args.space))
+        elif args.cmd == "fields":
+            _emit(cmd_fields(c, args.list_id))
+        elif args.cmd == "tasks":
+            _emit(cmd_tasks(c, args.list_id, args.all, args.archived,
+                            args.subtasks, args.status, args.limit, args.page))
+        elif args.cmd == "task":
+            _emit(cmd_task(c, args.task, args.with_subtasks,
+                           args.custom_id, args.workspace))
+        elif args.cmd == "task-context":
+            _emit(cmd_task_context(c, args.task, args.json))
+        elif args.cmd == "comments":
+            _emit(cmd_comments(c, args.task, args.limit))
+        elif args.cmd == "subtasks":
+            _emit(cmd_subtasks(c, args.task))
+        elif args.cmd == "deps":
+            _emit(cmd_deps(c, args.task, args.dependents))
+        elif args.cmd == "attachments":
+            _emit(cmd_attachments(c, args.task))
+        elif args.cmd == "find":
+            if args.field is not None:
+                if args.value is None:
+                    _die(6, "input", "--field requires --value")
+                _emit(cmd_find(c, args.workspace, field=args.field, value=args.value))
+            elif args.custom_id is not None:
+                _emit(cmd_find(c, args.workspace, custom_task_id=args.custom_id))
+            else:
+                _die(6, "input",
+                     "find needs a Custom Task ID, or --field UUID --value V")
+        elif args.cmd == "field-get":
+            _emit(cmd_field_get(c, args.task, args.field))
+        elif args.cmd == "assigned":
+            _emit(cmd_assigned(c, args.workspace, args.assignee, args.all,
+                               args.status, args.limit))
+        elif args.cmd == "create":
+            if args.desc is not None and args.markdown is not None:
+                _die(6, "conflicting_body", "pass only one of --desc / --markdown")
+            mode = "plain" if args.desc is not None else "markdown"
+            raw = args.desc if args.desc is not None else args.markdown
+            body = _read_text(raw) if raw is not None else None
+            _emit(cmd_create(c, args.list_id, args.name, body, mode,
+                             args.assignee, args.status, args.tag, args.priority,
+                             args.due_on, args.due_at, args.parent,
+                             _parse_fields(args.field)))
+        elif args.cmd == "update":
+            if args.desc is not None and args.markdown is not None:
+                _die(6, "conflicting_body", "pass only one of --desc / --markdown")
+            mode = "plain" if args.desc is not None else "markdown"
+            raw = args.desc if args.desc is not None else args.markdown
+            body = _read_text(raw) if raw is not None else None
+            _emit(cmd_update(c, args.task, args.name, body, mode, args.status,
+                             args.priority, args.due_on, args.due_at,
+                             args.add_assignee, args.rem_assignee, args.archive))
+        elif args.cmd == "comment":
+            _emit(cmd_comment(c, args.task, _read_text(args.text),
+                              args.assignee, args.notify_all))
+        elif args.cmd == "complete":
+            _emit(cmd_complete(c, args.task, args.reopen, args.force, args.no_rollup))
+        elif args.cmd == "deliverable":
+            if args.request_markdown == "-" and args.agent_markdown == "-":
+                _die(6, "two_stdin",
+                     "--request-markdown and --agent-markdown can't both be '-'",
+                     "only one can read stdin; pass the other inline or as a file path")
+            req_body = (_read_text(args.request_markdown)
+                        if args.request_markdown is not None else None)
+            ag_body = (_read_text(args.agent_markdown)
+                       if args.agent_markdown is not None else None)
+            _emit(cmd_deliverable(c, list_id=args.list_id,
+                                  request_name=args.request_name, request_body=req_body,
+                                  agent_name=args.agent_name, agent_body=ag_body,
+                                  supervisor=args.supervisor, agent=args.agent,
+                                  status=args.status, parent=args.parent,
+                                  state_field=args.state_field))
+        elif args.cmd == "assign":
+            _emit(cmd_assign(c, args.task, args.add, args.rem))
+        elif args.cmd == "watch":
+            _emit(cmd_watch(c, args.task, args.add, args.rem))
+        elif args.cmd == "tag-create":
+            _emit(cmd_tag_create(c, args.space, args.name, args.fg, args.bg))
+        elif args.cmd == "tag-add":
+            _emit(cmd_tag_add(c, args.task, args.tag))
+        elif args.cmd == "tag-remove":
+            _emit(cmd_tag_remove(c, args.task, args.tag))
+        elif args.cmd == "dep-add":
+            _emit(cmd_dep_add(c, args.task, args.on))
+        elif args.cmd == "dep-remove":
+            _emit(cmd_dep_remove(c, args.task, args.on))
+        elif args.cmd == "field-set":
+            _emit(cmd_field_set(c, args.task, args.field, args.value, args.json))
+        elif args.cmd == "field-clear":
+            _emit(cmd_field_clear(c, args.task, args.field))
+        elif args.cmd == "attach":
+            _emit(cmd_attach(token, args.task, args.file, args.name))
+        elif args.cmd == "list-create":
+            _emit(cmd_list_create(c, args.folder, args.space, args.name, args.content))
+        elif args.cmd == "webhooks":
+            _emit(cmd_webhooks(c, args.workspace))
+        elif args.cmd == "webhook-create":
+            _emit(cmd_webhook_create(c, args.workspace, args.endpoint, args.event,
+                                     args.space, args.folder, args.list_id, args.task))
+        elif args.cmd == "webhook-delete":
+            if not args.yes:
+                _die(6, "delete_requires_confirmation",
+                     "webhook-delete is destructive and needs --yes",
+                     "deleting a webhook stops all event delivery — confirm with the "
+                     "human, then re-run with --yes")
+            _emit(cmd_webhook_delete(c, args.webhook))
+        elif args.cmd == "task-delete":
+            if not args.yes:
+                _die(6, "delete_requires_confirmation",
+                     "task-delete is destructive and needs --yes",
+                     "deleting a task is irreversible — confirm with the human, "
+                     "then re-run with --yes")
+            _emit(cmd_task_delete(c, args.task, args.custom_id, args.workspace))
+
+
+if __name__ == "__main__":
+    main()
