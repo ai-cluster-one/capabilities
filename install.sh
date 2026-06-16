@@ -3,24 +3,22 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/install.sh | sh
 #
-# Pinned: TAG names the release this installer belongs to; SHA256 pins the
-# manager script it fetches. A release updates both together. Overrides:
-#   CAPABILITIES_TAG     fetch a different ref (empties the checksum pin)
+# By default this installs the latest manager from `main`. Overrides:
+#   CAPABILITIES_TAG     fetch a different ref
 #   CAPABILITIES_HOME    registry root            (default ~/.capabilities)
 #   CAPABILITIES_BIN     PATH dir for the symlink (default ~/.local/bin or
 #                        ~/bin, whichever exists and is on PATH)
+#   CAPABILITIES_SHA256  optionally verify the fetched manager script
 #
 # The installer prints its plan before acting, asks on a TTY, and is
 # idempotent — re-running refreshes the manager in place.
 
 set -eu
 
-TAG_PIN="v2.0.0"
-SHA256_PIN=""    # filled per release; empty = warn and proceed
+TAG_DEFAULT="main"
 
-TAG="${CAPABILITIES_TAG:-$TAG_PIN}"
-[ "$TAG" = "$TAG_PIN" ] || SHA256_PIN=""
-SHA256="${CAPABILITIES_SHA256:-$SHA256_PIN}"
+TAG="${CAPABILITIES_TAG:-$TAG_DEFAULT}"
+SHA256="${CAPABILITIES_SHA256:-}"
 
 REPO="https://raw.githubusercontent.com/ai-cluster-one/capabilities/$TAG"
 CAP_HOME="${CAPABILITIES_HOME:-$HOME/.capabilities}"
