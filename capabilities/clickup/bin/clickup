@@ -24,7 +24,12 @@ CONNECTIONS
     {
       "default": "<id>",
       "connections": {
-        "<id>": { "secret_env": "CLICKUP_<ID>_TOKEN", "allow_write": true }
+        "<id>": {
+          "secret_env": "CLICKUP_<ID>_TOKEN",
+          "allow_write": true,
+          "workspace_id": "123",
+          "external_id_field": "external_id"
+        }
       }
     }
   The registry resolves project envelope first, else the machine-level
@@ -33,7 +38,10 @@ CONNECTIONS
   The entry names the env var holding its token ("secret_env"); the value
   resolves through the cascade above. "allow_write": false makes the
   connection read-only: every mutating verb exits 4, and no flag lifts the
-  gate. Writes default to allowed (a workspace the consumer owns).
+  gate. Writes default to allowed (a workspace the consumer owns). Optional
+  non-secret settings can live on the entry too: "workspace_id" is the default
+  workspace/team for dedup queries; "external_id_field" (alias "external_id")
+  is the custom field UUID or field name used as the settable external-id key.
 
   Selection: --connection <id> (accepted anywhere on the command line).
   Unflagged, the registry's "default" pointer applies, else the sole entry;
@@ -48,6 +56,12 @@ Global option (accepted after any subcommand):
                       (e.g. CLICKUP_ALT_TOKEN=…) and pass
                       --token-env CLICKUP_ALT_TOKEN. It never lifts a
                       connection's write gate.
+
+  CLICKUP_WORKSPACE_ID and CLICKUP_EXTERNAL_ID_FIELD (alias CLICKUP_EXTERNAL_ID)
+  can also be set through the same cascade (project .env/.env.local,
+  ~/.config/clickup/credentials.env, process env). Connection entry values win
+  over env files. The external-id field may be a UUID or a field name resolvable
+  from the target list.
 
 THE HIERARCHY
   ClickUp nests Workspace (the API calls it a "team") > Space > Folder > List
@@ -128,12 +142,17 @@ Read:
                                               --dependents, what waits on it).
   clickup attachments <task>                  List a task's attachments (id +
                                               title + url; read from the task).
-  clickup find --workspace ID                 Resolve a task by a dedup key —
-        --field UUID --value V                 task JSON on a hit, null + exit 0 on
+  clickup find [--workspace ID] [--list ID]   Resolve a task by a dedup key —
+        --field UUID --value V                task JSON on a hit, null + exit 0 on
+        | --external-id V [--field FIELD]     a miss. --external-id uses the
+                                             configured external_id custom field
+                                             (or --field override, UUID/name);
+                                             --list resolves field names.
         | <custom-task-id>                     a miss. Two modes: --field/--value
                                               matches a custom field workspace-wide
                                               (the SETTABLE external-ID key — set it
-                                              with `create --field` or `field-set`);
+                                              with `create --external-id`,
+                                              `create --field`, or `field-set`);
                                               a bare <custom-task-id> is the ClickApp
                                               Custom Task ID lookup (read-only —
                                               ClickUp assigns those, the API cannot
@@ -153,6 +172,12 @@ Write:
         [--tag NAME ...] [--priority N]        --desc stores literal plain text.
         [--due-on YYYY-MM-DD]                  Pass at most one. '-' reads stdin.
         [--due-at ISO8601] [--parent ID]      --assignee repeatable (user id).
+        [--external-id V] [--workspace ID]     --external-id enforces a best-effort
+                                              dedup preflight against the configured
+                                              external_id custom field, then stamps
+                                              that field during creation. Requires
+                                              --workspace unless CLICKUP_WORKSPACE_ID
+                                              or connection workspace_id is set.
         [--field UUID=VALUE ...]              --priority 1=Urgent 2=High 3=Normal
                                               4=Low. --due-on is all-day; --due-at
                                               carries time-of-day; not both.
@@ -280,8 +305,10 @@ Notes:
     `deliverable --state-field`).
   - External-ID / dedup parity: ClickUp Custom Task IDs are read-only via the
     API, so the settable dedup key is a (UI-created) text custom field. Stamp it
-    at creation with `create --field <uuid>=<key>` and resolve it with
-    `find --field <uuid> --value <key>` — the analog of an external-id lookup.
+    at creation with `create --external-id <key>` after configuring
+    CLICKUP_EXTERNAL_ID_FIELD (or connection external_id_field), and resolve it
+    with `find --external-id <key>`. This is a best-effort create preflight, not
+    server-side uniqueness; concurrent producers can still race.
   - Tags are space-scoped and addressed by name (no tag ids).
   - Custom Task IDs are assigned by ClickUp's ClickApp and are read-only via
     the API: `find`/`task --custom-id` resolve by them, nothing sets them.
@@ -740,14 +767,16 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
 def _connections_report() -> dict:
     """The resolution report — every connection, every value, its winning tier
     and source, secrets masked. Local only: no network, no login attempt."""
-    reg, _ = _connections_registry()
+    reg, reg_file = _connections_registry()
     report: dict = {"default": None, "connections": {}}
     if reg is None:
         value, tier, source = _resolve_env_key("CLICKUP_API_TOKEN")
         report["default"] = "default"
+        settings = _connection_settings(None, None)
         report["connections"]["default"] = {
             "allow_write": WRITE_DEFAULT,
-            "keys": [_key_report("CLICKUP_API_TOKEN", True, True, value, tier, source)]}
+            "keys": [_key_report("CLICKUP_API_TOKEN", True, True, value, tier, source)],
+            "settings": settings}
         return report
     conns = reg["connections"]
     report["default"] = reg.get("default") or \
@@ -762,12 +791,58 @@ def _connections_report() -> dict:
             keys = [_key_report("secret_env", False, True, None, None, None)]
         report["connections"][cid] = {
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "keys": keys}
+            "keys": keys,
+            "settings": _connection_settings(entry, reg_file)}
     return report
 
 
 def _cmd_connections() -> None:
     _emit(_connections_report())
+
+
+# --- ClickUp-specific non-secret settings ------------------------------------
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _resolve_setting(entry: dict | None, reg_file: Path | None,
+                     entry_keys: tuple[str, ...], env_keys: tuple[str, ...]) \
+        -> tuple[str | None, str | None, Path | None, str | None]:
+    """Resolve a non-secret setting. Connection literals win, then env cascade."""
+    if isinstance(entry, dict):
+        for key in entry_keys:
+            val = str(entry.get(key) or "").strip()
+            if val:
+                return val, "connection", reg_file, key
+    for key in env_keys:
+        val, tier, source = _resolve_env_key(key)
+        if val:
+            return val.strip(), tier, source, key
+    return None, None, None, None
+
+
+def _connection_settings(entry: dict | None, reg_file: Path | None) -> dict:
+    field, field_tier, field_source, field_key = _resolve_setting(
+        entry, reg_file,
+        ("external_id_field", "external_id_field_id", "external_id"),
+        ("CLICKUP_EXTERNAL_ID_FIELD", "CLICKUP_EXTERNAL_ID_FIELD_ID",
+         "CLICKUP_EXTERNAL_ID"),
+    )
+    workspace, ws_tier, ws_source, ws_key = _resolve_setting(
+        entry, reg_file,
+        ("workspace_id", "workspace", "team_id"),
+        ("CLICKUP_WORKSPACE_ID", "CLICKUP_TEAM_ID"),
+    )
+    return {
+        "external_id_field": {"value": field, "tier": field_tier,
+                              "source": str(field_source) if field_source else None,
+                              "key": field_key},
+        "workspace_id": {"value": workspace, "tier": ws_tier,
+                         "source": str(ws_source) if ws_source else None,
+                         "key": ws_key},
+    }
 
 
 # --- Reference parsing -------------------------------------------------------
@@ -1019,6 +1094,34 @@ def cmd_tags(c: httpx.Client, space: str) -> list:
 
 def cmd_fields(c: httpx.Client, list_id: str) -> list:
     return _request(c, "GET", f"/list/{list_id}/field")["fields"]
+
+
+def _resolve_custom_field(c: httpx.Client, field: str | None,
+                          list_id: str | None = None,
+                          purpose: str = "custom field") -> str:
+    """Accept a custom field UUID, or a field name when a list is available."""
+    field = (field or "").strip()
+    if not field:
+        _die(6, "missing_field", f"no {purpose} configured",
+             "set connection external_id_field or CLICKUP_EXTERNAL_ID_FIELD, "
+             "or pass --field")
+    if _UUID_RE.match(field):
+        return field
+    if not list_id:
+        _die(6, "field_name_needs_list",
+             f"{purpose} {field!r} is a name, not a UUID",
+             "configure the field UUID, or pass --list where this command supports it")
+    matches = [f for f in cmd_fields(c, list_id)
+               if str(f.get("name") or "").lower() == field.lower()]
+    if not matches:
+        _die(3, "field_not_found",
+             f"no custom field named {field!r} on list {list_id}",
+             f"`clickup fields --list {list_id}` shows available fields")
+    if len(matches) > 1:
+        _die(6, "ambiguous_field",
+             f"several custom fields named {field!r} on list {list_id}",
+             "configure the field UUID instead of the name")
+    return str(matches[0].get("id"))
 
 
 # --- Commands: task reads ----------------------------------------------------
@@ -1283,10 +1386,30 @@ def cmd_create(c: httpx.Client, list_id: str, name: str, body: str | None,
                body_mode: str, assignees: list[str], status: str | None,
                tags: list[str], priority: int | None, due_on: str | None,
                due_at: str | None, parent: str | None,
-               custom_fields: list[dict] | None = None) -> dict:
+               custom_fields: list[dict] | None = None,
+               workspace: str | None = None, external_id: str | None = None,
+               external_id_field: str | None = None) -> dict:
     if due_on and due_at:
         _die(6, "conflicting_due", "pass only one of --due-on / --due-at",
              "--due-at carries the time-of-day; --due-on is all-day")
+    if external_id is not None:
+        external_id = str(external_id).strip()
+        if not external_id:
+            _die(6, "empty_external_id", "--external-id cannot be empty")
+        if not workspace:
+            _die(6, "missing_workspace",
+                 "--external-id dedup requires --workspace or configured workspace_id",
+                 "set connection workspace_id or CLICKUP_WORKSPACE_ID")
+        external_id_field = _resolve_custom_field(
+            c, external_id_field, list_id, purpose="external-id field")
+        existing = cmd_find(c, workspace, field=external_id_field, value=external_id)
+        if existing:
+            return {"deduped": True, "external_id": external_id,
+                    "external_id_field": external_id_field, "task": existing}
+        custom_fields = list(custom_fields or [])
+        custom_fields = [f for f in custom_fields
+                         if str(f.get("id")) != str(external_id_field)]
+        custom_fields.append({"id": external_id_field, "value": external_id})
     data: dict = {"name": name}
     data.update(_body_field(body, body_mode))
     if assignees:
@@ -1307,7 +1430,11 @@ def cmd_create(c: httpx.Client, list_id: str, name: str, body: str | None,
         data["parent"] = _ref(parent)
     if custom_fields:
         data["custom_fields"] = custom_fields
-    return _request(c, "POST", f"/list/{list_id}/task", json_body=data)
+    created = _request(c, "POST", f"/list/{list_id}/task", json_body=data)
+    if external_id is not None:
+        return {"deduped": False, "external_id": external_id,
+                "external_id_field": external_id_field, "task": created}
+    return created
 
 
 def cmd_update(c: httpx.Client, task: str, name: str | None, body: str | None,
@@ -1808,9 +1935,14 @@ def main() -> None:
     sp.add_argument("custom_id", nargs="?", default=None,
                     help="a ClickApp Custom Task ID (omit when using --field)")
     sp.add_argument("--field", default=None,
-                    help="custom field UUID to match on (the settable external-ID field)")
+                    help="custom field UUID/name to match on")
     sp.add_argument("--value", default=None, help="the value to match (with --field)")
-    sp.add_argument("--workspace", required=True, help="workspace (team) id")
+    sp.add_argument("--external-id", default=None,
+                    help="external id value; uses configured external_id field")
+    sp.add_argument("--workspace", default=None,
+                    help="workspace (team) id; default from connection/env")
+    sp.add_argument("--list", default=None, dest="list_id",
+                    help="list id used only to resolve field names to UUIDs")
 
     sp = sub.add_parser("field-get", help="read a task's custom field values")
     sp.add_argument("task", help="task id or URL")
@@ -1840,6 +1972,12 @@ def main() -> None:
     sp.add_argument("--due-at", default=None, help="ISO8601 datetime")
     sp.add_argument("--parent", default=None,
                     help="parent task id — makes this a subtask (same list)")
+    sp.add_argument("--external-id", default=None,
+                    help="dedup key to check and stamp in configured external_id field")
+    sp.add_argument("--external-id-field", default=None,
+                    help="override configured external_id field UUID/name")
+    sp.add_argument("--workspace", default=None,
+                    help="workspace id for external-id dedup; default from connection/env")
     sp.add_argument("--field", action="append", default=[], metavar="UUID=VALUE",
                     help="set a custom field at creation (repeatable; e.g. an external-ID key)")
 
@@ -2006,12 +2144,15 @@ def main() -> None:
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
 
-    reg, _ = _connections_registry()
+    reg, reg_file = _connections_registry()
     if args.cmd == "doctor":
         cmd_doctor(reg, wanted_conn, token_key)
         return
 
     cid, entry = _select_connection(reg, wanted_conn)
+    settings = _connection_settings(entry, reg_file)
+    default_workspace = settings["workspace_id"]["value"]
+    default_external_id_field = settings["external_id_field"]["value"]
     allow_write = WRITE_DEFAULT if entry is None else \
         bool(entry.get("allow_write", WRITE_DEFAULT))
     _write_gate(cid, allow_write, args.cmd)
@@ -2059,15 +2200,36 @@ def main() -> None:
         elif args.cmd == "attachments":
             _emit(cmd_attachments(c, args.task))
         elif args.cmd == "find":
-            if args.field is not None:
+            workspace = args.workspace or default_workspace
+            if args.external_id is not None:
+                if args.value is not None:
+                    _die(6, "input", "--external-id cannot be combined with --value")
+                if not workspace:
+                    _die(6, "missing_workspace",
+                         "find --external-id requires --workspace or configured workspace_id",
+                         "set connection workspace_id or CLICKUP_WORKSPACE_ID")
+                field = _resolve_custom_field(
+                    c, args.field or default_external_id_field, args.list_id,
+                    purpose="external-id field")
+                _emit(cmd_find(c, workspace, field=field, value=args.external_id))
+            elif args.field is not None:
                 if args.value is None:
                     _die(6, "input", "--field requires --value")
-                _emit(cmd_find(c, args.workspace, field=args.field, value=args.value))
+                if not workspace:
+                    _die(6, "missing_workspace",
+                         "find --field requires --workspace or configured workspace_id",
+                         "set connection workspace_id or CLICKUP_WORKSPACE_ID")
+                field = _resolve_custom_field(c, args.field, args.list_id)
+                _emit(cmd_find(c, workspace, field=field, value=args.value))
             elif args.custom_id is not None:
-                _emit(cmd_find(c, args.workspace, custom_task_id=args.custom_id))
+                if not workspace:
+                    _die(6, "missing_workspace",
+                         "find by Custom Task ID requires --workspace or configured workspace_id",
+                         "set connection workspace_id or CLICKUP_WORKSPACE_ID")
+                _emit(cmd_find(c, workspace, custom_task_id=args.custom_id))
             else:
                 _die(6, "input",
-                     "find needs a Custom Task ID, or --field UUID --value V")
+                     "find needs a Custom Task ID, --external-id V, or --field UUID --value V")
         elif args.cmd == "field-get":
             _emit(cmd_field_get(c, args.task, args.field))
         elif args.cmd == "assigned":
@@ -2082,7 +2244,10 @@ def main() -> None:
             _emit(cmd_create(c, args.list_id, args.name, body, mode,
                              args.assignee, args.status, args.tag, args.priority,
                              args.due_on, args.due_at, args.parent,
-                             _parse_fields(args.field)))
+                             _parse_fields(args.field),
+                             args.workspace or default_workspace,
+                             args.external_id,
+                             args.external_id_field or default_external_id_field))
         elif args.cmd == "update":
             if args.desc is not None and args.markdown is not None:
                 _die(6, "conflicting_body", "pass only one of --desc / --markdown")
