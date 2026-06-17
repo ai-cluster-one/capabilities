@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
+#     "qrcode>=7.4",
 #     "telethon>=1.36",
 # ]
 # ///
@@ -16,8 +17,9 @@ Agent startup protocol (this is a STATEFUL CLI — it holds a login session):
      is reachable, and the session is authorized.
   2. Exit 2 from doctor means the session is missing or expired — run
      `telegram login` (interactive: prompts for phone, the code Telegram sends, and a
-     2FA password if set). Login persists the session file; later commands reuse
-     it with no prompt.
+     2FA password if set), or `telegram login --qr` to scan from an already
+     authorized Telegram app. Login persists the session file; later commands
+     reuse it with no prompt.
   3. A healthy `telegram doctor` (exit 0) means ready to work.
 
 Configuration resolves as connections — named, complete resolutions of the app
@@ -65,7 +67,8 @@ unless a connection grants it. The implicit default cannot send; grant it with
 Commands:
   telegram help                                Print this document.
   telegram doctor                              Health check: creds + reachability + session.
-  telegram login                               Interactive first-time auth (phone + code).
+  telegram login [--qr]                        Interactive first-time auth (phone + code,
+                                               or scan a QR from an authorized app).
   telegram whoami                              Identity of the signed-in account.
   telegram chats [--limit N]                   List recent dialogs.
   telegram read <chat> [--limit N] [--since ISO] [--json]
@@ -129,6 +132,8 @@ Quirks worth knowing:
 
 import argparse
 import asyncio
+import getpass
+import io
 import json
 import os
 import sys
@@ -137,7 +142,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
 from telethon.errors.rpcerrorlist import (
     ApiIdInvalidError,
     AuthKeyUnregisteredError,
@@ -732,7 +737,8 @@ async def _require_auth(client: TelegramClient) -> None:
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
-        _die(2, "not_authorized", "not logged in to Telegram", "run: telegram login")
+        _die(2, "not_authorized", "not logged in to Telegram",
+             "run: telegram login  (or: telegram login --qr)")
 
 
 def _parse_since(since: str | None) -> datetime | None:
@@ -756,7 +762,8 @@ async def _check_connection(cfg: dict) -> dict:
         await client.connect()
         if not await client.is_user_authorized():
             return {"ok": False, "category": 2, "error": "not logged in",
-                    "hint": f"run: telegram login --connection {cfg['id']}"}
+                    "hint": (f"run: telegram login --connection {cfg['id']} "
+                             f"(or: telegram login --qr --connection {cfg['id']})")}
         me = await client.get_me()
         return {"ok": True, "reachable": True,
                 "account": entity_label(me), "id": me.id}
@@ -809,6 +816,51 @@ async def cmd_login(cfg: dict) -> dict:
     await client.disconnect()
     return {"ok": True, "connection": cfg["id"],
             "logged_in_as": entity_label(me), "id": me.id}
+
+
+def _show_qr_login(url: str, expires) -> None:
+    """Render the QR ceremony to stderr so stdout stays valid JSON."""
+    import qrcode
+
+    qr = qrcode.QRCode(border=2)
+    qr.add_data(url)
+    qr.make(fit=True)
+    buf = io.StringIO()
+    qr.print_ascii(out=buf, invert=True)
+    _log("Scan this QR with an already-authorized Telegram app:")
+    sys.stderr.write(buf.getvalue())
+    if not buf.getvalue().endswith("\n"):
+        sys.stderr.write("\n")
+    _log(f"Login URL: {url}")
+    _log(f"Expires:   {expires.isoformat()}")
+    _log("Waiting for scan/approval...")
+
+
+async def cmd_login_qr(cfg: dict) -> dict:
+    client = make_client(cfg)
+    try:
+        await client.connect()
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            return {"ok": True, "connection": cfg["id"],
+                    "logged_in_as": entity_label(me), "id": me.id,
+                    "already_authorized": True}
+
+        qr_login = await client.qr_login()
+        _show_qr_login(qr_login.url, qr_login.expires)
+        try:
+            me = await qr_login.wait()
+        except SessionPasswordNeededError:
+            password = getpass.getpass("Telegram 2FA password: ")
+            await client.sign_in(password=password)
+            me = await client.get_me()
+        except asyncio.TimeoutError:
+            _die(2, "qr_expired", "QR login expired before it was approved",
+                 "run `telegram login --qr` again to generate a fresh QR")
+        return {"ok": True, "connection": cfg["id"],
+                "logged_in_as": entity_label(me), "id": me.id}
+    finally:
+        await client.disconnect()
 
 
 async def cmd_whoami(cfg: dict) -> dict:
@@ -1273,7 +1325,9 @@ def main() -> None:
 
     sub.add_parser("help", help="print the full usage contract")
     sub.add_parser("doctor", help="health check: creds + reachability + session")
-    sub.add_parser("login", help="interactive first-time auth (phone + code)")
+    pl = sub.add_parser("login", help="interactive first-time auth (phone + code, or QR)")
+    pl.add_argument("--qr", action="store_true",
+                    help="scan a QR from an already-authorized Telegram app")
     sub.add_parser("whoami", help="identity of the signed-in account")
 
     pc = sub.add_parser("chats", help="list recent dialogs")
@@ -1352,7 +1406,7 @@ def main() -> None:
     _write_gate(cfg["id"], cfg["allow_write"], args.cmd)
     try:
         if args.cmd == "login":
-            _emit(asyncio.run(cmd_login(cfg)))
+            _emit(asyncio.run(cmd_login_qr(cfg) if args.qr else cmd_login(cfg)))
         elif args.cmd == "whoami":
             _emit(asyncio.run(cmd_whoami(cfg)))
         elif args.cmd == "chats":
@@ -1370,7 +1424,8 @@ def main() -> None:
             )))
     except (ApiIdInvalidError, AuthKeyUnregisteredError) as e:
         _die(2, "auth_failed", f"Telegram rejected the session/credentials: {e.__class__.__name__}",
-             "run `telegram login` to re-authenticate; verify TELEGRAM_API_ID / TELEGRAM_API_HASH")
+             "run `telegram login` or `telegram login --qr` to re-authenticate; "
+             "verify TELEGRAM_API_ID / TELEGRAM_API_HASH")
     except FloodWaitError as e:
         _die(5, "flood_wait", f"Telegram rate limit — wait {e.seconds}s before retrying",
              "back off and retry later", status=420)

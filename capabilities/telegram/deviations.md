@@ -10,7 +10,7 @@ The intent holds: fail fast and clearly, absorb transient rate-limits, a stable 
 
 ## Stateful session; the secret is not a flat token
 
-Auth is a login *ceremony*, not a header value. A connection identifies the app — `api_id` literally, the app hash by `secret_env` indirection (the implicit default rides the bare `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` cascade) — and a persisted **session file** holds the account login. So a connection resolves the app id/hash and a session *path*; the session *file* itself is produced by `telegram login`, not by any cascade tier. Per SHEBANG's stateful-CLI guidance, `help` opens with the startup protocol and `doctor` doubles as the session-health/recovery point (`doctor` exit 2 → `telegram login`).
+Auth is a login *ceremony*, not a header value. A connection identifies the app — `api_id` literally, the app hash by `secret_env` indirection (the implicit default rides the bare `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` cascade) — and a persisted **session file** holds the account login. So a connection resolves the app id/hash and a session *path*; the session *file* itself is produced by `telegram login`, not by any cascade tier. `telegram login --qr` is the same ceremony through Telethon's QR login token: it still needs the app id/hash and still persists the same session file, but the user approves it from an already-authorized Telegram app instead of entering an SMS/app code. Per SHEBANG's stateful-CLI guidance, `help` opens with the startup protocol and `doctor` doubles as the session-health/recovery point (`doctor` exit 2 → `telegram login` or `telegram login --qr`).
 
 ## Per-connection sessions; the implicit default's is un-keyed
 
