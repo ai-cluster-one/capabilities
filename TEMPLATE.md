@@ -63,7 +63,7 @@ The capability declares itself host-neutrally; the **manager owns the injection*
 
 Through that same CLI route a capability's **guides** reach the agent: `<name> guide [topic]` resolves against the capability's declared docs base and prints the doc, fetched **live** (the request, cache, and fallback mechanics are the executable standard's — [SHEBANG.md](SHEBANG.md#guides)). A guide is never copied into a consuming project; a project's reference points to it by role (DOCTRINE rule 14).
 
-The Codex host swaps the placement, not the composition: the same skill file at `~/.agents/skills/capabilities/`, and `capabilities context --codex` upserting the managed block in `AGENTS.md`. Another host swaps the injection while the registry and the CLI-on-`PATH` route stay the same.
+The Codex host swaps the placement, not the composition: the same skill file at `~/.agents/skills/capabilities/`, and `capabilities init --codex` wires Codex's internal project-context path by generating `.codex/config.toml`, `.codex/hooks.json`, `.codex/hooks/build-context.sh`, and `.codex/generated/` context artifacts. The context compiler is manager-owned host wiring, not a human customization surface; every `capabilities init --codex` overwrites it with the canonical compiler. `capabilities context --codex` refreshes the capabilities fragment consumed by that compiler. No project-root instruction markdown file is required or assumed. Another host swaps the injection while the registry and the CLI-on-`PATH` route stay the same.
 
 ## Settings vs identifiers vs reference
 

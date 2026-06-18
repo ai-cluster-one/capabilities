@@ -73,4 +73,4 @@ case ":$PATH:" in
 esac
 
 printf 'installed: %s -> %s\n' "$BIN_DIR/capabilities" "$MANAGER"
-printf 'next:      capabilities list · capabilities install <name> · capabilities init (in a project)\n'
+printf 'next:      capabilities list · capabilities install <name> · capabilities init --codex (Codex context wiring) or --claude (Claude Code project)\n'

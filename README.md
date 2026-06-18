@@ -79,7 +79,7 @@ Bootstrap installs **one** thing — the `capabilities` manager:
 curl -fsSL https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/install.sh | sh
 ```
 
-- **Install one** → `capabilities install asana` fetches the script into the registry, symlinks it onto `PATH`, snapshots its declaration, and scaffolds credentials per its declared scope. In a consuming project, `capabilities init` wires the session injection and `capabilities enable asana` makes it visible there.
+- **Install one** → `capabilities install asana` fetches the script into the registry, symlinks it onto `PATH`, snapshots its declaration, and scaffolds credentials per its declared scope. In a consuming project, `capabilities init --codex` wires Codex's generated context compiler (`.codex/config.toml`, `.codex/hooks.json`, manager-owned `.codex/hooks/build-context.sh`, `.codex/generated/`); `capabilities init --claude`, or bare `capabilities init`, wires Claude Code. `capabilities enable asana` makes it visible there.
 - **Package your own** → the convention works on *your* tools, not just this catalogue. `capabilities new` emits the authoring procedure with your context filled in — what you have, whether it should be a capability at all, and how to build a conformant one; `capabilities conform` does the same for a script you already own. Install the result from disk: `capabilities install <name> --from <path>`.
 - **Maintain** → `capabilities update` pulls newer versions, `capabilities uninstall` removes cleanly, `capabilities doctor` reconciles the machine, `capabilities audit <name>` checks a capability against the contract, and `capabilities groom <name>` reviews an installed one for drift and dead weight.
 
