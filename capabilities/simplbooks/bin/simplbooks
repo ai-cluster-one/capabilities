@@ -1426,11 +1426,16 @@ def build_http(cookies: dict, account: str, ajax: bool = False) -> httpx.Client:
     return httpx.Client(cookies=cookies, headers=headers, follow_redirects=False, timeout=30)
 
 
+def _session_stale(r: httpx.Response) -> bool:
+    """SSO redirect (301/302, caught by is_redirect) or a hard 401 — session expired, a re-login retry is warranted."""
+    return r.is_redirect or r.status_code == 401
+
+
 def fetch_add_page(http: httpx.Client, account: str, path: str = "invoices/add") -> str:
     """GET an add-form page, recovering once via auto-login if the session is
     stale. Returns the page HTML — callers extract csrf / vat_types / creator."""
     r = http.get(f"{BASE}/{account}/{path}")
-    if r.is_redirect or r.status_code in (301, 302):
+    if _session_stale(r):
         # Session is stale. Try auto-login + retry once with refreshed cookies.
         # auto_login_attempt raises AuthError if it can't recover — that propagates.
         auto_login_attempt(interactive=False)
@@ -1438,7 +1443,7 @@ def fetch_add_page(http: httpx.Client, account: str, path: str = "invoices/add")
         new_cookies = parse_cookie_string(creds["SIMPLBOOKS_COOKIE"])
         http.cookies = httpx.Cookies(new_cookies)
         r = http.get(f"{BASE}/{account}/{path}")
-        if r.is_redirect or r.status_code in (301, 302):
+        if _session_stale(r):
             raise AuthError(
                 f"Session still invalid after auto-login (HTTP {r.status_code}).\n"
                 "  → fallback: simplbooks refresh /path/to/fresh-curl.txt"
@@ -1661,15 +1666,15 @@ def cmd_doctor() -> None:
     with build_http(cookies, account) as http:
         r = http.get(f"{BASE}/{account}/invoices/add")
         click.echo(f"GET /invoices/add: HTTP {r.status_code}")
-        if r.status_code in (301, 302):
-            click.secho(f"⚠ session expired (redirect to {r.headers.get('location','?')})", fg="yellow")
+        if _session_stale(r):
+            click.secho(f"⚠ session expired (HTTP {r.status_code})", fg="yellow")
             # auto_login_attempt raises AuthError on failure → click handles exit 2.
             auto_login_attempt(interactive=False)
             cookies, account = session_or_die()
             http.cookies = httpx.Cookies(cookies)
             r = http.get(f"{BASE}/{account}/invoices/add")
             click.echo(f"after auto-login : HTTP {r.status_code}")
-            if r.status_code in (301, 302):
+            if _session_stale(r):
                 click.secho("✗ session still invalid after auto-login", fg="red")
                 click.echo("  → fallback: simplbooks refresh /path/to/fresh-curl.txt")
                 sys.exit(2)
@@ -3427,7 +3432,7 @@ def _scrape_purchase_edit_form(http: httpx.Client, account: str, purchase_id: in
     - `csrf` is the freshly-scraped token.
     """
     r = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
-    if r.is_redirect or r.status_code in (301, 302):
+    if _session_stale(r):
         auto_login_attempt(interactive=False)
         creds = load_credentials()
         http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
@@ -4416,7 +4421,7 @@ def _scrape_kanne_edit_form(
     - `csrf`       — the form's token (re-scrape from /add before POST to be safe).
     """
     r = http.get(f"{BASE}/{account}/financial_transactions/edit/{kanne_id}")
-    if r.is_redirect or r.status_code in (301, 302):
+    if _session_stale(r):
         auto_login_attempt(interactive=False)
         creds = load_credentials()
         http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
@@ -5109,7 +5114,7 @@ def _bt_fetch_process_page(http: httpx.Client, account: str, *, limit: int = 200
         params.append(("filters[date_to]", date_to))
     qs = urlencode(params)
     r = http.get(f"{BASE}/{account}/{BT_BASE_PATH}?{qs}")
-    if r.is_redirect or r.status_code in (301, 302):
+    if _session_stale(r):
         auto_login_attempt(interactive=False)
         creds = load_credentials()
         http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
