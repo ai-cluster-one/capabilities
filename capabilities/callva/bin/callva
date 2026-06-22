@@ -898,10 +898,14 @@ def _pick(obj, keys):
 
 
 def _slim_options(options):
-    """Collapse options to just values: [{"value":"a","label":"A"}] -> ["a"]."""
+    """Slim each option to its {value, label} pair, always keeping both.
+    [{"value":"a","label":"A","x":1}] -> [{"value":"a","label":"A"}]
+    Non-dict options pass through unchanged: "a" -> "a"."""
     if not options or not isinstance(options, list):
         return options
-    return [o.get("value", o) for o in options if isinstance(o, dict)]
+    return [{"value": o.get("value"), "label": o.get("label")}
+            if isinstance(o, dict) else o
+            for o in options]
 
 
 def _apply_slim(result, item_fn):
