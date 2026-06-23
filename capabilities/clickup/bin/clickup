@@ -194,10 +194,20 @@ Write:
         [--rem-assignee ID ...] [--archive]    add/remove set, not a replace).
                                               --archive archives the task.
   clickup comment <task> [--text TEXT|-]      Add a comment to a task. --assignee
-        [--assignee ID] [--notify-all]        assigns + notifies that user;
+        [--assignee ID] [--notify-all]        assigns + notifies that user (an
+        [--mention USER ...]                  ASSIGNED comment — carries a
+                                              resolved state, see comment-resolve);
                                               --notify-all notifies everyone on
-                                              the task. (ClickUp comments are
-                                              plain text — no @mention segment.)
+                                              the task; --mention @-mentions a
+                                              user id (repeatable) and fires the
+                                              "Mentioning me" inbox notification
+                                              without the assigned-comment baggage.
+                                              --text composes with --mention; with
+                                              only --mention the text is omitted.
+  clickup comment-resolve <comment_id>        Mark a comment resolved (clears the
+                                              Incomplete Warning ClickApp nag for
+                                              ASSIGNED comments). Get <comment_id>
+                                              from `comments <task>`.
   clickup complete <task> [--reopen]          Mark a task complete by setting its
         [--force] [--no-rollup]               list's closed status (--reopen sets
                                               the first open status). REFUSES
@@ -347,7 +357,7 @@ CRED_KEYS = [
      "note": "personal API token (pk_…; default identity, alternates via --token-env)"},
 ]
 WRITE_VERBS = {     # domain verbs that mutate ClickUp
-    "create", "update", "comment", "complete", "assign", "watch",
+    "create", "update", "comment", "comment-resolve", "complete", "assign", "watch",
     "tag-create", "tag-add", "tag-remove", "dep-add", "dep-remove",
     "field-set", "field-clear", "attach", "list-create", "deliverable",
     "task-delete", "webhook-create", "webhook-delete",
@@ -1471,11 +1481,37 @@ def cmd_update(c: httpx.Client, task: str, name: str | None, body: str | None,
 
 
 def cmd_comment(c: httpx.Client, task: str, text: str,
-                assignee: str | None, notify_all: bool) -> dict:
-    data: dict = {"comment_text": text, "notify_all": notify_all}
+                assignee: str | None, notify_all: bool,
+                mentions: list[str] | None = None) -> dict:
+    data: dict = {"notify_all": notify_all}
     if assignee:
         data["assignee"] = int(assignee) if str(assignee).isdigit() else assignee
+    if mentions:
+        # Structured `comment` array with tag segments fires the "Mentioning me"
+        # inbox notification. ClickUp renders tags inline as "@username"; we
+        # interleave them with the user's text and also send comment_text so
+        # legacy/plain renderers still show something readable.
+        segments: list = []
+        for uid in mentions:
+            try:
+                user_id = int(uid)
+            except (TypeError, ValueError):
+                _die(6, "invalid_mention", f"--mention requires a numeric user id (got {uid!r})")
+            segments.append({"type": "tag", "user": {"id": user_id}})
+            segments.append({"text": " "})
+        if text:
+            segments.append({"text": text})
+        data["comment"] = segments
+        data["comment_text"] = " ".join(f"@{uid}" for uid in mentions) + ((" " + text) if text else "")
+    else:
+        data["comment_text"] = text
     return _request(c, "POST", f"/task/{_ref(task)}/comment", json_body=data)
+
+
+def cmd_comment_resolve(c: httpx.Client, comment_id: str) -> dict:
+    _request(c, "PUT", f"/comment/{comment_id}",
+             json_body={"resolved": True})
+    return {"comment_id": str(comment_id), "resolved": True}
 
 
 def cmd_assign(c: httpx.Client, task: str, add: list[str], rem: list[str]) -> dict:
@@ -1999,12 +2035,20 @@ def main() -> None:
 
     sp = sub.add_parser("comment", help="add a comment to a task")
     sp.add_argument("task", help="task id or URL")
-    sp.add_argument("--text", default="-",
-                    help="comment text, a file path, or '-' for stdin")
+    sp.add_argument("--text", default=None,
+                    help="comment text, a file path, or '-' for stdin "
+                         "(default: stdin if no --mention, else empty)")
     sp.add_argument("--assignee", default=None,
                     help="user id to assign + notify with the comment")
     sp.add_argument("--notify-all", action="store_true",
                     help="notify everyone on the task")
+    sp.add_argument("--mention", action="append", default=[],
+                    help="user id to @mention (repeatable); fires the "
+                         "'Mentioning me' inbox notification, composes with --text")
+
+    sp = sub.add_parser("comment-resolve",
+                        help="mark a comment resolved (clears the Incomplete Warning nag)")
+    sp.add_argument("comment_id", help="comment id (from `comments`)")
 
     sp = sub.add_parser("complete", help="mark a task complete (via status)")
     sp.add_argument("task", help="task id or URL")
@@ -2258,8 +2302,17 @@ def main() -> None:
                              args.priority, args.due_on, args.due_at,
                              args.add_assignee, args.rem_assignee, args.archive))
         elif args.cmd == "comment":
-            _emit(cmd_comment(c, args.task, _read_text(args.text),
-                              args.assignee, args.notify_all))
+            if args.text is None:
+                text = "" if args.mention else _read_text("-")
+            else:
+                text = _read_text(args.text)
+            if not text and not args.mention:
+                _die(6, "empty_comment",
+                     "comment requires --text and/or --mention")
+            _emit(cmd_comment(c, args.task, text,
+                              args.assignee, args.notify_all, args.mention))
+        elif args.cmd == "comment-resolve":
+            _emit(cmd_comment_resolve(c, args.comment_id))
         elif args.cmd == "complete":
             _emit(cmd_complete(c, args.task, args.reopen, args.force, args.no_rollup))
         elif args.cmd == "deliverable":
