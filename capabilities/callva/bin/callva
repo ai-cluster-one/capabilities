@@ -153,7 +153,8 @@ Commands (`-f key=value` is repeatable for list filters):
                           [--settings JSON | --data JSON]
   automations delete <id>
   automations code <id>
-  automations deploy <id> (--file F | --code C) [--language deno]
+  automations deploy <id> (--file F | --code C)
+                          [--language bun|deno|python3|bash|go|nativets]
   automations run <id> [--args JSON | --args-file F]
   automations runs <id> [--per-page N]
   automations all-runs [--per-page N] [--page N] [-f k=v ...]
@@ -1995,7 +1996,9 @@ def build_parser():
     aut_dep.add_argument("id", help="Automation UUID")
     aut_dep.add_argument("--file", dest="code_file", help="Script file path (- for stdin)")
     aut_dep.add_argument("--code", help="Inline script code")
-    aut_dep.add_argument("--language", default="deno", choices=["deno"], help="Script language (default: deno)")
+    aut_dep.add_argument("--language", default="deno",
+                         choices=["bun", "deno", "python3", "bash", "go", "nativets"],
+                         help="Script language (default: deno)")
     aut_run = aut_sub.add_parser("run", help="Trigger execution")
     aut_run.add_argument("id", help="Automation UUID")
     aut_run.add_argument("--args", dest="run_args", type=parse_json_arg,
