@@ -1472,9 +1472,21 @@ def _audit_script(name: str, script: Path) -> list[str]:
             if verb not in out:
                 failures.append(f"help: contract verb {verb!r} undocumented")
 
-    # the gate, exercised in a sandbox — disabled / enabled / absent
-    with tempfile.TemporaryDirectory() as td:
+    # the gate, exercised in a sandbox — disabled / enabled / absent.
+    # A second throwaway dir isolates the XDG/HOME surface: the verdict must not
+    # depend on the developer's real ~/.config or ~/.local/state. A live
+    # connections.json there would otherwise leak into the registry-free
+    # 'implicit' check, so every sandboxed run resolves config and state from
+    # nothing. The home lives outside the sandbox to leave project-root walking
+    # (which stops at $HOME) untouched.
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as home_td:
         sandbox = Path(td)
+        home = Path(home_td)
+        env = {**env, "HOME": str(home),
+               "XDG_CONFIG_HOME": str(home / "config"),
+               "XDG_STATE_HOME": str(home / "state"),
+               "XDG_DATA_HOME": str(home / "data"),
+               "XDG_CACHE_HOME": str(home / "cache")}
         for state, expect in (("disabled", 4), ("enabled", 0), ("absent", 0)):
             capdir = sandbox / ".capabilities"
             if state == "absent":
