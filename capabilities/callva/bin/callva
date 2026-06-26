@@ -271,8 +271,11 @@ WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platfor
     "variables create", "variables update", "variables delete",
 }
 WRITE_DEFAULT = True    # writes stay inside a tenant the consumer owns
-DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
-TOPICS: list = []   # shipped guide topics
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/callva/guides/")
+TOPICS = ["automation-authoring", "batch-processing", "dry-run-pattern",
+          "idempotency", "multi-phase-pipelines", "prompt-authoring",
+          "resilience-and-retries", "timezone-handling"]
 STATE = False       # True when the capability writes session/cache state
 POST_INSTALL: list = []
 
