@@ -3174,6 +3174,7 @@ def build_purchase_fields(
     invoice_date: datetime,
     due_date: datetime,
     currency_code: str,
+    currency_rate: float,
     lines: list[dict],
     vat_total: str,
     row_sum_with_vat: bool,
@@ -3217,7 +3218,7 @@ def build_purchase_fields(
         ("data[Purchase][transaction_date]", inv_dot),
         ("data[Purchase][due]", due_dot),
         ("data[Purchase][currency_name]", currency_code),
-        ("data[Purchase][currency_rate]", "1.0000"),
+        ("data[Purchase][currency_rate]", f"{currency_rate:.4f}"),
         # reference is SB's Viitenumber — a checksummed numeric payment-reference
         # field; free text in it makes the save fail. Free-form text belongs in
         # payment_description (Makse kirjeldus).
@@ -3271,6 +3272,11 @@ def build_purchase_fields(
 @click.option("--date", "invoice_date", required=True, help="Invoice date YYYY-MM-DD.")
 @click.option("--due", "due_date", default=None, help="Due date YYYY-MM-DD. Defaults to invoice date.")
 @click.option("--currency", default="EUR", show_default=True)
+@click.option("--rate", "currency_rate", default=1.0, show_default=True, type=float,
+              help="Document-currency → EUR exchange rate. Default 1.0 leaves EUR invoices "
+                   "unchanged. For a foreign-currency invoice settled via a EUR bank debit, "
+                   "set --rate = (actual EUR settled) / (foreign-currency invoice total) so "
+                   "the EUR-equivalent ties to the real debit to the cent.")
 @click.option("--vat-total", default=None,
               help="Total VAT amount. Defaults to the row-derived total (0 when all rows "
                    "are 0%-rate, e.g. reverse-charge). Pass explicitly only to correct "
@@ -3298,7 +3304,8 @@ def build_purchase_fields(
 @click.option("--dry-run", is_flag=True,
               help="Resolve everything and print the payload WITHOUT creating the invoice.")
 def expenses_create(supplier_id: int, number: str, internal_number: str, invoice_date: str,
-                    due_date: str | None, currency: str, vat_total: str | None, rounding: str,
+                    due_date: str | None, currency: str, currency_rate: float,
+                    vat_total: str | None, rounding: str,
                     row_sum_with_vat: bool, lines_raw: tuple[str, ...], attachment_path: str | None,
                     reference: str, comments: str, creator: str, dry_run: bool) -> None:
     """Create a purchase invoice (ostuarve), optionally attaching the source PDF.
@@ -3306,6 +3313,9 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
     Each --line is a colon-separated set of `key=value` pairs:
       acct=126:vat_type=34:vat=24:name=Office supplies:sum=82,18
     """
+    if currency_rate <= 0:
+        raise click.ClickException(f"--rate must be a positive number, got {currency_rate}.")
+
     cookies, account = session_or_die()
     cache = load_clients_cache()
     if str(supplier_id) not in cache:
@@ -3359,6 +3369,7 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
             invoice_date=inv_dt,
             due_date=due_dt,
             currency_code=currency,
+            currency_rate=currency_rate,
             lines=lines,
             vat_total=vat_total,
             row_sum_with_vat=row_sum_with_vat,
