@@ -5403,6 +5403,59 @@ def _bt_check_save_response(r: httpx.Response, kind: str) -> None:
             )
 
 
+def _bt_recover_money_id(
+    r: httpx.Response, direction: str, *,
+    bt_id: int, sum_amount: str, date_str: str, description: str,
+) -> int:
+    """Recover the id of the money object that /bank_transactions/save just made.
+
+    PRIMARY: parse the 302 Location header — same pattern as _create_money.
+    FALLBACK: bounded /listdata lookup, matched on amount + date + description.
+    If exactly one row matches, trust it; otherwise refuse to guess and surface
+    the manual bind command instead. We never bind to an ambiguous id.
+    """
+    endpoint = "payments" if direction == "Payment" else "incomings"
+    loc = r.headers.get("location", "")
+    m = re.search(rf"/{endpoint}/view/(\d+)", loc)
+    if m:
+        return int(m.group(1))
+
+    try:
+        rows = _list_money(endpoint, search=description or "", limit=100)
+    except click.ClickException:
+        rows = []
+    want_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+    try:
+        want_sum = _amount_float(sum_amount)
+    except (ValueError, click.ClickException):
+        want_sum = None
+
+    def _matches(row: dict) -> bool:
+        if strip_html(row.get("date") or "")[:10] != want_date:
+            return False
+        try:
+            s = _amount_float(row.get("sum") or "")
+        except (ValueError, click.ClickException):
+            return False
+        if want_sum is None or abs(s - want_sum) > 0.005:
+            return False
+        if description and description not in strip_html(row.get("description") or ""):
+            return False
+        return True
+
+    cands = [row for row in rows if _matches(row)]
+    if len(cands) == 1:
+        return int(cands[0]["id"])
+
+    flag = "--to-purchase" if direction == "Payment" else "--to-invoice"
+    detail = "no list match" if not cands else f"{len(cands)} ambiguous matches"
+    raise click.ClickException(
+        f"BT {bt_id} saved as {endpoint[:-1]} (unbound), but the created id "
+        f"could not be safely recovered ({detail}). Find it by hand and bind: "
+        f"simplbooks {endpoint} bind <{endpoint[:-1]}-id> {flag} <id>"
+    )
+
+
 @bank_transactions.command("save")
 @click.argument("bt_id", type=int)
 @click.option("--as", "save_as", required=True,
@@ -5472,22 +5525,48 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
         desc = description if description is not None else (row['transaction_note'] or "")
 
         direction = "Incoming" if save_as == "incoming" else "Payment"
+        # Save CLEAN: never embed bind ids in /bank_transactions/save. SB
+        # accepts the form with a purchase_id/invoice_id and silently no-ops
+        # or partial-applies the binding, so save can report 200 while the
+        # money document still carries an unallocated remainder. The verified
+        # binding path is _do_bind — it posts to do_binding and reads the
+        # 'Katte summa' column back per target.
         fields = _bt_money_save_fields(
             direction=direction, bt_id=bt_id, csrf=csrf,
-            client=client, bind_ids=bind_ids,
+            client=client, bind_ids=[],
             income_account_id=cashbook_id,
             sum_amount=effective_sum, date=dt, description=desc,
             object_type=payment_object_type,
         )
         r = _bt_post_save(cookies, account, fields)
         _bt_check_save_response(r, save_as)
-        click.secho(f"✓ Saved BT {bt_id} as {save_as}", fg="green", bold=True)
+        money_id = _bt_recover_money_id(
+            r, direction, bt_id=bt_id,
+            sum_amount=effective_sum, date_str=effective_date, description=desc,
+        )
+        endpoint = "payments" if direction == "Payment" else "incomings"
+        click.secho(f"✓ Saved BT {bt_id} as {save_as} ({endpoint[:-1]} {money_id})",
+                    fg="green", bold=True)
         click.echo(f"  Client    : {client_id}  ({strip_html(client.get('name', ''))})")
-        if bind_ids:
-            label = "invoices" if save_as == "incoming" else "purchases"
-            click.echo(f"  Bound to  : {label} {bind_ids}")
         click.echo(f"  Sum       : {effective_sum} EUR  on {effective_date}")
         click.echo(f"  Bank acct : cashbook {cashbook_id}")
+        if not bind_ids:
+            return
+        try:
+            bound = _do_bind(direction, money_id, bind_ids)
+        except click.ClickException as e:
+            flag = "--to-purchase" if direction == "Payment" else "--to-invoice"
+            args = " ".join(f"{flag} {b}" for b in bind_ids)
+            raise click.ClickException(
+                f"{e.message} BT {bt_id} was saved as {endpoint[:-1]} "
+                f"{money_id} (unbound). Retry the bind by hand: "
+                f"simplbooks {endpoint} bind {money_id} {args}"
+            )
+        label = "invoices" if save_as == "incoming" else "purchases"
+        click.secho(f"✓ Bound {endpoint[:-1]} {money_id} → {label} {bind_ids}",
+                    fg="green")
+        for tid, katte in bound.items():
+            click.echo(f"  {label[:-1]} {tid}: allocated {katte or '?'}")
         return
 
     # save_as == "kanne"
