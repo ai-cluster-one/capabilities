@@ -651,7 +651,8 @@ def _build_conn(cid: str, entry: dict | None, args) -> tuple[dict | None, dict |
                 "hint": "set WINDMILL_WORKSPACE in a project .env, the user "
                         "config, the environment, or pass --workspace"}
         return {"id": cid, "allow_write": WRITE_DEFAULT, "url": url.rstrip("/"),
-                "token": token, "workspace": workspace}, None
+                "token": token, "workspace": workspace,
+                "script_timeout_default": None, "script_timeout_min": None}, None
     url = getattr(args, "url", None) or entry.get("url")
     workspace = getattr(args, "workspace", None) or entry.get("workspace")
     secret_env = entry.get("secret_env")
@@ -670,7 +671,9 @@ def _build_conn(cid: str, entry: dict | None, args) -> tuple[dict | None, dict |
         return None, {"exit": 6, "code": "incomplete_connection",
                       "message": f"connection {cid!r} missing: {', '.join(missing)}"}
     return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "url": url.rstrip("/"), "token": token, "workspace": workspace}, None
+            "url": url.rstrip("/"), "token": token, "workspace": workspace,
+            "script_timeout_default": entry.get("script_timeout_default"),
+            "script_timeout_min": entry.get("script_timeout_min")}, None
 
 
 def _resolve_conn(args) -> dict:
@@ -681,6 +684,25 @@ def _resolve_conn(args) -> dict:
         _die(problem["exit"], problem["code"], problem["message"],
              problem.get("hint"))
     return conn
+
+
+def _resolve_deploy_timeout(flag: int | None, conn: dict) -> int:
+    """Pick the deploy timeout — explicit flag, else the connection's
+    script_timeout_default, else 600 — then enforce script_timeout_min as a
+    hard floor. An explicit flag below the floor refuses the deploy."""
+    floor = conn.get("script_timeout_min")
+    if flag is not None:
+        if floor is not None and flag < floor:
+            _die(6, "timeout_below_floor",
+                 f"--timeout {flag} is below the connection floor "
+                 f"script_timeout_min={floor}",
+                 f"raise --timeout to at least {floor} or relax the "
+                 f"connection's script_timeout_min")
+        return flag
+    resolved = conn.get("script_timeout_default") or 600
+    if floor is not None and resolved < floor:
+        resolved = floor
+    return resolved
 
 
 def _connections_report() -> dict:
@@ -703,7 +725,9 @@ def _connections_report() -> dict:
     for cid, entry in conns.items():
         entry = entry if isinstance(entry, dict) else {}
         keys = []
-        for field, required in (("url", True), ("workspace", True), ("folder", False)):
+        for field, required in (("url", True), ("workspace", True), ("folder", False),
+                                ("script_timeout_default", False),
+                                ("script_timeout_min", False)):
             value = entry.get(field)
             keys.append(_key_report(field, False, required,
                                     str(value) if value is not None else None,
@@ -1323,7 +1347,7 @@ def cmd_verify(c, ws, m, base):
     return _check_manifest(c, ws, m, base)
 
 
-def cmd_provision(c, ws, m, base, url, admin_token):
+def cmd_provision(c, ws, m, base, url, admin_token, conn):
     """Idempotent, non-destructive apply of the manifest. Never deletes; never
     overwrites a secret that is already present; `external` vars are reported,
     not minted (the project routine that owns the box mints those)."""
@@ -1363,8 +1387,9 @@ def cmd_provision(c, ws, m, base, url, admin_token):
         if isinstance(cur, dict) and not _is_err(cur) and (cur.get("content") or "").strip() == content.strip():
             actions.append({"script": path, "skipped": "unchanged"})
             continue
+        timeout = _resolve_deploy_timeout(s.get("timeout"), conn)
         actions.append(cmd_deploy(c, ws, path, content, s.get("lang", "bun"),
-                                  s.get("summary"), s.get("description"), s.get("timeout", 600),
+                                  s.get("summary"), s.get("description"), timeout,
                                   s.get("tag")))
 
     for sch in m.get("schedules", []):
@@ -1426,7 +1451,7 @@ def main() -> None:
     sp.add_argument("path"); sp.add_argument("file", help="source file or '-' for stdin")
     sp.add_argument("--lang", default=None, help="bun (default) | deno | python3 | bash | go | nativets")
     sp.add_argument("--summary", default=None); sp.add_argument("--description", default=None)
-    sp.add_argument("--timeout", type=int, default=600); sp.add_argument("--tag", default=None)
+    sp.add_argument("--timeout", type=int, default=None); sp.add_argument("--tag", default=None)
 
     sp = sub.add_parser("schedules"); sp.add_argument("--limit", type=int, default=100)
     sp = sub.add_parser("schedule-get"); sp.add_argument("path")
@@ -1522,8 +1547,9 @@ def main() -> None:
         elif args.cmd == "script-delete":
             _emit(cmd_script_delete(c, ws, args.path))
         elif args.cmd == "deploy":
+            timeout = _resolve_deploy_timeout(args.timeout, conn)
             _emit(cmd_deploy(c, ws, args.path, _read_text(args.file), args.lang,
-                             args.summary, args.description, args.timeout, args.tag))
+                             args.summary, args.description, timeout, args.tag))
         elif args.cmd == "schedules":
             _emit(cmd_schedules(c, ws, args.limit))
         elif args.cmd == "schedule-get":
@@ -1575,7 +1601,7 @@ def main() -> None:
             if args.cmd == "verify":
                 _emit(cmd_verify(c, ws, m, base))
             else:
-                _emit(cmd_provision(c, ws, m, base, url, admin_token))
+                _emit(cmd_provision(c, ws, m, base, url, admin_token, conn))
 
 
 if __name__ == "__main__":
