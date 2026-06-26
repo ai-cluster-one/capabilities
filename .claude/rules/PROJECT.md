@@ -4,9 +4,11 @@ The doctrine and the manager that define and operate capabilities — one
 self-contained CLI per system an agent reaches, each built to a single standard.
 
 `DOCTRINE.md` is the single source of truth: the standing rules, each stating
-what must hold, why, and its own *Validate* clause. Before touching a capability
-or any doctrine doc, read the rule you are about to affect there — it governs its
-own editing as much as a capability's. Conform to it; never rediscover it.
+what must hold, why, and its own *Validate* clause. Read the rule there before
+you act on it — whether editing a capability or a doctrine doc, or merely
+claiming what the doctrine permits or requires; the rules are not reliably what
+you remember, and a recommendation grounded in doctrine is governed by it as
+much as an edit is. Conform to it; never rediscover it from memory.
 
 Its companions apply it, read on demand:
 - `SHEBANG.md` — the executable standard a capability implements.
