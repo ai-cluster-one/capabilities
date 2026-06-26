@@ -94,10 +94,11 @@ Commands:
         [--cc A ...] [--attach FILE ...]      --body, a file, or stdin.
         [--in-reply-to MESSAGE-ID]
 
-Gmail:
-  Folder reads (list/search/show/fetch) must be run SEQUENTIALLY against the
-  same account — running them in parallel trips Gmail's concurrent-connection
-  cap; the tool fails fast with exit 5 rather than hanging.
+IMAP concurrency:
+  Folder reads (list/search/show/fetch) each open one IMAP connection. Many
+  servers cap concurrent sessions, so run them sequentially rather than in
+  parallel; a stuck or refused connection fails fast (30s socket timeout,
+  non-zero exit) rather than hanging.
 
 Idempotency:
   Use message_id (globally stable) as the dedup key for processing, NOT uid.
@@ -675,25 +676,19 @@ def _safe_filename(name: str | None, uid: str, idx: int, content_type: str) -> s
 # --- IMAP --------------------------------------------------------------------
 
 def _imap(cfg: dict) -> MailBox:
+    hint = ("connection failed — note many IMAP servers cap concurrent "
+            "connections, so run folder reads (list/search/show/fetch) "
+            "sequentially rather than in parallel")
     try:
         mb = MailBox(cfg["imap_host"], port=cfg["imap_port"], timeout=30)
         mb.login(cfg["user"], cfg["password"], initial_folder="INBOX")
         return mb
     except MailboxLoginError as e:
-        if "too many simultaneous connections" in str(e).lower():
-            _die(5, "too_many_connections",
-                 f"provider refused: {e}",
-                 "Gmail folder reads must be run SEQUENTIALLY, not in parallel — "
-                 "rerun this read after any concurrent mailbox reads finish")
-        _die(2, "login_rejected", f"IMAP login failed: {e}",
-             "check the mailbox address and its app password")
+        _die(2, "login_rejected", f"IMAP login failed: {e}", hint)
     except (OSError, ssl.SSLError) as e:
-        if "too many simultaneous connections" in str(e).lower():
-            _die(5, "too_many_connections",
-                 f"provider refused: {e}",
-                 "Gmail folder reads must be run SEQUENTIALLY, not in parallel — "
-                 "rerun this read after any concurrent mailbox reads finish")
-        _die(5, "imap_unreachable", f"cannot reach IMAP {cfg['imap_host']}:{cfg['imap_port']}: {e}")
+        _die(5, "imap_unreachable",
+             f"cannot reach IMAP {cfg['imap_host']}:{cfg['imap_port']}: {e}",
+             hint)
 
 
 def _criteria(unread: bool, since: str | None,
