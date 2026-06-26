@@ -57,6 +57,11 @@ SESSION CONTINUITY  (state is LOCAL to the project you call from)
   machine-local). `-c/--continue` resumes the last session for that target;
   add --fork to branch instead of continue.
 
+  Scope a session to ONE unit of work — resume with -c only while on that
+  same item; start a fresh call for a new one; use --fork to branch off an
+  existing thread without polluting it. Sessions that span unrelated tasks
+  just carry dead context and grow costly — short, task-scoped is optimal.
+
 ────────────────────────────────────────────────────────────────────────────
 OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   {
