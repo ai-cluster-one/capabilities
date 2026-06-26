@@ -1618,6 +1618,38 @@ def load_clients_cache() -> dict[str, dict]:
         )
     return {str(c["id"]): c for c in json.loads(CLIENTS_CACHE.read_text())}
 
+
+def _refresh_clients_cache(search: str = "", limit: int = 200) -> tuple[list[dict], int]:
+    """Fetch /clients/listdata, overwrite CLIENTS_CACHE, return (rows, recordsTotal)."""
+    cookies, account = session_or_die()
+    cols = [
+        ("", "_select"),
+        ("name", "name"),
+        ("reg_no", "reg_no"),
+        ("vat_no", "vat_no"),
+        ("address_street", "address_street"),
+        ("address_city", "address_city"),
+        ("address_county", "address_county"),
+        ("address_country", "address_country"),
+        ("phone", "phone"),
+        ("fax", "fax"),
+        ("email", "email"),
+        ("webpage", "webpage"),
+        ("id", "_id"),
+        ("", "_actions"),
+    ]
+    data = datatables_payload(cols, order_col=12, length=limit, search=search)
+    with build_http(cookies, account, ajax=True) as http:
+        http.headers["X-CSRF-Token"] = fetch_fresh_csrf(http, account)
+        r = http.post(f"{BASE}/{account}/clients/listdata", data=data)
+        if r.status_code != 200:
+            raise click.ClickException(f"HTTP {r.status_code}: {r.text[:300]}")
+        payload = r.json()
+    rows = payload.get("data", [])
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CLIENTS_CACHE.write_text(json.dumps(rows, indent=2, ensure_ascii=False))
+    return rows, payload.get("recordsTotal", len(rows))
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 class _GatedCommand(click.Command):
@@ -1761,34 +1793,8 @@ def clients() -> None:
 @click.option("--limit", default=200, show_default=True, type=int)
 def clients_list(search: str, limit: int) -> None:
     """List clients (also caches them locally for `invoices create`)."""
-    cookies, account = session_or_die()
-    cols = [
-        ("", "_select"),
-        ("name", "name"),
-        ("reg_no", "reg_no"),
-        ("vat_no", "vat_no"),
-        ("address_street", "address_street"),
-        ("address_city", "address_city"),
-        ("address_county", "address_county"),
-        ("address_country", "address_country"),
-        ("phone", "phone"),
-        ("fax", "fax"),
-        ("email", "email"),
-        ("webpage", "webpage"),
-        ("id", "_id"),
-        ("", "_actions"),
-    ]
-    data = datatables_payload(cols, order_col=12, length=limit, search=search)
-    with build_http(cookies, account, ajax=True) as http:
-        http.headers["X-CSRF-Token"] = fetch_fresh_csrf(http, account)
-        r = http.post(f"{BASE}/{account}/clients/listdata", data=data)
-        if r.status_code != 200:
-            raise click.ClickException(f"HTTP {r.status_code}: {r.text[:300]}")
-        payload = r.json()
-    rows = payload.get("data", [])
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CLIENTS_CACHE.write_text(json.dumps(rows, indent=2, ensure_ascii=False))
-    click.secho(f"{payload.get('recordsTotal', len(rows))} total · {len(rows)} returned · cached → {CLIENTS_CACHE}", fg="cyan")
+    rows, total = _refresh_clients_cache(search=search, limit=limit)
+    click.secho(f"{total} total · {len(rows)} returned · cached → {CLIENTS_CACHE}", fg="cyan")
     click.echo()
     click.secho(f"{'ID':>5}  {'NAME':<40}  {'REG NO':<12}  {'VAT NO':<14}  COUNTRY", bold=True)
     for row in rows:
@@ -3990,9 +3996,12 @@ def _create_money(
     cookies, account = session_or_die()
     cache = load_clients_cache()
     if str(client_id) not in cache:
-        raise click.ClickException(
-            f"Client {client_id} not in cache. Run `simplbooks clients list` first."
-        )
+        _refresh_clients_cache(limit=10000)
+        cache = load_clients_cache()
+        if str(client_id) not in cache:
+            raise click.ClickException(
+                f"Client {client_id} not found even after a full clients refresh — check the id."
+            )
     client = cache[str(client_id)]
     dt = datetime.strptime(date_str, "%Y-%m-%d")
     form_path = "payments/add" if direction == "Payment" else "incomings/add"
@@ -4037,6 +4046,7 @@ def _list_money(endpoint: str, search: str = "", limit: int = 200) -> list[dict]
         ("sum", "sum"),
         ("currency_name", "currency_name"),
         ("account_name", "account_name"),
+        ("account_id", "account_id"),
         ("description", "description"),
     ]
     data = datatables_payload(list(cols), order_col=3, length=limit, search=search)
@@ -4290,8 +4300,7 @@ def payments_list(search, account_id, limit, as_json) -> None:
     """List outgoing payments (server-side global search; client-side account filter)."""
     rows = _list_money("payments", search=search, limit=limit)
     if account_id is not None:
-        rows = [r for r in rows if str(r.get("account_id") or "") == str(account_id)
-                or str(account_id) in str(r.get("account_name") or "")]
+        rows = [r for r in rows if str(r.get("account_id") or "") == str(account_id)]
     if as_json:
         click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
         return
@@ -4359,8 +4368,7 @@ def incomings_list(search, account_id, limit, as_json) -> None:
     """List incoming payments."""
     rows = _list_money("incomings", search=search, limit=limit)
     if account_id is not None:
-        rows = [r for r in rows if str(r.get("account_id") or "") == str(account_id)
-                or str(account_id) in str(r.get("account_name") or "")]
+        rows = [r for r in rows if str(r.get("account_id") or "") == str(account_id)]
     if as_json:
         click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
         return
