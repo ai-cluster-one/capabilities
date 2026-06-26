@@ -3275,7 +3275,8 @@ def build_purchase_fields(
                    "by this amount; negative means it over-shoots. Use to close cent gaps when "
                    "the supplier's line-by-line net × (1 + VAT) doesn't match their KOKKU line.")
 @click.option("--row-sum-with-vat/--row-sum-net", default=True, show_default=True,
-              help="Whether row 'sum' values include VAT (gross) or not (net).")
+              help="Interpret each --line 'sum' as GROSS (VAT-inclusive) by default. "
+                   "Pass --row-sum-net to interpret 'sum' as NET (VAT-exclusive) instead.")
 @click.option("--line", "lines_raw", multiple=True, required=True,
               help="Repeatable. Format: acct=<account_id>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>")
 @click.option("--attachment", "attachment_path", type=click.Path(exists=True, dir_okay=False), default=None,
@@ -3362,12 +3363,38 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
         )
         if dry_run:
             fmap = dict(fields)
+            interp = ("GROSS (VAT-inclusive); pass --row-sum-net to treat as net"
+                      if row_sum_with_vat
+                      else "NET (VAT-exclusive); omit --row-sum-net to treat as gross")
             click.secho("DRY RUN — purchase invoice NOT created. Resolved payload:", fg="yellow", bold=True)
             click.echo(f"  Supplier : {supplier.get('name')} [{supplier_id}]")
             click.echo(f"  Number   : {number}  (internal {internal_number})")
             click.echo(f"  Date     : {invoice_date}  due {due_date or invoice_date}")
             click.echo(f"  creator  : {fmap.get('data[Purchase][creator]')}  (--creator > logged-in user)")
-            click.echo(f"  Lines    : {len(lines)}  VAT total: {vat_label}")
+            click.echo(f"  Interpret: sum interpreted as {interp}")
+            click.echo(f"  Lines    : {len(lines)}")
+            doc_net = Decimal("0")
+            doc_gross = Decimal("0")
+            for i, ln in enumerate(lines, 1):
+                s = Decimal(normalize_number(ln["sum"]))
+                ln_vat = Decimal(compute_vat_total([ln], row_sum_with_vat))
+                if row_sum_with_vat:
+                    ln_gross, ln_net = s, s - ln_vat
+                else:
+                    ln_net, ln_gross = s, s + ln_vat
+                doc_net += ln_net
+                doc_gross += ln_gross
+                click.echo(
+                    f"    [{i}] sum={to_estonian_number(s)}  "
+                    f"net={to_estonian_number(ln_net)}  "
+                    f"vat={to_estonian_number(ln_vat)}  "
+                    f"gross={to_estonian_number(ln_gross)}"
+                )
+            click.echo(
+                f"  Totals   : net={to_estonian_number(doc_net)}  "
+                f"vat={to_estonian_number(vat_total)}  "
+                f"gross={to_estonian_number(doc_gross)}  ({vat_label})"
+            )
             click.echo(f"  Attach   : {attachment_path or '(none)'}")
             return
 
