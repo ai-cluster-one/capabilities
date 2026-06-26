@@ -47,9 +47,10 @@ CONNECTIONS
   gate; granting it is a deliberate registry edit, made after asking the
   user. The implicit default connection can never write.
 
-  Selection: --connection <id|address> on every command (--mailbox is an
-  alias). Unflagged, the registry's "default" pointer applies, else the sole
-  entry; several entries without a pointer is refused as ambiguous.
+  Selection: --connection <id|address> accepted before or after the
+  subcommand (--mailbox is an alias). Unflagged, the registry's "default"
+  pointer applies, else the sole entry; several entries without a pointer
+  is refused as ambiguous.
 
   Credential keys for the implicit default connection (no registry):
     MAILBOX_ADDRESS       mailbox address                  (required)
@@ -70,6 +71,10 @@ Commands:
   mailbox list [--unread] [--folder F]        List messages (headers only).
         [--since YYYY-MM-DD] [--limit N]      JSON: uid, message_id, date,
                                               from, subject, seen.
+  mailbox search [--from EMAIL]               Server-side IMAP SEARCH; same
+        [--subject S] [--text T]              output shape as `list`.
+        [--since YYYY-MM-DD] [--folder F]
+        [--limit N]
   mailbox show <uid> | --message-id <id>      One message: headers, text body,
         [--folder F]                          attachment manifest (no payloads).
                                               --message-id locates it across ALL
@@ -88,6 +93,11 @@ Commands:
         [--body TEXT | --body-file F | -]     Send a message. Body from
         [--cc A ...] [--attach FILE ...]      --body, a file, or stdin.
         [--in-reply-to MESSAGE-ID]
+
+Gmail:
+  Folder reads (list/search/show/fetch) must be run SEQUENTIALLY against the
+  same account — running them in parallel trips Gmail's concurrent-connection
+  cap; the tool fails fast with exit 5 rather than hanging.
 
 Idempotency:
   Use message_id (globally stable) as the dedup key for processing, NOT uid.
@@ -666,17 +676,29 @@ def _safe_filename(name: str | None, uid: str, idx: int, content_type: str) -> s
 
 def _imap(cfg: dict) -> MailBox:
     try:
-        mb = MailBox(cfg["imap_host"], port=cfg["imap_port"])
+        mb = MailBox(cfg["imap_host"], port=cfg["imap_port"], timeout=30)
         mb.login(cfg["user"], cfg["password"], initial_folder="INBOX")
         return mb
     except MailboxLoginError as e:
+        if "too many simultaneous connections" in str(e).lower():
+            _die(5, "too_many_connections",
+                 f"provider refused: {e}",
+                 "Gmail folder reads must be run SEQUENTIALLY, not in parallel — "
+                 "rerun this read after any concurrent mailbox reads finish")
         _die(2, "login_rejected", f"IMAP login failed: {e}",
              "check the mailbox address and its app password")
     except (OSError, ssl.SSLError) as e:
+        if "too many simultaneous connections" in str(e).lower():
+            _die(5, "too_many_connections",
+                 f"provider refused: {e}",
+                 "Gmail folder reads must be run SEQUENTIALLY, not in parallel — "
+                 "rerun this read after any concurrent mailbox reads finish")
         _die(5, "imap_unreachable", f"cannot reach IMAP {cfg['imap_host']}:{cfg['imap_port']}: {e}")
 
 
-def _criteria(unread: bool, since: str | None):
+def _criteria(unread: bool, since: str | None,
+              from_: str | None = None, subject: str | None = None,
+              text: str | None = None):
     kw = {}
     if unread:
         kw["seen"] = False
@@ -685,6 +707,12 @@ def _criteria(unread: bool, since: str | None):
             kw["date_gte"] = datetime.strptime(since, "%Y-%m-%d").date()
         except ValueError:
             _die(6, "bad_date", f"--since must be YYYY-MM-DD, got {since!r}")
+    if from_:
+        kw["from_"] = from_
+    if subject:
+        kw["subject"] = subject
+    if text:
+        kw["text"] = text
     return AND(**kw) if kw else "ALL"
 
 
@@ -792,6 +820,23 @@ def cmd_list(cfg: dict, folder: str, unread: bool, since: str | None, limit: int
             mb.folder.set(folder)
         for m in mb.fetch(_criteria(unread, since), mark_seen=False,
                           headers_only=True, bulk=False, reverse=True, limit=limit):
+            out.append({
+                "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
+                "date": m.date_str, "from": m.from_, "to": list(m.to),
+                "subject": m.subject, "seen": "\\Seen" in m.flags,
+            })
+    return out
+
+
+def cmd_search(cfg: dict, folder: str, from_: str | None, subject: str | None,
+               since: str | None, text: str | None, limit: int) -> list:
+    out = []
+    with _imap(cfg) as mb:
+        if folder != "INBOX":
+            mb.folder.set(folder)
+        for m in mb.fetch(_criteria(False, since, from_, subject, text),
+                          mark_seen=False, headers_only=True, bulk=False,
+                          reverse=True, limit=limit):
             out.append({
                 "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
                 "date": m.date_str, "from": m.from_, "to": list(m.to),
@@ -918,32 +963,60 @@ def _require_selector(args) -> None:
 def main() -> None:
     _gate()                      # every verb passes the project gate first
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
+    # --connection/--mailbox is accepted before AND after the subcommand:
+    # the shared parent carries it for every subparser (SUPPRESS so an absent
+    # post-subcommand flag never clobbers a value parsed pre-subcommand), and
+    # the top-level parser carries it for the pre-subcommand position.
+    conn_parent = argparse.ArgumentParser(add_help=False)
+    conn_parent.add_argument("--connection", "--mailbox", dest="connection",
+                             default=argparse.SUPPRESS,
+                             help="connection id or address (optional with a "
+                                  "default pointer or a sole connection); "
+                                  "accepted before or after the subcommand")
+
     p = argparse.ArgumentParser(
         prog="mailbox", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--connection", "--mailbox", dest="connection", default=None,
                    help="connection id or address (optional with a default "
-                        "pointer or a sole connection)")
+                        "pointer or a sole connection); accepted before or "
+                        "after the subcommand")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("help", help="print the full usage contract")
-    sub.add_parser("doctor", help="validate IMAP + SMTP login, per connection")
-    sub.add_parser("folders", help="list IMAP folders")
+    sub.add_parser("help", parents=[conn_parent],
+                   help="print the full usage contract")
+    sub.add_parser("doctor", parents=[conn_parent],
+                   help="validate IMAP + SMTP login, per connection")
+    sub.add_parser("folders", parents=[conn_parent], help="list IMAP folders")
 
-    sp = sub.add_parser("list", help="list messages (headers only)")
+    sp = sub.add_parser("list", parents=[conn_parent],
+                        help="list messages (headers only)")
     sp.add_argument("--folder", default="INBOX")
     sp.add_argument("--unread", action="store_true")
     sp.add_argument("--since", default=None, help="YYYY-MM-DD")
     sp.add_argument("--limit", type=int, default=50)
 
-    sp = sub.add_parser("show", help="show one message (by uid or --message-id)")
+    sp = sub.add_parser("search", parents=[conn_parent],
+                        help="server-side IMAP SEARCH (same output as list)")
+    sp.add_argument("--from", dest="from_", default=None,
+                    help="FROM substring match")
+    sp.add_argument("--subject", default=None, help="SUBJECT substring match")
+    sp.add_argument("--since", default=None, help="YYYY-MM-DD")
+    sp.add_argument("--text", default=None,
+                    help="TEXT match (body and headers)")
+    sp.add_argument("--folder", default="INBOX")
+    sp.add_argument("--limit", type=int, default=50)
+
+    sp = sub.add_parser("show", parents=[conn_parent],
+                        help="show one message (by uid or --message-id)")
     sp.add_argument("uid", nargs="?", default=None)
     sp.add_argument("--message-id", dest="message_id", default=None,
                     help="locate across all folders by Message-ID (folder-agnostic)")
     sp.add_argument("--folder", default="INBOX")
 
-    sp = sub.add_parser("fetch", help="save a message's attachments (by uid or --message-id)")
+    sp = sub.add_parser("fetch", parents=[conn_parent],
+                        help="save a message's attachments (by uid or --message-id)")
     sp.add_argument("uid", nargs="?", default=None)
     sp.add_argument("--message-id", dest="message_id", default=None,
                     help="locate across all folders by Message-ID (folder-agnostic)")
@@ -951,17 +1024,19 @@ def main() -> None:
     sp.add_argument("--folder", default="INBOX")
     sp.add_argument("--mark-seen", action="store_true")
 
-    sp = sub.add_parser("seen", help="flag or unflag \\Seen")
+    sp = sub.add_parser("seen", parents=[conn_parent],
+                        help="flag or unflag \\Seen")
     sp.add_argument("uid")
     sp.add_argument("--unsee", action="store_true")
     sp.add_argument("--folder", default="INBOX")
 
-    sp = sub.add_parser("move", help="move a message to another folder")
+    sp = sub.add_parser("move", parents=[conn_parent],
+                        help="move a message to another folder")
     sp.add_argument("uid")
     sp.add_argument("--to-folder", required=True)
     sp.add_argument("--folder", default="INBOX")
 
-    sp = sub.add_parser("send", help="send a message")
+    sp = sub.add_parser("send", parents=[conn_parent], help="send a message")
     sp.add_argument("--to", action="append", required=True)
     sp.add_argument("--cc", action="append", default=[])
     sp.add_argument("--subject", required=True)
@@ -991,6 +1066,9 @@ def main() -> None:
         _emit(cmd_move(cfg, args.uid, args.folder, args.to_folder))
     elif args.cmd == "list":
         _emit(cmd_list(cfg, args.folder, args.unread, args.since, args.limit))
+    elif args.cmd == "search":
+        _emit(cmd_search(cfg, args.folder, args.from_, args.subject,
+                         args.since, args.text, args.limit))
     elif args.cmd == "show":
         _require_selector(args)
         _emit(cmd_show(cfg, args.uid, args.folder, args.message_id))
