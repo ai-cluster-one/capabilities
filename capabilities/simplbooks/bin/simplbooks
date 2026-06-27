@@ -10,6 +10,7 @@
 """simplbooks — agent-first CLI for the SimpleBooks accounting app."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -2849,6 +2850,165 @@ def accounts_list(kind: str, limit: int, as_json: bool) -> None:
             f"{strip_html(row.get('name'))[:60]:<60}  "
             f"{strip_html(row.get('active'))[:5]}"
         )
+
+
+# ─── financial reports (read-only: trial balance / balances at a date) ──────
+
+def _report_num(x) -> float:
+    """A report cell → float. SB emits '' for an empty debit/credit side, and
+    occasionally a string with a non-breaking space / comma decimal."""
+    if x in ("", None):
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).replace(" ", "").replace(" ", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _report_date(s: str) -> str:
+    """Accept YYYY-MM-DD or DD.MM.YYYY; return SB's DD.MM.YYYY."""
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    raise click.ClickException(f"Bad date {s!r} — use YYYY-MM-DD or DD.MM.YYYY.")
+
+
+def _report_export_data(http: httpx.Client, account: str, endpoint: str,
+                        period_from: str, period_to: str) -> dict:
+    """POST a /financial_reports/<endpoint> page for a period and decode the
+    base64 `export_data` hidden field it embeds — { "header": [...], "rows": [...] }.
+    SB renders the report server-side using the account's saved report config;
+    we override only the period. Same cookies for GET (scrape _csrfToken +
+    report[id]) and POST, so the token matches the CSRF cookie."""
+    url = f"{BASE}/{account}/financial_reports/{endpoint}"
+    page = http.get(url)
+    if page.status_code != 200:
+        raise click.ClickException(
+            f"GET financial_reports/{endpoint}: HTTP {page.status_code} "
+            "(session stale? run `simplbooks doctor`).")
+    soup = BeautifulSoup(page.text, "html.parser")
+    csrf = soup.find("input", {"name": "_csrfToken"})
+    if not csrf or not csrf.get("value"):
+        raise click.ClickException(f"No _csrfToken on {endpoint} — layout changed?")
+    data = {
+        "_csrfToken": csrf["value"],
+        "report[period_from]": period_from,
+        "report[period_to]": period_to,
+    }
+    rid = soup.find("input", {"name": "report[id]"})
+    if rid and rid.get("value"):
+        data["report[id]"] = rid["value"]
+    http.headers["Referer"] = url
+    r = http.post(url, data=data)
+    if r.status_code != 200:
+        raise click.ClickException(f"POST financial_reports/{endpoint}: HTTP {r.status_code}")
+    m = re.search(r'name="export_data"\s+value="([^"]+)"', r.text)
+    if not m:
+        raise click.ClickException(
+            f"No export_data in {endpoint} response — session stale or layout changed?")
+    return json.loads(base64.b64decode(m.group(1)))
+
+
+def _parse_trial_balance(payload: dict) -> list[dict]:
+    """Käibeandmik export_data → one dict per row. Column layout (13 cols,
+    verified against two adjacent periods — a period's closing equals the next
+    period's opening): cells[0]='CODE Name'; cells[1]/[2]=opening debit/credit;
+    cells[11]/[12]=closing (accumulated) debit/credit. Subtotal/group rows carry
+    account_id=None (e.g. 'Varad', 'Kohustused ja omakapital')."""
+    out = []
+    for row in payload.get("rows", []):
+        c = row.get("cells") or []
+        if not c:
+            continue
+        label = str(c[0]).strip()
+        aid = row.get("account_id")
+        opening = _report_num(c[1]) - _report_num(c[2])
+        closing = _report_num(c[11]) - _report_num(c[12])
+        code, name = "", label
+        if aid is not None:
+            parts = label.split(" ", 1)
+            code = parts[0]
+            name = parts[1] if len(parts) > 1 else ""
+        out.append({
+            "account_id": aid, "code": code, "name": name,
+            "is_group": aid is None,
+            "opening": round(opening, 2), "closing": round(closing, 2),
+        })
+    return out
+
+
+@cli.group()
+def reports() -> None:
+    """Read-only financial reports (käibeandmik / account balances at a date)."""
+
+
+@reports.command("trial-balance")
+@click.option("--from", "period_from", required=True,
+              help="Period start (YYYY-MM-DD or DD.MM.YYYY).")
+@click.option("--to", "period_to", required=True,
+              help="Period end (YYYY-MM-DD or DD.MM.YYYY).")
+@click.option("--account", "acct_filter", default=None,
+              help="Show only accounts whose code or name contains this (a code or name fragment).")
+@click.option("--all", "show_all", is_flag=True,
+              help="Show every account, including those flat at zero (default hides them).")
+@click.option("--json", "as_json", is_flag=True)
+def reports_trial_balance(period_from: str, period_to: str, acct_filter: str | None,
+                          show_all: bool, as_json: bool) -> None:
+    """Käibeandmik — every account's opening + closing balance over a period.
+
+    The CLOSING column is the account's balance AS OF --to: the reconciliation
+    workhorse (read a bank account, a payment-processor clearing account, any
+    control account, at any date). A positive value is a debit (asset/expense)
+    balance, negative a credit (liability/equity/income) balance. The footer sums all closing
+    debits vs credits and confirms the books balance (gap ≈ 0)."""
+    pf, pt = _report_date(period_from), _report_date(period_to)
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        payload = _report_export_data(http, account, "turnoverstatement", pf, pt)
+    all_rows = _parse_trial_balance(payload)
+
+    # Balance check is over EVERY leaf account, independent of the display filter.
+    leaves = [r for r in all_rows if not r["is_group"]]
+    tot_d = round(sum(r["closing"] for r in leaves if r["closing"] > 0), 2)
+    tot_c = round(sum(-r["closing"] for r in leaves if r["closing"] < 0), 2)
+    gap = round(tot_d - tot_c, 2)
+
+    rows = all_rows
+    if acct_filter:
+        f = acct_filter.lower()
+        rows = [r for r in rows if f in r["code"].lower() or f in r["name"].lower()]
+
+    if as_json:
+        click.echo(json.dumps({
+            "period_from": pf, "period_to": pt,
+            "closing_debit_total": tot_d, "closing_credit_total": tot_c, "gap": gap,
+            "rows": [r for r in rows if not r["is_group"]],
+        }, indent=2, ensure_ascii=False))
+        return
+
+    click.secho(f"Käibeandmik (trial balance)  {pf} → {pt}", fg="cyan", bold=True)
+    click.echo()
+    click.secho(f"{'CODE':<8} {'ACCOUNT':<46} {'OPENING':>14} {'CLOSING':>14}", bold=True)
+    for r in rows:
+        if r["is_group"]:
+            continue
+        if not show_all and abs(r["closing"]) < 0.005 and abs(r["opening"]) < 0.005:
+            continue
+        click.echo(f"{r['code']:<8} {r['name'][:46]:<46} "
+                   f"{r['opening']:>14,.2f} {r['closing']:>14,.2f}")
+    click.echo()
+    summary = (f"Σ closing debit {tot_d:,.2f}   Σ closing credit {tot_c:,.2f}   "
+               f"gap {gap:+,.2f}")
+    if abs(gap) < 0.01:
+        click.secho("✓ balanced — " + summary, fg="green")
+    else:
+        click.secho("⚠ off-balance — " + summary, fg="yellow")
 
 
 # ─── expenses (purchase invoices / ostuarved) ───────────────────────────────
