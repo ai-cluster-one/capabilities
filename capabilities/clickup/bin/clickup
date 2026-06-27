@@ -1489,9 +1489,9 @@ def cmd_comment(c: httpx.Client, task: str, text: str,
     if mentions:
         # Structured `comment` array with tag segments fires the "Mentioning me"
         # inbox notification; the tag segment - not any "@<uid>" literal - is
-        # what ClickUp routes on. comment_text carries only the plain body so
-        # read-back paths that render it don't double the body alongside the
-        # rich rendering of the structured segments.
+        # what ClickUp routes on. Sending comment_text alongside makes ClickUp
+        # append its body as an extra segment, doubling the body, so the array
+        # is the only payload here; ClickUp derives comment_text on read.
         segments: list = []
         for uid in mentions:
             try:
@@ -1503,7 +1503,6 @@ def cmd_comment(c: httpx.Client, task: str, text: str,
         if text:
             segments.append({"text": text})
         data["comment"] = segments
-        data["comment_text"] = text
     else:
         data["comment_text"] = text
     return _request(c, "POST", f"/task/{_ref(task)}/comment", json_body=data)
