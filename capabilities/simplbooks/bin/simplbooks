@@ -3433,10 +3433,14 @@ def build_purchase_fields(
 @click.option("--due", "due_date", default=None, help="Due date YYYY-MM-DD. Defaults to invoice date.")
 @click.option("--currency", default="EUR", show_default=True)
 @click.option("--rate", "currency_rate", default=1.0, show_default=True, type=float,
-              help="Document-currency → EUR exchange rate. Default 1.0 leaves EUR invoices "
-                   "unchanged. For a foreign-currency invoice settled via a EUR bank debit, "
-                   "set --rate = (actual EUR settled) / (foreign-currency invoice total) so "
-                   "the EUR-equivalent ties to the real debit to the cent.")
+              help="Document-currency → EUR multiplier. The CLI converts each --line "
+                   "sum to EUR locally and books the invoice in EUR (SB does not apply "
+                   "the rate server-side, so the conversion MUST happen here). The "
+                   "source currency, rate, and document-currency totals are appended "
+                   "to the invoice comments for audit. Default 1.0 leaves EUR invoices "
+                   "unchanged. For a foreign-currency invoice settled via a EUR bank "
+                   "debit, set --rate = (actual EUR settled) / (foreign-currency "
+                   "invoice total) so the EUR-equivalent ties to the real debit to the cent.")
 @click.option("--vat-total", default=None,
               help="Total VAT amount. Defaults to the row-derived total (0 when all rows "
                    "are 0%-rate, e.g. reverse-charge). Pass explicitly only to correct "
@@ -3510,6 +3514,35 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
 
     internal_number = internal_number or number
 
+    # SB's /purchases/create ignores currency_rate for the ledger and does not
+    # persist the foreign document currency, so a true foreign-currency purchase
+    # cannot be held server-side. When --rate != 1.0 we convert each row to EUR
+    # client-side and book a plain EUR purchase, recording the source currency,
+    # rate, and document-currency totals in the invoice comments for audit.
+    fx_doc_total: Decimal | None = None
+    fx_eur_total: Decimal | None = None
+    fx_source_currency = currency
+    fx_rate = currency_rate
+    if currency_rate != 1.0:
+        rate_dec = Decimal(str(currency_rate))
+        fx_doc_total = Decimal("0")
+        fx_eur_total = Decimal("0")
+        for ln in lines:
+            doc_sum = Decimal(normalize_number(ln["sum"]))
+            eur_sum = (doc_sum * rate_dec).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            fx_doc_total += doc_sum
+            fx_eur_total += eur_sum
+            ln["sum"] = str(eur_sum)
+        fx_note = (
+            f"Source currency: {fx_source_currency}; rate {fx_rate:.7f}; "
+            f"document total {fx_source_currency} {to_estonian_number(fx_doc_total)} -> "
+            f"EUR {to_estonian_number(fx_eur_total)}"
+        )
+        comments = f"{comments}\n{fx_note}".strip() if comments else fx_note
+        # Row sums are now EUR; book as a plain EUR purchase.
+        currency = "EUR"
+        currency_rate = 1.0
+
     if vat_total is None:
         vat_total = compute_vat_total(lines, row_sum_with_vat)
         vat_label = f"{vat_total} (computed from rows)"
@@ -3572,6 +3605,13 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
                 f"vat={to_estonian_number(vat_total)}  "
                 f"gross={to_estonian_number(doc_gross)}  ({vat_label})"
             )
+            if fx_doc_total is not None:
+                click.echo(
+                    f"  FX       : rate={fx_rate:.7f}  "
+                    f"doc total {fx_source_currency} {to_estonian_number(fx_doc_total)} "
+                    f"-> EUR {to_estonian_number(fx_eur_total)} "
+                    f"(booked in EUR; SB does not apply the rate server-side)"
+                )
             click.echo(f"  Attach   : {attachment_path or '(none)'}")
             return
 
@@ -3596,6 +3636,13 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
         click.echo(f"  Supplier : {supplier.get('name')} [{supplier_id}]")
         click.echo(f"  Date     : {invoice_date}")
         click.echo(f"  Lines    : {len(lines)}  VAT total: {vat_label}")
+        if fx_doc_total is not None:
+            click.echo(
+                f"  FX       : converted {fx_source_currency} "
+                f"{to_estonian_number(fx_doc_total)} -> EUR "
+                f"{to_estonian_number(fx_eur_total)} @ {fx_rate:.7f} "
+                f"(booked in EUR; rate + source-currency totals recorded in comments)"
+            )
         if attachment_path:
             click.echo(f"  Attached : {attachment_path}")
         click.echo(f"  URL      : {BASE}/{account}/purchases/view/{pid}")
