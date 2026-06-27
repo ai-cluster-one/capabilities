@@ -171,7 +171,9 @@ Write:
         [--assignee ID ...] [--status NAME]   markdown body (ClickUp renders it);
         [--tag NAME ...] [--priority N]        --desc stores literal plain text.
         [--due-on YYYY-MM-DD]                  Pass at most one. '-' reads stdin.
-        [--due-at ISO8601] [--parent ID]      --assignee repeatable (user id).
+        [--due-at ISO8601]                     --assignee repeatable (user id).
+        [--start-on D] [--start-at ISO]        --start-* mirrors --due-*: the
+        [--parent ID]                          scheduled begin, all-day or timed.
         [--external-id V] [--workspace ID]     --external-id enforces a best-effort
                                               dedup preflight against the configured
                                               external_id custom field, then stamps
@@ -190,7 +192,8 @@ Write:
         [--desc T|-] [--markdown T|-]          --desc as for create. --status moves
         [--status NAME] [--priority N]         the column. --add-assignee /
         [--due-on D] [--due-at ISO]            --rem-assignee add or remove
-        [--add-assignee ID ...]                assignees (ClickUp updates use an
+        [--start-on D] [--start-at ISO]        assignees (ClickUp updates use an
+        [--add-assignee ID ...]
         [--rem-assignee ID ...] [--archive]    add/remove set, not a replace).
                                               --archive archives the task.
   clickup comment <task> [--text TEXT|-]      Add a comment to a task. --assignee
@@ -300,8 +303,9 @@ Exit codes:
   7  blocked (task has incomplete dependencies; see `complete`)
 
 Notes:
-  - Dates are epoch milliseconds on the wire; pass --due-on (all-day) or
-    --due-at (ISO8601, time-of-day) and the CLI converts.
+  - Dates are epoch milliseconds on the wire; pass --due-on / --start-on
+    (all-day) or --due-at / --start-at (ISO8601, time-of-day) and the CLI
+    converts. Due is the deadline; start is the scheduled begin.
   - Completion is status-based: a task is "done" when its status type is
     `done` or `closed`. `complete` discovers the list's closed status and sets
     it; there is no boolean done flag.
@@ -870,22 +874,22 @@ def _ref(ref: str) -> str:
 
 # --- Dates -------------------------------------------------------------------
 
-def _epoch_ms_date(date: str) -> int:
-    """YYYY-MM-DD → epoch milliseconds at UTC midnight (an all-day due date)."""
+def _epoch_ms_date(date: str, flag: str = "--due-on") -> int:
+    """YYYY-MM-DD → epoch milliseconds at UTC midnight (an all-day date)."""
     try:
         dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
-        _die(6, "bad_date", f"--due-on expects YYYY-MM-DD, got {date!r}")
+        _die(6, "bad_date", f"{flag} expects YYYY-MM-DD, got {date!r}")
     return int(dt.timestamp() * 1000)
 
 
-def _epoch_ms_iso(iso: str) -> int:
+def _epoch_ms_iso(iso: str, flag: str = "--due-at") -> int:
     """ISO8601 → epoch milliseconds. Accepts a trailing Z."""
     raw = iso.strip().replace("Z", "+00:00")
     try:
         dt = datetime.fromisoformat(raw)
     except ValueError:
-        _die(6, "bad_datetime", f"--due-at expects ISO8601, got {iso!r}",
+        _die(6, "bad_datetime", f"{flag} expects ISO8601, got {iso!r}",
              "e.g. 2026-06-30T16:00:00Z")
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -1366,6 +1370,9 @@ def _render_task_context(t: dict, assembled: str) -> str:
     meta = (f"Assignees: {assignees}"
             f" · Created: {_ts(t.get('date_created'))}"
             f" · Updated: {_ts(t.get('date_updated'))}")
+    start = t.get("start_date")
+    if start:
+        meta += f" · Start: {_ts(start)}"
     due = t.get("due_date")
     if due:
         meta += f" · Due: {_ts(due)}"
@@ -1392,16 +1399,35 @@ def _render_task_context(t: dict, assembled: str) -> str:
 
 # --- Commands: task writes ---------------------------------------------------
 
+def _verify_start_applied(task_obj: dict | None, intended_ms: int | None) -> None:
+    """ClickUp silently drops a start_date later than the task's due_date — the
+    write returns 200 but the field keeps its prior value. Compare the response
+    against what we sent and surface the rejection so the caller learns the
+    constraint at use-time, rather than the doc pre-describing it."""
+    if intended_ms is None:
+        return
+    got = (task_obj or {}).get("start_date")
+    if got is None or int(got) != int(intended_ms):
+        _die(6, "start_not_stored",
+             "ClickUp did not store the start date — a start date cannot be later "
+             "than the task's due date",
+             "set the start before the due date, or move/clear the due date, then retry")
+
+
 def cmd_create(c: httpx.Client, list_id: str, name: str, body: str | None,
                body_mode: str, assignees: list[str], status: str | None,
                tags: list[str], priority: int | None, due_on: str | None,
-               due_at: str | None, parent: str | None,
+               due_at: str | None, start_on: str | None, start_at: str | None,
+               parent: str | None,
                custom_fields: list[dict] | None = None,
                workspace: str | None = None, external_id: str | None = None,
                external_id_field: str | None = None) -> dict:
     if due_on and due_at:
         _die(6, "conflicting_due", "pass only one of --due-on / --due-at",
              "--due-at carries the time-of-day; --due-on is all-day")
+    if start_on and start_at:
+        _die(6, "conflicting_start", "pass only one of --start-on / --start-at",
+             "--start-at carries the time-of-day; --start-on is all-day")
     if external_id is not None:
         external_id = str(external_id).strip()
         if not external_id:
@@ -1436,11 +1462,18 @@ def cmd_create(c: httpx.Client, list_id: str, name: str, body: str | None,
     if due_at:
         data["due_date"] = _epoch_ms_iso(due_at)
         data["due_date_time"] = True
+    if start_on:
+        data["start_date"] = _epoch_ms_date(start_on, "--start-on")
+        data["start_date_time"] = False
+    if start_at:
+        data["start_date"] = _epoch_ms_iso(start_at, "--start-at")
+        data["start_date_time"] = True
     if parent:
         data["parent"] = _ref(parent)
     if custom_fields:
         data["custom_fields"] = custom_fields
     created = _request(c, "POST", f"/list/{list_id}/task", json_body=data)
+    _verify_start_applied(created, data.get("start_date"))
     if external_id is not None:
         return {"deduped": False, "external_id": external_id,
                 "external_id_field": external_id_field, "task": created}
@@ -1450,11 +1483,15 @@ def cmd_create(c: httpx.Client, list_id: str, name: str, body: str | None,
 def cmd_update(c: httpx.Client, task: str, name: str | None, body: str | None,
                body_mode: str, status: str | None, priority: int | None,
                due_on: str | None, due_at: str | None,
+               start_on: str | None, start_at: str | None,
                add_assignees: list[str], rem_assignees: list[str],
                archive: bool) -> dict:
     if due_on and due_at:
         _die(6, "conflicting_due", "pass only one of --due-on / --due-at",
              "--due-at carries the time-of-day; --due-on is all-day")
+    if start_on and start_at:
+        _die(6, "conflicting_start", "pass only one of --start-on / --start-at",
+             "--start-at carries the time-of-day; --start-on is all-day")
     data: dict = {}
     if name is not None:
         data["name"] = name
@@ -1469,6 +1506,12 @@ def cmd_update(c: httpx.Client, task: str, name: str | None, body: str | None,
     if due_at:
         data["due_date"] = _epoch_ms_iso(due_at)
         data["due_date_time"] = True
+    if start_on:
+        data["start_date"] = _epoch_ms_date(start_on, "--start-on")
+        data["start_date_time"] = False
+    if start_at:
+        data["start_date"] = _epoch_ms_iso(start_at, "--start-at")
+        data["start_date_time"] = True
     if add_assignees or rem_assignees:
         data["assignees"] = {"add": _ids(add_assignees), "rem": _ids(rem_assignees)}
     if archive:
@@ -1476,8 +1519,11 @@ def cmd_update(c: httpx.Client, task: str, name: str | None, body: str | None,
     if not data:
         _die(6, "no_changes", "update requires at least one field to change",
              "pass --name / --desc / --markdown / --status / --priority / "
-             "--due-on / --due-at / --add-assignee / --rem-assignee / --archive")
-    return _request(c, "PUT", f"/task/{_ref(task)}", json_body=data)
+             "--due-on / --due-at / --start-on / --start-at / "
+             "--add-assignee / --rem-assignee / --archive")
+    updated = _request(c, "PUT", f"/task/{_ref(task)}", json_body=data)
+    _verify_start_applied(updated, data.get("start_date"))
+    return updated
 
 
 def cmd_comment(c: httpx.Client, task: str, text: str,
@@ -2006,6 +2052,8 @@ def main() -> None:
                     help="1=Urgent 2=High 3=Normal 4=Low")
     sp.add_argument("--due-on", default=None, help="YYYY-MM-DD (all-day)")
     sp.add_argument("--due-at", default=None, help="ISO8601 datetime")
+    sp.add_argument("--start-on", default=None, help="YYYY-MM-DD (all-day)")
+    sp.add_argument("--start-at", default=None, help="ISO8601 datetime")
     sp.add_argument("--parent", default=None,
                     help="parent task id — makes this a subtask (same list)")
     sp.add_argument("--external-id", default=None,
@@ -2027,6 +2075,8 @@ def main() -> None:
                     help="1=Urgent 2=High 3=Normal 4=Low")
     sp.add_argument("--due-on", default=None, help="YYYY-MM-DD (all-day)")
     sp.add_argument("--due-at", default=None, help="ISO8601 datetime")
+    sp.add_argument("--start-on", default=None, help="YYYY-MM-DD (all-day)")
+    sp.add_argument("--start-at", default=None, help="ISO8601 datetime")
     sp.add_argument("--add-assignee", action="append", default=[],
                     help="user id to add as assignee (repeatable)")
     sp.add_argument("--rem-assignee", action="append", default=[],
@@ -2287,7 +2337,8 @@ def main() -> None:
             body = _read_text(raw) if raw is not None else None
             _emit(cmd_create(c, args.list_id, args.name, body, mode,
                              args.assignee, args.status, args.tag, args.priority,
-                             args.due_on, args.due_at, args.parent,
+                             args.due_on, args.due_at, args.start_on, args.start_at,
+                             args.parent,
                              _parse_fields(args.field),
                              args.workspace or default_workspace,
                              args.external_id,
@@ -2300,6 +2351,7 @@ def main() -> None:
             body = _read_text(raw) if raw is not None else None
             _emit(cmd_update(c, args.task, args.name, body, mode, args.status,
                              args.priority, args.due_on, args.due_at,
+                             args.start_on, args.start_at,
                              args.add_assignee, args.rem_assignee, args.archive))
         elif args.cmd == "comment":
             if args.text is None:
