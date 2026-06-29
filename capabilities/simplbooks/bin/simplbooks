@@ -59,7 +59,8 @@ CRED_KEYS = [
     {"key": "SIMPLBOOKS_WORKER", "secret": False, "required": False,
      "note": "optional pin for the invoice line worker; else the logged-in user"},
 ]
-WRITE_VERBS = {"create", "update", "delete", "unbind", "bind", "send-payment", "save"}
+WRITE_VERBS = {"create", "update", "delete", "unbind", "bind", "send-payment", "save",
+               "submit", "amend"}
 WRITE_DEFAULT = False    # writes create legal invoices / stage real bank payments;
                          # granted per connection, explicitly, via allow_write: true
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
@@ -881,6 +882,40 @@ Then re-run `simplbooks doctor` to confirm.
   simplbooks incomings list|create|bind|delete  Incoming bank movements
                                                 (supplier/customer payments;
                                                 `--help` on each for flags).
+
+  simplbooks kmd show --period YYYY-MM [--json]
+                                                The KMD (käibedeklaratsioon) SB
+                                                computes from the books for the
+                                                period — every line 1–13 with the
+                                                value it would file. Line 12 =
+                                                VAT payable, line 13 = refundable.
+
+  simplbooks kmd list --year YYYY [--json]      Per-month KMD for a year: output
+                                                VAT (line 4), input (line 5), net.
+
+  simplbooks kmd reconcile --filed <emta.csv>
+        [--year YYYY] [--tolerance EUR] [--json]
+                                                Diff the books' KMD against a
+                                                filed e-MTA KMD export; flags the
+                                                months whose net differs — the
+                                                amend candidates.
+
+  simplbooks kmd check --year YYYY [--filed <csv>] [--json]
+                                                Per-month, per-line KMD change flags
+                                                from SimpleBooks itself — any
+                                                declaration line that changed since
+                                                the period was confirmed is reported.
+                                                --filed adds the books-vs-filed net
+                                                delta per month.
+
+  simplbooks kmd submit --period YYYY-MM [--yes]
+  simplbooks kmd amend  --period YYYY-MM [--yes]
+                                                File / re-file a KMD to e-MTA
+                                                directly. Requires the e-MTA
+                                                integration active (exit 4 with the
+                                                activation path otherwise); external
+                                                and effectively irreversible, so it
+                                                confirms before filing.
 
 ═══ Tax classes ════════════════════════════════════════════════════════════
 
@@ -2880,12 +2915,16 @@ def _report_date(s: str) -> str:
 
 
 def _report_export_data(http: httpx.Client, account: str, endpoint: str,
-                        period_from: str, period_to: str) -> dict:
+                        period_from: str, period_to: str,
+                        extra: dict | None = None) -> dict | list:
     """POST a /financial_reports/<endpoint> page for a period and decode the
-    base64 `export_data` hidden field it embeds — { "header": [...], "rows": [...] }.
-    SB renders the report server-side using the account's saved report config;
-    we override only the period. Same cookies for GET (scrape _csrfToken +
-    report[id]) and POST, so the token matches the CSRF cookie."""
+    base64 `export_data` hidden field it embeds. Balance-type reports decode to
+    { "header": [...], "rows": [...] }; the mainledger account card decodes to a
+    flat list of HEAD/ROW/PREFOOT/FOOT arrays. SB renders the report server-side
+    using the account's saved report config; we override the period and any
+    `extra` report[...] fields (e.g. report[financial_account_id]). Same cookies
+    for GET (scrape _csrfToken + report[id]) and POST, so the token matches the
+    CSRF cookie."""
     url = f"{BASE}/{account}/financial_reports/{endpoint}"
     page = http.get(url)
     if page.status_code != 200:
@@ -2904,6 +2943,8 @@ def _report_export_data(http: httpx.Client, account: str, endpoint: str,
     rid = soup.find("input", {"name": "report[id]"})
     if rid and rid.get("value"):
         data["report[id]"] = rid["value"]
+    if extra:
+        data.update(extra)
     http.headers["Referer"] = url
     r = http.post(url, data=data)
     if r.status_code != 200:
@@ -3009,6 +3050,520 @@ def reports_trial_balance(period_from: str, period_to: str, acct_filter: str | N
         click.secho("✓ balanced — " + summary, fg="green")
     else:
         click.secho("⚠ off-balance — " + summary, fg="yellow")
+
+
+def _parse_account_ledger(payload: list) -> dict:
+    """mainledger (Pearaamat / account card) export_data → structured ledger.
+
+    The payload is a flat list of tagged arrays:
+      ["HEAD", ["Kande nr.",..], ["<code> <name>",..], ["Selgitus",..], ["Kuupäev",..],
+               ["Deebet",..], ["Kreedit",..], ["Saldo",..]]
+      ["ROW", <kanne_nr|"">, <description>, <note>, <DD.MM.YYYY>, <debit>, <credit>, <running_saldo>]
+      ["PREFOOT", "", "<period movements>", "", <date>, <debit_sum>, <credit_sum>, <net>]
+      ["FOOT", "", "<closing>", "", <date>, <debit_tot>, <credit_tot>, <closing_saldo>]
+    The first ROW (description "algsaldo") is the opening balance. Saldo is the
+    running balance signed as debit-positive."""
+    account_label, opening, closing, period = "", None, None, {}
+    moves: list[dict] = []
+    for r in payload:
+        if not r:
+            continue
+        tag = r[0]
+        if tag == "HEAD":
+            account_label = str(r[2][0]).strip() if len(r) > 2 and r[2] else ""
+            continue
+        if tag in ("ROW", "PREFOOT", "FOOT"):
+            kanne, desc, note = r[1], str(r[2]).strip(), str(r[3]).strip()
+            date, debit, credit, saldo = r[4], _report_num(r[5]), _report_num(r[6]), _report_num(r[7])
+        else:
+            continue
+        if tag == "ROW" and desc == "algsaldo":
+            opening = saldo
+            continue
+        if tag == "PREFOOT":
+            period = {"debit": round(debit, 2), "credit": round(credit, 2),
+                      "net": round(saldo, 2)}
+            continue
+        if tag == "FOOT":
+            closing = saldo
+            continue
+        moves.append({
+            "doc_nr": kanne if kanne != "" else None,
+            "date": date, "description": desc, "note": note,
+            "debit": round(debit, 2), "credit": round(credit, 2),
+            "saldo": round(saldo, 2),
+        })
+    return {"account": account_label, "opening": opening, "closing": closing,
+            "period": period, "moves": moves}
+
+
+@reports.command("account-ledger")
+@click.argument("account_id", type=int)
+@click.option("--from", "period_from", required=True,
+              help="Period start (YYYY-MM-DD or DD.MM.YYYY).")
+@click.option("--to", "period_to", required=True,
+              help="Period end (YYYY-MM-DD or DD.MM.YYYY).")
+@click.option("--json", "as_json", is_flag=True)
+def reports_account_ledger(account_id: int, period_from: str, period_to: str,
+                           as_json: bool) -> None:
+    """Pearaamat — one account's line-by-line movements over a period.
+
+    The account card (kontokaart): opening balance, every entry that touched the
+    account with a running saldo, then the period's debit/credit totals and the
+    closing balance. The drill-down behind a trial-balance figure — see WHICH
+    entries moved an account when reconciling a control/clearing/bank account or
+    chasing where a balance came from.
+
+    ACCOUNT_ID is the COA id (the `id` column of `accounts list chart`, e.g. 214
+    for 1535). The DOC NR column is SimplBooks' journal/document number (Kande
+    nr., as shown in the SB UI) — this is NOT the id that `kanne show` takes; to
+    open an underlying entry from the CLI find it with `kanne list --search` by
+    its date + description. Saldo is debit-positive (a positive saldo is a
+    debit/asset balance, negative a credit/liability balance)."""
+    pf, pt = _report_date(period_from), _report_date(period_to)
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        payload = _report_export_data(
+            http, account, "mainledger", pf, pt,
+            extra={"report[financial_account_id]": str(account_id)})
+    if not isinstance(payload, list):
+        raise click.ClickException("Unexpected mainledger payload shape — layout changed?")
+    led = _parse_account_ledger(payload)
+
+    if as_json:
+        click.echo(json.dumps(led, indent=2, ensure_ascii=False))
+        return
+
+    click.secho(f"Pearaamat — {led['account'] or account_id}   {pf} → {pt}",
+                fg="cyan", bold=True)
+    click.echo()
+    op = led["opening"] or 0.0
+    click.echo(f"{'':>10}  {'DOC NR':>7}  {'':<46}  {'DEBIT':>11}  {'CREDIT':>11}  {'SALDO':>12}")
+    click.secho(f"{'opening':>10}  {'':>7}  {'algsaldo':<46}  {'':>11}  {'':>11}  {op:>12,.2f}",
+                fg="white")
+    for m in led["moves"]:
+        click.echo(
+            f"{m['date']:>10}  {str(m['doc_nr'] or ''):>7}  {m['description'][:46]:<46}  "
+            f"{m['debit']:>11,.2f}  {m['credit']:>11,.2f}  {m['saldo']:>12,.2f}")
+    cl = led["closing"]
+    click.echo()
+    p = led["period"]
+    if p:
+        click.echo(f"period movements: debit {p['debit']:,.2f}   credit {p['credit']:,.2f}   "
+                   f"net {p['net']:+,.2f}")
+    if cl is not None:
+        click.secho(f"closing saldo as of {pt}: {cl:,.2f}", fg="green", bold=True)
+
+
+# ─── kmd (VAT return / käibedeklaratsioon) ──────────────────────────────────
+
+@cli.group()
+def kmd() -> None:
+    """Käibedeklaratsioon (KMD / VAT return) — read the declaration SB computes
+    from the books, reconcile it against what was filed, and (when the e-MTA
+    integration is active) draft / submit / amend it."""
+
+
+def _parse_vatstatement(payload: dict) -> dict:
+    """vatstatement export_data → the KMD declaration form. Top-level rows carry a
+    `code` (the KMD line: '1','2','3','4','5','5.3','12','13'…) and cells=[label,
+    value]; rows with `parent_row_id`+`account_id` are the contributing-account
+    breakdown under a line. Returns the coded lines and a code→value map."""
+    lines: list[dict] = []
+    by_code: dict[str, float] = {}
+    for row in payload.get("rows", []):
+        code = row.get("code")
+        if code is None:
+            continue
+        cells = row.get("cells") or ["", 0]
+        label = str(cells[0]).strip()
+        val = round(_report_num(cells[1]) if len(cells) > 1 else 0.0, 2)
+        lines.append({"code": str(code), "label": label, "value": val})
+        by_code[str(code)] = val
+    return {"lines": lines, "by_code": by_code}
+
+
+def _kmd_net(by_code: dict) -> float:
+    """Signed net VAT for the period: +payable (line 12) / −refund (line 13)."""
+    return round(by_code.get("12", 0.0) - by_code.get("13", 0.0), 2)
+
+
+@kmd.command("show")
+@click.option("--period", "period", required=True, help="Tax period YYYY-MM (e.g. 2025-06).")
+@click.option("--json", "as_json", is_flag=True)
+def kmd_show(period: str, as_json: bool) -> None:
+    """The käibedeklaratsioon (KMD form) SB computes from the books for a period.
+
+    Every declaration line (1–13 and sub-lines) with the value SB would file —
+    the books' own version of the return, to reconcile against what was actually
+    filed to e-MTA. Line 12 is VAT payable, line 13 VAT refundable."""
+    pf, pt = _kmd_period_bounds(period)
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        payload = _report_export_data(http, account, "vatstatement", pf, pt)
+    decl = _parse_vatstatement(payload)
+    net = _kmd_net(decl["by_code"])
+
+    if as_json:
+        click.echo(json.dumps({"period": period, "period_from": pf, "period_to": pt,
+                               "net": net, **decl}, indent=2, ensure_ascii=False))
+        return
+
+    click.secho(f"Käibedeklaratsioon (KMD)  {period}   ({pf} → {pt})", fg="cyan", bold=True)
+    click.echo()
+    click.secho(f"{'LINE':<6} {'DESCRIPTION':<58} {'AMOUNT':>13}", bold=True)
+    for ln in decl["lines"]:
+        click.echo(f"{ln['code']:<6} {ln['label'][:58]:<58} {ln['value']:>13,.2f}")
+    click.echo()
+    if net >= 0:
+        click.secho(f"net VAT payable (line 12−13): {net:,.2f}", fg="yellow", bold=True)
+    else:
+        click.secho(f"net VAT refundable (line 12−13): {net:,.2f}", fg="green", bold=True)
+
+
+def _kmd_period_for_month(http, account, year: int, month: int) -> dict:
+    """Fetch + parse the books' KMD for one month; return code→value + net."""
+    pf, pt = _kmd_period_bounds(f"{year:04d}-{month:02d}")
+    payload = _report_export_data(http, account, "vatstatement", pf, pt)
+    decl = _parse_vatstatement(payload)
+    return {"month": month, "by_code": decl["by_code"], "net": _kmd_net(decl["by_code"])}
+
+
+@kmd.command("list")
+@click.option("--year", type=int, required=True, help="Calendar year, e.g. 2025.")
+@click.option("--json", "as_json", is_flag=True)
+def kmd_list(year: int, as_json: bool) -> None:
+    """Per-month KMD overview for a year — the books' output VAT (line 4), input
+    VAT (line 5) and net (line 12−13) for every month, the reconciliation backbone."""
+    cookies, account = session_or_die()
+    rows = []
+    with build_http(cookies, account) as http:
+        for mo in range(1, 13):
+            r = _kmd_period_for_month(http, account, year, mo)
+            bc = r["by_code"]
+            rows.append({"month": mo, "out": bc.get("4", 0.0), "input": bc.get("5", 0.0),
+                         "payable": bc.get("12", 0.0), "refund": bc.get("13", 0.0),
+                         "net": r["net"]})
+
+    if as_json:
+        click.echo(json.dumps({"year": year, "months": rows}, indent=2, ensure_ascii=False))
+        return
+
+    click.secho(f"KMD overview — {year} (from the books)", fg="cyan", bold=True)
+    click.echo()
+    click.secho(f"{'MONTH':<8} {'OUT(4)':>11} {'INPUT(5)':>11} {'PAYABLE(12)':>13} "
+                f"{'REFUND(13)':>12} {'NET':>11}", bold=True)
+    tot = 0.0
+    for r in rows:
+        tot = round(tot + r["net"], 2)
+        click.echo(f"{year}-{r['month']:02d}  {r['out']:>11,.2f} {r['input']:>11,.2f} "
+                   f"{r['payable']:>13,.2f} {r['refund']:>12,.2f} {r['net']:>11,.2f}")
+    click.echo()
+    click.secho(f"Σ net VAT over {year}: {tot:+,.2f}  (+payable / −refund)", bold=True)
+
+
+def _parse_filed_kmd_csv(path: str) -> dict:
+    """An e-MTA KMD export (the per-period declaration CSV) → {year, months:{m:{code:val}}}.
+    Rows are keyed by the language-independent line code in column 0 ('R4','R5',
+    'R12','R13'); month columns are located from the header's 'M.YYYY' period tags.
+    Decimal comma, ';' delimiter, empty cell = 0."""
+    import csv as _csv
+    raw = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    rows = list(_csv.reader(raw.splitlines(), delimiter=";"))
+    month_cols: dict[int, int] = {}   # column index → month number
+    year = None
+    for r in rows:
+        for idx, cell in enumerate(r):
+            m = re.search(r"\b(\d{1,2})\.(\d{4})\b", cell)
+            if m and idx >= 2:
+                month_cols[idx] = int(m.group(1))
+                year = int(m.group(2))
+        if month_cols:
+            break
+    if not month_cols:
+        raise click.ClickException("Couldn't find month columns (M.YYYY headers) in the CSV.")
+    wanted = {"R4", "R5", "R12", "R13", "R1"}
+    months: dict[int, dict] = {}
+    for r in rows:
+        if not r:
+            continue
+        code = r[0].strip().strip('"')
+        if code not in wanted:
+            continue
+        for idx, mo in month_cols.items():
+            val = _report_num(r[idx]) if idx < len(r) else 0.0
+            months.setdefault(mo, {})[code] = round(val, 2)
+    return {"year": year, "months": months}
+
+
+@kmd.command("reconcile")
+@click.option("--filed", "filed_csv", required=True, type=click.Path(dir_okay=False, exists=True),
+              help="The e-MTA KMD export CSV of what was actually filed.")
+@click.option("--year", type=int, default=None, help="Override the year (else read from the CSV).")
+@click.option("--tolerance", type=float, default=0.05,
+              help="Per-month net gap (EUR) treated as rounding noise (default 0.05).")
+@click.option("--json", "as_json", is_flag=True)
+def kmd_reconcile(filed_csv: str, year: int | None, tolerance: float, as_json: bool) -> None:
+    """Reconcile the books' KMD against what was filed to e-MTA.
+
+    Parses a filed KMD export CSV and, for every month, compares the filed net VAT
+    (filed line 12 − line 13) to what SB computes from the books today. Months whose
+    net differs by more than a cent are flagged — those are the declarations to amend."""
+    filed = _parse_filed_kmd_csv(filed_csv)
+    yr = year or filed["year"]
+    if not yr:
+        raise click.ClickException("No year in the CSV — pass --year.")
+
+    cookies, account = session_or_die()
+    out = []
+    with build_http(cookies, account) as http:
+        for mo in range(1, 13):
+            fm = filed["months"].get(mo)
+            if not fm:
+                continue
+            books = _kmd_period_for_month(http, account, yr, mo)
+            filed_net = round(fm.get("R12", 0.0) - fm.get("R13", 0.0), 2)
+            books_net = books["net"]
+            delta = round(books_net - filed_net, 2)
+            out.append({
+                "month": mo, "filed_net": filed_net, "books_net": books_net, "delta": delta,
+                "filed_input": fm.get("R5", 0.0), "books_input": books["by_code"].get("5", 0.0),
+                "filed_output": fm.get("R4", 0.0), "books_output": books["by_code"].get("4", 0.0),
+                "ties": abs(delta) <= tolerance,
+            })
+
+    mismatches = [r for r in out if not r["ties"]]
+    if as_json:
+        click.echo(json.dumps({"year": yr, "rows": out,
+                               "mismatch_months": [r["month"] for r in mismatches]},
+                              indent=2, ensure_ascii=False))
+        return
+
+    click.secho(f"KMD reconciliation — {yr}   (books vs filed)", fg="cyan", bold=True)
+    click.echo()
+    click.secho(f"{'MONTH':<8} {'FILED NET':>12} {'BOOKS NET':>12} {'Δ(books−filed)':>15}  {'':<6}", bold=True)
+    for r in out:
+        mark = "ok" if r["ties"] else "DIFF"
+        col = "green" if r["ties"] else "yellow"
+        line = (f"{yr}-{r['month']:02d}  {r['filed_net']:>12,.2f} {r['books_net']:>12,.2f} "
+                f"{r['delta']:>+15,.2f}  ")
+        click.echo(line, nl=False)
+        click.secho(mark, fg=col, bold=not r["ties"])
+    click.echo()
+    if not mismatches:
+        click.secho("✓ every filed month ties to the books.", fg="green", bold=True)
+        return
+    click.secho(f"⚠ {len(mismatches)} month(s) differ — amend candidates:", fg="yellow", bold=True)
+    for r in mismatches:
+        favour = "in our favour" if r["delta"] < 0 else "against us"
+        click.echo(f"  {yr}-{r['month']:02d}: Δ {r['delta']:+,.2f} ({favour})   "
+                   f"input books {r['books_input']:,.2f} vs filed {r['filed_input']:,.2f}; "
+                   f"output books {r['books_output']:,.2f} vs filed {r['filed_output']:,.2f}")
+
+
+def _emta_integration_active(http, account: str) -> bool:
+    """True when direct e-MTA filing is wired. The settings page offers an
+    'Aktiveeri' / token-verification form while it is OFF; once linked that
+    activation affordance is gone."""
+    r = http.get(f"{BASE}/{account}/integrations/settings/emta")
+    if r.status_code != 200:
+        return False
+    body = r.text.lower()
+    return "aktiveeri" not in body and "user_verification/send_link" not in body
+
+
+def _require_emta_active() -> tuple:
+    """Gate for the two e-MTA-filing leaves. Returns (cookies, account) when the
+    integration is live; exits 4 (policy) with the activation path when it is not."""
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        if not _emta_integration_active(http, account):
+            _die(4, "emta_inactive",
+                 "Direct e-MTA filing is not activated for this account.\n"
+                 "  → one-time, out-of-band (KZ): SimplBooks → Seaded → Integratsioonid → "
+                 "e-MTA → Aktiveeri, and authorise SimplBooks in e-MTA.\n"
+                 "  Once active, the submit/amend flow gets wired against the live "
+                 "send action and verified before first use.")
+    return cookies, account
+
+
+@kmd.command("submit")
+@click.option("--period", required=True, help="Tax period YYYY-MM to file.")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def kmd_submit(period: str, yes: bool) -> None:
+    """File the period's KMD to e-MTA directly (requires the e-MTA integration).
+
+    Filing a declaration to the tax authority is an external, effectively
+    irreversible act: it always confirms first (unless --yes) and only runs when
+    the e-MTA integration is active."""
+    _require_emta_active()
+    raise click.ClickException(
+        "e-MTA integration reports active, but the live send action has not been "
+        "wired/verified yet — ping the operator to finish `kmd submit` against the "
+        "real flow before filing. (Refusing to POST a declaration blind.)")
+
+
+@kmd.command("amend")
+@click.option("--period", required=True, help="Tax period YYYY-MM to re-file (parandusdeklaratsioon).")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def kmd_amend(period: str, yes: bool) -> None:
+    """Re-file a corrected KMD for a past period (parandusdeklaratsioon) to e-MTA.
+
+    Same gate and caution as `submit`: external, effectively irreversible, e-MTA
+    integration required."""
+    _require_emta_active()
+    raise click.ClickException(
+        "e-MTA integration reports active, but the live amend action has not been "
+        "wired/verified yet — ping the operator to finish `kmd amend` against the "
+        "real flow before re-filing. (Refusing to POST a declaration blind.)")
+
+
+def _vatstatement_page_html(http: httpx.Client, account: str, period_from: str) -> str:
+    """Render the vatstatement report page for `period_from` (DD.MM.YYYY,
+    first-of-month). The GET seeds csrf + the saved-report id; the POST switches
+    SB's session period and re-renders the page with the per-line change-flag
+    column populated (col-type-change cells gain `text-danger` for any line that
+    moved since the period was confirmed). Only report[period_from] is sent —
+    omitting period_to is what makes SB treat the visit as a period switch."""
+    url = f"{BASE}/{account}/financial_reports/vatstatement"
+    r = http.get(url)
+    if _session_stale(r):
+        auto_login_attempt(interactive=False)
+        creds = load_credentials()
+        http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
+        r = http.get(url)
+    if r.status_code != 200:
+        raise click.ClickException(f"GET vatstatement returned {r.status_code}")
+    soup = BeautifulSoup(r.text, "html.parser")
+    tok = soup.find("input", {"name": "_csrfToken"})
+    rid = soup.find("input", {"name": "report[id]"})
+    if not tok or not tok.get("value") or not rid or not rid.get("value"):
+        raise click.ClickException("vatstatement page layout changed — no _csrfToken / report[id].")
+    body = [
+        ("_csrfToken", tok["value"]),
+        ("report[id]", rid["value"]),
+        ("report[name]", "vatstatement"),
+        ("report[is_saved_recently]", ""),
+        ("report[did_transaction_save_fail]", ""),
+        ("report[send_success_msg]", ""),
+        ("report[period_from]", period_from),
+    ]
+    headers = {"Referer": url, "Origin": BASE,
+               "Content-Type": "application/x-www-form-urlencoded"}
+    r2 = http.post(url, content=urlencode(body), headers=headers, follow_redirects=True)
+    if r2.status_code != 200:
+        raise click.ClickException(f"POST vatstatement returned {r2.status_code}")
+    return r2.text
+
+
+def _vat_change_flags(html: str) -> list[dict]:
+    """Per-row scrape of SB's change-since-confirm flags on the rendered
+    vatstatement page. A row whose `col-type-change` cell also carries
+    `text-danger` is a flagged declaration line; we extract the line code from
+    the row header's `title` attr (e.g. '5. Kokku sisendkäibemaksusumma…' → '5')
+    and the red cell's stripped text. Empty list ⇒ the month reconciles."""
+    soup = BeautifulSoup(html, "html.parser")
+    flagged: list[dict] = []
+    for tr in soup.find_all("tr"):
+        td = tr.find("td", class_=lambda c: c and "col-type-change" in c and "text-danger" in c)
+        if not td:
+            continue
+        header = tr.find(["th", "td"])
+        line = ""
+        if header is not None:
+            t = (header.get("title") or "").strip()
+            m = re.match(r"(\d+(?:\.\d+)*)", t)
+            if m:
+                line = m.group(1)
+        flagged.append({"line": line, "value": td.get_text(strip=True)})
+    return flagged
+
+
+@kmd.command("check")
+@click.option("--year", type=int, required=True, help="Calendar year, e.g. 2025.")
+@click.option("--filed", "filed_csv", default=None,
+              type=click.Path(dir_okay=False, exists=True),
+              help="Optional e-MTA KMD export CSV — adds the books-vs-filed net delta per month.")
+@click.option("--json", "as_json", is_flag=True)
+def kmd_check(year: int, filed_csv: str | None, as_json: bool) -> None:
+    """SimpleBooks' own per-period KMD reconciliation signal, per line.
+
+    On the vatstatement report page SB flags every declaration line that moved
+    since the period was confirmed (the `col-type-change` cell gets `text-danger`).
+    This walks all 12 months of --year and reports SB's verdict — RECONCILES, or
+    the flagged R<line>=<value> list. With --filed, also computes the books-vs-filed
+    net delta per month (same parsing as `kmd reconcile`)."""
+    cookies, account = session_or_die()
+    filed = _parse_filed_kmd_csv(filed_csv) if filed_csv else None
+
+    rows: list[dict] = []
+    with build_http(cookies, account) as http:
+        for mo in range(1, 13):
+            pf = f"01.{mo:02d}.{year:04d}"
+            html = _vatstatement_page_html(http, account, pf)
+            flags = _vat_change_flags(html)
+            row: dict = {"month": mo, "reconciles": not flags, "flags": flags}
+            if filed is not None:
+                fm = filed["months"].get(mo)
+                if fm:
+                    books = _kmd_period_for_month(http, account, year, mo)
+                    filed_net = round(fm.get("R12", 0.0) - fm.get("R13", 0.0), 2)
+                    row["filed_net"] = filed_net
+                    row["books_net"] = books["net"]
+                    row["delta"] = round(books["net"] - filed_net, 2)
+                else:
+                    row["filed_net"] = None
+                    row["books_net"] = None
+                    row["delta"] = None
+            rows.append(row)
+
+    if as_json:
+        click.echo(json.dumps({"year": year, "months": rows}, indent=2, ensure_ascii=False))
+        return
+
+    click.secho(f"KMD check — {year}   (SimpleBooks per-period change flags)",
+                fg="cyan", bold=True)
+    click.echo()
+    head = f"{'MONTH':<8} {'SB STATUS':<48}"
+    if filed is not None:
+        head += f"  {'Δ(books−filed)':>15}"
+    click.secho(head, bold=True)
+    for r in rows:
+        if r["reconciles"]:
+            status, col = "RECONCILES", "green"
+        else:
+            status = " ".join(f"R{f['line']}={f['value']}" for f in r["flags"])
+            col = "yellow"
+        click.echo(f"{year}-{r['month']:02d}  ", nl=False)
+        click.secho(f"{status[:48]:<48}", fg=col, bold=not r["reconciles"], nl=False)
+        if filed is not None:
+            d = r.get("delta")
+            if d is None:
+                click.echo(f"  {'-':>15}")
+            else:
+                click.echo(f"  {d:>+15,.2f}")
+        else:
+            click.echo()
+    click.echo()
+    diffs = [r for r in rows if not r["reconciles"]]
+    if not diffs:
+        click.secho("✓ every month reconciles per SimpleBooks.", fg="green", bold=True)
+    else:
+        click.secho(f"⚠ {len(diffs)} month(s) flagged by SimpleBooks — review the lines above.",
+                    fg="yellow", bold=True)
+
+
+def _kmd_period_bounds(period: str) -> tuple[str, str]:
+    """'YYYY-MM' → (first-day, last-day) in YYYY-MM-DD."""
+    m = re.fullmatch(r"(\d{4})-(\d{2})", period.strip())
+    if not m:
+        raise click.ClickException("--period must be YYYY-MM (e.g. 2025-06).")
+    y, mo = int(m.group(1)), int(m.group(2))
+    if not 1 <= mo <= 12:
+        raise click.ClickException("month out of range in --period.")
+    nxt = datetime(y + (mo == 12), (mo % 12) + 1, 1)
+    last = nxt - timedelta(days=1)
+    return f"{y:04d}-{mo:02d}-01", last.strftime("%Y-%m-%d")
 
 
 # ─── expenses (purchase invoices / ostuarved) ───────────────────────────────
