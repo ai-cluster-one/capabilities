@@ -60,7 +60,7 @@ CRED_KEYS = [
      "note": "optional pin for the invoice line worker; else the logged-in user"},
 ]
 WRITE_VERBS = {"create", "update", "delete", "unbind", "bind", "send-payment", "save",
-               "submit", "amend"}
+               "submit", "amend", "regenerate"}
 WRITE_DEFAULT = False    # writes create legal invoices / stage real bank payments;
                          # granted per connection, explicitly, via allow_write: true
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
@@ -907,6 +907,19 @@ Then re-run `simplbooks doctor` to confirm.
                                                 the period was confirmed is reported.
                                                 --filed adds the books-vs-filed net
                                                 delta per month.
+
+  simplbooks kmd regenerate --period YYYY-MM
+        [--apply] [--yes] [--json]              Create a missing closure or
+                                                regenerate a stale one (Käibemaksu
+                                                kontode sulgemine): SB only computes
+                                                fresh legs from its inline create-form,
+                                                so this either submits that form (new
+                                                period) or deletes the stale closure
+                                                so SB re-renders the form, then
+                                                submits it (regenerate). Default is
+                                                dry-run; --apply mutates and confirms
+                                                first (declared period), --yes for
+                                                non-interactive runs.
 
   simplbooks kmd submit --period YYYY-MM [--yes]
   simplbooks kmd amend  --period YYYY-MM [--yes]
@@ -3551,6 +3564,385 @@ def kmd_check(year: int, filed_csv: str | None, as_json: bool) -> None:
     else:
         click.secho(f"⚠ {len(diffs)} month(s) flagged by SimpleBooks — review the lines above.",
                     fg="yellow", bold=True)
+
+
+def _find_vatclosure_id(period_html: str) -> int | None:
+    """The closure row on the vatstatement period page exposes financial_transactions/
+    delete/<id> and /edit/<id> links — pull the id from whichever appears first."""
+    m = re.search(r"/financial_transactions/(?:delete|edit)/(\d+)", period_html)
+    return int(m.group(1)) if m else None
+
+
+def _harvest_closure_form(period_html: str) -> tuple[list[tuple[str, str]], list[str], str]:
+    """SB re-renders an inline VatClosure create-form on the period page
+    (id='transaction-form') only when there is no closure for the period. Harvest
+    every input/select/textarea, the leg keys (in order seen), and the csrf — the
+    fresh, SB-computed legs are exactly what this form carries."""
+    soup = BeautifulSoup(period_html, "html.parser")
+    form = soup.find("form", {"id": "transaction-form"})
+    if not form:
+        raise click.ClickException(
+            "No #transaction-form on the period page — expected SB's fresh VatClosure "
+            "create-form after the delete. Page layout changed?")
+    fields: list[tuple[str, str]] = []
+    keys_seen: list[str] = []
+    seen: set[str] = set()
+    for el in form.find_all(["input", "select", "textarea"]):
+        name = el.get("name")
+        if not name:
+            continue
+        itype = (el.get("type") or "").lower()
+        if itype in ("file", "submit", "button", "reset"):
+            continue
+        if el.name == "select":
+            opt = el.find("option", selected=True)
+            value = opt.get("value", "") if opt else ""
+        elif el.name == "textarea":
+            value = el.get_text()
+        else:
+            if itype == "checkbox" and not el.has_attr("checked"):
+                continue
+            value = el.get("value", "")
+        fields.append((name, value or ""))
+        m = KANNE_LINE_RE.fullmatch(name)
+        if m and m.group(1) not in seen:
+            keys_seen.append(m.group(1))
+            seen.add(m.group(1))
+    csrf_input = form.find("input", {"name": "_csrfToken"}) or soup.find("input", {"name": "_csrfToken"})
+    if not csrf_input or not csrf_input.get("value"):
+        raise click.ClickException("No _csrfToken on inline transaction-form.")
+    if not keys_seen:
+        raise click.ClickException("Inline transaction-form carries no legs — SB did not prefill.")
+    return fields, keys_seen, csrf_input["value"]
+
+
+def _format_closure_legs(lines: dict, acct_map: dict) -> tuple[list[dict], dict]:
+    """Render `_scrape_kanne_edit_form` lines + an account map into a sorted list
+    of {idx, account_*, debit, credit, note} plus a balance dict — the same view
+    `kanne show` builds, lifted here for closure-side display."""
+    def _ord(kv):
+        return int(kv[0]) if kv[0].isdigit() else 9999
+    legs = []
+    for idx, ln in sorted(lines.items(), key=_ord):
+        aid = str(ln.get("financial_account_id") or "")
+        info = acct_map.get(aid, {})
+        legs.append({
+            "idx": idx,
+            "account_id": aid,
+            "account_code": info.get("code", ""),
+            "account_name": info.get("name", ""),
+            "debit": ln.get("transaction_sum_debit", "0,00"),
+            "credit": ln.get("transaction_sum_credit", "0,00"),
+            "note": ln.get("account_note", ""),
+        })
+    debit, credit = _kanne_balance(lines)
+    bal = {"debit": round(debit, 2), "credit": round(credit, 2),
+           "ok": abs(debit - credit) < 0.005}
+    return legs, bal
+
+
+def _print_closure_legs(legs: list[dict], balance: dict) -> None:
+    click.secho(f"  {'#':>3}  {'ACCOUNT':<42}  {'DEBIT':>11}  {'CREDIT':>11}  NOTE", bold=True)
+    for leg in legs:
+        acct = f"{leg['account_id']:>4} {leg['account_code']} {leg['account_name']}".strip()
+        click.echo(
+            f"  {leg['idx'][:3]:>3}  {acct[:42]:<42}  "
+            f"{leg['debit']:>11}  {leg['credit']:>11}  {leg['note']}"
+        )
+    tie = "✓" if balance["ok"] else "✗ DOES NOT BALANCE"
+    click.echo(f"  {'':>3}  {'balance':<42}  "
+               f"{balance['debit']:>11.2f}  {balance['credit']:>11.2f}  {tie}")
+
+
+def _print_regenerate_preview(period: str, figures: dict, old_id: int,
+                              old_legs: list[dict], old_balance: dict) -> None:
+    click.secho(f"KMD regenerate — {period}   (regenerate preview)", fg="cyan", bold=True)
+    click.echo()
+    click.echo(f"  Existing closure : kanne {old_id}")
+    click.echo(f"  Books KMD        : output(4) {figures['output']:,.2f}   "
+               f"input(5) {figures['input']:,.2f}")
+    click.echo(f"                     payable(12) {figures['payable']:,.2f}  "
+               f"refund(13) {figures['refund']:,.2f}  net {figures['net']:+,.2f}")
+    click.echo()
+    click.secho("Current closure legs:", bold=True)
+    _print_closure_legs(old_legs, old_balance)
+
+
+def _print_create_preview(period: str, figures: dict,
+                          proposed_legs: list[dict], proposed_balance: dict) -> None:
+    click.secho(f"KMD regenerate — {period}   (create preview)", fg="cyan", bold=True)
+    click.echo()
+    click.echo(f"  Existing closure : (none)")
+    click.echo(f"  Books KMD        : output(4) {figures['output']:,.2f}   "
+               f"input(5) {figures['input']:,.2f}")
+    click.echo(f"                     payable(12) {figures['payable']:,.2f}  "
+               f"refund(13) {figures['refund']:,.2f}  net {figures['net']:+,.2f}")
+    click.echo()
+    click.secho("Proposed closure legs (from SB's inline create-form):", bold=True)
+    _print_closure_legs(proposed_legs, proposed_balance)
+
+
+def _has_inline_closure_form(html: str) -> bool:
+    """True when the period page renders SB's inline VatClosure create-form
+    (id='transaction-form'). SB renders it when no closure exists for the period
+    and SB has any VAT activity to close; absent on zero-VAT periods."""
+    return BeautifulSoup(html, "html.parser").find("form", {"id": "transaction-form"}) is not None
+
+
+def _lines_from_harvested(fields: list[tuple[str, str]]) -> dict[str, dict]:
+    """Group harvested form fields by leg key → {attr: value}, mirroring
+    `_scrape_kanne_edit_form`'s `lines` shape so the same formatters work."""
+    out: dict[str, dict] = {}
+    for n, v in fields:
+        m = KANNE_LINE_RE.fullmatch(n)
+        if m:
+            out.setdefault(m.group(1), {})[m.group(2)] = v
+    return out
+
+
+def _submit_inline_closure(http: httpx.Client, account: str, period_dm: str,
+                           cookies: dict) -> tuple[int, list[dict], dict]:
+    """Harvest the period's inline VatClosure create-form, drop the zero-sum
+    rounding leg the browser omits, urlencoded POST to financial_transactions/update,
+    then verify by re-fetching the period and reading the new closure's legs.
+    Shared by the create branch (no prior closure) and the regenerate branch
+    (after the stale closure was deleted)."""
+    fresh_page = _vatstatement_page_html(http, account, period_dm)
+    harvested, leg_keys, form_csrf = _harvest_closure_form(fresh_page)
+
+    by_key: dict[str, dict[str, str]] = {}
+    for n, v in harvested:
+        m = KANNE_LINE_RE.fullmatch(n)
+        if m:
+            by_key.setdefault(m.group(1), {})[m.group(2)] = v
+    drop_keys: set[str] = set()
+    for k in leg_keys:
+        leg = by_key.get(k, {})
+        debit = _amount_float(leg.get("transaction_sum_debit") or "0")
+        credit = _amount_float(leg.get("transaction_sum_credit") or "0")
+        if debit == 0.0 and credit == 0.0:
+            drop_keys.add(k)
+
+    body: list[tuple[str, str]] = []
+    for n, v in harvested:
+        m = KANNE_LINE_RE.fullmatch(n)
+        if m and m.group(1) in drop_keys:
+            continue
+        body.append((n, v))
+    _set_field(body, "_csrfToken", form_csrf)
+
+    http.headers["Referer"] = f"{BASE}/{account}/financial_reports/vatstatement"
+    http.headers["Origin"] = BASE
+    encoded = urlencode(body)
+    r = http.post(f"{BASE}/{account}/financial_transactions/update", content=encoded, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if r.status_code not in (200, 302):
+        fail = CONFIG_DIR / "last_kmd_regenerate_failure.html"
+        fail.write_text(r.text)
+        raise click.ClickException(
+            f"submit returned HTTP {r.status_code}. Response → {fail}")
+
+    verify_page = _vatstatement_page_html(http, account, period_dm)
+    new_id = _find_vatclosure_id(verify_page)
+    if new_id is None:
+        raise click.ClickException(
+            "re-rendered period page carries no VatClosure id — the closure may "
+            "not have been created.")
+    _f, new_lines, _ri, _csrf2 = _scrape_kanne_edit_form(http, account, new_id)
+    with build_http(cookies, account, ajax=True) as ajax:
+        acct_map = _resolve_accounts(ajax, account)
+    new_legs, new_balance = _format_closure_legs(new_lines, acct_map)
+    if not new_balance["ok"]:
+        raise click.ClickException(
+            f"new closure {new_id} does not balance "
+            f"(debit {new_balance['debit']:.2f} vs credit {new_balance['credit']:.2f}).")
+    return new_id, new_legs, new_balance
+
+
+@kmd.command("regenerate")
+@click.option("--period", required=True, help="Tax period YYYY-MM to regenerate the closure for.")
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Perform the delete + recreate (default: dry-run preview only).")
+@click.option("--yes", is_flag=True,
+              help="Skip the interactive confirmation (required with --apply + --json / non-tty).")
+@click.option("--json", "as_json", is_flag=True)
+def kmd_regenerate(period: str, do_apply: bool, yes: bool, as_json: bool) -> None:
+    """Create a missing VAT closing kanne or regenerate a stale one.
+
+    The closing kanne (Käibemaksu kontode sulgemine, base_object_type=VatClosure)
+    is what zeroes the input/output VAT accounts into the settlement account at
+    period end. SB only computes fresh legs from its inline VatClosure create-form
+    on the vatstatement page — it does not recompute a saved closure in place.
+    This command transparently handles both states:
+
+      - no prior closure ⇒ create:     submit the inline create-form SB has
+                                       already prefilled with the fresh legs.
+      - existing closure ⇒ regenerate: delete the stale one so SB re-renders its
+                                       inline create-form, then submit.
+
+    Modes:
+      dry-run (default)  preview proposed legs (create) or existing+books figures
+                         (regenerate) and exit. No mutation.
+      --apply            create or delete+recreate, then re-fetch the period and
+                         confirm the new closure balances. On regenerate, a
+                         recreate failure AFTER the delete is fatal and loud
+                         (period left with no closure — recreate manually).
+
+    --apply on a declared period confirms first (type 'yes'); pass --yes alongside
+    --json or in non-interactive runs."""
+    pf, pt = _kmd_period_bounds(period)
+    yr, mo = period.split("-")
+    period_dm = f"01.{mo}.{yr}"
+    cookies, account = session_or_die()
+
+    with build_http(cookies, account) as http:
+        page = _vatstatement_page_html(http, account, period_dm)
+        old_id = _find_vatclosure_id(page)
+
+        payload = _report_export_data(http, account, "vatstatement", pf, pt)
+        decl = _parse_vatstatement(payload)
+        net = _kmd_net(decl["by_code"])
+        figures = {
+            "output": decl["by_code"].get("4", 0.0),
+            "input": decl["by_code"].get("5", 0.0),
+            "payable": decl["by_code"].get("12", 0.0),
+            "refund": decl["by_code"].get("13", 0.0),
+            "net": net,
+        }
+
+        old_legs: list[dict] = []
+        old_balance: dict | None = None
+        proposed_legs: list[dict] = []
+        proposed_balance: dict | None = None
+
+        if old_id is not None:
+            operation = "regenerate"
+            _f, lines, _ri, _csrf = _scrape_kanne_edit_form(http, account, old_id)
+            with build_http(cookies, account, ajax=True) as ajax:
+                acct_map = _resolve_accounts(ajax, account)
+            old_legs, old_balance = _format_closure_legs(lines, acct_map)
+        else:
+            operation = "create"
+            if not _has_inline_closure_form(page):
+                noop = {
+                    "period": period, "operation": "noop", "applied": False,
+                    "figures": figures,
+                    "old_closure_id": None, "old_legs": [], "old_balance": None,
+                    "proposed_legs": [], "proposed_balance": None,
+                    "new_closure_id": None, "new_legs": [], "new_balance": None,
+                }
+                if as_json:
+                    click.echo(json.dumps(noop, indent=2, ensure_ascii=False))
+                    return
+                click.secho(f"KMD regenerate — {period}", fg="cyan", bold=True)
+                click.secho("No VAT closure on this period and no inline create-form rendered "
+                            "— SB sees no VAT activity to close.", fg="yellow")
+                click.echo(f"  → books' KMD for {period}: net {net:+,.2f} EUR.")
+                return
+
+            harvested, _keys, _csrf = _harvest_closure_form(page)
+            harvested_lines = _lines_from_harvested(harvested)
+            with build_http(cookies, account, ajax=True) as ajax:
+                acct_map = _resolve_accounts(ajax, account)
+            proposed_legs, proposed_balance = _format_closure_legs(harvested_lines, acct_map)
+
+        report: dict = {
+            "period": period, "operation": operation, "applied": False,
+            "figures": figures,
+            "old_closure_id": old_id,
+            "old_legs": old_legs,
+            "old_balance": old_balance,
+            "proposed_legs": proposed_legs,
+            "proposed_balance": proposed_balance,
+            "new_closure_id": None,
+            "new_legs": [],
+            "new_balance": None,
+        }
+
+        if not do_apply:
+            if as_json:
+                click.echo(json.dumps(report, indent=2, ensure_ascii=False))
+                return
+            if operation == "regenerate":
+                _print_regenerate_preview(period, figures, old_id, old_legs, old_balance)
+                click.echo()
+                click.secho("(dry-run) re-run with --apply to delete and recreate.", fg="cyan")
+                click.secho("  The exact fresh legs are produced by SimplBooks during --apply.",
+                            fg="cyan")
+            else:
+                _print_create_preview(period, figures, proposed_legs, proposed_balance)
+                click.echo()
+                click.secho("(dry-run) re-run with --apply to create.", fg="cyan")
+            return
+
+        if not yes:
+            if as_json or not sys.stdin.isatty():
+                raise click.ClickException(
+                    "--apply in a non-interactive context (--json / no tty) requires --yes.")
+            if operation == "regenerate":
+                _print_regenerate_preview(period, figures, old_id, old_legs, old_balance)
+                click.echo()
+                click.secho(
+                    f"⚠ {period} is a closed/declared period. Regenerating will DELETE "
+                    f"closure kanne {old_id} and recreate it from current books.",
+                    fg="yellow", bold=True)
+            else:
+                _print_create_preview(period, figures, proposed_legs, proposed_balance)
+                click.echo()
+                click.secho(
+                    f"⚠ {period} is a closed/declared period. Creating the VAT closure "
+                    f"from current books.",
+                    fg="yellow", bold=True)
+            click.secho("  Type 'yes' to proceed: ", fg="yellow", nl=False)
+            if input().strip().lower() != "yes":
+                raise click.ClickException("Aborted by operator.")
+
+    if operation == "regenerate":
+        # (1) delete — _do_delete owns its own client + verify GET.
+        _do_delete("financial_transactions", old_id, csrf_path="financial_transactions/add")
+        # Anything after the delete that fails leaves the period without a closure —
+        # be loud and tell the operator to recreate manually.
+        try:
+            with build_http(cookies, account) as http:
+                new_id, new_legs, new_balance = _submit_inline_closure(
+                    http, account, period_dm, cookies)
+        except Exception as e:
+            raise click.ClickException(
+                f"REGENERATE INCOMPLETE — closure {old_id} for {period} was DELETED but "
+                f"recreate failed: {str(e)}\n"
+                f"  → SB now has no VAT closure for this period. Inspect manually and "
+                f"recreate before filing.")
+    else:
+        # Create branch — no delete; a submit failure leaves the period exactly as before.
+        with build_http(cookies, account) as http:
+            new_id, new_legs, new_balance = _submit_inline_closure(
+                http, account, period_dm, cookies)
+
+    report["applied"] = True
+    report["new_closure_id"] = new_id
+    report["new_legs"] = new_legs
+    report["new_balance"] = new_balance
+
+    if as_json:
+        click.echo(json.dumps(report, indent=2, ensure_ascii=False))
+        return
+
+    if operation == "regenerate":
+        click.secho(f"✓ Regenerated VAT closure for {period}", fg="green", bold=True)
+        click.echo(f"  Old kanne : {old_id}    New kanne : {new_id}")
+        click.echo(f"  URL       : {BASE}/{account}/financial_transactions/view/{new_id}")
+        click.echo()
+        click.secho("OLD legs", bold=True)
+        _print_closure_legs(old_legs, old_balance)
+        click.echo()
+        click.secho("NEW legs", bold=True)
+        _print_closure_legs(new_legs, new_balance)
+    else:
+        click.secho(f"✓ Created VAT closure for {period}", fg="green", bold=True)
+        click.echo(f"  New kanne : {new_id}")
+        click.echo(f"  URL       : {BASE}/{account}/financial_transactions/view/{new_id}")
+        click.echo()
+        click.secho("Legs", bold=True)
+        _print_closure_legs(new_legs, new_balance)
 
 
 def _kmd_period_bounds(period: str) -> tuple[str, str]:
