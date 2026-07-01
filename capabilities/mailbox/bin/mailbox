@@ -3,6 +3,8 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "imap-tools>=1.13",
+#     "httpx>=0.27",
+#     "fpdf2>=2.7",
 # ]
 # ///
 """
@@ -85,6 +87,12 @@ Commands:
         --save-dir DIR [--folder F]           JSON: saved paths + content types.
         [--mark-seen]                         mark-seen is OFF by default.
                                               --message-id as for show.
+  mailbox pdf <uid> | --message-id <id>       Render the message as a self-
+        --save-dir DIR [--folder F]           contained PDF (headers, text body,
+                                              attachment manifest). UTF-8 safe
+                                              (Cyrillic, Estonian, etc.).
+                                              JSON: saved path + attachment
+                                              manifest. --message-id as for show.
   mailbox seen <uid> [--unsee] [--folder F]   Flag / unflag \\Seen.
   mailbox folders                             List IMAP folders (find Archive).
   mailbox move <uid> --to-folder F            Move a message to another folder
@@ -886,6 +894,174 @@ def cmd_fetch(cfg: dict, uid: str | None, folder: str, save_dir: str,
             "saved": saved, "marked_seen": mark_seen}
 
 
+# Ordered probe list — first hit wins; a project-scoped override lands first
+# so a machine without a system Unicode TTF can still render.
+_PDF_FONT_CANDIDATES = (
+    Path.home() / ".config" / "mailbox" / "pdf-font.ttf",
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    Path("/Library/Fonts/Arial Unicode.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
+    Path("/usr/share/fonts/TTF/DejaVuSans.ttf"),
+    Path("/usr/share/fonts/liberation/LiberationSans-Regular.ttf"),
+)
+
+
+def _find_pdf_font() -> Path | None:
+    for c in _PDF_FONT_CANDIDATES:
+        if c.is_file():
+            return c
+    return None
+
+
+def _html_to_text(html: str) -> str:
+    """Minimal HTML -> text: strip tags, collapse whitespace. Used only when a
+    message ships HTML but no text/plain part."""
+    from html.parser import HTMLParser
+    from html import unescape
+
+    class _X(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.buf: list[str] = []
+            self.skip = 0
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style"):
+                self.skip += 1
+            elif tag in ("br", "p", "div", "li", "tr"):
+                self.buf.append("\n")
+        def handle_endtag(self, tag):
+            if tag in ("script", "style") and self.skip:
+                self.skip -= 1
+            elif tag in ("p", "div", "li", "tr"):
+                self.buf.append("\n")
+        def handle_data(self, data):
+            if not self.skip:
+                self.buf.append(data)
+
+    x = _X()
+    try:
+        x.feed(html)
+    except Exception:
+        return unescape(html)
+    text = unescape("".join(x.buf))
+    # collapse runs of blank lines
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    out: list[str] = []
+    blank = 0
+    for ln in lines:
+        if ln.strip():
+            out.append(ln); blank = 0
+        else:
+            blank += 1
+            if blank <= 1:
+                out.append("")
+    return "\n".join(out).strip()
+
+
+def _pdf_slug(subject: str | None, uid: str | int) -> str:
+    base = (subject or f"message-{uid}").strip()
+    slug = "".join(c if (c.isalnum() or c in "-_ .") else "_" for c in base)
+    slug = slug.strip().strip(".")[:80] or f"message-{uid}"
+    return f"{slug}.pdf"
+
+
+def cmd_pdf(cfg: dict, uid: str | None, folder: str, save_dir: str,
+            message_id: str | None = None) -> dict:
+    try:
+        from fpdf import FPDF
+    except ImportError as e:
+        _die(5, "missing_dependency", f"fpdf2 is required for pdf: {e}",
+             "reinstall the mailbox capability so uv resolves the script deps")
+
+    out_dir = Path(save_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with _imap(cfg) as mb:
+        if message_id:
+            folder, m = _locate_by_message_id(mb, message_id)
+            uid = m.uid
+        else:
+            if folder != "INBOX":
+                mb.folder.set(folder)
+            m = _one(mb, uid, mark_seen=False)
+
+        subject = m.subject or ""
+        from_ = m.from_ or ""
+        to = list(m.to)
+        cc = list(m.cc)
+        date_str = m.date_str or ""
+        msgid_val = m.headers.get("message-id", ("",))[0] or None
+        text = m.text or ""
+        html = m.html or ""
+        attachments = [
+            {"filename": a.filename, "content_type": a.content_type, "size": a.size}
+            for a in m.attachments
+        ]
+
+    body = text or (_html_to_text(html) if html else "")
+
+    font_path = _find_pdf_font()
+    if font_path is None:
+        _die(5, "no_font",
+             "no Unicode-capable TTF font found on this system",
+             "place a TTF at ~/.config/mailbox/pdf-font.ttf, "
+             "or install a system font (macOS: Arial Unicode; Linux: DejaVu Sans)")
+
+    pdf = FPDF(unit="mm", format="A4")
+    pdf.set_auto_page_break(True, margin=15)
+    pdf.add_font("Body", "", str(font_path))
+    pdf.add_page()
+    w = pdf.epw
+
+    pdf.set_font("Body", "", 14)
+    pdf.multi_cell(w, 8, subject or "(no subject)", wrapmode='CHAR')
+    pdf.ln(2)
+
+    pdf.set_font("Body", "", 10)
+    header_rows = [
+        ("From", from_),
+        ("To", ", ".join(to)),
+        ("Cc", ", ".join(cc)),
+        ("Date", date_str),
+    ]
+    for label, value in header_rows:
+        if value:
+            pdf.multi_cell(w, 5, f"{label}: {value}", wrapmode='CHAR')
+    pdf.ln(3)
+
+    pdf.set_font("Body", "", 11)
+    if body:
+        for line in body.splitlines() or [""]:
+            pdf.multi_cell(w, 5, line if line else " ", wrapmode='CHAR')
+    else:
+        pdf.multi_cell(w, 5, "(empty body)", wrapmode='CHAR')
+
+    pdf.ln(4)
+    pdf.set_font("Body", "", 10)
+    if attachments:
+        pdf.multi_cell(w, 5, f"Attachments ({len(attachments)}):", wrapmode='CHAR')
+        for a in attachments:
+            size_kb = (a["size"] or 0) / 1024
+            pdf.multi_cell(
+                w, 5,
+                f"  - {a['filename'] or '(unnamed)'} "
+                f"({a['content_type'] or 'application/octet-stream'}, "
+                f"{size_kb:.1f} KB)",
+                wrapmode='CHAR'
+            )
+    else:
+        pdf.multi_cell(w, 5, "Attachments: none", wrapmode='CHAR')
+
+    dest = out_dir / _pdf_slug(subject, uid)
+    pdf.output(str(dest))
+
+    return {"uid": uid, "folder": folder,
+            "message_id": msgid_val,
+            "saved": str(dest),
+            "attachments": attachments}
+
+
 def cmd_seen(cfg: dict, uid: str, folder: str, unsee: bool) -> dict:
     with _imap(cfg) as mb:
         if folder != "INBOX":
@@ -1019,6 +1195,14 @@ def main() -> None:
     sp.add_argument("--folder", default="INBOX")
     sp.add_argument("--mark-seen", action="store_true")
 
+    sp = sub.add_parser("pdf", parents=[conn_parent],
+                        help="render a message to a self-contained PDF")
+    sp.add_argument("uid", nargs="?", default=None)
+    sp.add_argument("--message-id", dest="message_id", default=None,
+                    help="locate across all folders by Message-ID (folder-agnostic)")
+    sp.add_argument("--save-dir", required=True)
+    sp.add_argument("--folder", default="INBOX")
+
     sp = sub.add_parser("seen", parents=[conn_parent],
                         help="flag or unflag \\Seen")
     sp.add_argument("uid")
@@ -1070,6 +1254,9 @@ def main() -> None:
     elif args.cmd == "fetch":
         _require_selector(args)
         _emit(cmd_fetch(cfg, args.uid, args.folder, args.save_dir, args.mark_seen, args.message_id))
+    elif args.cmd == "pdf":
+        _require_selector(args)
+        _emit(cmd_pdf(cfg, args.uid, args.folder, args.save_dir, args.message_id))
     elif args.cmd == "seen":
         _emit(cmd_seen(cfg, args.uid, args.folder, args.unsee))
     elif args.cmd == "send":
