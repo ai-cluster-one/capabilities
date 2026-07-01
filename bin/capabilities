@@ -44,6 +44,11 @@ MACHINE VERBS
   update [<name>]
         Re-fetch one capability (or all) from its recorded source; refresh
         snapshots; regenerate the skill.
+  self-update
+        Refresh the manager itself from the canonical source and re-point its
+        PATH symlink (install.sh is the first-install bootstrap; this is the
+        ongoing update). No-op when already current. The manager is not a
+        capability, so it has no registry entry or snapshots.
   list
         Installed capabilities with summaries; inside a project, each entry
         also carries its gate state (enabled / disabled / ungated).
@@ -588,6 +593,49 @@ def cmd_update(name: str | None) -> None:
         results.append({"name": n, "changed": before != after})
     _regen_skills()
     _emit({"updated": results})
+
+
+def cmd_self_update() -> None:
+    """Refresh the installed manager itself from the canonical source.
+
+    The manager is not a capability — it has no registry entry, no snapshots,
+    no gate. It lives at CAP_HOME/.manager/capabilities, symlinked onto PATH.
+    install.sh is the first-install bootstrap; this is the ongoing update, a
+    discoverable verb rather than a remembered curl one-liner. Idempotent:
+    a no-op (with "already current") when the installed bytes match canonical.
+    """
+    url = f"{SOURCE}/bin/capabilities"
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=30.0)
+    except httpx.HTTPError as e:
+        _die(5, "network_error", f"fetch failed: {e}", url)
+    if resp.status_code != 200:
+        _die(5, "server_error", f"fetch returned {resp.status_code}", url)
+    content = resp.content
+    # The fetched bytes must actually be the manager script, not an error page
+    # or a redirect body — mirror install.sh's shebang guard.
+    if b"uv run" not in content.split(b"\n", 1)[0]:
+        _die(5, "server_error",
+             "fetched file does not look like the manager script", url)
+    manager = CAP_HOME / ".manager" / "capabilities"
+    before = _sha256(manager) if manager.exists() and not manager.is_symlink() else None
+    after = hashlib.sha256(content).hexdigest()
+    if before == after:
+        _emit({"self_update": "already current",
+               "manager": str(manager), "sha256": after, "source": url})
+        return
+    manager.parent.mkdir(parents=True, exist_ok=True)
+    # Never write through a stray symlink into a working tree — the same
+    # canonical-source discipline doctor enforces for capability registry
+    # entries. Replace with a fresh real file.
+    if manager.is_symlink() or manager.exists():
+        manager.unlink()
+    manager.write_bytes(content)
+    manager.chmod(manager.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    link = _symlink("capabilities", manager)
+    _emit({"self_update": "updated", "manager": str(manager),
+           "sha256_before": before, "sha256_after": after,
+           "symlink": str(link), "source": url})
 
 
 def cmd_list() -> None:
@@ -2064,6 +2112,8 @@ def main() -> None:
         cmd_uninstall(pos[0], flag("--purge-credentials"))
     elif cmd == "update":
         cmd_update(pos[0] if pos else None)
+    elif cmd == "self-update":
+        cmd_self_update()
     elif cmd == "list":
         cmd_list()
     elif cmd == "enable":
