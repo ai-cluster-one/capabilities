@@ -1,7 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+#     "httpx>=0.27",
+# ]
 # ///
 """
 mail — personal Mail.app CLI (JXA-backed; read + draft only; no send).

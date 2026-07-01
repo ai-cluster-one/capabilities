@@ -1,7 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+#     "httpx>=0.27",
+# ]
 # ///
 """railwayc — a credential harness around the official `railway` CLI. It resolves a
 PROJECT-SCOPED Railway token, injects it, and forwards your command verbatim to
