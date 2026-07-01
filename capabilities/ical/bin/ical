@@ -1,0 +1,1572 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""
+ical — personal Calendar.app CLI (JXA-backed; read + write, policy-gated).
+
+No secret on disk. Auth is the one-time macOS Automation grant:
+  System Settings → Privacy & Security → Automation → your terminal → Calendar
+
+Writes are gated through the standard connections model — the same exit-4
+write-gate every capability uses. A connection here carries policy, not a
+credential: which Calendar.app calendars are in scope, and whether that
+scope may be written. Selection: `--connection <id>` (anywhere on argv);
+without the flag the registry's default applies (marked with * in the
+`connections` output). Read verbs also respect the connection's scope —
+when `calendars` is non-empty they read only those calendars.
+
+Registry (first found wins, never merged):
+  <project>/.capabilities/ical/connections.json
+  ~/.config/ical/connections.json
+
+Registry shape:
+  {
+    "default": "<id>",
+    "connections": {
+      "<id>": { "calendars": ["<Calendar.app name>", ...], "allow_write": <bool> }
+    }
+  }
+  `calendars: []` (or omitted) means every calendar is in scope.
+  `allow_write: false` (the safe default) blocks the write verbs.
+
+Read commands:
+  ical help
+      Print this document.
+
+  ical doctor
+      Readiness — proves the macOS Automation grant by listing calendars.
+
+  ical calendars [--json] [--connection ID]
+      List calendars Calendar.app knows about (name, writable flag),
+      restricted to the connection's scope when non-empty.
+
+  ical events [--calendar NAME] [--from ISO] [--to ISO] [--limit N]
+       [--json] [--connection ID]
+      List events in a date window, sorted chronologically. Default window
+      is today .. +7 days. Each event carries a stable id (uid), title,
+      startDate, endDate, allDay flag, calendar name, and location.
+      Datetimes are emitted as ISO 8601 with the local offset.
+
+  ical show <event-id> [--json] [--connection ID]
+      Show one event by uid: title, times, allDay, calendar, location,
+      notes, url, and attendees (name + email). Only events on calendars
+      in the connection's scope are visible.
+
+  ical search <query> [--calendar NAME] [--from ISO] [--to ISO]
+       [--field title|notes|any] [--limit N] [--json] [--connection ID]
+      Search events. Default field 'any' matches title OR notes. Default
+      window today .. +30 days.
+
+  ical freebusy --from ISO --to ISO [--calendars NAME,NAME]
+       [--include-noise] [--json] [--connection ID]
+      Merged busy blocks across the given window. Restricted to the
+      connection's scope (intersected with --calendars when given). By
+      default excludes obvious noise (Birthdays / Holidays / Reminders /
+      Siri Suggestions); --include-noise turns that off.
+
+Write commands (gated: allow_write:true AND target calendar in scope,
+else exit 4):
+  ical create --calendar NAME --title T --from ISO --to ISO
+       [--all-day] [--location L] [--notes N] [--url U]
+       [--invitee EMAIL ...] [--alarm SPEC ...] [--connection ID]
+      Create an event. --url is where a video-call link belongs.
+      --invitee is repeatable (one email per flag). --alarm is repeatable;
+      SPEC is either relative — `-15m`, `-1h`, `-30s`, `-1d` meaning that
+      much before start — or an absolute ISO datetime. Prints the created
+      event's uid.
+
+  ical update <event-id>
+       [--title T] [--from ISO] [--to ISO] [--all-day] [--no-all-day]
+       [--location L] [--notes N] [--url U]
+       [--add-invitee EMAIL ...] [--alarm SPEC ...] [--connection ID]
+      Edit an existing event by uid; only provided fields change. Alarms
+      passed replace the existing alarm set on the event.
+
+  ical delete <event-id> [--connection ID]
+      Delete an event by uid.
+
+Calendar.app / JXA caveats — recorded honestly:
+  • Whether attendee invitations are actually *sent* depends on the
+    underlying account (iCloud/Exchange/CalDAV send; local calendars just
+    record the attendee). ical adds the attendee via JXA and reports
+    success at the JXA level, not the account level.
+  • Alarms are created as `display alarm` entries. Absolute-ISO SPECs use
+    `trigger date`; relative SPECs use `trigger interval` in seconds
+    (negative = before start).
+  • Event uids are Calendar.app's own — stable across a session.
+
+<calendar> matches case-insensitively against a Calendar.app calendar's
+name (trailing/leading whitespace ignored). Calendars are global to the
+app — there is no <account> concept.
+
+Contract commands (the same on every capability):
+  ical stub                                 One-line awareness text.
+  ical manifest --json                      Machine-readable declaration.
+  ical connections                          Connection resolution report —
+                                            each entry carries its calendars
+                                            scope and allow_write flag; the
+                                            default is marked with *. ical
+                                            holds no credential, so every
+                                            connection reports an empty key
+                                            set.
+  ical guide [<topic>]                      Guide topics / one guide body,
+                                            fetched live from the docs base.
+  ical ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
+       [--note <text>]                      (.capabilities/ical/identifiers.json).
+  ical refs                                 Menu of the project's reference
+                                            files for this capability.
+
+Exit codes:
+  0  success
+  2  auth — the macOS Automation grant is missing (doctor)
+  3  not found (contract verbs)
+  4  disabled by project policy, OR the active connection does not permit
+     the write (allow_write:false, or target calendar outside scope).
+     Ask the user; never lift the gate yourself.
+  5  server / network (contract verbs)
+  6  input / validation
+  Domain commands print human-readable output and exit 1 on failure — the
+  recorded deviation in this capability's deviations.md.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import NoReturn
+
+
+JXA_PRELUDE = r"""
+ObjC.import('Foundation');
+
+function env(name) {
+  const v = $.NSProcessInfo.processInfo.environment.objectForKey(name);
+  if (v.isNil()) return null;
+  const s = ObjC.unwrap(v);
+  return s === '' ? null : s;
+}
+
+function die(msg) { throw new Error(msg); }
+
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+function localISO(d) {
+  if (!d) return null;
+  try {
+    const off = -d.getTimezoneOffset();          // minutes east of UTC
+    const sign = off >= 0 ? '+' : '-';
+    const ah = Math.floor(Math.abs(off) / 60);
+    const am = Math.abs(off) % 60;
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate())
+      + 'T' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds())
+      + sign + pad2(ah) + ':' + pad2(am);
+  } catch (e) { return null; }
+}
+
+function calendarsForNames(names) {
+  const Cal = Application('Calendar');
+  const all = Cal.calendars();
+  if (!names || names.length === 0) return all;
+  const wanted = names.map(n => (n || '').trim().toLowerCase());
+  const out = [];
+  for (const c of all) {
+    const n = (c.name() || '').trim().toLowerCase();
+    if (wanted.indexOf(n) >= 0) out.push(c);
+  }
+  if (out.length === 0) die('No calendar matches: ' + names.join(', '));
+  return out;
+}
+
+function eventsInWindow(cal, fromDate, toDate) {
+  try {
+    return cal.events.whose({_and: [
+      {startDate: {'>=': fromDate}},
+      {startDate: {'<': toDate}}
+    ]})();
+  } catch (e) { return []; }
+}
+
+function eventSummary(e, calName) {
+  let uid = null, summary = null, loc = null, allDay = false, start = null, end = null;
+  try { uid = e.uid(); } catch (x) {}
+  try { summary = e.summary(); } catch (x) {}
+  try { loc = e.location(); } catch (x) {}
+  try { allDay = e.alldayEvent(); } catch (x) {}
+  try { start = localISO(e.startDate()); } catch (x) {}
+  try { end = localISO(e.endDate()); } catch (x) {}
+  return {
+    id: uid,
+    title: summary,
+    startDate: start,
+    endDate: end,
+    allDay: allDay,
+    calendar: calName,
+    location: loc || null
+  };
+}
+
+function eventFull(e, calName) {
+  const base = eventSummary(e, calName);
+  try { base.notes = e.description(); } catch (x) { base.notes = null; }
+  try { base.url = e.url(); } catch (x) { base.url = null; }
+  const atts = [];
+  try {
+    for (const a of e.attendees()) {
+      let name = null, email = null;
+      try { name = a.displayName(); } catch (x) {}
+      try { email = a.email(); } catch (x) {}
+      atts.push({name: name, email: email});
+    }
+  } catch (x) {}
+  base.attendees = atts;
+  return base;
+}
+"""
+
+
+# --- Capability declaration (protocol 2) — one home for every contract fact --
+
+NAME = "ical"
+PROTOCOL = 2
+SUMMARY = ("Calendar.app CLI over macOS Automation — read and write events "
+           "across Calendar.app's configured calendars (calendars, events, "
+           "show, search, freebusy, create, update, delete). Writes are "
+           "gated by the connection's policy (scope + allow_write); auth is "
+           "the one-time macOS Automation grant, no credential on disk.")
+SCOPE = "user"      # credential scope: "project" | "user"
+CRED_KEYS: list = []   # no credentials — auth is the one-time macOS Automation grant
+WRITE_VERBS: list = ["create", "update", "delete"]  # gated per-connection
+WRITE_DEFAULT = False   # safe default when a registry entry omits the flag
+DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
+TOPICS: list = []   # shipped guide topics
+STATE = False       # True when the capability writes session/cache state
+POST_INSTALL: list = []
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / "ical" / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding .capabilities/, .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = root / ".capabilities" / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    root = _project_root()
+    return (root / ".capabilities" / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where .capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None and (root / ".capabilities").is_dir():
+            return root / ".capabilities" / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import httpx as _hx
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        resp = _hx.get(url, headers=headers, timeout=10.0, follow_redirects=True)
+        if resp.status_code == 200:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(resp.text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(resp.text); return
+        if resp.status_code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if resp.status_code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        raise _hx.HTTPError(f"upstream returned {resp.status_code}")
+    except _hx.HTTPError as e:
+        if cache.exists():
+            sys.stderr.write(json.dumps(
+                {"warning": f"upstream unreachable; serving cached copy ({e})"},
+                ensure_ascii=False) + "\n")
+            _emit(cache.read_text()); return
+        _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not envdir.parent.is_dir():
+            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+# <<< contract: connections <<<
+
+
+# --- Connections (capability-specific) --------------------------------------
+
+def _conn_scope(entry: dict | None) -> list[str]:
+    """The calendars in scope for one connection. Empty ⇒ every calendar."""
+    if not isinstance(entry, dict):
+        return []
+    raw = entry.get("calendars") or []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _scope_permits(scope: list[str], calendar_name: str) -> bool:
+    """Scope empty ⇒ every calendar. Otherwise case-insensitive match."""
+    if not scope:
+        return True
+    n = (calendar_name or "").strip().lower()
+    return any(s.strip().lower() == n for s in scope)
+
+
+def _connections_report() -> dict:
+    """The resolution report. ical holds no credential and reaches no remote
+    service — auth is the one-time macOS Automation grant — so a registry, if
+    present, only names connections; each carries policy (calendars scope +
+    allow_write) and reports an empty key set (CRED_KEYS is empty). The default
+    entry is marked with * in `default_marker`. With no registry the sole
+    connection is the implicit `default`. Local only: no network, no
+    Calendar.app call."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = [_key_report(k["key"], k["secret"], k["required"],
+                            *_resolve_env_key(k["key"])) for k in CRED_KEYS]
+        report["default"] = "default*"
+        report["connections"]["default"] = {
+            "calendars": [], "allow_write": WRITE_DEFAULT, "keys": keys}
+        return report
+    conns = reg["connections"]
+    default_id = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    report["default"] = (default_id + "*") if default_id else None
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = [_key_report(k["key"], k["secret"], k["required"],
+                            *_resolve_env_key(k["key"])) for k in CRED_KEYS]
+        report["connections"][cid] = {
+            "calendars": _conn_scope(entry),
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    return report
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+# --- Active connection (selected by --connection or the registry default) ---
+
+def _active_conn(wanted: str | None) -> tuple[str, list[str], bool]:
+    """Resolve the active connection: (id, calendars_scope, allow_write)."""
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    if entry is None:  # implicit default (no registry)
+        return cid, [], WRITE_DEFAULT
+    return (cid, _conn_scope(entry),
+            bool(entry.get("allow_write", WRITE_DEFAULT)))
+
+
+def _enforce_write(cid: str, scope: list[str], allow_write: bool,
+                   verb: str, calendar_name: str) -> None:
+    """The standard exit-4 write-gate, extended: also fail when the target
+    calendar is outside the connection's calendars scope."""
+    _write_gate(cid, allow_write, verb)   # exits 4 on allow_write:false
+    if not _scope_permits(scope, calendar_name):
+        _die(4, "out_of_scope",
+             f"connection {cid!r} does not include calendar {calendar_name!r}",
+             "Do not lift the gate yourself — ask the user; scope lives in "
+             "the `calendars` list on this connection in connections.json.")
+
+
+def _extract_connection(argv: list[str]) -> tuple[list[str], str | None]:
+    """Pull --connection <id> (or --connection=<id>) out of argv so it works in
+    any position. Returns (cleaned_argv, connection_id_or_None)."""
+    wanted = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--connection" and i + 1 < len(argv):
+            wanted = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            wanted = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+    return cleaned, wanted
+
+
+# --- JXA runner -------------------------------------------------------------
+
+def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 600):
+    """Execute a JXA script via osascript; return parsed JSON or None."""
+    full_script = JXA_PRELUDE + "\n" + script_body
+    env = os.environ.copy()
+    if env_extras:
+        for k, v in env_extras.items():
+            env[k] = "" if v is None else str(v)
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", full_script],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+    except FileNotFoundError:
+        sys.exit("osascript not found — this CLI only works on macOS.")
+    if result.returncode != 0:
+        err = result.stderr.strip()
+        if "-1743" in err or "Not authorized to send Apple events" in err:
+            sys.exit(
+                "Calendar.app automation is not authorized for this terminal.\n"
+                "  Grant: System Settings → Privacy & Security → Automation\n"
+                "         → [your terminal app] → enable Calendar\n"
+                "  Then run the command again.\n"
+                f"  ({err})"
+            )
+        sys.exit(f"osascript failed: {err}")
+    out = result.stdout.strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return out
+
+
+# --- Date helpers -----------------------------------------------------------
+
+def _local_now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _parse_iso(s: str, fallback: datetime) -> datetime:
+    if not s:
+        return fallback
+    try:
+        # datetime.fromisoformat handles offsets on 3.11+.
+        return datetime.fromisoformat(s)
+    except ValueError:
+        sys.exit(f"bad ISO datetime: {s!r}")
+
+
+def _iso(d: datetime) -> str:
+    if d.tzinfo is None:
+        d = d.astimezone()
+    return d.isoformat(timespec="seconds")
+
+
+def _default_window(from_s: str | None, to_s: str | None,
+                    days_default: int) -> tuple[datetime, datetime]:
+    now = _local_now()
+    # Anchor "today" at local midnight so the window is agent-friendly.
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    frm = _parse_iso(from_s, today)
+    to = _parse_iso(to_s, today + timedelta(days=days_default))
+    if to <= frm:
+        sys.exit("--to must be after --from")
+    return frm, to
+
+
+# --- Scope helpers (read verbs) ---------------------------------------------
+
+def _resolve_read_calendars(args) -> list[str]:
+    """Effective calendar filter for a read verb: user's --calendar intersected
+    with the connection scope. `[]` means 'every calendar' (JXA default).
+    Explicit --calendar outside scope fails exit 4 so the agent sees the wall,
+    the same signal the write gate raises."""
+    scope = getattr(args, "_scope", [])
+    calendar = getattr(args, "calendar", None)
+    if calendar:
+        if scope and not _scope_permits(scope, calendar):
+            _die(4, "out_of_scope",
+                 f"connection {args._conn_id!r} does not include calendar "
+                 f"{calendar!r}",
+                 "Do not lift the gate yourself — ask the user to widen the "
+                 "connection's `calendars` scope in connections.json.")
+        return [calendar]
+    return list(scope)
+
+
+# --- Domain commands --------------------------------------------------------
+
+def cmd_doctor():
+    """Cheapest authenticated round-trip: the Automation grant + calendar list."""
+    _doctor_gate(_connections_report(), None)
+    script = r"""
+    const Cal = Application('Calendar');
+    const cals = Cal.calendars();
+    JSON.stringify({calendars: cals.map(c => c.name())});
+    """
+    info = run_jxa(script) or {}
+    if "calendars" not in info:
+        _die(2, "automation_denied",
+             "Calendar.app did not answer — the macOS Automation grant is missing",
+             "System Settings → Privacy & Security → Automation → your terminal → Calendar")
+    _emit({"ok": True, "count": len(info["calendars"]), "calendars": info["calendars"]})
+
+
+def cmd_calendars(args):
+    script = r"""
+    const Cal = Application('Calendar');
+    const out = Cal.calendars().map(c => {
+      let writable = null;
+      try { writable = c.writable(); } catch (e) {}
+      return { name: c.name(), writable: writable };
+    });
+    JSON.stringify(out);
+    """
+    cals = run_jxa(script) or []
+    scope = args._scope
+    if scope:
+        keep = {s.strip().lower() for s in scope}
+        cals = [c for c in cals if (c.get("name") or "").strip().lower() in keep]
+    if args.json:
+        print(json.dumps(cals, ensure_ascii=False, indent=2))
+        return
+    banner = f"# {len(cals)} calendar(s)"
+    if scope:
+        banner += f" — connection {args._conn_id!r} scope"
+    print(banner)
+    for c in cals:
+        flag = "" if c.get("writable") is not False else "  [read-only]"
+        print(f"  {c['name']}{flag}")
+
+
+def cmd_events(args):
+    frm, to = _default_window(args.frm, args.to, days_default=7)
+    wanted = _resolve_read_calendars(args)
+    script = r"""
+    const raw = env('CALENDARS') || '';
+    const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
+    const cals = calendarsForNames(wanted);
+    const fromDate = new Date(env('FROM'));
+    const toDate = new Date(env('TO'));
+    const limit = parseInt(env('LIMIT') || '0');
+    const out = [];
+    for (const c of cals) {
+      const evs = eventsInWindow(c, fromDate, toDate);
+      const calName = c.name();
+      for (const e of evs) out.push(eventSummary(e, calName));
+    }
+    out.sort(function(a, b) {
+      const as = a.startDate || '', bs = b.startDate || '';
+      return as < bs ? -1 : (as > bs ? 1 : 0);
+    });
+    const trimmed = limit > 0 ? out.slice(0, limit) : out;
+    JSON.stringify(trimmed);
+    """
+    events = run_jxa(script, {
+        "CALENDARS": "|".join(wanted),
+        "FROM": _iso(frm),
+        "TO": _iso(to),
+        "LIMIT": str(args.limit or 0),
+    }) or []
+    if args.json:
+        print(json.dumps(events, ensure_ascii=False, indent=2))
+        return
+    scope_txt = args.calendar or (", ".join(wanted) if wanted else "all calendars")
+    print(f"# {scope_txt}  {_iso(frm)} .. {_iso(to)}  ({len(events)} events)")
+    for e in events:
+        marker = "◉" if e.get("allDay") else " "
+        start = (e.get("startDate") or "")[:16].replace("T", " ")
+        title = (e.get("title") or "(no title)").replace("\n", " ")
+        cal = e.get("calendar") or ""
+        loc = e.get("location") or ""
+        print(f"{marker} [{start}] ({cal}) {title}")
+        if loc:
+            print(f"    @ {loc}")
+        if e.get("id"):
+            print(f"    id: {e['id']}")
+
+
+def cmd_show(args):
+    scope = args._scope
+    script = r"""
+    const Cal = Application('Calendar');
+    const target = env('UID');
+    const raw = env('CALENDARS') || '';
+    const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
+    const cals = calendarsForNames(wanted);
+    let found = null;
+    let calName = null;
+    for (const c of cals) {
+      try {
+        const hits = c.events.whose({uid: target})();
+        if (hits.length > 0) { found = hits[0]; calName = c.name(); break; }
+      } catch (e) {}
+    }
+    if (!found) die('Event not found: ' + target);
+    JSON.stringify(eventFull(found, calName));
+    """
+    ev = run_jxa(script, {
+        "UID": args.event_id,
+        "CALENDARS": "|".join(scope),
+    })
+    if args.json:
+        print(json.dumps(ev, ensure_ascii=False, indent=2))
+        return
+    print(f"Title:    {ev.get('title')}")
+    print(f"Calendar: {ev.get('calendar')}")
+    print(f"Start:    {ev.get('startDate')}")
+    print(f"End:      {ev.get('endDate')}")
+    if ev.get("allDay"):
+        print("All-day:  yes")
+    if ev.get("location"):
+        print(f"Location: {ev.get('location')}")
+    if ev.get("url"):
+        print(f"URL:      {ev.get('url')}")
+    print(f"Id:       {ev.get('id')}")
+    atts = ev.get("attendees") or []
+    if atts:
+        print("Attendees:")
+        for a in atts:
+            name = (a.get("name") or "").strip()
+            email = a.get("email") or ""
+            line = f"  - {name} <{email}>".strip() if (name or email) else "  - (unknown)"
+            print(line)
+    print()
+    print(ev.get("notes") or "")
+
+
+def cmd_search(args):
+    frm, to = _default_window(args.frm, args.to, days_default=30)
+    wanted = _resolve_read_calendars(args)
+    script = r"""
+    const raw = env('CALENDARS') || '';
+    const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
+    const cals = calendarsForNames(wanted);
+    const fromDate = new Date(env('FROM'));
+    const toDate = new Date(env('TO'));
+    const query = env('QUERY') || '';
+    const field = env('FIELD') || 'any';
+    const limit = parseInt(env('LIMIT') || '0');
+
+    function matchClauses() {
+      if (field === 'title') return [{summary: {_contains: query}}];
+      if (field === 'notes') return [{description: {_contains: query}}];
+      return null;   // 'any' → run two whose() calls and union
+    }
+
+    function windowClause() {
+      return [
+        {startDate: {'>=': fromDate}},
+        {startDate: {'<': toDate}}
+      ];
+    }
+
+    function runWhere(cal, extra) {
+      try {
+        return cal.events.whose({_and: windowClause().concat(extra)})();
+      } catch (e) { return []; }
+    }
+
+    const out = [];
+    const seen = {};
+    for (const c of cals) {
+      const calName = c.name();
+      let hits = [];
+      const clauses = matchClauses();
+      if (clauses) {
+        hits = runWhere(c, clauses);
+      } else {
+        // 'any' — union title-match and notes-match
+        const a = runWhere(c, [{summary: {_contains: query}}]);
+        const b = runWhere(c, [{description: {_contains: query}}]);
+        hits = a.concat(b);
+      }
+      for (const e of hits) {
+        const uid = (function(){try{return e.uid();}catch(x){return null;}})();
+        if (uid && seen[uid]) continue;
+        if (uid) seen[uid] = true;
+        out.push(eventSummary(e, calName));
+      }
+    }
+    out.sort(function(a, b) {
+      const as = a.startDate || '', bs = b.startDate || '';
+      return as < bs ? -1 : (as > bs ? 1 : 0);
+    });
+    const trimmed = limit > 0 ? out.slice(0, limit) : out;
+    JSON.stringify(trimmed);
+    """
+    events = run_jxa(script, {
+        "CALENDARS": "|".join(wanted),
+        "FROM": _iso(frm),
+        "TO": _iso(to),
+        "QUERY": args.query,
+        "FIELD": args.field,
+        "LIMIT": str(args.limit or 0),
+    }) or []
+    if args.json:
+        print(json.dumps(events, ensure_ascii=False, indent=2))
+        return
+    scope_txt = args.calendar or (", ".join(wanted) if wanted else "all calendars")
+    print(f"# search {args.query!r} in {scope_txt}  {_iso(frm)} .. {_iso(to)}  "
+          f"({len(events)} hits)")
+    for e in events:
+        marker = "◉" if e.get("allDay") else " "
+        start = (e.get("startDate") or "")[:16].replace("T", " ")
+        title = (e.get("title") or "(no title)").replace("\n", " ")
+        cal = e.get("calendar") or ""
+        print(f"{marker} [{start}] ({cal}) {title}")
+        if e.get("id"):
+            print(f"    id: {e['id']}")
+
+
+# Noise calendars excluded from freebusy by default. Substring, case-insensitive.
+_NOISE_TOKENS = ("birthday", "birthdays", "holiday", "holidays",
+                 "reminders", "siri suggestions")
+
+
+def cmd_freebusy(args):
+    if not args.frm or not args.to:
+        sys.exit("--from and --to are required for freebusy")
+    frm, to = _default_window(args.frm, args.to, days_default=7)
+    scope = args._scope
+    requested = [c.strip() for c in (args.calendars or "").split(",") if c.strip()]
+    if requested and scope:
+        keep = {s.strip().lower() for s in scope}
+        bad = [c for c in requested if c.strip().lower() not in keep]
+        if bad:
+            _die(4, "out_of_scope",
+                 f"connection {args._conn_id!r} does not include: {', '.join(bad)}",
+                 "Do not lift the gate yourself — ask the user to widen the "
+                 "connection's `calendars` scope in connections.json.")
+        wanted = requested
+    elif requested:
+        wanted = requested
+    else:
+        wanted = list(scope)
+    script = r"""
+    const wantedRaw = env('CALENDARS') || '';
+    const wanted = wantedRaw ? wantedRaw.split('|').map(s => s.trim()).filter(Boolean) : [];
+    const includeNoise = env('INCLUDE_NOISE') === '1';
+    const noiseTokens = (env('NOISE_TOKENS') || '').split('|').filter(Boolean);
+    const Cal = Application('Calendar');
+    const all = Cal.calendars();
+    let cals;
+    if (wanted.length > 0) {
+      cals = calendarsForNames(wanted);
+    } else {
+      cals = all;
+      if (!includeNoise && noiseTokens.length > 0) {
+        cals = cals.filter(function(c) {
+          const n = (c.name() || '').toLowerCase();
+          for (const t of noiseTokens) { if (n.indexOf(t) >= 0) return false; }
+          return true;
+        });
+      }
+    }
+    const fromDate = new Date(env('FROM'));
+    const toDate = new Date(env('TO'));
+    const busy = [];
+    for (const c of cals) {
+      const evs = eventsInWindow(c, fromDate, toDate);
+      for (const e of evs) {
+        let s = null, en = null, allDay = false;
+        try { s = e.startDate(); } catch (x) {}
+        try { en = e.endDate(); } catch (x) {}
+        try { allDay = e.alldayEvent(); } catch (x) {}
+        if (!s || !en) continue;
+        // Trim to window
+        if (s < fromDate) s = fromDate;
+        if (en > toDate) en = toDate;
+        if (en <= s) continue;
+        busy.push({start: localISO(s), end: localISO(en), allDay: allDay});
+      }
+    }
+    busy.sort(function(a, b) { return a.start < b.start ? -1 : (a.start > b.start ? 1 : 0); });
+    JSON.stringify({calendars: cals.map(c => c.name()), busy: busy});
+    """
+    data = run_jxa(script, {
+        "CALENDARS": "|".join(wanted),
+        "INCLUDE_NOISE": "1" if args.include_noise else "0",
+        "NOISE_TOKENS": "|".join(_NOISE_TOKENS),
+        "FROM": _iso(frm),
+        "TO": _iso(to),
+    }) or {"busy": [], "calendars": []}
+
+    merged = _merge_intervals(data.get("busy") or [])
+    payload = {
+        "from": _iso(frm),
+        "to": _iso(to),
+        "calendars": data.get("calendars") or [],
+        "busy": merged,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    scope = ", ".join(payload["calendars"]) or "(no calendars)"
+    print(f"# freebusy {_iso(frm)} .. {_iso(to)}")
+    print(f"# calendars: {scope}")
+    print(f"# {len(merged)} busy block(s)")
+    for b in merged:
+        s = (b.get("start") or "")[:16].replace("T", " ")
+        e = (b.get("end") or "")[:16].replace("T", " ")
+        print(f"  busy  {s} .. {e}")
+
+
+# --- Write commands ---------------------------------------------------------
+
+_ALARM_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_alarm(spec: str) -> dict:
+    """Turn one --alarm SPEC into a JXA-shaped alarm descriptor:
+      relative — '-15m', '-1h30m' (…) — becomes {kind:'interval', seconds: -N}
+      absolute — ISO 8601 datetime — becomes {kind:'date', iso: '<ISO>'}
+    Both count as `display alarm` in Calendar.app."""
+    s = (spec or "").strip()
+    if not s:
+        _die(6, "input", "empty --alarm spec")
+    if s[0] in ("-", "+"):
+        sign = -1 if s[0] == "-" else 1
+        body = s[1:]
+        total = 0
+        num = ""
+        for ch in body:
+            if ch.isdigit():
+                num += ch
+                continue
+            unit = ch.lower()
+            if unit not in _ALARM_UNIT_SECONDS or not num:
+                _die(6, "input", f"bad alarm interval spec: {spec!r}",
+                     "use forms like -15m / -1h / -1h30m / -1d")
+            total += int(num) * _ALARM_UNIT_SECONDS[unit]
+            num = ""
+        if num:
+            # trailing bare number defaults to minutes
+            total += int(num) * 60
+        return {"kind": "interval", "seconds": sign * total}
+    try:
+        datetime.fromisoformat(s)
+    except ValueError:
+        _die(6, "input", f"bad alarm spec: {spec!r}",
+             "use a relative like -15m / -1h, or an absolute ISO datetime")
+    return {"kind": "date", "iso": s}
+
+
+def _write_target_calendar(args) -> str:
+    """Resolve and gate the target calendar of a write verb."""
+    name = getattr(args, "calendar", None)
+    if not name:
+        _die(6, "input", "--calendar is required for write verbs")
+    _enforce_write(args._conn_id, args._scope, args._allow_write, args.cmd, name)
+    return name
+
+
+CREATE_JXA = r"""
+const Cal = Application('Calendar');
+const cals = calendarsForNames([env('CALENDAR')]);
+if (cals.length === 0) die('No calendar matches: ' + env('CALENDAR'));
+const cal = cals[0];
+const payload = JSON.parse(env('PAYLOAD'));
+const props = {
+  summary: payload.title,
+  startDate: new Date(payload.startDate),
+  endDate: new Date(payload.endDate)
+};
+if (payload.allDay) props.alldayEvent = true;
+if (payload.location) props.location = payload.location;
+if (payload.notes) props.description = payload.notes;
+if (payload.url) props.url = payload.url;
+const ev = Cal.Event(props);
+cal.events.push(ev);
+for (const email of (payload.invitees || [])) {
+  try {
+    const att = Cal.Attendee({email: email});
+    ev.attendees.push(att);
+  } catch (e) {}
+}
+for (const alarm of (payload.alarms || [])) {
+  try {
+    let a;
+    if (alarm.kind === 'interval') {
+      a = Cal.DisplayAlarm({triggerInterval: alarm.seconds});
+    } else {
+      a = Cal.DisplayAlarm({triggerDate: new Date(alarm.iso)});
+    }
+    ev.displayAlarms.push(a);
+  } catch (e) {}
+}
+JSON.stringify({uid: ev.uid(), calendar: cal.name()});
+"""
+
+
+UPDATE_JXA = r"""
+const Cal = Application('Calendar');
+const target = env('UID');
+const raw = env('CALENDARS') || '';
+const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
+const cals = calendarsForNames(wanted);
+let found = null;
+let calName = null;
+for (const c of cals) {
+  try {
+    const hits = c.events.whose({uid: target})();
+    if (hits.length > 0) { found = hits[0]; calName = c.name(); break; }
+  } catch (e) {}
+}
+if (!found) die('Event not found in scope: ' + target);
+const payload = JSON.parse(env('PAYLOAD'));
+if (payload.title !== undefined) found.summary = payload.title;
+if (payload.startDate !== undefined) found.startDate = new Date(payload.startDate);
+if (payload.endDate !== undefined) found.endDate = new Date(payload.endDate);
+if (payload.allDay !== undefined) found.alldayEvent = payload.allDay;
+if (payload.location !== undefined) found.location = payload.location;
+if (payload.notes !== undefined) found.description = payload.notes;
+if (payload.url !== undefined) found.url = payload.url;
+for (const email of (payload.addInvitees || [])) {
+  try {
+    const att = Cal.Attendee({email: email});
+    found.attendees.push(att);
+  } catch (e) {}
+}
+if (payload.alarms) {
+  try {
+    const existing = found.displayAlarms();
+    for (let i = existing.length - 1; i >= 0; i--) {
+      try { existing[i].delete(); } catch (e) {}
+    }
+  } catch (e) {}
+  for (const alarm of payload.alarms) {
+    try {
+      let a;
+      if (alarm.kind === 'interval') {
+        a = Cal.DisplayAlarm({triggerInterval: alarm.seconds});
+      } else {
+        a = Cal.DisplayAlarm({triggerDate: new Date(alarm.iso)});
+      }
+      found.displayAlarms.push(a);
+    } catch (e) {}
+  }
+}
+JSON.stringify({uid: found.uid(), calendar: calName});
+"""
+
+
+DELETE_JXA = r"""
+const Cal = Application('Calendar');
+const target = env('UID');
+const raw = env('CALENDARS') || '';
+const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
+const cals = calendarsForNames(wanted);
+let found = null;
+let calName = null;
+for (const c of cals) {
+  try {
+    const hits = c.events.whose({uid: target})();
+    if (hits.length > 0) { found = hits[0]; calName = c.name(); break; }
+  } catch (e) {}
+}
+if (!found) die('Event not found in scope: ' + target);
+Cal.delete(found);
+JSON.stringify({deleted: target, calendar: calName});
+"""
+
+
+def cmd_create(args):
+    frm = _parse_iso(args.frm, _local_now())
+    to = _parse_iso(args.to, frm + timedelta(hours=1))
+    if to <= frm and not args.all_day:
+        sys.exit("--to must be after --from")
+    calendar = _write_target_calendar(args)
+    payload = {
+        "title": args.title,
+        "startDate": _iso(frm),
+        "endDate": _iso(to),
+        "allDay": bool(args.all_day),
+        "location": args.location,
+        "notes": args.notes,
+        "url": args.url,
+        "invitees": args.invitee or [],
+        "alarms": [_parse_alarm(a) for a in (args.alarm or [])],
+    }
+    result = run_jxa(CREATE_JXA, {
+        "CALENDAR": calendar,
+        "PAYLOAD": json.dumps(payload, ensure_ascii=False),
+    }) or {}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    uid = (result or {}).get("uid")
+    cal_out = (result or {}).get("calendar")
+    if not uid:
+        sys.exit("event created but no uid returned")
+    print(f"created  ({cal_out}) {args.title}")
+    print(f"    id: {uid}")
+
+
+def cmd_update(args):
+    payload: dict = {}
+    if args.title is not None:
+        payload["title"] = args.title
+    if args.frm is not None:
+        payload["startDate"] = _iso(_parse_iso(args.frm, _local_now()))
+    if args.to is not None:
+        payload["endDate"] = _iso(_parse_iso(args.to, _local_now()))
+    if args.all_day:
+        payload["allDay"] = True
+    if args.no_all_day:
+        payload["allDay"] = False
+    if args.location is not None:
+        payload["location"] = args.location
+    if args.notes is not None:
+        payload["notes"] = args.notes
+    if args.url is not None:
+        payload["url"] = args.url
+    if args.add_invitee:
+        payload["addInvitees"] = args.add_invitee
+    if args.alarm:
+        payload["alarms"] = [_parse_alarm(a) for a in args.alarm]
+    if not payload:
+        sys.exit("update: at least one field flag is required")
+
+    scope = args._scope
+    # For update we don't know the calendar up front — look it up first, then
+    # gate. Cheapest is to resolve within the connection scope in JXA.
+    lookup_script = r"""
+    (function() {
+      const Cal = Application('Calendar');
+      const target = env('UID');
+      const raw = env('CALENDARS') || '';
+      const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
+      const cals = calendarsForNames(wanted);
+      for (const c of cals) {
+        try {
+          const hits = c.events.whose({uid: target})();
+          if (hits.length > 0) return JSON.stringify({calendar: c.name()});
+        } catch (e) {}
+      }
+      die('Event not found in scope: ' + target);
+    })();
+    """
+    found = run_jxa(lookup_script, {
+        "UID": args.event_id,
+        "CALENDARS": "|".join(scope),
+    })
+    cal_of = (found or {}).get("calendar") if isinstance(found, dict) else None
+    if not cal_of:
+        sys.exit(f"event not found in scope: {args.event_id}")
+    _enforce_write(args._conn_id, scope, args._allow_write, "update", cal_of)
+
+    result = run_jxa(UPDATE_JXA, {
+        "UID": args.event_id,
+        "CALENDARS": "|".join(scope),
+        "PAYLOAD": json.dumps(payload, ensure_ascii=False),
+    }) or {}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    print(f"updated  ({result.get('calendar')}) id: {result.get('uid')}")
+
+
+def cmd_delete(args):
+    scope = args._scope
+    lookup_script = r"""
+    (function() {
+      const Cal = Application('Calendar');
+      const target = env('UID');
+      const raw = env('CALENDARS') || '';
+      const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
+      const cals = calendarsForNames(wanted);
+      for (const c of cals) {
+        try {
+          const hits = c.events.whose({uid: target})();
+          if (hits.length > 0) return JSON.stringify({calendar: c.name()});
+        } catch (e) {}
+      }
+      die('Event not found in scope: ' + target);
+    })();
+    """
+    found = run_jxa(lookup_script, {
+        "UID": args.event_id,
+        "CALENDARS": "|".join(scope),
+    })
+    cal_of = (found or {}).get("calendar") if isinstance(found, dict) else None
+    if not cal_of:
+        sys.exit(f"event not found in scope: {args.event_id}")
+    _enforce_write(args._conn_id, scope, args._allow_write, "delete", cal_of)
+
+    result = run_jxa(DELETE_JXA, {
+        "UID": args.event_id,
+        "CALENDARS": "|".join(scope),
+    }) or {}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    print(f"deleted  ({result.get('calendar')}) id: {result.get('deleted')}")
+
+
+def _merge_intervals(items: list[dict]) -> list[dict]:
+    """Merge overlapping/touching [start, end] intervals. Parses ISO strings
+    with offsets; comparison is done as timezone-aware datetimes so the merge is
+    correct across DST boundaries."""
+    parsed: list[tuple[datetime, datetime]] = []
+    for it in items:
+        s, e = it.get("start"), it.get("end")
+        if not s or not e:
+            continue
+        try:
+            parsed.append((datetime.fromisoformat(s), datetime.fromisoformat(e)))
+        except ValueError:
+            continue
+    if not parsed:
+        return []
+    parsed.sort(key=lambda p: p[0])
+    out: list[tuple[datetime, datetime]] = []
+    cs, ce = parsed[0]
+    for s, e in parsed[1:]:
+        if s <= ce:
+            if e > ce:
+                ce = e
+        else:
+            out.append((cs, ce))
+            cs, ce = s, e
+    out.append((cs, ce))
+    return [{"start": _iso(s), "end": _iso(e)} for s, e in out]
+
+
+def main():
+    _gate()                      # every verb passes the project gate first
+    _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
+    cleaned, wanted_conn = _extract_connection(sys.argv[1:])
+
+    p = argparse.ArgumentParser(
+        prog="ical",
+        description="Personal Calendar.app CLI (JXA; read + write, "
+                    "connection-gated).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("help", help="Print the full usage contract.")
+    sub.add_parser("doctor", help="Prove the macOS Automation grant.")
+
+    pc = sub.add_parser("calendars", help="List Calendar.app calendars.")
+    pc.add_argument("--json", action="store_true")
+
+    pe = sub.add_parser("events", help="List events in a date window.")
+    pe.add_argument("--calendar", help="Restrict to one calendar (case-insensitive)")
+    pe.add_argument("--from", dest="frm", help="ISO datetime; window start (default: today)")
+    pe.add_argument("--to", help="ISO datetime; window end (default: today+7d)")
+    pe.add_argument("--limit", type=int, default=0, help="Cap results (0 = no cap)")
+    pe.add_argument("--json", action="store_true")
+
+    psh = sub.add_parser("show", help="Show one event by uid.")
+    psh.add_argument("event_id")
+    psh.add_argument("--json", action="store_true")
+
+    ps = sub.add_parser("search", help="Search events.")
+    ps.add_argument("query")
+    ps.add_argument("--calendar", help="Restrict to one calendar (case-insensitive)")
+    ps.add_argument("--from", dest="frm", help="ISO datetime; window start (default: today)")
+    ps.add_argument("--to", help="ISO datetime; window end (default: today+30d)")
+    ps.add_argument("--field", choices=["title", "notes", "any"], default="any")
+    ps.add_argument("--limit", type=int, default=0)
+    ps.add_argument("--json", action="store_true")
+
+    pf = sub.add_parser("freebusy", help="Merged busy blocks across a window.")
+    pf.add_argument("--from", dest="frm", required=True,
+                    help="ISO datetime; window start")
+    pf.add_argument("--to", required=True, help="ISO datetime; window end")
+    pf.add_argument("--calendars",
+                    help="Comma-separated calendar names; default: every "
+                         "calendar minus obvious noise (Birthdays/Holidays/"
+                         "Reminders/Siri Suggestions)")
+    pf.add_argument("--include-noise", action="store_true",
+                    help="Include Birthdays/Holidays/Reminders/Siri Suggestions "
+                         "in the default-all set")
+    pf.add_argument("--json", action="store_true")
+
+    pcr = sub.add_parser("create", help="Create an event (write-gated).")
+    pcr.add_argument("--calendar", required=True,
+                     help="Target calendar name (must be in the connection scope)")
+    pcr.add_argument("--title", required=True)
+    pcr.add_argument("--from", dest="frm", required=True,
+                     help="ISO datetime; event start")
+    pcr.add_argument("--to", required=True, help="ISO datetime; event end")
+    pcr.add_argument("--all-day", action="store_true", dest="all_day")
+    pcr.add_argument("--location")
+    pcr.add_argument("--notes", help="Description / notes")
+    pcr.add_argument("--url", help="URL (use for a video-call link)")
+    pcr.add_argument("--invitee", action="append", metavar="EMAIL",
+                     help="Attendee email (repeatable)")
+    pcr.add_argument("--alarm", action="append", metavar="SPEC",
+                     help="Alarm: relative (-15m, -1h, -1d) or absolute ISO "
+                          "(repeatable)")
+    pcr.add_argument("--json", action="store_true")
+
+    pup = sub.add_parser("update", help="Update an event by uid (write-gated).")
+    pup.add_argument("event_id")
+    pup.add_argument("--title")
+    pup.add_argument("--from", dest="frm")
+    pup.add_argument("--to")
+    pup.add_argument("--all-day", action="store_true", dest="all_day")
+    pup.add_argument("--no-all-day", action="store_true", dest="no_all_day")
+    pup.add_argument("--location")
+    pup.add_argument("--notes")
+    pup.add_argument("--url")
+    pup.add_argument("--add-invitee", action="append", metavar="EMAIL",
+                     dest="add_invitee",
+                     help="Add attendee email (repeatable)")
+    pup.add_argument("--alarm", action="append", metavar="SPEC",
+                     help="Replace alarm set; relative or absolute ISO "
+                          "(repeatable)")
+    pup.add_argument("--json", action="store_true")
+
+    pdel = sub.add_parser("delete", help="Delete an event by uid (write-gated).")
+    pdel.add_argument("event_id")
+    pdel.add_argument("--json", action="store_true")
+
+    args = p.parse_args(cleaned)
+
+    if args.cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+    if args.cmd == "doctor":
+        cmd_doctor()
+        return
+
+    # Resolve the active connection once; attach to args for every dispatch.
+    args._conn_id, args._scope, args._allow_write = _active_conn(wanted_conn)
+
+    dispatch = {
+        "calendars": cmd_calendars,
+        "events": cmd_events,
+        "show": cmd_show,
+        "search": cmd_search,
+        "freebusy": cmd_freebusy,
+        "create": cmd_create,
+        "update": cmd_update,
+        "delete": cmd_delete,
+    }
+    dispatch[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

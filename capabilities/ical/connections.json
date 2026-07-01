@@ -1,0 +1,25 @@
+{
+  "default": "default",
+  "connections": {
+    "default": {
+      "calendars": [],
+      "allow_write": false
+    },
+    "amanati": {
+      "calendars": ["konstantin@amanati.ai"],
+      "allow_write": true
+    },
+    "callva": {
+      "calendars": ["konstantin@callva.one"],
+      "allow_write": true
+    },
+    "jukotrade": {
+      "calendars": ["kz@jukotrade.com"],
+      "allow_write": true
+    },
+    "personal": {
+      "calendars": ["Personal"],
+      "allow_write": true
+    }
+  }
+}
