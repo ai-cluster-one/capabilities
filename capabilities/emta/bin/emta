@@ -1,0 +1,1372 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""emta — agent-first CLI for the Estonian Tax Board (maasikas.emta.ee).
+
+This tool is designed to be invoked by agents. Run `emta help` to load the
+full usage contract on demand — do not rely on memorised knowledge of its
+surface. It is identity-free: it knows nothing about any consuming project's
+person, company, or accounts.
+
+AUTH MODEL — maasikas.emta.ee has TWO authenticated surfaces:
+
+  (1) the PAS API — every URL under `/payments-and-settlements-api/`. Auth
+      is a short-lived bearer (the `PAS-AUTHORIZATION` cookie, identical
+      to the `Authorization: Bearer …` header) plus the `PAS-XSRF-TOKEN`
+      and the cookie jar. THIS capability uses ONLY this surface. ONE
+      paste of any PAS request unlocks every data verb: `balances`,
+      `period-balances`, `interest`, `ledger`.
+  (2) the customer-kmd2 Wicket app — the KMD declaration content (line
+      values). A different, stateful session. This capability does NOT
+      read it; declaration line values live on the books side.
+
+  The customer-portal landing page and the `/customer-portal/access-token`
+  request are the browser's internal login/bootstrap (they ride
+  `JSESSIONID` and carry NO PAS bearer) — a paste of those is refused.
+
+WHICH REQUEST TO COPY — unambiguous steps:
+
+  1. Log in at maasikas.emta.ee with SmartID. You land on the
+     customer-portal dashboard (it shows your prepayment account / tax
+     obligations).
+  2. Open devtools → Network. In the filter box type
+     `payments-and-settlements-api`. Reload the page so the requests
+     appear.
+  3. Pick ANY listed request — an async XHR/fetch, NOT a
+     document/navigation request — e.g. `session-user` or
+     `prepay/account/active`. Right-click → Copy → Copy as cURL.
+  4. Pipe it on stdin: `pbpaste | emta session ingest`.
+
+  DO NOT copy: the `/customer-portal/...` page (document) request, the
+  `access-token` request, or anything under `customer-kmd2/` — ingest
+  refuses them (no PAS bearer / xsrf).
+
+STARTUP PROTOCOL — stateful CLI, run this in order on the first call:
+
+  1. `emta doctor`             — is a session stored and live?
+  2. On `session_stale` (exit 2): paste a fresh PAS cURL (see WHICH
+     REQUEST TO COPY above) via `emta session ingest`. Ingest stores the
+     bearer + xsrf + cookie jar as per-connection state (mode 0600, never
+     committed) and auto-discovers `principal_person_id` from a
+     `/client/session-user` round-trip; the id is written to the ids store.
+  3. Re-run `emta doctor` — it should report healthy.
+
+SELF-HEAL
+  - Any 401 or 406 on an authed call → exit 2 `session_stale`. The bearer
+    is dead and there is nothing to refresh from — paste a fresh cURL.
+  - There is no programmatic refresh: every authed call sends the stored
+    bearer directly. ONE PAS paste unlocks every data verb until the
+    bearer dies, then paste again.
+
+SECRETS DISCIPLINE
+  - The cURL paste enters through stdin only; argv is refused (argv leaks
+    via process lists / shell history).
+  - The stored bearer is a secret — same discipline as the cookies: lives
+    in the state home (mode 0600), covered by the manager-owned
+    `.capabilities/.gitignore`, never logged, never printed, never committed.
+  - `emta session show` prints only presence flags, cookie NAMES, and
+    timestamps — never the bearer, the xsrf, or any cookie value.
+
+IDENTIFIERS
+  - `principal_person_id` — value sent as `x-principal-person-id` on every
+    data call. AUTO-DISCOVERED by `emta session ingest` and `emta doctor`
+    via a `/client/session-user` round-trip (the only authed call that
+    needs no `x-principal-person-id`); written to the ids store. Override
+    with `emta ids set principal_person_id <value>` if needed. The stored
+    value is coerced to a string when sent — a numeric ids value works.
+
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`, with state at `.capabilities/emta/state/default/`
+  (or `$XDG_STATE_HOME/emta/default/` outside an initialized project). A
+  project that drives several EMTA identities (e.g. several entities)
+  declares them in `<project>/.capabilities/emta/connections.json`:
+
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "allow_write": false }
+      }
+    }
+
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/emta/connections.json; first found wins, never merged. Sessions
+  are kept per connection in the state home, so two connections never share
+  a session. EMTA exposes no env-resolvable secret — the cascade has nothing
+  to resolve (see deviations.md) — so a connection entry carries no
+  `secret_env`. `allow_write` is accepted, but the surface is read-only, so
+  no verb is gated by it.
+
+  Selection: `--connection <id>` accepted anywhere on the line.
+
+COMMANDS
+
+  emta help                                  this contract
+  emta doctor [--connection <id>]            probe with stored creds via
+                                             /client/session-user; refresh
+                                             principal_person_id on 200
+  emta session ingest                        read a `Copy as cURL` on
+                                             stdin; persist bearer + xsrf
+                                             + cookies to per-connection
+                                             state; bootstrap via
+                                             session-user; auto-set
+                                             principal_person_id
+  emta session show [--connection <id>]      masked summary: bearer/xsrf
+                                             present, cookie names,
+                                             ingested-at; never values
+  emta session clear [--connection <id>]     drop per-connection state
+  emta balances [--connection <id>]          current prepay account balances
+  emta period-balances --date YYYY-MM-DD     per-tax-period balances on a
+                  [--connection <id>]        date; rows de-duplicated on
+                                             (taxPeriodCode, claimTypeCode,
+                                             documentNr)
+  emta interest --date YYYY-MM-DD            per-tax-period interest on a
+                  [--connection <id>]        date (sibling of
+                                             period-balances; chases
+                                             interest / cent gaps); rows
+                                             de-duplicated on the same key
+  emta ledger --from YYYY-MM-DD              prepay ledger movements;
+              --to YYYY-MM-DD                EMTA refuses multi-year spans
+              [--connection <id>]            — --from and --to must be in
+                                             the same calendar year
+
+CONTRACT COMMANDS (the same on every capability):
+  emta connections                           where every connection's
+                                             values resolve from; secrets
+                                             masked; local only
+  emta stub                                  one-line awareness text
+  emta manifest --json                       machine-readable declaration
+  emta guide [<topic>]                       guide topics / one guide body
+                                             (none ship initially)
+  emta ids list|get <l>|set <l> <v>|rm <l>   project identifiers envelope
+        [--note <text>]                      (.capabilities/emta/identifiers.json)
+  emta refs                                  menu of the project's reference
+                                             files for this capability
+
+EXIT CODES
+  0  success
+  2  auth / session_stale — paste a fresh cURL via `emta session ingest`
+  3  not found — unknown identifier, missing guide topic, etc.
+  4  policy refusal — the project gate, or a write verb on a read-only
+     connection (this CLI is read-only, no verb is gated)
+  5  network / server — timeout, 5xx, transport error
+  6  input / validation — bad date, multi-year ledger span, malformed cURL
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import NoReturn
+from urllib.parse import urlencode
+
+import httpx
+
+# ─── Constants ───────────────────────────────────────────────────────────────
+
+HOST = "https://maasikas.emta.ee"
+API_BASE = HOST + "/payments-and-settlements-api"
+SESSION_USER_PATH = "client/session-user"
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+)
+TIMEOUT = httpx.Timeout(60.0)
+MAX_RETRIES = 3
+
+# Cookies retained from the PAS-path cURL paste. The bearer
+# (PAS-AUTHORIZATION) is stored separately under session["bearer"] and sent
+# both as a cookie and an Authorization header per call. JSESSIONID is
+# path-scoped to /customer-portal/ and never appears on a
+# /payments-and-settlements-api/ request — not kept.
+SESSION_COOKIE_NAMES = (
+    "customer-kmd2_JSESSIONID",
+    "cf_clearance",
+    "_cfuvid",
+    "PAS-XSRF-TOKEN",
+)
+
+# Connection selection — `--connection <id>` extracted from argv in main()
+# (so it works anywhere on the line, including after the verb).
+_WANTED_CONN: str | None = None
+_ACTIVE_VERB: str = ""
+
+# --- Capability declaration (protocol 2) — one home for every contract fact --
+
+NAME = "emta"
+PROTOCOL = 2
+SUMMARY = ("Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay "
+           "balances, per-period balances, prepay ledger. Session is "
+           "paste-fed from a logged-in browser. Stateful — run `emta "
+           "doctor` first.")
+SCOPE = "project"   # the consuming project's tax data — service/tenant-bound
+CRED_KEYS: list = []        # no durable env-resolvable secret — see deviations.md
+WRITE_VERBS: set = set()    # read-only surface
+WRITE_DEFAULT = True        # protocol default; no write to gate
+DOCS_BASE = ""              # no guides ship initially
+TOPICS: list = []
+STATE = True                # cookie jar + xsrf live in state, per connection
+POST_INSTALL: list = [
+    {"cmd": "emta session ingest",
+     "note": ("Sign in at maasikas.emta.ee with SmartID. In devtools → "
+              "Network, filter by `payments-and-settlements-api` and "
+              "reload. Right-click any listed XHR (e.g. `session-user` or "
+              "`prepay/account/active`) → Copy → Copy as cURL → pipe stdin "
+              "to `emta session ingest`. The PAS bearer, the "
+              "PAS-XSRF-TOKEN, and the cookie jar are extracted and stored "
+              "as per-connection state (0600); `principal_person_id` is "
+              "auto-discovered via /client/session-user. DO NOT copy: the "
+              "customer-portal page (document) request, the access-token "
+              "request, or anything under customer-kmd2/ — ingest refuses "
+              "non-PAS requests. Re-paste whenever `emta doctor` reports "
+              "the session is stale.")}
+]
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / "emta" / "credentials.env"  # for _docs_base only; never written
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding .capabilities/, .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = root / ".capabilities" / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    root = _project_root()
+    return (root / ".capabilities" / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where .capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None and (root / ".capabilities").is_dir():
+            return root / ".capabilities" / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import httpx as _hx
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        resp = _hx.get(url, headers=headers, timeout=10.0, follow_redirects=True)
+        if resp.status_code == 200:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(resp.text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(resp.text); return
+        if resp.status_code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if resp.status_code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        raise _hx.HTTPError(f"upstream returned {resp.status_code}")
+    except _hx.HTTPError as e:
+        if cache.exists():
+            sys.stderr.write(json.dumps(
+                {"warning": f"upstream unreachable; serving cached copy ({e})"},
+                ensure_ascii=False) + "\n")
+            _emit(cache.read_text()); return
+        _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not envdir.parent.is_dir():
+            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+# <<< contract: connections <<<
+
+
+# ─── Connections (capability-specific report) ────────────────────────────────
+
+def _connections_report() -> dict:
+    """The resolution report — local only, no network. EMTA has no
+    env-resolvable credential (the session is paste-fed into state; see
+    deviations.md), so each entry's `keys` list is empty — readiness is
+    judged at use-time by `doctor`'s round-trip, not by the cascade."""
+    reg, _ = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": []}
+        return report
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": []}
+    return report
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+# ─── Identifier helpers (internal — reuse the on-disk envelope) ──────────────
+
+def _ids_data() -> dict:
+    envdir = _env_dir()
+    if envdir is None:
+        return {}
+    p = envdir / "identifiers.json"
+    if not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text())
+    except ValueError:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _ids_get(label: str) -> str | None:
+    """Read one ids value, coerced to str. ints/floats (e.g. principalId
+    written by `ids set` as a JSON number) become their str form so the
+    resolver works regardless of whether the value was stored as "749..."
+    or 749…. Bools, lists, dicts, and None do not coerce."""
+    e = _ids_data().get(label) or {}
+    v = e.get("value")
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return str(v)
+    return None
+
+
+def _ids_set_silent(label: str, value, note: str = "") -> bool:
+    """Direct write to the ids envelope without stdout side effects, so the
+    ingest verb can auto-populate principal_person_id without polluting its
+    own response. Returns True on success."""
+    envdir = _env_dir()
+    if envdir is None or not envdir.parent.is_dir():
+        return False
+    p = envdir / "identifiers.json"
+    data: dict = {}
+    if p.exists():
+        try:
+            data = json.loads(p.read_text())
+        except ValueError:
+            return False
+    if not isinstance(data, dict):
+        return False
+    data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+    envdir.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    return True
+
+
+# ─── Session state (per connection) ──────────────────────────────────────────
+
+def _session_file(cid: str) -> Path:
+    """The stored session's one home — per connection, 0600 on write."""
+    return _state_dir() / cid / "session.json"
+
+
+def _load_session(cid: str) -> dict | None:
+    p = _session_file(cid)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _save_session(cid: str, session: dict) -> Path:
+    p = _session_file(cid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(session, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    os.chmod(p, 0o600)
+    return p
+
+
+def _clear_session(cid: str) -> bool:
+    p = _session_file(cid)
+    if not p.exists():
+        return False
+    p.unlink()
+    return True
+
+
+# ─── cURL parsing (stdin) ────────────────────────────────────────────────────
+
+_CURL_LINE_CONT = re.compile(r"\\\s*\n")
+
+
+def _parse_curl(text: str) -> dict:
+    """Parse a `Copy as cURL` paste. Returns
+        {"url": str, "headers": dict[str,str], "cookies": dict[str,str]}.
+    Header names are normalized to lowercase. Cookie sources merge: any
+    `-b`/`--cookie` cookie strings AND the value of a `cookie:` header are
+    all merged. Raises ValueError on malformed input."""
+    if not text or not text.strip():
+        raise ValueError("empty input")
+    flat = _CURL_LINE_CONT.sub(" ", text.strip())
+    # shlex is POSIX-quote aware: handles 'single', "double", and $'...' in zsh.
+    # zsh's $'...' notation is preserved as-is by shlex (the leading $ stays);
+    # cURL paste from Chrome uses plain '...' quoting, so this is safe.
+    try:
+        tokens = shlex.split(flat, posix=True)
+    except ValueError as e:
+        raise ValueError(f"could not tokenize cURL ({e})") from e
+    if not tokens or tokens[0] != "curl":
+        raise ValueError("expected the paste to start with `curl`")
+
+    url: str | None = None
+    headers: dict[str, str] = {}
+    cookie_strs: list[str] = []
+    i = 1
+    while i < len(tokens):
+        t = tokens[i]
+        if t in ("-H", "--header"):
+            if i + 1 >= len(tokens):
+                raise ValueError(f"{t} without a value")
+            _add_header(headers, tokens[i + 1])
+            i += 2
+        elif t.startswith("--header="):
+            _add_header(headers, t.split("=", 1)[1])
+            i += 1
+        elif t in ("-b", "--cookie"):
+            if i + 1 >= len(tokens):
+                raise ValueError(f"{t} without a value")
+            cookie_strs.append(tokens[i + 1])
+            i += 2
+        elif t.startswith("--cookie="):
+            cookie_strs.append(t.split("=", 1)[1])
+            i += 1
+        elif t in ("--data", "--data-raw", "--data-binary",
+                   "--data-urlencode", "-d"):
+            # Skip the body (paste may include POST data; we don't need it).
+            i += 2
+        elif t in ("-X", "--request", "-A", "--user-agent",
+                   "--compressed", "-i", "--include", "-L", "--location"):
+            # Flags we ignore; -X/-A/--user-agent take one arg, others none.
+            if t in ("-X", "--request", "-A", "--user-agent"):
+                i += 2
+            else:
+                i += 1
+        elif t.startswith("-"):
+            # Unknown flag → skip; some Chrome variants emit extras.
+            i += 1
+        else:
+            if url is None:
+                url = t
+            i += 1
+
+    if url is None:
+        raise ValueError("no URL found in the cURL paste")
+
+    # Cookie can also arrive as a `cookie:` request header.
+    hcookie = headers.pop("cookie", None)
+    if hcookie:
+        cookie_strs.append(hcookie)
+
+    cookies: dict[str, str] = {}
+    for cs in cookie_strs:
+        for pair in cs.split(";"):
+            if "=" in pair:
+                k, _, v = pair.strip().partition("=")
+                k = k.strip()
+                if k:
+                    cookies[k] = v.strip()
+
+    return {"url": url, "headers": headers, "cookies": cookies}
+
+
+def _add_header(headers: dict, raw: str) -> None:
+    if ":" not in raw:
+        return
+    name, _, value = raw.partition(":")
+    headers[name.strip().lower()] = value.strip()
+
+
+# ─── HTTP — authed calls with the stored bearer ──────────────────────────────
+
+_STALE_HINT = (
+    "Paste a fresh `Copy as cURL` via `emta session ingest` — open a logged-in "
+    "maasikas.emta.ee browser, devtools → Network → any "
+    "/payments-and-settlements-api/ request → Copy as cURL → pipe stdin to "
+    "`emta session ingest`."
+)
+
+
+def _send(session: dict, path: str, params: dict | None,
+          person_id: str | None) -> httpx.Response:
+    """One authed GET against /payments-and-settlements-api/<path>. The
+    bearer + xsrf + cookies come from `session`; `person_id` is sent as the
+    `x-principal-person-id` header on every call except /client/session-user
+    (which is the only authed path that does not require it, and the path
+    used to discover person_id in the first place). Timeouts/5xx/429
+    retried per MAX_RETRIES; 4xx is returned as-is for the caller to map."""
+    bearer = session.get("bearer")
+    xsrf = session.get("xsrf")
+    if not bearer or not xsrf:
+        _die(2, "session_stale",
+             "stored session is missing the bearer or PAS-XSRF-TOKEN",
+             _STALE_HINT)
+    cookies = {k: v for k, v in (session.get("cookies") or {}).items() if v}
+    cookies["PAS-AUTHORIZATION"] = bearer
+    cookies["language"] = "et"
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+        "Authorization": f"Bearer {bearer}",
+        "x-xsrf-token": xsrf,
+        "Referer": HOST + "/customer-portal/client",
+        "language": "et",
+    }
+    if person_id:
+        headers["x-principal-person-id"] = str(person_id)
+    url = API_BASE + "/" + path.lstrip("/")
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with httpx.Client(timeout=TIMEOUT, follow_redirects=False) as c:
+                r = c.get(url, params=params or {}, headers=headers, cookies=cookies)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5); continue
+            _die(5, "timeout", f"GET {path} timed out",
+                 "maasikas.emta.ee was unresponsive")
+        except httpx.RequestError as e:
+            _die(5, "network_error", f"GET {path} network error: {e}",
+                 "check connectivity to maasikas.emta.ee")
+        last_status = r.status_code
+        if r.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5); continue
+            _die(5, "server_error", f"maasikas.emta.ee returned {r.status_code}",
+                 status=r.status_code)
+        if r.status_code == 429:
+            ra = float(r.headers.get("Retry-After", str(attempt * 1.5)))
+            if attempt < MAX_RETRIES:
+                time.sleep(ra); continue
+            _die(5, "rate_limited", "rate-limited", status=429)
+        return r
+    _die(5, "exhausted_retries",
+         f"exhausted {MAX_RETRIES} attempts on GET {path}", status=last_status)
+
+
+def _data_call(session: dict, path: str,
+               params: dict | None = None) -> dict | list:
+    """GET an authenticated /payments-and-settlements-api/ path with the
+    stored bearer. 401/406 collapses to one altitude — there is no
+    programmatic refresh — so the user pastes a fresh cURL."""
+    person_id = (_ids_get("principal_person_id")
+                 or session.get("principal_person_id_fallback"))
+    if not person_id:
+        _die(6, "missing_identifier",
+             "principal_person_id is not set",
+             "run `emta session ingest` (auto-discovers via session-user) or "
+             "`emta ids set principal_person_id <value>`")
+    r = _send(session, path, params, person_id=str(person_id))
+    return _decode(r, path)
+
+
+def _decode(r: httpx.Response, path: str):
+    if r.status_code in (401, 406):
+        _die(2, "session_stale",
+             f"GET {path} returned {r.status_code} — session is stale",
+             _STALE_HINT, status=r.status_code)
+    if r.status_code == 403:
+        _die(2, "unauthorized", f"GET {path} returned 403",
+             _STALE_HINT, status=403)
+    if r.status_code == 404:
+        _die(3, "not_found", f"GET {path} returned 404", status=404)
+    if r.status_code >= 400:
+        body = r.text[:500]
+        _die(6, "bad_request", f"GET {path} returned {r.status_code}: {body}",
+             status=r.status_code)
+    try:
+        return r.json()
+    except ValueError:
+        _die(5, "invalid_response", f"GET {path} returned non-JSON",
+             status=r.status_code)
+
+
+def _extract_principal_id(body) -> str | None:
+    """Pluck `data.principal.principalId` from a /client/session-user body
+    and coerce to str (the API returns it as a JSON number). The response
+    envelope wraps everything under a top-level "data" key:
+        {"data": {"principal": {"principalId": <int>, ...}, ...}, "ok": true}
+    """
+    if not isinstance(body, dict):
+        return None
+    inner = body.get("data")
+    if not isinstance(inner, dict):
+        return None
+    principal = inner.get("principal")
+    if not isinstance(principal, dict):
+        return None
+    pid = principal.get("principalId")
+    if pid is None or isinstance(pid, bool):
+        return None
+    if isinstance(pid, (str, int, float)):
+        return str(pid)
+    return None
+
+
+def _bootstrap(cid: str, session: dict) -> dict:
+    """GET /client/session-user with stored bearer + xsrf + cookies — the
+    one authed call that needs no x-principal-person-id. On 200, refresh
+    the ids store with `principal.principalId`. Returns
+        {"ok": bool, "status": int, "ids_action"?: str, "error"?: str}.
+    Does NOT exit on auth failure — the caller decides exit semantics."""
+    r = _send(session, SESSION_USER_PATH, params=None, person_id=None)
+    if r.status_code != 200:
+        return {"ok": False, "status": r.status_code}
+    try:
+        data = r.json()
+    except ValueError:
+        return {"ok": False, "status": 200,
+                "error": "session-user returned non-JSON"}
+    pid = _extract_principal_id(data)
+    if not pid:
+        return {"ok": True, "status": 200, "ids_action": "no_principal_in_response"}
+    existing = _ids_get("principal_person_id")
+    if existing == pid:
+        return {"ok": True, "status": 200, "ids_action": "unchanged"}
+    action = "updated" if existing else "set"
+    if _ids_set_silent(
+            "principal_person_id", pid,
+            note="discovered from /client/session-user; sent as the "
+                 "x-principal-person-id header on every data call"):
+        return {"ok": True, "status": 200, "ids_action": action}
+    # No project envelope to write into — stash in the session as a fallback
+    # so the same process and later invocations on this connection still work.
+    session["principal_person_id_fallback"] = pid
+    _save_session(cid, session)
+    return {"ok": True, "status": 200, "ids_action": "session_fallback"}
+
+
+# ─── Domain verbs ────────────────────────────────────────────────────────────
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_PAS_PASTE_HINT = (
+    "Copy a request whose URL contains `/payments-and-settlements-api/`: "
+    "in devtools → Network, filter by `payments-and-settlements-api`, "
+    "reload, right-click any listed XHR (e.g. `session-user` or "
+    "`prepay/account/active`) → Copy → Copy as cURL → "
+    "`pbpaste | emta session ingest`. NOT the customer-portal page, NOT "
+    "the access-token request, NOT anything under customer-kmd2/."
+)
+
+
+def _non_pas_diagnosis(missing: str, url: str) -> str:
+    """Compose a bad_curl message that names what is missing AND the most
+    likely reason — the paste is from a non-PAS surface. The cURL's URL
+    pins down which surface it actually came from when it is recognisable."""
+    surface = ""
+    low = url.lower()
+    if "/payments-and-settlements-api/" in low:
+        surface = ("the URL is on the PAS surface but the request did not "
+                   "carry full PAS auth — pick a different PAS XHR (most do)")
+    elif "/customer-portal/" in low and "access-token" in low:
+        surface = ("the paste is the `/customer-portal/access-token` "
+                   "bootstrap — that is the browser's internal login; "
+                   "it carries no PAS bearer")
+    elif "/customer-portal/" in low:
+        surface = ("the paste is a `/customer-portal/` page (document) "
+                   "request — only PAS XHRs carry the bearer")
+    elif "customer-kmd2" in low:
+        surface = ("the paste is from the customer-kmd2 Wicket app — a "
+                   "different surface this capability does not read")
+    else:
+        surface = ("the paste does not look like a PAS XHR (URL: "
+                   f"{url or '<empty>'})")
+    return f"{missing} — {surface}"
+
+
+def _cmd_session_ingest(cid: str) -> None:
+    """Read a `Copy as cURL` paste on stdin (argv refused — secrets do not
+    sit on the command line). Extract bearer + xsrf + cookie jar, persist
+    them, then bootstrap via /client/session-user to auto-discover
+    principal_person_id."""
+    if sys.stdin.isatty():
+        _die(6, "stdin_required",
+             "paste a `Copy as cURL` on stdin",
+             "e.g. `pbpaste | emta session ingest`")
+    raw = sys.stdin.read()
+    try:
+        parsed = _parse_curl(raw)
+    except ValueError as e:
+        _die(6, "bad_curl", f"could not parse the cURL paste: {e}",
+             "copy a fresh `Copy as cURL` from devtools → Network → any "
+             "/payments-and-settlements-api/ XHR")
+
+    cookies = parsed["cookies"]
+    headers = parsed["headers"]
+    url = parsed.get("url") or ""
+
+    # Bearer: prefer the Authorization header; fall back to the
+    # PAS-AUTHORIZATION cookie (Chrome puts the same value in both).
+    bearer = None
+    auth = headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        bearer = auth.split(" ", 1)[1].strip()
+    if not bearer:
+        bearer = cookies.get("PAS-AUTHORIZATION")
+    if not bearer:
+        _die(6, "bad_curl",
+             _non_pas_diagnosis("no PAS bearer (no `Authorization: Bearer …` "
+                                "header and no `PAS-AUTHORIZATION` cookie)",
+                                url),
+             _PAS_PASTE_HINT)
+
+    xsrf = headers.get("x-xsrf-token") or cookies.get("PAS-XSRF-TOKEN")
+    if not xsrf:
+        _die(6, "bad_curl",
+             _non_pas_diagnosis("no PAS-XSRF-TOKEN (neither the cookie nor "
+                                "the `x-xsrf-token` header was present)",
+                                url),
+             _PAS_PASTE_HINT)
+
+    # Cookies retained: the PAS-path session anchors + the XSRF cookie.
+    # PAS-AUTHORIZATION is excluded — it lives separately under session["bearer"]
+    # and is re-attached as a cookie on every call.
+    kept = {k: cookies[k] for k in SESSION_COOKIE_NAMES
+            if k in cookies and cookies[k]}
+    if "customer-kmd2_JSESSIONID" not in kept:
+        _die(6, "bad_curl",
+             _non_pas_diagnosis("no `customer-kmd2_JSESSIONID` cookie", url),
+             _PAS_PASTE_HINT)
+
+    session = {
+        "bearer": bearer,
+        "xsrf": xsrf,
+        "cookies": kept,
+        "ingested_at": _now_iso(),
+    }
+    path = _save_session(cid, session)
+
+    # Bootstrap: session-user verifies the bearer end-to-end and yields the
+    # principalId — exactly the value the data verbs need.
+    boot = _bootstrap(cid, session)
+
+    out = {
+        "connection": cid,
+        "state_file": str(path),
+        "bearer_stored": True,
+        "xsrf_stored": True,
+        "cookies_stored": sorted(kept.keys()),
+        "ingested_at": session["ingested_at"],
+        "bootstrap": boot,
+    }
+    _emit(out)
+    if not boot.get("ok"):
+        sys.exit(2)
+
+
+def _cmd_session_show(cid: str) -> None:
+    session = _load_session(cid)
+    if session is None:
+        _emit({"connection": cid, "stored": False})
+        return
+    cookies = session.get("cookies") or {}
+    _emit({
+        "connection": cid,
+        "stored": True,
+        "state_file": str(_session_file(cid)),
+        "bearer_stored": bool(session.get("bearer")),
+        "xsrf_stored": bool(session.get("xsrf")),
+        "cookies_stored": sorted(k for k, v in cookies.items() if v),
+        "ingested_at": session.get("ingested_at"),
+        "principal_person_id_in_ids": bool(_ids_get("principal_person_id")),
+        "principal_person_id_in_session_fallback":
+            bool(session.get("principal_person_id_fallback")),
+    })
+
+
+def _cmd_session_clear(cid: str) -> None:
+    removed = _clear_session(cid)
+    _emit({"connection": cid, "cleared": removed,
+           "state_file": str(_session_file(cid))})
+
+
+def _require_session(cid: str) -> dict:
+    session = _load_session(cid)
+    if session is None:
+        _die(2, "session_stale",
+             f"no session stored for connection {cid!r}",
+             _STALE_HINT)
+    return session
+
+
+def _check_connection(cid: str) -> dict:
+    """One connection's round-trip — load session, GET /client/session-user.
+    On 200, refresh principal_person_id in ids. Reported (not died) so
+    doctor can cover every connection."""
+    session = _load_session(cid)
+    if session is None:
+        return {"ok": False, "category": 2,
+                "error": "no session stored for this connection",
+                "hint": _STALE_HINT}
+    if not session.get("bearer"):
+        return {"ok": False, "category": 2,
+                "error": "stored session has no bearer",
+                "hint": _STALE_HINT}
+    if not session.get("xsrf"):
+        return {"ok": False, "category": 2,
+                "error": "stored session has no PAS-XSRF-TOKEN",
+                "hint": _STALE_HINT}
+    boot = _bootstrap(cid, session)
+    if boot.get("ok"):
+        return {"ok": True, "session": "live",
+                "ingested_at": session.get("ingested_at"),
+                "principal_person_id": boot.get("ids_action", "unchanged")}
+    status = boot.get("status")
+    if status in (401, 406):
+        return {"ok": False, "category": 2,
+                "error": f"/client/session-user returned {status} — session stale",
+                "hint": _STALE_HINT}
+    return {"ok": False, "category": 5,
+            "error": f"/client/session-user returned {status}"}
+
+
+def _cmd_doctor(wanted: str | None) -> None:
+    """Per-connection health — every connection bare; one with --connection.
+    Exit 0 only when every examined connection is healthy."""
+    _doctor_gate(_connections_report(), wanted)
+    reg, _ = _connections_registry()
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, _entry in targets:
+        res = _check_connection(cid)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
+
+
+def _cmd_balances(cid: str) -> None:
+    session = _require_session(cid)
+    _emit(_data_call(session, "client/prepay/account/active",
+                     params={"isBankruptcyPeriod": "false"}))
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_date(label: str, raw: str) -> str:
+    if not _DATE_RE.match(raw):
+        _die(6, "bad_date", f"{label} must be YYYY-MM-DD, got {raw!r}")
+    try:
+        datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError as e:
+        _die(6, "bad_date", f"{label} is not a valid date: {e}")
+    return raw
+
+
+_PERIOD_ROW_KEY = ("taxPeriodCode", "claimTypeCode", "documentNr")
+
+
+def _dedup_period_rows(payload):
+    """tax-period-balances and tax-period-interest sometimes return the same
+    row twice on the wire. De-dup the `data` array in place on the natural
+    key (taxPeriodCode, claimTypeCode, documentNr); first occurrence wins
+    so order is preserved. Non-dict / non-list payloads are returned as-is."""
+    if not isinstance(payload, dict):
+        return payload
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return payload
+    seen: set = set()
+    out: list = []
+    for row in rows:
+        if not isinstance(row, dict):
+            out.append(row); continue
+        key = tuple(row.get(k) for k in _PERIOD_ROW_KEY)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    payload["data"] = out
+    return payload
+
+
+def _cmd_period_balances(cid: str, date: str) -> None:
+    _validate_date("--date", date)
+    session = _require_session(cid)
+    _emit(_dedup_period_rows(
+        _data_call(session,
+                   "client/claim/accrual/tax-period-balances",
+                   params={"queryDate": date})))
+
+
+def _cmd_interest(cid: str, date: str) -> None:
+    _validate_date("--date", date)
+    session = _require_session(cid)
+    _emit(_dedup_period_rows(
+        _data_call(session,
+                   "client/claim/accrual/tax-period-interest",
+                   params={"queryDate": date})))
+
+
+def _cmd_ledger(cid: str, dfrom: str, dto: str) -> None:
+    _validate_date("--from", dfrom)
+    _validate_date("--to", dto)
+    if dfrom[:4] != dto[:4]:
+        _die(6, "multi_year_span",
+             f"--from ({dfrom}) and --to ({dto}) are in different calendar years",
+             "EMTA refuses multi-year spans; split into per-year calls")
+    if dfrom > dto:
+        _die(6, "bad_range", f"--from ({dfrom}) is after --to ({dto})")
+    session = _require_session(cid)
+    _emit(_data_call(session,
+                     "client/prepay/account/transaction/search",
+                     params={"dateFrom": dfrom, "dateTo": dto}))
+
+
+# ─── CLI dispatch ────────────────────────────────────────────────────────────
+
+def _opt(cleaned: list[str], name: str) -> str | None:
+    if name in cleaned:
+        i = cleaned.index(name)
+        if i + 1 >= len(cleaned):
+            _die(6, "input", f"{name} needs a value")
+        return cleaned[i + 1]
+    for tok in cleaned:
+        if tok.startswith(name + "="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def main() -> None:
+    global _WANTED_CONN, _ACTIVE_VERB
+    _gate()                          # every verb passes the project gate first
+
+    # `--connection <id>` extracted before dispatch so it works anywhere on
+    # the line, including after the verb. Selection itself stays lazy:
+    # `help`, the contract verbs, and the session verbs use no connection
+    # config beyond the connection id key for state.
+    argv = sys.argv[1:]
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--connection" and i + 1 < len(argv):
+            _WANTED_CONN = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            _WANTED_CONN = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+
+    _ACTIVE_VERB = cleaned[0] if cleaned else ""
+
+    if not cleaned or cleaned[0] in ("help", "--help", "-h"):
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+
+    _contract(cleaned)               # contract verbs; falls through otherwise
+
+    verb = cleaned[0]
+
+    # Resolve the connection id (used by state-keyed verbs even before any
+    # auth call), via the same deterministic selector every capability uses.
+    reg, _reg_path = _connections_registry()
+    if verb == "doctor":
+        _cmd_doctor(_WANTED_CONN)
+        return
+
+    cid, entry = _select_connection(reg, _WANTED_CONN)
+    allow_write = WRITE_DEFAULT if entry is None else \
+        bool(entry.get("allow_write", WRITE_DEFAULT))
+    _write_gate(cid, allow_write, verb)
+
+    if verb == "session":
+        if len(cleaned) < 2:
+            _die(6, "input",
+                 "usage: emta session ingest|show|clear [--connection <id>]")
+        sub = cleaned[1]
+        if sub == "ingest":
+            _cmd_session_ingest(cid)
+        elif sub == "show":
+            _cmd_session_show(cid)
+        elif sub == "clear":
+            _cmd_session_clear(cid)
+        else:
+            _die(6, "input", f"unknown session subcommand {sub!r}",
+                 "emta session ingest|show|clear")
+        return
+
+    if verb == "balances":
+        _cmd_balances(cid)
+        return
+
+    if verb == "period-balances":
+        date = _opt(cleaned, "--date")
+        if not date:
+            _die(6, "input", "period-balances requires --date YYYY-MM-DD")
+        _cmd_period_balances(cid, date)
+        return
+
+    if verb == "interest":
+        date = _opt(cleaned, "--date")
+        if not date:
+            _die(6, "input", "interest requires --date YYYY-MM-DD")
+        _cmd_interest(cid, date)
+        return
+
+    if verb == "ledger":
+        dfrom = _opt(cleaned, "--from")
+        dto = _opt(cleaned, "--to")
+        if not dfrom or not dto:
+            _die(6, "input",
+                 "ledger requires --from YYYY-MM-DD and --to YYYY-MM-DD")
+        _cmd_ledger(cid, dfrom, dto)
+        return
+
+    _die(6, "unknown_command", f"unknown command {verb!r}",
+         "run `emta help` for the contract")
+
+
+if __name__ == "__main__":
+    main()
