@@ -1265,6 +1265,16 @@ def cmd_doctor() -> None:
     for name, meta in _installed().items():
         reg = _registry_dir(name)
         script = _script_path(name)
+        # The registry copy is the canonical binary — a real file the manager
+        # wrote, never a symlink into a working tree. A dev-time `ln -s` back to
+        # a project checkout makes the machine run an uncommitted binary and
+        # reintroduces a direct project reference; the closed-loop lifecycle
+        # (.claude/rules/CONFORMANCE.md) exists to prevent exactly that.
+        if script.is_symlink():
+            findings.append(
+                f"{name}: registry script is a symlink to {script.resolve()}, "
+                f"not a canonical file under {CAP_HOME} — reinstall from the "
+                f"canonical source with `capabilities install {name}`")
         if not os.access(script, os.X_OK):
             findings.append(f"{name}: script is not executable ({script})")
         link = bin_dir / name

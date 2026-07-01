@@ -25,3 +25,20 @@ enforcer, never soften the rule to match a silent gap.
 This repo is public and capability-agnostic. Before committing or pushing edits
 to the shipped doctrine surface, run the `sanitize-project` skill so no consumer,
 person, company, or real value leaks into it.
+
+## A capability edit is a closed loop
+
+Editing `capabilities/<name>/bin/<name>` here changes only this checkout. The
+machine runs the copy in the registry (`~/.capabilities/<name>/<name>`), so an
+edit is not done until that canonical copy carries the new bytes. Every change
+to a capability closes the loop, in order:
+
+1. **Conform** — the checks above pass.
+2. **Publish** — commit and push to the canonical source (sanitize first).
+3. **Reinstall** — `capabilities install <name>` so the registry holds a fresh
+   real copy and the PATH symlink resolves to it.
+
+The machine references the canonical binary, never a direct link into a working
+tree — a live-edit `ln -s` from the registry back to this checkout is the leak
+this loop closes. `capabilities doctor` enforces the end state: a registry entry
+that is a symlink instead of a real file is a finding, not a convenience.
