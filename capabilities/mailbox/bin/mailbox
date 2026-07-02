@@ -88,11 +88,19 @@ Commands:
         [--mark-seen]                         mark-seen is OFF by default.
                                               --message-id as for show.
   mailbox pdf <uid> | --message-id <id>       Render the message as a self-
-        --save-dir DIR [--folder F]           contained PDF (headers, text body,
-                                              attachment manifest). UTF-8 safe
-                                              (Cyrillic, Estonian, etc.).
+        --save-dir DIR [--folder F]           contained PDF: headers, the FULL
+                                              text body (wraps long lines and
+                                              paginates), attachment manifest.
+                                              UTF-8 safe (Cyrillic, Estonian, ...).
                                               JSON: saved path + attachment
                                               manifest. --message-id as for show.
+  mailbox eml <uid> | --message-id <id>       Save the raw RFC822 source (.eml)
+        --save-dir DIR [--folder F]           exactly as it sits on the server
+                                              (BODY.PEEK[], all headers and MIME
+                                              parts preserved) — the archival
+                                              original for authenticity proofs.
+                                              JSON: saved path. --message-id as
+                                              for show.
   mailbox seen <uid> [--unsee] [--folder F]   Flag / unflag \\Seen.
   mailbox folders                             List IMAP folders (find Archive).
   mailbox move <uid> --to-folder F            Move a message to another folder
@@ -161,7 +169,8 @@ from imap_tools import AND, MailBox, MailboxLoginError, MailMessageFlags
 NAME = "mailbox"
 PROTOCOL = 2
 SUMMARY = ("Thin IMAP/SMTP CLI for mailboxes — list/show messages, save "
-           "attachments, flag `\\Seen`, move between folders, and send.")
+           "attachments, render PDF, save raw .eml, flag `\\Seen`, move "
+           "between folders, and send.")
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [       # the implicit default connection; a registry entry supplies these per id
     {"key": "MAILBOX_ADDRESS", "secret": False, "required": True, "note": "mailbox address"},
@@ -966,10 +975,62 @@ def _pdf_slug(subject: str | None, uid: str | int) -> str:
     return f"{slug}.pdf"
 
 
+def _render_message_pdf(subject: str, from_: str, to: list, cc: list,
+                        date_str: str, body: str, attachments: list,
+                        font_path: Path, dest: Path) -> None:
+    """Render one message to `dest`. Extracted so it can be exercised on a
+    synthetic fixture without an IMAP round-trip. Every `multi_cell` returns
+    the cursor to the left margin — the fpdf2 default (`new_x=RIGHT`) leaves
+    it at the page's right edge, which silently pushes subsequent cells off
+    the page and truncates the body."""
+    from fpdf import FPDF
+
+    pdf = FPDF(unit="mm", format="A4")
+    pdf.set_margin(15)
+    pdf.set_auto_page_break(True, margin=15)
+    pdf.add_font("Body", "", str(font_path))
+    pdf.add_page()
+    w = pdf.epw
+
+    def _row(size: float, text: str, h: float = 5) -> None:
+        pdf.set_font("Body", "", size)
+        pdf.multi_cell(w, h, text, wrapmode="CHAR",
+                       new_x="LMARGIN", new_y="NEXT")
+
+    _row(14, subject or "(no subject)", h=8)
+    pdf.ln(2)
+
+    for label, value in (("From", from_), ("To", ", ".join(to)),
+                         ("Cc", ", ".join(cc)), ("Date", date_str)):
+        if value:
+            _row(10, f"{label}: {value}")
+    pdf.ln(3)
+
+    if body:
+        for line in body.splitlines() or [""]:
+            _row(11, line if line else " ")
+    else:
+        _row(11, "(empty body)")
+
+    pdf.ln(4)
+    if attachments:
+        _row(10, f"Attachments ({len(attachments)}):")
+        for a in attachments:
+            size_kb = (a["size"] or 0) / 1024
+            _row(10,
+                 f"  - {a['filename'] or '(unnamed)'} "
+                 f"({a['content_type'] or 'application/octet-stream'}, "
+                 f"{size_kb:.1f} KB)")
+    else:
+        _row(10, "Attachments: none")
+
+    pdf.output(str(dest))
+
+
 def cmd_pdf(cfg: dict, uid: str | None, folder: str, save_dir: str,
             message_id: str | None = None) -> dict:
     try:
-        from fpdf import FPDF
+        import fpdf  # noqa: F401
     except ImportError as e:
         _die(5, "missing_dependency", f"fpdf2 is required for pdf: {e}",
              "reinstall the mailbox capability so uv resolves the script deps")
@@ -1008,58 +1069,53 @@ def cmd_pdf(cfg: dict, uid: str | None, folder: str, save_dir: str,
              "place a TTF at ~/.config/mailbox/pdf-font.ttf, "
              "or install a system font (macOS: Arial Unicode; Linux: DejaVu Sans)")
 
-    pdf = FPDF(unit="mm", format="A4")
-    pdf.set_auto_page_break(True, margin=15)
-    pdf.add_font("Body", "", str(font_path))
-    pdf.add_page()
-    w = pdf.epw
-
-    pdf.set_font("Body", "", 14)
-    pdf.multi_cell(w, 8, subject or "(no subject)", wrapmode='CHAR')
-    pdf.ln(2)
-
-    pdf.set_font("Body", "", 10)
-    header_rows = [
-        ("From", from_),
-        ("To", ", ".join(to)),
-        ("Cc", ", ".join(cc)),
-        ("Date", date_str),
-    ]
-    for label, value in header_rows:
-        if value:
-            pdf.multi_cell(w, 5, f"{label}: {value}", wrapmode='CHAR')
-    pdf.ln(3)
-
-    pdf.set_font("Body", "", 11)
-    if body:
-        for line in body.splitlines() or [""]:
-            pdf.multi_cell(w, 5, line if line else " ", wrapmode='CHAR')
-    else:
-        pdf.multi_cell(w, 5, "(empty body)", wrapmode='CHAR')
-
-    pdf.ln(4)
-    pdf.set_font("Body", "", 10)
-    if attachments:
-        pdf.multi_cell(w, 5, f"Attachments ({len(attachments)}):", wrapmode='CHAR')
-        for a in attachments:
-            size_kb = (a["size"] or 0) / 1024
-            pdf.multi_cell(
-                w, 5,
-                f"  - {a['filename'] or '(unnamed)'} "
-                f"({a['content_type'] or 'application/octet-stream'}, "
-                f"{size_kb:.1f} KB)",
-                wrapmode='CHAR'
-            )
-    else:
-        pdf.multi_cell(w, 5, "Attachments: none", wrapmode='CHAR')
-
     dest = out_dir / _pdf_slug(subject, uid)
-    pdf.output(str(dest))
+    _render_message_pdf(subject, from_, to, cc, date_str, body, attachments,
+                        font_path, dest)
 
     return {"uid": uid, "folder": folder,
             "message_id": msgid_val,
             "saved": str(dest),
             "attachments": attachments}
+
+
+def cmd_eml(cfg: dict, uid: str | None, folder: str, save_dir: str,
+            message_id: str | None = None) -> dict:
+    """Save the raw RFC822 source (.eml) — the on-server bytes fetched with
+    BODY.PEEK[] so no flags flip. imap_tools parses fetch data into `.obj` and
+    drops the raw payload, so we re-fetch through the underlying imaplib client
+    after locating the message."""
+    out_dir = Path(save_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with _imap(cfg) as mb:
+        if message_id:
+            folder, m = _locate_by_message_id(mb, message_id)
+            uid = m.uid
+        else:
+            if folder != "INBOX":
+                mb.folder.set(folder)
+            m = _one(mb, uid, mark_seen=False)
+        msgid_val = m.headers.get("message-id", ("",))[0] or None
+        typ, data = mb.client.uid("fetch", str(uid), "(BODY.PEEK[])")
+        if typ != "OK":
+            _die(5, "fetch_failed",
+                 f"raw fetch for uid {uid} returned {typ}")
+        raw: bytes | None = None
+        for item in data or []:
+            if isinstance(item, tuple) and len(item) >= 2 \
+                    and isinstance(item[1], (bytes, bytearray)):
+                raw = bytes(item[1])
+                break
+        if not raw:
+            _die(5, "fetch_failed",
+                 f"IMAP server returned no raw body for uid {uid}")
+
+    dest = out_dir / f"message-{uid}.eml"
+    dest.write_bytes(raw)
+    return {"uid": uid, "folder": folder,
+            "message_id": msgid_val,
+            "saved": str(dest)}
 
 
 def cmd_seen(cfg: dict, uid: str, folder: str, unsee: bool) -> dict:
@@ -1203,6 +1259,14 @@ def main() -> None:
     sp.add_argument("--save-dir", required=True)
     sp.add_argument("--folder", default="INBOX")
 
+    sp = sub.add_parser("eml", parents=[conn_parent],
+                        help="save the raw RFC822 source (.eml)")
+    sp.add_argument("uid", nargs="?", default=None)
+    sp.add_argument("--message-id", dest="message_id", default=None,
+                    help="locate across all folders by Message-ID (folder-agnostic)")
+    sp.add_argument("--save-dir", required=True)
+    sp.add_argument("--folder", default="INBOX")
+
     sp = sub.add_parser("seen", parents=[conn_parent],
                         help="flag or unflag \\Seen")
     sp.add_argument("uid")
@@ -1257,6 +1321,9 @@ def main() -> None:
     elif args.cmd == "pdf":
         _require_selector(args)
         _emit(cmd_pdf(cfg, args.uid, args.folder, args.save_dir, args.message_id))
+    elif args.cmd == "eml":
+        _require_selector(args)
+        _emit(cmd_eml(cfg, args.uid, args.folder, args.save_dir, args.message_id))
     elif args.cmd == "seen":
         _emit(cmd_seen(cfg, args.uid, args.folder, args.unsee))
     elif args.cmd == "send":
