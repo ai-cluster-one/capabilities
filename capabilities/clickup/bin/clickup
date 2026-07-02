@@ -70,7 +70,8 @@ THE HIERARCHY
   tags are space-scoped and addressed by name.
 
 Commands:
-  clickup help                                Print this document.
+  clickup help [<command>]                    Print this document, or one
+                                              subcommand's syntax.
   clickup connections                         Where every connection's values
                                               resolve from (tier, source,
                                               secrets masked). Local only.
@@ -1390,6 +1391,7 @@ def _render_task_context(t: dict, assembled: str) -> str:
                 "", "### Description",
                 (d.get("markdown_description") or d.get("description") or "").strip() or "(empty)"]
         out += [""] + comment_block(d.get("comments", []), "###")
+        out += [""] + attachment_block(d.get("attachments") or [], "###")
     dependents = t.get("_dependent_ids", [])
     if dependents:
         out += ["", f"## Dependents ({len(dependents)})"]
@@ -1946,7 +1948,10 @@ def main() -> None:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("help", help="print the full usage contract")
+    sp = sub.add_parser("help", help="print the full usage contract, "
+                                    "or `help <command>` for one subcommand's syntax")
+    sp.add_argument("topic", nargs="?", default=None,
+                    help="subcommand name; prints its --help instead of the full contract")
     sub.add_parser("doctor", help="health check — resolve token, confirm identity")
     sub.add_parser("whoami", help="confirm token and return identity")
     sub.add_parser("workspaces", help="list workspaces (teams)")
@@ -2235,6 +2240,19 @@ def main() -> None:
     args = p.parse_args(cleaned)
 
     if args.cmd == "help":
+        topic = getattr(args, "topic", None)
+        if topic:
+            # `help <cmd>` is an ergonomic alias for `<cmd> --help`. Look up the
+            # subparser and print its usage — argparse exits 0 on --help itself,
+            # so we invoke it directly rather than through parse_args recursion.
+            choices = sub.choices  # type: ignore[attr-defined]
+            if topic not in choices:
+                known = ", ".join(sorted(choices))
+                _die(6, "unknown_help_topic",
+                     f"no such command: {topic!r}",
+                     f"known commands: {known}")
+            choices[topic].print_help()
+            return
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
 

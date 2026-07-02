@@ -5201,7 +5201,15 @@ def _create_money(
 
 
 def _list_money(endpoint: str, search: str = "", limit: int = 200) -> list[dict]:
-    """Fetch /<endpoint>/listdata (payments or incomings). Returns the rows array."""
+    """Fetch /<endpoint>/listdata (payments or incomings). Returns the rows array.
+
+    SB's server-side DataTables search tokenizes on `_`, so a full-string
+    substring search like a Stripe idempotency key (`txn_3Rabcd…`) returns
+    empty even when the row's description begins with it — while partial
+    tokens (`Stripe`, `Billing`) match fine. When the search value contains
+    `_`, we search server-side on the longest `_`-delimited segment (still
+    highly selective on its own) and re-narrow client-side by full-substring
+    match, so an exact idempotency-key lookup is reliable."""
     cookies, account = session_or_die()
     cols = [
         ("payment_id" if endpoint == "payments" else "incoming_id",) * 2,
@@ -5214,13 +5222,33 @@ def _list_money(endpoint: str, search: str = "", limit: int = 200) -> list[dict]
         ("account_id", "account_id"),
         ("description", "description"),
     ]
-    data = datatables_payload(list(cols), order_col=3, length=limit, search=search)
+    if search and "_" in search:
+        server_search = max(search.split("_"), key=len)
+        client_needle = search
+        # Widen the server window because we'll narrow further client-side —
+        # otherwise the row we care about can sit just past `limit`.
+        server_length = max(limit, 500)
+    else:
+        server_search = search
+        client_needle = ""
+        server_length = limit
+    data = datatables_payload(list(cols), order_col=3, length=server_length, search=server_search)
     with build_http(cookies, account, ajax=True) as http:
         http.headers["X-CSRF-Token"] = fetch_fresh_csrf(http, account)
         r = http.post(f"{BASE}/{account}/{endpoint}/listdata", data=data)
         if r.status_code != 200:
             raise click.ClickException(f"HTTP {r.status_code}: {r.text[:300]}")
-        return r.json().get("data", [])
+        rows = r.json().get("data", [])
+    if client_needle:
+        low = client_needle.lower()
+        def _hay(row: dict) -> str:
+            return " ".join(
+                strip_html(str(row.get(k) or "")) for k in
+                ("description", "client_name", "account_name",
+                 "status", "sum", "date")
+            ).lower()
+        rows = [row for row in rows if low in _hay(row)]
+    return rows[:limit]
 
 
 def _parse_kanne_date(row: dict):

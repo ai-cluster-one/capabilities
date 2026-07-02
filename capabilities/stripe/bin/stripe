@@ -66,7 +66,11 @@ COMMANDS
                     (the seam a consumer fills with its own ids)
         · fee     → amount + category (billing_usage / invoicing / tax / processing)
         · payout  → amount (for tying to the bank side)
-        · refund  → kind:"refund", flagged residual — surfaced, never dropped
+        · refund  → kind:"refund", flagged residual — surfaced with the
+                    paired charge block {id, date, customer, gross} and a
+                    full_refund true|false signal (null when the charge is
+                    unresolvable), so a consumer can detect same-customer
+                    test-payment pairings without a second Stripe read
       Stateless: emits everything in range. Idempotency is the consumer's (it
       skips events already recorded in its own store, keyed by the txn_ id).
       --only-type restricts to one of charge|fee|payout|refund.
@@ -702,6 +706,11 @@ def _list_bts(client: httpx.Client, ts_from: int, ts_to: int):
         ("created[gte]", str(ts_from)),
         ("created[lt]", str(ts_to)),
         ("expand[]", "data.source"),
+        # For refund BTs, the source is the Refund object — expand its charge
+        # so consumers can see the paired charge (id/date/customer/amount)
+        # without a second round-trip. On non-refund BTs the source has no
+        # `charge` field and Stripe silently ignores the nested expand.
+        ("expand[]", "data.source.charge"),
     ]
     return _paginate(client, "/balance_transactions", params)
 
@@ -805,7 +814,16 @@ def _event_payout(txn, date_iso, amount, currency, description) -> dict:
     }
 
 
-def _event_refund(txn, date_iso, amount, currency, description) -> dict:
+def _event_refund(txn, date_iso, amount, currency, description,
+                  charge=None, full_refund=None) -> dict:
+    """A refund BT with its paired charge, when Stripe exposes it.
+
+    `charge` is `{"id","date","customer","gross"}` — the same customer block
+    shape as a charge event — or None when the refund lacks a resolvable
+    charge (e.g. an issuing/dispute refund). `full_refund` is True when the
+    refund amount equals the charge's full gross, False when it's partial,
+    None when the charge could not be resolved. Together they let a consumer
+    detect a same-customer test-payment pairing directly from this event."""
     return {
         "kind": "refund",
         "txn": txn,
@@ -814,6 +832,8 @@ def _event_refund(txn, date_iso, amount, currency, description) -> dict:
         "currency": currency,
         "residual": True,
         "description": description,
+        "charge": charge,
+        "full_refund": full_refund,
     }
 
 
@@ -944,8 +964,24 @@ def cmd_sync_plan(client: httpx.Client, from_date: str, to_date: str, only_type:
                 bt["id"], date_iso, _amt(amount, currency), currency, bt.get("description"),
             ))
         elif kind == "refund":
+            refund_obj = bt.get("source") if isinstance(bt.get("source"), dict) else {}
+            charge_obj = refund_obj.get("charge") if isinstance(refund_obj.get("charge"), dict) else None
+            charge_block = None
+            full_refund: bool | None = None
+            if charge_obj:
+                charge_amount = int(charge_obj.get("amount") or 0)
+                charge_currency = charge_obj.get("currency") or currency
+                refund_amount = int(refund_obj.get("amount") or 0) or abs(int(amount or 0))
+                full_refund = charge_amount > 0 and refund_amount == charge_amount
+                charge_block = {
+                    "id": charge_obj.get("id"),
+                    "date": _day(charge_obj.get("created")),
+                    "customer": _resolve_customer(client, charge_obj, cust_cache),
+                    "gross": _amt(charge_amount, charge_currency),
+                }
             events.append(_event_refund(
                 bt["id"], date_iso, _amt(amount, currency), currency, bt.get("description"),
+                charge=charge_block, full_refund=full_refund,
             ))
         else:
             events.append(_event_other(
@@ -975,7 +1011,16 @@ def cmd_contract() -> dict:
         _event_payout("txn_1ExamplePayout000", "2026-01-15", "950.00", "eur",
                       "STRIPE PAYOUT"),
         _event_refund("txn_1ExampleRefund000", "2026-01-20", "-30.00", "eur",
-                      "Refund for ch_Example"),
+                      "Refund for ch_Example",
+                      charge={
+                          "id": "ch_Example",
+                          "date": "2026-01-20",
+                          "customer": {"stripe_id": "cus_Example",
+                                       "name": "Example Co",
+                                       "email": "billing@example.com"},
+                          "gross": "30.00",
+                      },
+                      full_refund=True),
         _event_other("txn_1ExampleOther0000", "2026-01-22", "adjustment", "-5.00", "eur"),
     ])
 
