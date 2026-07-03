@@ -6805,7 +6805,12 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
                 f"Client {client_id} not in cache. Run `simplbooks clients list` first."
             )
         client = cache[str(client_id)]
-        cashbook_id = account_id if account_id is not None else (row['income_account_id'] or 3)
+        cashbook_id = account_id if account_id is not None else row['income_account_id']
+        if not cashbook_id:
+            raise click.ClickException(
+                "SB pre-selected no cashbook for this worklist row; pass --account-id "
+                "(see `accounts list cashbook`)."
+            )
         bind_ids = list(invoice_ids if save_as == "incoming" else purchase_ids)
         if save_as == "incoming" and purchase_ids:
             raise click.ClickException("--purchase-id is only valid with --as payment.")
