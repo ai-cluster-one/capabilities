@@ -127,6 +127,25 @@ Commands:
         [--admin] [--name N]                  a member of this workspace. No token is minted
                                               or stored — act as the user via `--as E`.
 
+  Data Tables (Postgres databases hosted inside the Windmill instance):
+  windmill datatables                          List datatable stores in this workspace.
+  windmill datatable run "<sql>" [--store S]   Execute SQL (DDL or DML) against a store.
+        [--arg k=v ...] [--timeout N]         Runs as an ephemeral postgresql preview job
+                                              with args.database = datatable://<store>.
+                                              MUTATING — gated by allow_write.
+  windmill datatable tables [--store S]        List tables in a store (default --store main).
+  windmill datatable schema <table>            Column names + compact types for one table.
+        [--store S] [--schema pub]            <table> may be "schema.table"; --schema
+                                              (default public) applies when omitted.
+
+  Instance databases (superadmin-only lifecycle of the underlying PG databases):
+  windmill datatable-db list                   Statuses of every custom instance database.
+  windmill datatable-db create <name>          Run CREATE DATABASE on the Windmill PG and
+                                              grant custom_instance_user. MUTATING.
+  windmill datatable-db drop <name>            Drop a custom instance database (irreversible).
+                                              MUTATING. Superadmin token required — a
+                                              non-superadmin surfaces as exit 2 with a hint.
+
   Provisioning (workspace skeleton — folder, operator user, scripts):
   windmill verify [--folder NS]               Read-only: check the workspace skeleton against
         [--operator E] [--scripts-dir D]      live state (folder+owners, operator user, each
@@ -224,6 +243,9 @@ WRITE_VERBS = {     # domain verbs that mutate the instance
     "schedule-delete", "run", "var-set", "var-delete", "folder-create",
     "folder-ensure", "trigger-set", "trigger-delete", "user-ensure",
     "provision",
+    # sub-verb forms: `datatable run` executes DDL/DML; `datatable-db create/drop`
+    # touch the instance's actual PG databases.
+    "datatable:run", "datatable-db:create", "datatable-db:drop",
 }
 WRITE_DEFAULT = True    # writes stay inside an instance the consumer owns
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
@@ -1100,6 +1122,88 @@ def cmd_folder_ensure(c, ws, name, owners):
     return {"folder": f"f/{name}", "owners": owners, "updated": True}
 
 
+# --- Data Tables (Postgres databases hosted inside the Windmill instance) ----
+
+def cmd_datatables(c, ws):
+    """List datatable stores in the workspace."""
+    return _request(c, "GET", W(ws, "workspaces/list_datatables"))
+
+
+def cmd_datatable_run(c, ws, sql, store, args_kv, timeout):
+    """Execute SQL against a datatable store via an ephemeral postgresql preview.
+    The preview body sets args.database = datatable://<store>; extra --arg values
+    become additional preview args (e.g. named parameters for the SQL)."""
+    args = _parse_args_kv(args_kv)
+    args["database"] = f"datatable://{store}"
+    params = {}
+    if timeout:
+        params["timeout"] = timeout
+    body = {"language": "postgresql", "content": sql, "args": args}
+    return _request(c, "POST", W(ws, "jobs/run_wait_result/preview"),
+                    params=params, json_body=body)
+
+
+def cmd_datatable_tables(c, ws, store):
+    """List tables in one store. list_datatable_tables returns one entry per
+    connected store; we filter to the requested one and surface its schemas map."""
+    entries = _request(c, "GET", W(ws, "workspaces/list_datatable_tables")) or []
+    for e in entries:
+        if e.get("datatable_name") == store:
+            if e.get("error"):
+                _die(5, "datatable_error",
+                     f"store {store!r} reported error: {e['error']}",
+                     status=None)
+            return {"store": store, "schemas": e.get("schemas") or {}}
+    known = [e.get("datatable_name") for e in entries]
+    _die(3, "not_found", f"no datatable store named {store!r} in this workspace",
+         f"known: {', '.join(x for x in known if x) or 'none'}")
+
+
+def cmd_datatable_schema(c, ws, table, store, schema):
+    """Column names/types for one table. <table> may be 'schema.table' — an
+    explicit --schema wins if given, else the segment before the dot, else
+    the default 'public'."""
+    if "." in table and schema is None:
+        schema, table = table.split(".", 1)
+    schema = schema or "public"
+    params = {"datatable_name": store, "schema_name": schema, "table_name": table}
+    return _request(c, "GET", W(ws, "workspaces/get_datatable_table_schema"),
+                    params=params)
+
+
+# --- Instance databases (superadmin-only lifecycle of the underlying PG dbs) --
+
+def _datatable_db_call(c, method: str, path: str, json_body=None):
+    """Wrapper for /settings endpoints — a non-superadmin token gets 401/403;
+    surface it as exit 2 with a superadmin hint rather than the generic auth die."""
+    r = _request(c, method, path, json_body=json_body, soft=True)
+    if _is_err(r):
+        st = r["__http_error__"]
+        if st in (401, 403):
+            _die(2, "not_superadmin", r.get("message") or "superadmin required",
+                 "instance-database lifecycle requires a superadmin token; "
+                 "use a superadmin's API token for this connection", status=st)
+        _die(5, "api_error", r.get("message") or "settings endpoint failed", status=st)
+    return r
+
+
+def cmd_datatable_db_list(c):
+    return _datatable_db_call(c, "POST", "/api/settings/list_custom_instance_pg_databases")
+
+
+def cmd_datatable_db_create(c, name):
+    r = _datatable_db_call(c, "POST",
+                           f"/api/settings/setup_custom_instance_pg_database/{name}",
+                           json_body={})
+    return {"name": name, "created": True, "status": r}
+
+
+def cmd_datatable_db_drop(c, name):
+    _datatable_db_call(c, "POST",
+                       f"/api/settings/drop_custom_instance_pg_database/{name}")
+    return {"name": name, "dropped": True}
+
+
 # --- HTTP triggers (custom routes that run a script/flow on request) ----------
 
 def _route_url(url: str, ws: str, route_path: str, workspaced: bool) -> str:
@@ -1509,6 +1613,30 @@ def main() -> None:
     sp.add_argument("--off", action="store_true", help="create disabled")
     sp = sub.add_parser("trigger-delete"); sp.add_argument("path")
 
+    sub.add_parser("datatables")
+    sp = sub.add_parser("datatable")
+    dsub = sp.add_subparsers(dest="sub", required=True)
+    dr = dsub.add_parser("run")
+    dr.add_argument("sql", help="SQL text (DDL or DML) to execute")
+    dr.add_argument("--store", default="main")
+    dr.add_argument("--arg", action="append", default=[],
+                    help="extra preview arg key=value (JSON-typed if parseable)")
+    dr.add_argument("--timeout", type=int, default=None)
+    dt = dsub.add_parser("tables")
+    dt.add_argument("--store", default="main")
+    ds = dsub.add_parser("schema")
+    ds.add_argument("table", help="table name; may be 'schema.table'")
+    ds.add_argument("--store", default="main")
+    ds.add_argument("--schema", default=None,
+                    help="Postgres schema (default: 'public', or the segment "
+                         "before the dot in <table>)")
+
+    sp = sub.add_parser("datatable-db")
+    ddsub = sp.add_subparsers(dest="sub", required=True)
+    ddsub.add_parser("list")
+    ddc = ddsub.add_parser("create"); ddc.add_argument("name")
+    ddd = ddsub.add_parser("drop"); ddd.add_argument("name")
+
     sub.add_parser("users")
     sp = sub.add_parser("user-ensure"); sp.add_argument("--email", required=True)
     sp.add_argument("--operator", action="store_true"); sp.add_argument("--admin", action="store_true")
@@ -1534,7 +1662,12 @@ def main() -> None:
         cmd_doctor(args); return
 
     conn = _resolve_conn(args)
-    _write_gate(conn["id"], conn["allow_write"], args.cmd)
+    # Verbs with sub-verbs (datatable, datatable-db) fold the sub-verb into the
+    # gate key so read subs stay ungated and write subs are refused on a
+    # read-only connection.
+    gate_verb = (f"{args.cmd}:{args.sub}"
+                 if args.cmd in ("datatable", "datatable-db") else args.cmd)
+    _write_gate(conn["id"], conn["allow_write"], gate_verb)
     url, token, ws = conn["url"], conn["token"], conn["workspace"]
     admin_token = token
     if args.as_user:
@@ -1591,6 +1724,22 @@ def main() -> None:
                                   args.summary, args.description, args.off))
         elif args.cmd == "trigger-delete":
             _emit(cmd_trigger_delete(c, ws, args.path))
+        elif args.cmd == "datatables":
+            _emit(cmd_datatables(c, ws))
+        elif args.cmd == "datatable":
+            if args.sub == "run":
+                _emit(cmd_datatable_run(c, ws, args.sql, args.store, args.arg, args.timeout))
+            elif args.sub == "tables":
+                _emit(cmd_datatable_tables(c, ws, args.store))
+            elif args.sub == "schema":
+                _emit(cmd_datatable_schema(c, ws, args.table, args.store, args.schema))
+        elif args.cmd == "datatable-db":
+            if args.sub == "list":
+                _emit(cmd_datatable_db_list(c))
+            elif args.sub == "create":
+                _emit(cmd_datatable_db_create(c, args.name))
+            elif args.sub == "drop":
+                _emit(cmd_datatable_db_drop(c, args.name))
         elif args.cmd == "users":
             _emit(cmd_users(c, ws))
         elif args.cmd == "user-ensure":
