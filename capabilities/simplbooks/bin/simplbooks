@@ -4147,50 +4147,37 @@ def expenses_meta(as_json: bool, refresh: bool) -> None:
     click.secho("Expense account IDs: `simplbooks accounts list chart` (filter for 5xxx codes).", bold=True)
 
 
-_ATTACHMENT_EXT_RE = re.compile(
-    r"\.(pdf|png|jpe?g|gif|bmp|webp|heic|heif|tiff?|"
-    r"docx?|xlsx?|odt|ods|rtf|txt|csv|zip|rar|7z|eml|msg)(\?.*)?$",
-    re.IGNORECASE,
+_SHOW_FILE_PREVIEW_RE = re.compile(
+    r"showFilePreview\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)",
 )
 
 
 def _parse_purchase_attachments(html: str, account: str) -> list[dict]:
-    """Attachment anchors on a purchase view/edit page → [{name, url}].
+    """Attachment entries on a purchase view/edit page → [{file_id, type, url, name}].
 
-    SB does not tag the stored copy download in any documented way, so this
-    defensively matches anchors that either land under a plausible
-    `.../purchases/(download|attachment|file|copy)/…` path OR carry a
-    file-like extension under the account tree. Anchors that look like
-    navigation (empty, `#`, JS handlers, mailto) are ignored.
-
-    Selector unverified against a live SB page — the first run against a
-    purchase with a stored attachment should confirm the match.
+    SB does not render a real href for the stored copy — the "Vaata arve
+    koopiat" anchor sits under `Arve koopia` in the summary grid with
+    `onclick="showFilePreview('<file_id>', '<type>'); return false;"`. We
+    parse those calls anywhere in the document, build the authoritative
+    URL `.../purchases/view_file/<file_id>`, and let the download command
+    resolve the real filename from the response's Content-Disposition.
+    Verified against a live view page; the endpoint returns the stored
+    file with `Content-Type: application/pdf` and a filename header.
     """
-    soup = BeautifulSoup(html, "html.parser")
-    path_re = re.compile(
-        rf"/{re.escape(account)}/purchases/"
-        r"(download|attachment|attachments|file|files|copy|copies|copy_download)"
-        r"[/?]",
-        re.IGNORECASE,
-    )
-    seen: set[str] = set()
     out: list[dict] = []
-    for a in soup.find_all("a", href=True):
-        href = (a.get("href") or "").strip()
-        if not href or href.startswith(("#", "javascript:", "mailto:")):
+    seen: set[str] = set()
+    for match in _SHOW_FILE_PREVIEW_RE.finditer(html):
+        file_id, ftype = match.group(1), match.group(2)
+        if file_id in seen:
             continue
-        bare = href.split("?", 1)[0]
-        if not (path_re.search(href) or _ATTACHMENT_EXT_RE.search(bare)):
-            continue
-        if href in seen:
-            continue
-        seen.add(href)
-        url = (
-            href if href.startswith("http")
-            else urljoin(f"{BASE}/{account}/", href.lstrip("/"))
-        )
-        name = a.get_text(" ", strip=True) or Path(urlparse(url).path).name or "attachment"
-        out.append({"name": name, "url": url})
+        seen.add(file_id)
+        url = urljoin(f"{BASE}/{account}/", f"purchases/view_file/{file_id}")
+        out.append({
+            "file_id": file_id,
+            "type": ftype,
+            "url": url,
+            "name": f"{file_id}.{ftype}",
+        })
     return out
 
 
@@ -4448,8 +4435,8 @@ def expenses_download(expense_id: int, out_path: str | None, attach_index: int) 
             raise click.ClickException(
                 f"GET {chosen['url']} → HTTP {r.status_code}"
             )
-        anchor_name = Path(urlparse(chosen["url"]).path).name or f"{expense_id}.pdf"
-        default_name = _filename_from_response(r, anchor_name)
+        fallback_name = f"{chosen['file_id']}.{chosen.get('type') or 'pdf'}"
+        default_name = _filename_from_response(r, fallback_name)
         target = Path(out_path) if out_path else Path(default_name)
         target.write_bytes(r.content)
     click.secho(f"✓ Saved {target}", fg="green", bold=True)
