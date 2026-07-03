@@ -4456,7 +4456,9 @@ def build_purchase_fields(
 @click.option("--vat-total", default=None,
               help="Total VAT amount. Defaults to the row-derived total (0 when all rows "
                    "are 0%-rate, e.g. reverse-charge). Pass explicitly only to correct "
-                   "supplier rounding gaps.")
+                   "supplier rounding gaps. SB rejects a --vat-total that differs from the "
+                   "rows' computed VAT by more than rounding as an illegal 'VAT-modification', "
+                   "failing the whole save; 0%-rate reverse-charge rows legitimately pass 0.")
 @click.option("--rounding", default="0", show_default=True,
               help="Supplier's own rounding adjustment (the 'Ümardamine' row on the PDF). "
                    "Positive means SB's net+VAT total under-shoots the supplier's stated gross "
@@ -5060,6 +5062,9 @@ def expenses_send_payment(purchase_id, amount, from_account, payment_date, targe
     SWIFT/BIC in SimplBooks bank settings, and the supplier contact must carry
     an IBAN (`simplbooks clients update <id> --iban`).
 
+    The push is reversible (SB's "Tühista makse panka saatmise märge") until
+    the order is signed in the bank.
+
       simplbooks expenses send-payment 1733
       simplbooks expenses send-payment 1733 --amount 166,82 --date 09.06.2026
     """
@@ -5546,7 +5551,11 @@ def _do_bind(direction: str, money_id: int, bind_ids: list[int]) -> dict[int, st
 
 @cli.group()
 def payments() -> None:
-    """Outgoing bank movements (supplier payments, expense reimbursements)."""
+    """Outgoing bank movements (supplier payments, expense reimbursements).
+
+    An unbound payment is a first-class supplier prepayment; bind it to a
+    purchase invoice later, once the document arrives.
+    """
 
 
 @payments.command("list")
@@ -5585,7 +5594,17 @@ def payments_list(search, account_id, limit, as_json) -> None:
 @click.option("--object-type", type=click.Choice(["Purchase", "ExpenseReport"]),
               default="Purchase", show_default=True)
 def payments_create(client_id, account_id, sum_amount, date_str, description, object_type) -> None:
-    """Create an outgoing payment (makse). Returns new payment id."""
+    """Create an outgoing payment (makse). Returns new payment id.
+
+    A payment does NOT require a purchase invoice to exist — an unbound
+    payment is a first-class SB primitive that books as a supplier
+    prepayment: SB credits the paying bank/cashbook and debits the
+    supplier-prepayment account (the `Ettemaksed tarnijatele` family), so
+    the money sits as a claim on the supplier rather than netted against
+    payables. Bind it later with `payments bind` when the invoice arrives.
+    `--object-type` selects the settlement target (Purchase default, or
+    ExpenseReport).
+    """
     pid = _create_money("Payment", client_id, account_id, sum_amount, date_str, description, object_type)
     cookies, account = session_or_die()
     click.secho(f"✓ Created payment {pid}", fg="green", bold=True)
@@ -5597,7 +5616,17 @@ def payments_create(client_id, account_id, sum_amount, date_str, description, ob
 @click.option("--to-purchase", "purchase_ids", multiple=True, type=int, required=True,
               help="Purchase invoice id(s) to bind. Repeatable.")
 def payments_bind(payment_id, purchase_ids) -> None:
-    """Link an outgoing payment to one or more purchase invoices."""
+    """Link an outgoing payment to one or more purchase invoices.
+
+    Bind allocates only the payment's FREE (unallocated) remainder against
+    each invoice's open balance; a cent residual stays as free prepayment.
+    Binding is a separate, later step from creating — an unbound payment
+    sits as a supplier prepayment until a document arrives to bind it to.
+
+    A bound allocation is NOT editable in place: to move or re-split an
+    already-bound payment, delete it and re-create it, then re-bind. There
+    is no unbind-in-place.
+    """
     bound = _do_bind("Payment", payment_id, list(purchase_ids))
     click.secho(f"✓ Bound payment {payment_id}", fg="green")
     for pid, katte in bound.items():
