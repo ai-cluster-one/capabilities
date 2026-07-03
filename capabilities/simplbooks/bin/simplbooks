@@ -878,7 +878,7 @@ Then re-run `simplbooks doctor` to confirm.
                                                 idx is the leg number from
                                                 `kanne show`. Headline use is
                                                 reclassification:
-                                                  kanne update 20046 --set-line '1:account=730'
+                                                  kanne update 20046 --set-line '1:account=<account-id>'
                                                 --attach uploads a source PDF.
 
   simplbooks kanne delete <id>                  Delete a kanne by id.
@@ -2163,7 +2163,7 @@ def clients_update(client_id, **overrides) -> None:
 
     Common use: set per-client VAT defaults so future invoices inherit them automatically.
 
-      simplbooks clients update 407 --purchase-vat-type 11 --expense-account 141
+      simplbooks clients update 407 --purchase-vat-type 11 --expense-account <expense-account-id>
       simplbooks clients update 389 --sales-vat-type 32 --vat-no EE123456789
     """
     cookies, account = session_or_die()
@@ -2523,7 +2523,7 @@ def _harvest_form_fields(soup: BeautifulSoup, html_text: str) -> list[tuple[str,
                    "unbind them, perform the edit, then re-bind. Use with caution.")
 @click.option("--add-line", "add_lines", multiple=True,
               help="Append a Task line. Format: 'name=X:price=Y:vat=R:vat_type=ID:account=ID[:amount=N:unit=tk]'. "
-                   "Repeatable. For rounding: 'name=Ümardamine:price=-0,01:vat=0:vat_type=15:account=102'.")
+                   "Repeatable. For rounding: 'name=Ümardamine:price=-0,01:vat=0:vat_type=15:account=<income-account-id>'.")
 def invoices_update(invoice_id, additional_info, append_reference, new_number,
                     new_date, new_due, new_client_id, set_pairs, force_unbind,
                     add_lines) -> None:
@@ -3280,8 +3280,9 @@ def kmd_show(period: str, as_json: bool) -> None:
     This vatstatement figure — NOT the VAT closing (VatClosure) legs — is the
     books' authoritative version of the return, the figure to reconcile a filed
     declaration against. Closing legs can be manually adjusted, can under-drain
-    input VAT, and can leave a residual debit on 1510 that has nothing to do
-    with what the return should say; never reconcile by reading closure legs."""
+    input VAT, and can leave a residual debit on the VAT settlement account
+    that has nothing to do with what the return should say; never reconcile by
+    reading closure legs."""
     pf, pt = _kmd_period_bounds(period)
     cookies, account = session_or_die()
     with build_http(cookies, account) as http:
@@ -3862,9 +3863,10 @@ def kmd_regenerate(period: str, do_apply: bool, yes: bool, as_json: bool) -> Non
     --apply on a declared period confirms first (type 'yes'); pass --yes alongside
     --json or in non-interactive runs.
 
-    Reverse-charge input VAT is excluded from the 1510 leg by design, so a 1510
-    leg sitting below KMD line 5 (R5) by exactly the reverse-charge amount is
-    correct, not stale — do not treat that gap as a reason to regenerate."""
+    Reverse-charge input VAT is excluded from the VAT settlement account's
+    closing leg by design, so that leg sitting below KMD line 5 (R5) by exactly
+    the reverse-charge amount is correct, not stale — do not treat that gap as
+    a reason to regenerate."""
     pf, pt = _kmd_period_bounds(period)
     yr, mo = period.split("-")
     period_dm = f"01.{mo}.{yr}"
@@ -4500,7 +4502,7 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
     """Create a purchase invoice (ostuarve), optionally attaching the source PDF.
 
     Each --line is a colon-separated set of `key=value` pairs:
-      acct=126:vat_type=34:vat=24:name=Office supplies:sum=82,18
+      acct=<coa-id>:vat_type=34:vat=24:name=Office supplies:sum=82,18
     """
     if currency_rate <= 0:
         raise click.ClickException(f"--rate must be a positive number, got {currency_rate}.")
@@ -4857,7 +4859,7 @@ def _purchase_remove_all_bindings(purchase_id: int) -> None:
               help="Edit an EXISTING line in place by its 1-based index (the order shown by "
                    "`expenses show`). Format: '<idx>:acct=<id>[:vat_type=<id>][:vat=<rate>]"
                    "[:name=<desc>][:sum=<amt>][:amount=N][:unit=tk]'. Repeatable. "
-                   "Re-point an account: --set-line '1:acct=149'.")
+                   "Re-point an account: --set-line '1:acct=<coa-id>'.")
 @click.option("--attach", "attach_path", type=click.Path(exists=True, dir_okay=False), default=None,
               help="Attach (set/replace) the source-document PDF/image on this purchase.")
 @click.option("--force-unbind/--no-force-unbind", default=False, show_default=True,
@@ -4885,13 +4887,13 @@ def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat
 
       # Add a second line (e.g. an Ümardamine row when --rounding isn't enough).
       simplbooks expenses update 1731 \\
-        --add-line 'acct=149:vat_type=15:vat=0:name=Ümardamine:sum=0,01'
+        --add-line 'acct=<coa-id>:vat_type=15:vat=0:name=Ümardamine:sum=0,01'
 
       # Re-point an existing line's expense account (idx as shown by `expenses show`).
-      simplbooks expenses update 1763 --set-line '1:acct=149'
+      simplbooks expenses update 1763 --set-line '1:acct=<coa-id>'
 
       # Re-point the account, close the 1-cent VAT gap, and attach the source PDF in one call.
-      simplbooks expenses update 1763 --set-line '1:acct=149' --vat-total 10,65 --attach invoice.pdf
+      simplbooks expenses update 1763 --set-line '1:acct=<coa-id>' --vat-total 10,65 --attach invoice.pdf
 
       # Fix a PAID invoice (locked): unbind its payment, fix number+period+PDF, re-bind.
       simplbooks expenses update 1764 --force-unbind \\
@@ -6065,7 +6067,7 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
 
     Headline use — reclassify a leg from one account to another:
 
-        simplbooks kanne update 20046 --set-line '1:account=730'
+        simplbooks kanne update 20046 --set-line '1:account=<account-id>'
 
     Other edits:
 
@@ -6379,7 +6381,7 @@ def _bt_parse_form(form_soup) -> dict:
         ft_html = _bt_template_html(form_soup, "financial_transaction")
         transaction_note = _bt_extract_value(ft_html, r"data\[FinancialTransaction\]\[transaction_note\]")
 
-    # Bank-side COA id (211/248/etc.) — same in the kanne template.
+    # Bank-side COA id (the bank cashbook's COA id) — same in the kanne template.
     ft_html = _bt_template_html(form_soup, "financial_transaction")
     coa_id = _bt_extract_value(ft_html, r"data\[FinancialTransaction\]\[income_financial_account_id\]")
 
@@ -6785,7 +6787,7 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
 
       # 3. Owner loan repayment (no invoice; offset to owner-loan account)
       simplbooks bank-transactions save 7062 --as kanne \\
-        --counter-account 145 --description 'Omanikule laenu tagastamine'
+        --counter-account <coa-id> --description 'Omanikule laenu tagastamine'
     """
     row, csrf, cookies, account = _bt_load_one(bt_id)
 
