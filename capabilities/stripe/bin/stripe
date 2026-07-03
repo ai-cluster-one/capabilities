@@ -533,17 +533,6 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
 
 # ── credentials ─────────────────────────────────────────────────────────────
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def _connections_report() -> dict:
     """The resolution report — every connection, every value, its winning tier
     and source, secrets masked. Local only: no network, no login attempt."""

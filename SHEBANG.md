@@ -133,7 +133,6 @@ Everything the capability reads and writes in a consuming project lives under `.
 
 ```
 .capabilities/<name>/
-  settings.json       # capability-owned, free shape: connection-independent project config
   connections.json    # the connections registry — standard envelope (see Connections)
   identifiers.json    # the identifiers envelope, managed by the ids verbs
   reference/          # the single home for references — one front-matter .md per topic
@@ -142,8 +141,6 @@ Everything the capability reads and writes in a consuming project lives under `.
 ```
 
 (`.capabilities/settings.json` — one level up — is the manager-owned gate; the script only ever reads it.)
-
-- **`settings.json`** — the non-secret, connection-independent values that drive this capability in this project: behavioral defaults, default folders, tuning. The standard names the location and the file name; the capability owns the schema. Per-connection wiring is the connections registry's ([below](#connections)).
 
 - **`identifiers.json`** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). A thin standard envelope — label → `{ value, note }` — so any reader can render the menu without understanding the capability; capability-specific structure lives inside values:
 
@@ -154,7 +151,7 @@ Everything the capability reads and writes in a consuming project lives under `.
   }
   ```
 
-  Settings vs identifiers is a **provenance split**: settings hold values someone *chose*; identifiers hold values the CLI *discovered*. Different writer, different cadence, different git-diff meaning — never merged.
+  Connections vs identifiers is a **provenance split**: connection entries hold values someone *chose* (wiring, per-connection behavioural keys); identifiers hold values the CLI *discovered*. Different writer, different cadence, different git-diff meaning — never merged.
 
 - **References** — prose by nature (a model, a treatment, a taxonomy); the envelope is standardized, the content free. Each is its own `.md` under `.capabilities/<name>/reference/` — the single home for references, kept apart from the JSON config files. Drop a file in with the front-matter below and the context build picks it up; no index to maintain:
 
@@ -318,7 +315,7 @@ The envelope is the standard's; the entry **interior** is the capability's (host
 - **`secret_env`** — a secret never sits in the registry. The entry names the env key holding it, and that key's *value* resolves through cascade tiers 2–4 exactly as any secret does — the registry namespaces the key, the cascade resolves it. A capability with several secrets names each through its own `*_env` field.
 - **`allow_write`** — the connection's write gate ([below](#the-write-gate)). Absent falls to the capability's declared `WRITE_DEFAULT`.
 
-Non-secret values sit literally in the entry: they are chosen, committed, per-connection project config — the per-connection counterpart of settings.
+Non-secret values sit literally in the entry: chosen, committed, per-connection project config — both the wiring (endpoints, workspaces) and any behavioural per-connection keys the capability defines.
 
 ### Selection
 
@@ -449,7 +446,7 @@ def _state_dir() -> Path:
 
 A stateful capability keys its state **per connection** — `<state-dir>/<connection-id>/…` — so two connections of one capability never share a session. The guides cache is the exception: guide content is capability-scoped and connection-independent, so it stays unkeyed at the user state home.
 
-**Bulk data stores are relocatable at the root, fixed inside.** A capability that syncs bulk data (message archives, exports) defaults the store to `<state-dir>/<connection-id>/…` like any state — and MAY expose the **root** as a settings key (e.g. `messages_dir`: absolute, or relative to the project root) for a consumer who wants the data elsewhere. Only the root moves: the structure beneath it is the CLI's contract, documented in its help, identical wherever the root points. The `*/state/` gitignore guard covers only the default location, so the guard travels as a responsibility: `doctor` verifies the active root is git-ignored and warns when it is not (DOCTRINE rule 16 — synced data is minted by credentials and never commits).
+**Bulk data stores are relocatable at the root, fixed inside.** A capability that syncs bulk data (message archives, exports) defaults the store to `<state-dir>/<connection-id>/…` like any state — and MAY expose the **root** as a per-connection key on the connection entry (e.g. `messages_dir`: absolute, or relative to the project root) for a consumer who wants the data elsewhere. Only the root moves: the structure beneath it is the CLI's contract, documented in its help, identical wherever the root points. The `*/state/` gitignore guard covers only the default location, so the guard travels as a responsibility: `doctor` verifies the active root is git-ignored and warns when it is not (DOCTRINE rule 16 — synced data is minted by credentials and never commits).
 
 Known limitation, recorded for fast diagnosis: two projects driving the *same* account of a single-session service thrash each other's cookies (login here invalidates the cookie there). Per-project state trades that for account isolation — the right trade where re-logins are cheap.
 

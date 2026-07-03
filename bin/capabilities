@@ -815,9 +815,6 @@ def _compose_context(root: Path) -> str:
         topics = ((manifest or {}).get("docs") or {}).get("topics") or []
         if topics:
             bullet.append(f"- Guides (`{name} guide <topic>`): " + ", ".join(sorted(topics)))
-        settings = envdir / "settings.json"
-        if settings.exists():
-            bullet.append(f"- Project settings: .capabilities/{name}/settings.json")
         refs = []
         refdir = envdir / "reference"
         if refdir.is_dir():
@@ -2055,9 +2052,9 @@ A periodic review of one capability: drift, dead weight, sharpening.
 - Guides: do declared topics still match upstream files? Anything learned
   repeatedly in sessions that belongs in a guide?
 - Identifiers/references in consuming projects: still non-secret, still
-  provenance-split (chosen → settings.json / connections.json, discovered →
-  identifiers.json)? Connections registries: no secret in an entry, default
-  pointer names a real entry, read-only entries still correct?
+  provenance-split (chosen → connections.json, discovered → identifiers.json)?
+  Connections registries: no secret in an entry, default pointer names a real
+  entry, read-only entries still correct?
 
 ## 3. Close
 

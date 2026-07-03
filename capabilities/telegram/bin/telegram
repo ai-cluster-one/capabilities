@@ -194,17 +194,6 @@ def _log(message: str) -> None:
     sys.stderr.flush()
 
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
 # --- Error reporting ---------------------------------------------------------

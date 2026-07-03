@@ -634,19 +634,6 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
             "token": token, "expect": entry.get("expect_project")}, None
 
 
-# --- Capability config (capability-specific) --------------------------------
-
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 # ── railway invocation ──────────────────────────────────────────────────────
 
 def _child_env(token: str) -> dict:

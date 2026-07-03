@@ -510,16 +510,6 @@ def _contract(argv: list[str]) -> None:
 
 # --- Config (cascade: flags > project .env > user config > process env) ------
 
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
 
 # >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -1309,7 +1299,6 @@ def _config_value(args, flag: str, env_key: str) -> str | None:
     config > process env. Mirrors the credential cascade for config-driven provision."""
     return (getattr(args, flag, None)
             or _project_env().get(env_key)
-            or _project_settings().get(env_key.removeprefix("WINDMILL_").lower())
             or _parse_env_file(CREDENTIALS_ENV).get(env_key)
             or os.environ.get(env_key))
 

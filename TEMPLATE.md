@@ -9,7 +9,7 @@ The **script is the sole shipped artifact**. Everything a capability declares ab
 A capability exists at two altitudes, and the split is the whole point:
 
 - **Global (machine-level)** — declared *just enough to be visible*. One generated skill carries awareness of every installed capability; the full contract loads on demand (`<name> help`). One install per machine.
-- **Project (repo-level)** — *expansion*. A consuming project enables the capability, holds **its** settings and identifiers, and accrues **its** references. Per consuming project.
+- **Project (repo-level)** — *expansion*. A consuming project enables the capability, holds **its** connections and identifiers, and accrues **its** references. Per consuming project.
 
 Global is the introduction; project is the elaboration. A fact lives at exactly one altitude and is never restated at the other (DOCTRINE rules 1–2).
 
@@ -17,7 +17,7 @@ Global is the introduction; project is the elaboration. A fact lives at exactly 
 
 - The **spec** (the doctrine, this template, [SHEBANG.md](SHEBANG.md)) is **domain-neutral** — slots and rules, no example domain's fingerprints.
 - The **declaration** (the `stub` line, the manifest) is **consumer-neutral** — identical for every project; it names the system and how to load its contract, nothing about any one consumer.
-- The **project envelope** (settings, identifiers, references) is where the **specifics live** — concrete values and the operational model. Domain terms here are not bleed; they are the point.
+- The **project envelope** (connections, identifiers, references) is where the **specifics live** — concrete values and the operational model. Domain terms here are not bleed; they are the point.
 
 Neutrality is a property of the declaration, not of the whole capability. (Enforced by DOCTRINE rules 2 and 10.)
 
@@ -32,9 +32,9 @@ Two questions place any piece of knowledge, and crossing them leaves no blurry m
 |---|---|---|
 | **Framework** — every capability | *(none — the framework is meta)* | the doctrine, this template, [SHEBANG.md](SHEBANG.md); the authoring procedures the manager emits (`capabilities new` / `conform` / `groom`) |
 | **Capability** — this tool, every project | the CLI + `<name> help`; the `stub` line | the **guide** — `<name> guide [topic]`, fetched live (DOCTRINE rule 14) |
-| **Project** — only here | settings + identifiers (values), references (model), routines (procedure) | *— empty: authoring guidance is never project-specific —* |
+| **Project** — only here | connections + identifiers (values), references (model), routines (procedure) | *— empty: authoring guidance is never project-specific —* |
 
-The project-meta cell is empty on purpose: authoring guidance never varies by project, so it always rises to one of the two agnostic homes — to **framework** meta when it holds for every capability (*how to write any reference* → this template), or to **capability** meta when it is specific to one tool (*how to author X with this tool* → that capability's guide, DOCTRINE rule 14). What does **not** exist is a *project-altitude* usage-guide: a per-project "how to use this here" file is always really the product (→ settings / identifiers / a reference / a routine) or it rises to one of those two meta homes. Procedure that is *executable* is a **routine**; procedure that is *the tool's surface* is the CLI's `help`; everything declarative and project-specific is a **reference**.
+The project-meta cell is empty on purpose: authoring guidance never varies by project, so it always rises to one of the two agnostic homes — to **framework** meta when it holds for every capability (*how to write any reference* → this template), or to **capability** meta when it is specific to one tool (*how to author X with this tool* → that capability's guide, DOCTRINE rule 14). What does **not** exist is a *project-altitude* usage-guide: a per-project "how to use this here" file is always really the product (→ connections / identifiers / a reference / a routine) or it rises to one of those two meta homes. Procedure that is *executable* is a **routine**; procedure that is *the tool's surface* is the CLI's `help`; everything declarative and project-specific is a **reference**.
 
 ## The slots
 
@@ -43,14 +43,13 @@ The project-meta cell is empty on purpose: authoring guidance never varies by pr
 | The script | `bin/<name>` upstream → registry copy at `~/.capabilities/<name>/bin/<name>`, symlinked onto `PATH` | capability | the whole shipped artifact: domain verbs + the contract verbs |
 | The declaration | verbs on the script — `stub`, `manifest --json` — snapshotted by the manager at install | capability | the one-line awareness text; the machine-readable manifest (name, summary, credential scope and keys, docs base, state flag) |
 | Guides *(opt)* | `guides/<topic>.md` beside the script upstream, surfaced by `<name> guide` fetched live | capability | consumer-neutral *how to author X with this tool* docs (DOCTRINE rule 14); present only when the tool has authoring depth |
-| Settings | `.capabilities/<name>/settings.json` — capability-owned, free shape | project | the non-secret, connection-independent values someone **chose**: behavioural defaults, tuning |
-| Connections | `.capabilities/<name>/connections.json` — standard envelope (`default` pointer + `connections` map), entry interior capability-owned | project | the project's named endpoints and identities: per-connection non-secret wiring, secrets by env-key indirection (`secret_env`), the write gate (`allow_write`) |
+| Connections | `.capabilities/<name>/connections.json` — standard envelope (`default` pointer + `connections` map), entry interior capability-owned | project | the project's named endpoints and identities: per-connection non-secret wiring (including behavioural per-connection keys), secrets by env-key indirection (`secret_env`), the write gate (`allow_write`) |
 | Identifiers | `.capabilities/<name>/identifiers.json` — CLI-managed envelope, written by `<name> ids set` and rendered by `capabilities ids <name>` | project | the non-secret structural values the CLI **discovered**: ids, labels, classifications, breadcrumbs |
 | References | `.capabilities/<name>/reference/*.md` — front-matter envelope + free prose, surfaced by `<name> refs` | project | the project-specific operational **model**: mappings, treatments, what output means here |
 | State | `.capabilities/<name>/state/` or `$XDG_STATE_HOME/<name>/`, per declared scope | project / user | what credentials mint: sessions, caches, pending logins. Never committed (DOCTRINE rule 16) |
 | Deviations *(opt)* | `deviations.md` beside the script upstream | capability | recorded, justified departures from the standard, kept apart so an audit reads them as choices |
 
-The project envelope's resting state is **empty**: `capabilities enable` writes the gate entry and nothing else. Settings appear when the project chooses values, connections when the project names more than the cascade's one implicit `default`, identifiers when the CLI discovers them, references when genuine project context accrues. An empty envelope is conformant, not a gap; never invent content to fill it.
+The project envelope's resting state is **empty**: `capabilities enable` writes the gate entry and nothing else. Connections appear when the project names more than the cascade's one implicit `default` — carrying any behavioural per-connection keys alongside the wiring — identifiers when the CLI discovers them, references when genuine project context accrues. An empty envelope is conformant, not a gap; never invent content to fill it.
 
 ## How each altitude reaches the agent
 
@@ -65,16 +64,15 @@ Through that same CLI route a capability's **guides** reach the agent: `<name> g
 
 The Codex host swaps the placement, not the composition: the same skill file at `~/.agents/skills/capabilities/`, and `capabilities init --codex` wires Codex's internal project-context path by generating `.codex/config.toml`, `.codex/hooks.json`, `.codex/hooks/build-context.sh`, and `.codex/generated/` context artifacts. The context compiler is manager-owned host wiring, not a human customization surface; every `capabilities init --codex` overwrites it with the canonical compiler. `capabilities context --codex` refreshes the capabilities fragment consumed by that compiler. No project-root instruction markdown file is required or assumed. Another host swaps the injection while the registry and the CLI-on-`PATH` route stay the same.
 
-## Settings vs identifiers vs reference
+## Connections vs identifiers vs reference
 
 The project homes split by **provenance and shape**:
 
-- **settings — the values someone chose.** Connection-independent configuration a human or agent decided at setup: behavioural defaults, tuning. Free shape — the standard names the location; the capability owns the schema. Written at configuration time, by whoever configures.
-- **connections — the endpoints and identities the project talks to.** Each entry carries its non-secret wiring literally, names its secrets by env-key indirection, and may carry the write gate; a `default` pointer names which entry an unflagged invocation uses. Standard envelope so the manager renders every capability's connections without understanding any of them; the entry interior is the capability's (SHEBANG.md's [Connections](SHEBANG.md#connections)). Written at configuration time, by whoever configures.
+- **connections — the endpoints and identities the project talks to, plus their chosen behaviour.** Each entry carries its non-secret wiring literally, names its secrets by env-key indirection, and may carry the write gate and any behavioural per-connection keys; a `default` pointer names which entry an unflagged invocation uses. Standard envelope so the manager renders every capability's connections without understanding any of them; the entry interior is the capability's (SHEBANG.md's [Connections](SHEBANG.md#connections)). Written at configuration time, by whoever configures.
 - **identifiers — the values the CLI discovered.** Discrete, lookup-able structural facts: ids, codes, account handles, labels, classifications, and breadcrumbs for values not yet pinned. The answer to *"what is the handle for X?"* Thin standard envelope (`{label: {value, note}}`) so the manager renders every capability's menu without understanding any of them; the CLI writes through `<name> ids set`. No prose narrative, no treatment (DOCTRINE rule 4).
 - **reference — the model and context.** The prose that is neither a value nor a step: how the system behaves, what its output represents, the mapping or treatment the consumer applies. The answer to *"how does this work, what does it mean, how is it handled?"* Domain-specific terms belong here freely — this is the slot that holds them.
 
-Settings and connections vs identifiers is a provenance split — different writer, different cadence, different git-diff meaning — never merged. The line for the rest: a **value** is settings', connections', or identifiers'; an **explanation or model** is a reference's; a **step-by-step to perform a task** is a routine's — never a reference's (DOCTRINE rule 11).
+Connections vs identifiers is a provenance split — connections are the values someone *chose*, identifiers the values the CLI *discovered*; different writer, different cadence, different git-diff meaning — never merged. The line for the rest: a **value** is a connection's or an identifier's; an **explanation or model** is a reference's; a **step-by-step to perform a task** is a routine's — never a reference's (DOCTRINE rule 11).
 
 ## References: the envelope and growth
 

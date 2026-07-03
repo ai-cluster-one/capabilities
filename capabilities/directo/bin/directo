@@ -738,19 +738,6 @@ def _cmd_connections() -> None:
     _emit(_connections_report())
 
 
-# ─── Project settings (capability-owned, non-secret project config) ──────────
-
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 # ─── URLs ────────────────────────────────────────────────────────────────────
 
 def _base(db: str) -> str:

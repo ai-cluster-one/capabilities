@@ -411,19 +411,6 @@ def _contract(argv: list[str]) -> None:
 # <<< contract: capability core <<<
 
 
-# --- Capability-specific project config --------------------------------------
-
-def _project_settings() -> dict:
-    """Capability-owned, non-secret project config: .capabilities/<NAME>/settings.json."""
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    try:
-        return json.loads((envdir / "settings.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 # --- Credentials -------------------------------------------------------------
 
 def _load_token(key: str = "NOTION_TOKEN") -> str:
