@@ -63,8 +63,9 @@ WRITE_VERBS = {"create", "update", "delete", "unbind", "bind", "send-payment", "
                "submit", "amend", "regenerate"}
 WRITE_DEFAULT = False    # writes create legal invoices / stage real bank payments;
                          # granted per connection, explicitly, via allow_write: true
-DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
-TOPICS: list = []   # shipped guide topics
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/simplbooks/guides/")
+TOPICS = ["id-spaces", "worklist"]   # shipped guide topics
 STATE = True        # the live session + scrape caches live in the state home
 POST_INSTALL: list = []
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
@@ -3274,7 +3275,13 @@ def kmd_show(period: str, as_json: bool) -> None:
 
     Every declaration line (1–13 and sub-lines) with the value SB would file —
     the books' own version of the return, to reconcile against what was actually
-    filed to e-MTA. Line 12 is VAT payable, line 13 VAT refundable."""
+    filed to e-MTA. Line 12 is VAT payable, line 13 VAT refundable.
+
+    This vatstatement figure — NOT the VAT closing (VatClosure) legs — is the
+    books' authoritative version of the return, the figure to reconcile a filed
+    declaration against. Closing legs can be manually adjusted, can under-drain
+    input VAT, and can leave a residual debit on 1510 that has nothing to do
+    with what the return should say; never reconcile by reading closure legs."""
     pf, pt = _kmd_period_bounds(period)
     cookies, account = session_or_die()
     with build_http(cookies, account) as http:
@@ -3853,7 +3860,11 @@ def kmd_regenerate(period: str, do_apply: bool, yes: bool, as_json: bool) -> Non
                          (period left with no closure — recreate manually).
 
     --apply on a declared period confirms first (type 'yes'); pass --yes alongside
-    --json or in non-interactive runs."""
+    --json or in non-interactive runs.
+
+    Reverse-charge input VAT is excluded from the 1510 leg by design, so a 1510
+    leg sitting below KMD line 5 (R5) by exactly the reverse-charge amount is
+    correct, not stale — do not treat that gap as a reason to regenerate."""
     pf, pt = _kmd_period_bounds(period)
     yr, mo = period.split("-")
     period_dm = f"01.{mo}.{yr}"
