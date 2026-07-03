@@ -107,9 +107,10 @@ VERIFICATION VERBS
         actually has, and every doc link resolves. Exit 0 whole, 7 otherwise.
 
 AUTHORING VERBS (emit agent-executable instructions; judgment stays with the agent)
-  new            The procedure for creating a capability from scratch.
-  conform <ref>  The procedure for bringing an existing script to the protocol.
-  groom <name>   The procedure for reviewing an installed capability.
+  new              The procedure for creating a capability from scratch.
+  conform <ref>    The procedure for bringing an existing script to the protocol.
+  groom <name>     The procedure for reviewing an installed capability.
+  sanitize <name>  The procedure for reviewing this project's envelope for <name>.
 
 I/O CONTRACT
   Success: JSON on stdout. Failure: {"error": {"code", "message", "hint"?}}
@@ -2063,6 +2064,100 @@ re-run `capabilities audit {name}`, and `capabilities update {name}` so
 snapshots refresh.
 """
 
+
+def _instructions_sanitize(name: str) -> str:
+    installed = name in _installed()
+    state = "installed" if installed else "NOT installed on this machine"
+    return f"""\
+# Sanitize `{name}`'s project envelope ({state}) — agent procedure
+
+A content review of the `{name}` project envelope in the *current* consuming
+project — semantics, placement, ambiguity. The scope split, in one line each:
+
+- `capabilities audit {name}` — mechanical contract conformance of the script.
+- `capabilities groom {name}` — periodic review of the installed capability
+  (the machine side).
+- `capabilities sanitize {name}` — the envelope-side content review (this
+  procedure): every file the project holds under the `{name}` capability's
+  envelope, judged as prose.
+
+The manager judges nothing here; you do, inside the consuming project.
+
+## 1. Inventory through the capability's own surface
+
+Discover what to review by asking the tool — never by asserting paths:
+
+- `{name} refs` — the reference envelope (name, description, path per file).
+- `{name} ids list` — the identifiers the CLI has discovered here.
+- `{name} connections` — the connections declared, with secrets masked.
+
+An empty envelope is **conformant-empty**, not a finding. Do not invent
+content to fill a slot; a project that has not accrued a reference yet has
+no reference to review.
+
+## 2. Walk the checks
+
+For each file the inventory named, walk the list below. Each check names the
+doctrine rule it enforces — read the rule at the source (`DOCTRINE.md`)
+before deciding a finding stands.
+
+1. **Name/description ↔ body** *(TEMPLATE.md's reference envelope).*  For
+   every reference, the front-matter `description` is load-bearing — it is
+   how an agent decides to load the body. A body that outgrew or shrank from
+   its description is a finding; fix by tightening the description or
+   splitting the body into siblings.
+
+2. **The identifiers/reference split** *(rule 4, rule 11).*  Both directions:
+   a structural lookup value (an id, code, label, classification) buried in
+   reference prose belongs in `identifiers.json`; a treatment or usage
+   narrative sitting in an identifiers note belongs in a reference. A
+   reference holds the model, not the values; an identifier holds the
+   value, not the narrative.
+
+3. **Domain ownership and consumer identity** *(rule 9, rule 10).*  Facts in
+   this envelope that belong to a **sibling capability's** envelope (source-
+   vs consumer-side domain), to the **consuming project's own files** (its
+   identity, restated), or to **no one** (dead or already-resolved notes).
+   Each finding names the correct home.
+
+4. **One fact, one home + affirmative framing** *(rule 1, rule 12).*
+   Duplication or contradiction across the envelope's files; prose that
+   defines by negation, by history ("formerly", "moved from"), or by a
+   neighbour's behaviour ("unlike X"). Restate affirmatively; consolidate
+   the duplicate to one home the others reference by role.
+
+5. **Pointer direction** *(rule 7, rule 8).*  An asset that names its
+   consumer (a routine, a workflow, a caller upstream) is a violation — the
+   asset describes itself; consumers point down to it. Hard literal links
+   between reference files across capability boundaries are a violation
+   too — resolve through the capability's own `refs`/`ids` surface.
+
+6. **Model vs procedure** *(rule 11).*  A step-by-step task recipe inside a
+   reference belongs in the consuming project's routines; the reference
+   keeps the model (mapping, treatment, taxonomy) the routine names by role.
+
+7. **WIP hygiene.**  Resolved items, fix-it lists, and to-dos living in a
+   reference belong on the consuming project's task system, not in the
+   envelope. The reference is for the durable model, not the open queue.
+
+## 3. Report, then fix on the project's terms
+
+Emit findings as a list. For each: **the file**, **the quoted fragment**,
+**the rule** it violates, and **the proposed move or fix**. Group by file
+so the reader sees each home once.
+
+Apply only what the consuming project's own norms allow — some fixes cross
+into project files this envelope does not own (a routine, a task list, a
+sibling capability's envelope); those are proposals for the project's
+maintainer, not this procedure's edits.
+
+## 4. Close
+
+- Re-run `{name} refs` to confirm the envelope still parses.
+- Refresh the generated context so the session sees the sharpened envelope:
+  `capabilities context --claude` (or `--codex`, per host).
+"""
+
 # ---------------------------------------------------------------- main
 
 def main() -> None:
@@ -2154,6 +2249,10 @@ def main() -> None:
         if not pos:
             _die(6, "input", "groom needs a capability name")
         _emit(_instructions_groom(pos[0]))
+    elif cmd == "sanitize":
+        if not pos:
+            _die(6, "input", "sanitize needs a capability name")
+        _emit(_instructions_sanitize(pos[0]))
     else:
         _die(6, "input", f"unknown command: {cmd}", "run `capabilities help`")
 
