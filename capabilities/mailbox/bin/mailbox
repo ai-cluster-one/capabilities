@@ -708,10 +708,30 @@ def _imap(cfg: dict) -> MailBox:
              hint)
 
 
+def _ascii_reduce(value: str) -> str | None:
+    """The longest whitespace-token of `value` that is pure ASCII, or None if
+    every token carries a non-ASCII byte. Used to keep a coarse server-side
+    SEARCH criterion when the real query is non-ASCII (which Gmail refuses
+    even with CHARSET UTF-8 — imaplib inlines the bytes instead of sending
+    an IMAP literal). The full string then narrows client-side."""
+    if all(ord(c) < 128 for c in value):
+        return value
+    ascii_tokens = [t for t in value.split() if t and all(ord(c) < 128 for c in t)]
+    return max(ascii_tokens, key=len) if ascii_tokens else None
+
+
 def _criteria(unread: bool, since: str | None,
               from_: str | None = None, subject: str | None = None,
               text: str | None = None):
+    """Server-side SEARCH criteria + the client-side narrows the caller
+    must run after fetch. Every non-ASCII text field is reduced to its
+    longest ASCII token for the server (or dropped if none survives) and
+    added to `narrows` as `(field, casefold(full_original))` so the caller
+    can match the untruncated string in Python. When every text field is
+    pure ASCII, `narrows` is empty and behavior is byte-identical to the
+    old server-only path."""
     kw = {}
+    narrows: list[tuple[str, str]] = []
     if unread:
         kw["seen"] = False
     if since:
@@ -719,13 +739,42 @@ def _criteria(unread: bool, since: str | None,
             kw["date_gte"] = datetime.strptime(since, "%Y-%m-%d").date()
         except ValueError:
             _die(6, "bad_date", f"--since must be YYYY-MM-DD, got {since!r}")
-    if from_:
-        kw["from_"] = from_
-    if subject:
-        kw["subject"] = subject
-    if text:
-        kw["text"] = text
-    return AND(**kw) if kw else "ALL"
+    for field, value in (("from_", from_), ("subject", subject), ("text", text)):
+        if not value:
+            continue
+        if all(ord(c) < 128 for c in value):
+            kw[field] = value
+            continue
+        reduced = _ascii_reduce(value)
+        if reduced:
+            kw[field] = reduced
+        narrows.append((field, value.casefold()))
+    return (AND(**kw) if kw else "ALL"), narrows
+
+
+def _narrow_iter(msgs, narrows: list[tuple[str, str]]):
+    """Keep only messages whose real header/body substring matches every
+    non-ASCII narrow, case-insensitive per Unicode casefold. A `text`
+    narrow scans subject + from + body, so the caller must fetch without
+    `headers_only` when any narrow targets that field (see _needs_body)."""
+    for m in msgs:
+        ok = True
+        for field, needle in narrows:
+            if field == "from_":
+                hay = m.from_ or ""
+            elif field == "subject":
+                hay = m.subject or ""
+            else:
+                hay = " ".join([m.subject or "", m.from_ or "", m.text or ""])
+            if needle not in hay.casefold():
+                ok = False
+                break
+        if ok:
+            yield m
+
+
+def _needs_body(narrows: list[tuple[str, str]]) -> bool:
+    return any(field == "text" for field, _ in narrows)
 
 
 def _one(mb: MailBox, uid: str, mark_seen: bool):
@@ -757,8 +806,7 @@ def _locate_by_message_id(mb: MailBox, message_id: str):
             mb.folder.set(name)
         except Exception:
             continue  # unselectable container (\Noselect) — can't hold a message
-        msgs = list(mb.fetch(crit, mark_seen=False, bulk=False, limit=1,
-                             charset="UTF-8"))
+        msgs = list(mb.fetch(crit, mark_seen=False, bulk=False, limit=1))
         if msgs:
             return name, msgs[0]
     _die(3, "not_found",
@@ -826,37 +874,46 @@ def cmd_doctor(wanted: str | None) -> None:
         sys.exit(fail_exit)
 
 
-def cmd_list(cfg: dict, folder: str, unread: bool, since: str | None, limit: int) -> list:
+def _emit_msg(m) -> dict:
+    return {
+        "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
+        "date": m.date_str, "from": m.from_, "to": list(m.to),
+        "subject": m.subject, "seen": "\\Seen" in m.flags,
+    }
+
+
+def _fetch_with_narrow(mb: MailBox, criteria, narrows, *, limit: int) -> list:
+    """One fetch + optional client-side narrow. When narrows are active we
+    widen the server window (a coarse ASCII token is a superset match) and
+    then trim to the caller's `limit` after the full-substring filter, so
+    --limit applies to the narrowed result."""
+    server_limit = max(limit * 5, 200) if narrows else limit
+    msgs = mb.fetch(criteria, mark_seen=False,
+                    headers_only=not _needs_body(narrows), bulk=False,
+                    reverse=True, limit=server_limit)
     out = []
+    for m in _narrow_iter(msgs, narrows):
+        out.append(_emit_msg(m))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def cmd_list(cfg: dict, folder: str, unread: bool, since: str | None, limit: int) -> list:
     with _imap(cfg) as mb:
         if folder != "INBOX":
             mb.folder.set(folder)
-        for m in mb.fetch(_criteria(unread, since), mark_seen=False,
-                          headers_only=True, bulk=False, reverse=True, limit=limit,
-                          charset="UTF-8"):
-            out.append({
-                "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
-                "date": m.date_str, "from": m.from_, "to": list(m.to),
-                "subject": m.subject, "seen": "\\Seen" in m.flags,
-            })
-    return out
+        criteria, narrows = _criteria(unread, since)
+        return _fetch_with_narrow(mb, criteria, narrows, limit=limit)
 
 
 def cmd_search(cfg: dict, folder: str, from_: str | None, subject: str | None,
                since: str | None, text: str | None, limit: int) -> list:
-    out = []
     with _imap(cfg) as mb:
         if folder != "INBOX":
             mb.folder.set(folder)
-        for m in mb.fetch(_criteria(False, since, from_, subject, text),
-                          mark_seen=False, headers_only=True, bulk=False,
-                          reverse=True, limit=limit, charset="UTF-8"):
-            out.append({
-                "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
-                "date": m.date_str, "from": m.from_, "to": list(m.to),
-                "subject": m.subject, "seen": "\\Seen" in m.flags,
-            })
-    return out
+        criteria, narrows = _criteria(False, since, from_, subject, text)
+        return _fetch_with_narrow(mb, criteria, narrows, limit=limit)
 
 
 def cmd_show(cfg: dict, uid: str | None, folder: str, message_id: str | None = None) -> dict:
