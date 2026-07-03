@@ -674,6 +674,10 @@ Then re-run `simplbooks doctor` to confirm.
                                                 (--sales-vat-type, --purchase-vat-type,
                                                 --expense-account) so future
                                                 invoices inherit them.
+  simplbooks clients show <client_id> [--json]  One client's identity + writable
+                                                settings, read-through from the
+                                                edit form (vat_type / account
+                                                ids kept raw).
 
   simplbooks invoices list [--search TERM] [--limit N]
                                                 List recent invoices.
@@ -2017,6 +2021,120 @@ CLIENT_UPDATE_FIELDS: list[tuple[str, str]] = [
     ("expense_account",     "data[Client][expense_account_id]"),
 ]
 
+# DOM ids of SB.Select widgets on the client edit form. SB renders empty
+# <select> shells and populates them from inline JS, so the saved value lives
+# in `new SB.Select('#DOMID', { items: [...] })`.
+_CLIENT_SB_SELECT_IDS: dict[str, str] = {
+    "data[Client][client_settings_sales_vat_type_id]":    "ClientSalesVatType",
+    "data[Client][client_settings_purchase_vat_type_id]": "ClientPurchaseVatType",
+    "data[Client][trade_receivables_account_id]":         "ClientTradeReceivablesAccountId",
+    "data[Client][trade_creditors_account_id]":           "ClientTradeCreditorsAccountId",
+    "data[Client][expense_account_id]":                   "ClientExpenseAccountId",
+    "data[Client][address_country]":                      "ClientAddressCountry",
+    "data[Client][client_settings_language]":             "ClientLanguage",
+    "data[Client][invoice_document_template_id]":         "ClientInvoiceDocumentTemplateId",
+    "data[Client][price_offer_document_template_id]":     "ClientPriceOfferDocumentTemplateId",
+    "data[Client][sales_order_document_template_id]":     "ClientSalesOrderDocumentTemplateId",
+}
+
+
+def _scrape_client_edit_form(http, account, client_id):
+    """GET /clients/edit/<id>, parse it, return (soup, html_text, form_val).
+
+    `form_val(name)` reads the field's persisted value, resolving SB.Select
+    widgets from their inline JS init. The items-value regex is intentionally
+    broad enough to capture non-numeric codes (country `EE`, language `et_EE`)
+    alongside numeric ids like vat_type / account.
+    """
+    r = http.get(f"{BASE}/{account}/clients/edit/{client_id}")
+    if r.status_code in (301, 302):
+        raise AuthError(
+            f"Session expired or client not accessible (→ {r.headers.get('location','')})."
+        )
+    if r.status_code != 200:
+        raise click.ClickException(f"GET /clients/edit/{client_id} → HTTP {r.status_code}")
+    html_text = r.text
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    sb_select_items: dict[str, str] = {}
+    for m in re.finditer(
+        r"new\s+SB\.Select\(['\"]#(\w+)['\"]\s*,\s*\{.*?items:\s*\[([^\]]*)\]",
+        html_text, re.DOTALL,
+    ):
+        dom_id = m.group(1)
+        items_raw = m.group(2).strip()
+        first = re.search(r"['\"]?([\w.-]+)['\"]?", items_raw)
+        sb_select_items[dom_id] = first.group(1) if first else ""
+
+    def form_val(name: str) -> str:
+        dom_id = _CLIENT_SB_SELECT_IDS.get(name)
+        if dom_id and dom_id in sb_select_items:
+            return sb_select_items[dom_id]
+        inp = soup.find("input", {"name": name})
+        if inp is not None:
+            return inp.get("value", "") or ""
+        sel = soup.find("select", {"name": name})
+        if sel is not None:
+            opt = sel.find("option", attrs={"selected": True})
+            return (opt.get("value", "") or "") if opt else ""
+        ta = soup.find("textarea", {"name": name})
+        if ta is not None:
+            return ta.text or ""
+        return ""
+
+    return soup, html_text, form_val
+
+
+# Fields emitted by `clients show`: identity + the flags that `clients update`
+# can write but the list endpoint doesn't return.
+CLIENT_SHOW_FIELDS: list[tuple[str, str]] = [
+    ("name",                         "data[Client][name]"),
+    ("reg_no",                       "data[Client][reg_no]"),
+    ("vat_no",                       "data[Client][vat_no]"),
+    ("country",                      "data[Client][address_country]"),
+    ("street",                       "data[Client][address_street]"),
+    ("city",                         "data[Client][address_city]"),
+    ("county",                       "data[Client][address_county]"),
+    ("postal_code",                  "data[Client][address_postal_code]"),
+    ("email",                        "data[Client][e_mail]"),
+    ("phone",                        "data[Client][phone]"),
+    ("language",                     "data[Client][client_settings_language]"),
+    ("sales_vat_type_id",            "data[Client][client_settings_sales_vat_type_id]"),
+    ("purchase_vat_type_id",         "data[Client][client_settings_purchase_vat_type_id]"),
+    ("expense_account_id",           "data[Client][expense_account_id]"),
+    ("trade_receivables_account_id", "data[Client][trade_receivables_account_id]"),
+    ("trade_creditors_account_id",   "data[Client][trade_creditors_account_id]"),
+    ("account_no",                   "data[Client][account_no]"),
+    ("bank",                         "data[Client][bank]"),
+    ("swift",                        "data[Client][swift_code]"),
+]
+
+
+@clients.command("show")
+@click.argument("client_id", type=int)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def clients_show(client_id: int, as_json: bool) -> None:
+    """Show one client's identity + writable settings, read-through from the edit form.
+
+    Uses the same scrape as `clients update` (no cache, no mutation). VAT-type
+    and account fields come back as ids — resolve labels via `invoices meta`
+    or the account's chart of accounts."""
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        _soup, _html, form_val = _scrape_client_edit_form(http, account, client_id)
+
+    record: dict[str, str] = {"id": str(client_id)}
+    for key, form_name in CLIENT_SHOW_FIELDS:
+        record[key] = form_val(form_name)
+
+    if as_json:
+        click.echo(json.dumps(record, indent=2, ensure_ascii=False))
+        return
+
+    click.secho(f"Client {client_id}: {record['name']}", bold=True)
+    for key, _ in CLIENT_SHOW_FIELDS:
+        click.echo(f"  {key:<32} = {record[key]}")
+
 
 @clients.command("update")
 @click.argument("client_id", type=int)
@@ -2052,61 +2170,8 @@ def clients_update(client_id, **overrides) -> None:
     if not overrides:
         raise click.ClickException("Pass at least one --<field> flag to change.")
 
-    # Map field name → DOM id of its SB.Select widget (the widget renders an empty
-    # <select> and populates it from inline JS, so we must read items from JS).
-    SB_SELECT_IDS: dict[str, str] = {
-        "data[Client][client_settings_sales_vat_type_id]":    "ClientSalesVatType",
-        "data[Client][client_settings_purchase_vat_type_id]": "ClientPurchaseVatType",
-        "data[Client][trade_receivables_account_id]":         "ClientTradeReceivablesAccountId",
-        "data[Client][trade_creditors_account_id]":           "ClientTradeCreditorsAccountId",
-        "data[Client][expense_account_id]":                   "ClientExpenseAccountId",
-        "data[Client][address_country]":                      "ClientAddressCountry",
-        "data[Client][client_settings_language]":             "ClientLanguage",
-        "data[Client][invoice_document_template_id]":         "ClientInvoiceDocumentTemplateId",
-        "data[Client][price_offer_document_template_id]":     "ClientPriceOfferDocumentTemplateId",
-        "data[Client][sales_order_document_template_id]":     "ClientSalesOrderDocumentTemplateId",
-    }
-
     with build_http(cookies, account) as http:
-        r = http.get(f"{BASE}/{account}/clients/edit/{client_id}")
-        if r.status_code in (301, 302):
-            raise AuthError(
-                f"Session expired or client not accessible (→ {r.headers.get('location','')})."
-            )
-        if r.status_code != 200:
-            raise click.ClickException(f"GET /clients/edit/{client_id} → HTTP {r.status_code}")
-        html_text = r.text
-        soup = BeautifulSoup(html_text, "html.parser")
-
-        # Pre-extract SB.Select items[] arrays by DOM id.
-        # The block contains nested {} (options array), so use .*? with DOTALL.
-        sb_select_items: dict[str, str] = {}
-        for m in re.finditer(
-            r"new\s+SB\.Select\(['\"]#(\w+)['\"]\s*,\s*\{.*?items:\s*\[([^\]]*)\]",
-            html_text, re.DOTALL,
-        ):
-            dom_id = m.group(1)
-            items_raw = m.group(2).strip()
-            # items can be ['32'], [32], or [] — pick first numeric/quoted entry
-            first = re.search(r"['\"]?(\d+)['\"]?", items_raw)
-            sb_select_items[dom_id] = first.group(1) if first else ""
-
-        def form_val(name: str) -> str:
-            # SB.Select widgets are rendered empty; the saved value lives in the JS init.
-            dom_id = SB_SELECT_IDS.get(name)
-            if dom_id and dom_id in sb_select_items:
-                return sb_select_items[dom_id]
-            inp = soup.find("input", {"name": name})
-            if inp is not None:
-                return inp.get("value", "") or ""
-            sel = soup.find("select", {"name": name})
-            if sel is not None:
-                opt = sel.find("option", attrs={"selected": True})
-                return (opt.get("value", "") or "") if opt else ""
-            ta = soup.find("textarea", {"name": name})
-            if ta is not None:
-                return ta.text or ""
-            return ""
+        _soup, _html, form_val = _scrape_client_edit_form(http, account, client_id)
 
         body = {
             "data[Client][id]":     str(client_id),
