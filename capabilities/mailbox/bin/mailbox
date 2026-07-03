@@ -757,7 +757,8 @@ def _locate_by_message_id(mb: MailBox, message_id: str):
             mb.folder.set(name)
         except Exception:
             continue  # unselectable container (\Noselect) — can't hold a message
-        msgs = list(mb.fetch(crit, mark_seen=False, bulk=False, limit=1))
+        msgs = list(mb.fetch(crit, mark_seen=False, bulk=False, limit=1,
+                             charset="UTF-8"))
         if msgs:
             return name, msgs[0]
     _die(3, "not_found",
@@ -831,7 +832,8 @@ def cmd_list(cfg: dict, folder: str, unread: bool, since: str | None, limit: int
         if folder != "INBOX":
             mb.folder.set(folder)
         for m in mb.fetch(_criteria(unread, since), mark_seen=False,
-                          headers_only=True, bulk=False, reverse=True, limit=limit):
+                          headers_only=True, bulk=False, reverse=True, limit=limit,
+                          charset="UTF-8"):
             out.append({
                 "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
                 "date": m.date_str, "from": m.from_, "to": list(m.to),
@@ -848,7 +850,7 @@ def cmd_search(cfg: dict, folder: str, from_: str | None, subject: str | None,
             mb.folder.set(folder)
         for m in mb.fetch(_criteria(False, since, from_, subject, text),
                           mark_seen=False, headers_only=True, bulk=False,
-                          reverse=True, limit=limit):
+                          reverse=True, limit=limit, charset="UTF-8"):
             out.append({
                 "uid": m.uid, "message_id": m.headers.get("message-id", ("",))[0] or None,
                 "date": m.date_str, "from": m.from_, "to": list(m.to),
