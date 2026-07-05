@@ -35,6 +35,13 @@ these module-level names; they are the only coupling):
     connections: CREDENTIALS_ENV, CRED_KEYS, WRITE_VERBS, WRITE_DEFAULT
     plus the stdlib imports the helpers use: os, sys, json, Path, NoReturn.
 
+The bare `help` verb is dispatched by `_contract` and reads the CLI's help
+body from a module-level `HELP` constant if defined, else the module docstring
+(`__doc__`) — either wire is acceptable, and every capability already carries
+one or the other. It then appends the project's identifiers as a labelled
+section rendered by `_render_ids_markdown` (the same format the manager's
+`capabilities ids <NAME>` produces, so one home for the rendering).
+
 `_contract`'s `connections` verb calls `_cmd_connections`, and every capability
 defines its own `_cmd_connections` (its no-registry branch names that capability's
 own primary key, or reports "no connections" for a core-only capability) — so
@@ -202,6 +209,67 @@ def _cmd_guide(argv: list[str]) -> None:
         _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
 
 
+def _render_ids_markdown(data: dict) -> str:
+    """Render the {label: {value, note}} envelope as the labelled markdown
+    list the manager's `capabilities ids <NAME>` also produces — one shared
+    format across the ids surface and the identifiers section of `help`."""
+    lines: list[str] = []
+    for label, entry in sorted(data.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        v = entry.get("value")
+        vs = f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+        line = f"- **{label}**: {vs}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _identifiers_section() -> str:
+    """The Identifiers block appended to the bare top-level help — deterministic
+    first-touch surfacing of `.capabilities/<NAME>/identifiers.json` so an
+    agent following the `<NAME> help` startup protocol loads the discovered
+    labels/values/notes into context at once. Empty when no project envelope
+    or nothing recorded (do not bloat help with an empty section)."""
+    envdir = _env_dir()
+    if envdir is None:
+        return ""
+    ids_file = envdir / "identifiers.json"
+    if not ids_file.exists():
+        return ""
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    header = (
+        "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
+        f"Structural lookups discovered for `{NAME}` in this project. Fetch a single\n"
+        f"raw value with `{NAME} ids get <label>`; the full envelope is also at\n"
+        f"`capabilities ids {NAME}`.\n\n"
+    )
+    return header + _render_ids_markdown(data) + "\n"
+
+
+def _cmd_help() -> None:
+    """Bare top-level help: the CLI's HELP body (module-level `HELP` if
+    defined, else the module docstring), then the project's Identifiers
+    section. Only fires when no extra args follow — per-verb help stays
+    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    g = globals()
+    text = g.get("HELP") or g.get("__doc__") or ""
+    if text.startswith("\n"):
+        text = text.lstrip("\n")
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    section = _identifiers_section()
+    if section:
+        sys.stdout.write(section)
+
+
 def _cmd_ids(argv: list[str]) -> None:
     sub = argv[0] if argv else "list"
     envdir = _env_dir()
@@ -276,7 +344,11 @@ def _cmd_refs() -> None:
 
 def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
-    parser. Runs after _gate(), before any credential is resolved."""
+    parser. Runs after _gate(), before any credential is resolved.
+
+    `help` is a contract verb only when bare (no extra args) — the top-level
+    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
+    through to the CLI so per-verb help stays clean."""
     cmd = argv[0] if argv else ""
     if cmd == "stub":
         _emit(f"{SUMMARY} Run `{NAME} help`.")
@@ -293,6 +365,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_refs()
     elif cmd == "connections":
         _cmd_connections()
+    elif cmd == "help" and len(argv) == 1:
+        _cmd_help()
     else:
         return
     sys.exit(0)
