@@ -602,68 +602,17 @@ PIN_STATE_FILE = _state_dir() / ".pin_pending"
 
 HELP = """simplbooks — agent-first CLI for the SimpleBooks accounting app.
 
-This tool is designed to be invoked by agents. Run `simplbooks help` to load
-the full usage contract on demand — do not rely on memorised knowledge of
-its surface.
+Configuration resolves as *connections* — a named login identity plus its
+minted session, with a per-connection write gate. `simplbooks connections`
+prints the resolution (every value, its tier and source, secrets masked;
+local only). Select a non-default connection with `--connection <id>` /
+`-c <id>` (accepted anywhere on the line; optional with a sole entry or a
+`default` pointer). A write on a read-only connection exits 4 — ask the
+user, never lift the gate.
 
-Configuration resolves as connections — named, complete resolutions of the
-login identity and its minted session. With no registry there is one implicit
-connection, `default`, whose identity resolves through the cascade — project
-.env(.local), then ~/.config/simplbooks/credentials.env, then process env:
-  SIMPLBOOKS_EMAIL='user@example.com'         (primary — for auto-login)
-  SIMPLBOOKS_PASSWORD='...'                   (primary — for auto-login)
-
-More than one accounting identity is declared in a connections registry —
-project .capabilities/simplbooks/connections.json, else
-~/.config/simplbooks/connections.json, first found wins. Each entry names its
-login `email` literally and its password by env-key indirection (`secret_env`),
-and carries the write gate (`allow_write`):
-
-  {
-    "default": "juko",
-    "connections": {
-      "juko":  { "email": "ops@example.com", "secret_env": "SIMPLBOOKS_JUKO_PASSWORD",
-                 "allow_write": true },
-      "audit": { "email": "view@example.com", "secret_env": "SIMPLBOOKS_AUDIT_PASSWORD" }
-    }
-  }
-
-  --connection <id>, -c <id>   Select a connection; accepted anywhere on the
-                               line. Optional with a default pointer or a sole
-                               connection.
-
-The write gate: a write creates a legal invoice or stages a real bank payment,
-so writes are OFF unless a connection grants them. The implicit default cannot
-write; grant it with "allow_write": true on a connection in connections.json.
-A refused write exits 4 — ask the user, never lift the gate yourself.
-
-The minted session (the SimpleBooks account hash + cookie) is per-connection
-state, NOT a credential in the registry. It lives in a per-identity file in the
-state home (.capabilities/simplbooks/state/ in an initialized project, else
-$XDG_STATE_HOME/simplbooks/; a named connection under <state-dir>/<id>/) —
-written by login/refresh, never into an env file. SIMPLBOOKS_ACCOUNT /
-SIMPLBOOKS_COOKIE stay readable from the cascade as the one-shot injection path
-(the deployed box) and are distinct from connection selection.
-
-Account-specific config (resolved by the cascade: flag > project .env(.local) >
-this credentials.env > process env — so a consuming project can set these in its
-own .env):
-  SIMPLBOOKS_WORKER=<name>                    (optional pin; else the logged-in user)
-  SIMPLBOOKS_INVOICE_FOOTER='...'             (optional invoice footer line)
-The own bank account (--bank-account), bank integration target (--target), and any
-per-regime income-account override (--income-account-id) are passed as flags per
-operation — the caller sources them from its own structural lookups; the CLI bakes
-no id and reads no env fallback for them. Sales VAT types + rates are read LIVE from
-SimpleBooks per invoice (`invoices meta` / `expenses meta`); the income account
-defaults to the live vat_types value unless --income-account-id overrides it. The
-issuer (`creator`) and line worker both follow the logged-in user, derived live from
-the form per invoice (nothing persisted; set SIMPLBOOKS_WORKER only to pin a fixed
-name), and the invoice number defaults to SimpleBooks' next sequential — pass
---number to override.
-
-There is no public SimpleBooks API. The CLI emulates a browser session.
-Sessions expire periodically. With EMAIL+PASSWORD present, expiry is
-recovered automatically. The cURL paste path remains as a fallback.
+Optional pins (resolved via the connection's env cascade):
+  SIMPLBOOKS_WORKER=<name>            pin the invoice worker (else logged-in user)
+  SIMPLBOOKS_INVOICE_FOOTER='...'     replace the default invoice footer line
 
 ═══ Agent startup protocol ═════════════════════════════════════════════════
 
@@ -1005,15 +954,14 @@ Then re-run `simplbooks doctor` to confirm.
 ═══ Tax classes ════════════════════════════════════════════════════════════
 
   A regime is a presentation choice (invoice language, reverse-charge mode,
-  footer) anchored to a sales vat_type_id. The VAT RATE is read LIVE from the
-  account's vat_types map for that type (`invoices meta`). The income ACCOUNT
-  defaults to the live map's value, overridable per regime by config (books
-  policy) or per invoice by --income-account-id; override the type --vat-type-id.
+  footer) anchored to a sales vat_type_id. The VAT rate is read live from the
+  account's vat_types map (`invoices meta`); the income account defaults to
+  the same map, overridable per invoice with --income-account-id (or the type
+  itself with --vat-type-id).
 
-  ee-domestic   Estonia, standard VAT          sales vat_type 32
-  eu-reverse    EU B2B, 0% reverse-charge      sales vat_type 10
-                (requires VAT no on client)
-  non-eu        Export, 0%                     sales vat_type 13
+  ee-domestic   Estonia, standard VAT
+  eu-reverse    EU B2B, 0% reverse-charge (requires VAT no on client)
+  non-eu        Export, 0%
 
 ═══ Price format ═══════════════════════════════════════════════════════════
 
