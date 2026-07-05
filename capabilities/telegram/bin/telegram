@@ -76,6 +76,10 @@ Commands:
   telegram search <chat> <query> [--limit N] [--json]
                                                Search messages inside a chat.
   telegram send <chat> <text>                  Send a message.
+  telegram download <chat> <msgid> [--json]    Materialize one message's media to a
+                                               deterministic per-connection cache
+                                               path (download only if absent);
+                                               prints the absolute path.
   telegram export <chat> --out PATH [--media-dir PATH] [--limit N] [--since ISO]
             [--no-photos] [--no-stickers] [--videos] [--documents]
                                                Dump full history to JSON; download
@@ -149,7 +153,7 @@ from telethon.errors.rpcerrorlist import (
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
-from telethon.tl.types import Channel, Chat, User
+from telethon.tl.types import Channel, Chat, MessageEmpty, User
 
 # --- Capability declaration (protocol 2) — one home for every contract fact --
 
@@ -1184,6 +1188,156 @@ async def cmd_export(cfg, chat: str, out_path: str, media_dir: str | None,
     }
 
 
+# --- Download (deterministic single-message media cache) ---------------------
+
+_MEDIA_EXT_FROM_MIME = {
+    "audio/ogg": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/flac": ".flac",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "application/pdf": ".pdf",
+    "application/x-tgsticker": ".tgs",
+}
+
+
+def _sanitize_filename(name: str) -> str:
+    """Strip path separators and control chars from a filename component."""
+    import re
+    cleaned = name.replace("\x00", "").replace("/", "_").replace("\\", "_")
+    cleaned = re.sub(r"[\r\n\t]+", "_", cleaned).strip(" .")
+    return cleaned or "file"
+
+
+def _synthesize_media_name(msg_id: int, kind: str, meta: dict) -> str:
+    """Filename for media with no original name — msgid + detected extension."""
+    ext = _MEDIA_EXT_FROM_MIME.get(meta.get("mime_type") or "", "")
+    if not ext:
+        ext = {"photo": ".jpg", "voice": ".ogg", "sticker": ".webp",
+               "video_note": ".mp4"}.get(kind, "")
+    return f"{msg_id}{ext}"
+
+
+def _find_cached_media(cache_dir: Path, msg_id: int) -> Path | None:
+    """First non-temp file in cache_dir whose name is <msgid> or begins <msgid>-/."""
+    if not cache_dir.is_dir():
+        return None
+    exact = str(msg_id)
+    prefixes = (f"{msg_id}-", f"{msg_id}.")
+    for p in sorted(cache_dir.iterdir()):
+        if not p.is_file():
+            continue
+        n = p.name
+        if n.startswith(".") or n.endswith(".part"):
+            continue
+        if n == exact or n.startswith(prefixes):
+            return p
+    return None
+
+
+async def cmd_download(cfg: dict, chat: str, msg_id: int, as_json: bool):
+    """Materialize a single message's media to a deterministic per-connection
+    cache path, downloading only if absent. Opens a fresh client on a hot copy
+    of the .session file so it never contends with a daemon holding the shared
+    session open — sharing the on-disk SQLite would deadlock on `database is
+    locked`."""
+    import shutil
+    import tempfile
+
+    src_session_file = Path(cfg["session"] + ".session")
+    if not src_session_file.exists():
+        _die(2, "not_authorized", "no session file on disk",
+             f"run: telegram login --connection {cfg['id']}")
+
+    with tempfile.TemporaryDirectory(prefix="telegram-download-") as td:
+        tmp_stem = Path(td) / "session"
+        shutil.copy2(str(src_session_file), str(tmp_stem) + ".session")
+        for ext in ("-wal", "-shm", "-journal"):
+            sidecar = Path(str(src_session_file) + ext)
+            if sidecar.exists():
+                try:
+                    shutil.copy2(str(sidecar), str(tmp_stem) + ".session" + ext)
+                except OSError:
+                    pass
+
+        client = TelegramClient(str(tmp_stem), cfg["api_id"], cfg["api_hash"])
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                _die(2, "not_authorized", "session is not authorized",
+                     f"run: telegram login --connection {cfg['id']}")
+
+            entity = await resolve_chat(client, chat)
+            chat_id = getattr(entity, "id", None) or 0
+            message = await client.get_messages(entity, ids=msg_id)
+            if message is None or isinstance(message, MessageEmpty):
+                _die(3, "message_not_found",
+                     f"no message id {msg_id} in chat {chat!r}")
+
+            kind, meta = _classify_media(message)
+            meta_d = meta if isinstance(meta, dict) else {}
+            if message.media is None or kind in (
+                    "text", "service", "webpage", "poll", "contact", "geo"):
+                _die(3, "no_media",
+                     f"message {msg_id} in chat {chat!r} carries no downloadable "
+                     f"media (type: {kind})",
+                     "the message has no attachment; use `telegram read` for text")
+
+            original = meta_d.get("filename")
+            if original:
+                base = f"{message.id}-{_sanitize_filename(original)}"
+            else:
+                base = _synthesize_media_name(message.id, kind, meta_d)
+
+            cache_dir = _state_dir() / cfg["id"] / "media" / str(chat_id)
+            existing = _find_cached_media(cache_dir, message.id)
+            if existing is not None:
+                dest = existing
+                cached = True
+            else:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                dest = cache_dir / base
+                tmp_part = cache_dir / f".{message.id}.{os.getpid()}.part"
+                try:
+                    with tmp_part.open("wb") as fp:
+                        await message.download_media(file=fp)
+                    if not tmp_part.exists() or tmp_part.stat().st_size == 0:
+                        tmp_part.unlink(missing_ok=True)
+                        _die(3, "no_media",
+                             f"message {msg_id} produced no bytes on download")
+                    tmp_part.replace(dest)
+                except Exception:
+                    tmp_part.unlink(missing_ok=True)
+                    raise
+                cached = False
+
+            if as_json:
+                try:
+                    size = dest.stat().st_size
+                except OSError:
+                    size = None
+                return {
+                    "path": str(dest.resolve()),
+                    "cached": cached,
+                    "msgid": message.id,
+                    "chat": chat_id,
+                    "filename": dest.name,
+                    "mime": meta_d.get("mime_type"),
+                    "size": size,
+                }
+            return str(dest.resolve())
+        finally:
+            await client.disconnect()
+
+
 # --- Transcribe (Deepgram) ---------------------------------------------------
 
 def _content_type_for(path: Path) -> str:
@@ -1338,6 +1492,12 @@ def main() -> None:
     pn.add_argument("chat")
     pn.add_argument("text")
 
+    pd = sub.add_parser("download",
+                        help="materialize one message's media to a deterministic cache path")
+    pd.add_argument("chat")
+    pd.add_argument("msgid", type=int)
+    pd.add_argument("--json", action="store_true")
+
     pe = sub.add_parser("export", help="dump full chat history to JSON and download media")
     pe.add_argument("chat")
     pe.add_argument("--out", required=True, help="output JSON path")
@@ -1406,6 +1566,8 @@ def main() -> None:
             _emit(asyncio.run(cmd_search(cfg, args.chat, args.query, args.limit, args.json)))
         elif args.cmd == "send":
             _emit(asyncio.run(cmd_send(cfg, args.chat, args.text)))
+        elif args.cmd == "download":
+            _emit(asyncio.run(cmd_download(cfg, args.chat, args.msgid, args.json)))
         elif args.cmd == "export":
             _emit(asyncio.run(cmd_export(
                 cfg, args.chat, args.out, args.media_dir, args.limit, args.since,
