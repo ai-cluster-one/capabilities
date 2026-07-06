@@ -381,7 +381,8 @@ def _cmd_guide(argv: list[str]) -> None:
     if topic not in TOPICS:
         _die(3, "not_found", f"no guide topic {topic!r}",
              f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
-    import httpx as _hx
+    import urllib.error as _ue
+    import urllib.request as _ur
     url = _docs_base().rstrip("/") + "/" + topic + ".md"
     cache_dir = _STATE_HOME / NAME / "guides"
     cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
@@ -389,25 +390,30 @@ def _cmd_guide(argv: list[str]) -> None:
     if cache.exists() and etag_f.exists():
         headers["If-None-Match"] = etag_f.read_text().strip()
     try:
-        resp = _hx.get(url, headers=headers, timeout=10.0, follow_redirects=True)
-        if resp.status_code == 200:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10.0) as resp:
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8")
             cache_dir.mkdir(parents=True, exist_ok=True)
-            cache.write_text(resp.text)
+            cache.write_text(text)
             if resp.headers.get("etag"):
                 etag_f.write_text(resp.headers["etag"])
-            _emit(resp.text); return
-        if resp.status_code == 304 and cache.exists():
+            _emit(text); return
+    except _ue.HTTPError as e:
+        if e.code == 304 and cache.exists():
             _emit(cache.read_text()); return
-        if resp.status_code == 404:
+        if e.code == 404:
             _die(3, "not_found", f"guide {topic!r} missing upstream", url)
-        raise _hx.HTTPError(f"upstream returned {resp.status_code}")
-    except _hx.HTTPError as e:
-        if cache.exists():
-            sys.stderr.write(json.dumps(
-                {"warning": f"upstream unreachable; serving cached copy ({e})"},
-                ensure_ascii=False) + "\n")
-            _emit(cache.read_text()); return
-        _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+        err = f"upstream returned {e.code}"
+    except _ue.URLError as e:
+        err = str(e.reason)
+    except OSError as e:
+        err = str(e)
+    if cache.exists():
+        sys.stderr.write(json.dumps(
+            {"warning": f"upstream unreachable; serving cached copy ({err})"},
+            ensure_ascii=False) + "\n")
+        _emit(cache.read_text()); return
+    _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
 
 
 def _render_ids_markdown(data: dict) -> str:
