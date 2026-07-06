@@ -202,8 +202,9 @@ CRED_KEYS = [       # the implicit default connection; a registry entry supplies
 ]
 WRITE_VERBS = ["send"]   # domain verbs that mutate the remote system
 WRITE_DEFAULT = False    # a WhatsApp send leaves the system — granted per connection, explicitly
-DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
-TOPICS: list = []   # shipped guide topics
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/whatsapp/guides/")
+TOPICS = ["message-storage", "operational-model"]   # shipped guide topics
 STATE = False       # True when the capability writes session/cache state
 POST_INSTALL: list = []
 

@@ -175,8 +175,9 @@ CRED_KEYS = [    # the implicit default connection; a registry entry supplies th
 ]
 WRITE_VERBS = {"send"}   # the only domain verb that leaves the system — a message to a person
 WRITE_DEFAULT = False    # a send leaves the system; granted per connection, explicitly
-DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
-TOPICS: list = []   # shipped guide topics
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/telegram/guides/")
+TOPICS = ["message-storage"]   # shipped guide topics
 STATE = True       # True when the capability writes session/cache state
 POST_INSTALL: list = []
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))

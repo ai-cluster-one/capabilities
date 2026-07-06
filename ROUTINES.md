@@ -50,26 +50,6 @@ Not every recurring need becomes a routine. The gate, lightest to heaviest — p
 
 A routine authored before its time is overhead that rots; a procedure run often enough to deserve one but left as scattered notes is a recurring re-derivation tax. The ladder is the judgment between them.
 
-## Template
+## Authoring Surface
 
-```
----
-name: <capability>-<verb>-<object>          # capability-bound; or a bare <verb>-<object> for cross-cutting
-description: <one line — what it does and where scope ends, affirmative; surfaced into every session>
----
-
-# <Title>
-
-<One paragraph: what this routine accomplishes and which capabilities it consumes.>
-
-## <Procedure section(s)>
-
-<The ordered steps. Invoke capability CLIs by name; lean on capability references for the
-model by role; resolve identifiers through the capability. State each step as an action.>
-
-## <Confidence / escalation — if it mutates state>
-
-<What is done deterministically vs. what is escalated for a human decision, and how.>
-```
-
-**Naming.** Capability-bound procedures take `<capability>-<verb>-<object>` (e.g. `mailbox-triage-inbox`); cross-cutting ones take a bare `<verb>-<object>` or a domain noun (e.g. `daily-digest`). The prefix groups routines in the sorted index by the system they drive.
+The concrete file contract, naming rules, producer/processor split, and harness-surfacing mechanics live in the Routine capability: `routine help` and `routine guide <topic>`. This document keeps the capability/routine boundary; the installed capability owns the operational authoring guidance.
