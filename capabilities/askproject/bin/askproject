@@ -39,10 +39,10 @@ MODES & MODELS  (model is auto-picked from mode; override with --model)
   act   (--act)     Peer gets acceptEdits + the target as an --add-dir. It can
                     edit files INSIDE its project without prompts; writes
                     outside the project and un-allowlisted shell are auto-denied
-                    in headless mode. Model: opus. Use for "fix X", "refactor".
-  bypass (--bypass) Adds --dangerously-skip-permissions. ⚠ This REMOVES all
-                    fences: the peer can touch ANYTHING your user can, anywhere
-                    on disk — not just its own project. Explicit opt-in only.
+                    in headless mode. Model: sonnet. Use for "fix X", "refactor".
+  bypass (--bypass) Uses bypassPermissions. ⚠ This REMOVES all fences: the peer
+                    can touch ANYTHING your user can, anywhere on disk — not just
+                    its own project. Explicit opt-in only.
 
 FENCING REALITY: flags are behavioural, not an OS sandbox. read mode is a hard
 "no tools to do harm" fence. act mode confines a cooperative agent but is not
@@ -81,11 +81,13 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   flagged loudly (a read query should never mutate).
 
 FLAGS
-  --act                 Modification mode (acceptEdits + opus).
-  --bypass              Add --dangerously-skip-permissions (DANGEROUS).
+  --act                 Modification mode (acceptEdits + sonnet).
+  --bypass              Use bypassPermissions (DANGEROUS).
   -c, --continue        Resume the last session for this target.
-  --fork                With -c: branch a new session instead of continuing.
-  --model <m>           Override the model (alias like 'opus'/'haiku' or id).
+  --fork                Reserved; current Claude CLI has no non-interactive
+                        fork flag, so this exits with a controlled error.
+  --model <m>           Override the model (`haiku`/`sonnet`/`opus` aliases are
+                        resolved by askproject to known-good full ids).
   --schema <file|json>  Pass a JSON Schema to constrain the peer's answer;
                         `answer` is then the parsed object.
   --timeout <seconds>   Kill the peer after N seconds (default 600).
@@ -139,7 +141,12 @@ CREDENTIALS_ENV = _CONFIG_HOME / "askproject" / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
 READ_MODEL = "claude-haiku-4-5-20251001"
-ACT_MODEL = "opus"
+ACT_MODEL = "claude-sonnet-4-5-20250929"
+MODEL_ALIASES = {
+    "haiku": READ_MODEL,
+    "sonnet": ACT_MODEL,
+    "opus": "claude-opus-4-5-20251101",
+}
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -553,7 +560,12 @@ def resolve_schema(spec: str) -> str:
     return spec  # assume inline JSON
 
 
-def build_preamble(mode: str, caller: str, extra: str | None) -> str:
+def resolve_model(model: str) -> str:
+    return MODEL_ALIASES.get(model, model)
+
+
+def build_preamble(mode: str, caller: str, extra: str | None,
+                   schema_text: str | None = None) -> str:
     base = (
         f"You are being queried programmatically by a peer Claude Code agent "
         f"working in another project ('{caller}'), via the askproject bridge. "
@@ -565,6 +577,11 @@ def build_preamble(mode: str, caller: str, extra: str | None) -> str:
             "This is a READ-ONLY research query — you have no tools to modify "
             "anything; do not attempt to."
         )
+    elif mode == "bypass":
+        base += (
+            "You are running with bypassPermissions. Make only the changes the "
+            "request requires, and summarise exactly what you changed."
+        )
     else:
         base += (
             "You may modify files within THIS project only. Make the smallest "
@@ -572,6 +589,11 @@ def build_preamble(mode: str, caller: str, extra: str | None) -> str:
         )
     if extra:
         base += " " + extra
+    if schema_text:
+        base += (
+            " Return ONLY a JSON value conforming to this JSON Schema; do not "
+            "wrap it in markdown or explanatory prose. Schema: " + schema_text
+        )
     return base
 
 
@@ -588,8 +610,8 @@ def run(args):
     if not target.is_dir():
         die(f"target is not a directory: {target}", as_json=as_json)
 
-    mode = "act" if args.act else "read"
-    model = args.model or (ACT_MODEL if mode == "act" else READ_MODEL)
+    mode = "bypass" if args.bypass else ("act" if args.act else "read")
+    model = resolve_model(args.model or (ACT_MODEL if mode in ("act", "bypass") else READ_MODEL))
     caller = find_project_root(Path.cwd()).name
 
     state = load_state()
@@ -605,23 +627,22 @@ def run(args):
         if not last:
             die(f"no prior session for {target}; run without -c first",
                 as_json=as_json)
+        if args.fork:
+            die("--fork is not supported by the current Claude CLI in headless mode",
+                as_json=as_json)
         cmd += ["--resume", last]
         resumed = True
-        if args.fork:
-            cmd += ["--fork-session"]
 
     # mode → permissions / tools
     if mode == "read":
-        cmd += ["--tools", "Read,Glob,Grep", "--permission-mode", "plan"]
+        cmd += ["--allowedTools", "Read,Glob,Grep", "--permission-mode", "plan"]
+    elif mode == "bypass":
+        cmd += ["--permission-mode", "bypassPermissions", "--add-dir", str(target)]
     else:
         cmd += ["--permission-mode", "acceptEdits", "--add-dir", str(target)]
-    if args.bypass:
-        cmd += ["--dangerously-skip-permissions"]
 
-    cmd += ["--append-system-prompt", build_preamble(mode, caller, args.append)]
-
-    if args.schema:
-        cmd += ["--json-schema", resolve_schema(args.schema)]
+    schema_text = resolve_schema(args.schema) if args.schema else None
+    cmd += ["--append-system-prompt", build_preamble(mode, caller, args.append, schema_text)]
 
     before = snapshot(target)
 
