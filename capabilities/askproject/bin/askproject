@@ -36,18 +36,15 @@ MODES & MODELS  (model is auto-picked from mode; override with --model)
   read  (default)   Peer gets ONLY Read/Glob/Grep + plan mode. It physically
                     cannot edit, write, or run shell — pure research. Model:
                     haiku (cheap). Use for "what does X do", "find Y", reviews.
-  act   (--act)     Peer gets acceptEdits + the target as an --add-dir. It can
-                    edit files INSIDE its project without prompts; writes
-                    outside the project and un-allowlisted shell are auto-denied
-                    in headless mode. Model: sonnet. Use for "fix X", "refactor".
-  bypass (--bypass) Uses bypassPermissions. ⚠ This REMOVES all fences: the peer
-                    can touch ANYTHING your user can, anywhere on disk — not just
-                    its own project. Explicit opt-in only.
+  act   (--act)     Peer gets bypassPermissions + the target as an --add-dir.
+                    It can edit, run tests, commit, and push from inside the
+                    target project without permission prompts. Model: sonnet.
+                    Use for "fix X", "audit and commit", "refactor".
 
 FENCING REALITY: flags are behavioural, not an OS sandbox. read mode is a hard
-"no tools to do harm" fence. act mode confines a cooperative agent but is not
-escape-proof against allowlisted shell. The git snapshot (below) is your safety
-net. A true OS sandbox is future work.
+"no tools to do harm" fence. act mode intentionally removes Claude's permission
+prompts so the peer can complete build work end-to-end. The prompt and the git
+snapshot (below) are your safety net. A true OS sandbox is future work.
 
 ────────────────────────────────────────────────────────────────────────────
 SESSION CONTINUITY  (state is LOCAL to the project you call from)
@@ -68,7 +65,7 @@ SESSION CONTINUITY  (state is LOCAL to the project you call from)
 OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   {
     "ok": bool, "error": str|null,
-    "target": "<abs path>", "mode": "read|act|bypass",
+    "target": "<abs path>", "mode": "read|act",
     "model": "<model id>", "session_id": "<uuid>", "resumed": bool,
     "answer": <string OR parsed object when --schema is used>,
     "cost_usd": float, "duration_ms": int, "num_turns": int,
@@ -81,8 +78,7 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   flagged loudly (a read query should never mutate).
 
 FLAGS
-  --act                 Modification mode (acceptEdits + sonnet).
-  --bypass              Use bypassPermissions (DANGEROUS).
+  --act                 Modification mode (bypassPermissions + sonnet).
   -c, --continue        Resume the last session for this target.
   --fork                Reserved; current Claude CLI has no non-interactive
                         fork flag, so this exits with a controlled error.
@@ -577,15 +573,11 @@ def build_preamble(mode: str, caller: str, extra: str | None,
             "This is a READ-ONLY research query — you have no tools to modify "
             "anything; do not attempt to."
         )
-    elif mode == "bypass":
-        base += (
-            "You are running with bypassPermissions. Make only the changes the "
-            "request requires, and summarise exactly what you changed."
-        )
     else:
         base += (
-            "You may modify files within THIS project only. Make the smallest "
-            "change that satisfies the request and summarise what you changed."
+            "You are running with bypassPermissions inside THIS target project. "
+            "Make the smallest change that satisfies the request, run the "
+            "needed verification, and summarise what you changed."
         )
     if extra:
         base += " " + extra
@@ -610,8 +602,8 @@ def run(args):
     if not target.is_dir():
         die(f"target is not a directory: {target}", as_json=as_json)
 
-    mode = "bypass" if args.bypass else ("act" if args.act else "read")
-    model = resolve_model(args.model or (ACT_MODEL if mode in ("act", "bypass") else READ_MODEL))
+    mode = "act" if args.act else "read"
+    model = resolve_model(args.model or (ACT_MODEL if mode == "act" else READ_MODEL))
     caller = find_project_root(Path.cwd()).name
 
     state = load_state()
@@ -636,10 +628,8 @@ def run(args):
     # mode → permissions / tools
     if mode == "read":
         cmd += ["--allowedTools", "Read,Glob,Grep", "--permission-mode", "plan"]
-    elif mode == "bypass":
-        cmd += ["--permission-mode", "bypassPermissions", "--add-dir", str(target)]
     else:
-        cmd += ["--permission-mode", "acceptEdits", "--add-dir", str(target)]
+        cmd += ["--permission-mode", "bypassPermissions", "--add-dir", str(target)]
 
     schema_text = resolve_schema(args.schema) if args.schema else None
     cmd += ["--append-system-prompt", build_preamble(mode, caller, args.append, schema_text)]
@@ -704,7 +694,7 @@ def run(args):
         "ok": ok,
         "error": err,
         "target": str(target),
-        "mode": "bypass" if args.bypass else mode,
+        "mode": mode,
         "model": model,
         "session_id": session_id,
         "resumed": resumed,
@@ -770,7 +760,6 @@ def main():
     p.add_argument("target")
     p.add_argument("prompt")
     p.add_argument("--act", action="store_true")
-    p.add_argument("--bypass", action="store_true")
     p.add_argument("-c", "--continue", dest="cont", action="store_true")
     p.add_argument("--fork", action="store_true")
     p.add_argument("--model")
