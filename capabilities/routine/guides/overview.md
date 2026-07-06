@@ -4,9 +4,4 @@ A routine is a self-contained, harness-independent recipe for one repeatable pro
 
 Install the routine capability once per machine/project, then author routines into the consuming project. The products of this capability are producer and processor recipes, task-worker contracts, and other repeatable procedures. Read existing project routines as worked examples.
 
-The CLI helps inspect the project-side routine corpus:
-
-- `routine doctor` checks whether the project has routines and whether their front matter validates.
-- `routine list` shows the routines discovered under `.routines/`.
-- `routine validate` enforces the indexable front matter contract.
-- `routine index` renders the always-on routine menu from front matter.
+The CLI is the source of truth for its own command surface. Use the overview only to understand what routine is: a small project-side mechanism that keeps repeatable procedures as files, validates their indexable metadata, and lets the harness surface only the compact routine menu into session context. Creation, review, and harness surfacing each have their own guide because they answer different questions: how to write one, how to judge an existing corpus, and how the generated index reaches an agent.

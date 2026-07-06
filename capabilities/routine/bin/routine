@@ -1,9 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = [
-#     "httpx>=0.27",
-# ]
+# dependencies = []
 # ///
 """routine — project routine helper.
 
@@ -34,6 +32,11 @@ Commands:
   routine index [--json]
       Render the routine index from front matter. The markdown form is the same
       one-line menu shape used by consuming-project context compilers.
+
+  routine groom <name|path|--all>
+      Emit the agent procedure for semantic quality review of one routine, or
+      of the whole `.routines/` corpus. Judgment stays with the calling agent;
+      this command supplies the target inventory and review flow.
 
 Contract commands:
   routine stub
@@ -71,11 +74,10 @@ WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/routine/guides/")
 TOPICS = [
-    "file-format",
-    "formalization-gate",
+    "authoring",
+    "groom",
     "harness-surfacing",
     "overview",
-    "producers-and-processors",
 ]
 STATE = False
 POST_INSTALL: list = []
@@ -505,6 +507,66 @@ def _index_markdown(entries: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _entry_by_selector(selector: str, entries: list[dict]) -> dict:
+    root = _project_root()
+    if root is None:
+        _die(3, "not_found", "no consuming project found",
+             "run inside a project containing .git, .env, or .capabilities")
+    for e in entries:
+        if e.get("name") == selector:
+            return e
+    raw = Path(selector).expanduser()
+    candidates = []
+    if raw.is_absolute():
+        candidates.append(raw.resolve())
+    else:
+        candidates.append((root / raw).resolve())
+        candidates.append((root / ".routines" / raw).resolve())
+        if raw.suffix != ".md":
+            candidates.append((root / ".routines" / f"{selector}.md").resolve())
+    by_abs = {
+        (root / e["path"]).resolve(): e
+        for e in entries
+        if e.get("path")
+    }
+    for cand in candidates:
+        if cand in by_abs:
+            return by_abs[cand]
+    _die(3, "not_found", f"unknown routine {selector!r}",
+         "`routine list` shows names and paths")
+
+
+def _groom_markdown(entries: list[dict], all_targets: bool) -> str:
+    target_lines = []
+    for e in entries:
+        target_lines.append(f"- `{e['path']}` — `{e.get('name')}`: {e.get('description') or ''}")
+    scope = "the full routine corpus" if all_targets else "one routine"
+    return "\n".join([
+        f"# Groom {scope}",
+        "",
+        "Use this as an agent-executable semantic review. The CLI has only",
+        "assembled the target inventory; the quality judgment is yours.",
+        "",
+        "## Load The Standards",
+        "",
+        "- `routine guide groom` — the review flow and output shape.",
+        "- `routine guide authoring` — the authoring contract to judge against.",
+        "- `routine validate` — deterministic front-matter/index check.",
+        "",
+        "## Targets",
+        "",
+        *target_lines,
+        "",
+        "## Output",
+        "",
+        "Return either `no findings` or findings grouped by file. Each finding",
+        "names the quoted fragment, the violated contract by role, and the",
+        "minimal proposed fix. Patch only when the caller explicitly asked for",
+        "edits; otherwise report the findings.",
+        "",
+    ])
+
+
 def cmd_doctor(args) -> None:
     root = _project_root()
     if root is None:
@@ -561,6 +623,21 @@ def cmd_index(args) -> None:
         sys.stdout.write(_index_markdown(entries))
 
 
+def cmd_groom(args) -> None:
+    _rroot, entries = _entries()
+    findings = _validate(entries)
+    if findings:
+        _die(6, "invalid_routines", "routine front matter is invalid",
+             "`routine validate` shows the findings")
+    if args.all:
+        selected = [e for e in entries if e.get("name")]
+    else:
+        if not args.target:
+            _die(6, "input", "routine groom needs <name|path> or --all")
+        selected = [_entry_by_selector(args.target, entries)]
+    sys.stdout.write(_groom_markdown(selected, args.all))
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     _gate()
@@ -578,6 +655,10 @@ def main(argv: list[str] | None = None) -> None:
     p_idx = sub.add_parser("index", add_help=False)
     p_idx.add_argument("--json", action="store_true")
     p_idx.set_defaults(fn=cmd_index)
+    p_groom = sub.add_parser("groom", add_help=False)
+    p_groom.add_argument("target", nargs="?")
+    p_groom.add_argument("--all", action="store_true")
+    p_groom.set_defaults(fn=cmd_groom)
     args, extra = parser.parse_known_args(argv)
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
