@@ -1320,11 +1320,16 @@ def cmd_find(c: httpx.Client, workspace: str, custom_task_id: str | None = None,
       --field <uuid> --value <v>  → the first task whose custom field equals <v>
                                      (workspace-wide; the settable dedup key).
       <custom-task-id>            → the ClickApp Custom Task ID point lookup.
-    A dedup-key field is meant to be unique; only the first match is returned."""
+    A dedup-key field is meant to be unique; only the first match is returned.
+    The custom-field lookup asks for closed tasks and subtasks unconditionally,
+    so a done or nested task is still resolved — status is a property of the
+    returned row, not a gate on existence."""
     if field is not None:
         flt = json.dumps([{"field_id": field, "operator": "=", "value": value}])
         body = _request(c, "GET", f"/team/{workspace}/task",
-                        params={"custom_fields": flt})
+                        params={"custom_fields": flt,
+                                "include_closed": "true",
+                                "subtasks": "true"})
         tasks = (body or {}).get("tasks") or []
         return tasks[0] if tasks else None
     res = _request(c, "GET", f"/task/{custom_task_id}",
