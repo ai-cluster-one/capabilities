@@ -45,11 +45,11 @@ UA = (
 NAME = "simplbooks"
 PROTOCOL = 2
 SUMMARY = ("SimpleBooks accounting CLI over a browser session (no public "
-           "API) — read clients/invoices/expenses/accounts/bank-transactions/"
-           "kanne, create invoices & purchase invoices, record payments/"
-           "incomings, post balanced journal entries, stage bank payment "
-           "orders, and process the PSD2 bank worklist. Stateful — run "
-           "`simplbooks doctor` first.")
+           "API) — read clients/invoices/purchases/accounts/bank-transactions/"
+           "financial_transactions, create invoices & purchase invoices, "
+           "record payments/incomings, post balanced journal entries, stage "
+           "bank payment orders, and process the PSD2 bank worklist. "
+           "Stateful — run `simplbooks doctor` first.")
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "SIMPLBOOKS_EMAIL", "secret": False, "required": True,
@@ -735,14 +735,14 @@ Then re-run `simplbooks doctor` to confirm.
                                                 from the sequence. Unbind first
                                                 if it has incomings/payments.
 
-  simplbooks expenses list [--search TERM] [--limit N]
+  simplbooks purchases list [--search TERM] [--limit N]
                                                 List purchase invoices.
-  simplbooks expenses meta [--json] [--refresh]
+  simplbooks purchases meta [--json] [--refresh]
                                                 Live PURCHASE vat types, read from
                                                 /purchases/add + cached to
                                                 purchases_meta.json.
-  simplbooks expenses show <id>                 Read a purchase invoice.
-  simplbooks expenses create
+  simplbooks purchases show <id>                 Read a purchase invoice.
+  simplbooks purchases create
         --supplier-id ID --number STR
         --date YYYY-MM-DD
         --line "acct=<id>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>"
@@ -766,7 +766,7 @@ Then re-run `simplbooks doctor` to confirm.
                                                 --dry-run resolves + prints
                                                 without creating.
 
-  simplbooks expenses update <purchase_id>
+  simplbooks purchases update <purchase_id>
         [--number STR] [--internal-number STR]
         [--date YYYY-MM-DD] [--due YYYY-MM-DD]
         [--vat-total AMT] [--rounding AMT] [--reference TEXT]
@@ -780,11 +780,11 @@ Then re-run `simplbooks doctor` to confirm.
                                                 when the supplier's KOKKU
                                                 doesn't tie to net+VAT.
 
-  simplbooks expenses delete <purchase_id>      Delete a purchase invoice by id.
+  simplbooks purchases delete <purchase_id>      Delete a purchase invoice by id.
                                                 Irreversible; unbind bound
                                                 payments first.
 
-  simplbooks expenses send-payment <purchase_id>
+  simplbooks purchases send-payment <purchase_id>
         [--amount AMT] [--from-account ID] [--date DD.MM.YYYY]
         [--target <bank>]
                                                 Stage a purchase invoice as a
@@ -859,30 +859,32 @@ Then re-run `simplbooks doctor` to confirm.
   see the consuming project's own simplbooks reference. Read it before
   processing rows.
 
-  simplbooks kanne list [--search T] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
-        [--limit N] [--json]
+  simplbooks financial_transactions list [--search T]
+        [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--limit N] [--json]
                                                 List manual journal entries
                                                 (Kanded / financial_transactions).
                                                 --from/--to bound on date; a range
                                                 older than the recent rows is paged
                                                 back to, not missed. NOTE: the list
                                                 row does NOT show which accounts a
-                                                kanne hit — use `kanne show` for that.
+                                                kanne hit — use `financial_transactions
+                                                show` for that.
 
-  simplbooks kanne show <id> [--json]           Full read of one kanne: both
+  simplbooks financial_transactions show <id> [--json]
+                                                Full read of one kanne: both
                                                 legs with resolved account
                                                 names, per-leg debit/credit,
                                                 notes, attached doc, and a
                                                 balance check. Read before
                                                 editing.
 
-  simplbooks kanne create --date YYYY-MM-DD [--note T]
+  simplbooks financial_transactions create --date YYYY-MM-DD [--note T]
         --line 'side=debit|credit:account=<id>:sum=<amt>[:note=...]' ...
                                                 Create a balanced double-entry.
                                                 Debit total must equal credit
                                                 total. --line repeatable.
 
-  simplbooks kanne update <id>
+  simplbooks financial_transactions update <id>
         [--date YYYY-MM-DD] [--note T]
         [--set-line '<idx>:account=<id>[:debit=<amt>][:credit=<amt>][:note=T]']
         [--add-line 'side=debit|credit:account=<id>:sum=<amt>[:note=...]']
@@ -892,12 +894,12 @@ Then re-run `simplbooks doctor` to confirm.
                                                 debit==credit, re-POSTs. Leg ids
                                                 are preserved (no delete+recreate).
                                                 idx is the leg number from
-                                                `kanne show`. Headline use is
-                                                reclassification:
-                                                  kanne update 20046 --set-line '1:account=<account-id>'
+                                                `financial_transactions show`.
+                                                Headline use is reclassification:
+                                                  financial_transactions update 20046 --set-line '1:account=<account-id>'
                                                 --attach uploads a source PDF.
 
-  simplbooks kanne delete <id>                  Delete a kanne by id.
+  simplbooks financial_transactions delete <id> Delete a kanne by id.
 
   simplbooks payments  list|create|bind|delete  Outgoing bank movements
   simplbooks incomings list|create|bind|delete  Incoming bank movements
@@ -2900,7 +2902,7 @@ ACCOUNT_KINDS: dict[str, str] = {
 }
 
 # Baked from /purchases/add inline JS — the platform's Estonian VAT-type
-# taxonomy, stable across renders (refresh live with `expenses meta`).
+# taxonomy, stable across renders (refresh live with `purchases meta`).
 # For services bought from another EU member state (SaaS, hosting, a payment
 # processor): use id 11 (0% intra-community service acquisition, reverse-charge).
 PURCHASE_VAT_TYPES: dict[str, dict] = {
@@ -3210,8 +3212,8 @@ def reports_account_ledger(account_id: int, period_from: str, period_to: str,
 
     ACCOUNT_ID is the COA id (the `id` column of `accounts list chart`, e.g. 214
     for 1535). The DOC NR column is SimplBooks' journal/document number (Kande
-    nr., as shown in the SB UI) — this is NOT the id that `kanne show` takes; to
-    open an underlying entry from the CLI find it with `kanne list --search` by
+    nr., as shown in the SB UI) — this is NOT the id that `financial_transactions show` takes; to
+    open an underlying entry from the CLI find it with `financial_transactions list --search` by
     its date + description. Saldo is debit-positive (a positive saldo is a
     debit/asset balance, negative a credit/liability balance)."""
     pf, pt = _report_date(period_from), _report_date(period_to)
@@ -3707,7 +3709,7 @@ def _harvest_closure_form(period_html: str) -> tuple[list[tuple[str, str]], list
 def _format_closure_legs(lines: dict, acct_map: dict) -> tuple[list[dict], dict]:
     """Render `_scrape_kanne_edit_form` lines + an account map into a sorted list
     of {idx, account_*, debit, credit, note} plus a balance dict — the same view
-    `kanne show` builds, lifted here for closure-side display."""
+    `financial_transactions show` builds, lifted here for closure-side display."""
     def _ord(kv):
         return int(kv[0]) if kv[0].isdigit() else 9999
     legs = []
@@ -4051,20 +4053,20 @@ def _kmd_period_bounds(period: str) -> tuple[str, str]:
     return f"{y:04d}-{mo:02d}-01", last.strftime("%Y-%m-%d")
 
 
-# ─── expenses (purchase invoices / ostuarved) ───────────────────────────────
+# ─── purchases (purchase invoices / ostuarved) ──────────────────────────────
 
 PURCHASES_META_CACHE = CONFIG_DIR / "purchases_meta.json"
 
 
 @cli.group()
-def expenses() -> None:
+def purchases() -> None:
     """Purchase invoice (ostuarve) operations."""
 
 
-@expenses.command("list")
+@purchases.command("list")
 @click.option("--limit", default=20, show_default=True, type=int)
 @click.option("--search", default="", help="Filter by supplier / number / status")
-def expenses_list(limit: int, search: str) -> None:
+def purchases_list(limit: int, search: str) -> None:
     """List recent purchase invoices."""
     cookies, account = session_or_die()
     cols = [
@@ -4129,10 +4131,10 @@ def purchase_vat_types(http: httpx.Client, account: str, refresh: bool = False) 
     return PURCHASE_VAT_TYPES
 
 
-@expenses.command("meta")
+@purchases.command("meta")
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON.")
 @click.option("--refresh", is_flag=True, help="Re-scrape /purchases/add for the live vat_types map.")
-def expenses_meta(as_json: bool, refresh: bool) -> None:
+def purchases_meta(as_json: bool, refresh: bool) -> None:
     """Show the account's PURCHASE vat types, read live from SimpleBooks.
 
     Scraped from the /purchases/add `vat_types` map and cached; this is the live
@@ -4196,7 +4198,7 @@ def _parse_purchase_attachments(html: str, account: str) -> list[dict]:
     return out
 
 
-def _expenses_show_view(html: str, as_json: bool, account: str) -> None:
+def _purchases_show_view(html: str, as_json: bool, account: str) -> None:
     """Render a purchase from its /purchases/view page — the read surface for
     payment-locked invoices. The page shows display values: row account and
     vat-type ids are not in its markup (the vat-type name rides in a tooltip)."""
@@ -4281,10 +4283,10 @@ def _expenses_show_view(html: str, as_json: bool, account: str) -> None:
                "row account / vat-type ids are not exposed there)")
 
 
-@expenses.command("show")
+@purchases.command("show")
 @click.argument("expense_id", type=int)
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-def expenses_show(expense_id: int, as_json: bool) -> None:
+def purchases_show(expense_id: int, as_json: bool) -> None:
     """Read an existing purchase invoice's header + line items.
 
     Reads the edit form, which carries the exact stored values including each
@@ -4306,7 +4308,7 @@ def expenses_show(expense_id: int, as_json: bool) -> None:
                 raise click.ClickException(
                     f"GET /purchases/view/{expense_id} → HTTP {rv.status_code}"
                 )
-            _expenses_show_view(rv.text, as_json, account)
+            _purchases_show_view(rv.text, as_json, account)
             return
         if r.status_code != 200:
             raise click.ClickException(f"HTTP {r.status_code}")
@@ -4402,14 +4404,14 @@ def _filename_from_response(r: httpx.Response, fallback: str) -> str:
     return fallback
 
 
-@expenses.command("download")
+@purchases.command("download")
 @click.argument("expense_id", type=int)
 @click.option("--out", "out_path", default=None,
               help="Output path. Default: the server-supplied filename in CWD.")
 @click.option("--index", "attach_index", default=1, show_default=True, type=int,
               help="Which attachment (1-based) when a purchase has more than one.")
-def expenses_download(expense_id: int, out_path: str | None, attach_index: int) -> None:
-    """Download a purchase's stored copy (the file uploaded via `expenses create`).
+def purchases_download(expense_id: int, out_path: str | None, attach_index: int) -> None:
+    """Download a purchase's stored copy (the file uploaded via `purchases create`).
 
     Attachments are behind the authed session, not on a public URL — this pulls
     the anchor SB renders on `/purchases/view/<id>` and streams the bytes to
@@ -4585,7 +4587,7 @@ def build_purchase_fields(
     return fields
 
 
-@expenses.command("create")
+@purchases.command("create")
 @click.option("--supplier-id", required=True, type=int)
 @click.option("--number", required=True, help="Supplier-issued invoice number (e.g. MWQSHUMO-2026-04).")
 @click.option("--internal-number", default="", help="Your internal sequence; defaults to --number.")
@@ -4629,7 +4631,7 @@ def build_purchase_fields(
               help="Issuer user id (else the logged-in user, read from the form).")
 @click.option("--dry-run", is_flag=True,
               help="Resolve everything and print the payload WITHOUT creating the invoice.")
-def expenses_create(supplier_id: int, number: str, internal_number: str, invoice_date: str,
+def purchases_create(supplier_id: int, number: str, internal_number: str, invoice_date: str,
                     due_date: str | None, currency: str, currency_rate: float,
                     vat_total: str | None, rounding: str,
                     row_sum_with_vat: bool, lines_raw: tuple[str, ...], attachment_path: str | None,
@@ -4819,7 +4821,7 @@ def expenses_create(supplier_id: int, number: str, internal_number: str, invoice
     )
 
 
-# ─── expenses update (edit existing purchase invoice) ───────────────────────
+# ─── purchases update (edit existing purchase invoice) ─────────────────────
 #
 # SB endpoints (mirror /purchases/create):
 #   GET  /<acct>/purchases/edit/<id>   — pre-populated form, same field names
@@ -4975,7 +4977,7 @@ def _purchase_remove_all_bindings(purchase_id: int) -> None:
         )
 
 
-@expenses.command("update")
+@purchases.command("update")
 @click.argument("purchase_id", type=int)
 @click.option("--number", default=None, help="Change supplier-issued invoice number.")
 @click.option("--internal-number", default=None, help="Change internal sequence number.")
@@ -4988,11 +4990,11 @@ def _purchase_remove_all_bindings(purchase_id: int) -> None:
 @click.option("--reference", default=None,
               help='Replace the free-form payment note (the "Makse kirjeldus" field).')
 @click.option("--add-line", "add_lines", multiple=True,
-              help="Append a new line. Same format as `expenses create --line`: "
+              help="Append a new line. Same format as `purchases create --line`: "
                    "acct=<id>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>[:amount=N][:unit=tk]")
 @click.option("--set-line", "set_lines", multiple=True,
               help="Edit an EXISTING line in place by its 1-based index (the order shown by "
-                   "`expenses show`). Format: '<idx>:acct=<id>[:vat_type=<id>][:vat=<rate>]"
+                   "`purchases show`). Format: '<idx>:acct=<id>[:vat_type=<id>][:vat=<rate>]"
                    "[:name=<desc>][:sum=<amt>][:amount=N][:unit=tk]'. Repeatable. "
                    "Re-point an account: --set-line '1:acct=<coa-id>'.")
 @click.option("--attach", "attach_path", type=click.Path(exists=True, dir_okay=False), default=None,
@@ -5004,7 +5006,7 @@ def _purchase_remove_all_bindings(purchase_id: int) -> None:
 @click.option("--set", "set_pairs", multiple=True,
               help="Raw form field override, repeatable. Example: "
                    "--set 'data[Purchase][cash_accounting_method]=1'")
-def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat_total,
+def purchases_update(purchase_id, number, internal_number, new_date, new_due, vat_total,
                      rounding, reference, add_lines, set_lines, attach_path,
                      force_unbind, set_pairs) -> None:
     """Edit an existing purchase invoice (ostuarve).
@@ -5018,24 +5020,24 @@ def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat
     Examples:
 
       # Bump the rounding adjustment by 1 cent.
-      simplbooks expenses update 1731 --rounding 0,01
+      simplbooks purchases update 1731 --rounding 0,01
 
       # Add a second line (e.g. an Ümardamine row when --rounding isn't enough).
-      simplbooks expenses update 1731 \\
+      simplbooks purchases update 1731 \\
         --add-line 'acct=<coa-id>:vat_type=15:vat=0:name=Ümardamine:sum=0,01'
 
-      # Re-point an existing line's expense account (idx as shown by `expenses show`).
-      simplbooks expenses update 1763 --set-line '1:acct=<coa-id>'
+      # Re-point an existing line's expense account (idx as shown by `purchases show`).
+      simplbooks purchases update 1763 --set-line '1:acct=<coa-id>'
 
       # Re-point the account, close the 1-cent VAT gap, and attach the source PDF in one call.
-      simplbooks expenses update 1763 --set-line '1:acct=<coa-id>' --vat-total 10,65 --attach invoice.pdf
+      simplbooks purchases update 1763 --set-line '1:acct=<coa-id>' --vat-total 10,65 --attach invoice.pdf
 
       # Fix a PAID invoice (locked): unbind its payment, fix number+period+PDF, re-bind.
-      simplbooks expenses update 1764 --force-unbind \\
+      simplbooks purchases update 1764 --force-unbind \\
         --number 3B6A7575-0016 --date 2026-05-03 --attach invoice.pdf
 
       # Change the invoice date / due date.
-      simplbooks expenses update 1731 --date 2026-05-18 --due 2026-05-25
+      simplbooks purchases update 1731 --date 2026-05-18 --due 2026-05-25
     """
     cookies, account = session_or_die()
 
@@ -5104,7 +5106,7 @@ def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat
 
         # Edit existing lines in place. The scraped `_row_index` keys the form's
         # PurchaseRow keys; ordering by sorted(key) matches the 1-based index the
-        # user reads from `expenses show`, so --set-line '<idx>:…' targets the same row.
+        # user reads from `purchases show`, so --set-line '<idx>:…' targets the same row.
         if set_lines:
             ordered_keys = sorted(_row_index.keys())
             alias = {"acct": "expense_account_id", "account": "expense_account_id",
@@ -5179,16 +5181,16 @@ def expenses_update(purchase_id, number, internal_number, new_date, new_due, vat
     click.echo(f"  URL: {BASE}/{account}/purchases/view/{purchase_id}")
 
 
-@expenses.command("delete")
+@purchases.command("delete")
 @click.argument("purchase_id", type=int)
-def expenses_delete(purchase_id) -> None:
+def purchases_delete(purchase_id) -> None:
     """Delete a purchase invoice (ostuarve) by id. Irreversible — removes the
     document. Any bound payments should be unbound first."""
     _do_delete("purchases", purchase_id, csrf_path="purchases/add")
     click.secho(f"✓ Deleted expense {purchase_id}", fg="green")
 
 
-@expenses.command("send-payment")
+@purchases.command("send-payment")
 @click.argument("purchase_id", type=int)
 @click.option("--amount", default=None,
               help="Payment amount. Defaults to the invoice's pre-filled total.")
@@ -5198,7 +5200,7 @@ def expenses_delete(purchase_id) -> None:
               help="Payment date dd.mm.yyyy. Defaults to today.")
 @click.option("--target", default=None,
               help="Bank integration target to push the order to (required).")
-def expenses_send_payment(purchase_id, amount, from_account, payment_date, target) -> None:
+def purchases_send_payment(purchase_id, amount, from_account, payment_date, target) -> None:
     """Stage a purchase invoice as a payment order to the bank.
 
     Pushes the invoice to the configured bank integration. On success the
@@ -5213,8 +5215,8 @@ def expenses_send_payment(purchase_id, amount, from_account, payment_date, targe
     The push is reversible (SB's "Tühista makse panka saatmise märge") until
     the order is signed in the bank.
 
-      simplbooks expenses send-payment 1733
-      simplbooks expenses send-payment 1733 --amount 166,82 --date 09.06.2026
+      simplbooks purchases send-payment 1733
+      simplbooks purchases send-payment 1733 --amount 166,82 --date 09.06.2026
     """
     if not (target and target.strip()):
         raise click.ClickException(
@@ -5527,6 +5529,13 @@ def _list_kanne(search: str = "", limit: int = 200,
     backwards through the desc-by-date result set until we've walked past
     `date_from`, accumulating the in-range rows — otherwise a window older
     than the most-recent `limit` rows would be silently invisible.
+
+    SB's DataTables search tokenizes on `_`, so a full-string substring search
+    like a Stripe idempotency key (`txn_3Rabcd…`) returns empty even when the
+    row's transaction_note begins with it. Mirror the incomings/payments
+    workaround (`_list_money`): when the search contains `_`, send the longest
+    `_`-delimited segment server-side, widen the server window, then re-narrow
+    client-side by full-substring match over the searchable text columns.
     """
     cookies, account = session_or_die()
     cols = [
@@ -5539,14 +5548,34 @@ def _list_kanne(search: str = "", limit: int = 200,
     ]
     url = f"{BASE}/{account}/financial_transactions/listdata"
 
+    if search and "_" in search:
+        server_search = max(search.split("_"), key=len)
+        client_needle = search.lower()
+    else:
+        server_search = search
+        client_needle = ""
+
+    def _client_narrow(rows: list[dict]) -> list[dict]:
+        if not client_needle:
+            return rows
+        def _hay(row: dict) -> str:
+            return " ".join(
+                strip_html(str(row.get(k) or "")) for k in
+                ("transaction_note", "transaction_group_id",
+                 "transaction_date", "sum_plus", "sum_minus", "base_object")
+            ).lower()
+        return [row for row in rows if client_needle in _hay(row)]
+
     if not date_from and not date_to:
-        data = datatables_payload(cols, order_col=2, length=limit, search=search)
+        server_length = max(limit, 500) if client_needle else limit
+        data = datatables_payload(cols, order_col=2, length=server_length, search=server_search)
         with build_http(cookies, account, ajax=True) as http:
             http.headers["X-CSRF-Token"] = fetch_fresh_csrf(http, account)
             r = http.post(url, data=data)
             if r.status_code != 200:
                 raise click.ClickException(f"HTTP {r.status_code}: {r.text[:300]}")
-            return r.json().get("data", [])
+            rows = r.json().get("data", [])
+        return _client_narrow(rows)[:limit]
 
     from_d = datetime.strptime(date_from, "%Y-%m-%d").date() if date_from else None
     to_d = datetime.strptime(date_to, "%Y-%m-%d").date() if date_to else None
@@ -5568,7 +5597,7 @@ def _list_kanne(search: str = "", limit: int = 200,
     with build_http(cookies, account, ajax=True) as http:
         http.headers["X-CSRF-Token"] = fetch_fresh_csrf(http, account)
         for _ in range(MAX_PAGES):
-            data = datatables_payload(cols, order_col=2, length=PAGE, search=search)
+            data = datatables_payload(cols, order_col=2, length=PAGE, search=server_search)
             data["start"] = str(start)
             r = http.post(url, data=data)
             if r.status_code != 200:
@@ -5576,7 +5605,8 @@ def _list_kanne(search: str = "", limit: int = 200,
             rows = r.json().get("data", [])
             if not rows:
                 break
-            in_range.extend(row for row in rows if _in_range(row))
+            narrowed = _client_narrow(rows)
+            in_range.extend(row for row in narrowed if _in_range(row))
             oldest = _parse_kanne_date(rows[-1])
             start += len(rows)
             if len(rows) < PAGE:
@@ -6001,12 +6031,12 @@ def _kanne_balance(lines: dict[str, dict]) -> tuple[float, float]:
     return debit, credit
 
 
-@cli.group()
-def kanne() -> None:
+@cli.group("financial_transactions")
+def financial_transactions() -> None:
     """Manual journal entries (Kanded) — double-entry between accounts."""
 
 
-@kanne.command("list")
+@financial_transactions.command("list")
 @click.option("--search", default="", help="Substring search across transaction_note etc.")
 @click.option("--from", "date_from", default=None, help="Only kanne on/after this date (YYYY-MM-DD).")
 @click.option("--to", "date_to", default=None, help="Only kanne on/before this date (YYYY-MM-DD).")
@@ -6019,7 +6049,8 @@ def kanne_list(search, date_from, date_to, limit, as_json) -> None:
     server-side date range, so a bounded query pages backwards through the
     (desc-by-date) result set until it has covered the window — a range older
     than the most-recent rows is found, not silently missed. Note: the row
-    does NOT carry the per-leg accounts — use `kanne show <id>` for those.
+    does NOT carry the per-leg accounts — use `financial_transactions show <id>`
+    for those.
     """
     rows = _list_kanne(search=search, limit=limit, date_from=date_from, date_to=date_to)
 
@@ -6046,7 +6077,7 @@ def kanne_list(search, date_from, date_to, limit, as_json) -> None:
         )
 
 
-@kanne.command("create")
+@financial_transactions.command("create")
 @click.option("--date", "date_str", required=True, help="Transaction date YYYY-MM-DD.")
 @click.option("--note", default="", help="Top-level kanne description.")
 @click.option("--line", "lines_raw", multiple=True, required=True,
@@ -6058,7 +6089,7 @@ def kanne_create(date_str, note, lines_raw) -> None:
 
     Example — move 1 000,00 between two cashbooks (ids from `accounts list cashbook`):
 
-        simplbooks kanne create --date 2026-01-02 --note 'Inter-account transfer' \\
+        simplbooks financial_transactions create --date 2026-01-02 --note 'Inter-account transfer' \\
           --line 'side=debit:account=<id-a>:sum=1000,00:note=transfer' \\
           --line 'side=credit:account=<id-b>:sum=1000,00:note=transfer'
 
@@ -6148,14 +6179,14 @@ def kanne_create(date_str, note, lines_raw) -> None:
     click.echo(f"  URL   : {BASE}/{account}/financial_transactions/view/{kid}")
 
 
-@kanne.command("show")
+@financial_transactions.command("show")
 @click.argument("kanne_id", type=int)
 @click.option("--json", "as_json", is_flag=True)
 def kanne_show(kanne_id, as_json) -> None:
     """Show one kanne in full — both legs, resolved account names, balance check.
 
-    The read-one primitive: `kanne list` cannot show which accounts an entry
-    touched; this can. Read it before `kanne update` so you patch the right leg.
+    The read-one primitive: `financial_transactions list` cannot show which accounts an entry
+    touched; this can. Read it before `financial_transactions update` so you patch the right leg.
     """
     cookies, account = session_or_die()
     with build_http(cookies, account) as http:
@@ -6222,17 +6253,17 @@ def kanne_show(kanne_id, as_json) -> None:
     click.echo(f"{'':>2}  {'balance':<42}  {debit:>11.2f}  {credit:>11.2f}  {tie}")
 
 
-@kanne.command("update")
+@financial_transactions.command("update")
 @click.argument("kanne_id", type=int)
 @click.option("--date", "date_str", default=None, help="Change transaction date (YYYY-MM-DD).")
 @click.option("--note", default=None, help="Replace the top-level transaction_note.")
 @click.option("--set-line", "set_lines", multiple=True,
               help="Patch a leg in place. '<idx>:account=<id>[:debit=<amt>][:credit=<amt>][:note=<t>]'. "
-                   "idx is the leg number from `kanne show`. Repeatable.")
+                   "idx is the leg number from `financial_transactions show`. Repeatable.")
 @click.option("--add-line", "add_lines", multiple=True,
               help="Append a leg. 'side=debit|credit:account=<id>:sum=<amt>[:note=...]'. Repeatable.")
 @click.option("--remove-line", "remove_lines", multiple=True,
-              help="Remove a leg by idx (from `kanne show`). Repeatable.")
+              help="Remove a leg by idx (from `financial_transactions show`). Repeatable.")
 @click.option("--attach", "attach_path", default=None,
               type=click.Path(exists=True, dir_okay=False),
               help="Attach a source document (PDF) to the kanne.")
@@ -6248,13 +6279,13 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
 
     Headline use — reclassify a leg from one account to another:
 
-        simplbooks kanne update 20046 --set-line '1:account=<account-id>'
+        simplbooks financial_transactions update 20046 --set-line '1:account=<account-id>'
 
     Other edits:
 
-        simplbooks kanne update 20046 --note 'SaaS subscription - 24.80 USD'
-        simplbooks kanne update 20046 --date 2026-05-29
-        simplbooks kanne update 20046 --attach /path/to/receipt.pdf
+        simplbooks financial_transactions update 20046 --note 'SaaS subscription - 24.80 USD'
+        simplbooks financial_transactions update 20046 --date 2026-05-29
+        simplbooks financial_transactions update 20046 --attach /path/to/receipt.pdf
     """
     cookies, account = session_or_die()
     with build_http(cookies, account) as http:
@@ -6271,7 +6302,8 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
             idx = head.strip()
             if idx not in lines:
                 raise click.ClickException(
-                    f"--set-line: no leg with idx {idx!r} (see `kanne show {kanne_id}`).")
+                    f"--set-line: no leg with idx {idx!r} "
+                    f"(see `financial_transactions show {kanne_id}`).")
             kv = _parse_kv_line(rest)
             base = f"data[FinancialTransactions][{idx}]"
             if "account" in kv:
@@ -6371,7 +6403,7 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
     click.echo(f"  URL    : {BASE}/{account}/financial_transactions/view/{kanne_id}")
 
 
-@kanne.command("delete")
+@financial_transactions.command("delete")
 @click.argument("kanne_id", type=int)
 def kanne_delete(kanne_id) -> None:
     """Delete a kanne (financial_transaction) by id."""
@@ -6691,7 +6723,7 @@ def bt_list(direction, status, date_from, date_to, limit, as_json) -> None:
 
     Each row is a not-yet-processed bank transaction. SB has typically not
     auto-matched a SB client_id for these — the agent does that work via
-    `clients` / `expenses list` / `invoices list` and then `save`.
+    `clients` / `purchases list` / `invoices list` and then `save`.
     """
     cookies, account = session_or_die()
     with build_http(cookies, account) as http:
