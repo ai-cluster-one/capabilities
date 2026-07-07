@@ -87,6 +87,14 @@ COMMANDS
       In-place lifecycle on a running resource. --type selects the endpoint
       family (defaults to application).
 
+  env list <uuid>
+      List environment variables for an application.
+  env set <uuid> <KEY> <VALUE>
+      Set or update an environment variable. For secrets, omit VALUE to read
+      from stdin (one line, no echo). Write verb - requires allow_write.
+  env rm <uuid> <KEY>
+      Remove an environment variable. Write verb - requires allow_write.
+
 Contract commands (the same on every capability):
   coolify stub                                 One-line awareness text.
   coolify manifest --json                      Machine-readable declaration.
@@ -133,7 +141,7 @@ CRED_KEYS = [
     {"key": "COOLIFY_TOKEN", "secret": True, "required": True,
      "note": "API token (Dashboard → Keys & Tokens → API tokens), team-scoped"},
 ]
-WRITE_VERBS = {"deploy", "start", "stop", "restart"}   # verbs that mutate the instance
+WRITE_VERBS = {"deploy", "start", "stop", "restart", "env"}   # verbs that mutate the instance
 WRITE_DEFAULT = True    # writes stay inside an instance the consumer owns
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 TOPICS: list = []   # shipped guide topics
@@ -863,6 +871,22 @@ def cmd_lifecycle(c, action: str, uuid: str, rtype: str):
     return _request(c, "GET", f"/{base}/{uuid}/{action}")
 
 
+def cmd_env_list(c, uuid: str):
+    """List environment variables for an application."""
+    return _request(c, "GET", f"/applications/{uuid}/envs")
+
+
+def cmd_env_set(c, uuid: str, key: str, value: str):
+    """Set or update an environment variable."""
+    return _request(c, "PATCH", f"/applications/{uuid}/envs",
+                    json_body={key: value})
+
+
+def cmd_env_rm(c, uuid: str, key: str):
+    """Remove an environment variable."""
+    return _request(c, "DELETE", f"/applications/{uuid}/envs/{key}")
+
+
 # ── dispatch ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -903,6 +927,22 @@ def main() -> None:
         sp.add_argument("--type", dest="rtype", default="application",
                         choices=["application", "service", "database"])
 
+    sp = sub.add_parser("env", help="manage application environment variables")
+    env_sub = sp.add_subparsers(dest="env_cmd", required=True)
+
+    sp_list = env_sub.add_parser("list", help="list environment variables")
+    sp_list.add_argument("uuid")
+
+    sp_set = env_sub.add_parser("set", help="set environment variable")
+    sp_set.add_argument("uuid")
+    sp_set.add_argument("key")
+    sp_set.add_argument("value", nargs="?", default=None,
+                        help="value (omit to read from stdin)")
+
+    sp_rm = env_sub.add_parser("rm", help="remove environment variable")
+    sp_rm.add_argument("uuid")
+    sp_rm.add_argument("key")
+
     args = p.parse_args()
     if args.cmd == "help":
         sys.stdout.write((__doc__ or "").lstrip("\n")); return
@@ -923,6 +963,19 @@ def main() -> None:
             _emit(cmd_deploy(c, args.uuid, args.force, args.tag))
         elif args.cmd in ("start", "stop", "restart"):
             _emit(cmd_lifecycle(c, args.cmd, args.uuid, args.rtype))
+        elif args.cmd == "env":
+            if args.env_cmd == "list":
+                _emit(cmd_env_list(c, args.uuid))
+            elif args.env_cmd == "set":
+                value = args.value
+                if value is None:
+                    import getpass
+                    value = getpass.getpass("")
+                _emit(cmd_env_set(c, args.uuid, args.key, value))
+            elif args.env_cmd == "rm":
+                _emit(cmd_env_rm(c, args.uuid, args.key))
+            else:
+                _die(6, "unknown_command", f"no handler for env {args.env_cmd!r}")
         else:
             _die(6, "unknown_command", f"no handler for {args.cmd!r}")
 
