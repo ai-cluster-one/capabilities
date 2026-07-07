@@ -27,58 +27,43 @@ name on your terminal. The source is the one you fix.
 The full chain is implement → validate → push to `main` → reinstall → re-test;
 the peer's `done` is the *start* of this chain, never the end. Until
 `capabilities update` has put the new version on `PATH`, the change has not
-arrived. Five beats:
+arrived. Three beats:
 
-### a. Implement in source via `askproject`
+### a. Delegate the edit to the capabilities repo agent
 
-You do not have the capabilities repo open; you have your own project open.
-Hand the edit to a peer Claude Code agent that owns the capabilities repo, by
-calling `askproject` from your project with `--act`:
+**From your outside project**, delegate the implementation to a peer Claude
+Code agent that owns the capabilities repo, via `askproject` with `--act`:
 
 ```sh
 askproject <capabilities-repo> --act "<one-paragraph task description>"
 ```
 
-The peer loads that repo's `CLAUDE.md`, doctrine, and rules, edits within its
-contract, fenced to that directory, and returns a JSON envelope naming the
-files it changed (`git.files_changed`) — read it back; refine with `-c` if a
-second pass is needed. The peer's report means *edited in source* — not
-shipped, not installed, not ready.
+The peer loads that repo's `CLAUDE.md`, doctrine, and rules, implements the
+change in the **source**, validates it per the repo's audit/test requirements,
+commits it, and pushes to `main`. The peer's JSON envelope reports what
+changed (`git.files_changed`) and the validation result. The peer **must not
+stop** after merely editing source — it owns the full cycle through commit and
+push to `main`. The outside agent never edits capability source directly; that
+is the capabilities repo agent's domain.
 
-### b. Validate and sign off
+### b. Reinstall via the capabilities manager
 
-Its own beat, never skipped. The change is validated before it lands, and
-this can be delegated to a sub-agent that reviews it and returns a verdict —
-a read-mode `askproject <capabilities-repo> "review the change…"`, a
-`--schema` structured pass/fail, or a reviewer sub-agent of your own.
-Optionally smoke-test the in-progress source on `PATH` first with
-`capabilities install <name> --from <capabilities-repo>` and exercise the
-case that failed. Validation produces the sign-off that the change is correct
-and ready to ship.
-
-### c. Land it in the repo
-
-Once signed off, the change is committed and pushed to GitHub `main`; the
-deployed copy only ever comes from `main`. The push is the user's gate: the
-outside agent does not push — it hands the validated change to the user (what
-changed, where, what validation showed) and stops.
-
-### d. Reinstall via the capabilities manager
+Once the peer has pushed to `main`, **back in your calling project**, pull
+the published version and relink `PATH`:
 
 ```sh
 capabilities update <name>
 ```
 
-This pulls the published version into the manager's canonical location and
-relinks `PATH` if the link is not already current (if no relink is needed,
-the manager simply does nothing extra). This is the *only* step that makes
-the new version the one the machine actually runs.
+This fetches from GitHub `main` into the manager's canonical registry and
+relinks the symlink on `PATH`. This is the *only* step that makes the new
+version the one the machine actually runs.
 
-### e. Consume and re-test
+### c. Re-test on PATH
 
 Then, and only then, the calling project can claim it is ready to use the
 updated capability; re-test against the original failure. A failure here is a
-regression to report back, never a reason to edit the deployed copy. Until
-`capabilities update` has completed, the change has not arrived: the peer's
-`done`, a green local smoke test, even a merged PR are not the same as the
+regression to report back to the capabilities repo agent, never a reason to
+edit the deployed copy. Until `capabilities update` has completed, the change
+has not arrived: the peer's `done`, even a merged PR, are not the same as the
 manager having reinstalled it onto `PATH`.

@@ -6852,6 +6852,11 @@ def _bt_money_save_fields(
     date_key = "payment_date" if is_payment else "income_date"
     bind_key = "purchase_id" if is_payment else "invoice_id"
 
+    effective_desc = description
+    if not description or f"bt_{bt_id}" not in description.lower():
+        marker = f"bt_{bt_id}"
+        effective_desc = f"{description} [{marker}]" if description else f"[{marker}]"
+
     fields: list[tuple[str, str]] = [
         ("data[BankTransaction][id]", str(bt_id)),
         ("data[BankTransaction][object_type]", "payment" if is_payment else "incoming"),
@@ -6863,7 +6868,7 @@ def _bt_money_save_fields(
         (f"data[{direction}][client_id]", str(client["id"])),
         (f"data[{direction}][{bind_key}]", ",".join(str(b) for b in bind_ids)),
         (f"data[{direction}][income_account_id]", str(income_account_id)),
-        (f"data[{direction}][description]", description),
+        (f"data[{direction}][description]", effective_desc),
     ]
     if is_payment:
         fields.append(("data[Payment][object_type]", object_type))
@@ -6911,9 +6916,10 @@ def _bt_recover_money_id(
     """Recover the id of the money object that /bank_transactions/save just made.
 
     PRIMARY: parse the 302 Location header — same pattern as _create_money.
-    FALLBACK: bounded /listdata lookup, matched on amount + date + description.
-    If exactly one row matches, trust it; otherwise refuse to guess and surface
-    the manual bind command instead. We never bind to an ambiguous id.
+    FALLBACK: bounded /listdata lookup by the bt_<id> marker stamped into the
+    description, then amount/date/description if marker lookup cannot isolate a
+    single row. If exactly one row matches, trust it; otherwise refuse to guess
+    and surface the candidate bind commands. We never bind to an ambiguous id.
     """
     endpoint = "payments" if direction == "Payment" else "incomings"
     loc = r.headers.get("location", "")
@@ -6921,10 +6927,29 @@ def _bt_recover_money_id(
     if m:
         return int(m.group(1))
 
+    marker = f"bt_{bt_id}"
     try:
-        rows = _list_money(endpoint, search=description or "", limit=100)
+        rows = _list_money(endpoint, search=marker, limit=100)
     except click.ClickException:
         rows = []
+
+    marker_matches = []
+    for row in rows:
+        desc_text = strip_html(row.get("description") or "")
+        if marker in desc_text.lower():
+            marker_matches.append(row)
+
+    if len(marker_matches) == 1:
+        return int(marker_matches[0]["id"])
+
+    if not marker_matches:
+        try:
+            rows = _list_money(endpoint, search=description or "", limit=100)
+        except click.ClickException:
+            rows = []
+    else:
+        rows = marker_matches
+
     want_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
     try:
         want_sum = _amount_float(sum_amount)
@@ -6949,12 +6974,22 @@ def _bt_recover_money_id(
         return int(cands[0]["id"])
 
     flag = "--to-purchase" if direction == "Payment" else "--to-invoice"
-    detail = "no list match" if not cands else f"{len(cands)} ambiguous matches"
-    raise click.ClickException(
-        f"BT {bt_id} saved as {endpoint[:-1]} (unbound), but the created id "
-        f"could not be safely recovered ({detail}). Find it by hand and bind: "
-        f"simplbooks {endpoint} bind <{endpoint[:-1]}-id> {flag} <id>"
-    )
+    if not cands:
+        detail = "no list match"
+        raise click.ClickException(
+            f"BT {bt_id} saved as {endpoint[:-1]} (unbound), but the created id "
+            f"could not be safely recovered ({detail}). Find it by hand and bind: "
+            f"simplbooks {endpoint} bind <{endpoint[:-1]}-id> {flag} <id>"
+        )
+    else:
+        cand_ids = [str(row["id"]) for row in cands]
+        detail = f"{len(cands)} ambiguous matches (ids: {', '.join(cand_ids)})"
+        bind_cmds = [f"simplbooks {endpoint} bind {cid} {flag} <id>" for cid in cand_ids]
+        raise click.ClickException(
+            f"BT {bt_id} saved as {endpoint[:-1]} (unbound), but the created id "
+            f"could not be safely recovered ({detail}).\n"
+            f"Find the correct one and bind:\n" + "\n".join(f"  {cmd}" for cmd in bind_cmds)
+        )
 
 
 @bank_transactions.command("save")
