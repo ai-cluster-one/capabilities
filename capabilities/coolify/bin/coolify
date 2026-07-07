@@ -877,14 +877,40 @@ def cmd_env_list(c, uuid: str):
 
 
 def cmd_env_set(c, uuid: str, key: str, value: str):
-    """Set or update an environment variable."""
-    return _request(c, "PATCH", f"/applications/{uuid}/envs",
-                    json_body={key: value})
+    """Set or update an environment variable. Creates if absent, updates if present."""
+    # List existing env vars to determine if this is a create or update
+    existing = _request(c, "GET", f"/applications/{uuid}/envs")
+    env_list = existing.get("data", []) if isinstance(existing, dict) else []
+
+    # Check if the key already exists (matching non-preview vars by default)
+    key_exists = any(
+        e.get("key") == key and not e.get("is_preview", False)
+        for e in env_list if isinstance(e, dict)
+    )
+
+    method = "PATCH" if key_exists else "POST"
+    return _request(c, method, f"/applications/{uuid}/envs",
+                    json_body={"key": key, "value": value})
 
 
 def cmd_env_rm(c, uuid: str, key: str):
-    """Remove an environment variable."""
-    return _request(c, "DELETE", f"/applications/{uuid}/envs/{key}")
+    """Remove an environment variable. Resolves key to env UUID before deletion."""
+    # List existing env vars to find the UUID for this key
+    existing = _request(c, "GET", f"/applications/{uuid}/envs")
+    env_list = existing.get("data", []) if isinstance(existing, dict) else []
+
+    # Find the env var UUID (matching non-preview vars by default)
+    env_uuid = None
+    for e in env_list:
+        if isinstance(e, dict) and e.get("key") == key and not e.get("is_preview", False):
+            env_uuid = e.get("uuid")
+            break
+
+    if not env_uuid:
+        _die(3, "not_found", f"environment variable {key!r} not found",
+             f"use `coolify env list {uuid}` to see available variables")
+
+    return _request(c, "DELETE", f"/applications/{uuid}/envs/{env_uuid}")
 
 
 # ── dispatch ────────────────────────────────────────────────────────────────
