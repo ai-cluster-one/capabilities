@@ -888,40 +888,58 @@ def cmd_env_list(c, uuid: str):
 
 
 def cmd_env_set(c, uuid: str, key: str, value: str):
-    """Set or update an environment variable. Creates if absent, updates if present."""
-    # List existing env vars to determine if this is a create or update
+    """Set or update an environment variable. Updates all entries (preview + non-preview)
+    with this key if any exist; creates a new one if none exist."""
+    # List existing env vars to find all matching entries
     existing = _request(c, "GET", f"/applications/{uuid}/envs")
     env_list = _normalize_env_list(existing)
 
-    # Check if the key already exists (matching non-preview vars by default)
-    key_exists = any(
-        e.get("key") == key and not e.get("is_preview", False)
-        for e in env_list if isinstance(e, dict)
-    )
+    # Find all entries with this key (both preview and non-preview)
+    matching = [
+        e for e in env_list
+        if isinstance(e, dict) and e.get("key") == key
+    ]
 
-    method = "PATCH" if key_exists else "POST"
-    return _request(c, method, f"/applications/{uuid}/envs",
-                    json_body={"key": key, "value": value})
+    if matching:
+        # Update all matching entries to keep preview/non-preview siblings aligned
+        results = []
+        for entry in matching:
+            result = _request(c, "PATCH", f"/applications/{uuid}/envs",
+                            json_body={"key": key, "value": value, "is_preview": entry.get("is_preview", False)})
+            results.append(result)
+        return {"updated": len(matching), "key": key, "results": results}
+    else:
+        # Create new entry
+        return _request(c, "POST", f"/applications/{uuid}/envs",
+                       json_body={"key": key, "value": value})
 
 
 def cmd_env_rm(c, uuid: str, key: str):
-    """Remove an environment variable. Resolves key to env UUID before deletion."""
-    # List existing env vars to find the UUID for this key
+    """Remove all environment variable entries matching KEY (preview + non-preview).
+    Reports what was deleted to avoid leaving orphaned entries."""
+    # List existing env vars to find all matching entries
     existing = _request(c, "GET", f"/applications/{uuid}/envs")
     env_list = _normalize_env_list(existing)
 
-    # Find the env var UUID (matching non-preview vars by default)
-    env_uuid = None
-    for e in env_list:
-        if isinstance(e, dict) and e.get("key") == key and not e.get("is_preview", False):
-            env_uuid = e.get("uuid")
-            break
+    # Find all entries with this key (both preview and non-preview)
+    matching = [
+        e for e in env_list
+        if isinstance(e, dict) and e.get("key") == key
+    ]
 
-    if not env_uuid:
+    if not matching:
         _die(3, "not_found", f"environment variable {key!r} not found",
              f"use `coolify env list {uuid}` to see available variables")
 
-    return _request(c, "DELETE", f"/applications/{uuid}/envs/{env_uuid}")
+    # Delete all matching entries
+    deleted = []
+    for entry in matching:
+        env_uuid = entry.get("uuid")
+        is_preview = entry.get("is_preview", False)
+        _request(c, "DELETE", f"/applications/{uuid}/envs/{env_uuid}")
+        deleted.append({"uuid": env_uuid, "is_preview": is_preview})
+
+    return {"deleted": len(matching), "key": key, "entries": deleted}
 
 
 # ── dispatch ────────────────────────────────────────────────────────────────
