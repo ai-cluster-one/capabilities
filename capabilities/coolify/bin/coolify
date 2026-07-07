@@ -871,6 +871,17 @@ def cmd_lifecycle(c, action: str, uuid: str, rtype: str):
     return _request(c, "GET", f"/{base}/{uuid}/{action}")
 
 
+def _normalize_env_list(response):
+    """Normalize env list response - handles both bare list and dict-with-data formats.
+    Coolify 4.1.2 returns a bare JSON list; older or future versions may wrap in {"data": [...]}.
+    """
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict) and "data" in response:
+        return response["data"]
+    return []
+
+
 def cmd_env_list(c, uuid: str):
     """List environment variables for an application."""
     return _request(c, "GET", f"/applications/{uuid}/envs")
@@ -880,7 +891,7 @@ def cmd_env_set(c, uuid: str, key: str, value: str):
     """Set or update an environment variable. Creates if absent, updates if present."""
     # List existing env vars to determine if this is a create or update
     existing = _request(c, "GET", f"/applications/{uuid}/envs")
-    env_list = existing.get("data", []) if isinstance(existing, dict) else []
+    env_list = _normalize_env_list(existing)
 
     # Check if the key already exists (matching non-preview vars by default)
     key_exists = any(
@@ -897,7 +908,7 @@ def cmd_env_rm(c, uuid: str, key: str):
     """Remove an environment variable. Resolves key to env UUID before deletion."""
     # List existing env vars to find the UUID for this key
     existing = _request(c, "GET", f"/applications/{uuid}/envs")
-    env_list = existing.get("data", []) if isinstance(existing, dict) else []
+    env_list = _normalize_env_list(existing)
 
     # Find the env var UUID (matching non-preview vars by default)
     env_uuid = None
