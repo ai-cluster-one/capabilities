@@ -31,12 +31,14 @@ ENVIRONMENT
 
 MACHINE VERBS
   install <name> [--from <path|url>] [--yes]
-        Fetch the capability script into the registry, symlink it onto PATH,
-        snapshot `stub` + `manifest --json` (keyed by script hash), scaffold
-        credentials per the declared scope, surface declared post-install
-        steps (--yes runs them), regenerate the skill.
-        --from accepts: a script file, a directory holding <name> or
-        bin/<name>, or a URL. Default source is the catalogue.
+        Fetch the capability into the registry, symlink its executable onto
+        PATH, snapshot `stub` + `manifest --json` (keyed by payload hash),
+        scaffold credentials per the declared scope, surface declared
+        post-install steps (--yes runs them), regenerate the skill.
+        --from accepts: a script file, a bundle directory holding <name> or
+        bin/<name>, a repo directory holding capabilities/<name>/bin/<name>, or
+        a URL. Source directories install the complete bundle, excluding
+        bytecode/cache files. Default source is the catalogue script.
   uninstall <name> [--purge-credentials]
         Remove the PATH symlink and the registry entry; regenerate the skill.
         Credentials are kept and reported; --purge-credentials deletes the
@@ -396,6 +398,18 @@ def _validate_manifest(name: str, manifest) -> list[str]:
         for step in post:
             if not isinstance(step, dict) or "cmd" not in step:
                 problems.append(f"post_install entry malformed: {step!r}")
+    service = manifest.get("service")
+    if service is not None:
+        if not isinstance(service, dict):
+            problems.append("service is not an object")
+        else:
+            if not isinstance(service.get("name"), str) or not service.get("name", "").strip():
+                problems.append("service.name missing or empty")
+            if not isinstance(service.get("summary"), str) or not service.get("summary", "").strip():
+                problems.append("service.summary missing or empty")
+            verbs = service.get("verbs")
+            if not isinstance(verbs, list) or not all(isinstance(v, str) for v in verbs):
+                problems.append("service.verbs is not a list of strings")
     return problems
 
 # ---------------------------------------------------------------- snapshots
@@ -434,19 +448,41 @@ def _load_snapshots(name: str) -> tuple[str | None, dict | None]:
 
 # ---------------------------------------------------------------- install
 
-def _resolve_source(name: str, from_ref: str | None) -> tuple[bytes, str]:
-    """Return (script bytes, recorded source string)."""
+def _bundle_ignore(_dir: str, names: list[str]) -> set[str]:
+    ignored = set()
+    for n in names:
+        if n in {"__pycache__", ".git", ".hg", ".svn"}:
+            ignored.add(n)
+        elif n.endswith((".pyc", ".pyo", ".session", ".session-journal",
+                         ".session-wal", ".session-shm")):
+            ignored.add(n)
+    return ignored
+
+
+def _bundle_script(bundle: Path, name: str) -> Path | None:
+    for cand in (bundle / name, bundle / "bin" / name):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _resolve_source(name: str, from_ref: str | None) -> tuple[bytes, str, Path | None]:
+    """Return (script bytes, recorded source string, bundle dir if local)."""
     if from_ref and not re.match(r"^https?://", from_ref):
         p = Path(from_ref).expanduser().resolve()
         if p.is_dir():
-            for cand in (p / name, p / "bin" / name,
-                         p / "capabilities" / name / "bin" / name):
-                if cand.is_file():
-                    return cand.read_bytes(), str(cand)
+            bundles = [p]
+            repo_bundle = p / "capabilities" / name
+            if repo_bundle.is_dir():
+                bundles.append(repo_bundle)
+            for bundle in bundles:
+                cand = _bundle_script(bundle, name)
+                if cand is not None:
+                    return cand.read_bytes(), str(bundle), bundle
             _die(3, "not_found", f"no script for {name!r} under {p}",
                  f"expected {name}, bin/{name}, or capabilities/{name}/bin/{name}")
         if p.is_file():
-            return p.read_bytes(), str(p)
+            return p.read_bytes(), str(p), None
         _die(3, "not_found", f"--from path does not exist: {p}")
     url = from_ref or f"{SOURCE}/capabilities/{name}/bin/{name}"
     try:
@@ -457,7 +493,35 @@ def _resolve_source(name: str, from_ref: str | None) -> tuple[bytes, str]:
         _die(3, "not_found", f"no such capability in the catalogue: {name}", url)
     if resp.status_code != 200:
         _die(5, "server_error", f"fetch returned {resp.status_code}", url)
-    return resp.content, url
+    return resp.content, url, None
+
+
+def _install_payload(name: str, content: bytes, bundle_dir: Path | None) -> Path:
+    reg = _registry_dir(name)
+    if reg.exists():
+        shutil.rmtree(reg)
+    reg.mkdir(parents=True, exist_ok=True)
+    if bundle_dir is not None:
+        shutil.copytree(bundle_dir, reg, dirs_exist_ok=True, ignore=_bundle_ignore)
+    script = _script_path(name)
+    script.write_bytes(content)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def _payload_sha256(reg: Path) -> str:
+    h = hashlib.sha256()
+    skip = {"meta.json", "stub", "manifest.json"}
+    for path in sorted(p for p in reg.rglob("*") if p.is_file()):
+        if (path.name in skip or "__pycache__" in path.parts
+                or path.suffix in {".pyc", ".pyo", ".session"}
+                or path.name.endswith((".session-journal", ".session-wal", ".session-shm"))):
+            continue
+        rel = path.relative_to(reg).as_posix()
+        h.update(rel.encode("utf-8") + b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def _symlink(name: str, script: Path) -> Path:
@@ -512,15 +576,13 @@ def _scaffold_credentials(name: str, manifest: dict) -> list[str]:
 
 
 def cmd_install(name: str, from_ref: str | None, yes: bool) -> None:
-    content, source = _resolve_source(name, from_ref)
+    content, source, bundle_dir = _resolve_source(name, from_ref)
     reg = _registry_dir(name)
-    reg.mkdir(parents=True, exist_ok=True)
-    script = _script_path(name)
-    script.write_bytes(content)
-    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    script = _install_payload(name, content, bundle_dir)
     manifest = _snapshot(name, script)
     _write_json(reg / "meta.json", {
-        "name": name, "source": source, "sha256": _sha256(script),
+        "name": name, "source": source, "source_type": "directory" if bundle_dir else "script",
+        "sha256": _sha256(script), "payload_sha256": _payload_sha256(reg),
         "protocol": manifest.get("protocol"),
     })
     link = _symlink(name, script)
@@ -536,6 +598,7 @@ def cmd_install(name: str, from_ref: str | None, yes: bool) -> None:
     result = {
         "installed": name, "registry": str(reg), "symlink": str(link),
         "summary": manifest.get("summary"), "scope": manifest["credentials"]["scope"],
+        "bundle": bool(bundle_dir),
         "project_visibility": _project_visibility_hint(name),
     }
     if notes:
@@ -580,15 +643,16 @@ def cmd_update(name: str | None) -> None:
     for n in targets:
         meta = _read_json(_registry_dir(n) / "meta.json") or {}
         source = meta.get("source")
-        content, source = _resolve_source(n, source)
-        script = _script_path(n)
-        before = _sha256(script) if script.exists() else None
-        script.write_bytes(content)
-        script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        before = meta.get("payload_sha256")
+        if before is None and _script_path(n).exists():
+            before = _sha256(_script_path(n))
+        content, source, bundle_dir = _resolve_source(n, source)
+        script = _install_payload(n, content, bundle_dir)
         manifest = _snapshot(n, script)
-        after = _sha256(script)
+        after = _payload_sha256(_registry_dir(n))
         _write_json(_registry_dir(n) / "meta.json", {
-            "name": n, "source": source, "sha256": after,
+            "name": n, "source": source, "source_type": "directory" if bundle_dir else "script",
+            "sha256": _sha256(script), "payload_sha256": after,
             "protocol": manifest.get("protocol"),
         })
         results.append({"name": n, "changed": before != after})
@@ -816,6 +880,15 @@ def _compose_context(root: Path) -> str:
         topics = ((manifest or {}).get("docs") or {}).get("topics") or []
         if topics:
             bullet.append(f"- Guides (`{name} guide <topic>`): " + ", ".join(sorted(topics)))
+        service = (manifest or {}).get("service")
+        if isinstance(service, dict):
+            verbs = service.get("verbs") or []
+            verb_hint = ", ".join(str(v) for v in verbs[:8])
+            summary = service.get("summary") or service.get("name") or "bundled service"
+            line = f"- Service (`{name} service ...`): {summary}"
+            if verb_hint:
+                line += f" (verbs: {verb_hint})"
+            bullet.append(line)
         refs = []
         refdir = envdir / "reference"
         if refdir.is_dir():

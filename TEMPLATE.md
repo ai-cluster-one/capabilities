@@ -2,9 +2,9 @@
 
 What a capability is **comprised of** — the artifact it ships and the envelope it manages. This is the doctrine ([DOCTRINE.md](DOCTRINE.md)) applied to structure: a case study in where each kind of knowledge lives. It is deliberately **abstract** — slots, not any one capability — so a new capability slots in without re-deciding the shape, and `capabilities audit` has a fixed thing to check against. The behavioural invariants and how to validate them live in the doctrine; this file holds the form.
 
-## The mental model: one artifact, two altitudes
+## The mental model: one executable contract, two altitudes
 
-The **script is the sole shipped artifact**. Everything a capability declares about itself — its domain verbs, its awareness line, its machine-readable manifest, its documentation access, its identifier management, its gate — is a verb on that one file (the contract, [SHEBANG.md](SHEBANG.md#the-contract-verbs)). What surrounds the script is *managed*, not shipped: the manager snapshots its declaration into the registry at install, and the script maintains its project envelope where it is used. One artifact, one version, no skew between the pieces.
+The **script is the sole contract surface**. Everything a capability declares about itself — its domain verbs, its awareness line, its machine-readable manifest, its documentation access, its identifier management, its gate — is a verb on that executable (the contract, [SHEBANG.md](SHEBANG.md#the-contract-verbs)). A capability may ship helper files beside it, but those helpers are part of the installed bundle and are reached through the executable. A consuming project keeps only its envelope: connections, identifiers, references, state, and project-local config. One executable contract, one installed bundle version, no copied engine code.
 
 A capability exists at two altitudes, and the split is the whole point:
 
@@ -40,10 +40,12 @@ The project-meta cell is empty on purpose: authoring guidance never varies by pr
 
 | Slot | Lives in | Altitude | Holds |
 |---|---|---|---|
-| The script | `bin/<name>` upstream → registry copy at `~/.capabilities/<name>/bin/<name>`, symlinked onto `PATH` | capability | the whole shipped artifact: domain verbs + the contract verbs |
-| The declaration | verbs on the script — `stub`, `manifest --json` — snapshotted by the manager at install | capability | the one-line awareness text; the machine-readable manifest (name, summary, credential scope and keys, docs base, state flag) |
+| The script | `bin/<name>` upstream → registry copy at `~/.capabilities/<name>/<name>`, symlinked onto `PATH` | capability | the executable contract: domain verbs + the contract verbs |
+| The bundle *(opt)* | files beside `bin/<name>` upstream → copied under `~/.capabilities/<name>/` on source-directory install | capability | helper assets, templates, or service engines used by the executable; never copied into consuming projects |
+| The declaration | verbs on the script — `stub`, `manifest --json` — snapshotted by the manager at install | capability | the one-line awareness text; the machine-readable manifest (name, summary, credential scope and keys, docs base, state flag, optional service metadata) |
 | Guides *(opt)* | `guides/<topic>.md` beside the script upstream, surfaced by `<name> guide` fetched live | capability | consumer-neutral *how to author X with this tool* docs (DOCTRINE rule 14); present only when the tool has authoring depth |
 | Connections | `.capabilities/<name>/connections.json` — standard envelope (`default` pointer + `connections` map), entry interior capability-owned | project | the project's named endpoints and identities: per-connection non-secret wiring (including behavioural per-connection keys), secrets by env-key indirection (`secret_env`), the write gate (`allow_write`) |
+| Service config *(opt)* | `.capabilities/<name>/service/` | project | project-local policy/context for a bundled service; the engine still runs from the installed bundle |
 | Identifiers | `.capabilities/<name>/identifiers.json` — CLI-managed envelope, written by `<name> ids set` and rendered by `capabilities ids <name>` | project | the non-secret structural values the CLI **discovered**: ids, labels, classifications, breadcrumbs |
 | References | `.capabilities/<name>/reference/*.md` — front-matter envelope + free prose, surfaced by `<name> refs` | project | the project-specific operational **model**: mappings, treatments, what output means here |
 | State | `.capabilities/<name>/state/` or `$XDG_STATE_HOME/<name>/`, per declared scope | project / user | what credentials mint: sessions, caches, pending logins. Never committed (DOCTRINE rule 16) |

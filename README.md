@@ -49,7 +49,7 @@ Short version: reach for a **skill** when the reusable thing is *instructions*; 
 | [Directo](capabilities/directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) |
 | [Mail](capabilities/mail/) | read and draft mail across Mail.app's configured accounts over macOS Automation (read/search/show/links/attachments/draft/export; never sends) |
 | [Mailbox](capabilities/mailbox/) | IMAP/SMTP adapter for one mailbox — list/show/fetch/flag/move and **send**; connections in its `connections.json`, app-password by env-key indirection |
-| [Telegram](capabilities/telegram/) | drive a personal Telegram account over MTProto (a full user account) — read/search a chat, send, export a chat's full history to JSON with voice/audio + photos/stickers, and transcribe voice/audio via Deepgram; stateful login session |
+| [Telegram](capabilities/telegram/) | drive a personal Telegram account over MTProto (a full user account) — read/search a chat, send, export a chat's full history to JSON with voice/audio + photos/stickers, transcribe voice/audio via Deepgram, and run the bundled project-local assistant service; stateful login session |
 | [Notion](capabilities/notion/) | publish markdown to Notion pages over the REST API (whoami, list child pages, fetch a page as markdown, replace a page's body+title, create under a parent, upsert by exact title); the local markdown H1 is the source of truth for the page title |
 | [Stripe](capabilities/stripe/) | read-only Stripe fetch CLI over the REST API — a neutral JSON contract of account activity over a date range (doctor, sync-plan, contract, invoices + hosted-PDF download, balance-transactions, payouts); emits Stripe-domain facts only, every command a read |
 | [SimpleBooks](capabilities/simplbooks/) | drive a SimpleBooks accounting account over its browser session (no public API) — read clients/invoices/expenses/accounts/bank-transactions/kanne, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist; stateful login session, identity-free (account ids resolve from env) |
@@ -81,7 +81,7 @@ Bootstrap installs **one** thing — the `capabilities` manager:
 curl -fsSL https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/install.sh | sh
 ```
 
-- **Install one** → `capabilities install asana` fetches the script into the registry, symlinks it onto `PATH`, snapshots its declaration, and scaffolds credentials per its declared scope. In a consuming project, `capabilities init --codex` wires Codex's generated context compiler (`.codex/config.toml`, `.codex/hooks.json`, manager-owned `.codex/hooks/build-context.sh`, `.codex/generated/`); `capabilities init --claude`, or bare `capabilities init`, wires Claude Code. `capabilities enable asana` makes it visible there.
+- **Install one** → `capabilities install asana` fetches the capability into the registry, symlinks its executable onto `PATH`, snapshots its declaration, and scaffolds credentials per its declared scope. Source-directory installs copy the complete bundle beside the executable. In a consuming project, `capabilities init --codex` wires Codex's generated context compiler (`.codex/config.toml`, `.codex/hooks.json`, manager-owned `.codex/hooks/build-context.sh`, `.codex/generated/`); `capabilities init --claude`, or bare `capabilities init`, wires Claude Code. `capabilities enable asana` makes it visible there.
 - **Package your own** → the convention works on *your* tools, not just this catalogue. `capabilities new` emits the authoring procedure with your context filled in — what you have, whether it should be a capability at all, and how to build a conformant one; `capabilities conform` does the same for a script you already own. Install the result from disk: `capabilities install <name> --from <path>`.
 - **Maintain** → `capabilities update` pulls newer versions, `capabilities uninstall` removes cleanly, `capabilities doctor` reconciles the machine, `capabilities audit <name>` checks a capability against the contract, `capabilities groom <name>` reviews an installed one for drift and dead weight, and `capabilities sanitize <name>` reviews this project's envelope for `<name>` — semantics, placement, ambiguity.
 
@@ -89,13 +89,14 @@ The manager is itself a shebang CLI — one file, `uv run`, no daemon — and ev
 
 ## How it's shaped
 
-The capability **script is the sole shipped artifact** — a single-file CLI that carries its own declaration as verbs:
+The capability **executable is the contract**. Most capabilities are just one self-contained CLI; a capability may also ship a bundle of helper files used by that executable, such as service engines or templates. The project still invokes the CLI on `PATH`; it does not copy engine code.
 
 ```
 capabilities/<capability>/
   bin/<name>          the executable — domain verbs + contract verbs (stub, manifest, guide, ids, refs)
   guides/             upstream guide topics, fetched live by `<name> guide`    (optional)
+  service/            bundled helper/runtime files, if the manifest declares a service
   deviations.md       recorded departures from the standard                    (optional)
 ```
 
-The manager installs the script into the registry (`~/.capabilities/<name>/`), symlinks it onto `PATH`, and snapshots its `stub` + `manifest --json` output. In a consuming project, `.capabilities/` holds the gate and each capability's envelope — connections, identifiers, references, state. Surfacing all of that into a session is the **manager's** job (`capabilities context`), generated per host — Claude Code and Codex are the two generated targets today. Swap the injection for another host's own and the registry plus the CLI-on-PATH route stay identical.
+The manager installs the executable at `~/.capabilities/<name>/<name>`, copies any source-directory bundle into `~/.capabilities/<name>/`, symlinks the executable onto `PATH`, and snapshots its `stub` + `manifest --json` output. In a consuming project, `.capabilities/` holds the gate and each capability's envelope — connections, identifiers, references, state, and any project-local service config. Surfacing all of that into a session is the **manager's** job (`capabilities context`), generated per host — Claude Code and Codex are the two generated targets today. Swap the injection for another host's own and the registry plus the CLI-on-PATH route stay identical.

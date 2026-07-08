@@ -91,6 +91,15 @@ Commands:
                                                Fill transcription placeholders in an
                                                exported JSON via Deepgram (audio
                                                referenced by media.file_path).
+  telegram service init [--connection ID] [--force]
+                                               Create project-local service settings
+                                               and context templates.
+  telegram service doctor|run|start|stop|status|logs
+                                               Manage the bundled Telegram assistant
+                                               service for this project. The engine
+                                               runs from the installed capability
+                                               bundle; the project stores only
+                                               .capabilities/telegram/service config.
 
 Chat references:
   <chat> can be @username, a phone (+1555…), a numeric id, or a chat title
@@ -137,6 +146,7 @@ Quirks worth knowing:
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import io
 import json
@@ -178,9 +188,16 @@ WRITE_VERBS = {"send"}   # the only domain verb that leaves the system — a mes
 WRITE_DEFAULT = False    # a send leaves the system; granted per connection, explicitly
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/telegram/guides/")
-TOPICS = ["message-storage"]   # shipped guide topics
+TOPICS = ["assistant-service", "message-storage"]   # shipped guide topics
 STATE = True       # True when the capability writes session/cache state
 POST_INSTALL: list = []
+SERVICE = {
+    "name": "assistant",
+    "summary": "Project-local Telegram assistant daemon using the bundled service engine.",
+    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
+    "config": ".capabilities/telegram/service",
+    "state": "<connection-state>/service",
+}
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -1529,10 +1546,334 @@ def cmd_transcribe(json_path: str, force: bool, model: str) -> dict:
     }
 
 
+# --- Bundled assistant service ----------------------------------------------
+
+def _manifest_payload() -> dict:
+    payload = {"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL}
+    if SERVICE:
+        payload["service"] = SERVICE
+    return payload
+
+
+def _service_bundle_dir() -> Path:
+    here = Path(__file__).resolve()
+    return here.parent.parent if here.parent.name == "bin" else here.parent
+
+
+def _service_daemon() -> Path:
+    return _service_bundle_dir() / "service" / "daemon.py"
+
+
+def _service_template(name: str) -> Path:
+    return _service_bundle_dir() / "service" / "templates" / name
+
+
+def _json_file(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _service_project_root() -> Path:
+    root = _project_root()
+    if root is None:
+        _die(6, "no_project", "not inside a project",
+             "run from a project, then `capabilities init` before `telegram service init`")
+    return root
+
+
+def _require_service_envelope(root: Path) -> None:
+    if not (root / ".capabilities").is_dir():
+        _die(6, "no_envelope", "no .capabilities envelope in this project",
+             "run `capabilities init` first, then `telegram service init`")
+
+
+def _service_dir(root: Path) -> Path:
+    return root / ".capabilities" / NAME / "service"
+
+
+def _service_settings_path(root: Path) -> Path:
+    return _service_dir(root) / "settings.json"
+
+
+def _service_context_path(root: Path) -> Path:
+    return _service_dir(root) / "context.md"
+
+
+def _service_settings(root: Path) -> dict:
+    data = _json_file(_service_settings_path(root))
+    return data if isinstance(data, dict) else {}
+
+
+def _service_wanted_connection(root: Path, connection_flag: str | None) -> str | None:
+    if connection_flag:
+        return connection_flag
+    value = _service_settings(root).get("connection")
+    return str(value) if value else None
+
+
+def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
+    root = _service_project_root()
+    _require_service_envelope(root)
+    target = _service_dir(root)
+    target.mkdir(parents=True, exist_ok=True)
+    settings_path = _service_settings_path(root)
+    context_path = _service_context_path(root)
+    written = []
+    skipped = []
+
+    if force or not settings_path.exists():
+        settings = json.loads(_service_template("settings.json").read_text())
+        if connection_flag:
+            settings["connection"] = connection_flag
+        settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+        written.append(str(settings_path))
+    else:
+        skipped.append(str(settings_path))
+
+    if force or not context_path.exists():
+        context_path.write_text(_service_template("context.md").read_text())
+        written.append(str(context_path))
+    else:
+        skipped.append(str(context_path))
+
+    return {"initialized": NAME, "project": str(root), "service_dir": str(target),
+            "written": written, "skipped": skipped,
+            "next": [
+                "edit settings.json allowed_users/allowed_groups and worker defaults",
+                "ensure the selected connection has allow_write: true",
+                "run `telegram service doctor`, then `telegram service start`",
+            ]}
+
+
+def _service_session_stem(root: Path, wanted: str | None,
+                          session_flag: str | None) -> tuple[str, Path]:
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    if entry is None:
+        session = session_flag or _resolve_env_key("TELEGRAM_SESSION")[0] or str(DEFAULT_SESSION)
+    else:
+        session = session_flag or entry.get("session") or str(_state_dir() / cid / "session")
+    path = Path(str(session)).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return cid, path
+
+
+def _service_state_dir(root: Path, connection_flag: str | None,
+                       session_flag: str | None) -> tuple[str, dict[str, Path]]:
+    wanted = _service_wanted_connection(root, connection_flag)
+    cid, session = _service_session_stem(root, wanted, session_flag)
+    override = _project_env().get("TELEGRAM_SERVICE_STATE_DIR") \
+        or os.environ.get("TELEGRAM_SERVICE_STATE_DIR")
+    state = (Path(override).expanduser() if override else session.parent / "service")
+    if not state.is_absolute():
+        state = root / state
+    return cid, {
+        "session": session,
+        "state": state,
+        "pid": state / "daemon.pid",
+        "log": state / "daemon.log",
+        "register": state / "register.json",
+        "progress": state / "progress",
+        "worker_sessions": state / "worker-sessions",
+    }
+
+
+def _read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def cmd_service_status(connection_flag: str | None, session_flag: str | None) -> dict:
+    root = _service_project_root()
+    initialized = _service_settings_path(root).exists() and _service_context_path(root).exists()
+    cid, paths = _service_state_dir(root, connection_flag, session_flag)
+    pid = _read_pid(paths["pid"])
+    running = _pid_alive(pid)
+    return {
+        "initialized": initialized,
+        "running": running,
+        "pid": pid if running else None,
+        "stale_pid": bool(pid and not running),
+        "connection": cid,
+        "project": str(root),
+        "daemon": str(_service_daemon()),
+        "settings": str(_service_settings_path(root)),
+        "context": str(_service_context_path(root)),
+        "session": str(paths["session"]),
+        "state_dir": str(paths["state"]),
+        "pid_file": str(paths["pid"]),
+        "log_file": str(paths["log"]),
+        "register": str(paths["register"]),
+        "progress_dir": str(paths["progress"]),
+        "worker_sessions": str(paths["worker_sessions"]),
+    }
+
+
+def _require_service_initialized(root: Path) -> None:
+    _require_service_envelope(root)
+    missing = [str(p) for p in (_service_settings_path(root), _service_context_path(root))
+               if not p.exists()]
+    if missing:
+        _die(6, "service_not_initialized", "telegram service is not initialized",
+             "`telegram service init` creates project-local settings/context; missing: "
+             + ", ".join(missing))
+
+
+def _service_env(root: Path, connection_id: str) -> dict:
+    env = dict(os.environ)
+    env["TELEGRAM_SERVICE_PROJECT_ROOT"] = str(root)
+    env["TELEGRAM_SERVICE_SETTINGS"] = str(_service_settings_path(root))
+    env["TELEGRAM_SERVICE_CONTEXT"] = str(_service_context_path(root))
+    env["TELEGRAM_SERVICE_CONNECTION"] = connection_id
+    env["TELEGRAM_REAL_TELEGRAM"] = str(Path(__file__).resolve())
+    return env
+
+
+def _service_start_result(connection_flag: str | None, session_flag: str | None) -> dict:
+    import subprocess
+    import time
+
+    root = _service_project_root()
+    _require_service_initialized(root)
+    wanted = _service_wanted_connection(root, connection_flag)
+    cfg = _load_config(wanted, session_flag)
+    _write_gate(cfg["id"], cfg["allow_write"], "send")
+    status = cmd_service_status(cfg["id"], session_flag)
+    if status["running"]:
+        status["already_running"] = True
+        return status
+    daemon = _service_daemon()
+    if not daemon.is_file():
+        _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",
+             "reinstall/update telegram from a bundled source directory")
+    cid, paths = _service_state_dir(root, cfg["id"], session_flag)
+    paths["state"].mkdir(parents=True, exist_ok=True)
+    with paths["log"].open("a", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            [str(daemon)], cwd=str(root), env=_service_env(root, cid),
+            stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    paths["pid"].write_text(f"{proc.pid}\n")
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        paths["pid"].unlink(missing_ok=True)
+        tail = []
+        if paths["log"].exists():
+            tail = paths["log"].read_text(errors="replace").splitlines()[-20:]
+        _die(5, "service_start_failed", f"telegram service exited with {proc.returncode}",
+             "\n".join(tail[-8:]) or "check credentials, service settings, and log file")
+    out = cmd_service_status(cid, session_flag)
+    out["started"] = True
+    return out
+
+
+def _service_stop_result(connection_flag: str | None, session_flag: str | None,
+                         timeout: float, force: bool) -> dict:
+    import signal
+    import time
+
+    root = _service_project_root()
+    cid, paths = _service_state_dir(root, connection_flag, session_flag)
+    pid = _read_pid(paths["pid"])
+    if not _pid_alive(pid):
+        if paths["pid"].exists():
+            paths["pid"].unlink(missing_ok=True)
+        return {"stopped": False, "running": False, "connection": cid,
+                "pid": None, "pid_file": str(paths["pid"])}
+    def signal_service(sig: signal.Signals) -> None:
+        try:
+            os.killpg(pid, sig)
+            return
+        except ProcessLookupError:
+            pass
+        except PermissionError as e:
+            _die(6, "service_stop_failed", f"cannot signal service process {pid}: {e}")
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, sig)
+
+    signal_service(signal.SIGTERM)
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            paths["pid"].unlink(missing_ok=True)
+            return {"stopped": True, "running": False, "connection": cid,
+                    "pid": pid, "pid_file": str(paths["pid"])}
+        time.sleep(0.2)
+    if force:
+        signal_service(signal.SIGKILL)
+        paths["pid"].unlink(missing_ok=True)
+        return {"stopped": True, "killed": True, "running": False,
+                "connection": cid, "pid": pid, "pid_file": str(paths["pid"])}
+    _die(5, "service_stop_timeout", f"telegram service did not stop within {timeout:g}s",
+         "retry with `telegram service stop --force`")
+
+
+def cmd_service_logs(connection_flag: str | None, session_flag: str | None,
+                     tail: int) -> dict:
+    root = _service_project_root()
+    cid, paths = _service_state_dir(root, connection_flag, session_flag)
+    if not paths["log"].exists():
+        _die(3, "logs_not_found", f"service log does not exist: {paths['log']}",
+             "`telegram service start` creates it")
+    lines = paths["log"].read_text(errors="replace").splitlines()
+    return {"connection": cid, "log_file": str(paths["log"]),
+            "lines": lines[-max(0, tail):]}
+
+
+def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) -> dict:
+    root = _service_project_root()
+    _require_service_initialized(root)
+    wanted = _service_wanted_connection(root, connection_flag)
+    cfg = _load_config(wanted, session_flag)
+    _write_gate(cfg["id"], cfg["allow_write"], "send")
+    status = cmd_service_status(cfg["id"], session_flag)
+    session_file = Path(cfg["session"] + ".session")
+    status["session_file_exists"] = session_file.exists()
+    return {"ok": status["initialized"] and cfg["allow_write"],
+            "service": status,
+            "connection": cfg["id"],
+            "note": "`telegram doctor` performs the authenticated Telegram round-trip"}
+
+
+def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> None:
+    root = _service_project_root()
+    _require_service_initialized(root)
+    wanted = _service_wanted_connection(root, connection_flag)
+    cfg = _load_config(wanted, session_flag)
+    _write_gate(cfg["id"], cfg["allow_write"], "send")
+    daemon = _service_daemon()
+    if not daemon.is_file():
+        _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",
+             "reinstall/update telegram from a bundled source directory")
+    os.execvpe(str(daemon), [str(daemon)], _service_env(root, cfg["id"]))
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def main() -> None:
     _gate()                      # every verb passes the project gate first
+    if (sys.argv[1:2] or [""])[0] == "manifest":
+        _emit(_manifest_payload())
+        return
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
     p = argparse.ArgumentParser(
         prog="telegram",
@@ -1593,6 +1934,22 @@ def main() -> None:
     pt.add_argument("--force", action="store_true", help="re-transcribe even if already filled")
     pt.add_argument("--model", default="nova-3", help="Deepgram model (default: nova-3)")
 
+    psvc = sub.add_parser("service", help="manage the bundled assistant service")
+    svc = psvc.add_subparsers(dest="service_cmd", required=True)
+    svc.add_parser("init", help="create project-local service settings/context")
+    svc_init = svc.choices["init"]
+    svc_init.add_argument("--force", action="store_true",
+                          help="overwrite existing service settings/context")
+    svc.add_parser("start", help="start the assistant service in the background")
+    stop = svc.add_parser("stop", help="stop the assistant service")
+    stop.add_argument("--timeout", type=float, default=10.0)
+    stop.add_argument("--force", action="store_true")
+    svc.add_parser("status", help="show local service status")
+    logs = svc.add_parser("logs", help="tail the service log")
+    logs.add_argument("--tail", type=int, default=80)
+    svc.add_parser("doctor", help="local service readiness check")
+    svc.add_parser("run", help="run the assistant service in the foreground")
+
     # `--connection <id>` selects a connection; `--session <PATH>` overrides the
     # session-file path. Both are global, accepted anywhere on the line (extracted
     # before argparse so they work after the subcommand). `--session` is the flag
@@ -1624,6 +1981,23 @@ def main() -> None:
         return
     if args.cmd == "transcribe":      # connection-independent: a local file + Deepgram
         _emit(cmd_transcribe(args.json_path, args.force, args.model))
+        return
+    if args.cmd == "service":
+        if args.service_cmd == "init":
+            _emit(cmd_service_init(connection_flag, args.force))
+        elif args.service_cmd == "start":
+            _emit(_service_start_result(connection_flag, session_flag))
+        elif args.service_cmd == "stop":
+            _emit(_service_stop_result(connection_flag, session_flag,
+                                       args.timeout, args.force))
+        elif args.service_cmd == "status":
+            _emit(cmd_service_status(connection_flag, session_flag))
+        elif args.service_cmd == "logs":
+            _emit(cmd_service_logs(connection_flag, session_flag, args.tail))
+        elif args.service_cmd == "doctor":
+            _emit(cmd_service_doctor(connection_flag, session_flag))
+        elif args.service_cmd == "run":
+            cmd_service_run(connection_flag, session_flag)
         return
 
     cfg = _load_config(connection_flag, session_flag)

@@ -1,12 +1,12 @@
 # The shebang CLI
 
-What a capability's **executable** is comprised of — the code shape every `bin/<name>` fills. The script is the capability's **sole distributed artifact**: one self-contained file carrying its domain verbs and the **contract verbs** that make it self-describing and self-gating. This file is the contract's specification — the verbs and their output shapes, the shared code patterns (the project walk, the gate, the credential cascade, connection selection, state resolution), the I/O envelope, and the exit codes. The behavioural invariants — the credential cascade, identity-freedom, discoverable knowledge, host-neutrality — and how to validate them live in the doctrine ([DOCTRINE.md](DOCTRINE.md)); this file holds the **code patterns that realize them**, distilled from the CLIs that already embody them so a new executable slots in without re-deriving the house style.
+What a capability's **executable** is comprised of — the code shape every `bin/<name>` fills. The executable is the capability's public contract: one self-contained CLI carrying its domain verbs and the **contract verbs** that make it self-describing and self-gating. A capability may also ship a bundle of helper files beside the executable, but those helpers are reached through the CLI's declared surface, not copied into consuming projects as engine code. This file is the contract's specification — the verbs and their output shapes, the shared code patterns (the project walk, the gate, the credential cascade, connection selection, state resolution), the I/O envelope, and the exit codes. The behavioural invariants — the credential cascade, identity-freedom, discoverable knowledge, host-neutrality — and how to validate them live in the doctrine ([DOCTRINE.md](DOCTRINE.md)); this file holds the **code patterns that realize them**, distilled from the CLIs that already embody them so a new executable slots in without re-deriving the house style.
 
 A capability's CLI is the **only** thing a consuming project runs — symlinked onto `PATH` by the manager, knowing nothing of hosts or sibling capabilities — so its surface, its contract, and its failure behaviour are the capability's public API. The patterns below are what make that API uniform across every tool an agent picks up.
 
-## One file, `uv run`, PEP-723
+## One executable, `uv run`, PEP-723
 
-The executable is a single script with its dependencies declared inline, run by `uv` with no venv to provision and no install step. Every CLI opens identically:
+The executable is a single script with its dependencies declared inline, run by `uv` with no venv to provision and no install step. Most capabilities stop there. When a capability needs helper assets, templates, or a service engine, those ship as an installed bundle beside the executable; the executable remains the stable contract and dispatch point. Every CLI opens identically:
 
 ```python
 #!/usr/bin/env -S uv run --script
@@ -51,6 +51,7 @@ DOCS_BASE = "https://raw.githubusercontent.com/<org>/capabilities/main/capabilit
 TOPICS = ["authoring", "boards"]    # [] when no guides ship; DOCS_BASE "" likewise
 STATE = False       # True when the capability writes session/cache state
 POST_INSTALL = []   # [{"cmd": …, "note": …}] steps the manager offers at install
+SERVICE = None      # or {"name", "summary", "verbs", ...} when a bundled service ships
 ```
 
 ## Agent-first help is the surface
@@ -101,7 +102,12 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
     "topics": ["authoring", "boards"]
   },
   "state": false,
-  "post_install": []
+  "post_install": [],
+  "service": {
+    "name": "assistant",
+    "summary": "Project-local assistant daemon using the bundled service engine.",
+    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"]
+  }
 }
 ```
 
@@ -114,6 +120,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `docs.topics` | The shipped topic list; `[]` when no guides ship. |
 | `state` | `true` declares the capability writes session/cache state (see [state](#state)). |
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
+| `service` *(optional)* | Conservative metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns the detailed lifecycle contract, usually under `<name> service ...`. |
 
 ## Guides
 
@@ -137,6 +144,7 @@ Everything the capability reads and writes in a consuming project lives under `.
   identifiers.json    # the identifiers envelope, managed by the ids verbs
   reference/          # the single home for references — one front-matter .md per topic
     *.md              # front-matter envelope + free prose, surfaced by `<name> refs`
+  service/            # project-local config/policy for a bundled service, if any
   state/              # capability-written; never committed
 ```
 

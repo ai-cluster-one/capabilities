@@ -1,0 +1,33 @@
+{
+  "connection": null,
+  "assistant_name": "Assistant",
+  "direct_messages": {
+    "mode": "allowed_users",
+    "default_role": "direct_user"
+  },
+  "allowed_users": {},
+  "allowed_groups": {},
+  "defaults": {
+    "tail_size": 40,
+    "debounce": 5,
+    "worker_timeout": 120,
+    "progress_after": 15,
+    "max_parallel_jobs": 2,
+    "group_aliases": ["Assistant"],
+    "worker": "stub",
+    "workers": {
+      "claude": {
+        "model": null,
+        "effort": null
+      },
+      "codex": {
+        "model": null,
+        "reasoning_effort": null,
+        "service_tier": null
+      },
+      "stub": {
+        "model": null
+      }
+    }
+  }
+}

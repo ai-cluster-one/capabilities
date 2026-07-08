@@ -9,6 +9,7 @@ credentials.env
 # Deliberately reference the cross-project conversations that produced them;
 # kept local so the public repo never ships those specifics.
 .assets/
+.claude/askproject/
 
 # OS / editor cruft
 .DS_Store
