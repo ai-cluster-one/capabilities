@@ -37,8 +37,9 @@ MACHINE VERBS
         post-install steps (--yes runs them), regenerate the skill.
         --from accepts: a script file, a bundle directory holding <name> or
         bin/<name>, a repo directory holding capabilities/<name>/bin/<name>, or
-        a URL. Source directories install the complete bundle, excluding
-        bytecode/cache files. Default source is the catalogue script.
+        a URL. Source directories, and script paths inside source directories,
+        install the complete bundle, excluding bytecode/cache files. Default
+        catalogue sources install from the public repo bundle when available.
   uninstall <name> [--purge-credentials]
         Remove the PATH symlink and the registry entry; regenerate the skill.
         Credentials are kept and reported; --purge-credentials deletes the
@@ -131,6 +132,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 from typing import NoReturn
@@ -466,8 +468,81 @@ def _bundle_script(bundle: Path, name: str) -> Path | None:
     return None
 
 
-def _resolve_source(name: str, from_ref: str | None) -> tuple[bytes, str, Path | None]:
-    """Return (script bytes, recorded source string, bundle dir if local)."""
+def _enclosing_bundle_for_script(script: Path, name: str) -> Path | None:
+    """The bundle directory that owns a script path, when it matches the layout."""
+    if script.name != name:
+        return None
+    candidates: list[Path] = []
+    if script.parent.name == "bin":
+        candidates.append(script.parent.parent)
+    candidates.append(script.parent)
+    for bundle in candidates:
+        cand = _bundle_script(bundle, name)
+        if cand is not None and cand.resolve() == script.resolve():
+            return bundle
+    return None
+
+
+def _catalogue_archive_url(name: str, script_url: str) -> str | None:
+    pattern = (
+        rf"^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/"
+        rf"capabilities/{re.escape(name)}/bin/{re.escape(name)}$"
+    )
+    m = re.match(pattern, script_url.rstrip("/"))
+    if not m:
+        return None
+    owner, repo, ref = m.groups()
+    return f"https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}"
+
+
+def _extract_tar_safely(archive: Path, dest: Path) -> None:
+    root = dest.resolve()
+    with tarfile.open(archive, "r:gz") as tf:
+        for member in tf.getmembers():
+            target = (dest / member.name).resolve()
+            if target != root and root not in target.parents:
+                _die(5, "server_error", f"archive member escapes target: {member.name}")
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                src = tf.extractfile(member)
+                if src is None:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("wb") as out:
+                    shutil.copyfileobj(src, out)
+                os.chmod(target, member.mode & 0o777)
+
+
+def _fetch_catalogue_bundle(name: str, script_url: str) -> tuple[bytes, Path, Path] | None:
+    archive_url = _catalogue_archive_url(name, script_url)
+    if archive_url is None:
+        return None
+    tmp_root = Path(tempfile.mkdtemp(prefix="capabilities-bundle-"))
+    try:
+        try:
+            resp = httpx.get(archive_url, follow_redirects=True, timeout=60.0)
+        except httpx.HTTPError as e:
+            _die(5, "network_error", f"fetch failed: {e}", archive_url)
+        if resp.status_code != 200:
+            _die(5, "server_error", f"fetch returned {resp.status_code}", archive_url)
+        archive = tmp_root / "repo.tar.gz"
+        archive.write_bytes(resp.content)
+        _extract_tar_safely(archive, tmp_root)
+        for root in sorted(p for p in tmp_root.iterdir() if p.is_dir()):
+            bundle = root / "capabilities" / name
+            cand = _bundle_script(bundle, name)
+            if cand is not None:
+                return cand.read_bytes(), tmp_root, bundle
+        _die(3, "not_found", f"no bundled capability {name!r} in catalogue archive",
+             archive_url)
+    except BaseException:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        raise
+
+
+def _resolve_source(name: str, from_ref: str | None) -> tuple[bytes, str, Path | None, Path | None]:
+    """Return (script bytes, recorded source string, bundle dir, temp root)."""
     if from_ref and not re.match(r"^https?://", from_ref):
         p = Path(from_ref).expanduser().resolve()
         if p.is_dir():
@@ -478,13 +553,20 @@ def _resolve_source(name: str, from_ref: str | None) -> tuple[bytes, str, Path |
             for bundle in bundles:
                 cand = _bundle_script(bundle, name)
                 if cand is not None:
-                    return cand.read_bytes(), str(bundle), bundle
+                    return cand.read_bytes(), str(bundle), bundle, None
             _die(3, "not_found", f"no script for {name!r} under {p}",
                  f"expected {name}, bin/{name}, or capabilities/{name}/bin/{name}")
         if p.is_file():
-            return p.read_bytes(), str(p), None
+            bundle = _enclosing_bundle_for_script(p, name)
+            if bundle is not None:
+                return p.read_bytes(), str(bundle), bundle, None
+            return p.read_bytes(), str(p), None, None
         _die(3, "not_found", f"--from path does not exist: {p}")
     url = from_ref or f"{SOURCE}/capabilities/{name}/bin/{name}"
+    bundle = _fetch_catalogue_bundle(name, url)
+    if bundle is not None:
+        content, tmp_root, bundle_dir = bundle
+        return content, url, bundle_dir, tmp_root
     try:
         resp = httpx.get(url, follow_redirects=True, timeout=30.0)
     except httpx.HTTPError as e:
@@ -493,7 +575,7 @@ def _resolve_source(name: str, from_ref: str | None) -> tuple[bytes, str, Path |
         _die(3, "not_found", f"no such capability in the catalogue: {name}", url)
     if resp.status_code != 200:
         _die(5, "server_error", f"fetch returned {resp.status_code}", url)
-    return resp.content, url, None
+    return resp.content, url, None, None
 
 
 def _install_payload(name: str, content: bytes, bundle_dir: Path | None) -> Path:
@@ -507,6 +589,25 @@ def _install_payload(name: str, content: bytes, bundle_dir: Path | None) -> Path
     script.write_bytes(content)
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return script
+
+
+def _install_resolved_payload(name: str, content: bytes, bundle_dir: Path | None,
+                              temp_root: Path | None) -> Path:
+    try:
+        return _install_payload(name, content, bundle_dir)
+    finally:
+        if temp_root is not None:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def _validate_installed_payload(name: str, manifest: dict) -> None:
+    reg = _registry_dir(name)
+    if manifest.get("service") is not None and not (reg / "service").is_dir():
+        shutil.rmtree(reg, ignore_errors=True)
+        _die(6, "service_bundle_missing",
+             f"{name}: manifest declares a service but service/ was not installed",
+             "reinstall/update from a bundled source; public catalogue sources should "
+             "install the full capability bundle")
 
 
 def _payload_sha256(reg: Path) -> str:
@@ -576,10 +677,11 @@ def _scaffold_credentials(name: str, manifest: dict) -> list[str]:
 
 
 def cmd_install(name: str, from_ref: str | None, yes: bool) -> None:
-    content, source, bundle_dir = _resolve_source(name, from_ref)
+    content, source, bundle_dir, temp_root = _resolve_source(name, from_ref)
     reg = _registry_dir(name)
-    script = _install_payload(name, content, bundle_dir)
+    script = _install_resolved_payload(name, content, bundle_dir, temp_root)
     manifest = _snapshot(name, script)
+    _validate_installed_payload(name, manifest)
     _write_json(reg / "meta.json", {
         "name": name, "source": source, "source_type": "directory" if bundle_dir else "script",
         "sha256": _sha256(script), "payload_sha256": _payload_sha256(reg),
@@ -646,9 +748,10 @@ def cmd_update(name: str | None) -> None:
         before = meta.get("payload_sha256")
         if before is None and _script_path(n).exists():
             before = _sha256(_script_path(n))
-        content, source, bundle_dir = _resolve_source(n, source)
-        script = _install_payload(n, content, bundle_dir)
+        content, source, bundle_dir, temp_root = _resolve_source(n, source)
+        script = _install_resolved_payload(n, content, bundle_dir, temp_root)
         manifest = _snapshot(n, script)
+        _validate_installed_payload(n, manifest)
         after = _payload_sha256(_registry_dir(n))
         _write_json(_registry_dir(n) / "meta.json", {
             "name": n, "source": source, "source_type": "directory" if bundle_dir else "script",

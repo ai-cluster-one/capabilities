@@ -1571,6 +1571,14 @@ def _service_template(name: str) -> Path:
     return _service_bundle_dir() / "service" / "templates" / name
 
 
+def _require_service_bundle_files(*paths: Path) -> None:
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        _die(3, "service_bundle_missing", "bundled telegram service files are missing",
+             "reinstall/update telegram from a bundled source directory; missing: "
+             + ", ".join(missing))
+
+
 def _json_file(path: Path):
     try:
         return json.loads(path.read_text())
@@ -1619,6 +1627,9 @@ def _service_wanted_connection(root: Path, connection_flag: str | None) -> str |
 def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     root = _service_project_root()
     _require_service_envelope(root)
+    settings_template = _service_template("settings.json")
+    context_template = _service_template("context.md")
+    _require_service_bundle_files(settings_template, context_template)
     target = _service_dir(root)
     target.mkdir(parents=True, exist_ok=True)
     settings_path = _service_settings_path(root)
@@ -1627,7 +1638,7 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     skipped = []
 
     if force or not settings_path.exists():
-        settings = json.loads(_service_template("settings.json").read_text())
+        settings = json.loads(settings_template.read_text())
         if connection_flag:
             settings["connection"] = connection_flag
         settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
@@ -1636,7 +1647,7 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
         skipped.append(str(settings_path))
 
     if force or not context_path.exists():
-        context_path.write_text(_service_template("context.md").read_text())
+        context_path.write_text(context_template.read_text())
         written.append(str(context_path))
     else:
         skipped.append(str(context_path))
