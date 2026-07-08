@@ -6,13 +6,20 @@
 # ]
 # ///
 """
-askproject — ask a Claude Code agent running in ANOTHER project to answer in
-its own context, then return its answer plus traceability to the caller.
+askproject — ask a coding agent running in ANOTHER project to answer in its own
+context, then return its answer plus traceability to the caller.
 
 This tool is designed to be invoked BY an agent (you), from inside your own
-project. It spawns a headless `claude -p` in a target project's directory, so
-that peer loads the target's CLAUDE.md / settings / rights and answers as that
-project — then hands back the answer with cost, token, and files-changed data.
+project. It spawns a headless peer agent in a target project's directory, so
+that peer loads the target's project context (Claude reads CLAUDE.md, Codex
+reads AGENTS.md) / settings / rights and answers as that project — then hands
+back the answer with cost, token, and files-changed data.
+
+Two engines drive the peer, selected with `--engine`:
+  claude (default)  headless `claude -p`; mode picks the model (haiku/sonnet).
+  codex             headless `codex exec`; uses your ~/.codex/config.toml model
+                    (the newest) unless you pass --model. No USD cost is
+                    reported under ChatGPT auth, so cost_usd stays null.
 
 Run `askproject help` to (re)load this contract on demand — do not rely on
 memorised knowledge of its surface.
@@ -32,19 +39,24 @@ your cwd. YOU decide which project to talk to and pass its path. It must be a
 directory (a git repo is strongly recommended — see snapshots below).
 
 ────────────────────────────────────────────────────────────────────────────
-MODES & MODELS  (model is auto-picked from mode; override with --model)
-  read  (default)   Peer gets ONLY Read/Glob/Grep + plan mode. It physically
-                    cannot edit, write, or run shell — pure research. Model:
-                    haiku (cheap). Use for "what does X do", "find Y", reviews.
-  act   (--act)     Peer gets bypassPermissions + the target as an --add-dir.
-                    It can edit, run tests, commit, and push from inside the
-                    target project without permission prompts. Model: sonnet.
-                    Use for "fix X", "audit and commit", "refactor".
+MODES  (the fence; how each engine implements it differs)
+  read  (default)   Pure research. claude: ONLY Read/Glob/Grep + plan mode.
+                    codex: an OS read-only sandbox (sandbox_mode=read-only) —
+                    it may run read-only shell but cannot write. Model on
+                    claude: haiku (cheap). Use for "what does X do", reviews.
+  act   (--act)     Peer can edit, run tests, commit, and push from inside the
+                    target project without prompts. claude: bypassPermissions +
+                    target as --add-dir. codex: bypass approvals + sandbox.
+                    Model on claude: sonnet. Use for "fix X", "refactor".
 
-FENCING REALITY: flags are behavioural, not an OS sandbox. read mode is a hard
-"no tools to do harm" fence. act mode intentionally removes Claude's permission
-prompts so the peer can complete build work end-to-end. The prompt and the git
-snapshot (below) are your safety net. A true OS sandbox is future work.
+MODELS: on claude the mode auto-picks the model (override with --model); on
+codex no model is forced — it uses your ~/.codex/config.toml default (the
+newest) unless --model is given.
+
+FENCING REALITY: read mode is a hard fence (claude has no harmful tools; codex
+runs in an OS read-only sandbox). act mode intentionally drops the peer's
+prompts so it can complete build work end-to-end. The prompt and the git
+snapshot (below) are your safety net.
 
 ────────────────────────────────────────────────────────────────────────────
 SESSION CONTINUITY  (state is LOCAL to the project you call from)
@@ -65,8 +77,8 @@ SESSION CONTINUITY  (state is LOCAL to the project you call from)
 OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   {
     "ok": bool, "error": str|null,
-    "target": "<abs path>", "mode": "read|act",
-    "model": "<model id>", "session_id": "<uuid>", "resumed": bool,
+    "target": "<abs path>", "engine": "claude|codex", "mode": "read|act",
+    "model": "<model id>|null", "session_id": "<uuid>", "resumed": bool,
     "answer": <string OR parsed object when --schema is used>,
     "cost_usd": float, "duration_ms": int, "num_turns": int,
     "tokens": {input, output, cache_read, cache_creation},
@@ -78,12 +90,16 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   flagged loudly (a read query should never mutate).
 
 FLAGS
-  --act                 Modification mode (bypassPermissions + sonnet).
+  --engine <claude|codex>  Which peer engine to spawn (default: claude, or
+                        $ASKPROJECT_ENGINE). A -c resume adopts the session's
+                        own engine — a codex thread can't be resumed by claude.
+  --act                 Modification mode (bypass prompts; sonnet on claude).
   -c, --continue        Resume the last session for this target.
-  --fork                Reserved; current Claude CLI has no non-interactive
-                        fork flag, so this exits with a controlled error.
-  --model <m>           Override the model (`haiku`/`sonnet`/`opus` aliases are
-                        resolved by askproject to known-good full ids).
+  --fork                Reserved; neither headless CLI has a non-interactive
+                        fork, so this exits with a controlled error.
+  --model <m>           Override the model. On claude the `haiku`/`sonnet`/
+                        `opus` aliases resolve to known-good full ids; on codex
+                        the value is passed straight to `codex -m`.
   --schema <file|json>  Pass a JSON Schema to constrain the peer's answer;
                         `answer` is then the parsed object.
   --timeout <seconds>   Kill the peer after N seconds (default 600).
@@ -92,14 +108,15 @@ FLAGS
   --append <text>       Extra instruction appended to the peer's system prompt.
 
 EXAMPLES
-  askproject ../simplbooks "Which file defines the VAT regime taxonomy?"
+  askproject ../shop "Which file defines the pricing taxonomy?"
   askproject ~/dev/api --act "Add a --json flag to the export command"
-  askproject ../simplbooks -c "And where is it consumed?"
+  askproject ../shop -c "And where is it consumed?"
+  askproject ../shop --engine codex "Trace the checkout flow end to end"
 
 ────────────────────────────────────────────────────────────────────────────
 CONTRACT  (self-description an agent loads on demand; this capability has NO
-           connections — it drives the local `claude` CLI, with no credentials)
-  askproject doctor        Readiness — confirms the `claude` CLI is on PATH.
+           connections — it drives the local `claude`/`codex` CLI, no creds)
+  askproject doctor        Readiness — reports which engine CLIs are on PATH.
   askproject stub          One-line awareness text.
   askproject manifest      Machine-readable declaration (JSON).
   askproject guide [topic] How-to guides — `capability-changes`.
@@ -121,9 +138,9 @@ from typing import NoReturn
 
 NAME = "askproject"
 PROTOCOL = 2
-SUMMARY = ("Bridge to a Claude Code agent in ANOTHER project — spawn a headless "
-           "`claude -p` in a target project, fenced by mode (read/act/bypass), "
-           "and return its answer with cost, token, and files-changed traceability.")
+SUMMARY = ("Bridge to a coding agent in ANOTHER project — spawn a headless peer "
+           "(claude or codex) in a target project, fenced by mode (read/act), and "
+           "return its answer with cost, token, and files-changed traceability.")
 SCOPE = "user"      # credential scope: "project" | "user"
 CRED_KEYS: list = []   # no credentials — it drives the local `claude` CLI on PATH
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
@@ -136,6 +153,11 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CREDENTIALS_ENV = _CONFIG_HOME / "askproject" / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
+ENGINES = ("claude", "codex")
+DEFAULT_ENGINE = "claude"
+
+# claude: the mode auto-picks the model; these aliases resolve to full ids.
+# codex: no model is forced — it falls back to ~/.codex/config.toml (the newest).
 READ_MODEL = "claude-haiku-4-5-20251001"
 ACT_MODEL = "claude-sonnet-4-5-20250929"
 MODEL_ALIASES = {
@@ -560,6 +582,15 @@ def resolve_model(model: str) -> str:
     return MODEL_ALIASES.get(model, model)
 
 
+def _default_engine() -> str:
+    """Engine when --engine is not passed: $ASKPROJECT_ENGINE (project .env or
+    process env), else the built-in default. An unknown value falls back."""
+    v = (_project_env().get("ASKPROJECT_ENGINE")
+         or os.environ.get("ASKPROJECT_ENGINE")
+         or DEFAULT_ENGINE).strip().lower()
+    return v if v in ENGINES else DEFAULT_ENGINE
+
+
 def build_preamble(mode: str, caller: str, extra: str | None,
                    schema_text: str | None = None) -> str:
     base = (
@@ -570,12 +601,12 @@ def build_preamble(mode: str, caller: str, extra: str | None,
     )
     if mode == "read":
         base += (
-            "This is a READ-ONLY research query — you have no tools to modify "
-            "anything; do not attempt to."
+            "This is a READ-ONLY research query — your environment forbids any "
+            "modification (no writes, edits, or state changes); do not attempt them."
         )
     else:
         base += (
-            "You are running with bypassPermissions inside THIS target project. "
+            "You are running with full write access inside THIS target project. "
             "Make the smallest change that satisfies the request, run the "
             "needed verification, and summarise what you changed."
         )
@@ -589,75 +620,40 @@ def build_preamble(mode: str, caller: str, extra: str | None,
     return base
 
 
-def run(args):
-    text_only = args.text
-    as_json = not text_only
+# --- engines -----------------------------------------------------------------
+# Each engine turns (target, prompt, mode, model, resume) into ONE normalized
+# dict so run() stays engine-blind:
+#   {answer, session_id, model, cost_usd, duration_ms, num_turns,
+#    tokens:{input,output,cache_read,cache_creation}, is_error, permission_denials}
 
-    if not shutil.which("claude"):
-        die("`claude` CLI not found on PATH", as_json=as_json)
-
-    target = Path(args.target).expanduser()
-    if not target.is_absolute():
-        target = (Path.cwd() / target).resolve()
-    if not target.is_dir():
-        die(f"target is not a directory: {target}", as_json=as_json)
-
-    mode = "act" if args.act else "read"
-    model = resolve_model(args.model or (ACT_MODEL if mode == "act" else READ_MODEL))
-    caller = find_project_root(Path.cwd()).name
-
-    state = load_state()
-    key = str(target)
-    entry = state.get(key, {})
-
-    cmd = ["claude", "-p", args.prompt, "--output-format", "json", "--model", model]
-
-    # resume / continuity
-    resumed = False
-    if args.cont:
-        last = entry.get("last_session_id")
-        if not last:
-            die(f"no prior session for {target}; run without -c first",
-                as_json=as_json)
-        if args.fork:
-            die("--fork is not supported by the current Claude CLI in headless mode",
-                as_json=as_json)
-        cmd += ["--resume", last]
-        resumed = True
-
-    # mode → permissions / tools
+def run_claude(target, prompt, mode, model, caller, append,
+               schema_text, resume_id, timeout, as_json) -> dict:
+    """Headless `claude -p --output-format json`. Schema is injected into the
+    peer's system prompt and the reply parsed from result/structured_output."""
+    cmd = ["claude", "-p", prompt, "--output-format", "json", "--model", model]
+    if resume_id:
+        cmd += ["--resume", resume_id]
     if mode == "read":
         cmd += ["--allowedTools", "Read,Glob,Grep", "--permission-mode", "plan"]
     else:
         cmd += ["--permission-mode", "bypassPermissions", "--add-dir", str(target)]
-
-    schema_text = resolve_schema(args.schema) if args.schema else None
-    cmd += ["--append-system-prompt", build_preamble(mode, caller, args.append, schema_text)]
-
-    before = snapshot(target)
+    cmd += ["--append-system-prompt", build_preamble(mode, caller, append, schema_text)]
 
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(target), capture_output=True, text=True,
-            timeout=args.timeout,
-        )
+        proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
+                              text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        die(f"peer timed out after {args.timeout}s", as_json=as_json)
-
+        die(f"peer timed out after {timeout}s", as_json=as_json)
     if proc.returncode != 0:
         snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
         die(f"peer exited {proc.returncode}: {snippet}", as_json=as_json)
-
     try:
         env = json.loads(proc.stdout)
     except json.JSONDecodeError:
         die(f"could not parse peer output: {proc.stdout[:800]}", as_json=as_json)
 
-    after = snapshot(target)
-    files_changed, dirty_before = diff_snapshots(before, after)
-
     answer = env.get("result", "")
-    if args.schema:
+    if schema_text:
         # structured output may arrive parsed in `structured_output`, or as a
         # JSON string in `result` depending on harness version — handle both.
         if env.get("structured_output") is not None:
@@ -667,11 +663,179 @@ def run(args):
                 answer = json.loads(answer)
             except json.JSONDecodeError:
                 pass
-
-    session_id = env.get("session_id")
     usage = env.get("usage", {}) or {}
+    return {
+        "answer": answer,
+        "session_id": env.get("session_id"),
+        "model": model,
+        "cost_usd": env.get("total_cost_usd"),
+        "duration_ms": env.get("duration_ms"),
+        "num_turns": env.get("num_turns"),
+        "tokens": {
+            "input": usage.get("input_tokens"),
+            "output": usage.get("output_tokens"),
+            "cache_read": usage.get("cache_read_input_tokens"),
+            "cache_creation": usage.get("cache_creation_input_tokens"),
+        },
+        "is_error": bool(env.get("is_error", False)),
+        "permission_denials": env.get("permission_denials", []),
+    }
 
-    ok = not env.get("is_error", False)
+
+def _parse_codex_events(stdout: str) -> tuple[dict, str | None, bool]:
+    """Pull usage + thread id (+ any failure) out of codex's --json JSONL."""
+    usage: dict = {}
+    thread_id = None
+    is_error = False
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        t = o.get("type")
+        if t == "turn.completed":
+            usage = o.get("usage") or usage
+        elif t == "thread.started":
+            thread_id = o.get("thread_id") or thread_id
+        elif t in ("turn.failed", "error"):
+            is_error = True
+    return usage, thread_id, is_error
+
+
+def run_codex(target, prompt, mode, model, caller, append,
+              schema_text, resume_id, timeout, as_json) -> dict:
+    """Headless `codex exec`. codex has no system-prompt flag, so the peer
+    preamble is folded into the prompt; the final message is read from -o and
+    usage/thread id from the --json JSONL. Schema uses codex's native
+    --output-schema. No USD cost under ChatGPT auth → cost_usd stays null."""
+    import tempfile
+    prompt = build_preamble(mode, caller, append, None) + "\n\n" + prompt
+    out_fd, outfile = tempfile.mkstemp(prefix="askproject-codex-", suffix=".txt")
+    os.close(out_fd)
+    schema_file = None
+    try:
+        cmd = ["codex", "exec"]
+        if resume_id:
+            cmd += ["resume", resume_id]
+        cmd += [prompt, "--skip-git-repo-check", "--json", "-o", outfile]
+        if mode == "read":
+            # -s/--sandbox is absent on `resume`; the config override works on
+            # both the fresh and resume paths and genuinely blocks writes.
+            cmd += ["-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
+        else:
+            cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+        if model:
+            cmd += ["-m", model]
+        if schema_text:
+            s_fd, schema_file = tempfile.mkstemp(prefix="askproject-schema-", suffix=".json")
+            os.close(s_fd)
+            Path(schema_file).write_text(schema_text)
+            cmd += ["--output-schema", schema_file]
+
+        try:
+            proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
+                                  text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            die(f"peer timed out after {timeout}s", as_json=as_json)
+        if proc.returncode != 0:
+            snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
+            die(f"peer exited {proc.returncode}: {snippet}", as_json=as_json)
+
+        answer = Path(outfile).read_text().strip()
+        usage, thread_id, evt_error = _parse_codex_events(proc.stdout)
+        if schema_text and answer:
+            try:
+                answer = json.loads(answer)
+            except json.JSONDecodeError:
+                pass
+    finally:
+        for f in (outfile, schema_file):
+            if f:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+
+    return {
+        "answer": answer,
+        "session_id": thread_id,
+        "model": model,
+        "cost_usd": None,
+        "duration_ms": None,
+        "num_turns": None,
+        "tokens": {
+            "input": usage.get("input_tokens"),
+            "output": usage.get("output_tokens"),
+            "cache_read": usage.get("cached_input_tokens"),
+            "cache_creation": None,
+        },
+        "is_error": bool(evt_error or not answer),
+        "permission_denials": [],
+    }
+
+
+ENGINE_RUNNERS = {"claude": run_claude, "codex": run_codex}
+
+
+def run(args):
+    text_only = args.text
+    as_json = not text_only
+
+    target = Path(args.target).expanduser()
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+    if not target.is_dir():
+        die(f"target is not a directory: {target}", as_json=as_json)
+
+    mode = "act" if args.act else "read"
+    caller = find_project_root(Path.cwd()).name
+
+    state = load_state()
+    key = str(target)
+    entry = state.get(key, {})
+
+    # engine selection: explicit --engine > env/default. A -c resume adopts the
+    # session's own engine (a codex thread can't be resumed by claude).
+    resumed = False
+    resume_id = None
+    if args.cont:
+        stored_engine = entry.get("engine") or "claude"
+        if args.engine and args.engine != stored_engine:
+            die(f"cannot resume {target} with {args.engine}: the last session "
+                f"used {stored_engine}", as_json=as_json)
+        engine = args.engine or stored_engine
+        resume_id = entry.get("last_session_id")
+        if not resume_id:
+            die(f"no prior session for {target}; run without -c first", as_json=as_json)
+        if args.fork:
+            die("--fork is not supported in headless mode", as_json=as_json)
+        resumed = True
+    else:
+        engine = args.engine or _default_engine()
+
+    if not shutil.which(engine):
+        die(f"`{engine}` CLI not found on PATH", as_json=as_json)
+
+    if engine == "claude":
+        model = resolve_model(args.model or (ACT_MODEL if mode == "act" else READ_MODEL))
+    else:
+        model = args.model or None   # codex: fall back to its config default (newest)
+
+    schema_text = resolve_schema(args.schema) if args.schema else None
+
+    before = snapshot(target)
+    res = ENGINE_RUNNERS[engine](target, args.prompt, mode, model, caller,
+                                 args.append, schema_text, resume_id,
+                                 args.timeout, as_json)
+    after = snapshot(target)
+    files_changed, dirty_before = diff_snapshots(before, after)
+
+    answer = res["answer"]
+    session_id = res["session_id"]
+    ok = not res["is_error"]
     err = None
     if mode == "read" and files_changed:
         ok = False
@@ -680,7 +844,8 @@ def run(args):
     # persist session mapping (local to the initiating project)
     if session_id:
         entry["last_session_id"] = session_id
-        entry["last_model"] = model
+        entry["last_model"] = res.get("model")
+        entry["engine"] = engine
         entry["interactions"] = entry.get("interactions", 0) + 1
         state[key] = entry
         save_state(state)
@@ -694,20 +859,16 @@ def run(args):
         "ok": ok,
         "error": err,
         "target": str(target),
+        "engine": engine,
         "mode": mode,
-        "model": model,
+        "model": res.get("model"),
         "session_id": session_id,
         "resumed": resumed,
         "answer": answer,
-        "cost_usd": env.get("total_cost_usd"),
-        "duration_ms": env.get("duration_ms"),
-        "num_turns": env.get("num_turns"),
-        "tokens": {
-            "input": usage.get("input_tokens"),
-            "output": usage.get("output_tokens"),
-            "cache_read": usage.get("cache_read_input_tokens"),
-            "cache_creation": usage.get("cache_creation_input_tokens"),
-        },
+        "cost_usd": res.get("cost_usd"),
+        "duration_ms": res.get("duration_ms"),
+        "num_turns": res.get("num_turns"),
+        "tokens": res.get("tokens", {}),
         "git": {
             "repo": before.get("repo", False),
             "head_before": before.get("head"),
@@ -715,7 +876,7 @@ def run(args):
             "dirty_before": dirty_before,
             "files_changed": files_changed,
         },
-        "permission_denials": env.get("permission_denials", []),
+        "permission_denials": res.get("permission_denials", []),
     }
     print(json.dumps(result, indent=2))
     sys.exit(0 if ok else 1)
@@ -728,18 +889,19 @@ def cmd_targets():
         return
     for k, v in state.items():
         print(f"{k}")
-        print(f"  last_session: {v.get('last_session_id')}")
+        print(f"  last_session: {v.get('last_session_id')}  engine: {v.get('engine', 'claude')}")
         print(f"  model: {v.get('last_model')}  interactions: {v.get('interactions')}")
 
 
 def cmd_doctor():
-    """Readiness: the `claude` CLI must be on PATH for any query to run."""
-    claude = shutil.which("claude")
-    if not claude:
-        _emit({"ok": False, "claude": None,
-               "error": "`claude` CLI not found on PATH"})
-        sys.exit(2)
-    _emit({"ok": True, "claude": claude})
+    """Readiness: report which engine CLIs are on PATH. ok requires the default
+    engine to be present (either engine covers its own --engine calls)."""
+    engines = {name: shutil.which(name) for name in ENGINES}
+    default = _default_engine()
+    ok = bool(engines.get(default))
+    _emit({"ok": ok, "engines": engines, "default_engine": default,
+           "error": None if ok else f"default engine {default!r} not found on PATH"})
+    sys.exit(0 if ok else 2)
 
 
 def main():
@@ -759,6 +921,7 @@ def main():
     p = argparse.ArgumentParser(prog="askproject", add_help=False)
     p.add_argument("target")
     p.add_argument("prompt")
+    p.add_argument("--engine", choices=ENGINES)
     p.add_argument("--act", action="store_true")
     p.add_argument("-c", "--continue", dest="cont", action="store_true")
     p.add_argument("--fork", action="store_true")
