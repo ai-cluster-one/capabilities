@@ -1653,22 +1653,33 @@ async def main():
     catch-up recovers what was missed. A not-yet-authorized session (first deploy on the
     box, or a revoked session) is not fatal either — the container stays up and retries so
     `telegram login` can be run inside it. Complements the box's `restart: unless-stopped`."""
-    if not CHANNEL_ENABLED:
-        log("telegram channel disabled (TELEGRAM_SERVICE_ENABLED not truthy) — idling; "
-            "set it true on instances that should run the channel")
-        await asyncio.Event().wait()               # stay alive so restart:unless-stopped doesn't loop
-        return
     main_task = asyncio.current_task()
     loop = asyncio.get_running_loop()
+
+    shutdown_requested = False
+
+    def request_shutdown():
+        nonlocal shutdown_requested
+        shutdown_requested = True
+        main_task.cancel()
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, main_task.cancel)
-    api_id, api_hash = resolve_creds()
-    CONNECTION_STATE_DIR.mkdir(parents=True, exist_ok=True)   # telethon opens the session sqlite here;
-    lock_handle = acquire_daemon_lock()
-    backoff = 2                                     # the connection-namespace dir may not exist yet (fresh volume)
-    PID_FILE.write_text(f"{os.getpid()}\n")
+            loop.add_signal_handler(sig, request_shutdown)
+    lock_handle = None
+    wrote_pid = False
     try:
+        if not CHANNEL_ENABLED:
+            log("telegram channel disabled (TELEGRAM_SERVICE_ENABLED not truthy) — idling; "
+                "set it true on instances that should run the channel")
+            await asyncio.Event().wait()           # stay alive so restart:unless-stopped doesn't loop
+            return
+        api_id, api_hash = resolve_creds()
+        CONNECTION_STATE_DIR.mkdir(parents=True, exist_ok=True)   # telethon opens the session sqlite here;
+        lock_handle = acquire_daemon_lock()
+        backoff = 2                                 # the connection-namespace dir may not exist yet (fresh volume)
+        PID_FILE.write_text(f"{os.getpid()}\n")
+        wrote_pid = True
         while True:
             client = TelegramClient(str(SESSION), api_id, api_hash)
             try:
@@ -1693,10 +1704,23 @@ async def main():
                     await client.disconnect()
                 except Exception:
                     pass
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        if not shutdown_requested:
+            raise
+        log("shutdown requested; stopping telegram daemon")
     finally:
-        with contextlib.suppress(OSError):
-            if PID_FILE.read_text().strip() == str(os.getpid()):
-                PID_FILE.unlink()
+        if wrote_pid:
+            with contextlib.suppress(OSError):
+                if PID_FILE.read_text().strip() == str(os.getpid()):
+                    PID_FILE.unlink()
+        if lock_handle is not None:
+            with contextlib.suppress(OSError):
+                if LOCK_FILE.read_text().strip() == str(os.getpid()):
+                    LOCK_FILE.unlink()
+            with contextlib.suppress(Exception):
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
+            with contextlib.suppress(Exception):
+                lock_handle.close()
 
 
 if __name__ == "__main__":
