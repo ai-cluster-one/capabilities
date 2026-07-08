@@ -1,0 +1,1643 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""deployment - project deployment standard for agent-readable runtime specs.
+
+Agent-invoked. Run `deployment help` to reload this contract before using the
+tool. This capability is provider-neutral: it owns the local deployment shape
+inside a consuming project, while provider capabilities such as `coolify` own
+the external substrate. A project can use deployment without enabling Coolify.
+
+USAGE
+  deployment setup [--profile agent-box] [--target production]
+                   [--provider coolify|dockerhost|manual]
+                   [--with-telegram auto|yes|no] [--project-name NAME]
+                   [--force] [--dry-run]
+      Full bootstrap for a non-technical deployment path. Creates the deployment
+      declarations plus Dockerfile, docker-compose.yaml, .dockerignore,
+      .env.example, entrypoint.sh, and project references. Defaults are safe for
+      an agent box: one idle agent service plus an optional Telegram service.
+      If --dry-run is passed, print the files that would be written.
+
+  deployment scaffold
+      Alias for `deployment setup`.
+
+  deployment init [--profile generic|agent-box] [--target production]
+                  [--provider coolify|dockerhost|manual] [--force]
+      Create the standard local deployment files:
+        deployment/runtime.json
+        deployment/targets/<target>.json
+        deployment/capabilities.lock
+        .capabilities/deployment/reference/runtime.md
+        .capabilities/deployment/reference/target-<target>.md
+      Existing files are left untouched unless --force is passed. This command
+      requires an existing project `.capabilities/` envelope; it never writes
+      `.capabilities/settings.json`.
+
+  deployment freeze [--force]
+      Refresh deployment/capabilities.lock from the current project capability gate.
+      The file is a lightweight install list: one capability name per line,
+      comments allowed. Docker builds bootstrap the capabilities manager and run
+      `capabilities install <name>` for each entry.
+
+  deployment doctor [--target <name>]
+      Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
+      references. Reports provider readiness as local facts only: whether the
+      provider capability is installed/enabled here. It does not call Coolify,
+      SSH, Docker, or any remote provider.
+
+  deployment runtime
+      Print deployment/runtime.json.
+
+  deployment targets [--target <name>]
+      Print target declarations from deployment/targets/.
+
+  deployment plan [--target <name>]
+      Print an execution-neutral deployment plan. The plan names the provider
+      adapter that would execute the target, plus command hints, but performs no
+      remote operation.
+
+  deployment next [--target <name>] [--text|--json]
+      Human next steps after setup: what to review, what secrets to enter, how
+      to create the provider resource, first-login commands, and validation.
+
+Contract commands:
+  deployment help
+  deployment stub
+  deployment manifest --json
+  deployment guide [bootstrap|standard|targets]
+  deployment connections
+  deployment ids list|get <label>|set <label> <value>|rm <label> [--note <text>]
+  deployment refs
+
+FILES
+  deployment/runtime.json
+      The project's runtime declaration: profile, compose file, services,
+      service-level required env, state volumes, and capability lock path.
+
+  deployment/targets/*.json
+      One deployment target per file. Each target chooses a provider
+      (`coolify`, `dockerhost`, or `manual`) and carries only the adapter-facing
+      resource handle needed to execute that target.
+
+  deployment/capabilities.lock
+      Lightweight install list for the agent image: one capability per line.
+      It is a deployment input, not a capability manager file.
+
+  .capabilities/deployment/reference/*.md
+      Context pointers loaded on demand by `deployment refs` and the manager's
+      generated capability context.
+
+EXIT CODES
+  0 success
+  3 not found (no project, no runtime, unknown target)
+  4 project policy refused this capability
+  6 malformed input, validation failure, or init conflict
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+
+NAME = "deployment"
+PROTOCOL = 2
+SUMMARY = ("Project deployment standard - declare runtime services, target "
+           "providers, references, and capability locks without depending on "
+           "any one deployment adapter.")
+SCOPE = "project"
+CRED_KEYS: list = []
+WRITE_VERBS = {"init", "freeze", "setup", "scaffold"}
+WRITE_DEFAULT = False
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/deployment/guides/")
+TOPICS = ["bootstrap", "standard", "targets"]
+STATE = False
+POST_INSTALL: list = []
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / "deployment" / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+RUNTIME_SCHEMA = "capabilities.deployment.runtime.v1"
+TARGET_SCHEMA = "capabilities.deployment.target.v1"
+PROFILES = ("generic", "agent-box")
+PROVIDERS = ("coolify", "dockerhost", "manual")
+PROVIDER_CAPABILITIES = {"coolify": "coolify", "dockerhost": "dockerhost"}
+
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding .capabilities/, .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = root / ".capabilities" / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    root = _project_root()
+    return (root / ".capabilities" / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where .capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None and (root / ".capabilities").is_dir():
+            return root / ".capabilities" / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import urllib.error as _ue
+    import urllib.request as _ur
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10.0) as resp:
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(text); return
+    except _ue.HTTPError as e:
+        if e.code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if e.code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        err = f"upstream returned {e.code}"
+    except _ue.URLError as e:
+        err = str(e.reason)
+    except OSError as e:
+        err = str(e)
+    if cache.exists():
+        sys.stderr.write(json.dumps(
+            {"warning": f"upstream unreachable; serving cached copy ({err})"},
+            ensure_ascii=False) + "\n")
+        _emit(cache.read_text()); return
+    _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _render_ids_markdown(data: dict) -> str:
+    """Render the {label: {value, note}} envelope as the labelled markdown
+    list the manager's `capabilities ids <NAME>` also produces — one shared
+    format across the ids surface and the identifiers section of `help`."""
+    lines: list[str] = []
+    for label, entry in sorted(data.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        v = entry.get("value")
+        vs = f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+        line = f"- **{label}**: {vs}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _identifiers_section() -> str:
+    """The Identifiers block appended to the bare top-level help — deterministic
+    first-touch surfacing of `.capabilities/<NAME>/identifiers.json` so an
+    agent following the `<NAME> help` startup protocol loads the discovered
+    labels/values/notes into context at once. Empty when no project envelope
+    or nothing recorded (do not bloat help with an empty section)."""
+    envdir = _env_dir()
+    if envdir is None:
+        return ""
+    ids_file = envdir / "identifiers.json"
+    if not ids_file.exists():
+        return ""
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    header = (
+        "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
+        f"Structural lookups discovered for `{NAME}` in this project. Fetch a single\n"
+        f"raw value with `{NAME} ids get <label>`; the full envelope is also at\n"
+        f"`capabilities ids {NAME}`.\n\n"
+    )
+    return header + _render_ids_markdown(data) + "\n"
+
+
+def _cmd_help() -> None:
+    """Bare top-level help: the CLI's HELP body (module-level `HELP` if
+    defined, else the module docstring), then the project's Identifiers
+    section. Only fires when no extra args follow — per-verb help stays
+    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    g = globals()
+    text = g.get("HELP") or g.get("__doc__") or ""
+    if text.startswith("\n"):
+        text = text.lstrip("\n")
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    section = _identifiers_section()
+    if section:
+        sys.stdout.write(section)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not envdir.parent.is_dir():
+            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved.
+
+    `help` is a contract verb only when bare (no extra args) — the top-level
+    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
+    through to the CLI so per-verb help stays clean."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    elif cmd == "help" and len(argv) == 1:
+        _cmd_help()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+
+def _cmd_connections() -> None:
+    _emit({"connections": {}})
+
+
+def _root() -> Path:
+    root = _project_root()
+    if root is None:
+        _die(3, "not_found", "no consuming project found",
+             "run inside a project containing .git, .env, or .capabilities")
+    return root
+
+
+def _require_envelope(root: Path) -> Path:
+    cap_root = root / ".capabilities"
+    if not cap_root.is_dir():
+        _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+             "run `capabilities init --codex` or `capabilities init --claude` first")
+    return cap_root / NAME
+
+
+def _rel(root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def _slug(value: str) -> str:
+    out = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return out or "project"
+
+
+def _json_text(value) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _read_json(path: Path) -> tuple[object | None, str | None]:
+    try:
+        return json.loads(path.read_text()), None
+    except FileNotFoundError:
+        return None, "missing"
+    except json.JSONDecodeError as e:
+        return None, f"invalid JSON: {e.msg} at line {e.lineno} column {e.colno}"
+    except OSError as e:
+        return None, f"unreadable: {e}"
+
+
+def _write_file(root: Path, path: Path, text: str, force: bool) -> dict:
+    existed = path.exists()
+    if existed:
+        try:
+            old = path.read_text()
+        except OSError as e:
+            return {
+                "path": _rel(root, path),
+                "action": "error",
+                "message": f"unreadable existing file: {e}",
+            }
+        if old == text:
+            return {"path": _rel(root, path), "action": "unchanged"}
+        if not force:
+            return {
+                "path": _rel(root, path),
+                "action": "skipped",
+                "message": "exists with different content; pass --force to overwrite",
+            }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return {"path": _rel(root, path), "action": "overwritten" if existed else "created"}
+
+
+def _enabled_capabilities(root: Path) -> list[str]:
+    caps = _settings(root).get("capabilities") or {}
+    return sorted(name for name, gate in caps.items()
+                  if isinstance(gate, dict) and gate.get("enabled") is True)
+
+
+def _has_enabled(root: Path, name: str) -> bool:
+    return name in _enabled_capabilities(root)
+
+
+def _with_telegram(root: Path, choice: str) -> bool:
+    if choice == "yes":
+        return True
+    if choice == "no":
+        return False
+    return _has_enabled(root, "telegram") or (root / ".capabilities" / "telegram" / "service").is_dir()
+
+
+def _contextkit_source(root: Path) -> Path | None:
+    candidates = [
+        root / ".contextkit" / "manager" / "contextkit",
+        Path(shutil.which("contextkit") or ""),
+        Path.home() / ".contextkit" / ".manager" / "contextkit",
+    ]
+    for path in candidates:
+        if path and path.is_file():
+            return path
+    return None
+
+
+def _has_contextkit(root: Path) -> bool:
+    return (root / ".contextkit" / "config.toml").is_file()
+
+
+def _dockerignore_template(has_contextkit: bool) -> str:
+    lines = [
+        "# Keep the build context lean and secret-free.",
+        ".git",
+        ".env",
+        ".env.local",
+        ".env.*.local",
+        "**/credentials.env",
+        "**/.DS_Store",
+        "__pycache__/",
+        "**/__pycache__/",
+        "*.pyc",
+        "",
+        "# Runtime state is volume-backed.",
+        ".capabilities/*/state/",
+        "*/state/",
+        "",
+        "# Local session/transient files.",
+        ".claude/askproject/sessions.json",
+        ".claude/settings.local.json",
+    ]
+    if has_contextkit:
+        lines += [
+            "",
+            "# Generated host context is rebuilt inside the image.",
+            ".codex/generated/",
+            ".claude/rules/CONTEXT.md",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _env_example_template(with_telegram: bool) -> str:
+    lines = [
+        "# Image/build knobs",
+        "AGENT_IMAGE=agent-box",
+        "CAPABILITIES_REF=main",
+        "CODEX_REF=rust-v0.142.5",
+        "",
+        "# Runtime secrets injected by Coolify / docker compose env.",
+    ]
+    if with_telegram:
+        lines += [
+            "TELEGRAM_API_HASH=",
+            "DEEPGRAM_API_KEY=",
+            "TELEGRAM_CHANNEL_ENABLED=true",
+            "TG_WORKER=codex",
+            "",
+        ]
+    lines += [
+        "# Optional git push identity for agent-originated branches.",
+        "GIT_DEPLOY_KEY_B64=",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _entrypoint_template(project_name: str) -> str:
+    identity = _slug(project_name)
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -n "${{GIT_DEPLOY_KEY_B64:-}}" ]; then
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  if printf '%s' "$GIT_DEPLOY_KEY_B64" | base64 -d > "$HOME/.ssh/id_ed25519" 2>/dev/null \\
+       && [ -s "$HOME/.ssh/id_ed25519" ]; then
+    chmod 600 "$HOME/.ssh/id_ed25519"
+    grep -q '^github.com ' "$HOME/.ssh/known_hosts" 2>/dev/null || \\
+      echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> "$HOME/.ssh/known_hosts"
+    git config --global user.name "{identity}"
+    git config --global user.email "{identity}@local"
+  else
+    rm -f "$HOME/.ssh/id_ed25519"
+    echo "[entrypoint] WARN: GIT_DEPLOY_KEY_B64 is set but not valid base64; git push identity skipped" >&2
+  fi
+fi
+
+if [ -f "$HOME/.claude/.credentials.json" ] || [ -d "$HOME/.claude/projects" ]; then
+  claude_auth="claude state present"
+else
+  claude_auth="claude not logged in; run: docker exec -it {identity}-agent claude login"
+fi
+
+if [ -f "$HOME/.codex/auth.json" ]; then
+  codex_auth="codex state present"
+else
+  codex_auth="codex not logged in; run: docker exec -it {identity}-agent codex login --device-auth"
+fi
+
+echo "[entrypoint] {identity} agent box ready; $(claude --version 2>/dev/null || echo 'claude missing'); $claude_auth"
+echo "[entrypoint] $(codex --version 2>/dev/null || echo 'codex missing'); $codex_auth"
+
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
+
+exec sleep infinity
+"""
+
+
+def _dockerfile_template(has_contextkit: bool) -> str:
+    contextkit_setup = ""
+    contextkit_link = ""
+    contextkit_build = ""
+    if has_contextkit:
+        contextkit_setup = (
+            "RUN chmod +x /app/entrypoint.sh /app/.contextkit/manager/contextkit \\\n"
+            " && ln -sf /app/.contextkit/manager/contextkit \"$HOME/.local/bin/contextkit\"\n"
+        )
+        contextkit_link = (
+            " && ln -sf /home/${USERNAME}/.local/bin/contextkit /usr/local/bin/contextkit"
+        )
+        contextkit_build = (
+            "\n# Compile ContextKit after capability install, so generated host context sees the\n"
+            "# installed set available inside the image.\n"
+            "RUN contextkit build --target all\n"
+        )
+    else:
+        contextkit_setup = "RUN chmod +x /app/entrypoint.sh\n"
+    return f"""# Agent box: project brain + agent CLIs + capability CLIs.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+        ca-certificates curl git openssh-client ripgrep file ffmpeg python3 \\
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+ARG USERNAME=agent
+RUN useradd --create-home --shell /bin/bash ${{USERNAME}}
+
+USER ${{USERNAME}}
+ENV HOME=/home/${{USERNAME}}
+ENV XDG_STATE_HOME=/home/${{USERNAME}}/.local/state
+ENV PATH=/home/${{USERNAME}}/.local/bin:${{PATH}}
+WORKDIR /app
+
+RUN mkdir -p "$HOME/.local/bin" "$XDG_STATE_HOME/telegram" "$HOME/.claude" "$HOME/.codex"
+
+# Claude Code CLI. Auth/session state is persisted by the claude_state volume.
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# OpenAI Codex CLI. Auth/session state is persisted by the codex_state volume.
+ARG CODEX_REF=rust-v0.142.5
+RUN set -eux; \\
+    case "$(dpkg --print-architecture)" in \\
+      amd64) triple=x86_64-unknown-linux-musl ;; \\
+      arm64) triple=aarch64-unknown-linux-musl ;; \\
+      *) echo "unsupported arch $(dpkg --print-architecture)" >&2; exit 1 ;; \\
+    esac; \\
+    curl -fsSL "https://github.com/openai/codex/releases/download/${{CODEX_REF}}/codex-${{triple}}.tar.gz" -o /tmp/codex.tgz; \\
+    mkdir -p "$HOME/.local/bin"; tar -xzf /tmp/codex.tgz -C /tmp; \\
+    mv "$(find /tmp -maxdepth 1 -name 'codex-*-linux-musl' -type f | head -1)" "$HOME/.local/bin/codex"; \\
+    chmod +x "$HOME/.local/bin/codex"; rm -f /tmp/codex.tgz
+
+RUN uv python install 3.11
+
+COPY --chown=${{USERNAME}}:${{USERNAME}} . /app
+{contextkit_setup}
+USER root
+RUN ln -sf /home/${{USERNAME}}/.local/bin/claude /usr/local/bin/claude \\
+ && ln -sf /home/${{USERNAME}}/.local/bin/codex /usr/local/bin/codex{contextkit_link}
+USER ${{USERNAME}}
+
+# Capability CLIs are installed from the capabilities catalogue by the manager.
+# CAPABILITIES_REF can be a branch, tag, or SHA that contains every name in
+# deployment/capabilities.lock.
+ARG CAPABILITIES_REF=main
+ENV CAPABILITIES_SOURCE=https://raw.githubusercontent.com/ai-cluster-one/capabilities/${{CAPABILITIES_REF}}
+RUN curl -fsSL "https://raw.githubusercontent.com/ai-cluster-one/capabilities/${{CAPABILITIES_REF}}/install.sh" \\
+      | CAPABILITIES_TAG=${{CAPABILITIES_REF}} sh \\
+ && grep -v '^[[:space:]]*#' /app/deployment/capabilities.lock | grep -v '^[[:space:]]*$' \\
+      | while read -r name; do capabilities install "$name"; done
+
+# Warm common PEP-723 environments. Best-effort so missing runtime credentials do not
+# break image builds.
+RUN while read -r name; do \\
+      case "$name" in ""|\\#*) continue ;; esac; \\
+      "$name" help >/dev/null 2>&1 || true; \\
+    done < /app/deployment/capabilities.lock
+
+# Capability state used by services is volume-backed.
+RUN mkdir -p "$XDG_STATE_HOME/telegram" "$HOME/.claude" "$HOME/.codex"
+{contextkit_build}
+ENTRYPOINT ["/app/entrypoint.sh"]
+"""
+
+
+def _compose_template(project_name: str, with_telegram: bool) -> str:
+    slug = _slug(project_name)
+    env_lines = [
+        "x-agent-env: &agent-env",
+        "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
+    ]
+    if with_telegram:
+        env_lines = [
+            "x-agent-env: &agent-env",
+            "  TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}",
+            "  DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}",
+            "  TELEGRAM_CHANNEL_ENABLED: ${TELEGRAM_CHANNEL_ENABLED:-true}",
+            "  TG_WORKER: ${TG_WORKER:-codex}",
+            "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
+        ]
+    telegram_service = ""
+    telegram_volume = ""
+    if with_telegram:
+        telegram_service = f"""
+  telegram:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CAPABILITIES_REF: ${{CAPABILITIES_REF:-main}}
+        CODEX_REF: ${{CODEX_REF:-rust-v0.142.5}}
+    image: ${{AGENT_IMAGE:-{slug}-agent}}
+    container_name: {slug}-telegram
+    restart: unless-stopped
+    command: ["telegram", "service", "run"]
+    environment:
+      <<: *agent-env
+    volumes:
+      - claude_state:/home/agent/.claude
+      - codex_state:/home/agent/.codex
+      - telegram_state:/home/agent/.local/state/telegram
+"""
+        telegram_volume = "  telegram_state:\n"
+    return "\n".join(env_lines) + f"""
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CAPABILITIES_REF: ${{CAPABILITIES_REF:-main}}
+        CODEX_REF: ${{CODEX_REF:-rust-v0.142.5}}
+    image: ${{AGENT_IMAGE:-{slug}-agent}}
+    container_name: {slug}-agent
+    restart: unless-stopped
+    environment: *agent-env
+    volumes:
+      - claude_state:/home/agent/.claude
+      - codex_state:/home/agent/.codex
+{telegram_service}
+volumes:
+  claude_state:
+  codex_state:
+{telegram_volume}"""
+
+
+def _docker_reference() -> str:
+    return "\n".join([
+        "---",
+        "name: dockerization",
+        "description: Generated Docker build and compose surface",
+        "---",
+        "",
+        "Dockerization files are generated at the project root:",
+        "",
+        "- `Dockerfile`",
+        "- `docker-compose.yaml`",
+        "- `.dockerignore`",
+        "- `.env.example`",
+        "- `entrypoint.sh`",
+        "",
+        "Run `deployment doctor` to validate the declaration and `deployment next`",
+        "for the human deployment checklist.",
+        "",
+    ])
+
+
+def _runtime_template(profile: str, project_name: str, with_telegram: bool = True) -> dict:
+    slug = _slug(project_name)
+    services: dict = {
+        "app": {
+            "role": "application",
+            "compose_service": "app",
+            "description": "Primary application/runtime service.",
+            "required_env": [],
+            "optional_env": [],
+            "state": [],
+        }
+    }
+    volumes: dict = {}
+    if profile == "agent-box":
+        services = {
+            "agent": {
+                "role": "agent-runtime",
+                "compose_service": "agent",
+                "description": "Container that holds the project checkout, agent CLIs, and capability CLIs.",
+                "required_env": [],
+                "optional_env": ["AGENT_IMAGE"],
+                "state": ["claude_state", "codex_state"],
+            }
+        }
+        if with_telegram:
+            services["telegram"] = {
+                "role": "channel-service",
+                "capability": "telegram",
+                "compose_service": "telegram",
+                "description": "Optional Telegram assistant service when the telegram capability is configured.",
+                "required_env": ["TELEGRAM_API_HASH"],
+                "optional_env": ["DEEPGRAM_API_KEY", "TELEGRAM_CHANNEL_ENABLED", "TG_WORKER"],
+                "state": ["telegram_state", "claude_state", "codex_state"],
+            }
+        volumes = {
+            "claude_state": {
+                "description": "Claude login and session continuity.",
+                "mount": "/home/agent/.claude",
+            },
+            "codex_state": {
+                "description": "Codex login and session continuity.",
+                "mount": "/home/agent/.codex",
+            },
+        }
+        if with_telegram:
+            volumes["telegram_state"] = {
+                "description": "Telegram MTProto session and channel-service state.",
+                "mount": "/home/agent/.local/state/telegram",
+            }
+    return {
+        "schema": RUNTIME_SCHEMA,
+        "name": slug,
+        "profile": profile,
+        "compose_file": "docker-compose.yaml",
+        "image_env": "AGENT_IMAGE" if profile == "agent-box" else None,
+        "required_env": [],
+        "optional_env": [],
+        "services": services,
+        "volumes": volumes,
+        "capabilities": {"lockfile": "deployment/capabilities.lock"},
+    }
+
+
+def _target_template(provider: str, target: str, project_name: str) -> dict:
+    slug = _slug(project_name)
+    data = {
+        "schema": TARGET_SCHEMA,
+        "name": target,
+        "provider": provider,
+        "connection": None if provider == "manual" else "default",
+        "environment": target,
+        "resource": {},
+    }
+    if provider == "coolify":
+        data["resource"] = {
+            "type": "application",
+            "identifier_label": f"{target}_resource_uuid",
+        }
+    elif provider == "dockerhost":
+        data["resource"] = {
+            "remote_path": f"/opt/{slug}",
+            "compose_project": slug,
+        }
+    else:
+        data["resource"] = {"compose_file": "docker-compose.yaml"}
+    return data
+
+
+def _runtime_reference() -> str:
+    return "\n".join([
+        "---",
+        "name: runtime",
+        "description: Deployment runtime declaration for this project",
+        "---",
+        "",
+        "The deployment runtime declaration lives at `deployment/runtime.json`.",
+        "",
+        "Load it with `deployment runtime`. Validate it with `deployment doctor`.",
+        "",
+    ])
+
+
+def _target_reference(target: str) -> str:
+    return "\n".join([
+        "---",
+        f"name: target-{target}",
+        f"description: Deployment target declaration for {target}",
+        "---",
+        "",
+        f"The `{target}` deployment target lives at `deployment/targets/{target}.json`.",
+        "",
+        f"Load it with `deployment targets --target {target}` or `deployment plan --target {target}`.",
+        "",
+    ])
+
+
+def _settings(root: Path) -> dict:
+    path = root / ".capabilities" / "settings.json"
+    data, err = _read_json(path)
+    if err == "missing":
+        return {"capabilities": {}}
+    if err:
+        _die(6, "bad_settings", f"{_rel(root, path)}: {err}",
+             "fix the manager-owned settings file or rerun `capabilities init`")
+    if not isinstance(data, dict):
+        _die(6, "bad_settings", f"{_rel(root, path)} is not a JSON object")
+    return data
+
+
+def _cap_home() -> Path:
+    return Path(os.environ.get("CAPABILITIES_HOME") or (Path.home() / ".capabilities"))
+
+
+def _installed_capability(name: str) -> bool:
+    reg = _cap_home() / name
+    return (reg / name).is_file() or (reg / "bin" / name).is_file()
+
+
+def _capability_state(root: Path, name: str) -> dict:
+    entry = ((_settings(root).get("capabilities") or {}).get(name) or {})
+    if isinstance(entry, dict) and entry.get("enabled") is True:
+        gate = "enabled"
+    elif isinstance(entry, dict) and entry.get("enabled") is False:
+        gate = "disabled"
+    else:
+        gate = "ungated"
+    return {"name": name, "installed": _installed_capability(name), "gate": gate}
+
+
+def _lock_text(root: Path, extra: list[str] | None = None) -> str:
+    caps = _settings(root).get("capabilities") or {}
+    wanted = set(extra or [])
+    wanted.add(NAME)
+    wanted.update(name for name, gate in caps.items()
+                  if isinstance(gate, dict) and gate.get("enabled") is True)
+    enabled = sorted(wanted)
+    lines = [
+        "# Capabilities the image installs via the `capabilities` manager.",
+        "# One capability name per line; comments and blank lines are ignored.",
+        "# Source ref is selected by the Dockerfile's CAPABILITIES_REF build arg.",
+        "",
+    ]
+    lines.extend(enabled)
+    return "\n".join(lines) + "\n"
+
+
+def _lock_entries(text: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not re.match(r"^[a-z][a-z0-9_-]*$", line):
+            _die(6, "bad_lock", f"invalid capability name in deployment/capabilities.lock: {line!r}")
+        if line not in seen:
+            out.append(line)
+            seen.add(line)
+    return out
+
+
+def _runtime_path(root: Path) -> Path:
+    return root / "deployment" / "runtime.json"
+
+
+def _target_dir(root: Path) -> Path:
+    return root / "deployment" / "targets"
+
+
+def _target_path(root: Path, name: str) -> Path:
+    return _target_dir(root) / f"{name}.json"
+
+
+def _load_runtime(root: Path) -> dict:
+    path = _runtime_path(root)
+    data, err = _read_json(path)
+    if err:
+        _die(3 if err == "missing" else 6, "not_found" if err == "missing" else "bad_runtime",
+             f"{_rel(root, path)}: {err}", "run `deployment init` or fix the JSON")
+    if not isinstance(data, dict):
+        _die(6, "bad_runtime", f"{_rel(root, path)} is not a JSON object")
+    return data
+
+
+def _load_target(root: Path, name: str) -> dict:
+    path = _target_path(root, name)
+    data, err = _read_json(path)
+    if err:
+        _die(3 if err == "missing" else 6, "not_found" if err == "missing" else "bad_target",
+             f"{_rel(root, path)}: {err}", "`deployment targets` lists known targets")
+    if not isinstance(data, dict):
+        _die(6, "bad_target", f"{_rel(root, path)} is not a JSON object")
+    return data
+
+
+def _target_files(root: Path) -> list[Path]:
+    tdir = _target_dir(root)
+    if not tdir.is_dir():
+        return []
+    return sorted(p for p in tdir.glob("*.json") if p.is_file())
+
+
+def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
+    findings: list[dict] = []
+    if not isinstance(data, dict):
+        return [{"severity": "error", "path": _rel(root, path), "message": "runtime is not an object"}]
+    if data.get("schema") != RUNTIME_SCHEMA:
+        findings.append({"severity": "error", "path": _rel(root, path),
+                         "message": f"schema must be {RUNTIME_SCHEMA!r}"})
+    if not isinstance(data.get("name"), str) or not data.get("name", "").strip():
+        findings.append({"severity": "error", "path": _rel(root, path), "message": "name missing"})
+    if data.get("profile") not in PROFILES:
+        findings.append({"severity": "error", "path": _rel(root, path),
+                         "message": f"profile must be one of {', '.join(PROFILES)}"})
+    services = data.get("services")
+    if not isinstance(services, dict) or not services:
+        findings.append({"severity": "error", "path": _rel(root, path),
+                         "message": "services must be a non-empty object"})
+    compose_file = data.get("compose_file")
+    if compose_file and not (root / str(compose_file)).exists():
+        findings.append({"severity": "warning", "path": str(compose_file),
+                         "message": "compose_file is declared but does not exist"})
+    for field in ("required_env", "optional_env"):
+        if not isinstance(data.get(field, []), list) or not all(
+                isinstance(x, str) for x in data.get(field, [])):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": f"{field} must be a list of strings"})
+    return findings
+
+
+def _validate_target(root: Path, data: object, path: Path) -> list[dict]:
+    findings: list[dict] = []
+    if not isinstance(data, dict):
+        return [{"severity": "error", "path": _rel(root, path), "message": "target is not an object"}]
+    if data.get("schema") != TARGET_SCHEMA:
+        findings.append({"severity": "error", "path": _rel(root, path),
+                         "message": f"schema must be {TARGET_SCHEMA!r}"})
+    if not isinstance(data.get("name"), str) or not data.get("name", "").strip():
+        findings.append({"severity": "error", "path": _rel(root, path), "message": "name missing"})
+    provider = data.get("provider")
+    if provider not in PROVIDERS:
+        findings.append({"severity": "error", "path": _rel(root, path),
+                         "message": f"provider must be one of {', '.join(PROVIDERS)}"})
+    if data.get("resource") is not None and not isinstance(data.get("resource"), dict):
+        findings.append({"severity": "error", "path": _rel(root, path),
+                         "message": "resource must be an object"})
+    if provider in PROVIDER_CAPABILITIES:
+        cap = _capability_state(root, PROVIDER_CAPABILITIES[provider])
+        if not cap["installed"]:
+            findings.append({"severity": "warning", "path": _rel(root, path),
+                             "message": f"provider capability {cap['name']!r} is not installed"})
+        elif cap["gate"] != "enabled":
+            findings.append({"severity": "warning", "path": _rel(root, path),
+                             "message": f"provider capability {cap['name']!r} is {cap['gate']}"})
+    resource = data.get("resource") if isinstance(data.get("resource"), dict) else {}
+    if provider == "coolify" and not resource.get("identifier_label"):
+        findings.append({"severity": "warning", "path": _rel(root, path),
+                         "message": "coolify target has no resource.identifier_label"})
+    if provider == "dockerhost":
+        for key in ("remote_path", "compose_project"):
+            if not resource.get(key):
+                findings.append({"severity": "warning", "path": _rel(root, path),
+                                 "message": f"dockerhost target has no resource.{key}"})
+    return findings
+
+
+def _all_target_payloads(root: Path) -> list[dict]:
+    out = []
+    for path in _target_files(root):
+        data, err = _read_json(path)
+        out.append({
+            "name": path.stem,
+            "path": _rel(root, path),
+            "target": data if err is None else None,
+            "error": err,
+        })
+    return out
+
+
+def _provider_plan(root: Path, target: dict) -> dict:
+    provider = target.get("provider")
+    conn = target.get("connection")
+    resource = target.get("resource") if isinstance(target.get("resource"), dict) else {}
+    if provider == "manual":
+        compose = resource.get("compose_file") or "docker-compose.yaml"
+        return {
+            "mode": "manual",
+            "provider_capability": None,
+            "commands": [f"docker compose -f {compose} up -d --build"],
+        }
+    cap_name = PROVIDER_CAPABILITIES.get(provider)
+    cap_state = _capability_state(root, cap_name) if cap_name else None
+    if provider == "coolify":
+        label = resource.get("identifier_label") or "<resource-id-label>"
+        return {
+            "mode": "provider-adapter",
+            "provider_capability": cap_state,
+            "resource_lookup": {"capability": "coolify", "identifier_label": label},
+            "commands": [
+                f"coolify ids get {label}",
+                f"coolify deploy <uuid> --connection {conn or 'default'}",
+            ],
+            "note": "deployment validates this target locally; coolify executes it only when enabled separately.",
+        }
+    if provider == "dockerhost":
+        return {
+            "mode": "provider-adapter",
+            "provider_capability": cap_state,
+            "resource": resource,
+            "commands": ["dockerhost help"],
+            "note": "dockerhost is the expected raw-server adapter; deployment does not implement SSH/Docker operations.",
+        }
+    return {"mode": "unknown", "provider_capability": cap_state, "commands": []}
+
+
+def cmd_init(args) -> None:
+    root = _root()
+    envdir = _require_envelope(root)
+    target = _slug(args.target)
+    profile = args.profile
+    provider = args.provider
+    project_name = root.name
+    writes = [
+        (_runtime_path(root), _json_text(_runtime_template(profile, project_name))),
+        (_target_path(root, target), _json_text(_target_template(provider, target, project_name))),
+        (root / "deployment" / "capabilities.lock", _lock_text(root)),
+        (envdir / "reference" / "runtime.md", _runtime_reference()),
+        (envdir / "reference" / f"target-{target}.md", _target_reference(target)),
+    ]
+    results = [_write_file(root, path, text, args.force) for path, text in writes]
+    conflicts = [r for r in results if r["action"] in {"skipped", "error"}]
+    _emit({"ok": not conflicts, "project": str(root), "written": results})
+    if conflicts:
+        sys.exit(6)
+
+
+def cmd_freeze(args) -> None:
+    root = _root()
+    _require_envelope(root)
+    path = root / "deployment" / "capabilities.lock"
+    extra = _runtime_capabilities(root)
+    result = _write_file(root, path, _lock_text(root, extra), args.force)
+    _emit({"ok": result["action"] not in {"skipped", "error"}, "written": [result]})
+    if result["action"] in {"skipped", "error"}:
+        sys.exit(6)
+
+
+def _runtime_capabilities(root: Path) -> list[str]:
+    path = _runtime_path(root)
+    data, err = _read_json(path)
+    if err or not isinstance(data, dict):
+        return []
+    services = data.get("services")
+    if not isinstance(services, dict):
+        return []
+    out: list[str] = []
+    for entry in services.values():
+        if isinstance(entry, dict) and isinstance(entry.get("capability"), str):
+            out.append(entry["capability"])
+    return sorted(set(out))
+
+
+def _deployment_questions() -> list[dict]:
+    return [
+        {
+            "id": "profile",
+            "question": "What kind of thing is being deployed?",
+            "default": "agent-box",
+            "plain_language": "Use agent-box for a project that should run Codex/Claude plus capability CLIs.",
+        },
+        {
+            "id": "provider",
+            "question": "Where should it run?",
+            "default": "coolify",
+            "plain_language": "Use coolify if there is a Coolify dashboard; use manual for local Docker or a hand-managed server.",
+        },
+        {
+            "id": "telegram",
+            "question": "Should this project run a Telegram assistant service?",
+            "default": "auto",
+            "plain_language": "Auto turns it on when the telegram capability or service config is already present.",
+        },
+    ]
+
+
+def _setup_writes(root: Path, profile: str, provider: str, target: str,
+                  project_name: str, with_telegram: bool) -> tuple[list[tuple[Path, str]], list[str]]:
+    warnings: list[str] = []
+    envdir = _require_envelope(root)
+    has_contextkit = _has_contextkit(root)
+    writes: list[tuple[Path, str]] = [
+        (_runtime_path(root), _json_text(_runtime_template(profile, project_name, with_telegram))),
+        (_target_path(root, target), _json_text(_target_template(provider, target, project_name))),
+        (root / "deployment" / "capabilities.lock",
+         _lock_text(root, ["telegram"] if with_telegram else [])),
+        (envdir / "reference" / "runtime.md", _runtime_reference()),
+        (envdir / "reference" / f"target-{target}.md", _target_reference(target)),
+        (envdir / "reference" / "dockerization.md", _docker_reference()),
+        (root / ".dockerignore", _dockerignore_template(has_contextkit)),
+        (root / ".env.example", _env_example_template(with_telegram)),
+        (root / "Dockerfile", _dockerfile_template(has_contextkit)),
+        (root / "docker-compose.yaml", _compose_template(project_name, with_telegram)),
+        (root / "entrypoint.sh", _entrypoint_template(project_name)),
+    ]
+    if has_contextkit:
+        source = _contextkit_source(root)
+        if source is None:
+            warnings.append("ContextKit config exists, but no contextkit executable was found to copy into .contextkit/manager/contextkit")
+        else:
+            try:
+                writes.append((root / ".contextkit" / "manager" / "contextkit", source.read_text()))
+            except OSError as e:
+                warnings.append(f"could not read contextkit executable {source}: {e}")
+    return writes, warnings
+
+
+def cmd_setup(args) -> None:
+    root = _root()
+    _require_envelope(root)
+    if args.profile != "agent-box":
+        _die(6, "unsupported_profile",
+             "full setup currently supports the agent-box profile",
+             "use `deployment init --profile generic` for descriptors only")
+    target = _slug(args.target)
+    project_name = args.project_name or root.name
+    with_telegram = _with_telegram(root, args.with_telegram)
+    writes, warnings = _setup_writes(root, args.profile, args.provider, target,
+                                     project_name, with_telegram)
+    if args.dry_run:
+        _emit({
+            "ok": True,
+            "dry_run": True,
+            "project": str(root),
+            "profile": args.profile,
+            "provider": args.provider,
+            "target": target,
+            "with_telegram": with_telegram,
+            "would_write": [_rel(root, path) for path, _text in writes],
+            "warnings": warnings,
+            "questions": _deployment_questions(),
+        })
+        return
+    results = [_write_file(root, path, text, args.force) for path, text in writes]
+    for rel in ("entrypoint.sh", ".contextkit/manager/contextkit"):
+        path = root / rel
+        if path.exists():
+            path.chmod(path.stat().st_mode | 0o755)
+    conflicts = [r for r in results if r["action"] in {"skipped", "error"}]
+    _emit({
+        "ok": not conflicts,
+        "project": str(root),
+        "profile": args.profile,
+        "provider": args.provider,
+        "target": target,
+        "with_telegram": with_telegram,
+        "written": results,
+        "warnings": warnings,
+        "next": f"Run `deployment next --target {target}` for the human deployment checklist.",
+    })
+    if conflicts:
+        sys.exit(6)
+
+
+def _telegram_connection(root: Path) -> str:
+    settings, _ = _read_json(root / ".capabilities" / "telegram" / "service" / "settings.json")
+    if isinstance(settings, dict) and isinstance(settings.get("connection"), str):
+        return settings["connection"]
+    conns, _ = _read_json(root / ".capabilities" / "telegram" / "connections.json")
+    if isinstance(conns, dict) and isinstance(conns.get("default"), str):
+        return conns["default"]
+    return "default"
+
+
+def _next_payload(root: Path, target_name: str | None) -> dict:
+    runtime = _load_runtime(root)
+    target_files = _target_files(root)
+    if target_name:
+        target = _load_target(root, target_name)
+        target_path = _target_path(root, target_name)
+    elif target_files:
+        target_path = target_files[0]
+        target = _load_target(root, target_path.stem)
+    else:
+        _die(3, "not_found", "no deployment targets found", "run `deployment setup`")
+    slug = _slug(str(runtime.get("name") or root.name))
+    services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
+    with_telegram = "telegram" in services
+    required_env = set(runtime.get("required_env") or [])
+    optional_env = set(runtime.get("optional_env") or [])
+    for service in services.values():
+        if isinstance(service, dict):
+            required_env.update(x for x in (service.get("required_env") or []) if isinstance(x, str))
+            optional_env.update(x for x in (service.get("optional_env") or []) if isinstance(x, str))
+    provider = target.get("provider")
+    validation = [
+        "docker compose config",
+        "docker build --check .",
+        "docker compose build",
+    ]
+    provider_steps: list[str] = []
+    if provider == "coolify":
+        provider_steps = [
+            "In Coolify, create a new Docker Compose resource from this repository.",
+            "Set the build context to the repository root and use `docker-compose.yaml`.",
+            "Add every required secret from `.env.example` as Coolify environment variables.",
+            "Set `CAPABILITIES_REF` to a branch, tag, or SHA that contains every capability in `deployment/capabilities.lock`.",
+            "Deploy the resource.",
+        ]
+    elif provider == "dockerhost":
+        provider_steps = [
+            "Provision an Ubuntu/Debian server with Docker and the Compose plugin.",
+            "Copy or clone this repository to the target path declared in the target resource.",
+            "Create a `.env` file from `.env.example` on the server.",
+            "Run `docker compose up -d --build` on the server.",
+        ]
+    else:
+        provider_steps = [
+            "Create a `.env` file from `.env.example` locally or on the target machine.",
+            "Run `docker compose up -d --build`.",
+        ]
+    first_run = [
+        f"docker exec -it {slug}-agent codex login --device-auth",
+        f"docker exec -it {slug}-agent claude login",
+    ]
+    if with_telegram:
+        first_run.append(
+            f"docker exec -it {slug}-telegram telegram login --connection {_telegram_connection(root)}"
+        )
+    return {
+        "project": str(root),
+        "runtime": _rel(root, _runtime_path(root)),
+        "target": {"name": target.get("name") or target_path.stem,
+                   "path": _rel(root, target_path),
+                   "provider": provider},
+        "required_env": sorted(required_env),
+        "optional_env": sorted(optional_env),
+        "validation": validation,
+        "provider_steps": provider_steps,
+        "first_run": first_run,
+        "with_telegram": with_telegram,
+    }
+
+
+def _next_markdown(payload: dict) -> str:
+    lines = [
+        "# Deployment Next Steps",
+        "",
+        f"Target: `{payload['target']['name']}` via `{payload['target']['provider']}`.",
+        "",
+        "## 1. Review Files",
+        "",
+        "- `Dockerfile`",
+        "- `docker-compose.yaml`",
+        "- `.dockerignore`",
+        "- `.env.example`",
+        f"- `{payload['runtime']}`",
+        f"- `{payload['target']['path']}`",
+        "",
+        "## 2. Fill Secrets",
+        "",
+    ]
+    if payload["required_env"]:
+        lines += [f"- `{key}`" for key in payload["required_env"]]
+    else:
+        lines.append("- No required secrets are declared.")
+    if payload["optional_env"]:
+        lines += ["", "Optional:", ""]
+        lines += [f"- `{key}`" for key in payload["optional_env"]]
+    lines += [
+        "",
+        "## 3. Validate Locally",
+        "",
+    ]
+    lines += [f"```sh\n{cmd}\n```" for cmd in payload["validation"]]
+    lines += [
+        "",
+        "## 4. Put It Online",
+        "",
+    ]
+    lines += [f"{idx}. {step}" for idx, step in enumerate(payload["provider_steps"], 1)]
+    lines += [
+        "",
+        "## 5. First Login",
+        "",
+    ]
+    lines += [f"```sh\n{cmd}\n```" for cmd in payload["first_run"]]
+    lines += [
+        "",
+        "## 6. Check",
+        "",
+        "```sh",
+        "docker compose ps",
+        "docker compose logs --tail=100",
+        "```",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_next(args) -> None:
+    payload = _next_payload(_root(), args.target)
+    if args.json:
+        _emit(payload)
+    else:
+        _emit(_next_markdown(payload))
+
+
+def cmd_doctor(args) -> None:
+    root = _root()
+    findings: list[dict] = []
+    runtime_path = _runtime_path(root)
+    runtime, err = _read_json(runtime_path)
+    if err:
+        findings.append({"severity": "error", "path": _rel(root, runtime_path), "message": err})
+    else:
+        findings.extend(_validate_runtime(root, runtime, runtime_path))
+    target_paths = [_target_path(root, args.target)] if args.target else _target_files(root)
+    if args.target and not target_paths[0].exists():
+        findings.append({"severity": "error", "path": _rel(root, target_paths[0]),
+                         "message": "target missing"})
+    elif not args.target and not target_paths:
+        findings.append({"severity": "warning", "path": "deployment/targets",
+                         "message": "no targets declared"})
+    for path in target_paths:
+        if not path.exists():
+            continue
+        data, terr = _read_json(path)
+        if terr:
+            findings.append({"severity": "error", "path": _rel(root, path), "message": terr})
+        else:
+            findings.extend(_validate_target(root, data, path))
+    lock_path = root / "deployment" / "capabilities.lock"
+    try:
+        lock_text = lock_path.read_text()
+    except FileNotFoundError:
+        findings.append({"severity": "warning", "path": _rel(root, lock_path), "message": "missing"})
+        lock_entries: list[str] = []
+    except OSError as e:
+        findings.append({"severity": "error", "path": _rel(root, lock_path), "message": f"unreadable: {e}"})
+        lock_entries = []
+    else:
+        lock_entries = _lock_entries(lock_text)
+        if not lock_entries:
+            findings.append({"severity": "warning", "path": _rel(root, lock_path),
+                             "message": "capability install list is empty"})
+        enabled = sorted(name for name, gate in (_settings(root).get("capabilities") or {}).items()
+                         if isinstance(gate, dict) and gate.get("enabled") is True)
+        missing = [name for name in enabled if name not in lock_entries]
+        if missing:
+            findings.append({"severity": "warning", "path": _rel(root, lock_path),
+                             "message": "enabled capabilities missing from install list: " + ", ".join(missing)})
+    refdir = root / ".capabilities" / NAME / "reference"
+    refs = sorted(str(p.relative_to(root)) for p in refdir.glob("*.md")) if refdir.is_dir() else []
+    if not refs:
+        findings.append({"severity": "warning", "path": _rel(root, refdir),
+                         "message": "no deployment references declared"})
+    errors = [f for f in findings if f.get("severity") == "error"]
+    _emit({
+        "ok": not errors,
+        "project": str(root),
+        "runtime": _rel(root, runtime_path),
+        "targets": [_rel(root, p) for p in target_paths if p.exists()],
+        "references": refs,
+        "findings": findings,
+    })
+    if errors:
+        sys.exit(6)
+
+
+def cmd_runtime(args) -> None:
+    _emit(_load_runtime(_root()))
+
+
+def cmd_targets(args) -> None:
+    root = _root()
+    if args.target:
+        _emit([{"name": args.target, "path": _rel(root, _target_path(root, args.target)),
+                "target": _load_target(root, args.target)}])
+    else:
+        _emit(_all_target_payloads(root))
+
+
+def cmd_plan(args) -> None:
+    root = _root()
+    runtime = _load_runtime(root)
+    runtime_findings = _validate_runtime(root, runtime, _runtime_path(root))
+    target_payloads = []
+    target_paths = [_target_path(root, args.target)] if args.target else _target_files(root)
+    if not target_paths:
+        _die(3, "not_found", "no deployment targets found", "run `deployment init`")
+    findings = list(runtime_findings)
+    for path in target_paths:
+        data, err = _read_json(path)
+        if err or not isinstance(data, dict):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": err or "target is not an object"})
+            continue
+        tf = _validate_target(root, data, path)
+        findings.extend(tf)
+        target_payloads.append({
+            "name": data.get("name") or path.stem,
+            "path": _rel(root, path),
+            "provider": data.get("provider"),
+            "connection": data.get("connection"),
+            "resource": data.get("resource"),
+            "execution": _provider_plan(root, data),
+            "findings": tf,
+        })
+    errors = [f for f in findings if f.get("severity") == "error"]
+    _emit({
+        "ok": not errors,
+        "project": str(root),
+        "runtime": {
+            "path": _rel(root, _runtime_path(root)),
+            "name": runtime.get("name"),
+            "profile": runtime.get("profile"),
+            "compose_file": runtime.get("compose_file"),
+        },
+        "targets": target_payloads,
+        "findings": findings,
+    })
+    if errors:
+        sys.exit(6)
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    _gate()
+    _contract(argv)
+
+    parser = argparse.ArgumentParser(prog=NAME, add_help=False)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_setup = sub.add_parser("setup", add_help=False)
+    p_setup.add_argument("--profile", choices=("agent-box",), default="agent-box")
+    p_setup.add_argument("--target", default="production")
+    p_setup.add_argument("--provider", choices=PROVIDERS, default="coolify")
+    p_setup.add_argument("--with-telegram", choices=("auto", "yes", "no"), default="auto")
+    p_setup.add_argument("--project-name")
+    p_setup.add_argument("--force", action="store_true")
+    p_setup.add_argument("--dry-run", action="store_true")
+    p_setup.set_defaults(fn=cmd_setup)
+
+    p_scaffold = sub.add_parser("scaffold", add_help=False)
+    p_scaffold.add_argument("--profile", choices=("agent-box",), default="agent-box")
+    p_scaffold.add_argument("--target", default="production")
+    p_scaffold.add_argument("--provider", choices=PROVIDERS, default="coolify")
+    p_scaffold.add_argument("--with-telegram", choices=("auto", "yes", "no"), default="auto")
+    p_scaffold.add_argument("--project-name")
+    p_scaffold.add_argument("--force", action="store_true")
+    p_scaffold.add_argument("--dry-run", action="store_true")
+    p_scaffold.set_defaults(fn=cmd_setup)
+
+    p_init = sub.add_parser("init", add_help=False)
+    p_init.add_argument("--profile", choices=PROFILES, default="agent-box")
+    p_init.add_argument("--target", default="production")
+    p_init.add_argument("--provider", choices=PROVIDERS, default="coolify")
+    p_init.add_argument("--force", action="store_true")
+    p_init.set_defaults(fn=cmd_init)
+
+    p_freeze = sub.add_parser("freeze", add_help=False)
+    p_freeze.add_argument("--force", action="store_true")
+    p_freeze.set_defaults(fn=cmd_freeze)
+
+    p_doctor = sub.add_parser("doctor", add_help=False)
+    p_doctor.add_argument("--target")
+    p_doctor.set_defaults(fn=cmd_doctor)
+
+    sub.add_parser("runtime", add_help=False).set_defaults(fn=cmd_runtime)
+
+    p_targets = sub.add_parser("targets", add_help=False)
+    p_targets.add_argument("--target")
+    p_targets.set_defaults(fn=cmd_targets)
+
+    p_plan = sub.add_parser("plan", add_help=False)
+    p_plan.add_argument("--target")
+    p_plan.set_defaults(fn=cmd_plan)
+
+    p_next = sub.add_parser("next", add_help=False)
+    p_next.add_argument("--target")
+    p_next.add_argument("--text", action="store_true")
+    p_next.add_argument("--json", action="store_true")
+    p_next.set_defaults(fn=cmd_next)
+
+    args, extra = parser.parse_known_args(argv)
+    if extra:
+        _die(6, "input", f"unknown arguments: {' '.join(extra)}")
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
