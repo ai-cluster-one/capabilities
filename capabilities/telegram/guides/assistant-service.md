@@ -36,7 +36,6 @@ capability bundle.
        "assistant": {
          "api_id": 123456,
          "secret_env": "TELEGRAM_API_HASH",
-         "session": ".capabilities/telegram/state/assistant/session",
          "allow_write": true
        }
      }
@@ -65,16 +64,15 @@ under the connection's service state directory.
 
 ## State Layout
 
-For a connection whose session is
-`.capabilities/telegram/state/assistant/session`, runtime state is:
+For a connection named `assistant`, runtime state is:
 
 ```text
-.capabilities/telegram/state/assistant/session.session
-.capabilities/telegram/state/assistant/service/register.json
-.capabilities/telegram/state/assistant/service/progress/
-.capabilities/telegram/state/assistant/service/worker-sessions/
-.capabilities/telegram/state/assistant/service/daemon.log
-.capabilities/telegram/state/assistant/service/daemon.pid
+$XDG_STATE_HOME/telegram/assistant/session.session
+$XDG_STATE_HOME/telegram/assistant/service/register.json
+$XDG_STATE_HOME/telegram/assistant/service/progress/
+$XDG_STATE_HOME/telegram/assistant/service/worker-sessions/
+$XDG_STATE_HOME/telegram/assistant/service/daemon.log
+$XDG_STATE_HOME/telegram/assistant/service/daemon.pid
 ```
 
 The auth session and service runtime files are separate. Worker session copies
@@ -99,4 +97,4 @@ Telethon SQLite session.
 To migrate a project that copied a service directory, delete the copied engine
 files after installing the bundled capability. Keep or move only the project
 policy/context files into `.capabilities/telegram/service/` and keep the
-connection/session state under `.capabilities/telegram/state/<connection>/`.
+connection/session state under `$XDG_STATE_HOME/telegram/<connection>/`.
