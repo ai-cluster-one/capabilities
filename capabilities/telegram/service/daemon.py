@@ -627,6 +627,7 @@ def channel_settings(reg, key):
         "worker_timeout": s.get("worker_timeout", DEFAULTS.get("worker_timeout", 90)),
         "progress_after": s.get("progress_after", DEFAULTS.get("progress_after", 15)),
         "max_parallel_jobs": s.get("max_parallel_jobs", DEFAULTS.get("max_parallel_jobs", 2)),
+        "max_attempts": s.get("max_attempts", DEFAULTS.get("max_attempts", 3)),
         "worker": worker,
         "worker_settings": cfg,
         "model": cfg.get("model"),
@@ -880,6 +881,7 @@ def _settings_summary(s):
         f"timeout={s.get('worker_timeout')}s",
         f"progress_after={s.get('progress_after')}s",
         f"parallel={s.get('max_parallel_jobs')}",
+        f"max_attempts={s.get('max_attempts')}",
     ]
     if s.get("worker") == "claude":
         bits.append(f"effort={s.get('effort') or 'default'}")
@@ -1308,9 +1310,21 @@ async def run_session(client):
         s = channel_settings(reg, key)
         _, group_policy = _group_policy(key)
         is_direct = group_policy is None
+
+        # Check max attempts cap before incrementing
+        current_attempts = int(job.get("attempts") or 0)
+        max_attempts = s.get("max_attempts", 3)
+        if current_attempts >= max_attempts:
+            log(f"{key}: job msg={job.get('message_id')} exceeded max attempts ({current_attempts}/{max_attempts}), marking as failed")
+            # Build minimal context to send the error reply
+            tail_stub, participants = await build_tail_and_participants(key, ent_id, s, group_policy, is_direct, job)
+            error_msg = f"Failed after {current_attempts} attempts - worker process did not complete"
+            await fail_job(key, ent_id, job, is_direct, participants, error_msg)
+            return
+
         job["status"] = "running"
         job["started_at"] = now()
-        job["attempts"] = int(job.get("attempts") or 0) + 1
+        job["attempts"] = current_attempts + 1
         save_register(reg)
 
         tail, participants = await build_tail_and_participants(key, ent_id, s, group_policy, is_direct, job)
