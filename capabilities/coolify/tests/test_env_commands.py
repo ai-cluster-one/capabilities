@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Tests for coolify env commands, especially duplicate key handling.
 
-Run with: python3 capabilities/coolify/tests/test_env_commands.py
+Run with: uv run --with httpx python3 capabilities/coolify/tests/test_env_commands.py
+(the coolify bin declares httpx in its PEP-723 header, so bare python3 cannot import it)
 """
 
 import json

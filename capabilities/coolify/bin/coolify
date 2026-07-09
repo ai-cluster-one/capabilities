@@ -67,6 +67,9 @@ COMMANDS
 
   projects [<uuid>]
       List projects, or get one project (its environments come inside it).
+  projects create --name <name> [--description <text>]
+      Create a new project. Returns the project_uuid and default environment.
+      Write verb - requires allow_write.
   resources
       Flat list of every deployable resource (uuid, name, type, status) —
       the lookup an agent runs to find the uuid to act on.
@@ -78,6 +81,26 @@ COMMANDS
                                   deployment by its uuid.
   logs <uuid> [--lines N]         An application's runtime logs (default 100).
 
+  app create --project <uuid> --server <uuid> --environment <name>
+      Create an application. Source-selecting flags (mutually exclusive):
+      --git-repository <url> --git-branch <branch>  (public git)
+          [--build-pack nixpacks|railpack|static|dockerfile|dockercompose]
+          [--docker-compose-location <path>] [--dockerfile-location <path>]
+      --private-deploy-key <uuid> (+ git flags above for private git with key)
+      --github-app <uuid> (+ git flags above for private git with GitHub app)
+      --image <registry/name:tag>  (registry image)
+      --dockerfile <file|->  (inline dockerfile, raw content)
+      Common optional: --name, --domains, --ports-exposes, --instant-deploy,
+      --destination <uuid>. Returns the application uuid.
+      Write verb - requires allow_write.
+
+  service create --compose <file|-> --project <uuid> --server <uuid>
+                 --environment <name> [--name <name>] [--instant-deploy]
+                 [--destination <uuid>]
+      Create a service from a docker-compose file. The compose file is
+      base64-encoded before sending. Returns the service uuid.
+      Write verb - requires allow_write.
+
   deploy <uuid> [--force] [--tag T]
       Trigger a deployment of an application/service by uuid (GET /deploy).
       --force rebuilds without cache; --tag deploys by image tag instead.
@@ -87,13 +110,16 @@ COMMANDS
       In-place lifecycle on a running resource. --type selects the endpoint
       family (defaults to application).
 
-  env list <uuid>
-      List environment variables for an application.
-  env set <uuid> <KEY> <VALUE>
+  env list <uuid> [--type application|service]
+      List environment variables for an application or service.
+  env set <uuid> <KEY> <VALUE> [--type application|service]
       Set or update an environment variable. For secrets, omit VALUE to read
       from stdin (one line, no echo). Write verb - requires allow_write.
-  env rm <uuid> <KEY>
+  env rm <uuid> <KEY> [--type application|service]
       Remove an environment variable. Write verb - requires allow_write.
+  env bulk <uuid> [--type application|service]
+      Bulk update environment variables (PATCH). Reads KEY=VALUE pairs from
+      stdin, one per line. Write verb - requires allow_write.
 
 Contract commands (the same on every capability):
   coolify stub                                 One-line awareness text.
@@ -942,6 +968,187 @@ def cmd_env_rm(c, uuid: str, key: str):
     return {"deleted": len(matching), "key": key, "entries": deleted}
 
 
+def cmd_env_list_typed(c, uuid: str, rtype: str):
+    """List environment variables for an application or service."""
+    base = "applications" if rtype == "application" else "services"
+    return _request(c, "GET", f"/{base}/{uuid}/envs")
+
+
+def cmd_env_set_typed(c, uuid: str, key: str, value: str, rtype: str):
+    """Set or update an environment variable for an application or service."""
+    base = "applications" if rtype == "application" else "services"
+    # List existing env vars to find all matching entries
+    existing = _request(c, "GET", f"/{base}/{uuid}/envs")
+    env_list = _normalize_env_list(existing)
+
+    # Find all entries with this key (both preview and non-preview)
+    matching = [
+        e for e in env_list
+        if isinstance(e, dict) and e.get("key") == key
+    ]
+
+    if matching:
+        # Update all matching entries to keep preview/non-preview siblings aligned
+        results = []
+        for entry in matching:
+            result = _request(c, "PATCH", f"/{base}/{uuid}/envs",
+                            json_body={"key": key, "value": value, "is_preview": entry.get("is_preview", False)})
+            results.append(result)
+        return {"updated": len(matching), "key": key, "results": results}
+    else:
+        # Create new entry
+        return _request(c, "POST", f"/{base}/{uuid}/envs",
+                       json_body={"key": key, "value": value})
+
+
+def cmd_env_rm_typed(c, uuid: str, key: str, rtype: str):
+    """Remove all environment variable entries matching KEY for an application or service."""
+    base = "applications" if rtype == "application" else "services"
+    # List existing env vars to find all matching entries
+    existing = _request(c, "GET", f"/{base}/{uuid}/envs")
+    env_list = _normalize_env_list(existing)
+
+    # Find all entries with this key (both preview and non-preview)
+    matching = [
+        e for e in env_list
+        if isinstance(e, dict) and e.get("key") == key
+    ]
+
+    if not matching:
+        _die(3, "not_found", f"environment variable {key!r} not found",
+             f"use `coolify env list {uuid} --type {rtype}` to see available variables")
+
+    # Delete all matching entries
+    deleted = []
+    for entry in matching:
+        env_uuid = entry.get("uuid")
+        is_preview = entry.get("is_preview", False)
+        _request(c, "DELETE", f"/{base}/{uuid}/envs/{env_uuid}")
+        deleted.append({"uuid": env_uuid, "is_preview": is_preview})
+
+    return {"deleted": len(matching), "key": key, "entries": deleted}
+
+
+def cmd_env_bulk(c, uuid: str, env_data: str, rtype: str):
+    """Bulk update environment variables (PATCH). env_data is newline-separated KEY=VALUE pairs."""
+    base = "applications" if rtype == "application" else "services"
+    # Parse KEY=VALUE pairs from input
+    env_vars = []
+    for line in env_data.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env_vars.append({"key": key.strip(), "value": value.strip()})
+
+    if not env_vars:
+        _die(6, "input", "no valid KEY=VALUE pairs found in input")
+
+    return _request(c, "PATCH", f"/{base}/{uuid}/envs/bulk", json_body=env_vars)
+
+
+def cmd_projects_create(c, name: str, description: str | None):
+    """Create a new project."""
+    payload = {"name": name}
+    if description:
+        payload["description"] = description
+    result = _request(c, "POST", "/projects", json_body=payload)
+    return result
+
+
+def cmd_app_create(c, args):
+    """Create an application with various source types."""
+    import base64
+
+    # Build the payload - common fields
+    payload = {
+        "project_uuid": args.project,
+        "server_uuid": args.server,
+        "environment_name": args.environment,
+    }
+
+    # Optional common fields
+    if hasattr(args, 'name') and args.name:
+        payload["name"] = args.name
+    if hasattr(args, 'domains') and args.domains:
+        payload["domains"] = args.domains
+    if hasattr(args, 'ports_exposes') and args.ports_exposes:
+        payload["ports_exposes"] = args.ports_exposes
+    if hasattr(args, 'instant_deploy') and args.instant_deploy:
+        payload["instant_deploy"] = True
+    if hasattr(args, 'destination') and args.destination:
+        payload["destination_uuid"] = args.destination
+
+    # Determine source type and endpoint
+    if hasattr(args, 'image') and args.image:
+        # Registry image
+        endpoint = "/applications/dockerimage"
+        parts = args.image.rsplit(":", 1)
+        payload["docker_registry_image_name"] = parts[0]
+        payload["docker_registry_image_tag"] = parts[1] if len(parts) > 1 else "latest"
+    elif hasattr(args, 'dockerfile') and args.dockerfile:
+        # Inline dockerfile
+        endpoint = "/applications/dockerfile"
+        if args.dockerfile == "-":
+            dockerfile_content = sys.stdin.read()
+        else:
+            dockerfile_content = Path(args.dockerfile).read_text()
+        payload["dockerfile"] = dockerfile_content
+    elif hasattr(args, 'git_repository') and args.git_repository:
+        # Git-based - determine which endpoint
+        payload["git_repository"] = args.git_repository
+        payload["git_branch"] = args.git_branch
+        if hasattr(args, 'build_pack') and args.build_pack:
+            payload["build_pack"] = args.build_pack
+        if hasattr(args, 'docker_compose_location') and args.docker_compose_location:
+            payload["docker_compose_location"] = args.docker_compose_location
+        if hasattr(args, 'dockerfile_location') and args.dockerfile_location:
+            payload["dockerfile_location"] = args.dockerfile_location
+
+        if hasattr(args, 'private_deploy_key') and args.private_deploy_key:
+            endpoint = "/applications/private-deploy-key"
+            payload["private_key_uuid"] = args.private_deploy_key
+        elif hasattr(args, 'github_app') and args.github_app:
+            endpoint = "/applications/private-github-app"
+            payload["github_app_uuid"] = args.github_app
+        else:
+            endpoint = "/applications/public"
+    else:
+        _die(6, "input", "must specify one source type: --image, --dockerfile, or --git-repository")
+
+    return _request(c, "POST", endpoint, json_body=payload)
+
+
+def cmd_service_create(c, args):
+    """Create a service from docker-compose file."""
+    import base64
+
+    # Read compose file
+    if args.compose == "-":
+        compose_content = sys.stdin.read()
+    else:
+        compose_content = Path(args.compose).read_text()
+
+    # Base64 encode the compose content
+    compose_b64 = base64.b64encode(compose_content.encode()).decode()
+
+    payload = {
+        "project_uuid": args.project,
+        "server_uuid": args.server,
+        "environment_name": args.environment,
+        "docker_compose_raw": compose_b64,
+    }
+
+    if args.name:
+        payload["name"] = args.name
+    if args.instant_deploy:
+        payload["instant_deploy"] = True
+    if args.destination:
+        payload["destination_uuid"] = args.destination
+
+    return _request(c, "POST", "/services", json_body=payload)
+
+
 # ── dispatch ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -962,7 +1169,14 @@ def main() -> None:
     sub.add_parser("doctor")
     sub.add_parser("resources")
 
-    for verb in ("projects", "applications", "services", "databases",
+    # projects with create subcommand
+    sp = sub.add_parser("projects")
+    sp.add_argument("uuid", nargs="?", default=None)
+    sp.add_argument("subcmd", nargs="?", default=None, choices=["create"])
+    sp.add_argument("--name", default=None)
+    sp.add_argument("--description", default=None)
+
+    for verb in ("applications", "services", "databases",
                  "servers", "deployments"):
         sp = sub.add_parser(verb)
         sp.add_argument("uuid", nargs="?", default=None)
@@ -982,21 +1196,68 @@ def main() -> None:
         sp.add_argument("--type", dest="rtype", default="application",
                         choices=["application", "service", "database"])
 
-    sp = sub.add_parser("env", help="manage application environment variables")
+    # app create
+    sp = sub.add_parser("app", help="create application")
+    app_sub = sp.add_subparsers(dest="app_cmd", required=True)
+    sp_create = app_sub.add_parser("create", help="create application")
+    sp_create.add_argument("--project", required=True, help="project UUID")
+    sp_create.add_argument("--server", required=True, help="server UUID")
+    sp_create.add_argument("--environment", required=True, help="environment name")
+    sp_create.add_argument("--name", help="application name")
+    sp_create.add_argument("--domains", help="comma-separated domains")
+    sp_create.add_argument("--ports-exposes", dest="ports_exposes", help="exposed ports")
+    sp_create.add_argument("--instant-deploy", dest="instant_deploy", action="store_true")
+    sp_create.add_argument("--destination", help="destination UUID")
+    # Source type flags
+    sp_create.add_argument("--git-repository", dest="git_repository", help="git repository URL")
+    sp_create.add_argument("--git-branch", dest="git_branch", help="git branch")
+    sp_create.add_argument("--build-pack", dest="build_pack",
+                          choices=["nixpacks", "railpack", "static", "dockerfile", "dockercompose"])
+    sp_create.add_argument("--docker-compose-location", dest="docker_compose_location")
+    sp_create.add_argument("--dockerfile-location", dest="dockerfile_location")
+    sp_create.add_argument("--private-deploy-key", dest="private_deploy_key", help="deploy key UUID")
+    sp_create.add_argument("--github-app", dest="github_app", help="GitHub app UUID")
+    sp_create.add_argument("--image", help="registry image (name:tag)")
+    sp_create.add_argument("--dockerfile", help="inline dockerfile (file path or - for stdin)")
+
+    # service create
+    sp = sub.add_parser("service", help="create service")
+    service_sub = sp.add_subparsers(dest="service_cmd", required=True)
+    sp_create = service_sub.add_parser("create", help="create service")
+    sp_create.add_argument("--compose", required=True, help="docker-compose file (path or - for stdin)")
+    sp_create.add_argument("--project", required=True, help="project UUID")
+    sp_create.add_argument("--server", required=True, help="server UUID")
+    sp_create.add_argument("--environment", required=True, help="environment name")
+    sp_create.add_argument("--name", help="service name")
+    sp_create.add_argument("--instant-deploy", dest="instant_deploy", action="store_true")
+    sp_create.add_argument("--destination", help="destination UUID")
+
+    sp = sub.add_parser("env", help="manage application/service environment variables")
     env_sub = sp.add_subparsers(dest="env_cmd", required=True)
 
     sp_list = env_sub.add_parser("list", help="list environment variables")
     sp_list.add_argument("uuid")
+    sp_list.add_argument("--type", dest="rtype", default="application",
+                        choices=["application", "service"])
 
     sp_set = env_sub.add_parser("set", help="set environment variable")
     sp_set.add_argument("uuid")
     sp_set.add_argument("key")
     sp_set.add_argument("value", nargs="?", default=None,
                         help="value (omit to read from stdin)")
+    sp_set.add_argument("--type", dest="rtype", default="application",
+                        choices=["application", "service"])
 
     sp_rm = env_sub.add_parser("rm", help="remove environment variable")
     sp_rm.add_argument("uuid")
     sp_rm.add_argument("key")
+    sp_rm.add_argument("--type", dest="rtype", default="application",
+                        choices=["application", "service"])
+
+    sp_bulk = env_sub.add_parser("bulk", help="bulk update environment variables")
+    sp_bulk.add_argument("uuid")
+    sp_bulk.add_argument("--type", dest="rtype", default="application",
+                        choices=["application", "service"])
 
     args = p.parse_args()
     if args.cmd == "help":
@@ -1005,11 +1266,28 @@ def main() -> None:
         cmd_doctor(args); return
 
     conn = _resolve_conn(args)
-    _write_gate(conn["id"], conn["allow_write"], args.cmd)
+
+    # Determine if this is a write operation for gate check
+    is_write = args.cmd in WRITE_VERBS
+    if args.cmd == "projects" and hasattr(args, "subcmd") and args.subcmd == "create":
+        is_write = True
+    elif args.cmd in ("app", "service"):
+        is_write = True
+
+    if is_write:
+        _write_gate(conn["id"], conn["allow_write"], args.cmd)
+
     with _client(conn) as c:
         if args.cmd == "resources":
             _emit(_slim_list(_request(c, "GET", "/resources")))
-        elif args.cmd in ("projects", "applications", "services", "databases",
+        elif args.cmd == "projects":
+            if hasattr(args, "subcmd") and args.subcmd == "create":
+                if not args.name:
+                    _die(6, "input", "projects create requires --name")
+                _emit(cmd_projects_create(c, args.name, args.description))
+            else:
+                _emit(cmd_collection(c, args.cmd, args.uuid))
+        elif args.cmd in ("applications", "services", "databases",
                           "servers", "deployments"):
             _emit(cmd_collection(c, args.cmd, args.uuid))
         elif args.cmd == "logs":
@@ -1018,17 +1296,30 @@ def main() -> None:
             _emit(cmd_deploy(c, args.uuid, args.force, args.tag))
         elif args.cmd in ("start", "stop", "restart"):
             _emit(cmd_lifecycle(c, args.cmd, args.uuid, args.rtype))
+        elif args.cmd == "app":
+            if args.app_cmd == "create":
+                _emit(cmd_app_create(c, args))
+            else:
+                _die(6, "unknown_command", f"no handler for app {args.app_cmd!r}")
+        elif args.cmd == "service":
+            if args.service_cmd == "create":
+                _emit(cmd_service_create(c, args))
+            else:
+                _die(6, "unknown_command", f"no handler for service {args.service_cmd!r}")
         elif args.cmd == "env":
             if args.env_cmd == "list":
-                _emit(cmd_env_list(c, args.uuid))
+                _emit(cmd_env_list_typed(c, args.uuid, args.rtype))
             elif args.env_cmd == "set":
                 value = args.value
                 if value is None:
                     import getpass
                     value = getpass.getpass("")
-                _emit(cmd_env_set(c, args.uuid, args.key, value))
+                _emit(cmd_env_set_typed(c, args.uuid, args.key, value, args.rtype))
             elif args.env_cmd == "rm":
-                _emit(cmd_env_rm(c, args.uuid, args.key))
+                _emit(cmd_env_rm_typed(c, args.uuid, args.key, args.rtype))
+            elif args.env_cmd == "bulk":
+                env_data = sys.stdin.read()
+                _emit(cmd_env_bulk(c, args.uuid, env_data, args.rtype))
             else:
                 _die(6, "unknown_command", f"no handler for env {args.env_cmd!r}")
         else:
