@@ -6,7 +6,9 @@ Run with: python3 tests/test_manager_bundle_install.py
 
 from __future__ import annotations
 
+import asyncio
 import json
+import importlib.util
 import os
 import shutil
 import signal
@@ -70,6 +72,96 @@ def _run_service_init(bin_dir: Path, env: dict[str, str], project: Path) -> None
     if "FileNotFoundError" in proc.stderr:
         raise AssertionError(proc.stderr)
     assert (project / ".capabilities" / "telegram" / "service" / "settings.json").is_file()
+
+
+def _write_fake_telethon(fake_telethon: Path) -> None:
+    fake_telethon.mkdir(parents=True, exist_ok=True)
+    (fake_telethon / "__init__.py").write_text("""
+import asyncio
+from types import SimpleNamespace
+
+
+class _NewMessage:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class events:
+    NewMessage = _NewMessage
+
+
+class TelegramClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def connect(self):
+        pass
+
+    async def is_user_authorized(self):
+        return True
+
+    async def get_me(self):
+        return SimpleNamespace(first_name="Stub", id=42)
+
+    def on(self, _event):
+        def decorate(fn):
+            return fn
+        return decorate
+
+    async def run_until_disconnected(self):
+        await asyncio.Event().wait()
+
+    async def disconnect(self):
+        pass
+""".lstrip())
+
+
+def _import_telegram_daemon(tmp: Path, settings: dict) -> object:
+    project = tmp / "project"
+    service_dir = project / ".capabilities" / "telegram" / "service"
+    service_dir.mkdir(parents=True, exist_ok=True)
+    (service_dir / "settings.json").write_text(json.dumps(settings) + "\n")
+    (service_dir / "context.md").write_text("test context\n")
+    connections = tmp / "connections.json"
+    connections.write_text(json.dumps({
+        "connections": {
+            "marvin": {
+                "api_id": 12345,
+                "allow_write": True,
+            },
+        },
+    }) + "\n")
+    fake_telethon = tmp / "fake" / "telethon"
+    _write_fake_telethon(fake_telethon)
+    old_env = dict(os.environ)
+    old_path = list(sys.path)
+    try:
+        os.environ.update({
+            "HOME": str(tmp / "home"),
+            "XDG_CONFIG_HOME": str(tmp / "config"),
+            "XDG_STATE_HOME": str(tmp / "state"),
+            "PYTHONPATH": str(tmp / "fake") + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            "TELEGRAM_API_HASH": "test-hash",
+            "TELEGRAM_SERVICE_CONNECTION": "marvin",
+            "TELEGRAM_SERVICE_CONNECTIONS_FILE": str(connections),
+            "TELEGRAM_SERVICE_CONTEXT": str(service_dir / "context.md"),
+            "TELEGRAM_SERVICE_PROJECT_ROOT": str(project),
+            "TELEGRAM_SERVICE_SETTINGS": str(service_dir / "settings.json"),
+            "TELEGRAM_SERVICE_STATE_DIR": str(tmp / "service-state"),
+        })
+        sys.path.insert(0, str(tmp / "fake"))
+        module_name = f"telegram_daemon_test_{time.time_ns()}"
+        spec = importlib.util.spec_from_file_location(module_name, TELEGRAM_DAEMON)
+        if spec is None or spec.loader is None:
+            raise AssertionError("cannot load telegram daemon module")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+        sys.path[:] = old_path
 
 
 def test_install_from_source_script_installs_bundle() -> None:
@@ -291,6 +383,123 @@ def test_telegram_worker_wrapper_limits_current_chat_scope() -> None:
     assert payload["error"]["code"] == "chat_scope_denied"
 
 
+def test_telegram_control_authority_limits_settings_commands() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        daemon = _import_telegram_daemon(tmp, {
+            "connection": "marvin",
+            "assistant_name": "Assistant",
+            "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
+            "allowed_users": {
+                "535123867": {"name": "KZ", "role": "supervisor"},
+            },
+            "allowed_groups": {
+                "-1001": {"name": "Test Group", "member_role": "group_member"},
+            },
+            "control": {
+                "roles": {
+                    "supervisor": {"commands": ["status", "set", "stop", "help"]},
+                    "group_member": {"commands": ["status", "help"]},
+                },
+            },
+            "defaults": {"worker": "stub"},
+        })
+        group_policy = {"name": "Test Group", "member_role": "group_member"}
+        supervisor = {"id": "535123867", "name": "KZ", "role": "supervisor"}
+        member = {"id": "777", "name": "Member", "role": "group_member"}
+
+        assert daemon._control_command_allowed("/status", member, group_policy)
+        assert not daemon._control_command_allowed("/set", member, group_policy)
+        assert not daemon._control_command_allowed("/stop", member, group_policy)
+        assert daemon._control_command_allowed("/status", supervisor, group_policy)
+        assert daemon._control_command_allowed("/set", supervisor, group_policy)
+        assert daemon._control_command_allowed("/stop", supervisor, group_policy)
+
+
+def test_telegram_group_chat_ref_never_falls_back_to_sender() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        daemon = _import_telegram_daemon(tmp, {
+            "connection": "marvin",
+            "assistant_name": "Assistant",
+            "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
+            "allowed_users": {},
+            "allowed_groups": {},
+            "defaults": {"worker": "stub"},
+        })
+
+        class GroupEvent:
+            chat_id = -770312767
+            input_chat = None
+            input_sender = "sender-peer"
+
+            async def get_input_chat(self):
+                return "chat-peer"
+
+            async def get_input_sender(self):
+                return "sender-peer-from-method"
+
+        class FallbackGroupEvent:
+            chat_id = -770312767
+            input_chat = None
+            input_sender = "sender-peer"
+
+            async def get_input_chat(self):
+                raise RuntimeError("no input chat")
+
+            async def get_chat(self):
+                raise RuntimeError("no chat entity")
+
+            async def get_input_sender(self):
+                return "sender-peer-from-method"
+
+        assert asyncio.run(daemon._event_chat_ref(GroupEvent(), is_direct=False)) == "chat-peer"
+        assert asyncio.run(daemon._event_chat_ref(FallbackGroupEvent(), is_direct=False)) == -770312767
+
+
+def test_telegram_channel_context_overlay_is_added_to_prompt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        daemon = _import_telegram_daemon(tmp, {
+            "connection": "marvin",
+            "assistant_name": "Assistant",
+            "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
+            "allowed_users": {},
+            "allowed_groups": {},
+            "defaults": {"worker": "stub"},
+        })
+        channel_context_dir = tmp / "project" / ".capabilities" / "telegram" / "service" / "context"
+        channel_context_dir.mkdir(parents=True)
+        (channel_context_dir / "family.md").write_text("File overlay line.\n")
+
+        policy = {
+            "context": "Inline overlay line.",
+            "context_file": "context/family.md",
+        }
+        overlay = daemon._channel_context_from_policy(policy)
+        assert "Inline overlay line." in overlay
+        assert "File overlay line." in overlay
+
+        prompt = daemon.build_prompt(
+            [{"id": 1, "sender": "KZ", "text": "Hello"}],
+            {
+                "chat_id": "-1001",
+                "chat_type": "group",
+                "connection": "marvin",
+                "harness": "stub",
+                "chat_name": "Family",
+                "channel_context": overlay,
+                "current_request": {"message_id": 1, "sender_name": "KZ", "sender_role": "supervisor", "kind": "text", "text": "Hello", "reply_to": 1},
+                "settings": {"tail_size": 30, "debounce": 2, "worker": "stub"},
+            },
+        )
+        assert "--- Channel-specific context ---" in prompt
+        assert prompt.index("--- Channel-specific context ---") < prompt.index("--- Channel state ---")
+
+        outside = daemon._channel_context_from_policy({"context_file": "../outside.md"})
+        assert "ignored" in outside
+
+
 if __name__ == "__main__":
     tests = [
         ("install from source script installs bundle", test_install_from_source_script_installs_bundle),
@@ -298,6 +507,9 @@ if __name__ == "__main__":
         ("telegram daemon sigterm stops without traceback", test_telegram_daemon_sigterm_stops_without_traceback),
         ("auth context denies unlisted capability", test_capability_auth_context_denies_unlisted_capability),
         ("telegram worker wrapper limits current chat scope", test_telegram_worker_wrapper_limits_current_chat_scope),
+        ("telegram control authority limits settings commands", test_telegram_control_authority_limits_settings_commands),
+        ("telegram group chat ref never falls back to sender", test_telegram_group_chat_ref_never_falls_back_to_sender),
+        ("telegram channel context overlay is added to prompt", test_telegram_channel_context_overlay_is_added_to_prompt),
     ]
     failed = 0
     for name, test in tests:

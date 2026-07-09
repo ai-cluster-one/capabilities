@@ -7,6 +7,22 @@
   },
   "allowed_users": {},
   "allowed_groups": {},
+  "control": {
+    "roles": {
+      "supervisor": {
+        "commands": ["status", "set", "stop", "help"]
+      },
+      "channel_admin": {
+        "commands": ["status", "set", "help"]
+      },
+      "direct_user": {
+        "commands": ["status", "help"]
+      },
+      "group_member": {
+        "commands": ["status", "help"]
+      }
+    }
+  },
   "authority": {
     "roles": {
       "supervisor": {

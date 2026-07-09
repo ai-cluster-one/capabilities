@@ -18,12 +18,13 @@ Runtime state follows the selected Telegram connection:
   <connection-state>/service/progress/        progress outbox
   <connection-state>/service/worker-sessions/ hot session copies
 
-Three gates, not to be conflated:
+Four gates, not to be conflated:
   1. door         — direct_messages mode in private chats; allowed_groups in groups,
                     only when the assistant is explicitly addressed                  (HARD)
-  2. tool authority — what the worker (claude/codex) may call (later, via flags)      (HARD)
-  3. soft-gates   — behavioural guidance in context.md                              (SOFT)
-This file implements gate 1; context.md carries gate 3.
+  2. control authority — who may run service control commands like /set and /stop    (HARD)
+  3. tool authority — what the worker (claude/codex) may call (later, via flags)     (HARD)
+  4. soft-gates   — behavioural guidance in context.md                              (SOFT)
+This file implements gates 1 and 2; context.md carries gate 4.
 
 Telegram is the source of truth: the worker rebuilds context from the live tail
 each turn. The register holds only what Telegram doesn't — the watermark and the
@@ -122,6 +123,14 @@ DIRECT_DEFAULT_ROLE = DIRECT_MESSAGES.get("default_role") or "direct_user"
 DEFAULTS = SETTINGS.get("defaults", {})
 ASSISTANT_NAME = SETTINGS.get("assistant_name") or DEFAULTS.get("assistant_name") or "Assistant"
 DEFAULT_GROUP_ALIASES = tuple(DEFAULTS.get("group_aliases") or (ASSISTANT_NAME,))
+CONTROL_DEFAULTS = {
+    "roles": {
+        "supervisor": {"commands": ["status", "set", "stop", "help"]},
+        "channel_admin": {"commands": ["status", "set", "help"]},
+        "direct_user": {"commands": ["status", "help"]},
+        "group_member": {"commands": ["status", "help"]},
+    }
+}
 DEFAULT_WORKER = (
     os.environ.get("TELEGRAM_SERVICE_WORKER")
     or os.environ.get("TG_WORKER")
@@ -566,12 +575,18 @@ async def _event_access(event, me):
     return {"kind": "group", "group_key": group_key, "policy": policy}
 
 
-async def _event_chat_ref(event):
-    for attr in ("input_chat", "input_sender"):
+async def _event_chat_ref(event, is_direct=False):
+    attrs = ("input_chat", "input_sender") if is_direct else ("input_chat",)
+    for attr in attrs:
         value = getattr(event, attr, None)
         if value:
             return value
-    for method in ("get_input_chat", "get_input_sender", "get_chat"):
+    methods = (
+        ("get_input_chat", "get_input_sender", "get_chat")
+        if is_direct else
+        ("get_input_chat", "get_chat")
+    )
+    for method in methods:
         fn = getattr(event, method, None)
         if not fn:
             continue
@@ -935,6 +950,62 @@ def _command_name(text):
     return parts[0].split("@", 1)[0].lower()
 
 
+def _control_command_key(command):
+    key = str(command or "").strip().split("@", 1)[0].lower().lstrip("/")
+    return key if key in {"status", "set", "stop"} else "help"
+
+
+def _control_commands_allow(commands, command):
+    if commands is True or commands == "*":
+        return True
+    key = _control_command_key(command)
+    if isinstance(commands, list):
+        allowed = {str(item).strip().lower().lstrip("/") for item in commands}
+        return "*" in allowed or key in allowed
+    if isinstance(commands, dict):
+        rule = commands.get(key, commands.get("*"))
+        if rule is True or rule == "*":
+            return True
+        if isinstance(rule, dict):
+            if rule.get("deny") is True:
+                return False
+            if rule.get("enabled") is False or rule.get("allow") is False:
+                return False
+            return True
+    return False
+
+
+def _control_policy_for(profile, group_policy=None):
+    role = (profile or {}).get("role") or "unknown"
+    sender_id = str((profile or {}).get("id") or "")
+    control = _as_mapping(SETTINGS.get("control"))
+    policy = _deep_merge(
+        _as_mapping(_as_mapping(CONTROL_DEFAULTS.get("roles")).get(role)),
+        _as_mapping(_as_mapping(control.get("roles")).get(role)),
+    )
+
+    if sender_id in ALLOWED and isinstance(ALLOWED[sender_id], dict):
+        policy = _deep_merge(policy, _as_mapping(ALLOWED[sender_id].get("control")))
+    if isinstance(group_policy, dict):
+        policy = _deep_merge(policy, _as_mapping(group_policy.get("control")))
+        member = _as_mapping(_as_mapping(group_policy.get("members")).get(sender_id))
+        policy = _deep_merge(policy, _as_mapping(member.get("control")))
+    return policy
+
+
+def _control_command_allowed(command, profile, group_policy=None):
+    policy = _control_policy_for(profile, group_policy)
+    return _control_commands_allow(policy.get("commands"), command)
+
+
+def _control_denied_reply(command, profile):
+    cmd = "/" + _control_command_key(command)
+    role = (profile or {}).get("role") or "unknown"
+    if cmd == "/help":
+        cmd = str(command or "that command")
+    return f"nope: {cmd} is not allowed for role {role}"
+
+
 def handle_command(reg, key, text):
     """Parse a /command. Returns reply text; mutates reg for /set (caller saves)."""
     parts = text.strip().split()
@@ -1013,6 +1084,45 @@ def _settings_summary(s):
     return ", ".join(bits)
 
 
+def _service_context_path(value):
+    if not value:
+        return None
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = SERVICE_DIR / path
+    try:
+        resolved = path.resolve()
+        service_root = SERVICE_DIR.resolve()
+    except OSError:
+        return path
+    if resolved == service_root or service_root in resolved.parents:
+        return resolved
+    return None
+
+
+def _channel_context_from_policy(policy):
+    if not isinstance(policy, dict):
+        return ""
+    parts = []
+    inline = str(policy.get("context") or "").strip()
+    if inline:
+        parts.append(inline)
+    context_file = policy.get("context_file")
+    path = _service_context_path(context_file)
+    if context_file and path is None:
+        parts.append(f"[channel context file ignored: {context_file}]")
+    elif path and path.exists():
+        try:
+            text = path.read_text().strip()
+        except OSError as e:
+            text = f"[channel context file unreadable: {context_file}: {e}]"
+        if text:
+            parts.append(text)
+    elif context_file:
+        parts.append(f"[channel context file missing: {context_file}]")
+    return "\n\n".join(parts).strip()
+
+
 def build_prompt(tail, state=None):
     """Assemble the worker prompt: soft-gate context (context.md) + the daemon-resolved channel
     state (time, channel/harness, participants + roles, active settings, context-window size,
@@ -1020,6 +1130,9 @@ def build_prompt(tail, state=None):
     worker reads its situation from the context, not by inferring it from chat history."""
     context = CONTEXT_FILE.read_text().strip() if CONTEXT_FILE.exists() else ""
     st = state or {}
+    channel_context = (st.get("channel_context") or "").strip()
+    if channel_context:
+        channel_context = "--- Channel-specific context ---\n" + channel_context + "\n\n"
     lines = []
     if st.get("now"):
         lines.append(f"Time: {st['now']}")
@@ -1070,7 +1183,7 @@ def build_prompt(tail, state=None):
     history = "\n".join(
         f'[{m.get("id")}] {m["sender"]}: {m["text"]}' if m.get("id") else f'{m["sender"]}: {m["text"]}'
         for m in tail)
-    return f"{context}\n\n{block}{request_block}--- Conversation ---\n{history}"
+    return f"{context}\n\n{channel_context}{block}{request_block}--- Conversation ---\n{history}"
 
 
 def message_tail_text(m):
@@ -1470,6 +1583,7 @@ async def run_session(client):
             progress_outbox.unlink()
         worker_session = prepare_worker_session(key, job.get("message_id"))
         authority = _authority_policy_for(job, group_policy, is_direct)
+        channel_context = _channel_context_from_policy(group_policy)
         authority_context = None
         if authority is not None:
             AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
@@ -1482,6 +1596,7 @@ async def run_session(client):
                  "harness": s["worker"], "participants": participants, "settings": s,
                  "messages": len(tail),
                  "history_chars": sum(len(m["text"]) for m in tail),
+                 "channel_context": channel_context,
                  "prev_usage": reg.get(key, {}).get("last_usage"),
                  "current_request": current_request,
                  "authority": authority,
@@ -1743,11 +1858,18 @@ async def run_session(client):
             log(f"{event.chat_id}: ignored {_message_kind(event.message)} from {event.sender_id}")
             return
         key = str(event.chat_id)
-        chat_ref = await _event_chat_ref(event)
         text = _message_text(event.message)
+        group_policy = access.get("policy")
+        is_direct = access["kind"] == "private"
+        chat_ref = await _event_chat_ref(event, is_direct=is_direct)
         if text.startswith("/"):                          # control path — act now
-            log(f"{key}: /command «{text[:40]}»")
-            if _command_name(text) == "/stop":
+            profile = await _sender_profile(event.message, group_policy, direct=is_direct)
+            cmd = _command_name(text)
+            log(f"{key}: /command «{text[:40]}» from {profile['id']} ({profile['role']})")
+            if not _control_command_allowed(cmd, profile, group_policy):
+                reply = _control_denied_reply(cmd, profile)
+                log(f"{key}: denied command {cmd} for {profile['id']} ({profile['role']})")
+            elif cmd == "/stop":
                 reply = stop_running(key)
             else:
                 reply = handle_command(reg, key, text)
@@ -1759,8 +1881,6 @@ async def run_session(client):
                     chat_ref, reply, access["kind"] == "private",
                     reply_to=None if access["kind"] == "private" else event.message.id)
             return
-        group_policy = access.get("policy")
-        is_direct = access["kind"] == "private"
         spoken = None
         if _is_spoken_media(event.message):               # transcribe → echo (visible + attributed by reply)
             spoken = await echo_voice_message(event.message, chat_ref, key, is_direct)

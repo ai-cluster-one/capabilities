@@ -24,6 +24,10 @@ capability bundle.
 
    - Set `connection` or rely on the default in `.capabilities/telegram/connections.json`.
    - Add `allowed_users` and `allowed_groups`.
+   - Add optional per-channel `context_file` or short inline `context` entries
+     when a chat needs its own soft prompt overlay.
+   - Review `control.roles`: this hard gate limits who may run service
+     control commands such as `/set` and `/stop`.
    - Review `authority.roles`: this request-scoped hard gate limits which
      capability CLIs a worker may invoke for each sender role.
    - Set group `aliases` / `address_aliases` if the assistant should react to names other than the default.
@@ -94,7 +98,62 @@ Telethon SQLite session.
 - `telegram send <chat> <text>` inside a worker writes to the daemon progress
   outbox instead of sending directly.
 - Workers can be `codex`, `claude`, or `stub`; `/set` and `/status` in Telegram
-  adjust per-channel runtime settings.
+  adjust or inspect per-channel runtime settings when `control.roles` allows
+  the sender role to run that command.
+
+## Channel Context
+
+The global soft prompt lives in `.capabilities/telegram/service/context.md`.
+Group policies may add a channel-specific overlay with either a markdown file or
+a short inline string. File paths are relative to
+`.capabilities/telegram/service/`.
+
+```json
+{
+  "allowed_groups": {
+    "-100123": {
+      "name": "Family",
+      "member_role": "group_member",
+      "context_file": "context/family.md"
+    },
+    "-100456": {
+      "name": "Small Team",
+      "member_role": "group_member",
+      "context": "Keep replies brief and operational in this channel."
+    }
+  }
+}
+```
+
+The prompt order is: global `context.md`, channel context overlay, daemon channel
+state, current request, then the recent conversation tail. Channel context is a
+soft behavior layer only; access control still belongs to `control.roles` and
+tool access still belongs to `authority.roles`.
+
+## Control Authority
+
+Service control commands are handled by the daemon before a worker job exists,
+so they are governed by `control.roles` instead of `authority.roles`.
+`/status` is safe to expose broadly; `/set` changes per-channel runtime
+settings; `/stop` stops queued/running work for the channel.
+
+```json
+{
+  "control": {
+    "roles": {
+      "supervisor": {
+        "commands": ["status", "set", "stop", "help"]
+      },
+      "channel_admin": {
+        "commands": ["status", "set", "help"]
+      },
+      "group_member": {
+        "commands": ["status", "help"]
+      }
+    }
+  }
+}
+```
 
 ## Tool Authority
 
