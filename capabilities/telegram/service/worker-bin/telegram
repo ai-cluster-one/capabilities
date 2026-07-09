@@ -38,9 +38,88 @@ def write_progress(argv):
     return True
 
 
+def auth_context():
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return {}
+    try:
+        if raw.lstrip().startswith("{"):
+            return json.loads(raw)
+        with open(raw, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def telegram_rule(ctx):
+    caps = ctx.get("allowed_capabilities") or {}
+    if caps is True or caps == "*":
+        return True
+    if isinstance(caps, list):
+        return True if ("telegram" in caps or "*" in caps) else False
+    if not isinstance(caps, dict):
+        return None
+    return caps.get("telegram", caps.get("*"))
+
+
+def rule_scope(rule):
+    if rule is True or rule == "*":
+        return None
+    if isinstance(rule, dict):
+        return rule.get("scope")
+    return None
+
+
+def parse_command_and_chat(argv):
+    chat_commands = {"read", "search", "send", "download", "export"}
+    takes_value = {"--session", "--connection", "--chat"}
+    args = list(argv[1:])
+    i = 0
+    while i < len(args):
+        item = args[i]
+        if item in takes_value:
+            i += 2
+            continue
+        if item.startswith("--"):
+            i += 1
+            continue
+        cmd = item
+        if cmd not in chat_commands:
+            return cmd, None
+        j = i + 1
+        while j < len(args) and args[j].startswith("--"):
+            j += 2 if args[j] in takes_value else 1
+        return cmd, args[j] if j < len(args) else None
+    return None, None
+
+
+def enforce_current_chat_scope(argv):
+    ctx = auth_context()
+    rule = telegram_rule(ctx)
+    if rule in (None, False):
+        return
+    if rule_scope(rule) != "current_chat":
+        return
+    cmd, chat = parse_command_and_chat(argv)
+    if not chat:
+        return
+    current = str(ctx.get("chat_id") or "")
+    if str(chat) in (current, "current", "$current"):
+        return
+    sys.stderr.write(json.dumps({
+        "error": {
+            "code": "chat_scope_denied",
+            "message": "telegram is limited to the current chat for this request",
+            "hint": f"requested={chat}; current_chat_id={current}"
+        }
+    }, ensure_ascii=False) + "\n")
+    raise SystemExit(4)
+
+
 def main():
     if write_progress(sys.argv):
         return 0
+    enforce_current_chat_scope(sys.argv)
     real = os.environ.get("TELEGRAM_REAL_TELEGRAM")
     if not real:
         real = "telegram"

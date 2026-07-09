@@ -7,6 +7,26 @@
   },
   "allowed_users": {},
   "allowed_groups": {},
+  "authority": {
+    "roles": {
+      "supervisor": {
+        "allowed_capabilities": {
+          "*": true
+        }
+      },
+      "direct_user": {
+        "allowed_capabilities": {}
+      },
+      "group_member": {
+        "allowed_capabilities": {
+          "telegram": {
+            "scope": "current_chat"
+          },
+          "routine": true
+        }
+      }
+    }
+  },
   "defaults": {
     "tail_size": 40,
     "debounce": 5,

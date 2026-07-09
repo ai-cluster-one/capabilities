@@ -22,6 +22,8 @@ MANAGER = REPO / "bin" / "capabilities"
 TELEGRAM_SCRIPT = REPO / "capabilities" / "telegram" / "bin" / "telegram"
 TELEGRAM_BUNDLE = TELEGRAM_SCRIPT.parent.parent
 TELEGRAM_DAEMON = TELEGRAM_BUNDLE / "service" / "daemon.py"
+TELEGRAM_WORKER = TELEGRAM_BUNDLE / "service" / "worker-bin" / "telegram"
+MAILBOX_SCRIPT = REPO / "capabilities" / "mailbox" / "bin" / "mailbox"
 
 
 def _env(tmp: Path) -> tuple[dict[str, str], Path, Path]:
@@ -227,11 +229,75 @@ class TelegramClient:
         assert not (state_dir / "daemon.lock").exists()
 
 
+def test_capability_auth_context_denies_unlisted_capability() -> None:
+    env = dict(os.environ)
+    env["CAPABILITIES_AUTH_CONTEXT"] = json.dumps({
+        "source": "telegram",
+        "chat_id": "-1001",
+        "sender_role": "group_member",
+        "allowed_capabilities": {
+            "telegram": {"scope": "current_chat"},
+            "routine": True,
+        },
+    })
+    proc = subprocess.run(
+        [str(MAILBOX_SCRIPT), "list"],
+        cwd=str(REPO),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 4
+    payload = json.loads(proc.stderr)
+    assert payload["error"]["code"] == "capability_not_authorized"
+    assert "mailbox" in payload["error"]["message"]
+
+
+def test_telegram_worker_wrapper_limits_current_chat_scope() -> None:
+    env = dict(os.environ)
+    env.update({
+        "CAPABILITIES_AUTH_CONTEXT": json.dumps({
+            "source": "telegram",
+            "chat_id": "-1001",
+            "sender_role": "group_member",
+            "allowed_capabilities": {
+                "telegram": {"scope": "current_chat"},
+            },
+        }),
+        "TELEGRAM_REAL_TELEGRAM": "/bin/echo",
+    })
+    ok = subprocess.run(
+        [str(TELEGRAM_WORKER), "read", "-1001", "--limit", "1"],
+        cwd=str(REPO),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert ok.returncode == 0, ok.stderr
+    assert "read -1001 --limit 1" in ok.stdout
+
+    denied = subprocess.run(
+        [str(TELEGRAM_WORKER), "read", "-1002", "--limit", "1"],
+        cwd=str(REPO),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert denied.returncode == 4
+    payload = json.loads(denied.stderr)
+    assert payload["error"]["code"] == "chat_scope_denied"
+
+
 if __name__ == "__main__":
     tests = [
         ("install from source script installs bundle", test_install_from_source_script_installs_bundle),
         ("update migrates script source to bundle", test_update_migrates_script_source_to_bundle),
         ("telegram daemon sigterm stops without traceback", test_telegram_daemon_sigterm_stops_without_traceback),
+        ("auth context denies unlisted capability", test_capability_auth_context_denies_unlisted_capability),
+        ("telegram worker wrapper limits current chat scope", test_telegram_worker_wrapper_limits_current_chat_scope),
     ]
     failed = 0
     for name, test in tests:

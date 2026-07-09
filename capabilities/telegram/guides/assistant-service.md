@@ -24,6 +24,8 @@ capability bundle.
 
    - Set `connection` or rely on the default in `.capabilities/telegram/connections.json`.
    - Add `allowed_users` and `allowed_groups`.
+   - Review `authority.roles`: this request-scoped hard gate limits which
+     capability CLIs a worker may invoke for each sender role.
    - Set group `aliases` / `address_aliases` if the assistant should react to names other than the default.
    - Choose `defaults.worker`: `codex`, `claude`, or `stub`.
 
@@ -93,6 +95,39 @@ Telethon SQLite session.
   outbox instead of sending directly.
 - Workers can be `codex`, `claude`, or `stub`; `/set` and `/status` in Telegram
   adjust per-channel runtime settings.
+
+## Tool Authority
+
+The service creates a per-job `CAPABILITIES_AUTH_CONTEXT` file for workers when
+`settings.json` declares an `authority` policy. Capability CLIs read this file
+before resolving credentials; an unlisted capability exits with policy refusal
+(`exit 4`). This is a hard gate for normal capability use, while `context.md`
+remains soft behavioral guidance.
+
+Role policies live under `authority.roles.<role>.allowed_capabilities`:
+
+```json
+{
+  "authority": {
+    "roles": {
+      "supervisor": {
+        "allowed_capabilities": { "*": true }
+      },
+      "group_member": {
+        "allowed_capabilities": {
+          "telegram": { "scope": "current_chat" },
+          "routine": true
+        }
+      }
+    }
+  }
+}
+```
+
+For group members, keep personal or administrative capabilities such as
+`mailbox`, `coolify`, or external write tools absent unless the project has a
+deliberate reason to expose them. The bundled worker `telegram` wrapper also
+honors `scope: current_chat` for chat-addressed Telegram commands.
 
 To migrate a project that copied a service directory, delete the copied engine
 files after installing the bundled capability. Keep or move only the project

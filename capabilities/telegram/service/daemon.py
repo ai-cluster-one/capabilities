@@ -275,6 +275,7 @@ PID_FILE = SERVICE_STATE_DIR / "daemon.pid"
 LOG_FILE = SERVICE_STATE_DIR / "daemon.log"
 PROGRESS_DIR = SERVICE_STATE_DIR / "progress"
 WORKER_SESSION_DIR = SERVICE_STATE_DIR / "worker-sessions"
+AUTHORITY_DIR = SERVICE_STATE_DIR / "authority"
 
 
 def now():
@@ -339,6 +340,127 @@ def _as_list(value):
         return [str(v).strip() for v in value if str(v).strip()]
     text = str(value).strip()
     return [text] if text else []
+
+
+def _as_mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _deep_merge(base, overlay):
+    out = dict(base or {})
+    for key, value in (overlay or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _policy_allowed_capabilities(policy):
+    if not isinstance(policy, dict):
+        return None
+    if "allowed_capabilities" in policy:
+        return policy.get("allowed_capabilities")
+    return policy.get("capabilities")
+
+
+def _normalize_capability_rule(rule):
+    if rule is True or rule == "*":
+        return True
+    if rule in (False, None):
+        return False
+    if isinstance(rule, list):
+        return {"allow": True, "verbs": rule}
+    if isinstance(rule, dict):
+        out = dict(rule)
+        out.setdefault("allow", True)
+        return out
+    return bool(rule)
+
+
+def _normalize_allowed_capabilities(value):
+    if value is True or value == "*":
+        return {"*": True}
+    if isinstance(value, list):
+        return {str(name): True for name in value}
+    if isinstance(value, dict):
+        return {
+            str(name): _normalize_capability_rule(rule)
+            for name, rule in value.items()
+        }
+    return {}
+
+
+def _authority_policy_for(job, group_policy, is_direct):
+    authority = _as_mapping(SETTINGS.get("authority"))
+    if not authority and not (
+        isinstance(group_policy, dict) and (
+            group_policy.get("authority") or _policy_allowed_capabilities(group_policy)
+        )
+    ):
+        return None
+
+    role = job.get("sender_role") or ("direct_user" if is_direct else "group_member")
+    policy = _deep_merge(
+        _as_mapping(authority.get("default")),
+        _as_mapping(_as_mapping(authority.get("roles")).get(role)),
+    )
+
+    sender_id = str(job.get("sender_id") or "")
+    if sender_id in ALLOWED and isinstance(ALLOWED[sender_id], dict):
+        row = ALLOWED[sender_id]
+        policy = _deep_merge(policy, _as_mapping(row.get("authority")))
+        caps = _policy_allowed_capabilities(row)
+        if caps is not None:
+            policy["allowed_capabilities"] = caps
+
+    if isinstance(group_policy, dict):
+        policy = _deep_merge(policy, _as_mapping(group_policy.get("authority")))
+        caps = _policy_allowed_capabilities(group_policy)
+        if caps is not None:
+            policy["allowed_capabilities"] = caps
+        member = _as_mapping(_as_mapping(group_policy.get("members")).get(sender_id))
+        policy = _deep_merge(policy, _as_mapping(member.get("authority")))
+        caps = _policy_allowed_capabilities(member)
+        if caps is not None:
+            policy["allowed_capabilities"] = caps
+
+    caps = _normalize_allowed_capabilities(_policy_allowed_capabilities(policy))
+    return {
+        "version": 1,
+        "source": "telegram",
+        "connection": CONNECTION,
+        "chat_id": job.get("chat_id"),
+        "chat_type": "private" if is_direct else "group",
+        "chat_name": (group_policy or {}).get("name") if isinstance(group_policy, dict) else None,
+        "sender_id": sender_id,
+        "sender_name": job.get("sender_name"),
+        "sender_role": role,
+        "allowed_capabilities": caps,
+    }
+
+
+def _authority_summary(ctx):
+    if not ctx:
+        return "not declared"
+    caps = ctx.get("allowed_capabilities") or {}
+    if caps.get("*") is True:
+        return "all capabilities"
+    bits = []
+    for name, rule in sorted(caps.items()):
+        if rule is False:
+            continue
+        if rule is True:
+            bits.append(name)
+            continue
+        if isinstance(rule, dict):
+            detail = []
+            if rule.get("scope"):
+                detail.append(f"scope={rule['scope']}")
+            if rule.get("verbs"):
+                detail.append("verbs=" + ",".join(map(str, rule["verbs"])))
+            bits.append(f"{name} ({'; '.join(detail)})" if detail else name)
+    return ", ".join(bits) if bits else "no capabilities"
 
 
 def _chat_key_candidates(chat_id):
@@ -917,6 +1039,8 @@ def build_prompt(tail, state=None):
     s = st.get("settings") or {}
     if s:
         lines.append(f"Settings: {_settings_summary(s)}")
+    if st.get("authority"):
+        lines.append(f"Tool authority: {_authority_summary(st['authority'])}")
     if st.get("messages") is not None:
         ctx = f"Context window: {st['messages']} msgs (of max {s.get('tail_size', '?')})"
         if st.get("history_chars") is not None:
@@ -1012,6 +1136,8 @@ def worker_env(state=None):
         env["TELEGRAM_PROGRESS_OUTBOX"] = st["progress_outbox"]
     if st.get("worker_session"):
         env["TELEGRAM_WORKER_SESSION"] = st["worker_session"]
+    if st.get("authority_context"):
+        env["CAPABILITIES_AUTH_CONTEXT"] = st["authority_context"]
     if st.get("chat_type"):
         env["TELEGRAM_PROGRESS_CHAT_TYPE"] = st["chat_type"]
     req = st.get("current_request") or {}
@@ -1343,6 +1469,13 @@ async def run_session(client):
         with contextlib.suppress(OSError):
             progress_outbox.unlink()
         worker_session = prepare_worker_session(key, job.get("message_id"))
+        authority = _authority_policy_for(job, group_policy, is_direct)
+        authority_context = None
+        if authority is not None:
+            AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
+            auth_path = AUTHORITY_DIR / f"{_safe_file_part(key)}-{job.get('message_id')}.json"
+            auth_path.write_text(json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            authority_context = str(auth_path)
         state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
                  "chat_type": "private" if is_direct else "group",
                  "chat_name": (group_policy or {}).get("name"),
@@ -1351,6 +1484,8 @@ async def run_session(client):
                  "history_chars": sum(len(m["text"]) for m in tail),
                  "prev_usage": reg.get(key, {}).get("last_usage"),
                  "current_request": current_request,
+                 "authority": authority,
+                 "authority_context": authority_context,
                  "progress_outbox": str(progress_outbox),
                  "worker_session": worker_session,
                  "proc_key": proc_key}
@@ -1391,6 +1526,9 @@ async def run_session(client):
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(progress_task, timeout=5)
             cleanup_worker_session(worker_session)
+            if authority_context:
+                with contextlib.suppress(OSError):
+                    Path(authority_context).unlink()
 
         reply, meta = result["reply"], result["meta"]
         if closing:
