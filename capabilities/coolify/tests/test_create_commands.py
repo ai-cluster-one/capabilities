@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Tests for coolify create commands (projects, app, service).
 
-Run with: python3 capabilities/coolify/tests/test_create_commands.py
+Run with: uv run --with httpx python3 capabilities/coolify/tests/test_create_commands.py
+(the coolify bin declares httpx in its PEP-723 header, so bare python3 cannot import it)
 """
 
 import json
