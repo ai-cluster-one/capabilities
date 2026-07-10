@@ -71,6 +71,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.server.seen.append({  # type: ignore[attr-defined]
             "path": self.path,
             "authorization": self.headers.get("Authorization"),
+            "user_agent": self.headers.get("User-Agent"),
         })
         status, body = self.server.routes.get(  # type: ignore[attr-defined]
             self.path, (404, {"error": "not found"}))
@@ -187,7 +188,9 @@ def test_assistant_unmarshal_falls_back_to_rest() -> None:
         assert json.loads(proc.stdout) == [{"id": "from-rest"}]
         assert proc.stderr == ""
         assert seen == [{"path": "/assistant",
-                         "authorization": f"Bearer {SECRET}"}]
+                         "authorization": f"Bearer {SECRET}",
+                         "user_agent": "vapic-capability"}]
+        assert SECRET not in seen[0]["user_agent"]
         assert _fake_log(log)[0]["argv"] == ["assistant", "list"]
         assert SECRET not in _fake_log(log)[0]["argv_text"]
         _assert_no_secret(proc)
@@ -211,7 +214,9 @@ def test_call_unmarshal_falls_back_to_rest() -> None:
         assert json.loads(proc.stdout) == [{"id": "call-from-rest"}]
         assert proc.stderr == ""
         assert seen == [{"path": "/call",
-                         "authorization": f"Bearer {SECRET}"}]
+                         "authorization": f"Bearer {SECRET}",
+                         "user_agent": "vapic-capability"}]
+        assert SECRET not in seen[0]["user_agent"]
         _assert_no_secret(proc)
 
 
@@ -254,7 +259,8 @@ def test_http_failure_is_environment_category_without_secret() -> None:
         err = json.loads(proc.stderr)
         assert err["error"]["code"] == "rest_http_error"
         assert seen == [{"path": "/assistant",
-                         "authorization": f"Bearer {SECRET}"}]
+                         "authorization": f"Bearer {SECRET}",
+                         "user_agent": "vapic-capability"}]
         _assert_no_secret(proc)
 
 
@@ -276,7 +282,8 @@ def test_auth_failure_is_auth_category_without_secret() -> None:
         err = json.loads(proc.stderr)
         assert err["error"]["code"] == "auth_failed"
         assert seen == [{"path": "/assistant",
-                         "authorization": f"Bearer {SECRET}"}]
+                         "authorization": f"Bearer {SECRET}",
+                         "user_agent": "vapic-capability"}]
         _assert_no_secret(proc)
 
 
@@ -300,7 +307,9 @@ def test_doctor_uses_resilient_probe() -> None:
         assert body["connections"]["default"]["ok"] is True
         assert "GET /assistant" in body["connections"]["default"]["probe"]
         assert seen == [{"path": "/assistant",
-                         "authorization": f"Bearer {SECRET}"}]
+                         "authorization": f"Bearer {SECRET}",
+                         "user_agent": "vapic-capability"}]
+        assert SECRET not in seen[0]["user_agent"]
         _assert_no_secret(proc)
 
 

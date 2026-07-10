@@ -202,6 +202,7 @@ API_BASE_NAME = "VAPI_API_BASE_URL"
 DASHBOARD_NAME = "VAPI_DASHBOARD_URL"
 VAPI_INSTALL_URL = "https://vapi.ai/install.sh"
 VAPI_API_BASE_DEFAULT = "https://api.vapi.ai"
+VAPI_REST_USER_AGENT = "vapic-capability"
 DOCTOR_TIMEOUT = 30.0
 
 
@@ -1014,6 +1015,7 @@ def _rest_read(resource: str, cfg: dict) -> dict:
         headers={
             "Authorization": f"Bearer {cfg['token']}",
             "Accept": "application/json",
+            "User-Agent": VAPI_REST_USER_AGENT,
         },
         method="GET",
     )
