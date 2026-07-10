@@ -16,12 +16,11 @@ Agent startup protocol:
      `geminitalk text "question"` for a headless smoke test.
 
 geminitalk is a voice-in / voice-out project companion built on Gemini Live API
-native audio. It is deliberately not a coding worker. It can clarify project
-structure, read and search project files through bounded read-only tools, and
-ask other installed capabilities for their help/doctor/connections/ids/refs/guide
-surfaces. If the human asks it to implement, patch, run risky commands, commit,
-deploy, or perform external writes, it must route that work back to the main
-Codex text dialogue.
+native audio. It can clarify project structure, read and search project files,
+inspect safe capability surfaces, and optionally delegate an explicit bounded
+task to headless Codex. When launched from an active Codex thread it can relay
+explicit messages between the voice session and that active text turn without
+copying the complete conversation history.
 
 COMMANDS
   geminitalk help
@@ -57,8 +56,10 @@ COMMANDS
 
   geminitalk talk [--connection <id>] [--timeout <seconds>] [--no-tools]
       Start the interactive voice session. Microphone audio is sent as raw PCM
-      16-bit 16 kHz; model audio is played as PCM 24 kHz. Ctrl-C ends the
-      session. Transcripts and tool calls are echoed to stderr.
+      16-bit 16 kHz while model audio is streamed concurrently as PCM 24 kHz.
+      On macOS, system Voice Processing supplies acoustic echo cancellation.
+      Lines received on terminal stdin are relayed to Gemini as realtime text.
+      Ctrl-C ends the session. Transcripts and tool calls are echoed to stderr.
 
 CONNECTIONS
   With no registry there is one implicit `default` connection. The key resolves
@@ -78,6 +79,7 @@ CONNECTIONS
     GEMINITALK_SYSTEM_PROMPT_FILE extra prompt text file, inside the project
     GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS
                                true/false; default false
+    GEMINITALK_ALLOW_CODEX_TASKS true/false; default false
 
   A named registry lives at .capabilities/geminitalk/connections.json, else
   ~/.config/geminitalk/connections.json:
@@ -89,7 +91,9 @@ CONNECTIONS
           "model": "gemini-3.1-flash-live-preview",
           "voice": "Kore",
           "language": "ru-RU",
-          "allow_capability_domain_commands": false
+          "allow_capability_domain_commands": false,
+          "allow_codex_tasks": true,
+          "allow_write": true
         }
       }
     }
@@ -104,6 +108,10 @@ CONNECTIONS
     allow_capability_domain_commands
                     optional; default false. When false, the Live model can only
                     call contract/readiness commands on other capabilities.
+    allow_codex_tasks
+                    optional; default false. Exposes bounded read/act delegation
+                    to headless Codex in the selected project.
+    allow_write     enable only when act-mode Codex delegation is intended.
 
 CONTRACT COMMANDS
   geminitalk stub
@@ -142,7 +150,10 @@ import fnmatch
 import json
 import os
 import re
+import secrets
 import shutil
+import signal
+import struct
 import subprocess
 import sys
 import urllib.error
@@ -156,9 +167,9 @@ from typing import NoReturn
 
 NAME = "geminitalk"
 PROTOCOL = 2
-SUMMARY = ("Unofficial Gemini Live native-audio voice companion for the current "
-           "project - talk to the repo through bounded read-only tools and safe "
-           "capability contract calls; coding work stays in the main Codex dialogue.")
+SUMMARY = ("Gemini Live native-audio project companion with continuous duplex audio, "
+           "bounded project tools, optional headless Codex delegation, and an active "
+           "Codex-thread relay.")
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "GEMINITALK_API_KEY", "secret": True, "required": True,
@@ -192,6 +203,7 @@ LANGUAGE_KEY = "GEMINITALK_LANGUAGE"
 PROJECT_ROOT_KEY = "GEMINITALK_PROJECT_ROOT"
 PROMPT_FILE_KEY = "GEMINITALK_SYSTEM_PROMPT_FILE"
 ALLOW_CAP_DOMAIN_KEY = "GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS"
+ALLOW_CODEX_TASKS_KEY = "GEMINITALK_ALLOW_CODEX_TASKS"
 
 DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
 DEFAULT_VOICE = "Kore"
@@ -200,10 +212,16 @@ INPUT_RATE = 16000
 OUTPUT_RATE = 24000
 DOCTOR_TIMEOUT = 20.0
 TEXT_TIMEOUT = 60.0
+START_GREETING_PROMPT = (
+    "Start the voice conversation now. Speak first and briefly greet the user "
+    "in the conversation language. Introduce yourself as their Gemini voice "
+    "project companion and ask what they would like to discuss."
+)
 MAX_FILE_BYTES = 220_000
 MAX_TOOL_CHARS = 12_000
 _ACTIVE_PROJECT_ROOT: Path | None = None
 _ALLOW_CAPABILITY_DOMAIN_COMMANDS = False
+_ALLOW_CODEX_TASKS = False
 
 KNOWN_VOICES = [
     {"name": "Zephyr", "style": "bright"},
@@ -793,6 +811,7 @@ def _connections_report() -> dict:
         (PROJECT_ROOT_KEY, "project_root", None),
         (PROMPT_FILE_KEY, "prompt_file", None),
         (ALLOW_CAP_DOMAIN_KEY, "allow_capability_domain_commands", None),
+        (ALLOW_CODEX_TASKS_KEY, "allow_codex_tasks", None),
     ]
     if reg is None:
         value, tier, source, actual = _resolve_first(KEY_ALIASES)
@@ -845,9 +864,10 @@ def _default_project_root() -> Path:
 
 
 def _activate_cfg(cfg: dict) -> None:
-    global _ACTIVE_PROJECT_ROOT, _ALLOW_CAPABILITY_DOMAIN_COMMANDS
+    global _ACTIVE_PROJECT_ROOT, _ALLOW_CAPABILITY_DOMAIN_COMMANDS, _ALLOW_CODEX_TASKS
     _ACTIVE_PROJECT_ROOT = Path(cfg.get("project_root") or _default_project_root()).resolve()
     _ALLOW_CAPABILITY_DOMAIN_COMMANDS = bool(cfg.get("allow_capability_domain_commands"))
+    _ALLOW_CODEX_TASKS = bool(cfg.get("allow_codex_tasks"))
 
 
 def _tool_root() -> Path:
@@ -878,6 +898,8 @@ def _materialize_cfg(cid: str, entry: dict | None,
             "prompt_file": prompt_file,
             "allow_capability_domain_commands": _boolish(
                 _resolve_env_key(ALLOW_CAP_DOMAIN_KEY)[0], False),
+            "allow_codex_tasks": _boolish(
+                _resolve_env_key(ALLOW_CODEX_TASKS_KEY)[0], False),
             "allow_tools": True,
         }, None
 
@@ -910,6 +932,9 @@ def _materialize_cfg(cid: str, entry: dict | None,
         "allow_capability_domain_commands": _boolish(
             entry.get("allow_capability_domain_commands",
                       _resolve_env_key(ALLOW_CAP_DOMAIN_KEY)[0]), False),
+        "allow_codex_tasks": _boolish(
+            entry.get("allow_codex_tasks",
+                      _resolve_env_key(ALLOW_CODEX_TASKS_KEY)[0]), False),
         "allow_tools": True,
     }, None
 
@@ -1120,6 +1145,252 @@ def tool_capability_read(name: str, args: list | None = None) -> dict:
     }
 
 
+def _codex_task_command(task: str, mode: str = "read", timeout: int = 300):
+    if not _ALLOW_CODEX_TASKS:
+        return {"ok": False, "error": "Codex task delegation is disabled for this connection"}, None
+    task = str(task or "").strip()
+    if not task:
+        return {"ok": False, "error": "task is required"}, None
+    if len(task) > 6000:
+        return {"ok": False, "error": "task is too long (maximum 6000 characters)"}, None
+    mode = str(mode or "read").strip().lower()
+    if mode not in {"read", "act"}:
+        return {"ok": False, "error": "mode must be read or act"}, None
+    askproject = shutil.which("askproject")
+    if not askproject:
+        return {"ok": False, "error": "askproject is not installed/on PATH"}, None
+
+    timeout = max(30, min(int(timeout or 300), 900))
+    root = _tool_root()
+    argv = [askproject, str(root), "--engine", "codex", "--timeout", str(timeout)]
+    if mode == "act":
+        argv.append("--act")
+    argv.append(task)
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(root)
+    return None, (argv, env, root, mode, timeout)
+
+
+def _codex_task_result(returncode: int, stdout: str, stderr: str, mode: str) -> dict:
+    try:
+        payload = json.loads(stdout) if stdout.strip() else {}
+    except json.JSONDecodeError:
+        payload = {}
+    answer = payload.get("answer") if isinstance(payload, dict) else None
+    git = payload.get("git") if isinstance(payload, dict) else None
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    return {
+        "ok": returncode == 0 and bool(payload.get("ok", True)),
+        "mode": mode,
+        "answer": str(answer or "")[-6000:],
+        "session_id": payload.get("session_id") if isinstance(payload, dict) else None,
+        "files_changed": git.get("files_changed", []) if isinstance(git, dict) else [],
+        "tokens": tokens if isinstance(tokens, dict) else None,
+        "error": payload.get("error") if isinstance(payload, dict) else None,
+        "stderr": stderr[-3000:],
+    }
+
+
+def tool_codex_task(task: str, mode: str = "read", timeout: int = 300) -> dict:
+    problem, spec = _codex_task_command(task, mode, timeout)
+    if problem:
+        return problem
+    assert spec is not None
+    argv, env, root, mode, timeout = spec
+    try:
+        proc = subprocess.run(argv, cwd=str(root), env=env, text=True,
+                              capture_output=True, timeout=timeout + 30)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"Codex task timed out after {timeout}s"}
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    return _codex_task_result(proc.returncode, proc.stdout, proc.stderr, mode)
+
+
+def tool_codex_portal(message: str) -> dict:
+    message = str(message or "").strip()
+    if not message:
+        return {"ok": False, "error": "message is required"}
+    if len(message) > 4000:
+        return {"ok": False, "error": "message is too long (maximum 4000 characters)"}
+    if not os.environ.get("CODEX_THREAD_ID"):
+        return {"ok": False, "error": "this voice session is not attached to a Codex thread"}
+    event = {"type": "geminitalk.codex_portal", "message": message}
+    sys.stderr.write("\n[geminitalk portal] " + json.dumps(event, ensure_ascii=False) + "\n")
+    sys.stderr.flush()
+    return {"ok": True, "delivered": "current Codex thread bridge"}
+
+
+class _LiveRuntime:
+    def __init__(self, session) -> None:
+        self.session = session
+        self.stop_requested = asyncio.Event()
+        self.model_idle = asyncio.Event()
+        self.model_idle.set()
+        self.completions: asyncio.Queue[dict] = asyncio.Queue()
+        self.jobs: dict[str, asyncio.Task] = {}
+        self.processes: dict[str, asyncio.subprocess.Process] = {}
+        self.active_job_id: str | None = None
+        self.recent_user_text = ""
+        self.stop_after_turn = False
+        self.stop_fallback: asyncio.Task | None = None
+
+    def record_user_text(self, text: str) -> None:
+        text = str(text or "").strip()
+        if text:
+            self.recent_user_text = (self.recent_user_text + " " + text)[-1200:]
+
+    def note_model_activity(self) -> None:
+        self.model_idle.clear()
+
+    def note_turn_complete(self) -> None:
+        self.model_idle.set()
+        self.recent_user_text = ""
+        if self.stop_after_turn:
+            self.stop_requested.set()
+
+    def request_end_session(self) -> dict:
+        text = self.recent_user_text.lower()
+        direct_patterns = [
+            r"\bзаверш(?:и|ай|аем|им)\b",
+            r"\bзаконч(?:и|им|аем)\b",
+            r"\bзаканчивай\b",
+            r"\bостанови\b.*\bсесси",
+            r"\bвыключ(?:ай)?\b",
+            r"\bвырубай\b",
+            r"\b(end|stop|close|terminate)\s+(the\s+)?(session|conversation)\b",
+        ]
+        if not any(re.search(pattern, text) for pattern in direct_patterns):
+            return {
+                "ok": False,
+                "error": "end_session requires a direct, explicit user request in the current turn",
+            }
+        return {
+            "ok": True,
+            "status": "ending",
+            "instruction": "Say one brief goodbye now. The runtime will close after this turn.",
+        }
+
+    def arm_end_after_turn(self) -> None:
+        self.stop_after_turn = True
+        if self.stop_fallback is None:
+            self.stop_fallback = asyncio.create_task(self._force_stop_after_delay())
+
+    async def _force_stop_after_delay(self) -> None:
+        await asyncio.sleep(10)
+        self.stop_requested.set()
+
+    def start_codex_job(self, args: dict) -> dict:
+        if self.active_job_id and self.active_job_id in self.jobs:
+            return {
+                "ok": True,
+                "status": "already_running",
+                "job_id": self.active_job_id,
+                "instruction": "A Codex task is already running. Continue the conversation; do not start a duplicate.",
+            }
+        problem, spec = _codex_task_command(
+            str(args.get("task") or ""),
+            str(args.get("mode") or "read"),
+            int(args.get("timeout") or 300),
+        )
+        if problem:
+            return problem
+        assert spec is not None
+        job_id = "codex-" + secrets.token_hex(4)
+        job = asyncio.create_task(self._run_codex_job(job_id, spec))
+        self.jobs[job_id] = job
+        self.active_job_id = job_id
+        return {
+            "ok": True,
+            "status": "started",
+            "job_id": job_id,
+            "instruction": ("Tell the user Codex is working in the background, then continue the "
+                            "conversation. The result will be delivered automatically."),
+        }
+
+    async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3)
+        except TimeoutError:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await process.wait()
+
+    async def _run_codex_job(self, job_id: str, spec) -> None:
+        argv, env, root, mode, timeout = spec
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(root),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            self.processes[job_id] = process
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout + 30)
+                result = _codex_task_result(
+                    process.returncode or 0,
+                    stdout_b.decode("utf-8", errors="replace"),
+                    stderr_b.decode("utf-8", errors="replace"),
+                    mode,
+                )
+            except TimeoutError:
+                await self._terminate_process(process)
+                result = {"ok": False, "mode": mode,
+                          "error": f"Codex task timed out after {timeout}s"}
+        except asyncio.CancelledError:
+            if process is not None:
+                await self._terminate_process(process)
+            raise
+        except Exception as e:
+            result = {"ok": False, "mode": mode,
+                      "error": f"{type(e).__name__}: {e}"}
+        finally:
+            self.processes.pop(job_id, None)
+            self.jobs.pop(job_id, None)
+            if self.active_job_id == job_id:
+                self.active_job_id = None
+
+        await self.completions.put({"job_id": job_id, "result": result})
+
+    async def completion_notifier(self) -> None:
+        while True:
+            completion = await self.completions.get()
+            await self.model_idle.wait()
+            sys.stderr.write(
+                "\n[geminitalk codex completed] "
+                + json.dumps(completion, ensure_ascii=False) + "\n"
+            )
+            prompt = (
+                "Internal background event: a Codex task has completed. "
+                "This is not a new user request. Briefly tell the user the task finished and "
+                "summarize the result in the conversation language. Do not call codex_task again.\n"
+                + json.dumps(completion, ensure_ascii=False)[:8000]
+            )
+            await self.session.send_realtime_input(text=prompt)
+
+    async def close(self) -> None:
+        if self.stop_fallback is not None:
+            self.stop_fallback.cancel()
+        jobs = list(self.jobs.values())
+        for job in jobs:
+            job.cancel()
+        if jobs:
+            await asyncio.gather(*jobs, return_exceptions=True)
+
+
 TOOL_DECLARATIONS = [
     {
         "name": "project_overview",
@@ -1178,6 +1449,36 @@ TOOL_DECLARATIONS = [
             "required": ["name"],
         },
     },
+    {
+        "name": "codex_task",
+        "description": ("Start one bounded background research or implementation task in headless "
+                        "Codex. Returns immediately; completion is announced automatically."),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "task": {"type": "STRING"},
+                "mode": {"type": "STRING", "enum": ["read", "act"]},
+                "timeout": {"type": "INTEGER"},
+            },
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "codex_portal",
+        "description": ("Send a concise note, question, or requested action to the currently "
+                        "attached Codex text-session bridge. This does not copy chat history."),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"message": {"type": "STRING"}},
+            "required": ["message"],
+        },
+    },
+    {
+        "name": "end_session",
+        "description": ("End the current live voice session. Call only after a direct explicit "
+                        "request from the user in the current turn; never infer it."),
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
 ]
 
 
@@ -1199,6 +1500,12 @@ def _execute_tool(name: str, args: dict) -> dict:
         if name == "capability_read":
             return tool_capability_read(str(args.get("name") or ""),
                                         args.get("args") if isinstance(args.get("args"), list) else None)
+        if name == "codex_task":
+            return tool_codex_task(str(args.get("task") or ""),
+                                   str(args.get("mode") or "read"),
+                                   int(args.get("timeout") or 300))
+        if name == "codex_portal":
+            return tool_codex_portal(str(args.get("message") or ""))
         return {"ok": False, "error": f"unknown tool {name!r}"}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -1212,10 +1519,25 @@ Your job is to help the human talk through the project: explain structure, clari
 what files do, find references, summarize local docs, and ask crisp follow-up
 questions. Keep answers conversational and brief unless the human asks for detail.
 
-Hard boundary: you are not the coding worker. Do not write files, patch code,
-install dependencies, run mutating commands, commit, deploy, send messages, place
-calls, or perform external writes. If the human wants implementation or risky
-operations, say that this should move to the main Codex text dialogue.
+You do not edit the project yourself. When the human explicitly asks for project
+research or implementation, you may delegate one well-scoped task to the headless
+Codex tool. Use read mode by default. Use act mode only when the human clearly asks
+to change the project. codex_task starts in the background and returns immediately.
+Tell the human Codex is working, continue the conversation, and wait for the
+automatic completion event; do not start duplicate jobs. When completion arrives,
+briefly announce and summarize it. Never use delegation for unrelated external
+writes, messages, calls, or deployments unless the human explicitly authorizes
+that exact action.
+
+When the human explicitly asks you to tell, ask, or hand something to the current
+Codex text conversation, use the codex_portal tool with a concise self-contained
+message. Text relayed from that Codex conversation arrives as ordinary realtime
+text input. Do not request or mirror the whole Codex transcript.
+
+Call end_session only when the human directly and explicitly asks to end, stop,
+close, or turn off this voice session in the current turn. A question about whether
+you can end it is not a request. After the tool accepts the request, say one brief
+goodbye; the runtime closes the session automatically after that turn.
 
 Use the provided tools for bounded read-only project context. Do not reveal
 secrets or read likely secret files. When using another capability, prefer help,
@@ -1246,6 +1568,7 @@ def _system_prompt(cfg: dict) -> str:
         BASE_SYSTEM_PROMPT
         + f"\nDefault conversation language hint: {cfg.get('language') or DEFAULT_LANGUAGE}.\n"
         + f"Capability domain commands allowed: {bool(cfg.get('allow_capability_domain_commands'))}.\n"
+        + f"Codex task delegation allowed: {bool(cfg.get('allow_codex_tasks'))}.\n"
         + f"Project snapshot at session start:\n{snapshot}\n"
         + _prompt_extra(cfg)
     )
@@ -1308,7 +1631,7 @@ def _transcription_texts(response) -> tuple[str | None, str | None, bool]:
             turn_complete)
 
 
-async def _handle_tool_call(session, response) -> None:
+async def _handle_tool_call(session, response, runtime: _LiveRuntime | None = None) -> None:
     tool_call = getattr(response, "tool_call", None)
     calls = getattr(tool_call, "function_calls", None) if tool_call else None
     if not calls:
@@ -1316,18 +1639,34 @@ async def _handle_tool_call(session, response) -> None:
     from google.genai import types
 
     responses = []
+    end_after_ack = False
+    if runtime is not None:
+        runtime.note_model_activity()
     for fc in calls:
         name = getattr(fc, "name", "")
         raw_args = getattr(fc, "args", {}) or {}
         args = dict(raw_args) if not isinstance(raw_args, dict) else raw_args
         sys.stderr.write(f"\n[geminitalk tool] {name} {json.dumps(args, ensure_ascii=False)}\n")
-        result = _execute_tool(name, args)
+        if name == "codex_task" and runtime is not None:
+            result = runtime.start_codex_job(args)
+        elif name == "end_session":
+            if runtime is None:
+                result = {"ok": False, "error": "end_session is available only in talk mode"}
+            else:
+                result = runtime.request_end_session()
+                end_after_ack = bool(result.get("ok"))
+        else:
+            # Other project and capability tools can block. Keep them off the
+            # event loop so microphone streaming never pauses.
+            result = await asyncio.to_thread(_execute_tool, name, args)
         responses.append(types.FunctionResponse(
             name=name,
             id=getattr(fc, "id", None),
             response={"result": result},
         ))
     await session.send_tool_response(function_responses=responses)
+    if end_after_ack and runtime is not None:
+        runtime.arm_end_after_turn()
 
 
 async def _run_text_session(cfg: dict, message: str, timeout: float) -> str:
@@ -1404,21 +1743,128 @@ async def _speaker_player(q: asyncio.Queue[bytes | None]) -> None:
             await asyncio.to_thread(stream.write, chunk)
 
 
-async def _receiver(session, out_q: asyncio.Queue[bytes | None]) -> None:
-    async for response in session.receive():
-        await _handle_tool_call(session, response)
-        inp, out, done = _transcription_texts(response)
-        if inp:
-            sys.stderr.write(f"\n[you] {inp}\n")
-        if out:
-            sys.stderr.write(f"\n[geminitalk] {out}\n")
-        content = getattr(response, "server_content", None)
-        if bool(getattr(content, "interrupted", False)):
-            _drain_async_queue(out_q)
-        for chunk in _audio_chunks(response):
-            await out_q.put(chunk)
-        if done:
-            sys.stderr.write("\n")
+def _prepare_macos_voice_io() -> Path:
+    executable = Path(__file__).resolve()
+    candidates = [
+        executable.with_name("geminitalk-audio.swift"),
+        executable.parent / "bin" / "geminitalk-audio.swift",
+    ]
+    source = next((path for path in candidates if path.is_file()), None)
+    if source is None:
+        raise RuntimeError("macOS audio helper source is missing from the capability bundle")
+    swiftc = shutil.which("swiftc")
+    if not swiftc:
+        raise RuntimeError("swiftc is required for macOS Voice Processing audio")
+
+    cache_dir = _STATE_HOME / NAME
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    binary = cache_dir / "geminitalk-audio"
+    if not binary.is_file() or binary.stat().st_mtime_ns < source.stat().st_mtime_ns:
+        temporary = binary.with_suffix(".new")
+        result = subprocess.run(
+            [swiftc, "-swift-version", "5", str(source), "-o", str(temporary)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(f"could not compile macOS audio helper: {detail}")
+        os.replace(temporary, binary)
+    return binary
+
+
+async def _macos_microphone_sender(session, process: asyncio.subprocess.Process) -> None:
+    from google.genai import types
+
+    if process.stdout is None:
+        raise RuntimeError("macOS audio helper has no capture stream")
+    while True:
+        chunk = await process.stdout.read(3200)
+        if not chunk:
+            code = await process.wait()
+            raise RuntimeError(f"macOS audio helper stopped with exit code {code}")
+        await session.send_realtime_input(
+            audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={INPUT_RATE}")
+        )
+
+
+async def _stdin_text_sender(session, runtime: _LiveRuntime | None = None) -> None:
+    loop = asyncio.get_running_loop()
+    lines: asyncio.Queue[str | None] = asyncio.Queue()
+    fd = sys.stdin.fileno()
+
+    def readable() -> None:
+        line = sys.stdin.readline()
+        lines.put_nowait(line if line else None)
+
+    loop.add_reader(fd, readable)
+    try:
+        while True:
+            line = await lines.get()
+            if line is None:
+                return
+            message = line.strip()
+            if not message:
+                continue
+            sys.stderr.write(f"\n[codex → geminitalk] {message}\n")
+            if runtime is not None:
+                runtime.record_user_text(message)
+            await session.send_realtime_input(text=message)
+    finally:
+        loop.remove_reader(fd)
+
+
+async def _macos_playback_command(process: asyncio.subprocess.Process,
+                                  command: int, audio: bytes = b"") -> None:
+    if process.stdin is None:
+        raise RuntimeError("macOS audio helper has no playback stream")
+    process.stdin.write(struct.pack(">BI", command, len(audio)) + audio)
+    await process.stdin.drain()
+
+
+async def _receiver(session, out_q: asyncio.Queue[bytes | None] | None = None,
+                    voice_io: asyncio.subprocess.Process | None = None,
+                    runtime: _LiveRuntime | None = None) -> None:
+    while True:
+        received = False
+        async for response in session.receive():
+            received = True
+            inp, out, done = _transcription_texts(response)
+            if inp:
+                sys.stderr.write(f"\n[you] {inp}\n")
+                if runtime is not None:
+                    runtime.record_user_text(inp)
+            if out:
+                sys.stderr.write(f"\n[geminitalk] {out}\n")
+                if runtime is not None:
+                    runtime.note_model_activity()
+            chunks = _audio_chunks(response)
+            if chunks and runtime is not None:
+                runtime.note_model_activity()
+            await _handle_tool_call(session, response, runtime)
+            content = getattr(response, "server_content", None)
+            if bool(getattr(content, "interrupted", False)):
+                if voice_io is not None:
+                    await _macos_playback_command(voice_io, 1)
+                elif out_q is not None:
+                    _drain_async_queue(out_q)
+            for chunk in chunks:
+                if voice_io is not None:
+                    # Stream each Gemini PCM packet straight to the audio
+                    # engine. The microphone sender is a separate concurrent
+                    # task and is never gated by playback.
+                    await _macos_playback_command(voice_io, 0, chunk)
+                elif out_q is not None:
+                    await out_q.put(chunk)
+            if done:
+                sys.stderr.write("\n")
+                if runtime is not None:
+                    runtime.note_turn_complete()
+        # The SDK ends each receive iterator at turn_complete. Open the next
+        # iterator for another user/model turn; an empty iterator means the
+        # underlying Live session has actually closed.
+        if not received:
+            return
 
 
 async def _run_talk_session(cfg: dict, timeout: float | None, enable_tools: bool) -> None:
@@ -1426,18 +1872,39 @@ async def _run_talk_session(cfg: dict, timeout: float | None, enable_tools: bool
 
     client = genai.Client(api_key=cfg["api_key"])
     config = _live_config(cfg, enable_tools=enable_tools)
-    out_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=120)
+    voice_io: asyncio.subprocess.Process | None = None
+    if sys.platform == "darwin":
+        binary = _prepare_macos_voice_io()
+        voice_io = await asyncio.create_subprocess_exec(
+            str(binary),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
     async with client.aio.live.connect(model=cfg["model"], config=config) as session:
+        runtime = _LiveRuntime(session)
         sys.stderr.write(
             f"geminitalk live session started: model={cfg['model']} voice={cfg['voice']} "
             f"project={cfg['project_root']}\nPress Ctrl-C to stop.\n"
         )
-        tasks = [
-            asyncio.create_task(_microphone_sender(session)),
-            asyncio.create_task(_speaker_player(out_q)),
-            asyncio.create_task(_receiver(session, out_q)),
-        ]
+        if voice_io is not None:
+            out_q = None
+            tasks = [
+                asyncio.create_task(_macos_microphone_sender(session, voice_io)),
+                asyncio.create_task(_receiver(session, voice_io=voice_io, runtime=runtime)),
+            ]
+        else:
+            out_q = asyncio.Queue(maxsize=120)
+            tasks = [
+                asyncio.create_task(_microphone_sender(session)),
+                asyncio.create_task(_speaker_player(out_q)),
+                asyncio.create_task(_receiver(session, out_q, runtime=runtime)),
+            ]
+        tasks.append(asyncio.create_task(runtime.completion_notifier()))
+        tasks.append(asyncio.create_task(runtime.stop_requested.wait()))
+        if sys.stdin.isatty():
+            tasks.append(asyncio.create_task(_stdin_text_sender(session, runtime)))
         try:
+            await session.send_realtime_input(text=START_GREETING_PROMPT)
             if timeout:
                 await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
             else:
@@ -1445,8 +1912,13 @@ async def _run_talk_session(cfg: dict, timeout: float | None, enable_tools: bool
         finally:
             for task in tasks:
                 task.cancel()
-            await out_q.put(None)
+            if out_q is not None:
+                await out_q.put(None)
             await asyncio.gather(*tasks, return_exceptions=True)
+            await runtime.close()
+            if voice_io is not None and voice_io.returncode is None:
+                voice_io.terminate()
+                await voice_io.wait()
 
 
 # --- Doctor ------------------------------------------------------------------

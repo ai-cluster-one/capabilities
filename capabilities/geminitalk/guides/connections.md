@@ -31,12 +31,15 @@ For named connections, use `.capabilities/geminitalk/connections.json`:
       "model": "gemini-3.1-flash-live-preview",
       "voice": "Kore",
       "language": "ru-RU",
-      "allow_capability_domain_commands": false
+      "allow_capability_domain_commands": false,
+      "allow_codex_tasks": true,
+      "allow_write": true
     }
   }
 }
 ```
 
-Keep `allow_capability_domain_commands` false unless you are deliberately
-experimenting. The v1 agent is designed to inspect and clarify, not to perform
-write-capable work by voice.
+Keep `allow_capability_domain_commands` false unless you deliberately need broad
+capability domain commands. `allow_codex_tasks` exposes the dedicated bounded
+`codex_task` tool. Set `allow_write` only when voice-authorized `act` delegation
+is intended for this connection.

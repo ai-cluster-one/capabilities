@@ -89,6 +89,12 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   In read mode files_changed must be empty; if it isn't, ok=false and it is
   flagged loudly (a read query should never mutate).
 
+  While the peer runs, concise stage updates are streamed to stderr. They are
+  derived from the engines' native event streams and intentionally omit full
+  commands, command output, reasoning, and the final answer. This keeps stdout
+  machine-parseable while letting an invoking agent see that work is moving.
+  Pass --quiet to suppress these updates for callers that require silent stderr.
+
 FLAGS
   --engine <claude|codex>  Which peer engine to spawn (default: claude, or
                         $ASKPROJECT_ENGINE). A -c resume adopts the session's
@@ -105,6 +111,7 @@ FLAGS
   --timeout <seconds>   Kill the peer after N seconds (default 600).
   --text                Print only the answer to stdout (still exits non-zero
                         on error).
+  --quiet               Suppress the concise progress stream on stderr.
   --append <text>       Extra instruction appended to the peer's system prompt.
 
 EXAMPLES
@@ -128,9 +135,12 @@ CONTRACT  (self-description an agent loads on demand; this capability has NO
 import argparse
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import NoReturn
 
@@ -690,6 +700,221 @@ def build_preamble(mode: str, caller: str, extra: str | None,
     return base
 
 
+# --- progress stream ---------------------------------------------------------
+
+class ProgressReporter:
+    """Concise stderr-only visibility into a peer's native event stream."""
+
+    def __init__(self, engine: str, enabled: bool):
+        self.engine = engine
+        self.enabled = enabled
+        self._last: tuple[str, str] | None = None
+
+    def emit(self, stage: str, message: str) -> None:
+        if not self.enabled:
+            return
+        message = _brief(message)
+        if not message or self._last == (stage, message):
+            return
+        self._last = (stage, message)
+        sys.stderr.write(f"askproject[{self.engine}] {stage}: {message}\n")
+        sys.stderr.flush()
+
+
+def _brief(value, limit: int = 180) -> str:
+    """One short status line; never forward a peer's full narrative."""
+    if not isinstance(value, str):
+        return ""
+    lines = [" ".join(line.split()) for line in value.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    text = lines[0].lstrip("#*- ")
+    if len(text) > limit:
+        text = text[:limit - 1].rstrip() + "…"
+    return text
+
+
+def _command_stage(command) -> tuple[str, str]:
+    """Classify a command without exposing its argv or output."""
+    text = command if isinstance(command, str) else ""
+    lower = f" {text.lower()} "
+    if any(marker in lower for marker in (
+            "pytest", "unittest", "npm test", "pnpm test", "yarn test",
+            "cargo test", "go test", "rspec", "vitest", "jest")):
+        return "verify", "Running tests"
+    if any(marker in lower for marker in (
+            " lint", " typecheck", " type-check", " mypy", " pyright",
+            " ruff", " eslint", " tsc", " build", " audit")):
+        return "verify", "Running verification"
+    if any(marker in lower for marker in (
+            " apply_patch", " sed -i", " perl -pi", " tee ")):
+        return "edit", "Updating project files"
+    if any(marker in lower for marker in (
+            " rg ", " grep ", " find ", " ls ", " sed -n", " git status",
+            " git diff", " git log", " cat ", " head ", " tail ")):
+        return "inspect", "Inspecting the project"
+    return "work", "Running a project command"
+
+
+def _tool_stage(name, tool_input=None) -> tuple[str, str]:
+    """Map a Claude tool event to a small, host-neutral status vocabulary."""
+    name = name if isinstance(name, str) else ""
+    if name in ("Read", "Glob", "Grep", "LS", "NotebookRead"):
+        return "inspect", "Inspecting the project"
+    if name == "Bash":
+        command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+        return _command_stage(command)
+    if name in ("Edit", "MultiEdit", "Write", "NotebookEdit"):
+        return "edit", "Updating project files"
+    if name in ("WebFetch", "WebSearch"):
+        return "research", "Checking external documentation"
+    if name in ("TodoWrite", "ExitPlanMode"):
+        return "plan", "Updating the work plan"
+    return "work", "Using a project tool"
+
+
+def _stream_process(cmd: list[str], *, cwd: str, timeout: int,
+                    on_stdout) -> subprocess.CompletedProcess:
+    """Capture both pipes without deadlock while delivering stdout lines live."""
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    events: queue.Queue = queue.Queue()
+
+    def pump(kind: str, stream) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                events.put((kind, line))
+        finally:
+            events.put((kind, None))
+
+    threads = [
+        threading.Thread(target=pump, args=("stdout", proc.stdout), daemon=True),
+        threading.Thread(target=pump, args=("stderr", proc.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    captured = {"stdout": [], "stderr": []}
+    open_streams = 2
+    deadline = time.monotonic() + timeout
+    while open_streams:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            proc.kill()
+            proc.wait()
+            raise subprocess.TimeoutExpired(
+                cmd, timeout,
+                output="".join(captured["stdout"]),
+                stderr="".join(captured["stderr"]),
+            )
+        try:
+            kind, line = events.get(timeout=min(0.25, remaining))
+        except queue.Empty:
+            continue
+        if line is None:
+            open_streams -= 1
+            continue
+        captured[kind].append(line)
+        if kind == "stdout":
+            on_stdout(line)
+
+    returncode = proc.wait()
+    for thread in threads:
+        thread.join(timeout=1)
+    return subprocess.CompletedProcess(
+        cmd, returncode,
+        stdout="".join(captured["stdout"]),
+        stderr="".join(captured["stderr"]),
+    )
+
+
+def _event(line: str) -> dict | None:
+    try:
+        value = json.loads(line)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+class CodexProgress:
+    """Render Codex JSONL while withholding the last agent message (the answer)."""
+
+    def __init__(self, reporter: ProgressReporter):
+        self.reporter = reporter
+        self.pending_message = ""
+
+    def feed(self, line: str) -> None:
+        evt = _event(line)
+        if evt is None:
+            return
+        kind = evt.get("type")
+        item = evt.get("item") if isinstance(evt.get("item"), dict) else {}
+        item_type = item.get("type")
+
+        if kind == "item.completed" and item_type == "agent_message":
+            # Codex uses the same event for commentary and the final answer.
+            # Hold it until the next event: a following tool makes it commentary;
+            # turn.completed makes it the answer, which progress must not echo.
+            self.pending_message = _brief(item.get("text"))
+            return
+
+        if self.pending_message:
+            if kind != "turn.completed":
+                self.reporter.emit("update", self.pending_message)
+            self.pending_message = ""
+
+        if kind == "thread.started":
+            self.reporter.emit("started", "Codex peer started")
+        elif kind == "turn.started":
+            self.reporter.emit("work", "Peer is working")
+        elif kind == "item.started":
+            if item_type == "command_execution":
+                self.reporter.emit(*_command_stage(item.get("command")))
+            elif item_type in ("file_change", "file_changes"):
+                self.reporter.emit("edit", "Updating project files")
+            elif item_type in ("mcp_tool_call", "dynamic_tool_call"):
+                self.reporter.emit("work", "Using a project tool")
+            elif item_type == "web_search":
+                self.reporter.emit("research", "Checking external documentation")
+        elif kind == "item.completed" and item_type == "command_execution":
+            if item.get("exit_code") not in (None, 0):
+                self.reporter.emit("update", "A command failed; the peer is handling it")
+        elif kind == "item.completed" and item_type in ("file_change", "file_changes"):
+            self.reporter.emit("edit", "Updated project files")
+        elif kind == "turn.completed":
+            self.reporter.emit("completed", "Codex peer finished")
+        elif kind in ("turn.failed", "error"):
+            self.reporter.emit("failed", "Codex peer reported a failure")
+
+
+def _claude_progress(evt: dict, reporter: ProgressReporter) -> None:
+    kind = evt.get("type")
+    if kind == "system" and evt.get("subtype") == "init":
+        reporter.emit("started", "Claude peer started")
+        return
+    if kind == "assistant":
+        message = evt.get("message") if isinstance(evt.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        tools = [block for block in content
+                 if isinstance(block, dict) and block.get("type") == "tool_use"]
+        if tools:
+            # Text accompanying a tool call is commentary, not the final answer.
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    reporter.emit("update", block.get("text", ""))
+                    break
+            for block in tools:
+                reporter.emit(*_tool_stage(block.get("name"), block.get("input")))
+        return
+    if kind == "result":
+        if evt.get("is_error"):
+            reporter.emit("failed", "Claude peer reported a failure")
+        else:
+            reporter.emit("completed", "Claude peer finished")
+
+
 # --- engines -----------------------------------------------------------------
 # Each engine turns (target, prompt, mode, model, resume) into ONE normalized
 # dict so run() stays engine-blind:
@@ -697,10 +922,14 @@ def build_preamble(mode: str, caller: str, extra: str | None,
 #    tokens:{input,output,cache_read,cache_creation}, is_error, permission_denials}
 
 def run_claude(target, prompt, mode, model, caller, append,
-               schema_text, resume_id, timeout, as_json) -> dict:
-    """Headless `claude -p --output-format json`. Schema is injected into the
-    peer's system prompt and the reply parsed from result/structured_output."""
-    cmd = ["claude", "-p", prompt, "--output-format", "json", "--model", model]
+               schema_text, resume_id, timeout, as_json,
+               reporter: ProgressReporter) -> dict:
+    """Headless Claude. Progress uses stream-json; --quiet retains json mode."""
+    output_format = "stream-json" if reporter.enabled else "json"
+    cmd = ["claude", "-p", prompt, "--output-format", output_format,
+           "--model", model]
+    if reporter.enabled:
+        cmd += ["--verbose"]
     if resume_id:
         cmd += ["--resume", resume_id]
     if mode == "read":
@@ -709,18 +938,38 @@ def run_claude(target, prompt, mode, model, caller, append,
         cmd += ["--permission-mode", "bypassPermissions", "--add-dir", str(target)]
     cmd += ["--append-system-prompt", build_preamble(mode, caller, append, schema_text)]
 
+    result_event: dict = {}
     try:
-        proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
-                              text=True, timeout=timeout)
+        if reporter.enabled:
+            def on_stdout(line: str) -> None:
+                evt = _event(line)
+                if evt is None:
+                    return
+                _claude_progress(evt, reporter)
+                if evt.get("type") == "result":
+                    result_event.update(evt)
+
+            proc = _stream_process(cmd, cwd=str(target), timeout=timeout,
+                                   on_stdout=on_stdout)
+        else:
+            proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
+                                  text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
+        reporter.emit("failed", f"Peer timed out after {timeout}s")
         die(f"peer timed out after {timeout}s", as_json=as_json)
     if proc.returncode != 0:
+        reporter.emit("failed", f"Claude peer exited with status {proc.returncode}")
         snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
         die(f"peer exited {proc.returncode}: {snippet}", as_json=as_json)
-    try:
-        env = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        die(f"could not parse peer output: {proc.stdout[:800]}", as_json=as_json)
+    if reporter.enabled:
+        env = result_event
+        if not env:
+            die(f"could not parse peer output: {proc.stdout[:800]}", as_json=as_json)
+    else:
+        try:
+            env = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            die(f"could not parse peer output: {proc.stdout[:800]}", as_json=as_json)
 
     answer = env.get("result", "")
     if schema_text:
@@ -776,7 +1025,8 @@ def _parse_codex_events(stdout: str) -> tuple[dict, str | None, bool]:
 
 
 def run_codex(target, prompt, mode, model, caller, append,
-              schema_text, resume_id, timeout, as_json) -> dict:
+              schema_text, resume_id, timeout, as_json,
+              reporter: ProgressReporter) -> dict:
     """Headless `codex exec`. codex has no system-prompt flag, so the peer
     preamble is folded into the prompt; the final message is read from -o and
     usage/thread id from the --json JSONL. Schema uses codex's native
@@ -806,11 +1056,18 @@ def run_codex(target, prompt, mode, model, caller, append,
             cmd += ["--output-schema", schema_file]
 
         try:
-            proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
-                                  text=True, timeout=timeout)
+            if reporter.enabled:
+                progress = CodexProgress(reporter)
+                proc = _stream_process(cmd, cwd=str(target), timeout=timeout,
+                                       on_stdout=progress.feed)
+            else:
+                proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
+                                      text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
+            reporter.emit("failed", f"Peer timed out after {timeout}s")
             die(f"peer timed out after {timeout}s", as_json=as_json)
         if proc.returncode != 0:
+            reporter.emit("failed", f"Codex peer exited with status {proc.returncode}")
             snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
             die(f"peer exited {proc.returncode}: {snippet}", as_json=as_json)
 
@@ -896,10 +1153,12 @@ def run(args):
 
     schema_text = resolve_schema(args.schema) if args.schema else None
 
+    reporter = ProgressReporter(engine, enabled=not args.quiet)
+    reporter.emit("starting", f"Launching {engine} peer")
     before = snapshot(target)
     res = ENGINE_RUNNERS[engine](target, args.prompt, mode, model, caller,
                                  args.append, schema_text, resume_id,
-                                 args.timeout, as_json)
+                                 args.timeout, as_json, reporter)
     after = snapshot(target)
     files_changed, dirty_before = diff_snapshots(before, after)
 
@@ -999,6 +1258,7 @@ def main():
     p.add_argument("--schema")
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--text", action="store_true")
+    p.add_argument("--quiet", action="store_true")
     p.add_argument("--append")
     args = p.parse_args(argv)
     run(args)
