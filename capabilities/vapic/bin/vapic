@@ -6,13 +6,14 @@
 """vapic - a capability harness around the official `vapi` CLI.
 
 It resolves a Vapi API key through the capability connection cascade, injects
-that key into the child environment, and forwards commands verbatim to `vapi`.
-vapic owns project policy, connection selection, and readiness. Vapi owns the
-actual voice-AI command surface.
+that key into the child environment, and normally forwards commands verbatim to
+`vapi`. vapic owns project policy, connection selection, and readiness. Vapi
+owns the actual voice-AI command surface.
 
 USAGE
-  vapic <command> [args...]    Forward to `vapi <command> [args...]`, with the
-                               selected connection injected as VAPI_API_KEY.
+  vapic <command> [args...]    Forward to `vapi <command> [args...]`, normally
+                               with the selected connection injected as
+                               VAPI_API_KEY.
   vapic bootstrap [--yes]      Check/install the official Vapi CLI. Without
                                --yes, print the install plan and make no change.
   vapic connections            Where every connection's values resolve from
@@ -35,18 +36,28 @@ real CLI) for the full command surface. vapic deliberately does not re-document
 or re-map the official Vapi commands.
 
 MODEL
-  vapic is not a REST client for Vapi and not a replacement command surface. It
-  is a thin auth shim: it chooses one declared connection, sets VAPI_API_KEY
-  plus optional VAPI_ENV, VAPI_API_BASE_URL, and VAPI_DASHBOARD_URL, then runs
-  the official `vapi` CLI with inherited stdio. `vapic --connection staging
-  assistant list` runs `vapi assistant list` under the staging key; stdout,
-  stderr, prompts, --json, colors, and exit code are Vapi CLI's own.
+  vapic is not a general REST client for Vapi and not a replacement command
+  surface. It is a thin auth shim: it chooses one declared connection, sets
+  VAPI_API_KEY plus optional VAPI_ENV, VAPI_API_BASE_URL, and
+  VAPI_DASHBOARD_URL, then normally runs the official `vapi` CLI with inherited
+  stdio. `vapic --connection staging assistant list` runs `vapi assistant list`
+  under the staging key; stdout, stderr, prompts, --json, colors, and exit code
+  are Vapi CLI's own unless the documented narrow read-list fallback is
+  triggered.
 
   It REQUIRES a capability connection and never falls back to the official
   `~/.vapi-cli.yaml` login state. That refusal is the scoping guarantee: a
   command can never silently run against whichever Vapi account the human last
   selected with `vapi login` or `vapi auth switch`. Use native `vapi` directly
   for manual login/account management; use vapic for agent work.
+
+  Narrow resilience exception: official Vapi CLI v0.2.1 can fail to decode
+  list responses for `assistant list` and `call list` when the API returns
+  schema variants its pinned Go SDK cannot unmarshal. Only for those exact read
+  commands, and only after that recognized failure, vapic retries the official
+  read-only REST endpoint with the already-resolved API key in an in-process
+  Authorization header. Native success, unrelated failures, all other reads,
+  and every write command stay native.
 
 CONNECTIONS
   Configuration resolves as named connections. With no registry the sole
@@ -105,8 +116,8 @@ COMMANDS vapic owns
 
   doctor [--connection <id>]
       Per connection (every configured one bare; one with --connection): resolve
-      its key, confirm `vapi` exists, run `vapi assistant list` with injected
-      env, and report the selected environment. Exit 0 all healthy /
+      its key, confirm `vapi` exists, run the resilient assistant-list probe
+      with injected env, and report the selected environment. Exit 0 all healthy /
       2 key missing or rejected / 5 official CLI missing or unreachable.
 
   help
@@ -128,8 +139,10 @@ EXIT CODES (vapic's own layer)
   read-only connection (allow_write: false); ask the user, never lift a gate
   yourself - 5 environment (vapi not on PATH, installer failed, or unreachable)
   - 6 input (bad use of a vapic-owned command, or an unknown/ambiguous connection).
-  Forwarded commands return Vapi CLI's own exit code, not these - vapic is
-  transparent for everything it forwards (after the gate).
+  Forwarded commands return Vapi CLI's own exit code, not these - except the
+  documented read-list fallback, which uses vapic's auth/environment categories
+  if the REST retry fails. vapic is transparent for everything it forwards
+  (after the gate).
 
 EXAMPLES
   vapic bootstrap
@@ -155,8 +168,8 @@ from typing import NoReturn
 NAME = "vapic"
 PROTOCOL = 2
 SUMMARY = ("Connection harness around the official `vapi` CLI - resolves a "
-           "Vapi API key, injects it, and forwards commands straight to "
-           "`vapi`; the command surface is `vapi --help`.")
+           "Vapi API key, injects it, and forwards commands to `vapi` with a "
+           "narrow read-list fallback; the command surface is `vapi --help`.")
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "VAPI_API_KEY", "secret": True, "required": True,
@@ -188,6 +201,7 @@ ENV_NAME = "VAPI_ENV"
 API_BASE_NAME = "VAPI_API_BASE_URL"
 DASHBOARD_NAME = "VAPI_DASHBOARD_URL"
 VAPI_INSTALL_URL = "https://vapi.ai/install.sh"
+VAPI_API_BASE_DEFAULT = "https://api.vapi.ai"
 DOCTOR_TIMEOUT = 30.0
 
 
@@ -929,29 +943,19 @@ def _check_connection(cfg: dict) -> dict:
         return {"ok": False, "category": 5,
                 "error": "the official `vapi` CLI is not on PATH",
                 "hint": "run `vapic bootstrap` for the install command"}
-    try:
-        proc = subprocess.run(["vapi", "assistant", "list"],
-                              env=_child_env(cfg),
-                              capture_output=True, text=True, timeout=DOCTOR_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "category": 5,
-                "error": "vapi was unresponsive (`assistant list` timed out)"}
-    except OSError as e:
-        return {"ok": False, "category": 5, "error": f"could not run vapi: {e}"}
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        low = err.lower()
-        if any(s in low for s in ("api key", "auth", "unauthor", "forbidden", "login")):
-            return {"ok": False, "category": 2,
-                    "error": err or "Vapi rejected the API key",
-                    "hint": "the key is missing, invalid, revoked, or for the wrong environment"}
-        return {"ok": False, "category": 5, "error": err or "`vapi assistant list` failed"}
+    res = _run_resilient_read(["assistant", "list"], cfg, timeout=DOCTOR_TIMEOUT)
+    if not res.get("ok"):
+        out = {"ok": False, "category": res.get("category") or 5,
+               "error": res.get("error") or "`vapi assistant list` failed"}
+        if res.get("hint"):
+            out["hint"] = res["hint"]
+        return out
     return {
         "ok": True,
         "environment": cfg.get("environment") or "production",
         "api_base_url": cfg.get("api_base_url"),
         "dashboard_url": cfg.get("dashboard_url"),
-        "probe": "vapi assistant list",
+        "probe": res["probe"],
     }
 
 
@@ -981,7 +985,114 @@ def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
         sys.exit(fail_exit)
 
 
+def _read_fallback_resource(argv: list[str]) -> str | None:
+    if argv == ["assistant", "list"]:
+        return "assistant"
+    if argv == ["call", "list"]:
+        return "call"
+    return None
+
+
+def _recognized_vapi_decode_failure(text: str) -> bool:
+    low = text.lower()
+    if "cannot unmarshal" in low and ("json" in low or "go struct" in low):
+        return True
+    return "deserializ" in low and ("json" in low or "unmarshal" in low)
+
+
+def _rest_url(cfg: dict, resource: str) -> str:
+    base = str(cfg.get("api_base_url") or VAPI_API_BASE_DEFAULT).rstrip("/")
+    return f"{base}/{resource}"
+
+
+def _rest_read(resource: str, cfg: dict) -> dict:
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        _rest_url(cfg, resource),
+        headers={
+            "Authorization": f"Bearer {cfg['token']}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=DOCTOR_TIMEOUT) as resp:
+            text = resp.read().decode(
+                resp.headers.get_content_charset() or "utf-8", errors="replace")
+            return {"ok": True, "text": text, "probe": f"GET /{resource}"}
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return {"ok": False, "category": 2,
+                    "code": "auth_failed",
+                    "error": f"Vapi REST fallback returned HTTP {e.code}",
+                    "hint": "the key is missing, invalid, revoked, or for the wrong environment"}
+        return {"ok": False, "category": 5,
+                "code": "rest_http_error",
+                "error": f"Vapi REST fallback returned HTTP {e.code}"}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "category": 5,
+                "code": "rest_network_error",
+                "error": f"Vapi REST fallback could not reach the API: {e}"}
+
+
+def _native_auth_failure(text: str) -> bool:
+    low = text.lower()
+    return any(s in low for s in ("api key", "auth", "unauthor", "forbidden", "login"))
+
+
+def _run_resilient_read(argv: list[str], cfg: dict, timeout: float | None = None) -> dict:
+    resource = _read_fallback_resource(argv)
+    try:
+        proc = subprocess.run(["vapi", *argv],
+                              env=_child_env(cfg),
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "category": 5,
+                "error": f"vapi was unresponsive (`{' '.join(argv)}` timed out)"}
+    except OSError as e:
+        return {"ok": False, "category": 5, "error": f"could not run vapi: {e}"}
+    if proc.returncode == 0:
+        return {"ok": True, "stdout": proc.stdout, "stderr": proc.stderr,
+                "returncode": 0, "probe": f"vapi {' '.join(argv)}"}
+
+    err = (proc.stderr or proc.stdout or "").strip()
+    if resource and _recognized_vapi_decode_failure(err):
+        fallback = _rest_read(resource, cfg)
+        if fallback.get("ok"):
+            fallback["probe"] = f"{fallback['probe']} after vapi {' '.join(argv)} decode fallback"
+        return fallback
+    if _native_auth_failure(err):
+        return {"ok": False, "category": 2,
+                "error": err or "Vapi rejected the API key",
+                "hint": "the key is missing, invalid, revoked, or for the wrong environment",
+                "stdout": proc.stdout, "stderr": proc.stderr,
+                "returncode": proc.returncode}
+    return {"ok": False, "category": 5,
+            "error": err or f"`vapi {' '.join(argv)}` failed",
+            "stdout": proc.stdout, "stderr": proc.stderr,
+            "returncode": proc.returncode}
+
+
 def _forward(argv: list[str], cfg: dict | None) -> NoReturn:
+    if cfg and _read_fallback_resource(argv):
+        res = _run_resilient_read(argv, cfg)
+        if res.get("ok"):
+            if "text" in res:
+                sys.stdout.write(res["text"])
+                if res["text"] and not res["text"].endswith("\n"):
+                    sys.stdout.write("\n")
+            else:
+                sys.stdout.write(res.get("stdout") or "")
+                sys.stderr.write(res.get("stderr") or "")
+            sys.exit(0)
+        if "returncode" in res:
+            sys.stdout.write(res.get("stdout") or "")
+            sys.stderr.write(res.get("stderr") or "")
+            sys.exit(int(res["returncode"]))
+        _die(int(res.get("category") or 5), res.get("code") or "vapi_read_failed",
+             res.get("error") or "Vapi read failed", res.get("hint"))
     try:
         proc = subprocess.run(["vapi", *argv], env=_child_env(cfg))
     except OSError as e:
