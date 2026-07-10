@@ -1,0 +1,1047 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""vapic - a capability harness around the official `vapi` CLI.
+
+It resolves a Vapi API key through the capability connection cascade, injects
+that key into the child environment, and forwards commands verbatim to `vapi`.
+vapic owns project policy, connection selection, and readiness. Vapi owns the
+actual voice-AI command surface.
+
+USAGE
+  vapic <command> [args...]    Forward to `vapi <command> [args...]`, with the
+                               selected connection injected as VAPI_API_KEY.
+  vapic bootstrap [--yes]      Check/install the official Vapi CLI. Without
+                               --yes, print the install plan and make no change.
+  vapic connections            Where every connection's values resolve from
+                               (tier, source, secrets masked). Local only.
+  vapic doctor [--connection <id>]
+                               Prove the selected Vapi key resolves, the
+                               official CLI exists, and the key is accepted.
+  vapic help                   Print this contract.
+
+Contract commands (the same on every capability; vapic's own, never forwarded):
+  vapic stub                                  One-line awareness text.
+  vapic manifest --json                       Machine-readable declaration.
+  vapic guide [connections|official-cli]      Guide topics / one guide body.
+  vapic ids list|get <l>|set <l> <v>|rm <l>   The project identifiers envelope
+        [--note <text>]                       (.capabilities/vapic/identifiers.json).
+  vapic refs                                  Menu of the project's reference files.
+
+Agent-invoked. Run `vapic help` to reload this contract; run `vapi --help` (the
+real CLI) for the full command surface. vapic deliberately does not re-document
+or re-map the official Vapi commands.
+
+MODEL
+  vapic is not a REST client for Vapi and not a replacement command surface. It
+  is a thin auth shim: it chooses one declared connection, sets VAPI_API_KEY
+  plus optional VAPI_ENV, VAPI_API_BASE_URL, and VAPI_DASHBOARD_URL, then runs
+  the official `vapi` CLI with inherited stdio. `vapic --connection staging
+  assistant list` runs `vapi assistant list` under the staging key; stdout,
+  stderr, prompts, --json, colors, and exit code are Vapi CLI's own.
+
+  It REQUIRES a capability connection and never falls back to the official
+  `~/.vapi-cli.yaml` login state. That refusal is the scoping guarantee: a
+  command can never silently run against whichever Vapi account the human last
+  selected with `vapi login` or `vapi auth switch`. Use native `vapi` directly
+  for manual login/account management; use vapic for agent work.
+
+CONNECTIONS
+  Configuration resolves as named connections. With no registry the sole
+  connection is `default`: VAPI_API_KEY - a Vapi API key. Because a key chooses
+  the Vapi organization/environment the agent can reach, its natural home is the
+  consuming project's .env when the project owns that integration.
+  Resolved (first non-empty wins):
+    1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
+    2. user config   $XDG_CONFIG_HOME/vapic/credentials.env (default ~/.config/vapic/)
+    3. process env   VAPI_API_KEY (deployed box, or one-shot `VAPI_API_KEY=... vapic ...`)
+  There is deliberately no token flag - a secret must not touch argv. One Vapi
+  account/environment per connection; projects with prod + staging declare one
+  connection per key:
+    {
+      "default": "production",
+      "connections": {
+        "production": { "secret_env": "VAPI_PRODUCTION_API_KEY",
+                        "environment": "production",
+                        "allow_write": false },
+        "staging": { "secret_env": "VAPI_STAGING_API_KEY",
+                     "environment": "staging",
+                     "allow_write": true }
+      }
+    }
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/vapic/connections.json; first found wins, never merged.
+
+  Entry fields:
+    secret_env        required; env var holding the Vapi API key
+    environment       optional; production, staging, development
+    api_base_url      optional; explicit VAPI_API_BASE_URL override
+    dashboard_url     optional; explicit VAPI_DASHBOARD_URL override
+    allow_write       optional; default false
+
+  Selection: --connection <id> (accepted anywhere on the command line; consumed
+  by vapic, never forwarded). Unflagged, the registry's "default" pointer
+  applies, else the sole entry; several entries without a pointer is refused
+  as ambiguous.
+
+WRITE GATE
+  Vapi can place outbound calls, change assistants, phone numbers, tools,
+  webhooks, campaigns, squads, and billing-relevant resources. Writes therefore
+  default to refused. A read-only connection allows only known read/status/help
+  commands; unknown official commands require allow_write: true instead of
+  being guessed safe.
+
+COMMANDS vapic owns
+  connections
+      The resolution report - every connection, every value, its winning tier
+      and source, secrets masked. Local only: no network, no token use.
+
+  bootstrap [--yes]
+      Check whether the official `vapi` CLI is on PATH. Without --yes, emit the
+      official install command and exit 0 without changing the machine. With
+      --yes, download https://vapi.ai/install.sh to a temporary file and run it.
+
+  doctor [--connection <id>]
+      Per connection (every configured one bare; one with --connection): resolve
+      its key, confirm `vapi` exists, run `vapi assistant list` with injected
+      env, and report the selected environment. Exit 0 all healthy /
+      2 key missing or rejected / 5 official CLI missing or unreachable.
+
+  help
+      Print this document. (`vapi --help` is the real CLI's surface, a separate
+      thing; vapic reserves bare `help` for itself but forwards `help <cmd>`.)
+
+EVERYTHING ELSE - forwarded verbatim to `vapi`, key injected, I/O transparent.
+  Run `vapi --help` and `vapi <cmd> --help` for the official surface. Common reaches:
+    assistant list|get|create|update|delete
+    call list|get|create
+    phone list|get|create|update|delete
+    tool list|get|create|update|delete
+    logs
+    listen --forward-to <url>
+
+EXIT CODES (vapic's own layer)
+  0 success - 2 auth (token missing or rejected) - 4 policy refusal: the
+  project gate (.capabilities/settings.json) on any verb, or a write verb on a
+  read-only connection (allow_write: false); ask the user, never lift a gate
+  yourself - 5 environment (vapi not on PATH, installer failed, or unreachable)
+  - 6 input (bad use of a vapic-owned command, or an unknown/ambiguous connection).
+  Forwarded commands return Vapi CLI's own exit code, not these - vapic is
+  transparent for everything it forwards (after the gate).
+
+EXAMPLES
+  vapic bootstrap
+  vapic doctor
+  vapic --connection staging assistant list
+  vapic --connection staging assistant create --help
+  vapic --connection production logs
+  VAPI_API_KEY=... vapic assistant list
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+# --- Capability declaration (protocol 2) — one home for every contract fact --
+
+NAME = "vapic"
+PROTOCOL = 2
+SUMMARY = ("Connection harness around the official `vapi` CLI - resolves a "
+           "Vapi API key, injects it, and forwards commands straight to "
+           "`vapi`; the command surface is `vapi --help`.")
+SCOPE = "project"   # credential scope: "project" | "user"
+CRED_KEYS = [
+    {"key": "VAPI_API_KEY", "secret": True, "required": True,
+     "note": "Vapi API key; lives in the consuming project's .env by default"},
+    {"key": "VAPI_ENV", "secret": False, "required": False,
+     "note": "official CLI environment: production, staging, or development"},
+    {"key": "VAPI_API_BASE_URL", "secret": False, "required": False,
+     "note": "optional official CLI API base URL override"},
+    {"key": "VAPI_DASHBOARD_URL", "secret": False, "required": False,
+     "note": "optional official CLI dashboard URL override"},
+]
+WRITE_VERBS = {
+    "assistant", "call", "phone", "tool", "workflow", "squad", "webhook",
+    "campaign", "listen", "init", "auth", "config", "mcp", "update",
+}
+WRITE_DEFAULT = False   # Vapi writes can call people or mutate paid resources
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/vapic/guides/")
+TOPICS = ["connections", "official-cli"]
+STATE = False       # True when the capability writes session/cache state
+POST_INSTALL = [{"cmd": "vapic bootstrap", "note": "check the official Vapi CLI"}]
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / "vapic" / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+TOKEN_NAME = "VAPI_API_KEY"
+ENV_NAME = "VAPI_ENV"
+API_BASE_NAME = "VAPI_API_BASE_URL"
+DASHBOARD_NAME = "VAPI_DASHBOARD_URL"
+VAPI_INSTALL_URL = "https://vapi.ai/install.sh"
+DOCTOR_TIMEOUT = 30.0
+
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding .capabilities/, .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _auth_context() -> dict | None:
+    """Optional runtime authority envelope passed by an ingress/service.
+
+    Absence means the ordinary project gate is the whole policy. Presence means
+    a request-scoped authority layer exists and must fail closed before any
+    credential or network work happens.
+    """
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return None
+    try:
+        if raw.lstrip().startswith("{"):
+            data = json.loads(raw)
+        else:
+            data = json.loads(Path(raw).read_text())
+    except (OSError, ValueError) as e:
+        _die(4, "auth_context_unreadable",
+             "runtime authority context could not be read",
+             f"{raw}: {e}")
+    if not isinstance(data, dict):
+        _die(4, "auth_context_invalid",
+             "runtime authority context is not an object")
+    return data
+
+
+def _auth_capability_allowed(rule) -> bool:
+    if rule is True or rule == "*":
+        return True
+    if rule in (False, None):
+        return False
+    if isinstance(rule, dict):
+        if rule.get("deny") is True:
+            return False
+        if rule.get("enabled") is False or rule.get("allow") is False:
+            return False
+        return True
+    return False
+
+
+def _auth_gate() -> None:
+    ctx = _auth_context()
+    if ctx is None:
+        return
+    allowed = ctx.get("allowed_capabilities")
+    if allowed is None:
+        return
+    if allowed is True or allowed == "*":
+        return
+    if isinstance(allowed, list):
+        if NAME in allowed or "*" in allowed:
+            return
+    elif isinstance(allowed, dict):
+        if _auth_capability_allowed(allowed.get(NAME, allowed.get("*"))):
+            return
+    else:
+        _die(4, "auth_context_invalid",
+             "runtime authority context has invalid allowed_capabilities")
+    source = ctx.get("source") or "runtime"
+    role = ctx.get("sender_role") or ctx.get("role") or "unknown"
+    chat = ctx.get("chat_id") or "unknown"
+    _die(4, "capability_not_authorized",
+         f"{NAME} is not authorized for this {source} request",
+         f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
+
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks.
+
+    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
+    is stricter and also runs here, before credentials or network calls.
+    """
+    _auth_gate()
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = root / ".capabilities" / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    root = _project_root()
+    return (root / ".capabilities" / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where .capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None and (root / ".capabilities").is_dir():
+            return root / ".capabilities" / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import urllib.error as _ue
+    import urllib.request as _ur
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10.0) as resp:
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(text); return
+    except _ue.HTTPError as e:
+        if e.code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if e.code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        err = f"upstream returned {e.code}"
+    except _ue.URLError as e:
+        err = str(e.reason)
+    except OSError as e:
+        err = str(e)
+    if cache.exists():
+        sys.stderr.write(json.dumps(
+            {"warning": f"upstream unreachable; serving cached copy ({err})"},
+            ensure_ascii=False) + "\n")
+        _emit(cache.read_text()); return
+    _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _render_ids_markdown(data: dict) -> str:
+    """Render the {label: {value, note}} envelope as the labelled markdown
+    list the manager's `capabilities ids <NAME>` also produces — one shared
+    format across the ids surface and the identifiers section of `help`."""
+    lines: list[str] = []
+    for label, entry in sorted(data.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        v = entry.get("value")
+        vs = f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+        line = f"- **{label}**: {vs}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _identifiers_section() -> str:
+    """The Identifiers block appended to the bare top-level help — deterministic
+    first-touch surfacing of `.capabilities/<NAME>/identifiers.json` so an
+    agent following the `<NAME> help` startup protocol loads the discovered
+    labels/values/notes into context at once. Empty when no project envelope
+    or nothing recorded (do not bloat help with an empty section)."""
+    envdir = _env_dir()
+    if envdir is None:
+        return ""
+    ids_file = envdir / "identifiers.json"
+    if not ids_file.exists():
+        return ""
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    header = (
+        "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
+        f"Structural lookups discovered for `{NAME}` in this project. Fetch a single\n"
+        f"raw value with `{NAME} ids get <label>`; the full envelope is also at\n"
+        f"`capabilities ids {NAME}`.\n\n"
+    )
+    return header + _render_ids_markdown(data) + "\n"
+
+
+def _cmd_help() -> None:
+    """Bare top-level help: the CLI's HELP body (module-level `HELP` if
+    defined, else the module docstring), then the project's Identifiers
+    section. Only fires when no extra args follow — per-verb help stays
+    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    g = globals()
+    text = g.get("HELP") or g.get("__doc__") or ""
+    if text.startswith("\n"):
+        text = text.lstrip("\n")
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    section = _identifiers_section()
+    if section:
+        sys.stdout.write(section)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not envdir.parent.is_dir():
+            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved.
+
+    `help` is a contract verb only when bare (no extra args) — the top-level
+    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
+    through to the CLI so per-verb help stays clean."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    elif cmd == "help" and len(argv) == 1:
+        _cmd_help()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+# <<< contract: connections <<<
+
+
+# -- credentials (cascade: project .env(.local) -> user config -> process env) --
+# Secrets omit a flag tier: a Vapi API key must not touch argv.
+
+# --- Connections (capability-specific) --------------------------------------
+
+def _literal_report(key: str, value, reg_path: Path | None,
+                    required: bool = False) -> dict:
+    return _key_report(key, False, required,
+                       str(value) if value not in (None, "") else None,
+                       "connection" if value not in (None, "") else None,
+                       reg_path)
+
+
+def _connections_report() -> dict:
+    """Every connection, every value, its winning tier and source. Local only."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_env_key(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        return report
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys.append(_key_report(secret_env, True, True, value, tier, source))
+        else:
+            keys.append(_key_report("secret_env", False, True, None, None, None))
+        for key, field in (
+                (ENV_NAME, "environment"),
+                (API_BASE_NAME, "api_base_url"),
+                (DASHBOARD_NAME, "dashboard_url")):
+            if field in entry:
+                keys.append(_literal_report(field, entry.get(field), reg_path))
+            else:
+                value, tier, source = _resolve_env_key(key)
+                keys.append(_key_report(key, False, False, value, tier, source))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    return report
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection without dying, so doctor can cover all."""
+    if entry is None:
+        token = _resolve_env_key(TOKEN_NAME)[0]
+        if not token:
+            return None, {
+                "exit": 2, "code": "missing_credentials",
+                "message": f"{TOKEN_NAME} is required for vapic",
+                "hint": f"set {TOKEN_NAME} in this project's .env(.local), "
+                        f"{CREDENTIALS_ENV}, or process env; `vapic guide "
+                        f"connections` shows the connection shape"}
+        return {
+            "id": cid,
+            "allow_write": WRITE_DEFAULT,
+            "token": token,
+            "environment": _resolve_env_key(ENV_NAME)[0],
+            "api_base_url": _resolve_env_key(API_BASE_NAME)[0],
+            "dashboard_url": _resolve_env_key(DASHBOARD_NAME)[0],
+        }, None
+    secret_env = entry.get("secret_env")
+    if not secret_env:
+        return None, {"exit": 6, "code": "no_secret_env",
+                      "message": f"connection {cid!r} is missing 'secret_env'"}
+    token = _resolve_env_key(secret_env)[0]
+    if not token:
+        return None, {
+            "exit": 2, "code": "missing_secret",
+            "message": f"env var {secret_env} (for connection {cid!r}) is unset",
+            "hint": f"set {secret_env} in the project's .env / .env.local "
+                    f"or the environment"}
+    return {
+        "id": cid,
+        "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+        "token": token,
+        "environment": entry.get("environment") or _resolve_env_key(ENV_NAME)[0],
+        "api_base_url": entry.get("api_base_url") or _resolve_env_key(API_BASE_NAME)[0],
+        "dashboard_url": entry.get("dashboard_url") or _resolve_env_key(DASHBOARD_NAME)[0],
+    }, None
+
+
+# -- vapi invocation ---------------------------------------------------------
+
+def _child_env(cfg: dict | None) -> dict:
+    env = dict(os.environ)
+    if cfg:
+        env[TOKEN_NAME] = cfg["token"]
+        if cfg.get("environment"):
+            env[ENV_NAME] = str(cfg["environment"])
+        if cfg.get("api_base_url"):
+            env[API_BASE_NAME] = str(cfg["api_base_url"])
+        if cfg.get("dashboard_url"):
+            env[DASHBOARD_NAME] = str(cfg["dashboard_url"])
+    return env
+
+
+def _vapi_path() -> str | None:
+    return shutil.which("vapi")
+
+
+def _official_install_command() -> str:
+    return f"curl -sSL {VAPI_INSTALL_URL} | bash"
+
+
+def cmd_bootstrap(args: list[str]) -> None:
+    yes = False
+    for arg in args:
+        if arg == "--yes":
+            yes = True
+        else:
+            _die(6, "input", f"unknown bootstrap argument {arg!r}",
+                 "usage: vapic bootstrap [--yes]")
+    path = _vapi_path()
+    if path:
+        _emit({"ok": True, "installed": True, "path": path})
+        return
+    payload = {
+        "ok": not yes,
+        "installed": False,
+        "install": {"command": _official_install_command(),
+                    "url": VAPI_INSTALL_URL},
+    }
+    if not yes:
+        payload["next"] = "run `vapic bootstrap --yes` to execute the official installer"
+        _emit(payload)
+        return
+
+    import tempfile
+    import urllib.request
+    try:
+        with urllib.request.urlopen(VAPI_INSTALL_URL, timeout=30.0) as resp:
+            script = resp.read()
+    except OSError as e:
+        _die(5, "installer_fetch_failed",
+             f"could not fetch official Vapi installer: {e}",
+             VAPI_INSTALL_URL)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", delete=False) as tmp:
+            tmp.write(script)
+            tmp_path = tmp.name
+        proc = subprocess.run(["bash", tmp_path], text=True)
+    finally:
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+    if proc.returncode != 0:
+        _die(5, "installer_failed",
+             f"official Vapi installer exited with {proc.returncode}")
+    path = _vapi_path()
+    if not path:
+        _die(5, "vapi_not_on_path",
+             "official Vapi installer completed, but `vapi` is not on PATH",
+             "open a new shell or add the install directory to PATH, then rerun `vapic doctor`")
+    _emit({"ok": True, "installed": True, "path": path})
+
+
+def _is_native_help(argv: list[str]) -> bool:
+    if not argv:
+        return True
+    if argv[0] in ("help", "-h", "--help", "version", "--version", "completion", "manual"):
+        return True
+    return "-h" in argv or "--help" in argv
+
+
+def _first_word(args: list[str]) -> str | None:
+    for arg in args:
+        if not arg.startswith("-"):
+            return arg
+    return None
+
+
+def _requires_write(argv: list[str]) -> bool:
+    if not argv or _is_native_help(argv):
+        return False
+    root = argv[0]
+    if root == "logs":
+        return False
+    if root == "auth":
+        return (_first_word(argv[1:]) or "status") not in {"status", "whoami"}
+    if root in {"assistant", "call", "phone", "tool", "workflow",
+                "squad", "webhook", "campaign"}:
+        return (_first_word(argv[1:]) or "list") not in {
+            "list", "get", "show", "status", "describe"}
+    return True
+
+
+def _write_gate_command(conn_id: str, allow_write: bool, argv: list[str]) -> None:
+    if not allow_write and _requires_write(argv):
+        shown = " ".join(argv[:3]) if argv else "<empty>"
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes; `{shown}` is not a known read-only Vapi command",
+             "Do not lift the gate yourself - ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _check_connection(cfg: dict) -> dict:
+    """Use a cheap official-CLI read to prove the key is accepted."""
+    if not _vapi_path():
+        return {"ok": False, "category": 5,
+                "error": "the official `vapi` CLI is not on PATH",
+                "hint": "run `vapic bootstrap` for the install command"}
+    try:
+        proc = subprocess.run(["vapi", "assistant", "list"],
+                              env=_child_env(cfg),
+                              capture_output=True, text=True, timeout=DOCTOR_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "category": 5,
+                "error": "vapi was unresponsive (`assistant list` timed out)"}
+    except OSError as e:
+        return {"ok": False, "category": 5, "error": f"could not run vapi: {e}"}
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        low = err.lower()
+        if any(s in low for s in ("api key", "auth", "unauthor", "forbidden", "login")):
+            return {"ok": False, "category": 2,
+                    "error": err or "Vapi rejected the API key",
+                    "hint": "the key is missing, invalid, revoked, or for the wrong environment"}
+        return {"ok": False, "category": 5, "error": err or "`vapi assistant list` failed"}
+    return {
+        "ok": True,
+        "environment": cfg.get("environment") or "production",
+        "api_base_url": cfg.get("api_base_url"),
+        "dashboard_url": cfg.get("dashboard_url"),
+        "probe": "vapi assistant list",
+    }
+
+
+def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
+    _doctor_gate(_connections_report(), wanted)
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        cfg, problem = _build_cfg(cid, entry)
+        if problem:
+            res = {"ok": False, "category": problem["exit"],
+                   "error": problem["message"]}
+            if problem.get("hint"):
+                res["hint"] = problem["hint"]
+        else:
+            res = _check_connection(cfg)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
+
+
+def _forward(argv: list[str], cfg: dict | None) -> NoReturn:
+    try:
+        proc = subprocess.run(["vapi", *argv], env=_child_env(cfg))
+    except OSError as e:
+        _die(5, "vapi_exec_failed", f"could not run vapi: {e}",
+             "run `vapic bootstrap` for the install command")
+    sys.exit(proc.returncode)
+
+
+# -- dispatch ----------------------------------------------------------------
+
+def main() -> None:
+    _gate()
+
+    argv = sys.argv[1:]
+    wanted_conn: str | None = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--connection" and i + 1 < len(argv):
+            wanted_conn = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            wanted_conn = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+
+    _contract(cleaned)
+    if not cleaned or (len(cleaned) == 1 and cleaned[0] in ("help", "-h", "--help")):
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+
+    reg, _ = _connections_registry()
+    if cleaned[0] == "bootstrap":
+        cmd_bootstrap(cleaned[1:])
+        return
+    if cleaned[0] == "doctor":
+        cmd_doctor(reg, wanted_conn)
+        return
+
+    if _is_native_help(cleaned):
+        if not _vapi_path():
+            _die(5, "vapi_not_found", "the official `vapi` CLI is not on PATH",
+                 "run `vapic bootstrap` for the install command")
+        _forward(cleaned, None)
+
+    cid, entry = _select_connection(reg, wanted_conn)
+    allow_write = WRITE_DEFAULT if entry is None else \
+        bool(entry.get("allow_write", WRITE_DEFAULT))
+    _write_gate_command(cid, allow_write, cleaned)
+
+    cfg, problem = _build_cfg(cid, entry)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"],
+             problem.get("hint"))
+
+    if not _vapi_path():
+        _die(5, "vapi_not_found", "the official `vapi` CLI is not on PATH",
+             "run `vapic bootstrap` for the install command")
+
+    _forward(cleaned, cfg)
+
+
+if __name__ == "__main__":
+    main()
