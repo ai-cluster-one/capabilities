@@ -44,6 +44,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -680,7 +681,19 @@ def _queued_jobs(reg, key):
 
 
 def _has_pending_jobs(reg, key):
-    return any(job.get("status") in ("queued", "running") for job in _job_map(reg, key).values())
+    return any(job.get("status") in ("preparing", "queued", "running")
+               for job in _job_map(reg, key).values())
+
+
+def _message_is_known(reg, key, message_id):
+    """True once a message is reserved as a job or covered by the channel watermark."""
+    if _job_id(message_id) in _job_map(reg, key):
+        return True
+    try:
+        watermark = int(_channel_row(reg, key).get("last_processed_message_id") or 0)
+        return int(message_id) <= watermark
+    except (TypeError, ValueError):
+        return False
 
 
 def _recover_incomplete_jobs(reg):
@@ -689,9 +702,11 @@ def _recover_incomplete_jobs(reg):
         if not isinstance(row, dict):
             continue
         for job in (row.get("jobs") or {}).values():
-            if job.get("status") == "running":
+            if job.get("status") in ("preparing", "running"):
+                previous = job.get("status")
                 job["status"] = "queued"
                 job.pop("started_at", None)
+                job["last_error"] = f"service restarted while job was {previous}"
                 changed = True
     return changed
 
@@ -1259,20 +1274,32 @@ def worker_env(state=None):
     return env
 
 
-def run_worker_proc(chat, cmd, procs, env=None):
+def _kill_process_group(proc):
+    """Kill the process group created for a worker, even if its leader already exited."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None):
     """Run a worker subprocess in its own process group (start_new_session) and register it in
-    the caller's `procs` map for the run's lifetime, so /stop can SIGKILL the whole group —
+    the caller's `procs` map until the async job finalizes, so /stop can SIGKILL the whole group —
     claude/codex spawn children, so killing the group, not just the lone parent, is what stops
     the run. Returns (returncode, stdout, stderr); a killed run comes back with a negative
     returncode, which the caller raises on like any nonzero exit."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("worker cancelled before process start")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, start_new_session=True, cwd=str(PROJECT_ROOT),
                             env=env)
     procs[chat] = proc
-    try:
-        out, err = proc.communicate()
-    finally:
-        procs.pop(chat, None)
+    # Cancellation can race with Popen. Register first, then honor a cancellation
+    # that arrived while the process was being created so no late process escapes.
+    if cancel_event is not None and cancel_event.is_set():
+        _kill_process_group(proc)
+    out, err = proc.communicate()
     return proc.returncode, out, err
 
 
@@ -1298,7 +1325,9 @@ def worker_claude(chat, tail, state=None, procs=None):
     if effort:
         cmd += ["--effort", effort]
     proc_key = ((state or {}).get("proc_key") or chat)
-    rc, out, err = run_worker_proc(proc_key, cmd, procs, env=worker_env(state))
+    rc, out, err = run_worker_proc(
+        proc_key, cmd, procs, env=worker_env(state),
+        cancel_event=(state or {}).get("cancel_event"))
     if rc != 0:
         detail = (err.strip() or out.strip() or f"exit {rc}")[:500]
         raise RuntimeError(f"claude worker failed: {detail}")
@@ -1361,7 +1390,9 @@ def worker_codex(chat, tail, state=None, procs=None):
         if service_tier:
             cmd += ["-c", f'service_tier="{service_tier}"']
         proc_key = ((state or {}).get("proc_key") or chat)
-        rc, stdout_txt, err = run_worker_proc(proc_key, cmd, procs, env=worker_env(state))
+        rc, stdout_txt, err = run_worker_proc(
+            proc_key, cmd, procs, env=worker_env(state),
+            cancel_event=(state or {}).get("cancel_event"))
         if rc != 0:
             raise RuntimeError(f"codex worker failed: {err.strip()[:200]}")
         reply = Path(out).read_text().strip()
@@ -1387,6 +1418,10 @@ class SessionUnhealthy(Exception):
     """The MTProto client is alive but no longer decoding Telegram updates reliably."""
 
 
+class WorkerTimedOut(Exception):
+    """The worker future exceeded its configured deadline without being cancelled."""
+
+
 async def run_session(client):
     await client.connect()
     if not await client.is_user_authorized():
@@ -1409,30 +1444,39 @@ async def run_session(client):
     reg = load_register()
     if migrate_register(reg):
         save_register(reg)
-    if _recover_incomplete_jobs(reg) or _prune_all_jobs(reg):
+    recovered = _recover_incomplete_jobs(reg)
+    pruned = _prune_all_jobs(reg)
+    if recovered or pruned:
         save_register(reg)
     # Per-chat concurrency is capped by max_parallel_jobs. The unit of work is an
     # addressed Telegram message, persisted in register.jobs and deduped by message id.
-    busy, timers = set(), {}
+    busy, timers, runners = set(), {}, {}
     procs, stopping = {}, set()   # live worker per chat + chats whose worker /stop just killed
     closing = False
 
     def kill_worker_proc(key, reason):
         proc = procs.get(key)
-        if not proc or proc.poll() is not None:
+        if not proc:
             return False
         try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGKILL)
-            log(f"{key}: killed worker pgid {pgid} ({reason})")
+            killed = _kill_process_group(proc)
+            if not killed:
+                log(f"{key}: worker process group {proc.pid} already gone ({reason})")
+                return False
+            log(f"{key}: killed worker pgid {proc.pid} ({reason})")
             return True
-        except (ProcessLookupError, PermissionError) as e:
+        except PermissionError as e:
             log(f"{key}: worker kill failed ({reason}): {e}")
             return False
 
     def kill_all_workers(reason):
         for key in list(procs):
             kill_worker_proc(key, reason)
+
+    def release_worker_proc(key):
+        proc = procs.pop(key, None)
+        if proc is not None and _kill_process_group(proc):
+            log(f"{key}: killed lingering worker pgid {proc.pid} during job cleanup")
 
     def proc_key_for(chat_key, job):
         return f"{chat_key}:{job.get('message_id')}"
@@ -1475,31 +1519,72 @@ async def run_session(client):
                 pass
         await drain_progress(key, outbox, ent_id, is_direct, reply_to, offset)
 
-    async def enqueue_job(key, message, group_policy, is_direct, reason, text_override=None):
+    def reserve_job(key, message, group_policy, is_direct, reason):
+        """Persist ownership of a message before any transcription or other await.
+
+        The preparing state is recovered as queued on startup. This reservation is the
+        idempotency boundary for both live delivery and startup catch-up.
+        """
         jobs = _job_map(reg, key)
         jid = _job_id(message.id)
-        if jid in jobs:
-            return False
-        profile = await _sender_profile(message, group_policy, direct=is_direct)
-        text = text_override or message_tail_text(message) or _message_text(message) or f"[{_message_kind(message)}]"
-        jobs[jid] = {
+        if _message_is_known(reg, key, message.id):
+            return None
+        sender_id = str(getattr(message, "sender_id", None))
+        member = (group_policy or {}).get("members", {}).get(sender_id, {})
+        allowed = ALLOWED.get(sender_id, {})
+        sender_name = allowed.get("name") or member.get("name") or sender_id
+        default_role = (DIRECT_DEFAULT_ROLE if is_direct else
+                        (group_policy or {}).get("member_role")
+                        or (group_policy or {}).get("role") or "group_member")
+        sender_role = allowed.get("role") or member.get("role") or default_role
+        job = {
             "message_id": message.id,
             "chat_id": key,
-            "sender_id": profile["id"],
-            "sender_name": profile["name"],
-            "sender_role": profile["role"],
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "sender_role": sender_role,
             "kind": _message_kind(message),
-            "text": text,
-            "status": "queued",
+            "text": message_tail_text(message) or _message_text(message)
+                    or f"[{_message_kind(message)}]",
+            "status": "preparing",
             "attempts": 0,
             "enqueued_at": now(),
             "source": reason,
         }
+        jobs[jid] = job
         row = _channel_row(reg, key)
         row["last_seen_message_id"] = max(message.id, row.get("last_seen_message_id", 0))
         _prune_jobs(reg, key)
         save_register(reg)
+        return job
+
+    async def finalize_job(key, message, group_policy, is_direct, reason, job,
+                           text_override=None):
+        if _job_map(reg, key).get(_job_id(message.id)) is not job:
+            return False
+        profile = await _sender_profile(message, group_policy, direct=is_direct)
+        text = (text_override if text_override is not None else
+                message_tail_text(message) or _message_text(message)
+                or f"[{_message_kind(message)}]")
+        job.update({
+            "sender_id": profile["id"],
+            "sender_name": profile["name"],
+            "sender_role": profile["role"],
+            "text": text,
+            "status": "queued",
+        })
+        save_register(reg)
         log(f"{key}: enqueued job msg={message.id} from {profile['id']} ({reason})")
+        return True
+
+    def retry_job(key, job, error):
+        if _job_map(reg, key).get(_job_id(job.get("message_id"))) is not job:
+            return False
+        job["status"] = "queued"
+        job.pop("started_at", None)
+        job.pop("finished_at", None)
+        job["last_error"] = str(error)[:500]
+        save_register(reg)
         return True
 
     def mark_job_finished(key, job, status, meta=None, error=None, reply_message_id=None):
@@ -1545,6 +1630,20 @@ async def run_session(client):
         participants = [{"name": p["name"], "role": p["role"]} for p in profiles.values() if p.get("name")]
         return tail, participants
 
+    async def terminate_worker(proc_key, future, cancel_event, reason):
+        """Close the cancellation/Popen race, kill the whole group, and reap the worker future."""
+        cancel_event.set()
+        kill_worker_proc(proc_key, reason)
+        if future is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(future), timeout=5)
+        except asyncio.TimeoutError:
+            kill_worker_proc(proc_key, f"{reason}; worker future did not settle")
+            log(f"{proc_key}: worker future did not settle within 5s ({reason})")
+        except (Exception, asyncio.CancelledError):
+            pass
+
     async def run_one_job(key, ent_id, job):
         s = channel_settings(reg, key)
         _, group_policy = _group_policy(key)
@@ -1555,8 +1654,7 @@ async def run_session(client):
         max_attempts = s.get("max_attempts", 3)
         if current_attempts >= max_attempts:
             log(f"{key}: job msg={job.get('message_id')} exceeded max attempts ({current_attempts}/{max_attempts}), marking as failed")
-            # Build minimal context to send the error reply
-            tail_stub, participants = await build_tail_and_participants(key, ent_id, s, group_policy, is_direct, job)
+            participants = [{"name": job.get("sender_name"), "role": job.get("sender_role")}]
             error_msg = f"Failed after {current_attempts} attempts - worker process did not complete"
             await fail_job(key, ent_id, job, is_direct, participants, error_msg)
             return
@@ -1566,96 +1664,123 @@ async def run_session(client):
         job["attempts"] = current_attempts + 1
         save_register(reg)
 
-        tail, participants = await build_tail_and_participants(key, ent_id, s, group_policy, is_direct, job)
-        current_request = {
-            "message_id": job.get("message_id"),
-            "sender_id": job.get("sender_id"),
-            "sender_name": job.get("sender_name"),
-            "sender_role": job.get("sender_role"),
-            "kind": job.get("kind"),
-            "text": job.get("text"),
-            "reply_to": None if is_direct else job.get("message_id"),
-        }
         proc_key = proc_key_for(key, job)
-        PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-        progress_outbox = PROGRESS_DIR / f"{_safe_file_part(key)}-{job.get('message_id')}.jsonl"
-        with contextlib.suppress(OSError):
-            progress_outbox.unlink()
-        worker_session = prepare_worker_session(key, job.get("message_id"))
-        authority = _authority_policy_for(job, group_policy, is_direct)
-        channel_context = _channel_context_from_policy(group_policy)
+        future = None
+        progress_task = None
+        progress_stop = None
+        worker_session = None
         authority_context = None
-        if authority is not None:
-            AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
-            auth_path = AUTHORITY_DIR / f"{_safe_file_part(key)}-{job.get('message_id')}.json"
-            auth_path.write_text(json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-            authority_context = str(auth_path)
-        state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
-                 "chat_type": "private" if is_direct else "group",
-                 "chat_name": (group_policy or {}).get("name"),
-                 "harness": s["worker"], "participants": participants, "settings": s,
-                 "messages": len(tail),
-                 "history_chars": sum(len(m["text"]) for m in tail),
-                 "channel_context": channel_context,
-                 "prev_usage": reg.get(key, {}).get("last_usage"),
-                 "current_request": current_request,
-                 "authority": authority,
-                 "authority_context": authority_context,
-                 "progress_outbox": str(progress_outbox),
-                 "worker_session": worker_session,
-                 "proc_key": proc_key}
-        log(f"{key}: dispatch job msg={job.get('message_id')} tail={s['tail_size']} "
-            f"worker={s['worker']} model={s['model'] or 'default'} msgs={len(tail)}")
-        loop = asyncio.get_running_loop()
-        progress_stop = asyncio.Event()
-        progress_task = asyncio.create_task(
-            pump_progress(key, str(progress_outbox), ent_id, is_direct, job.get("message_id"), progress_stop))
+        participants = [{"name": job.get("sender_name"), "role": job.get("sender_role")}]
+        cancel_event = threading.Event()
         try:
+            tail, participants = await build_tail_and_participants(
+                key, ent_id, s, group_policy, is_direct, job)
+            current_request = {
+                "message_id": job.get("message_id"),
+                "sender_id": job.get("sender_id"),
+                "sender_name": job.get("sender_name"),
+                "sender_role": job.get("sender_role"),
+                "kind": job.get("kind"),
+                "text": job.get("text"),
+                "reply_to": None if is_direct else job.get("message_id"),
+            }
+            PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+            progress_outbox = PROGRESS_DIR / f"{_safe_file_part(key)}-{job.get('message_id')}.jsonl"
+            with contextlib.suppress(OSError):
+                progress_outbox.unlink()
+            worker_session = prepare_worker_session(key, job.get("message_id"))
+            authority = _authority_policy_for(job, group_policy, is_direct)
+            channel_context = _channel_context_from_policy(group_policy)
+            if authority is not None:
+                AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
+                auth_path = AUTHORITY_DIR / f"{_safe_file_part(key)}-{job.get('message_id')}.json"
+                auth_path.write_text(
+                    json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+                authority_context = str(auth_path)
+            state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
+                     "chat_type": "private" if is_direct else "group",
+                     "chat_name": (group_policy or {}).get("name"),
+                     "harness": s["worker"], "participants": participants, "settings": s,
+                     "messages": len(tail),
+                     "history_chars": sum(len(m["text"]) for m in tail),
+                     "channel_context": channel_context,
+                     "prev_usage": reg.get(key, {}).get("last_usage"),
+                     "current_request": current_request,
+                     "authority": authority,
+                     "authority_context": authority_context,
+                     "progress_outbox": str(progress_outbox),
+                     "worker_session": worker_session,
+                     "cancel_event": cancel_event,
+                     "proc_key": proc_key}
+            log(f"{key}: dispatch job msg={job.get('message_id')} tail={s['tail_size']} "
+                f"worker={s['worker']} model={s['model'] or 'default'} msgs={len(tail)}")
+            loop = asyncio.get_running_loop()
+            progress_stop = asyncio.Event()
+            progress_task = asyncio.create_task(
+                pump_progress(key, str(progress_outbox), ent_id, is_direct,
+                              job.get("message_id"), progress_stop))
             future = loop.run_in_executor(None, WORKERS[s["worker"]], key, tail, state, procs)
             async with client.action(ent_id, "typing"):
-                result = await asyncio.wait_for(
-                    asyncio.shield(future), timeout=float(s["worker_timeout"]))
-        except asyncio.TimeoutError:
-            kill_worker_proc(proc_key, f"timeout after {s['worker_timeout']}s")
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(future, timeout=5)
+                done, _ = await asyncio.wait({future}, timeout=float(s["worker_timeout"]))
+                if not done:
+                    raise WorkerTimedOut
+                result = await future
+            if closing:
+                retry_job(key, job, "session closed before worker reply was delivered")
+                return
+            reply, meta = result["reply"], result["meta"]
+            sent = await send_channel_message(
+                ent_id, reply, is_direct, reply_to=None if is_direct else job.get("message_id"))
+            tok = meta.get("tokens", {})
+            cost = f" ${meta['cost_usd']:.4f}" if meta.get("cost_usd") else ""
+            log(f"{key}: replied job msg={job.get('message_id')} «{reply[:80]}» · "
+                f"{meta.get('harness')}/{meta.get('model') or '?'}"
+                f" · in={tok.get('input')} out={tok.get('output')} cache_r={tok.get('cache_read')}{cost}")
+            mark_job_finished(
+                key, job, "done", meta=meta, reply_message_id=getattr(sent, "id", None))
+        except WorkerTimedOut:
+            await terminate_worker(
+                proc_key, future, cancel_event, f"timeout after {s['worker_timeout']}s")
             e = RuntimeError(f"{s['worker']} worker timed out after {s['worker_timeout']}s")
             if closing:
-                log(f"{key}: worker stopped during session close")
+                retry_job(key, job, e)
+                log(f"{key}: worker timed out during session close; job requeued")
                 return
             await fail_job(key, ent_id, job, is_direct, participants, e)
             return
+        except asyncio.CancelledError:
+            await terminate_worker(proc_key, future, cancel_event, "job task cancelled")
+            current = _job_map(reg, key).get(_job_id(job.get("message_id")))
+            if current is job and job.get("status") == "running":
+                retry_job(key, job, "job task cancelled before completion")
+                log(f"{key}: cancelled job msg={job.get('message_id')}; requeued")
+            else:
+                log(f"{key}: cancelled job msg={job.get('message_id')}; already finalized")
+            raise
         except Exception as e:
-            if closing:
-                log(f"{key}: worker stopped during session close")
-                return
-            if key in stopping:
+            await terminate_worker(proc_key, future, cancel_event, "job failed before completion")
+            current = _job_map(reg, key).get(_job_id(job.get("message_id")))
+            if current is not job or job.get("status") == "stopped":
                 stopping.discard(key)
                 log(f"{key}: run stopped by /stop")
-                mark_job_finished(key, job, "stopped", error="/stop")
+                return
+            if closing:
+                retry_job(key, job, e)
+                log(f"{key}: worker interrupted during session close; job requeued: {_short_error(e)}")
                 return
             await fail_job(key, ent_id, job, is_direct, participants, e)
             return
         finally:
-            progress_stop.set()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(progress_task, timeout=5)
+            if progress_stop is not None:
+                progress_stop.set()
+            if progress_task is not None:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(progress_task, timeout=5)
             cleanup_worker_session(worker_session)
             if authority_context:
                 with contextlib.suppress(OSError):
                     Path(authority_context).unlink()
-
-        reply, meta = result["reply"], result["meta"]
-        if closing:
-            return
-        sent = await send_channel_message(
-            ent_id, reply, is_direct, reply_to=None if is_direct else job.get("message_id"))
-        tok = meta.get("tokens", {})
-        cost = f" ${meta['cost_usd']:.4f}" if meta.get("cost_usd") else ""
-        log(f"{key}: replied job msg={job.get('message_id')} «{reply[:80]}» · "
-            f"{meta.get('harness')}/{meta.get('model') or '?'}"
-            f" · in={tok.get('input')} out={tok.get('output')} cache_r={tok.get('cache_read')}{cost}")
-        mark_job_finished(key, job, "done", meta=meta, reply_message_id=getattr(sent, "id", None))
+            release_worker_proc(proc_key)
 
     async def fail_job(key, ent_id, job, is_direct, participants, error):
         log(f"{key}: worker error job msg={job.get('message_id')}: {error}")
@@ -1678,7 +1803,7 @@ async def run_session(client):
         if key in busy:
             return
         busy.add(key)
-        active = set()
+        active = {}
         try:
             while not closing:
                 s = channel_settings(reg, key)
@@ -1686,29 +1811,65 @@ async def run_session(client):
                 queued = _queued_jobs(reg, key)
                 while queued and len(active) < limit:
                     job = queued.pop(0)
-                    active.add(asyncio.create_task(run_one_job(key, ent_id, job)))
+                    active[asyncio.create_task(run_one_job(key, ent_id, job))] = job
                 if not active:
                     break
-                done, active = await asyncio.wait(
+                done, _ = await asyncio.wait(
                     active, timeout=1, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
-                    with contextlib.suppress(Exception):
+                    job = active.pop(task)
+                    try:
                         await task
+                    except asyncio.CancelledError:
+                        if job.get("status") == "running":
+                            retry_job(key, job, "worker task vanished from queue runner")
+                        log(f"{key}: worker task cancelled msg={job.get('message_id')}")
+                    except BaseException as e:
+                        if job.get("status") == "running":
+                            retry_job(key, job, f"worker task escaped: {_short_error(e)}")
+                        log(f"{key}: worker task escaped msg={job.get('message_id')}: "
+                            f"{_short_error(e)}")
         finally:
-            for task in active:
+            pending = list(active.items())
+            for task, _ in pending:
                 task.cancel()
+            if pending:
+                await asyncio.gather(*(task for task, _ in pending), return_exceptions=True)
+            for _, job in pending:
+                if job.get("status") == "running":
+                    retry_job(key, job, "queue runner stopped before worker completion")
             busy.discard(key)
 
     async def debounce(key, ent_id):
+        current = asyncio.current_task()
         try:
             await asyncio.sleep(channel_settings(reg, key)["debounce"])
         except asyncio.CancelledError:
             return
-        timers.pop(key, None)
-        try:
-            await run_queue(key, ent_id)
-        except Exception as e:
-            log(f"{key}: debounce/run error: {_short_error(e)}")
+        finally:
+            if timers.get(key) is current:
+                timers.pop(key, None)
+        if closing:
+            return
+        existing = runners.get(key)
+        if existing is not None and not existing.done():
+            return
+        runner = asyncio.create_task(run_queue(key, ent_id))
+        runners[key] = runner
+
+        def runner_done(task):
+            if runners.get(key) is task:
+                runners.pop(key, None)
+            if task.cancelled():
+                log(f"{key}: queue runner cancelled")
+            else:
+                error = task.exception()
+                if error is not None:
+                    log(f"{key}: queue runner error: {_short_error(error)}")
+            if not closing and _queued_jobs(reg, key):
+                arm(key, ent_id)
+
+        runner.add_done_callback(runner_done)
 
     def arm(key, ent_id):
         if key in timers:
@@ -1721,7 +1882,7 @@ async def run_session(client):
         for run_key, proc in list(procs.items()):
             if run_key != key and not run_key.startswith(f"{key}:"):
                 continue
-            if not proc or proc.poll() is not None:
+            if not proc:
                 continue
             stopping.add(key)
             if kill_worker_proc(run_key, "/stop"):
@@ -1732,8 +1893,8 @@ async def run_session(client):
         if t:
             t.cancel()
             stopped = True
-        for job in _job_map(reg, key).values():
-            if job.get("status") in ("queued", "running"):
+        for job in list(_job_map(reg, key).values()):
+            if job.get("status") in ("preparing", "queued", "running"):
                 mark_job_finished(key, job, "stopped", error="/stop")
                 stopped = True
         return "Stopped." if stopped else "Nothing is running right now."
@@ -1756,13 +1917,18 @@ async def run_session(client):
         except Exception as e:
             log(f"{key}: voice download error: {e}")
         spoken = transcript or "[голосовое — не удалось расшифровать]"
-        await send_channel_message(
-            chat_id,
-            f"Твоё сообщение:\n<blockquote>{html.escape(spoken)}</blockquote>",
-            is_direct,
-            parse_mode="html",
-            reply_to=None if is_direct else message.id)
-        log(f"{key}: voice echo «{spoken[:50]}»")
+        try:
+            await send_channel_message(
+                chat_id,
+                f"Твоё сообщение:\n<blockquote>{html.escape(spoken)}</blockquote>",
+                is_direct,
+                parse_mode="html",
+                reply_to=None if is_direct else message.id)
+            log(f"{key}: voice echo «{spoken[:50]}»")
+        except Exception as e:
+            # The job reservation remains the idempotency record. Retrying the echo on a
+            # later catch-up could duplicate a message whose send succeeded remotely.
+            log(f"{key}: voice echo send failed msg={message.id}: {_short_error(e)}")
         return spoken
 
     async def registered_chat_ref(key):
@@ -1783,12 +1949,11 @@ async def run_session(client):
         return cid
 
     async def catch_up_known(reason):
-        # Recover messages missed while the daemon was down or while Telegram updates were flaky.
+        # Recover messages missed while the daemon was down. This runs once for every
+        # supervised connection/reconnection, before live processing resumes.
         tl_failures = 0
         checked = 0
         for key in list(reg.keys()):
-            if reason == "periodic" and (key in busy or key in timers):
-                continue
             ent = await registered_chat_ref(key)
             if ent is None:
                 continue
@@ -1812,7 +1977,7 @@ async def run_session(client):
             for m in reversed(raw):
                 if getattr(m, "out", False):
                     continue
-                if m.id <= wm and _job_id(m.id) not in _job_map(reg, key):
+                if _message_is_known(reg, key, m.id):
                     continue
                 is_direct = group_policy is None
                 if group_policy is not None:
@@ -1820,10 +1985,15 @@ async def run_session(client):
                         continue
                 elif not _incoming_in_scope(m, group_policy):
                     continue
+                job = reserve_job(key, m, group_policy, is_direct, f"catch-up/{reason}")
+                if job is None:
+                    continue
                 spoken = None
                 if _is_spoken_media(m):
                     spoken = await echo_voice_message(m, ent, key, is_direct)
-                if await enqueue_job(key, m, group_policy, is_direct, f"catch-up/{reason}", text_override=spoken):
+                if await finalize_job(
+                        key, m, group_policy, is_direct, f"catch-up/{reason}", job,
+                        text_override=spoken):
                     enqueued += 1
             if enqueued:
                 log(f"{key}: catch-up/{reason} enqueued {enqueued} since watermark {wm}")
@@ -1831,23 +2001,6 @@ async def run_session(client):
         if checked and tl_failures >= checked:
             raise SessionUnhealthy(
                 f"Telegram TL decode failed for {tl_failures}/{checked} catch-up chats")
-
-    async def periodic_catch_up():
-        nonlocal closing
-        while True:
-            await asyncio.sleep(30)
-            try:
-                await catch_up_known("periodic")
-            except asyncio.CancelledError:
-                raise
-            except SessionUnhealthy as e:
-                log(f"catch-up/periodic unhealthy: {e}; reconnecting")
-                closing = True
-                kill_all_workers("session unhealthy")
-                await client.disconnect()
-                return
-            except Exception as e:
-                log(f"catch-up/periodic error: {_short_error(e)}")
 
     @client.on(events.NewMessage(incoming=True))
     async def on_message(event):
@@ -1862,6 +2015,9 @@ async def run_session(client):
         group_policy = access.get("policy")
         is_direct = access["kind"] == "private"
         chat_ref = await _event_chat_ref(event, is_direct=is_direct)
+        if _message_is_known(reg, key, event.message.id):
+            log(f"{key}: already queued/done msg={event.message.id}")
+            return
         if text.startswith("/"):                          # control path — act now
             profile = await _sender_profile(event.message, group_policy, direct=is_direct)
             cmd = _command_name(text)
@@ -1881,13 +2037,18 @@ async def run_session(client):
                     chat_ref, reply, access["kind"] == "private",
                     reply_to=None if access["kind"] == "private" else event.message.id)
             return
+        job = reserve_job(key, event.message, group_policy, is_direct, "live")
+        if job is None:
+            log(f"{key}: already queued/done msg={event.message.id}")
+            return
         spoken = None
         if _is_spoken_media(event.message):               # transcribe → echo (visible + attributed by reply)
             spoken = await echo_voice_message(event.message, chat_ref, key, is_direct)
         else:
             log(f"{key}: <- {_message_kind(event.message)} «{text[:60]}» "
                 f"(debounce {channel_settings(reg, key)['debounce']}s)")
-        enqueued = await enqueue_job(key, event.message, group_policy, is_direct, "live", text_override=spoken)
+        enqueued = await finalize_job(
+            key, event.message, group_policy, is_direct, "live", job, text_override=spoken)
         if not enqueued:
             log(f"{key}: already queued/done msg={event.message.id}")
             return
@@ -1904,18 +2065,26 @@ async def run_session(client):
         ent = await registered_chat_ref(key)
         if ent is not None:
             arm(key, ent)
-    catch_up_task = asyncio.create_task(periodic_catch_up())
 
     log("live — reacting in real time. Ctrl-C to stop.")
     try:
         await client.run_until_disconnected()
     finally:
         closing = True
-        catch_up_task.cancel()
-        for task in list(timers.values()):
+        pending_timers = list(timers.values())
+        for task in pending_timers:
             task.cancel()
         timers.clear()
+        if pending_timers:
+            await asyncio.gather(*pending_timers, return_exceptions=True)
         kill_all_workers("session closing")
+        pending_runners = list(runners.values())
+        for task in pending_runners:
+            task.cancel()
+        if pending_runners:
+            await asyncio.gather(*pending_runners, return_exceptions=True)
+        runners.clear()
+        kill_all_workers("session closing cleanup")
 
 
 async def main():

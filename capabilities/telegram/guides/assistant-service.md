@@ -93,6 +93,12 @@ Telethon SQLite session.
   by mention, reply, or configured alias unless the group policy sets
   `require_reference` to `false`.
 - Each addressed message becomes its own queued job.
+- The daemon performs one catch-up pass when a Telegram session connects, including
+  supervisor-driven reconnects, to recover messages received while it was down. It
+  does not poll chat history periodically while the live update stream is healthy.
+- A message is reserved in the persistent job register before voice transcription or
+  any echo is attempted. Live re-delivery and startup catch-up therefore cannot
+  transcribe or echo the same voice message twice.
 - Group final replies and progress updates are sent as replies to the addressed
   message. Direct-chat replies are plain messages.
 - `telegram send <chat> <text>` inside a worker writes to the daemon progress
@@ -100,6 +106,9 @@ Telethon SQLite session.
 - Workers can be `codex`, `claude`, or `stub`; `/set` and `/status` in Telegram
   adjust or inspect per-channel runtime settings when `control.roles` allows
   the sender role to run that command.
+- Worker subprocesses run in dedicated process groups. Timeout, task cancellation,
+  reconnect, and incomplete post-worker delivery all terminate that group and move
+  the persisted job to a terminal error or startup-retry state.
 
 ## Channel Context
 
