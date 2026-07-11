@@ -17,7 +17,9 @@ Optional settings:
 GEMINITALK_MODEL=gemini-3.1-flash-live-preview
 GEMINITALK_VOICE=Kore
 GEMINITALK_LANGUAGE=ru-RU
-GEMINITALK_SYSTEM_PROMPT_FILE=.capabilities/geminitalk/reference/voice-context.md
+GEMINITALK_AGENT_NAME=GeminiTalk
+GEMINITALK_MAX_AGENT_SESSIONS=3
+GEMINITALK_PROMPT_FILES='[".capabilities/geminitalk/base.md",".codex/generated/context.md"]'
 ```
 
 For named connections, use `.capabilities/geminitalk/connections.json`:
@@ -30,7 +32,13 @@ For named connections, use `.capabilities/geminitalk/connections.json`:
       "secret_env": "GOOGLE_API_KEY",
       "model": "gemini-3.1-flash-live-preview",
       "voice": "Kore",
+      "agent_name": "GeminiTalk",
+      "max_agent_sessions": 3,
       "language": "ru-RU",
+      "prompt_files": [
+        ".capabilities/geminitalk/base.md",
+        ".codex/generated/context.md"
+      ],
       "allow_capability_domain_commands": false,
       "allow_codex_tasks": true,
       "allow_write": true
@@ -43,3 +51,27 @@ Keep `allow_capability_domain_commands` false unless you deliberately need broad
 capability domain commands. `allow_codex_tasks` exposes the dedicated bounded
 `codex_task` tool. Set `allow_write` only when voice-authorized `act` delegation
 is intended for this connection.
+
+`voice` selects a Gemini prebuilt voice; run `geminitalk voices` for the current
+list. `agent_name` controls how the spoken companion introduces itself.
+`max_agent_sessions` limits concurrent background agent jobs and is clamped to
+the range 1 through 16. Exact duplicate active tasks are still deduplicated.
+
+Run `geminitalk init` once in each consuming project after `capabilities init`;
+it creates `.capabilities/geminitalk/base.md` from the bundled template and
+never overwrites an existing file. Edit that project copy for local voice
+behavior.
+
+`prompt_files` is an ordered array loaded fresh for every session. When omitted,
+GeminiTalk loads `.capabilities/geminitalk/base.md`, then also
+`.codex/generated/context.md` if that generated Codex context file exists.
+Explicit `prompt_files` arrays stay authoritative and are not expanded. Paths
+with a `capability:` prefix resolve inside the installed GeminiTalk bundle;
+other relative paths resolve from `project_root`. Files are supplied in array
+order, with earlier files taking precedence when instructions conflict. Runtime
+permissions and safety gates always remain authoritative.
+
+Each prompt file is limited to 20,000 characters and the combined stack to
+40,000 characters. `prompt_file` and `GEMINITALK_SYSTEM_PROMPT_FILE` remain as
+legacy single-file inputs; when used, GeminiTalk prepends the default project
+base/context stack automatically.
