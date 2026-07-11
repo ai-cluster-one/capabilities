@@ -103,6 +103,11 @@ def _prompt_text(module, cfg: dict) -> str:
     return buf.getvalue()
 
 
+def _geminitalk_key_values(report: dict, cid: str = "default") -> dict:
+    rows = ((report.get("connections") or {}).get(cid) or {}).get("keys") or []
+    return {row.get("key"): row.get("value") for row in rows}
+
+
 def _run_service_init(bin_dir: Path, env: dict[str, str], project: Path) -> None:
     (project / ".capabilities").mkdir(parents=True, exist_ok=True)
     proc = _run(
@@ -556,6 +561,69 @@ def test_geminitalk_init_scaffolds_project_prompt() -> None:
             assert result["prompt_files"] == [".capabilities/geminitalk/base.md"]
 
 
+def test_geminitalk_effective_defaults_match_marvin_baseline() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        (project / ".capabilities").mkdir(parents=True)
+        with _loaded_geminitalk(tmp, project) as geminitalk:
+            assert geminitalk.DEFAULT_VOICE == "Aoede"
+            assert geminitalk.DEFAULT_AGENT_NAME == "Tessa"
+            assert geminitalk.DEFAULT_LANGUAGE == "auto"
+            assert geminitalk.DEFAULT_MAX_AGENT_SESSIONS == 3
+            assert geminitalk.WRITE_DEFAULT is True
+
+            cid, cfg = geminitalk._selected_cfg(None, None, require_key=False)
+            assert cid == "default"
+            assert cfg["voice"] == "Aoede"
+            assert cfg["agent_name"] == "Tessa"
+            assert cfg["language"] == "auto"
+            assert cfg["max_agent_sessions"] == 3
+            assert cfg["allow_capability_domain_commands"] is False
+            assert cfg["allow_codex_tasks"] is True
+            assert cfg["prompt_files"] == [".capabilities/geminitalk/base.md"]
+
+            implicit = geminitalk._connections_report()
+            assert implicit["connections"]["default"]["allow_write"] is True
+            implicit_values = _geminitalk_key_values(implicit)
+            assert implicit_values["voice"] == "Aoede"
+            assert implicit_values["agent_name"] == "Tessa"
+            assert implicit_values["language"] == "auto"
+            assert implicit_values["max_agent_sessions"] == 3
+            assert implicit_values["allow_capability_domain_commands"] is False
+            assert implicit_values["allow_codex_tasks"] is True
+            assert implicit_values["prompt_files"] == [".capabilities/geminitalk/base.md"]
+
+            capdir = project / ".capabilities" / "geminitalk"
+            capdir.mkdir(parents=True)
+            (capdir / "connections.json").write_text(json.dumps({
+                "default": "marvin-like",
+                "connections": {"marvin-like": {"secret_env": "GOOGLE_API_KEY"}},
+            }) + "\n")
+            registry = geminitalk._connections_report()
+            assert registry["connections"]["marvin-like"]["allow_write"] is True
+            registry_values = _geminitalk_key_values(registry, "marvin-like")
+            assert registry_values["voice"] == "Aoede"
+            assert registry_values["agent_name"] == "Tessa"
+            assert registry_values["language"] == "auto"
+            assert registry_values["max_agent_sessions"] == 3
+            assert registry_values["allow_capability_domain_commands"] is False
+            assert registry_values["allow_codex_tasks"] is True
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    geminitalk._contract(["manifest", "--json"])
+                except SystemExit as exc:
+                    assert exc.code == 0
+            manifest = json.loads(buf.getvalue())
+            notes = {item["key"]: item.get("note", "") for item in manifest["credentials"]["keys"]}
+            assert "default Aoede" in notes["GEMINITALK_VOICE"]
+            assert "default Tessa" in notes["GEMINITALK_AGENT_NAME"]
+            assert "default true" in notes["GEMINITALK_ALLOW_CODEX_TASKS"]
+            assert "default true" in notes["allow_write"]
+
+
 def test_geminitalk_default_prompt_adds_codex_context_when_present() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -696,6 +764,7 @@ if __name__ == "__main__":
         ("telegram group chat ref never falls back to sender", test_telegram_group_chat_ref_never_falls_back_to_sender),
         ("telegram channel context overlay is added to prompt", test_telegram_channel_context_overlay_is_added_to_prompt),
         ("geminitalk init scaffolds project prompt", test_geminitalk_init_scaffolds_project_prompt),
+        ("geminitalk effective defaults match marvin baseline", test_geminitalk_effective_defaults_match_marvin_baseline),
         ("geminitalk default prompt adds codex context when present", test_geminitalk_default_prompt_adds_codex_context_when_present),
         ("geminitalk explicit prompt files are ordered and authoritative", test_geminitalk_explicit_prompt_files_are_ordered_and_authoritative),
         ("geminitalk legacy prompt_file migrates after project base", test_geminitalk_legacy_prompt_file_migrates_after_project_base),

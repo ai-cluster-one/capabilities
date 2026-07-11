@@ -18,9 +18,10 @@ direction gates the other. Gemini performs speech activity detection. A server
 `interrupted` event only clears the obsolete playback tail.
 
 The assistant can inspect files, search text, and call safe capability contract
-commands. When `allow_codex_tasks` is enabled, it can delegate an explicit
-research or implementation task to headless Codex in the current project. The
-tool returns a job id immediately and lets the voice conversation continue.
+commands. `allow_codex_tasks` defaults true; when enabled, it can delegate an
+explicit research or implementation task to headless Codex in the current
+project. The tool returns a job id immediately and lets the voice conversation
+continue.
 Different jobs can run concurrently up to the
 connection's `max_agent_sessions` limit; exact duplicates are deduplicated. When
 Codex finishes, the runtime injects the

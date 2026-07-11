@@ -15,11 +15,12 @@ Optional settings:
 
 ```sh
 GEMINITALK_MODEL=gemini-3.1-flash-live-preview
-GEMINITALK_VOICE=Kore
-GEMINITALK_LANGUAGE=ru-RU
-GEMINITALK_AGENT_NAME=GeminiTalk
+GEMINITALK_VOICE=Aoede
+GEMINITALK_LANGUAGE=auto
+GEMINITALK_AGENT_NAME=Tessa
 GEMINITALK_MAX_AGENT_SESSIONS=3
-GEMINITALK_PROMPT_FILES='[".capabilities/geminitalk/base.md",".codex/generated/context.md"]'
+GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS=false
+GEMINITALK_ALLOW_CODEX_TASKS=true
 ```
 
 For named connections, use `.capabilities/geminitalk/connections.json`:
@@ -31,14 +32,10 @@ For named connections, use `.capabilities/geminitalk/connections.json`:
     "studio": {
       "secret_env": "GOOGLE_API_KEY",
       "model": "gemini-3.1-flash-live-preview",
-      "voice": "Kore",
-      "agent_name": "GeminiTalk",
+      "voice": "Aoede",
+      "agent_name": "Tessa",
       "max_agent_sessions": 3,
-      "language": "ru-RU",
-      "prompt_files": [
-        ".capabilities/geminitalk/base.md",
-        ".codex/generated/context.md"
-      ],
+      "language": "auto",
       "allow_capability_domain_commands": false,
       "allow_codex_tasks": true,
       "allow_write": true
@@ -48,9 +45,9 @@ For named connections, use `.capabilities/geminitalk/connections.json`:
 ```
 
 Keep `allow_capability_domain_commands` false unless you deliberately need broad
-capability domain commands. `allow_codex_tasks` exposes the dedicated bounded
-`codex_task` tool. Set `allow_write` only when voice-authorized `act` delegation
-is intended for this connection.
+capability domain commands. `allow_codex_tasks` defaults true and exposes the
+dedicated bounded `codex_task` tool. `allow_write` also defaults true; set it
+false on a connection that must remain read-only.
 
 `voice` selects a Gemini prebuilt voice; run `geminitalk voices` for the current
 list. `agent_name` controls how the spoken companion introduces itself.
@@ -62,8 +59,9 @@ it creates `.capabilities/geminitalk/base.md` from the bundled template and
 never overwrites an existing file. Edit that project copy for local voice
 behavior.
 
-`prompt_files` is an ordered array loaded fresh for every session. When omitted,
-GeminiTalk loads `.capabilities/geminitalk/base.md`, then also
+`prompt_files` is an ordered array loaded fresh for every session. Omit it for
+the canonical prompt stack: GeminiTalk loads `.capabilities/geminitalk/base.md`,
+then also
 `.codex/generated/context.md` if that generated Codex context file exists.
 Explicit `prompt_files` arrays stay authoritative and are not expanded. Paths
 with a `capability:` prefix resolve inside the installed GeminiTalk bundle;

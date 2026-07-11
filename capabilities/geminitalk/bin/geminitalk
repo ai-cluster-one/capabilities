@@ -77,16 +77,16 @@ CONNECTIONS
 
   Optional env keys for the implicit connection:
     GEMINITALK_MODEL              default gemini-3.1-flash-live-preview
-    GEMINITALK_VOICE              default Kore
+    GEMINITALK_VOICE              default Aoede
     GEMINITALK_LANGUAGE           conversational language hint; default auto
-    GEMINITALK_AGENT_NAME         spoken agent name; default GeminiTalk
+    GEMINITALK_AGENT_NAME         spoken agent name; default Tessa
     GEMINITALK_MAX_AGENT_SESSIONS concurrent background agent limit; default 3
     GEMINITALK_PROJECT_ROOT       project root override
-    GEMINITALK_PROMPT_FILES       JSON array of ordered prompt files
+    GEMINITALK_PROMPT_FILES       explicit JSON array of ordered prompt files
     GEMINITALK_SYSTEM_PROMPT_FILE legacy single project prompt file
     GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS
                                true/false; default false
-    GEMINITALK_ALLOW_CODEX_TASKS true/false; default false
+    GEMINITALK_ALLOW_CODEX_TASKS true/false; default true
 
   A named registry lives at .capabilities/geminitalk/connections.json, else
   ~/.config/geminitalk/connections.json:
@@ -96,14 +96,10 @@ CONNECTIONS
         "studio": {
           "secret_env": "GOOGLE_API_KEY",
           "model": "gemini-3.1-flash-live-preview",
-          "voice": "Kore",
-          "agent_name": "GeminiTalk",
+          "voice": "Aoede",
+          "agent_name": "Tessa",
           "max_agent_sessions": 3,
-          "language": "ru-RU",
-          "prompt_files": [
-            ".capabilities/geminitalk/base.md",
-            ".codex/generated/context.md"
-          ],
+          "language": "auto",
           "allow_capability_domain_commands": false,
           "allow_codex_tasks": true,
           "allow_write": true
@@ -130,9 +126,10 @@ CONNECTIONS
                     optional; default false. When false, the Live model can only
                     call contract/readiness commands on other capabilities.
     allow_codex_tasks
-                    optional; default false. Exposes bounded read/act delegation
+                    optional; default true. Exposes bounded read/act delegation
                     to headless Codex in the selected project.
-    allow_write     enable only when act-mode Codex delegation is intended.
+    allow_write     optional; default true. Set false for a read-only
+                    connection.
 
 CONTRACT COMMANDS
   geminitalk stub
@@ -199,20 +196,26 @@ CRED_KEYS = [
     {"key": "GEMINITALK_MODEL", "secret": False, "required": False,
      "note": "Live model id; default gemini-3.1-flash-live-preview"},
     {"key": "GEMINITALK_VOICE", "secret": False, "required": False,
-     "note": "prebuilt voice name; run `geminitalk voices`"},
+     "note": "prebuilt voice name; default Aoede; run `geminitalk voices`"},
     {"key": "GEMINITALK_LANGUAGE", "secret": False, "required": False,
-     "note": "conversation language hint, for example auto, ru-RU, en-US"},
+     "note": "conversation language hint; default auto; examples: ru-RU, en-US"},
     {"key": "GEMINITALK_AGENT_NAME", "secret": False, "required": False,
-     "note": "spoken agent name; default GeminiTalk"},
+     "note": "spoken agent name; default Tessa"},
     {"key": "GEMINITALK_MAX_AGENT_SESSIONS", "secret": False, "required": False,
      "note": "maximum concurrent background agent sessions; default 3"},
     {"key": "GEMINITALK_PROMPT_FILES", "secret": False, "required": False,
-     "note": "JSON array of ordered project/capability prompt files"},
+     "note": "explicit JSON array of ordered project/capability prompt files"},
     {"key": "GEMINITALK_SYSTEM_PROMPT_FILE", "secret": False, "required": False,
      "note": "legacy single project prompt file"},
+    {"key": "GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS", "secret": False,
+     "required": False, "note": "true/false; default false"},
+    {"key": "GEMINITALK_ALLOW_CODEX_TASKS", "secret": False, "required": False,
+     "note": "true/false; default true"},
+    {"key": "allow_write", "secret": False, "required": False,
+     "note": "connection policy field, not an env var; default true"},
 ]
 WRITE_VERBS: set[str] = set()
-WRITE_DEFAULT = False
+WRITE_DEFAULT = True    # no direct domain writes; act-mode delegation stays inside the user's project
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/geminitalk/guides/")
 TOPICS = ["connections", "voice-session"]
@@ -240,9 +243,9 @@ ALLOW_CAP_DOMAIN_KEY = "GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS"
 ALLOW_CODEX_TASKS_KEY = "GEMINITALK_ALLOW_CODEX_TASKS"
 
 DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
-DEFAULT_VOICE = "Kore"
+DEFAULT_VOICE = "Aoede"
 DEFAULT_LANGUAGE = "auto"
-DEFAULT_AGENT_NAME = "GeminiTalk"
+DEFAULT_AGENT_NAME = "Tessa"
 DEFAULT_MAX_AGENT_SESSIONS = 3
 PROJECT_BASE_PROMPT = ".capabilities/geminitalk/base.md"
 CODEX_CONTEXT_PROMPT = ".codex/generated/context.md"
@@ -983,8 +986,8 @@ def _connections_report() -> dict:
         (LANGUAGE_KEY, "language", DEFAULT_LANGUAGE),
         (AGENT_NAME_KEY, "agent_name", DEFAULT_AGENT_NAME),
         (MAX_AGENT_SESSIONS_KEY, "max_agent_sessions", DEFAULT_MAX_AGENT_SESSIONS),
-        (ALLOW_CAP_DOMAIN_KEY, "allow_capability_domain_commands", None),
-        (ALLOW_CODEX_TASKS_KEY, "allow_codex_tasks", None),
+        (ALLOW_CAP_DOMAIN_KEY, "allow_capability_domain_commands", False),
+        (ALLOW_CODEX_TASKS_KEY, "allow_codex_tasks", True),
     ]
     if reg is None:
         root = Path(_resolve_env_key(PROJECT_ROOT_KEY)[0]
@@ -992,9 +995,12 @@ def _connections_report() -> dict:
         value, tier, source, actual = _resolve_first(KEY_ALIASES)
         keys = [_key_report(PRIMARY_KEY if actual is None else actual,
                             True, True, value, tier, source)]
-        for env_key, _field, _default in optional_fields:
+        for env_key, field, default in optional_fields:
             v, t, s = _resolve_env_key(env_key)
-            keys.append(_key_report(env_key, False, False, v, t, s))
+            if v:
+                keys.append(_key_report(env_key, False, False, v, t, s))
+            else:
+                keys.append(_literal_report(field, default, None))
         project_root_value, project_root_tier, project_root_source = _resolve_env_key(PROJECT_ROOT_KEY)
         if project_root_value:
             keys.append(_key_report(PROJECT_ROOT_KEY, False, False,
@@ -1100,7 +1106,7 @@ def _materialize_cfg(cid: str, entry: dict | None,
             "allow_capability_domain_commands": _boolish(
                 _resolve_env_key(ALLOW_CAP_DOMAIN_KEY)[0], False),
             "allow_codex_tasks": _boolish(
-                _resolve_env_key(ALLOW_CODEX_TASKS_KEY)[0], False),
+                _resolve_env_key(ALLOW_CODEX_TASKS_KEY)[0], True),
             "allow_tools": True,
         }, None
 
@@ -1148,7 +1154,7 @@ def _materialize_cfg(cid: str, entry: dict | None,
                       _resolve_env_key(ALLOW_CAP_DOMAIN_KEY)[0]), False),
         "allow_codex_tasks": _boolish(
             entry.get("allow_codex_tasks",
-                      _resolve_env_key(ALLOW_CODEX_TASKS_KEY)[0]), False),
+                      _resolve_env_key(ALLOW_CODEX_TASKS_KEY)[0]), True),
         "allow_tools": True,
     }, None
 
