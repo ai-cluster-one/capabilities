@@ -1291,9 +1291,9 @@ def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None):
     returncode, which the caller raises on like any nonzero exit."""
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("worker cancelled before process start")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=True, cwd=str(PROJECT_ROOT),
-                            env=env)
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True,
+                            cwd=str(PROJECT_ROOT), env=env)
     procs[chat] = proc
     # Cancellation can race with Popen. Register first, then honor a cancellation
     # that arrived while the process was being created so no late process escapes.

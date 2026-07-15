@@ -10,8 +10,18 @@ SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "askproject"
 
 CODEX_FAKE = r'''#!/usr/bin/env python3
 import json
+import os
+import select
 import sys
 from pathlib import Path
+
+ready, _, _ = select.select([0], [], [], 0.5)
+if not ready:
+    print("codex inherited an open stdin", file=sys.stderr)
+    raise SystemExit(8)
+if os.read(0, 1) != b"":
+    print("codex received unexpected stdin data", file=sys.stderr)
+    raise SystemExit(9)
 
 args = sys.argv[1:]
 outfile = args[args.index("-o") + 1]
@@ -51,23 +61,35 @@ Path(outfile).write_text("FINAL ANSWER MUST NOT BE PROGRESS")
 
 CLAUDE_FAKE = r'''#!/usr/bin/env python3
 import json
+import os
+import select
 import sys
 
-args = sys.argv[1:]
-if "stream-json" not in args or "--verbose" not in args:
-    print("expected streaming flags", file=sys.stderr)
+ready, _, _ = select.select([0], [], [], 0.5)
+if not ready:
+    print("claude inherited an open stdin", file=sys.stderr)
+    raise SystemExit(8)
+if os.read(0, 1) != b"":
+    print("claude received unexpected stdin data", file=sys.stderr)
     raise SystemExit(9)
+
+args = sys.argv[1:]
+streaming = "stream-json" in args
+if streaming != ("--verbose" in args):
+    print("expected streaming flags", file=sys.stderr)
+    raise SystemExit(10)
 
 def emit(value):
     print(json.dumps(value), flush=True)
 
-emit({
-    "type": "system", "subtype": "init", "session_id": "claude-session"
-})
-emit({"type": "assistant", "message": {"content": [
-    {"type": "text", "text": "I will inspect the relevant module."},
-    {"type": "tool_use", "name": "Read", "input": {"file_path": "/private/code.py"}}
-]}})
+if streaming:
+    emit({
+        "type": "system", "subtype": "init", "session_id": "claude-session"
+    })
+    emit({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "I will inspect the relevant module."},
+        {"type": "tool_use", "name": "Read", "input": {"file_path": "/private/code.py"}}
+    ]}})
 emit({
     "type": "result",
     "subtype": "success",
@@ -92,7 +114,8 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def _invoke(tmp_path: Path, engine: str, fake: str, *extra: str):
+def _invoke(tmp_path: Path, engine: str, fake: str, *extra: str,
+            open_stdin: bool = False):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     _write_executable(fake_bin / engine, fake)
@@ -107,15 +130,24 @@ def _invoke(tmp_path: Path, engine: str, fake: str, *extra: str):
     env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
     env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
     env["XDG_STATE_HOME"] = str(tmp_path / "state")
-    return subprocess.run(
-        [sys.executable, str(SCRIPT), str(target), "do the task",
-         "--engine", engine, *extra],
-        cwd=caller,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
+    read_fd = write_fd = None
+    if open_stdin:
+        read_fd, write_fd = os.pipe()
+    try:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), str(target), "do the task",
+             "--engine", engine, *extra],
+            cwd=caller,
+            env=env,
+            text=True,
+            capture_output=True,
+            stdin=read_fd,
+            timeout=10,
+        )
+    finally:
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                os.close(fd)
 
 
 def test_codex_progress_is_concise_and_stdout_stays_json(tmp_path):
@@ -144,6 +176,26 @@ def test_quiet_keeps_legacy_silent_stderr(tmp_path):
     assert proc.returncode == 0
     assert json.loads(proc.stdout)["answer"] == "FINAL ANSWER MUST NOT BE PROGRESS"
     assert proc.stderr == ""
+
+
+def test_codex_closes_inherited_open_stdin(tmp_path):
+    for name, extra in (("stream", ()), ("quiet", ("--quiet",))):
+        case = tmp_path / name
+        case.mkdir()
+        proc = _invoke(case, "codex", CODEX_FAKE, *extra, open_stdin=True)
+
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout)["answer"] == "FINAL ANSWER MUST NOT BE PROGRESS"
+
+
+def test_claude_closes_inherited_open_stdin(tmp_path):
+    for name, extra in (("stream", ()), ("quiet", ("--quiet",))):
+        case = tmp_path / name
+        case.mkdir()
+        proc = _invoke(case, "claude", CLAUDE_FAKE, *extra, open_stdin=True)
+
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout)["answer"] == "CLAUDE FINAL MUST NOT BE PROGRESS"
 
 
 def test_claude_progress_uses_stream_events_without_echoing_answer(tmp_path):

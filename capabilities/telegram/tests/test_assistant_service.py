@@ -225,6 +225,32 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)
 
+    async def test_worker_process_stdin_is_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            captured = {}
+
+            class FakeProcess:
+                pid = 123
+                returncode = 0
+
+                def communicate(self):
+                    return "", ""
+
+            def fake_popen(*args, **kwargs):
+                captured.update(kwargs)
+                return FakeProcess()
+
+            original_popen = daemon.subprocess.Popen
+            try:
+                daemon.subprocess.Popen = fake_popen
+                rc, out, err = daemon.run_worker_proc("worker", ["worker"], {})
+            finally:
+                daemon.subprocess.Popen = original_popen
+
+            self.assertEqual((rc, out, err), (0, "", ""))
+            self.assertEqual(captured["stdin"], daemon.subprocess.DEVNULL)
+
     async def test_voice_is_reserved_before_transcription_and_live_duplicate_is_silent(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
