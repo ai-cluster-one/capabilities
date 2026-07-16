@@ -29,3 +29,21 @@ After setup, `deployment next` prints the checklist for the chosen target:
 which files were created, which secrets must be entered, local validation
 commands, provider steps, and first-login commands for Codex, Claude, and
 Telegram when present.
+
+## ContextKit Projects
+
+For projects with `.contextkit/config.toml`, the generated Dockerfile:
+
+1. Installs ContextKit globally via the public installer (pinned to `CONTEXTKIT_REF`).
+2. Copies the project body.
+3. Installs the capabilities manager and all locked capability payloads.
+4. Runs `contextkit install-hooks --target codex --target claude`.
+5. Runs `contextkit build --target all` to generate host bindings and context.
+6. Runs `contextkit doctor` to verify the installation.
+
+Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`) and
+the ContextKit manager binary (`.contextkit/manager/`) are excluded from the
+Docker build context via `.dockerignore`. These are target-local build artifacts,
+not deployment inputs shipped from the repo.
+
+The build fails on missing installer, hook, doctor, or context-build steps.
