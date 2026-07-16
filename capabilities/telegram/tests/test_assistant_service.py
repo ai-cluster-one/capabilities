@@ -60,7 +60,7 @@ class TelegramClient:
 
 def import_daemon(tmp: Path, service_settings: dict):
     project = tmp / "project"
-    service_dir = project / ".capabilities" / "telegram" / "service"
+    service_dir = project / "capabilities" / "telegram" / "service"
     service_dir.mkdir(parents=True)
     settings_file = service_dir / "settings.json"
     context_file = service_dir / "context.md"

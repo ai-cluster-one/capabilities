@@ -9,7 +9,7 @@ Registered chats belong in the consuming project's Telegram identifiers envelope
 Use one folder per chat, keyed by a stable slug:
 
 ```text
-.capabilities/telegram/messages/
+capabilities/telegram/messages/
 └── <slug>/
     ├── messages.json
     └── media/

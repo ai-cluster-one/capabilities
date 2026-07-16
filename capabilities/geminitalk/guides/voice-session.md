@@ -40,7 +40,7 @@ runtime closes after that turn. Ctrl-C remains the unconditional local stop.
 At the start of every session, GeminiTalk reads the connection's ordered
 `prompt_files` stack again. This lets project-generated context change between
 sessions without reinstalling the capability. Run `geminitalk init` once to
-create the project-editable `.capabilities/geminitalk/base.md`, then run
+create the project-editable `capabilities/geminitalk/base.md`, then run
 `geminitalk prompt` to inspect the fully rendered instruction that the next
 session will receive.
 

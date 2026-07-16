@@ -23,7 +23,7 @@ GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS=false
 GEMINITALK_ALLOW_CODEX_TASKS=true
 ```
 
-For named connections, use `.capabilities/geminitalk/connections.json`:
+For named connections, use `capabilities/geminitalk/connections.json`:
 
 ```json
 {
@@ -55,12 +55,12 @@ list. `agent_name` controls how the spoken companion introduces itself.
 the range 1 through 16. Exact duplicate active tasks are still deduplicated.
 
 Run `geminitalk init` once in each consuming project after `capabilities init`;
-it creates `.capabilities/geminitalk/base.md` from the bundled template and
+it creates `capabilities/geminitalk/base.md` from the bundled template and
 never overwrites an existing file. Edit that project copy for local voice
 behavior.
 
 `prompt_files` is an ordered array loaded fresh for every session. Omit it for
-the canonical prompt stack: GeminiTalk loads `.capabilities/geminitalk/base.md`,
+the canonical prompt stack: GeminiTalk loads `capabilities/geminitalk/base.md`,
 then also
 `.codex/generated/context.md` if that generated Codex context file exists.
 Explicit `prompt_files` arrays stay authoritative and are not expanded. Paths

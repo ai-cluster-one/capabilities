@@ -31,7 +31,7 @@ credentials and the session. With no registry there is one implicit connection,
 flag — only their env-var NAME resolves them, never the command line.
 
 More than one account is declared in a connections registry — project
-.capabilities/telegram/connections.json, else the machine-level
+capabilities/telegram/connections.json, else the machine-level
 ~/.config/telegram/connections.json (the natural home for a personal account),
 first found wins. Each entry names its app id literally and its app hash by
 env-key indirection, and owns a per-connection session:
@@ -99,7 +99,7 @@ Commands:
                                                service for this project. The engine
                                                runs from the installed capability
                                                bundle; the project stores only
-                                               .capabilities/telegram/service config.
+                                               capabilities/telegram/service config.
 
 Chat references:
   <chat> can be @username, a phone (+1555…), a numeric id, or a chat title
@@ -122,7 +122,7 @@ Contract commands (the same on every capability):
   telegram guide [<topic>]                      Guide topics / one guide body,
                                                  fetched live from the docs base.
   telegram ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-                [--note <text>]                  (.capabilities/telegram/identifiers.json).
+                [--note <text>]                  (capabilities/telegram/identifiers.json).
   telegram refs                                 Menu of the project's reference
                                                  files for this capability.
 
@@ -130,7 +130,7 @@ Exit codes:
   0  success
   2  auth — missing/invalid credentials, session expired, not logged in
   3  not found — the chat or entity could not be resolved
-  4  policy refusal — disabled by project policy (.capabilities/settings.json),
+  4  policy refusal — disabled by project policy (capabilities/settings.json),
      or `send` on a read-only connection — ask the user, never lift the gate
      yourself
   5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx
@@ -195,7 +195,7 @@ SERVICE = {
     "name": "assistant",
     "summary": "Project-local Telegram assistant daemon using the bundled service engine.",
     "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
-    "config": ".capabilities/telegram/service",
+    "config": "capabilities/telegram/service",
     "state": "<connection-state>/service",
 }
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
@@ -264,7 +264,8 @@ def _parse_env_file(path: Path) -> dict:
 
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding .capabilities/, .env(.local), or .git.
+    the first directory holding capabilities/, legacy .capabilities/,
+    .env(.local), or .git.
     $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
@@ -272,10 +273,27 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
-        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
     return None
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    `capabilities/` is canonical. A legacy `.capabilities/` remains readable
+    until `capabilities init` migrates it. If both exist, the canonical tree
+    wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
 
 
 def _project_env() -> dict:
@@ -363,7 +381,7 @@ def _gate() -> None:
     root = _project_root()
     if root is None:
         return
-    gate_file = root / ".capabilities" / "settings.json"
+    gate_file = _project_capabilities_dir(root) / "settings.json"
     try:
         entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
     except (OSError, ValueError):
@@ -375,18 +393,20 @@ def _gate() -> None:
 
 
 def _env_dir() -> Path | None:
-    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    """The capability's envelope dir in the project's active capabilities/."""
     root = _project_root()
-    return (root / ".capabilities" / NAME) if root is not None else None
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
 
 
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
-    lands inside the envelope only where .capabilities/ already exists."""
+    lands inside the envelope only where capabilities/ already exists."""
     if SCOPE == "project":
         root = _project_root()
-        if root is not None and (root / ".capabilities").is_dir():
-            return root / ".capabilities" / NAME / "state"
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
     return _STATE_HOME / NAME
 
 
@@ -461,7 +481,7 @@ def _render_ids_markdown(data: dict) -> str:
 
 def _identifiers_section() -> str:
     """The Identifiers block appended to the bare top-level help — deterministic
-    first-touch surfacing of `.capabilities/<NAME>/identifiers.json` so an
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
     agent following the `<NAME> help` startup protocol loads the discovered
     labels/values/notes into context at once. Empty when no project envelope
     or nothing recorded (do not bloat help with an empty section)."""
@@ -523,8 +543,8 @@ def _cmd_ids(argv: list[str]) -> None:
     if sub == "set":
         if len(argv) < 3:
             _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
-        if envdir is None or not envdir.parent.is_dir():
-            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
                  "run `capabilities init` first")
         label, raw = argv[1], argv[2]
         try:
@@ -758,7 +778,7 @@ def _build_cfg(cid: str, entry: dict | None,
                 "hint": f"create an app at my.telegram.org/apps, then set them in a "
                         f"project .env(.local), {CREDENTIALS_ENV}, or the environment "
                         f"— or declare a connections registry "
-                        f"(.capabilities/{NAME}/connections.json)"}
+                        f"(capabilities/{NAME}/connections.json)"}
         session = (session_flag or _resolve_env_key("TELEGRAM_SESSION")[0]
                    or str(DEFAULT_SESSION))
         allow_write = WRITE_DEFAULT
@@ -1665,13 +1685,13 @@ def _service_project_root() -> Path:
 
 
 def _require_service_envelope(root: Path) -> None:
-    if not (root / ".capabilities").is_dir():
-        _die(6, "no_envelope", "no .capabilities envelope in this project",
+    if not (_project_capabilities_dir(root) / "settings.json").is_file():
+        _die(6, "no_envelope", "no capabilities envelope in this project",
              "run `capabilities init` first, then `telegram service init`")
 
 
 def _service_dir(root: Path) -> Path:
-    return root / ".capabilities" / NAME / "service"
+    return _project_capabilities_dir(root) / NAME / "service"
 
 
 def _service_settings_path(root: Path) -> Path:

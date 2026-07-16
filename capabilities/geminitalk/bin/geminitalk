@@ -28,7 +28,7 @@ COMMANDS
 
   geminitalk init
       Scaffold the project-editable base prompt at
-      .capabilities/geminitalk/base.md. Existing files are never overwritten.
+      capabilities/geminitalk/base.md. Existing files are never overwritten.
 
   geminitalk doctor [--connection <id>] [--audio]
       Resolve the selected connection(s), check the Google GenAI SDK import, and
@@ -88,7 +88,7 @@ CONNECTIONS
                                true/false; default false
     GEMINITALK_ALLOW_CODEX_TASKS true/false; default true
 
-  A named registry lives at .capabilities/geminitalk/connections.json, else
+  A named registry lives at capabilities/geminitalk/connections.json, else
   ~/.config/geminitalk/connections.json:
     {
       "default": "studio",
@@ -118,7 +118,7 @@ CONNECTIONS
     project_root    optional; project to inspect; defaults to current project
     prompt_files    optional; ordered string array. Project-relative paths are
                     read from project_root; capability: paths come from bundle.
-                    When omitted, GeminiTalk loads .capabilities/geminitalk/base.md
+                    When omitted, GeminiTalk loads capabilities/geminitalk/base.md
                     and then .codex/generated/context.md only if it exists.
     prompt_file     legacy single project prompt; appended after the default
                     project base/context stack.
@@ -222,7 +222,7 @@ TOPICS = ["connections", "voice-session"]
 STATE = False
 POST_INSTALL: list = [
     {"cmd": "geminitalk init",
-     "note": "scaffold the project-editable base prompt at .capabilities/geminitalk/base.md"},
+     "note": "scaffold the project-editable base prompt at capabilities/geminitalk/base.md"},
 ]
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -247,7 +247,7 @@ DEFAULT_VOICE = "Aoede"
 DEFAULT_LANGUAGE = "auto"
 DEFAULT_AGENT_NAME = "Tessa"
 DEFAULT_MAX_AGENT_SESSIONS = 3
-PROJECT_BASE_PROMPT = ".capabilities/geminitalk/base.md"
+PROJECT_BASE_PROMPT = "capabilities/geminitalk/base.md"
 CODEX_CONTEXT_PROMPT = ".codex/generated/context.md"
 DEFAULT_PROMPT_FILES = (PROJECT_BASE_PROMPT,)
 INPUT_RATE = 16000
@@ -343,7 +343,8 @@ def _parse_env_file(path: Path) -> dict:
 
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding .capabilities/, .env(.local), or .git.
+    the first directory holding capabilities/, legacy .capabilities/,
+    .env(.local), or .git.
     $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
@@ -351,10 +352,27 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
-        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
     return None
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    `capabilities/` is canonical. A legacy `.capabilities/` remains readable
+    until `capabilities init` migrates it. If both exist, the canonical tree
+    wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
 
 
 def _project_env() -> dict:
@@ -442,7 +460,7 @@ def _gate() -> None:
     root = _project_root()
     if root is None:
         return
-    gate_file = root / ".capabilities" / "settings.json"
+    gate_file = _project_capabilities_dir(root) / "settings.json"
     try:
         entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
     except (OSError, ValueError):
@@ -454,18 +472,20 @@ def _gate() -> None:
 
 
 def _env_dir() -> Path | None:
-    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    """The capability's envelope dir in the project's active capabilities/."""
     root = _project_root()
-    return (root / ".capabilities" / NAME) if root is not None else None
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
 
 
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
-    lands inside the envelope only where .capabilities/ already exists."""
+    lands inside the envelope only where capabilities/ already exists."""
     if SCOPE == "project":
         root = _project_root()
-        if root is not None and (root / ".capabilities").is_dir():
-            return root / ".capabilities" / NAME / "state"
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
     return _STATE_HOME / NAME
 
 
@@ -540,7 +560,7 @@ def _render_ids_markdown(data: dict) -> str:
 
 def _identifiers_section() -> str:
     """The Identifiers block appended to the bare top-level help — deterministic
-    first-touch surfacing of `.capabilities/<NAME>/identifiers.json` so an
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
     agent following the `<NAME> help` startup protocol loads the discovered
     labels/values/notes into context at once. Empty when no project envelope
     or nothing recorded (do not bloat help with an empty section)."""
@@ -602,8 +622,8 @@ def _cmd_ids(argv: list[str]) -> None:
     if sub == "set":
         if len(argv) < 3:
             _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
-        if envdir is None or not envdir.parent.is_dir():
-            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
                  "run `capabilities init` first")
         label, raw = argv[1], argv[2]
         try:
@@ -829,12 +849,16 @@ def _bundle_base_prompt_template() -> Path:
 
 
 def _project_base_prompt_path(root: Path) -> Path:
-    return root / PROJECT_BASE_PROMPT
+    return _project_capabilities_dir(root) / NAME / "base.md"
+
+
+def _project_base_prompt_rel(root: Path) -> str:
+    return str(_project_base_prompt_path(root).relative_to(root))
 
 
 def _default_prompt_files(root: Path) -> list[str]:
     root = Path(root).expanduser().resolve()
-    files = [PROJECT_BASE_PROMPT]
+    files = [_project_base_prompt_rel(root)]
     if (root / CODEX_CONTEXT_PROMPT).is_file():
         files.append(CODEX_CONTEXT_PROMPT)
     return files
@@ -845,8 +869,8 @@ def cmd_init() -> dict:
     if root is None:
         _die(6, "no_project", "not inside a project",
              "run `capabilities init` from the consuming project first")
-    if not (root / ".capabilities").is_dir():
-        _die(6, "no_envelope", "no .capabilities envelope in this project",
+    if not (_project_capabilities_dir(root) / "settings.json").is_file():
+        _die(6, "no_envelope", "no capabilities envelope in this project",
              "run `capabilities init` first")
     template = _bundle_base_prompt_template()
     if not template.is_file():
@@ -869,7 +893,7 @@ def cmd_init() -> dict:
         "skipped": skipped,
         "prompt_files": _default_prompt_files(root),
         "next": [
-            f"edit {PROJECT_BASE_PROMPT} for this project",
+            f"edit {_project_base_prompt_rel(root)} for this project",
             "run `geminitalk prompt` to inspect the rendered prompt stack",
         ],
     }
@@ -1240,7 +1264,7 @@ def tool_project_overview(include_readme: bool = True) -> dict:
         if (root / name).exists():
             common.append(name)
     caps_enabled = None
-    settings = root / ".capabilities" / "settings.json"
+    settings = _project_capabilities_dir(root) / "settings.json"
     if settings.exists():
         try:
             caps = json.loads(settings.read_text()).get("capabilities", {})

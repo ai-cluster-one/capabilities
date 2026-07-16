@@ -24,7 +24,7 @@ Contract commands (the same on every capability; railwayc's own, never forwarded
   railwayc manifest --json                      Machine-readable declaration.
   railwayc guide [<topic>]                      Guide topics / one guide body.
   railwayc ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-           [--note <text>]                      (.capabilities/railwayc/identifiers.json).
+           [--note <text>]                      (capabilities/railwayc/identifiers.json).
   railwayc refs                                 Menu of the project's reference files.
 
 Agent-invoked. Run `railwayc help` to reload this contract; run `railway help` (the
@@ -59,7 +59,7 @@ CONNECTIONS
   check (exit 7) catches a token that points at the wrong project. One token = one
   project + one environment; a project with prod + staging uses one token per
   environment — and declares them as connections in
-  <project>/.capabilities/railwayc/connections.json:
+  <project>/capabilities/railwayc/connections.json:
     {
       "default": "<id>",
       "connections": {
@@ -120,7 +120,7 @@ EVERYTHING ELSE — forwarded verbatim to `railway`, token injected, I/O transpa
 
 EXIT CODES (railwayc's own layer)
   0 success · 2 auth (token missing or rejected) · 4 policy refusal — the
-  project gate (.capabilities/settings.json) on any verb, or a write verb on a
+  project gate (capabilities/settings.json) on any verb, or a write verb on a
   read-only connection (allow_write: false); ask the user, never lift a gate
   yourself · 5 environment (railway not on PATH, or unreachable) · 6 input (bad
   use of a railwayc-owned command, or an unknown/ambiguous connection) · 7 wrong
@@ -231,7 +231,8 @@ def _parse_env_file(path: Path) -> dict:
 
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding .capabilities/, .env(.local), or .git.
+    the first directory holding capabilities/, legacy .capabilities/,
+    .env(.local), or .git.
     $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
@@ -239,10 +240,27 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
-        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
     return None
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    `capabilities/` is canonical. A legacy `.capabilities/` remains readable
+    until `capabilities init` migrates it. If both exist, the canonical tree
+    wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
 
 
 def _project_env() -> dict:
@@ -330,7 +348,7 @@ def _gate() -> None:
     root = _project_root()
     if root is None:
         return
-    gate_file = root / ".capabilities" / "settings.json"
+    gate_file = _project_capabilities_dir(root) / "settings.json"
     try:
         entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
     except (OSError, ValueError):
@@ -342,18 +360,20 @@ def _gate() -> None:
 
 
 def _env_dir() -> Path | None:
-    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    """The capability's envelope dir in the project's active capabilities/."""
     root = _project_root()
-    return (root / ".capabilities" / NAME) if root is not None else None
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
 
 
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
-    lands inside the envelope only where .capabilities/ already exists."""
+    lands inside the envelope only where capabilities/ already exists."""
     if SCOPE == "project":
         root = _project_root()
-        if root is not None and (root / ".capabilities").is_dir():
-            return root / ".capabilities" / NAME / "state"
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
     return _STATE_HOME / NAME
 
 
@@ -428,7 +448,7 @@ def _render_ids_markdown(data: dict) -> str:
 
 def _identifiers_section() -> str:
     """The Identifiers block appended to the bare top-level help — deterministic
-    first-touch surfacing of `.capabilities/<NAME>/identifiers.json` so an
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
     agent following the `<NAME> help` startup protocol loads the discovered
     labels/values/notes into context at once. Empty when no project envelope
     or nothing recorded (do not bloat help with an empty section)."""
@@ -490,8 +510,8 @@ def _cmd_ids(argv: list[str]) -> None:
     if sub == "set":
         if len(argv) < 3:
             _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
-        if envdir is None or not envdir.parent.is_dir():
-            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
                  "run `capabilities init` first")
         label, raw = argv[1], argv[2]
         try:

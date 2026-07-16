@@ -20,9 +20,9 @@ capability bundle.
    telegram service init
    ```
 
-3. Edit `.capabilities/telegram/service/settings.json`:
+3. Edit `capabilities/telegram/service/settings.json`:
 
-   - Set `connection` or rely on the default in `.capabilities/telegram/connections.json`.
+   - Set `connection` or rely on the default in `capabilities/telegram/connections.json`.
    - Add `allowed_users` and `allowed_groups`.
    - Add optional per-channel `context_file` or short inline `context` entries
      when a chat needs its own soft prompt overlay.
@@ -112,10 +112,10 @@ Telethon SQLite session.
 
 ## Channel Context
 
-The global soft prompt lives in `.capabilities/telegram/service/context.md`.
+The global soft prompt lives in `capabilities/telegram/service/context.md`.
 Group policies may add a channel-specific overlay with either a markdown file or
 a short inline string. File paths are relative to
-`.capabilities/telegram/service/`.
+`capabilities/telegram/service/`.
 
 ```json
 {
@@ -199,5 +199,5 @@ honors `scope: current_chat` for chat-addressed Telegram commands.
 
 To migrate a project that copied a service directory, delete the copied engine
 files after installing the bundled capability. Keep or move only the project
-policy/context files into `.capabilities/telegram/service/` and keep the
+policy/context files into `capabilities/telegram/service/` and keep the
 connection/session state under `$XDG_STATE_HOME/telegram/<connection>/`.

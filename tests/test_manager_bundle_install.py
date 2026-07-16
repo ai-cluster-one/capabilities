@@ -33,6 +33,15 @@ GEMINITALK_SCRIPT = REPO / "capabilities" / "geminitalk" / "bin" / "geminitalk"
 GEMINITALK_BASE = REPO / "capabilities" / "geminitalk" / "prompts" / "base.md"
 
 
+def _ensure_project_envelope(project: Path) -> Path:
+    capdir = project / "capabilities"
+    capdir.mkdir(parents=True, exist_ok=True)
+    settings = capdir / "settings.json"
+    if not settings.exists():
+        settings.write_text('{"capabilities": {}}\n')
+    return capdir
+
+
 def _env(tmp: Path) -> tuple[dict[str, str], Path, Path]:
     home = tmp / "home"
     cap_home = home / ".capabilities"
@@ -73,6 +82,7 @@ def _loaded_geminitalk(tmp: Path, project: Path):
     old_path = list(sys.path)
     module_name = f"geminitalk_test_{time.time_ns()}"
     try:
+        _ensure_project_envelope(project)
         os.environ.update({
             "HOME": str(tmp / "home"),
             "XDG_CONFIG_HOME": str(tmp / "config"),
@@ -109,7 +119,7 @@ def _geminitalk_key_values(report: dict, cid: str = "default") -> dict:
 
 
 def _run_service_init(bin_dir: Path, env: dict[str, str], project: Path) -> None:
-    (project / ".capabilities").mkdir(parents=True, exist_ok=True)
+    _ensure_project_envelope(project)
     proc = _run(
         [str(bin_dir / "telegram"), "service", "init", "--connection", "marvin"],
         {**env, "CLAUDE_PROJECT_DIR": str(project)},
@@ -117,7 +127,7 @@ def _run_service_init(bin_dir: Path, env: dict[str, str], project: Path) -> None
     )
     if "FileNotFoundError" in proc.stderr:
         raise AssertionError(proc.stderr)
-    assert (project / ".capabilities" / "telegram" / "service" / "settings.json").is_file()
+    assert (project / "capabilities" / "telegram" / "service" / "settings.json").is_file()
 
 
 def _write_fake_telethon(fake_telethon: Path) -> None:
@@ -164,7 +174,8 @@ class TelegramClient:
 
 def _import_telegram_daemon(tmp: Path, settings: dict) -> object:
     project = tmp / "project"
-    service_dir = project / ".capabilities" / "telegram" / "service"
+    _ensure_project_envelope(project)
+    service_dir = project / "capabilities" / "telegram" / "service"
     service_dir.mkdir(parents=True, exist_ok=True)
     (service_dir / "settings.json").write_text(json.dumps(settings) + "\n")
     (service_dir / "context.md").write_text("test context\n")
@@ -253,7 +264,7 @@ def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
-        service_dir = project / ".capabilities" / "telegram" / "service"
+        service_dir = project / "capabilities" / "telegram" / "service"
         fake_telethon = tmp / "fake" / "telethon"
         state_dir = tmp / "service-state"
         log_file = tmp / "daemon.log"
@@ -514,7 +525,7 @@ def test_telegram_channel_context_overlay_is_added_to_prompt() -> None:
             "allowed_groups": {},
             "defaults": {"worker": "stub"},
         })
-        channel_context_dir = tmp / "project" / ".capabilities" / "telegram" / "service" / "context"
+        channel_context_dir = tmp / "project" / "capabilities" / "telegram" / "service" / "context"
         channel_context_dir.mkdir(parents=True)
         (channel_context_dir / "family.md").write_text("File overlay line.\n")
 
@@ -550,22 +561,22 @@ def test_geminitalk_init_scaffolds_project_prompt() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
-        (project / ".capabilities").mkdir(parents=True)
+        (project / "capabilities").mkdir(parents=True)
         with _loaded_geminitalk(tmp, project) as geminitalk:
             result = geminitalk.cmd_init()
-            prompt = project / ".capabilities" / "geminitalk" / "base.md"
+            prompt = project / "capabilities" / "geminitalk" / "base.md"
             assert prompt.is_file()
             assert prompt.read_text() == GEMINITALK_BASE.read_text()
             assert [Path(p).resolve() for p in result["written"]] == [prompt.resolve()]
             assert result["skipped"] == []
-            assert result["prompt_files"] == [".capabilities/geminitalk/base.md"]
+            assert result["prompt_files"] == ["capabilities/geminitalk/base.md"]
 
 
 def test_geminitalk_effective_defaults_match_marvin_baseline() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
-        (project / ".capabilities").mkdir(parents=True)
+        (project / "capabilities").mkdir(parents=True)
         with _loaded_geminitalk(tmp, project) as geminitalk:
             assert geminitalk.DEFAULT_VOICE == "Aoede"
             assert geminitalk.DEFAULT_AGENT_NAME == "Tessa"
@@ -581,7 +592,7 @@ def test_geminitalk_effective_defaults_match_marvin_baseline() -> None:
             assert cfg["max_agent_sessions"] == 3
             assert cfg["allow_capability_domain_commands"] is False
             assert cfg["allow_codex_tasks"] is True
-            assert cfg["prompt_files"] == [".capabilities/geminitalk/base.md"]
+            assert cfg["prompt_files"] == ["capabilities/geminitalk/base.md"]
 
             implicit = geminitalk._connections_report()
             assert implicit["connections"]["default"]["allow_write"] is True
@@ -592,9 +603,9 @@ def test_geminitalk_effective_defaults_match_marvin_baseline() -> None:
             assert implicit_values["max_agent_sessions"] == 3
             assert implicit_values["allow_capability_domain_commands"] is False
             assert implicit_values["allow_codex_tasks"] is True
-            assert implicit_values["prompt_files"] == [".capabilities/geminitalk/base.md"]
+            assert implicit_values["prompt_files"] == ["capabilities/geminitalk/base.md"]
 
-            capdir = project / ".capabilities" / "geminitalk"
+            capdir = project / "capabilities" / "geminitalk"
             capdir.mkdir(parents=True)
             (capdir / "connections.json").write_text(json.dumps({
                 "default": "marvin-like",
@@ -628,18 +639,18 @@ def test_geminitalk_default_prompt_adds_codex_context_when_present() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
-        (project / ".capabilities").mkdir(parents=True)
+        (project / "capabilities").mkdir(parents=True)
         with _loaded_geminitalk(tmp, project) as geminitalk:
             geminitalk.cmd_init()
             _cid, cfg = geminitalk._selected_cfg(None, None, require_key=False)
-            assert cfg["prompt_files"] == [".capabilities/geminitalk/base.md"]
+            assert cfg["prompt_files"] == ["capabilities/geminitalk/base.md"]
 
             codex_context = project / ".codex" / "generated" / "context.md"
             codex_context.parent.mkdir(parents=True)
             codex_context.write_text("Codex generated context marker.\n")
             _cid, cfg = geminitalk._selected_cfg(None, None, require_key=False)
             assert cfg["prompt_files"] == [
-                ".capabilities/geminitalk/base.md",
+                "capabilities/geminitalk/base.md",
                 ".codex/generated/context.md",
             ]
             rendered = _prompt_text(geminitalk, cfg)
@@ -650,7 +661,7 @@ def test_geminitalk_explicit_prompt_files_are_ordered_and_authoritative() -> Non
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
-        capdir = project / ".capabilities" / "geminitalk"
+        capdir = project / "capabilities" / "geminitalk"
         capdir.mkdir(parents=True)
         (project / ".codex" / "generated").mkdir(parents=True)
         (project / ".codex" / "generated" / "context.md").write_text("SHOULD NOT AUTO LOAD\n")
@@ -664,7 +675,7 @@ def test_geminitalk_explicit_prompt_files_are_ordered_and_authoritative() -> Non
                     "secret_env": "GOOGLE_API_KEY",
                     "prompt_files": [
                         "first.md",
-                        ".capabilities/geminitalk/base.md",
+                        "capabilities/geminitalk/base.md",
                         "second.md",
                     ],
                 },
@@ -675,7 +686,7 @@ def test_geminitalk_explicit_prompt_files_are_ordered_and_authoritative() -> Non
             _cid, cfg = geminitalk._selected_cfg(reg, None, require_key=False)
             assert cfg["prompt_files"] == [
                 "first.md",
-                ".capabilities/geminitalk/base.md",
+                "capabilities/geminitalk/base.md",
                 "second.md",
             ]
             rendered = _prompt_text(geminitalk, cfg)
@@ -688,7 +699,7 @@ def test_geminitalk_legacy_prompt_file_migrates_after_project_base() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
-        capdir = project / ".capabilities" / "geminitalk"
+        capdir = project / "capabilities" / "geminitalk"
         capdir.mkdir(parents=True)
         (capdir / "base.md").write_text("BASE PROMPT MARKER\n")
         (project / "legacy-env.md").write_text("LEGACY ENV PROMPT MARKER\n")
@@ -697,7 +708,7 @@ def test_geminitalk_legacy_prompt_file_migrates_after_project_base() -> None:
             os.environ["GEMINITALK_SYSTEM_PROMPT_FILE"] = "legacy-env.md"
             _cid, cfg = geminitalk._selected_cfg(None, None, require_key=False)
             assert cfg["prompt_files"] == [
-                ".capabilities/geminitalk/base.md",
+                "capabilities/geminitalk/base.md",
                 "legacy-env.md",
             ]
             rendered = _prompt_text(geminitalk, cfg)
@@ -715,7 +726,7 @@ def test_geminitalk_legacy_prompt_file_migrates_after_project_base() -> None:
             reg, _path = geminitalk._connections_registry()
             _cid, cfg = geminitalk._selected_cfg(reg, None, require_key=False)
             assert cfg["prompt_files"] == [
-                ".capabilities/geminitalk/base.md",
+                "capabilities/geminitalk/base.md",
                 "legacy-connection.md",
             ]
 
@@ -724,10 +735,10 @@ def test_geminitalk_init_does_not_overwrite_edited_prompt() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
-        (project / ".capabilities").mkdir(parents=True)
+        (project / "capabilities").mkdir(parents=True)
         with _loaded_geminitalk(tmp, project) as geminitalk:
             geminitalk.cmd_init()
-            prompt = project / ".capabilities" / "geminitalk" / "base.md"
+            prompt = project / "capabilities" / "geminitalk" / "base.md"
             prompt.write_text("USER EDITED PROMPT\n")
             result = geminitalk.cmd_init()
             assert prompt.read_text() == "USER EDITED PROMPT\n"
@@ -739,7 +750,7 @@ def test_geminitalk_generation_complete_marks_turn_done() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
-        (project / ".capabilities").mkdir(parents=True)
+        (project / "capabilities").mkdir(parents=True)
         with _loaded_geminitalk(tmp, project) as geminitalk:
             response = type("Response", (), {
                 "server_content": type("Content", (), {

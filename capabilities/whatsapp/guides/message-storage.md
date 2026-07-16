@@ -2,14 +2,14 @@
 
 How a consuming project stores WhatsApp histories exported through the `whatsapp` CLI.
 
-The CLI reads the store root from the selected connection's `messages_dir`. That value may be absolute, or relative to the consuming project's `.capabilities/whatsapp/` folder. The default project pattern is to set `messages_dir` to `messages`, which resolves to `.capabilities/whatsapp/messages/`.
+The CLI reads the store root from the selected connection's `messages_dir`. That value may be absolute, or relative to the consuming project's `capabilities/whatsapp/` folder. The default project pattern is to set `messages_dir` to `messages`, which resolves to `capabilities/whatsapp/messages/`.
 
 ## Layout
 
 Use one folder per conversation, keyed by a stable kebab-case slug of the chat name, falling back to the chat id when there is no useful name:
 
 ```text
-.capabilities/whatsapp/messages/
+capabilities/whatsapp/messages/
 └── <slug>/
     ├── messages.json
     └── media/

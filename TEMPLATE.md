@@ -44,14 +44,16 @@ The project-meta cell is empty on purpose: authoring guidance never varies by pr
 | The bundle *(opt)* | files beside `bin/<name>` upstream → copied under `~/.capabilities/<name>/` on source-directory install | capability | helper assets, templates, or service engines used by the executable; never copied into consuming projects |
 | The declaration | verbs on the script — `stub`, `manifest --json` — snapshotted by the manager at install | capability | the one-line awareness text; the machine-readable manifest (name, summary, credential scope and keys, docs base, state flag, optional service metadata) |
 | Guides *(opt)* | `guides/<topic>.md` beside the script upstream, surfaced by `<name> guide` fetched live | capability | consumer-neutral *how to author X with this tool* docs (DOCTRINE rule 14); present only when the tool has authoring depth |
-| Connections | `.capabilities/<name>/connections.json` — standard envelope (`default` pointer + `connections` map), entry interior capability-owned | project | the project's named endpoints and identities: per-connection non-secret wiring (including behavioural per-connection keys), secrets by env-key indirection (`secret_env`), the write gate (`allow_write`) |
-| Service config *(opt)* | `.capabilities/<name>/service/` | project | project-local policy/context for a bundled service; the engine still runs from the installed bundle |
-| Identifiers | `.capabilities/<name>/identifiers.json` — CLI-managed envelope, written by `<name> ids set` and rendered by `capabilities ids <name>` | project | the non-secret structural values the CLI **discovered**: ids, labels, classifications, breadcrumbs |
-| References | `.capabilities/<name>/reference/*.md` — front-matter envelope + free prose, surfaced by `<name> refs` | project | the project-specific operational **model**: mappings, treatments, what output means here |
-| State | `.capabilities/<name>/state/` or `$XDG_STATE_HOME/<name>/`, per declared scope | project / user | what credentials mint: sessions, caches, pending logins. Never committed (DOCTRINE rule 16) |
+| Connections | `capabilities/<name>/connections.json` — standard envelope (`default` pointer + `connections` map), entry interior capability-owned | project | the project's named endpoints and identities: per-connection non-secret wiring (including behavioural per-connection keys), secrets by env-key indirection (`secret_env`), the write gate (`allow_write`) |
+| Service config *(opt)* | `capabilities/<name>/service/` | project | project-local policy/context for a bundled service; the engine still runs from the installed bundle |
+| Identifiers | `capabilities/<name>/identifiers.json` — CLI-managed envelope, written by `<name> ids set` and rendered by `capabilities ids <name>` | project | the non-secret structural values the CLI **discovered**: ids, labels, classifications, breadcrumbs |
+| References | `capabilities/<name>/reference/*.md` — front-matter envelope + free prose, surfaced by `<name> refs` | project | the project-specific operational **model**: mappings, treatments, what output means here |
+| State | `capabilities/<name>/state/` or `$XDG_STATE_HOME/<name>/`, per declared scope | project / user | what credentials mint: sessions, caches, pending logins. Never committed (DOCTRINE rule 16) |
 | Deviations *(opt)* | `deviations.md` beside the script upstream | capability | recorded, justified departures from the standard, kept apart so an audit reads them as choices |
 
 The project envelope's resting state is **empty**: `capabilities enable` writes the gate entry and nothing else. Connections appear when the project names more than the cascade's one implicit `default` — carrying any behavioural per-connection keys alongside the wiring — identifiers when the CLI discovers them, references when genuine project context accrues. An empty envelope is conformant, not a gap; never invent content to fill it.
+
+`capabilities/` is the canonical project envelope. The shared runtime can read the legacy `.capabilities/` location until the manager migrates it. `capabilities init` preflights the complete move, merges disjoint gate entries and gitignore lines, and refuses content collisions without partially changing either tree.
 
 ## How each altitude reaches the agent
 
@@ -60,6 +62,7 @@ The capability declares itself host-neutrally; the **manager owns the injection*
 - **Global — the generated skill.** `~/.claude/skills/capabilities/SKILL.md`, regenerated on every install/uninstall/update, with the installed capability names embedded in its description — so naming a capability trigger-matches the skill in any session, with zero project context. The body teaches the protocol: the manager verbs, the contract verbs, the exit-4 rule.
 - **Project — the generated rule.** `capabilities context --claude`, wired by `capabilities init` as the project's single `SessionStart` hook line, composes `.claude/rules/CAPABILITIES.md` from the gate, the registry snapshots, and the project envelopes: per enabled capability, the stub line, the connections menu, an identifiers pointer (the full labelled list loads on demand via `capabilities ids <name>`), the references menu, and the discovery pointers. Composition is files-only — no subprocess fan-out at session start — and degradation is per-capability, never whole: a broken envelope renders as a warning line, an enabled-but-not-installed capability as a one-line install pointer.
 - **Project prompt override.** The generated rule includes a short agent instruction paragraph; by default it teaches identifier persistence. A project may override that paragraph with `CAPABILITIES_CONTEXT_PROMPT` in `.env.local` or `.env`; absent the variable, the default is used.
+- **ContextKit ownership.** A project bound by `.contextkit/config.toml` delegates project injection to ContextKit, which already composes the capability index into its combined Claude/Codex context. In that project `capabilities init` keeps envelope/global-skill setup but creates no host hooks or standalone capability context, retires legacy capabilities-owned wiring by generation marker, and preserves ContextKit-authored or unrelated host configuration. `capabilities context` returns the `contextkit build` handoff without writing.
 - **CLI on `PATH`** — the host-neutral third route: the registry copy is symlinked onto `PATH`, so any session invokes `<name>` directly. A consuming project never copies the CLI.
 
 Through that same CLI route a capability's **guides** reach the agent: `<name> guide [topic]` resolves against the capability's declared docs base and prints the doc, fetched **live** (the request, cache, and fallback mechanics are the executable standard's — [SHEBANG.md](SHEBANG.md#guides)). A guide is never copied into a consuming project; a project's reference points to it by role (DOCTRINE rule 14).
@@ -78,7 +81,7 @@ Connections vs identifiers is a provenance split — connections are the values 
 
 ## References: the envelope and growth
 
-A reference is a markdown file in the capability's `reference/` folder (`.capabilities/<name>/reference/` — the single home for references, kept apart from the JSON config files), carrying a two-key front-matter envelope:
+A reference is a markdown file in the capability's `reference/` folder (`capabilities/<name>/reference/` — the single home for references, kept apart from the JSON config files), carrying a two-key front-matter envelope:
 
 ```markdown
 ---

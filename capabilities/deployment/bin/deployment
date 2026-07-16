@@ -30,11 +30,11 @@ USAGE
         deployment/runtime.json
         deployment/targets/<target>.json
         deployment/capabilities.lock
-        .capabilities/deployment/reference/runtime.md
-        .capabilities/deployment/reference/target-<target>.md
+        capabilities/deployment/reference/runtime.md
+        capabilities/deployment/reference/target-<target>.md
       Existing files are left untouched unless --force is passed. This command
-      requires an existing project `.capabilities/` envelope; it never writes
-      `.capabilities/settings.json`.
+      requires an existing project `capabilities/` envelope; it never writes
+      `capabilities/settings.json`.
 
   deployment freeze [--force]
       Refresh deployment/capabilities.lock from the current project capability gate.
@@ -86,7 +86,7 @@ FILES
       Lightweight install list for the agent image: one capability per line.
       It is a deployment input, not a capability manager file.
 
-  .capabilities/deployment/reference/*.md
+  capabilities/deployment/reference/*.md
       Context pointers loaded on demand by `deployment refs` and the manager's
       generated capability context.
 
@@ -182,7 +182,8 @@ def _parse_env_file(path: Path) -> dict:
 
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding .capabilities/, .env(.local), or .git.
+    the first directory holding capabilities/, legacy .capabilities/,
+    .env(.local), or .git.
     $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
@@ -190,10 +191,27 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
-        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
     return None
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    `capabilities/` is canonical. A legacy `.capabilities/` remains readable
+    until `capabilities init` migrates it. If both exist, the canonical tree
+    wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
 
 
 def _project_env() -> dict:
@@ -281,7 +299,7 @@ def _gate() -> None:
     root = _project_root()
     if root is None:
         return
-    gate_file = root / ".capabilities" / "settings.json"
+    gate_file = _project_capabilities_dir(root) / "settings.json"
     try:
         entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
     except (OSError, ValueError):
@@ -293,18 +311,20 @@ def _gate() -> None:
 
 
 def _env_dir() -> Path | None:
-    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    """The capability's envelope dir in the project's active capabilities/."""
     root = _project_root()
-    return (root / ".capabilities" / NAME) if root is not None else None
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
 
 
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
-    lands inside the envelope only where .capabilities/ already exists."""
+    lands inside the envelope only where capabilities/ already exists."""
     if SCOPE == "project":
         root = _project_root()
-        if root is not None and (root / ".capabilities").is_dir():
-            return root / ".capabilities" / NAME / "state"
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
     return _STATE_HOME / NAME
 
 
@@ -379,7 +399,7 @@ def _render_ids_markdown(data: dict) -> str:
 
 def _identifiers_section() -> str:
     """The Identifiers block appended to the bare top-level help — deterministic
-    first-touch surfacing of `.capabilities/<NAME>/identifiers.json` so an
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
     agent following the `<NAME> help` startup protocol loads the discovered
     labels/values/notes into context at once. Empty when no project envelope
     or nothing recorded (do not bloat help with an empty section)."""
@@ -441,8 +461,8 @@ def _cmd_ids(argv: list[str]) -> None:
     if sub == "set":
         if len(argv) < 3:
             _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
-        if envdir is None or not envdir.parent.is_dir():
-            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
                  "run `capabilities init` first")
         label, raw = argv[1], argv[2]
         try:
@@ -533,14 +553,14 @@ def _root() -> Path:
     root = _project_root()
     if root is None:
         _die(3, "not_found", "no consuming project found",
-             "run inside a project containing .git, .env, or .capabilities")
+             "run inside a project containing .git, .env, or capabilities")
     return root
 
 
 def _require_envelope(root: Path) -> Path:
-    cap_root = root / ".capabilities"
-    if not cap_root.is_dir():
-        _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+    cap_root = _project_capabilities_dir(root)
+    if not (cap_root / "settings.json").is_file():
+        _die(6, "no_envelope", "no capabilities/ envelope in this project",
              "run `capabilities init --codex` or `capabilities init --claude` first")
     return cap_root / NAME
 
@@ -611,7 +631,8 @@ def _with_telegram(root: Path, choice: str) -> bool:
         return True
     if choice == "no":
         return False
-    return _has_enabled(root, "telegram") or (root / ".capabilities" / "telegram" / "service").is_dir()
+    return _has_enabled(root, "telegram") or \
+        (_project_capabilities_dir(root) / "telegram" / "service").is_dir()
 
 
 def _contextkit_source(root: Path) -> Path | None:
@@ -644,7 +665,7 @@ def _dockerignore_template(has_contextkit: bool) -> str:
         "*.pyc",
         "",
         "# Runtime state is volume-backed.",
-        ".capabilities/*/state/",
+        "capabilities/*/state/",
         "*/state/",
         "",
         "# Local session/transient files.",
@@ -1016,7 +1037,7 @@ def _target_reference(target: str) -> str:
 
 
 def _settings(root: Path) -> dict:
-    path = root / ".capabilities" / "settings.json"
+    path = _project_capabilities_dir(root) / "settings.json"
     data, err = _read_json(path)
     if err == "missing":
         return {"capabilities": {}}
@@ -1383,10 +1404,11 @@ def cmd_setup(args) -> None:
 
 
 def _telegram_connection(root: Path) -> str:
-    settings, _ = _read_json(root / ".capabilities" / "telegram" / "service" / "settings.json")
+    cap_root = _project_capabilities_dir(root)
+    settings, _ = _read_json(cap_root / "telegram" / "service" / "settings.json")
     if isinstance(settings, dict) and isinstance(settings.get("connection"), str):
         return settings["connection"]
-    conns, _ = _read_json(root / ".capabilities" / "telegram" / "connections.json")
+    conns, _ = _read_json(cap_root / "telegram" / "connections.json")
     if isinstance(conns, dict) and isinstance(conns.get("default"), str):
         return conns["default"]
     return "default"
@@ -1570,7 +1592,7 @@ def cmd_doctor(args) -> None:
         if missing:
             findings.append({"severity": "warning", "path": _rel(root, lock_path),
                              "message": "enabled capabilities missing from install list: " + ", ".join(missing)})
-    refdir = root / ".capabilities" / NAME / "reference"
+    refdir = _project_capabilities_dir(root) / NAME / "reference"
     refs = sorted(str(p.relative_to(root)) for p in refdir.glob("*.md")) if refdir.is_dir() else []
     if not refs:
         findings.append({"severity": "warning", "path": _rel(root, refdir),

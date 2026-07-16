@@ -19,7 +19,7 @@ The standard files are:
 - `deployment/targets/*.json` - one target declaration per deploy destination.
 - `deployment/capabilities.lock` - lightweight install list for the agent image:
   one capability name per line.
-- `.capabilities/deployment/reference/*.md` - lightweight context pointers.
+- `capabilities/deployment/reference/*.md` - lightweight context pointers.
 
 Use `deployment setup` for a full bootstrap, including Dockerfile,
 docker-compose, env example, entrypoint, deployment declarations, and human next

@@ -105,7 +105,7 @@ AUTH — the three-step ceremony (login mints the session):
   3. POST /<db>/keeks_koht.asp  koht=<CODE>      pick a location → authenticated session
 The session is (chuser + ASPSESSIONID); it is bound to the chosen location (koht).
 `login` runs all three and persists the session (cookie + location) in the state
-home, keyed per connection — .capabilities/directo/state/<connection>/ in an
+home, keyed per connection — capabilities/directo/state/<connection>/ in an
 initialized project, else $XDG_STATE_HOME/directo/<connection>/.
 
 LOCATION (koht) is a per-session selection, not a fixed preset. Pass --koht to choose;
@@ -123,7 +123,7 @@ CONNECTIONS
   Configuration resolves as named connections. With no registry the sole
   connection is `default`, resolved from the cascade above. A project with
   several Directo instances (or several logins on one) declares them in
-  <project>/.capabilities/directo/connections.json:
+  <project>/capabilities/directo/connections.json:
     {{
       "default": "<id>",
       "connections": {{
@@ -157,11 +157,11 @@ CONTRACT COMMANDS (the same on every capability):
   directo manifest --json                      machine-readable declaration
   directo guide [<topic>]                      guide topics / one guide body
   directo ids list|get <l>|set <l> <v>|rm <l>  the project identifiers envelope
-          [--note <text>]                      (.capabilities/directo/identifiers.json)
+          [--note <text>]                      (capabilities/directo/identifiers.json)
   directo refs                                 menu of the project's reference files
 
 EXIT CODES: 0 success · 2 auth/session · 4 policy refusal — the project gate
-(.capabilities/settings.json) on any verb, or a write verb on a read-only
+(capabilities/settings.json) on any verb, or a write verb on a read-only
 connection. Ask the user; never lift a gate yourself. · contract verbs add
 3 not-found / 5 network / 6 input; domain commands otherwise exit 1 via
 click (recorded deviation).
@@ -261,7 +261,8 @@ def _parse_env_file(path: Path) -> dict:
 
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding .capabilities/, .env(.local), or .git.
+    the first directory holding capabilities/, legacy .capabilities/,
+    .env(.local), or .git.
     $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
@@ -269,10 +270,27 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
-        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
     return None
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    `capabilities/` is canonical. A legacy `.capabilities/` remains readable
+    until `capabilities init` migrates it. If both exist, the canonical tree
+    wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
 
 
 def _project_env() -> dict:
@@ -360,7 +378,7 @@ def _gate() -> None:
     root = _project_root()
     if root is None:
         return
-    gate_file = root / ".capabilities" / "settings.json"
+    gate_file = _project_capabilities_dir(root) / "settings.json"
     try:
         entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
     except (OSError, ValueError):
@@ -372,18 +390,20 @@ def _gate() -> None:
 
 
 def _env_dir() -> Path | None:
-    """The capability's envelope dir in the project: .capabilities/<NAME>/."""
+    """The capability's envelope dir in the project's active capabilities/."""
     root = _project_root()
-    return (root / ".capabilities" / NAME) if root is not None else None
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
 
 
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
-    lands inside the envelope only where .capabilities/ already exists."""
+    lands inside the envelope only where capabilities/ already exists."""
     if SCOPE == "project":
         root = _project_root()
-        if root is not None and (root / ".capabilities").is_dir():
-            return root / ".capabilities" / NAME / "state"
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
     return _STATE_HOME / NAME
 
 
@@ -458,7 +478,7 @@ def _render_ids_markdown(data: dict) -> str:
 
 def _identifiers_section() -> str:
     """The Identifiers block appended to the bare top-level help — deterministic
-    first-touch surfacing of `.capabilities/<NAME>/identifiers.json` so an
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
     agent following the `<NAME> help` startup protocol loads the discovered
     labels/values/notes into context at once. Empty when no project envelope
     or nothing recorded (do not bloat help with an empty section)."""
@@ -520,8 +540,8 @@ def _cmd_ids(argv: list[str]) -> None:
     if sub == "set":
         if len(argv) < 3:
             _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
-        if envdir is None or not envdir.parent.is_dir():
-            _die(6, "no_envelope", "no .capabilities/ envelope in this project",
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
                  "run `capabilities init` first")
         label, raw = argv[1], argv[2]
         try:
@@ -793,7 +813,7 @@ def _build_cfg(cid: str, entry: dict | None,
         if entry is None:
             hint = (f"set DIRECTO_DB in the project .env(.local), "
                     f"{CREDENTIALS_ENV}, or the environment — or declare a "
-                    f"connections registry (.capabilities/{NAME}/connections.json)")
+                    f"connections registry (capabilities/{NAME}/connections.json)")
         else:
             hint = f'set "db" on connection {cid!r} in connections.json'
         return None, {"exit": 6, "code": "missing_db",

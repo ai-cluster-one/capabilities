@@ -136,10 +136,10 @@ The cache is the **offline floor, never the authority**: `$XDG_STATE_HOME/<name>
 
 ## The project envelope
 
-Everything the capability reads and writes in a consuming project lives under `.capabilities/<name>/`:
+Everything the capability reads and writes in a consuming project lives under `capabilities/<name>/`:
 
 ```
-.capabilities/<name>/
+capabilities/<name>/
   connections.json    # the connections registry — standard envelope (see Connections)
   identifiers.json    # the identifiers envelope, managed by the ids verbs
   reference/          # the single home for references — one front-matter .md per topic
@@ -148,7 +148,13 @@ Everything the capability reads and writes in a consuming project lives under `.
   state/              # capability-written; never committed
 ```
 
-(`.capabilities/settings.json` — one level up — is the manager-owned gate; the script only ever reads it.)
+(`capabilities/settings.json` — one level up — is the manager-owned gate; the script only ever reads it.)
+
+`capabilities/` is canonical and intentionally visible so ContextKit and humans
+share one project body. The runtime also reads a legacy `.capabilities/` tree
+until `capabilities init` migrates it. Migration is manager-owned and
+preflighted: disjoint gate entries and gitignore lines merge; any other content
+collision stops before either tree changes. Capability scripts never migrate.
 
 - **`identifiers.json`** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). A thin standard envelope — label → `{ value, note }` — so any reader can render the menu without understanding the capability; capability-specific structure lives inside values:
 
@@ -161,7 +167,7 @@ Everything the capability reads and writes in a consuming project lives under `.
 
   Connections vs identifiers is a **provenance split**: connection entries hold values someone *chose* (wiring, per-connection behavioural keys); identifiers hold values the CLI *discovered*. Different writer, different cadence, different git-diff meaning — never merged.
 
-- **References** — prose by nature (a model, a treatment, a taxonomy); the envelope is standardized, the content free. Each is its own `.md` under `.capabilities/<name>/reference/` — the single home for references, kept apart from the JSON config files. Drop a file in with the front-matter below and the context build picks it up; no index to maintain:
+- **References** — prose by nature (a model, a treatment, a taxonomy); the envelope is standardized, the content free. Each is its own `.md` under `capabilities/<name>/reference/` — the single home for references, kept apart from the JSON config files. Drop a file in with the front-matter below and the context build picks it up; no index to maintain:
 
   ```markdown
   ---
@@ -170,7 +176,7 @@ Everything the capability reads and writes in a consuming project lives under `.
   ---
   ```
 
-  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading **front-matter only** from `.capabilities/<name>/reference/*.md`, never the bodies. References elsewhere in the envelope (loose `.md` beside the JSON files) are not read.
+  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading **front-matter only** from `capabilities/<name>/reference/*.md`, never the bodies. References elsewhere in the envelope (loose `.md` beside the JSON files) are not read.
 
 The `ids` verbs manage the identifiers envelope:
 
@@ -181,16 +187,17 @@ The `ids` verbs manage the identifiers envelope:
 | `ids set <label> <value> [--note <text>]` | Upsert: `<value>` parses as JSON, a non-JSON argument stores as a string; `--note` sets the annotation. |
 | `ids rm <label>` | Removes the label. Unknown label → exit 3. |
 
-`ids set` creates `.capabilities/<name>/` on demand **inside an existing `.capabilities/`**; in a project with no `.capabilities/` envelope it exits 6, naming `capabilities init` as the remediation.
+`ids set` creates `capabilities/<name>/` on demand **inside an existing `capabilities/`**; in a project with no `capabilities/` envelope it exits 6, naming `capabilities init` as the remediation.
 
 ## The project gate
 
-Every verb — `help` and `doctor` included — passes the project gate before dispatch. The gate reads one file, the manager-owned `.capabilities/settings.json` at the project root, resolved by the same walk everything project-scoped shares:
+Every verb — `help` and `doctor` included — passes the project gate before dispatch. The gate reads one file, the manager-owned `capabilities/settings.json` at the project root, resolved by the same walk everything project-scoped shares:
 
 ```python
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding .capabilities/, .env(.local), or .git.
+    the first directory holding capabilities/settings.json, legacy
+    .capabilities/, .env(.local), or .git.
     $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
@@ -198,17 +205,25 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
-        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir() or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
     return None
+
+def _project_capabilities_dir(root: Path) -> Path:
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
 
 def _gate() -> None:
     """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
     root = _project_root()
     if root is None:
         return
-    gate_file = root / ".capabilities" / "settings.json"
+    gate_file = _project_capabilities_dir(root) / "settings.json"
     try:
         entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
     except (OSError, ValueError):
@@ -301,7 +316,7 @@ Every capability resolves its configuration as **connections** — named, comple
 
 More than one endpoint or identity is declared in the **connections registry** — a standard envelope, written at configuration time by whoever configures, read by the script. The registry resolves through two homes, **first found wins, never merged**:
 
-1. **Project** — `.capabilities/<name>/connections.json`: the project's own endpoints and identities.
+1. **Project** — `capabilities/<name>/connections.json`: the project's own endpoints and identities.
 2. **User** — `$XDG_CONFIG_HOME/<name>/connections.json` (default `~/.config/<name>/`): machine-level identities, the shape for personal-account tools whose connections are a fact of the machine, not of any one project.
 
 Whichever registry is found is **authoritative**: it fully defines the connection set, the implicit default does not exist beside it, and the other home is not consulted.
@@ -409,7 +424,7 @@ The principle: **the cascade resolves values; a gate is not a value.** No flag, 
       "allow_write": true,
       "keys": [
         { "key": "address", "secret": false, "required": true, "set": true,
-          "tier": "connection", "source": "/path/.capabilities/mailbox/connections.json",
+          "tier": "connection", "source": "/path/capabilities/mailbox/connections.json",
           "value": "billing@example.com" },
         { "key": "MAILBOX_BILLING_APP_PASSWORD", "secret": true, "required": true, "set": true,
           "tier": "project", "source": "/path/.env.local", "value": "…k9f3" }
@@ -444,12 +459,14 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 def _state_dir() -> Path:
     if SCOPE == "project":
         root = _project_root()
-        if root is not None and (root / ".capabilities").is_dir():
-            return root / ".capabilities" / NAME / "state"
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
     return _STATE_HOME / NAME
 ```
 
-- **Project scope** → `<root>/.capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, session maps, each project isolated to its own account session. The manager-owned `.capabilities/.gitignore` is what guarantees `*/state/` never commits — a session cookie is a secret, so the guard is a precondition: project state lands inside the envelope only where `.capabilities/` already exists. Anywhere else — a home directory, a server, cron, an unwired repo — state falls back to the user state home and ad-hoc use keeps working.
+- **Project scope** → `<root>/capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, session maps, each project isolated to its own account session. The manager-owned `capabilities/.gitignore` is what guarantees `*/state/` never commits — a session cookie is a secret, so the guard is a precondition: project state lands inside the envelope only where `capabilities/` already exists. Anywhere else — a home directory, a server, cron, an unwired repo — state falls back to the user state home and ad-hoc use keeps working.
 - **User scope** → `$XDG_STATE_HOME/<name>/` (default `~/.local/state/<name>/`).
 
 A stateful capability keys its state **per connection** — `<state-dir>/<connection-id>/…` — so two connections of one capability never share a session. The guides cache is the exception: guide content is capability-scoped and connection-independent, so it stays unkeyed at the user state home.

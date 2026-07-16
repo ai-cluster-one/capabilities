@@ -82,7 +82,7 @@ def test_create_and_comment_payloads(tmp_path):
 
 
 def test_read_only_connection_refuses_create_before_network(tmp_path):
-    envelope = tmp_path / ".capabilities" / "youtrack"
+    envelope = tmp_path / "capabilities" / "youtrack"
     envelope.mkdir(parents=True)
     (tmp_path / ".git").mkdir()
     (envelope / "connections.json").write_text(json.dumps({

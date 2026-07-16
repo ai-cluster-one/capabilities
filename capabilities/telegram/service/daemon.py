@@ -7,7 +7,7 @@
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
 
 This engine is shipped in the installed telegram capability bundle. A project
-keeps only its policy/config under .capabilities/telegram/service/:
+keeps only its policy/config under capabilities/telegram/service/:
   settings.json — connection, direct_messages, allowed_users, allowed_groups,
                   defaults
   context.md    — soft-gate prompt injected into every worker turn
@@ -82,14 +82,27 @@ def _find_project_root():
     for d in (here, *here.parents):
         if d == home:
             break
-        if ((d / ".capabilities").is_dir() or (d / ".env").exists()
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
     return here
 
 
 PROJECT_ROOT = _find_project_root()
-SERVICE_DIR = PROJECT_ROOT / ".capabilities" / "telegram" / "service"
+
+
+def _project_capabilities_dir():
+    current = PROJECT_ROOT / "capabilities"
+    legacy = PROJECT_ROOT / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
+
+
+PROJECT_CAPABILITIES_DIR = _project_capabilities_dir()
+SERVICE_DIR = PROJECT_CAPABILITIES_DIR / "telegram" / "service"
 SETTINGS_FILE = Path(os.environ.get("TELEGRAM_SERVICE_SETTINGS")
                      or SERVICE_DIR / "settings.json")
 CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_CONTEXT")
@@ -205,7 +218,7 @@ def _connection_file_override():
 def _connections_envelope():
     override = _connection_file_override()
     candidates = [override] if override else [
-        PROJECT_ROOT / ".capabilities" / "telegram" / "connections.json",
+        PROJECT_CAPABILITIES_DIR / "telegram" / "connections.json",
         USER_CONN_FILE,
     ]
     for path in candidates:
