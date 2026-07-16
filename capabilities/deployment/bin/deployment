@@ -764,6 +764,7 @@ def _dockerfile_template(has_contextkit: bool) -> str:
     contextkit_install = ""
     contextkit_link = ""
     contextkit_build = ""
+    capabilities_init_step = " && capabilities init --codex --claude \\\n"
     if has_contextkit:
         contextkit_install = (
             "\n# ContextKit is installed globally via the public installer. Generated host\n"
@@ -778,16 +779,18 @@ def _dockerfile_template(has_contextkit: bool) -> str:
         )
         contextkit_build = (
             "\n# Initialize target-local ContextKit bindings (creates .env.local and technical\n"
-            "# guards), install ContextKit hooks, and validate, build, and audit context after\n"
-            "# the installed capability set is present, so generated context sees the complete\n"
-            "# runtime. The capabilities manager readiness check runs before this to ensure the\n"
-            "# lock is complete.\n"
+            "# guards), initialize capability contexts, install ContextKit hooks, and validate,\n"
+            "# build, and audit context after the installed capability set is present, so\n"
+            "# generated context sees the complete runtime. The capabilities manager readiness\n"
+            "# check runs before this to ensure the lock is complete.\n"
             "RUN contextkit init \\\n"
+            " && capabilities init --codex --claude \\\n"
             " && contextkit install-hooks --target codex --target claude \\\n"
             " && contextkit doctor \\\n"
             " && contextkit build --target all \\\n"
             " && contextkit audit || { echo \"[build] ContextKit project setup failed\" >&2; exit 1; }\n"
         )
+        capabilities_init_step = ""
     return f"""# Agent box: project brain + agent CLIs + capability CLIs.
 FROM debian:bookworm-slim
 
@@ -844,8 +847,7 @@ RUN curl -fsSL "https://raw.githubusercontent.com/ai-cluster-one/capabilities/${
       | CAPABILITIES_TAG=${{CAPABILITIES_REF}} sh \\
  && grep -v '^[[:space:]]*#' /app/deployment/capabilities.lock | grep -v '^[[:space:]]*$' \\
       | while read -r name; do capabilities install "$name"; done \\
- && capabilities init --claude --codex \\
- && capabilities doctor || {{ echo "[build] capabilities readiness check failed" >&2; exit 1; }}
+{capabilities_init_step} && capabilities doctor || {{ echo "[build] capabilities readiness check failed" >&2; exit 1; }}
 
 # Warm common PEP-723 environments. Best-effort so missing runtime credentials do not
 # break image builds.
