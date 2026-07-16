@@ -111,13 +111,27 @@ def test_dockerignore_excludes_contextkit(tmpdir: Path) -> None:
 
     dockerignore = (project / ".dockerignore").read_text()
 
-    # Should exclude manager binary
+    # Should exclude ContextKit product paths
     assert ".contextkit/manager/" in dockerignore, \
         "Should exclude .contextkit/manager/"
+    assert ".contextkit/.manager/" in dockerignore, \
+        "Should exclude .contextkit/.manager/"
+    assert ".contextkit/bundle/" in dockerignore, \
+        "Should exclude .contextkit/bundle/"
+    assert ".contextkit/guides/" in dockerignore, \
+        "Should exclude .contextkit/guides/"
+    assert ".contextkit/templates/" in dockerignore, \
+        "Should exclude .contextkit/templates/"
+    assert ".contextkit/install.json" in dockerignore, \
+        "Should exclude .contextkit/install.json"
+    assert ".contextkit/release.json" in dockerignore, \
+        "Should exclude .contextkit/release.json"
 
-    # Should exclude generated host bindings
+    # Should exclude generated host bindings and hooks
     assert ".codex/generated/" in dockerignore, \
         "Should exclude .codex/generated/"
+    assert ".codex/hooks/build-context.sh" in dockerignore, \
+        "Should exclude .codex/hooks/build-context.sh"
     assert ".claude/rules/CONTEXT.md" in dockerignore, \
         "Should exclude .claude/rules/CONTEXT.md"
 
@@ -125,7 +139,7 @@ def test_dockerignore_excludes_contextkit(tmpdir: Path) -> None:
     assert "public installer" in dockerignore.lower(), \
         "Should explain ContextKit is installed via public installer"
 
-    print("✓ .dockerignore excludes ContextKit manager and generated files")
+    print("✓ .dockerignore excludes ContextKit product paths and generated files")
 
 
 def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
@@ -142,7 +156,7 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
     assert "CONTEXTKIT_REF" in dockerfile, \
         "Should use CONTEXTKIT_REF build arg"
     assert "contextkit doctor" in dockerfile, \
-        "Should verify installation with contextkit doctor"
+        "Should verify project with contextkit doctor"
 
     # Should NOT copy local contextkit binary
     assert ".contextkit/manager/contextkit" not in dockerfile, \
@@ -154,11 +168,21 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
     assert "contextkit build --target all" in dockerfile, \
         "Should build ContextKit context"
 
+    # Should install both target hooks
+    assert "contextkit install-hooks --target codex --target claude" in dockerfile, \
+        "Should install hooks for both codex and claude targets"
+
+    # Should initialize capabilities for both targets
+    assert "capabilities init --codex --claude" in dockerfile, \
+        "Should initialize capabilities for both codex and claude"
+
     # Verify build order
     lines = dockerfile.split('\n')
     contextkit_install_idx = None
+    contextkit_verify_idx = None
     copy_idx = None
     capabilities_install_idx = None
+    capabilities_init_idx = None
     hooks_idx = None
     build_idx = None
     doctor_idx = None
@@ -166,35 +190,55 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
     for i, line in enumerate(lines):
         if "context-kit" in line and "install.sh" in line:
             contextkit_install_idx = i
+        elif "contextkit help" in line and contextkit_verify_idx is None:
+            contextkit_verify_idx = i
         elif "COPY" in line and "/app" in line and "entrypoint" not in line:
             copy_idx = i
         elif "capabilities install" in line:
             capabilities_install_idx = i
+        elif "capabilities init" in line:
+            capabilities_init_idx = i
         elif "contextkit install-hooks" in line:
             hooks_idx = i
         elif "contextkit build --target all" in line:
             build_idx = i
-        elif "contextkit doctor" in line and "ContextKit context build failed" in line:
+        elif "contextkit doctor" in line and "project setup failed" in line:
             doctor_idx = i
 
-    # Verify order: install ContextKit -> copy project -> install capabilities -> hooks -> build -> doctor
+    # Verify order: install ContextKit -> verify product -> copy project -> install capabilities -> init capabilities -> hooks -> build -> doctor
     assert contextkit_install_idx is not None, "Should install ContextKit"
+    assert contextkit_verify_idx is not None, "Should verify ContextKit product installation"
     assert copy_idx is not None, "Should copy project"
     assert capabilities_install_idx is not None, "Should install capabilities"
+    assert capabilities_init_idx is not None, "Should initialize capabilities contexts"
     assert hooks_idx is not None, "Should install hooks"
     assert build_idx is not None, "Should build context"
-    assert doctor_idx is not None, "Should verify with doctor"
+    assert doctor_idx is not None, "Should verify project with doctor"
 
-    assert contextkit_install_idx < copy_idx, \
-        "Should install ContextKit before copying project"
+    assert contextkit_install_idx < contextkit_verify_idx, \
+        "Should verify ContextKit installation immediately after install"
+    assert contextkit_verify_idx < copy_idx, \
+        "Should verify product before copying project"
     assert copy_idx < capabilities_install_idx, \
         "Should copy project before installing capabilities"
-    assert capabilities_install_idx < hooks_idx, \
-        "Should install capabilities before installing hooks"
+    assert capabilities_install_idx < capabilities_init_idx, \
+        "Should install capabilities before initializing capability contexts"
+    assert capabilities_init_idx < hooks_idx, \
+        "Should initialize capability contexts before installing hooks"
     assert hooks_idx < build_idx, \
         "Should install hooks before building context"
     assert build_idx < doctor_idx, \
-        "Should build context before verifying with doctor"
+        "Should build context before verifying project with doctor"
+
+    # CRITICAL: No project-dependent contextkit commands should occur before COPY
+    for i in range(copy_idx if copy_idx is not None else len(lines)):
+        line = lines[i]
+        if "contextkit doctor" in line:
+            assert False, f"contextkit doctor (project-dependent) found before COPY at line {i}"
+        if "contextkit build" in line:
+            assert False, f"contextkit build (project-dependent) found before COPY at line {i}"
+        if "contextkit install-hooks" in line:
+            assert False, f"contextkit install-hooks (project-dependent) found before COPY at line {i}"
 
     print("✓ Dockerfile uses public installer with correct build order")
 
@@ -267,9 +311,9 @@ def test_build_fails_on_missing_steps(tmpdir: Path) -> None:
     assert "ContextKit installation failed" in dockerfile, \
         "Should fail on ContextKit installation failure"
 
-    # Should fail on context build failure
-    assert "ContextKit context build failed" in dockerfile, \
-        "Should fail on ContextKit context build failure"
+    # Should fail on project setup failure
+    assert "ContextKit project setup failed" in dockerfile, \
+        "Should fail on ContextKit project setup failure"
 
     # Check for exit 1
     assert "exit 1" in dockerfile, \

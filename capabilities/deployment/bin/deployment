@@ -673,7 +673,14 @@ def _dockerignore_template(has_contextkit: bool) -> str:
             "# ContextKit is installed via public installer; generated host bindings",
             "# and compiled context are rebuilt inside the image.",
             ".contextkit/manager/",
+            ".contextkit/.manager/",
+            ".contextkit/bundle/",
+            ".contextkit/guides/",
+            ".contextkit/templates/",
+            ".contextkit/install.json",
+            ".contextkit/release.json",
             ".codex/generated/",
+            ".codex/hooks/build-context.sh",
             ".claude/rules/CONTEXT.md",
         ]
     return "\n".join(lines) + "\n"
@@ -761,18 +768,19 @@ def _dockerfile_template(has_contextkit: bool) -> str:
             "ARG CONTEXTKIT_REF=main\n"
             "RUN curl -fsSL \"https://raw.githubusercontent.com/ai-cluster-one/context-kit/${CONTEXTKIT_REF}/install.sh\" \\\n"
             "      | CONTEXTKIT_REF=\"${CONTEXTKIT_REF}\" sh \\\n"
-            " && contextkit doctor || { echo \"[build] ContextKit installation failed\" >&2; exit 1; }\n"
+            " && contextkit help >/dev/null || { echo \"[build] ContextKit installation failed\" >&2; exit 1; }\n"
         )
         contextkit_link = (
             " && ln -sf /home/${USERNAME}/.local/bin/contextkit /usr/local/bin/contextkit"
         )
         contextkit_build = (
-            "\n# Install ContextKit host bindings and build generated context after the\n"
-            "# installed capability set is present, so generated host context sees the\n"
-            "# complete runtime environment.\n"
-            "RUN contextkit install-hooks --target codex --target claude \\\n"
+            "\n# Initialize project contexts for both Claude and Codex, then install ContextKit\n"
+            "# host bindings and build generated context after the installed capability set\n"
+            "# is present, so generated host context sees the complete runtime environment.\n"
+            "RUN capabilities init --codex --claude \\\n"
+            " && contextkit install-hooks --target codex --target claude \\\n"
             " && contextkit build --target all \\\n"
-            " && contextkit doctor || { echo \"[build] ContextKit context build failed\" >&2; exit 1; }\n"
+            " && contextkit doctor || { echo \"[build] ContextKit project setup failed\" >&2; exit 1; }\n"
         )
     return f"""# Agent box: project brain + agent CLIs + capability CLIs.
 FROM debian:bookworm-slim
