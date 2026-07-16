@@ -70,8 +70,8 @@ def test_dockerfile_has_capabilities_doctor_after_init(tmp_path: Path) -> None:
     assert "capabilities readiness check failed" in dockerfile
 
 
-def test_dockerfile_contextkit_has_doctor_before_contextkit_init(tmp_path: Path) -> None:
-    """Verify ContextKit projects run capabilities doctor before contextkit init."""
+def test_dockerfile_contextkit_has_doctor_after_capabilities_init(tmp_path: Path) -> None:
+    """Verify ContextKit projects run capabilities doctor after capabilities init."""
     project = _project(tmp_path, has_contextkit=True)
     (project / "capabilities").mkdir()
     (project / "capabilities" / "settings.json").write_text('{"capabilities": {}}\n')
@@ -81,13 +81,20 @@ def test_dockerfile_contextkit_has_doctor_before_contextkit_init(tmp_path: Path)
     assert result.returncode == 0, result.stderr
     dockerfile = (project / "Dockerfile").read_text()
 
-    # Verify capabilities doctor comes before contextkit init
+    # Verify capabilities doctor comes after capabilities init
+    cap_init_idx = dockerfile.find("capabilities init")
     cap_doctor_idx = dockerfile.find("capabilities doctor")
-    contextkit_init_idx = dockerfile.find("contextkit init")
+    assert cap_init_idx > 0, "capabilities init not found"
     assert cap_doctor_idx > 0, "capabilities doctor not found"
-    assert contextkit_init_idx > 0, "contextkit init not found"
-    assert cap_doctor_idx < contextkit_init_idx, (
-        "capabilities doctor should run before contextkit init"
+    assert cap_init_idx < cap_doctor_idx, (
+        "capabilities init should run before capabilities doctor"
+    )
+
+    # Verify capabilities doctor comes before contextkit install-hooks
+    hooks_idx = dockerfile.find("contextkit install-hooks")
+    assert hooks_idx > 0, "contextkit install-hooks not found"
+    assert cap_doctor_idx < hooks_idx, (
+        "capabilities doctor should run before contextkit install-hooks"
     )
 
 
@@ -123,9 +130,9 @@ def test_dockerfile_ordering_capabilities_to_contextkit(tmp_path: Path) -> None:
     # Extract the relevant sections and verify ordering
     steps = [
         "capabilities install",
+        "contextkit init",
         "capabilities init",
         "capabilities doctor",
-        "contextkit init",
         "contextkit install-hooks",
         "contextkit doctor",
         "contextkit build",

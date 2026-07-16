@@ -12,13 +12,12 @@ the external substrate. A project can use deployment without enabling Coolify.
 
 For ContextKit projects, generated Docker builds install ContextKit via the
 public installer (https://raw.githubusercontent.com/ai-cluster-one/context-kit/main/install.sh),
-install capabilities from the lock, initialize project contexts with `capabilities init`,
-verify the capability set with `capabilities doctor`, then run `contextkit init` to
-create target-local technical bindings, install hooks, and validate and build context
-with the canonical sequence: `contextkit doctor`, `contextkit build --target all`,
-`contextkit audit`. Generated host bindings, compiled context, and machine-local
-bindings (.env.local) are target-local build artifacts, not deployment inputs
-shipped from the repo.
+install capabilities from the lock, then initialize with the canonical sequence:
+`contextkit init` (target-local bindings), `capabilities init --codex --claude`,
+`capabilities doctor`, `contextkit install-hooks`, `contextkit doctor`,
+`contextkit build --target all`, `contextkit audit`. Generated host bindings,
+compiled context, and machine-local bindings (.env.local) are target-local build
+artifacts, not deployment inputs shipped from the repo.
 
 USAGE
   deployment setup [--profile agent-box] [--target production]
@@ -764,7 +763,7 @@ def _dockerfile_template(has_contextkit: bool) -> str:
     contextkit_install = ""
     contextkit_link = ""
     contextkit_build = ""
-    capabilities_init_step = " && capabilities init --codex --claude \\\n"
+    capabilities_init_and_doctor = " && capabilities init --codex --claude \\\n && capabilities doctor"
     if has_contextkit:
         contextkit_install = (
             "\n# ContextKit is installed globally via the public installer. Generated host\n"
@@ -779,18 +778,18 @@ def _dockerfile_template(has_contextkit: bool) -> str:
         )
         contextkit_build = (
             "\n# Initialize target-local ContextKit bindings (creates .env.local and technical\n"
-            "# guards), initialize capability contexts, install ContextKit hooks, and validate,\n"
-            "# build, and audit context after the installed capability set is present, so\n"
-            "# generated context sees the complete runtime. The capabilities manager readiness\n"
-            "# check runs before this to ensure the lock is complete.\n"
+            "# guards), initialize capability contexts, verify the capabilities manager,\n"
+            "# install ContextKit hooks, and validate, build, and audit context after the\n"
+            "# installed capability set is present, so generated context sees the complete runtime.\n"
             "RUN contextkit init \\\n"
             " && capabilities init --codex --claude \\\n"
+            " && capabilities doctor \\\n"
             " && contextkit install-hooks --target codex --target claude \\\n"
             " && contextkit doctor \\\n"
             " && contextkit build --target all \\\n"
             " && contextkit audit || { echo \"[build] ContextKit project setup failed\" >&2; exit 1; }\n"
         )
-        capabilities_init_step = ""
+        capabilities_init_and_doctor = ""
     return f"""# Agent box: project brain + agent CLIs + capability CLIs.
 FROM debian:bookworm-slim
 
@@ -846,8 +845,7 @@ ENV CAPABILITIES_SOURCE=https://raw.githubusercontent.com/ai-cluster-one/capabil
 RUN curl -fsSL "https://raw.githubusercontent.com/ai-cluster-one/capabilities/${{CAPABILITIES_REF}}/install.sh" \\
       | CAPABILITIES_TAG=${{CAPABILITIES_REF}} sh \\
  && grep -v '^[[:space:]]*#' /app/deployment/capabilities.lock | grep -v '^[[:space:]]*$' \\
-      | while read -r name; do capabilities install "$name"; done \\
-{capabilities_init_step} && capabilities doctor || {{ echo "[build] capabilities readiness check failed" >&2; exit 1; }}
+      | while read -r name; do capabilities install "$name"; done{capabilities_init_and_doctor} || {{ echo "[build] capabilities readiness check failed" >&2; exit 1; }}
 
 # Warm common PEP-723 environments. Best-effort so missing runtime credentials do not
 # break image builds.

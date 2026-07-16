@@ -192,8 +192,9 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
     capabilities_install_idx = None
     contextkit_init_idx = None
     capabilities_init_idx = None
+    capabilities_doctor_idx = None
     hooks_idx = None
-    doctor_idx = None
+    contextkit_doctor_idx = None
     build_idx = None
     audit_idx = None
 
@@ -210,24 +211,27 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
             contextkit_init_idx = i
         elif "capabilities init" in line and capabilities_init_idx is None:
             capabilities_init_idx = i
+        elif "capabilities doctor" in line and capabilities_doctor_idx is None:
+            capabilities_doctor_idx = i
         elif "contextkit install-hooks" in line and hooks_idx is None:
             hooks_idx = i
-        elif "contextkit doctor" in line and doctor_idx is None:
-            doctor_idx = i
+        elif "contextkit doctor" in line and contextkit_doctor_idx is None:
+            contextkit_doctor_idx = i
         elif "contextkit build --target all" in line and build_idx is None:
             build_idx = i
         elif "contextkit audit" in line and audit_idx is None:
             audit_idx = i
 
-    # Verify order: install ContextKit -> verify product -> copy project -> install capabilities -> contextkit init -> capabilities init -> hooks -> doctor -> build -> audit
+    # Verify order: install ContextKit -> verify product -> copy project -> install capabilities -> contextkit init -> capabilities init -> capabilities doctor -> hooks -> contextkit doctor -> build -> audit
     assert contextkit_install_idx is not None, "Should install ContextKit"
     assert contextkit_verify_idx is not None, "Should verify ContextKit product installation"
     assert copy_idx is not None, "Should copy project"
     assert capabilities_install_idx is not None, "Should install capabilities"
     assert contextkit_init_idx is not None, "Should initialize ContextKit target-local bindings"
     assert capabilities_init_idx is not None, "Should initialize capabilities contexts"
+    assert capabilities_doctor_idx is not None, "Should verify capabilities manager readiness"
     assert hooks_idx is not None, "Should install hooks"
-    assert doctor_idx is not None, "Should verify project with doctor"
+    assert contextkit_doctor_idx is not None, "Should verify project with contextkit doctor"
     assert build_idx is not None, "Should build context"
     assert audit_idx is not None, "Should audit built context"
 
@@ -241,12 +245,14 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
         "Should install capabilities before initializing ContextKit bindings"
     assert contextkit_init_idx < capabilities_init_idx, \
         "Should initialize ContextKit bindings before initializing capability contexts"
-    assert capabilities_init_idx < hooks_idx, \
-        "Should initialize capability contexts before installing hooks"
-    assert hooks_idx < doctor_idx, \
-        "Should install hooks before verifying with doctor"
-    assert doctor_idx < build_idx, \
-        "Should verify with doctor before building context"
+    assert capabilities_init_idx < capabilities_doctor_idx, \
+        "Should initialize capability contexts before verifying capabilities manager"
+    assert capabilities_doctor_idx < hooks_idx, \
+        "Should verify capabilities manager before installing hooks"
+    assert hooks_idx < contextkit_doctor_idx, \
+        "Should install hooks before verifying with contextkit doctor"
+    assert contextkit_doctor_idx < build_idx, \
+        "Should verify with contextkit doctor before building context"
     assert build_idx < audit_idx, \
         "Should build context before auditing"
 
