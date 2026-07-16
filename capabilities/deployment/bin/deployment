@@ -12,8 +12,9 @@ the external substrate. A project can use deployment without enabling Coolify.
 
 For ContextKit projects, generated Docker builds install ContextKit via the
 public installer (https://raw.githubusercontent.com/ai-cluster-one/context-kit/main/install.sh),
-run `contextkit init` to create target-local technical bindings, initialize project
-contexts with `capabilities init`, install hooks, then validate and build context
+install capabilities from the lock, initialize project contexts with `capabilities init`,
+verify the capability set with `capabilities doctor`, then run `contextkit init` to
+create target-local technical bindings, install hooks, and validate and build context
 with the canonical sequence: `contextkit doctor`, `contextkit build --target all`,
 `contextkit audit`. Generated host bindings, compiled context, and machine-local
 bindings (.env.local) are target-local build artifacts, not deployment inputs
@@ -777,11 +778,11 @@ def _dockerfile_template(has_contextkit: bool) -> str:
         )
         contextkit_build = (
             "\n# Initialize target-local ContextKit bindings (creates .env.local and technical\n"
-            "# guards), then initialize project contexts for both Claude and Codex, install\n"
-            "# ContextKit hooks, and validate, build, and audit context after the installed\n"
-            "# capability set is present, so generated context sees the complete runtime.\n"
+            "# guards), install ContextKit hooks, and validate, build, and audit context after\n"
+            "# the installed capability set is present, so generated context sees the complete\n"
+            "# runtime. The capabilities manager readiness check runs before this to ensure the\n"
+            "# lock is complete.\n"
             "RUN contextkit init \\\n"
-            " && capabilities init --codex --claude \\\n"
             " && contextkit install-hooks --target codex --target claude \\\n"
             " && contextkit doctor \\\n"
             " && contextkit build --target all \\\n"
@@ -842,7 +843,9 @@ ENV CAPABILITIES_SOURCE=https://raw.githubusercontent.com/ai-cluster-one/capabil
 RUN curl -fsSL "https://raw.githubusercontent.com/ai-cluster-one/capabilities/${{CAPABILITIES_REF}}/install.sh" \\
       | CAPABILITIES_TAG=${{CAPABILITIES_REF}} sh \\
  && grep -v '^[[:space:]]*#' /app/deployment/capabilities.lock | grep -v '^[[:space:]]*$' \\
-      | while read -r name; do capabilities install "$name"; done
+      | while read -r name; do capabilities install "$name"; done \\
+ && capabilities init --claude --codex \\
+ && capabilities doctor || {{ echo "[build] capabilities readiness check failed" >&2; exit 1; }}
 
 # Warm common PEP-723 environments. Best-effort so missing runtime credentials do not
 # break image builds.
