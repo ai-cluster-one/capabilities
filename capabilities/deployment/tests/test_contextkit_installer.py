@@ -135,6 +135,10 @@ def test_dockerignore_excludes_contextkit(tmpdir: Path) -> None:
     assert ".claude/rules/CONTEXT.md" in dockerignore, \
         "Should exclude .claude/rules/CONTEXT.md"
 
+    # Should exclude machine-local bindings
+    assert ".env.local" in dockerignore, \
+        "Should exclude .env.local (machine-local binding)"
+
     # Should have explanatory comment
     assert "public installer" in dockerignore.lower(), \
         "Should explain ContextKit is installed via public installer"
@@ -162,11 +166,15 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
     assert ".contextkit/manager/contextkit" not in dockerfile, \
         "Should not reference local ContextKit manager binary"
 
-    # Should install hooks and build context
+    # Should initialize, install hooks, and build context
+    assert "contextkit init" in dockerfile, \
+        "Should initialize ContextKit target-local bindings"
     assert "contextkit install-hooks" in dockerfile, \
         "Should install ContextKit hooks"
     assert "contextkit build --target all" in dockerfile, \
         "Should build ContextKit context"
+    assert "contextkit audit" in dockerfile, \
+        "Should audit built ContextKit context"
 
     # Should install both target hooks
     assert "contextkit install-hooks --target codex --target claude" in dockerfile, \
@@ -182,10 +190,12 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
     contextkit_verify_idx = None
     copy_idx = None
     capabilities_install_idx = None
+    contextkit_init_idx = None
     capabilities_init_idx = None
     hooks_idx = None
-    build_idx = None
     doctor_idx = None
+    build_idx = None
+    audit_idx = None
 
     for i, line in enumerate(lines):
         if "context-kit" in line and "install.sh" in line:
@@ -196,24 +206,30 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
             copy_idx = i
         elif "capabilities install" in line:
             capabilities_install_idx = i
-        elif "capabilities init" in line:
+        elif "contextkit init" in line and contextkit_init_idx is None:
+            contextkit_init_idx = i
+        elif "capabilities init" in line and capabilities_init_idx is None:
             capabilities_init_idx = i
-        elif "contextkit install-hooks" in line:
+        elif "contextkit install-hooks" in line and hooks_idx is None:
             hooks_idx = i
-        elif "contextkit build --target all" in line:
-            build_idx = i
-        elif "contextkit doctor" in line and "project setup failed" in line:
+        elif "contextkit doctor" in line and doctor_idx is None:
             doctor_idx = i
+        elif "contextkit build --target all" in line and build_idx is None:
+            build_idx = i
+        elif "contextkit audit" in line and audit_idx is None:
+            audit_idx = i
 
-    # Verify order: install ContextKit -> verify product -> copy project -> install capabilities -> init capabilities -> hooks -> build -> doctor
+    # Verify order: install ContextKit -> verify product -> copy project -> install capabilities -> contextkit init -> capabilities init -> hooks -> doctor -> build -> audit
     assert contextkit_install_idx is not None, "Should install ContextKit"
     assert contextkit_verify_idx is not None, "Should verify ContextKit product installation"
     assert copy_idx is not None, "Should copy project"
     assert capabilities_install_idx is not None, "Should install capabilities"
+    assert contextkit_init_idx is not None, "Should initialize ContextKit target-local bindings"
     assert capabilities_init_idx is not None, "Should initialize capabilities contexts"
     assert hooks_idx is not None, "Should install hooks"
-    assert build_idx is not None, "Should build context"
     assert doctor_idx is not None, "Should verify project with doctor"
+    assert build_idx is not None, "Should build context"
+    assert audit_idx is not None, "Should audit built context"
 
     assert contextkit_install_idx < contextkit_verify_idx, \
         "Should verify ContextKit installation immediately after install"
@@ -221,22 +237,30 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
         "Should verify product before copying project"
     assert copy_idx < capabilities_install_idx, \
         "Should copy project before installing capabilities"
-    assert capabilities_install_idx < capabilities_init_idx, \
-        "Should install capabilities before initializing capability contexts"
+    assert capabilities_install_idx < contextkit_init_idx, \
+        "Should install capabilities before initializing ContextKit bindings"
+    assert contextkit_init_idx < capabilities_init_idx, \
+        "Should initialize ContextKit bindings before initializing capability contexts"
     assert capabilities_init_idx < hooks_idx, \
         "Should initialize capability contexts before installing hooks"
-    assert hooks_idx < build_idx, \
-        "Should install hooks before building context"
-    assert build_idx < doctor_idx, \
-        "Should build context before verifying project with doctor"
+    assert hooks_idx < doctor_idx, \
+        "Should install hooks before verifying with doctor"
+    assert doctor_idx < build_idx, \
+        "Should verify with doctor before building context"
+    assert build_idx < audit_idx, \
+        "Should build context before auditing"
 
     # CRITICAL: No project-dependent contextkit commands should occur before COPY
     for i in range(copy_idx if copy_idx is not None else len(lines)):
         line = lines[i]
+        if "contextkit init" in line:
+            assert False, f"contextkit init (project-dependent) found before COPY at line {i}"
         if "contextkit doctor" in line:
             assert False, f"contextkit doctor (project-dependent) found before COPY at line {i}"
         if "contextkit build" in line:
             assert False, f"contextkit build (project-dependent) found before COPY at line {i}"
+        if "contextkit audit" in line:
+            assert False, f"contextkit audit (project-dependent) found before COPY at line {i}"
         if "contextkit install-hooks" in line:
             assert False, f"contextkit install-hooks (project-dependent) found before COPY at line {i}"
 

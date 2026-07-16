@@ -37,13 +37,17 @@ For projects with `.contextkit/config.toml`, the generated Dockerfile:
 1. Installs ContextKit globally via the public installer (pinned to `CONTEXTKIT_REF`).
 2. Copies the project body.
 3. Installs the capabilities manager and all locked capability payloads.
-4. Runs `contextkit install-hooks --target codex --target claude`.
-5. Runs `contextkit build --target all` to generate host bindings and context.
-6. Runs `contextkit doctor` to verify the installation.
+4. Runs `contextkit init` to create target-local technical bindings (`.env.local`, guards).
+5. Runs `capabilities init --codex --claude` to initialize project contexts.
+6. Runs `contextkit install-hooks --target codex --target claude` to install hooks.
+7. Runs `contextkit doctor` to verify the project is correctly configured.
+8. Runs `contextkit build --target all` to generate host bindings and compile context.
+9. Runs `contextkit audit` to validate the built context.
 
-Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`) and
-the ContextKit manager binary (`.contextkit/manager/`) are excluded from the
-Docker build context via `.dockerignore`. These are target-local build artifacts,
-not deployment inputs shipped from the repo.
+Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`),
+the ContextKit manager binary (`.contextkit/manager/`), and machine-local
+bindings (`.env.local`) are excluded from the Docker build context via
+`.dockerignore`. These are target-local build artifacts, not deployment inputs
+shipped from the repo.
 
-The build fails on missing installer, hook, doctor, or context-build steps.
+The build fails if any step from contextkit init through contextkit audit fails.

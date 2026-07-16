@@ -12,10 +12,12 @@ the external substrate. A project can use deployment without enabling Coolify.
 
 For ContextKit projects, generated Docker builds install ContextKit via the
 public installer (https://raw.githubusercontent.com/ai-cluster-one/context-kit/main/install.sh),
-install host bindings, build generated context on the target with the installed
-capability set present, and verify with `contextkit doctor`. Generated host
-bindings and compiled context are target-local build artifacts, not deployment
-inputs shipped from the repo.
+run `contextkit init` to create target-local technical bindings, initialize project
+contexts with `capabilities init`, install hooks, then validate and build context
+with the canonical sequence: `contextkit doctor`, `contextkit build --target all`,
+`contextkit audit`. Generated host bindings, compiled context, and machine-local
+bindings (.env.local) are target-local build artifacts, not deployment inputs
+shipped from the repo.
 
 USAGE
   deployment setup [--profile agent-box] [--target production]
@@ -774,13 +776,16 @@ def _dockerfile_template(has_contextkit: bool) -> str:
             " && ln -sf /home/${USERNAME}/.local/bin/contextkit /usr/local/bin/contextkit"
         )
         contextkit_build = (
-            "\n# Initialize project contexts for both Claude and Codex, then install ContextKit\n"
-            "# host bindings and build generated context after the installed capability set\n"
-            "# is present, so generated host context sees the complete runtime environment.\n"
-            "RUN capabilities init --codex --claude \\\n"
+            "\n# Initialize target-local ContextKit bindings (creates .env.local and technical\n"
+            "# guards), then initialize project contexts for both Claude and Codex, install\n"
+            "# ContextKit hooks, and validate, build, and audit context after the installed\n"
+            "# capability set is present, so generated context sees the complete runtime.\n"
+            "RUN contextkit init \\\n"
+            " && capabilities init --codex --claude \\\n"
             " && contextkit install-hooks --target codex --target claude \\\n"
+            " && contextkit doctor \\\n"
             " && contextkit build --target all \\\n"
-            " && contextkit doctor || { echo \"[build] ContextKit project setup failed\" >&2; exit 1; }\n"
+            " && contextkit audit || { echo \"[build] ContextKit project setup failed\" >&2; exit 1; }\n"
         )
     return f"""# Agent box: project brain + agent CLIs + capability CLIs.
 FROM debian:bookworm-slim

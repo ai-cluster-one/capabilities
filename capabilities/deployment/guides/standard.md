@@ -35,13 +35,16 @@ line in `deployment/capabilities.lock`.
 For ContextKit projects, Docker builds install ContextKit via the public
 installer (https://raw.githubusercontent.com/ai-cluster-one/context-kit/${CONTEXTKIT_REF}/install.sh),
 defaulting `CONTEXTKIT_REF` to `main`. After copying the project body and
-installing capabilities, the build runs `contextkit install-hooks` for all
-configured targets, `contextkit build --target all` to generate host bindings
-and compile context, and `contextkit doctor` to verify. Generated host bindings
-(`.codex/generated/`, `.claude/rules/CONTEXT.md`) and the ContextKit manager
-binary (`.contextkit/manager/`) are excluded from the build context via
-`.dockerignore`. These are target-local build artifacts, not deployment inputs
-shipped from the repo.
+installing capabilities, the build runs `contextkit init` to create target-local
+technical bindings, `capabilities init --codex --claude` to initialize project
+contexts, `contextkit install-hooks` for all configured targets, then the
+canonical validation sequence: `contextkit doctor` to verify configuration,
+`contextkit build --target all` to generate host bindings and compile context,
+and `contextkit audit` to validate the built context. Generated host bindings
+(`.codex/generated/`, `.claude/rules/CONTEXT.md`), the ContextKit manager
+binary (`.contextkit/manager/`), and machine-local bindings (`.env.local`) are
+excluded from the build context via `.dockerignore`. These are target-local
+build artifacts, not deployment inputs shipped from the repo.
 
 `deployment` does not require `coolify` to be enabled. If a target chooses
 `coolify`, that only means the target is executable by the `coolify` capability
