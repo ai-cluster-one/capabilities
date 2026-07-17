@@ -179,3 +179,82 @@ def test_freeze_includes_deployment_in_lock(tmp_path: Path) -> None:
     assert "deployment" in entries, "deployment should be in capabilities.lock"
     # Verify enabled capabilities are in the lock
     assert "telegram" in entries, "enabled capabilities should be in lock"
+
+
+def test_init_does_not_create_reference_files(tmp_path: Path) -> None:
+    """Verify deployment init does not create pointer files in capabilities/deployment/reference/."""
+    project = _project(tmp_path, has_contextkit=False)
+    (project / "capabilities").mkdir()
+    (project / "capabilities" / "settings.json").write_text('{"capabilities": {}}\n')
+
+    result = _run(tmp_path, project, "init", "--profile", "agent-box", "--target", "production")
+    assert result.returncode == 0, result.stderr
+
+    # Verify the reference directory was not created
+    refdir = project / "capabilities" / "deployment" / "reference"
+    assert not refdir.exists(), "reference directory should not be created by init"
+
+
+def test_setup_does_not_create_reference_files(tmp_path: Path) -> None:
+    """Verify deployment setup does not create pointer files in capabilities/deployment/reference/."""
+    project = _project(tmp_path, has_contextkit=False)
+    (project / "capabilities").mkdir()
+    (project / "capabilities" / "settings.json").write_text('{"capabilities": {}}\n')
+
+    result = _run(tmp_path, project, "setup", "--profile", "agent-box", "--target", "production", "--force")
+    assert result.returncode == 0, result.stderr
+
+    # Verify the reference directory was not created
+    refdir = project / "capabilities" / "deployment" / "reference"
+    assert not refdir.exists(), "reference directory should not be created by setup"
+
+
+def test_doctor_clean_without_reference_directory(tmp_path: Path) -> None:
+    """Verify deployment doctor is clean when reference directory does not exist."""
+    project = _project(tmp_path, has_contextkit=False)
+    (project / "capabilities").mkdir()
+    (project / "capabilities" / "settings.json").write_text('{"capabilities": {}}\n')
+
+    result = _run(tmp_path, project, "init", "--profile", "agent-box")
+    assert result.returncode == 0, result.stderr
+
+    result = _run(tmp_path, project, "doctor")
+    assert result.returncode == 0, result.stderr
+
+    # Parse the JSON output
+    output = json.loads(result.stdout)
+    assert output.get("ok") is True, "doctor should be ok without reference directory"
+
+    # Verify no warning about missing references
+    findings = output.get("findings", [])
+    ref_warnings = [
+        f for f in findings
+        if "reference" in f.get("message", "").lower()
+    ]
+    assert not ref_warnings, "doctor should not warn about missing references"
+
+
+def test_doctor_lists_genuine_reference_files(tmp_path: Path) -> None:
+    """Verify deployment doctor validates and lists genuine reference files when present."""
+    project = _project(tmp_path, has_contextkit=False)
+    (project / "capabilities").mkdir()
+    (project / "capabilities" / "settings.json").write_text('{"capabilities": {}}\n')
+
+    result = _run(tmp_path, project, "init", "--profile", "agent-box")
+    assert result.returncode == 0, result.stderr
+
+    # Create a genuine project-specific reference file
+    refdir = project / "capabilities" / "deployment" / "reference"
+    refdir.mkdir(parents=True, exist_ok=True)
+    (refdir / "custom-workflow.md").write_text("# Custom Deployment Workflow\n\nProject-specific steps.\n")
+
+    result = _run(tmp_path, project, "doctor")
+    assert result.returncode == 0, result.stderr
+
+    # Parse the JSON output
+    output = json.loads(result.stdout)
+    assert output.get("ok") is True, "doctor should be ok with valid reference file"
+
+    # Verify the reference file is listed
+    refs = output.get("references", [])
+    assert any("custom-workflow.md" in ref for ref in refs), "custom reference should be listed"

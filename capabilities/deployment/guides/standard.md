@@ -10,8 +10,8 @@ The split is deliberate:
   targets.
 - `coolify`, `dockerhost`, `railway`, or another adapter executes one target
   against its own external substrate.
-- Context files may point to deployment references, but they do not need to
-  duplicate the runtime schema.
+- Project-specific reference files are optional; when absent, agent context
+  reads the canonical runtime and target JSON directly.
 
 The standard files are:
 
@@ -19,7 +19,10 @@ The standard files are:
 - `deployment/targets/*.json` - one target declaration per deploy destination.
 - `deployment/capabilities.lock` - lightweight install list for the agent image:
   one capability name per line.
-- `capabilities/deployment/reference/*.md` - lightweight context pointers.
+- `capabilities/deployment/reference/*.md` - optional project-specific operational
+  models. Reference files are neither created nor required by deployment init or
+  setup. When present, they hold genuine project-specific deployment context
+  rather than pointers duplicating runtime.json or target JSON schemas.
 
 Use `deployment setup` for a full bootstrap, including Dockerfile,
 docker-compose, env example, entrypoint, deployment declarations, and human next

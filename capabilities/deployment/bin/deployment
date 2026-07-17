@@ -26,9 +26,9 @@ USAGE
                    [--force] [--dry-run]
       Full bootstrap for a non-technical deployment path. Creates the deployment
       declarations plus Dockerfile, docker-compose.yaml, .dockerignore,
-      .env.example, entrypoint.sh, and project references. Defaults are safe for
-      an agent box: one idle agent service plus an optional Telegram service.
-      If --dry-run is passed, print the files that would be written.
+      .env.example, and entrypoint.sh. Defaults are safe for an agent box: one
+      idle agent service plus an optional Telegram service. If --dry-run is
+      passed, print the files that would be written.
 
   deployment scaffold
       Alias for `deployment setup`.
@@ -39,8 +39,6 @@ USAGE
         deployment/runtime.json
         deployment/targets/<target>.json
         deployment/capabilities.lock
-        capabilities/deployment/reference/runtime.md
-        capabilities/deployment/reference/target-<target>.md
       Existing files are left untouched unless --force is passed. This command
       requires an existing project `capabilities/` envelope; it never writes
       `capabilities/settings.json`.
@@ -96,8 +94,11 @@ FILES
       It is a deployment input, not a capability manager file.
 
   capabilities/deployment/reference/*.md
-      Context pointers loaded on demand by `deployment refs` and the manager's
-      generated capability context.
+      Optional project-specific operational models. Reference files are neither
+      created nor required by deployment init or setup. When present, they hold
+      genuine project-specific deployment context rather than pointers
+      duplicating runtime.json or target JSON schemas. Loaded on demand by
+      `deployment refs` and the manager's generated capability context.
 
 EXIT CODES
   0 success
@@ -1286,7 +1287,7 @@ def _provider_plan(root: Path, target: dict) -> dict:
 
 def cmd_init(args) -> None:
     root = _root()
-    envdir = _require_envelope(root)
+    _require_envelope(root)
     target = _slug(args.target)
     profile = args.profile
     provider = args.provider
@@ -1295,8 +1296,6 @@ def cmd_init(args) -> None:
         (_runtime_path(root), _json_text(_runtime_template(profile, project_name))),
         (_target_path(root, target), _json_text(_target_template(provider, target, project_name))),
         (root / "deployment" / "capabilities.lock", _lock_text(root)),
-        (envdir / "reference" / "runtime.md", _runtime_reference()),
-        (envdir / "reference" / f"target-{target}.md", _target_reference(target)),
     ]
     results = [_write_file(root, path, text, args.force) for path, text in writes]
     conflicts = [r for r in results if r["action"] in {"skipped", "error"}]
@@ -1357,16 +1356,13 @@ def _deployment_questions() -> list[dict]:
 def _setup_writes(root: Path, profile: str, provider: str, target: str,
                   project_name: str, with_telegram: bool) -> tuple[list[tuple[Path, str]], list[str]]:
     warnings: list[str] = []
-    envdir = _require_envelope(root)
+    _require_envelope(root)
     has_contextkit = _has_contextkit(root)
     writes: list[tuple[Path, str]] = [
         (_runtime_path(root), _json_text(_runtime_template(profile, project_name, with_telegram))),
         (_target_path(root, target), _json_text(_target_template(provider, target, project_name))),
         (root / "deployment" / "capabilities.lock",
          _lock_text(root, ["telegram"] if with_telegram else [])),
-        (envdir / "reference" / "runtime.md", _runtime_reference()),
-        (envdir / "reference" / f"target-{target}.md", _target_reference(target)),
-        (envdir / "reference" / "dockerization.md", _docker_reference()),
         (root / ".dockerignore", _dockerignore_template(has_contextkit)),
         (root / ".env.example", _env_example_template(with_telegram, has_contextkit)),
         (root / "Dockerfile", _dockerfile_template(has_contextkit)),
@@ -1613,9 +1609,6 @@ def cmd_doctor(args) -> None:
                              "message": "enabled capabilities missing from install list: " + ", ".join(missing)})
     refdir = _project_capabilities_dir(root) / NAME / "reference"
     refs = sorted(str(p.relative_to(root)) for p in refdir.glob("*.md")) if refdir.is_dir() else []
-    if not refs:
-        findings.append({"severity": "warning", "path": _rel(root, refdir),
-                         "message": "no deployment references declared"})
     errors = [f for f in findings if f.get("severity") == "error"]
     _emit({
         "ok": not errors,
