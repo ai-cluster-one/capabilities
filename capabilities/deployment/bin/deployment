@@ -929,27 +929,6 @@ volumes:
 {telegram_volume}"""
 
 
-def _docker_reference() -> str:
-    return "\n".join([
-        "---",
-        "name: dockerization",
-        "description: Generated Docker build and compose surface",
-        "---",
-        "",
-        "Dockerization files are generated at the project root:",
-        "",
-        "- `Dockerfile`",
-        "- `docker-compose.yaml`",
-        "- `.dockerignore`",
-        "- `.env.example`",
-        "- `entrypoint.sh`",
-        "",
-        "Run `deployment doctor` to validate the declaration and `deployment next`",
-        "for the human deployment checklist.",
-        "",
-    ])
-
-
 def _runtime_template(profile: str, project_name: str, with_telegram: bool = True) -> dict:
     slug = _slug(project_name)
     services: dict = {
@@ -1036,34 +1015,6 @@ def _target_template(provider: str, target: str, project_name: str) -> dict:
     else:
         data["resource"] = {"compose_file": "docker-compose.yaml"}
     return data
-
-
-def _runtime_reference() -> str:
-    return "\n".join([
-        "---",
-        "name: runtime",
-        "description: Deployment runtime declaration for this project",
-        "---",
-        "",
-        "The deployment runtime declaration lives at `deployment/runtime.json`.",
-        "",
-        "Load it with `deployment runtime`. Validate it with `deployment doctor`.",
-        "",
-    ])
-
-
-def _target_reference(target: str) -> str:
-    return "\n".join([
-        "---",
-        f"name: target-{target}",
-        f"description: Deployment target declaration for {target}",
-        "---",
-        "",
-        f"The `{target}` deployment target lives at `deployment/targets/{target}.json`.",
-        "",
-        f"Load it with `deployment targets --target {target}` or `deployment plan --target {target}`.",
-        "",
-    ])
 
 
 def _settings(root: Path) -> dict:
