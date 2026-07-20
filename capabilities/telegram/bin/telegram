@@ -151,7 +151,9 @@ import getpass
 import io
 import json
 import os
+import sqlite3
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
@@ -894,6 +896,30 @@ def make_client(cfg: dict) -> TelegramClient:
     return TelegramClient(str(session_path), cfg["api_id"], cfg["api_hash"])
 
 
+def _doctor_session_snapshot(cfg: dict) -> tuple[dict, tempfile.TemporaryDirectory]:
+    """Give doctor an isolated SQLite session so a running daemon cannot lock it.
+
+    Doctor is a readiness probe, not the owner of the durable MTProto session.
+    SQLite's backup API takes a consistent snapshot while the daemon is active;
+    Telethon may then update its transient copy during connect/disconnect without
+    contending with or mutating the canonical session database.
+    """
+    temporary = tempfile.TemporaryDirectory(prefix="telegram-doctor-")
+    source = Path(str(cfg["session"]) + ".session").expanduser()
+    target = Path(temporary.name) / "session.session"
+    if source.is_file():
+        try:
+            with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=3) as src:
+                with sqlite3.connect(target, timeout=3) as dst:
+                    src.backup(dst)
+        except sqlite3.Error:
+            temporary.cleanup()
+            raise
+    isolated = dict(cfg)
+    isolated["session"] = str(target.with_suffix(""))
+    return isolated, temporary
+
+
 def load_deepgram_key() -> str:
     key = _resolve_env_key("DEEPGRAM_API_KEY")[0]
     if not key:
@@ -956,7 +982,13 @@ async def _check_connection(cfg: dict) -> dict:
     """One connection's authenticated round-trip, reported rather than died —
     doctor covers every connection, so a broken one becomes a finding, not a
     stop. Proves creds resolved, Telegram reachable, session authorized."""
-    client = make_client(cfg)
+    temporary = None
+    try:
+        isolated_cfg, temporary = _doctor_session_snapshot(cfg)
+    except sqlite3.Error as e:
+        return {"ok": False, "category": 5,
+                "error": f"cannot snapshot Telegram session: {e}"}
+    client = make_client(isolated_cfg)
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -976,7 +1008,10 @@ async def _check_connection(cfg: dict) -> dict:
     except (RPCError, ConnectionError, OSError) as e:
         return {"ok": False, "category": 5, "error": f"cannot reach Telegram: {e}"}
     finally:
-        await client.disconnect()
+        with contextlib.suppress(RPCError, ConnectionError, OSError, sqlite3.Error):
+            await client.disconnect()
+        if temporary is not None:
+            temporary.cleanup()
 
 
 def cmd_doctor(wanted: str | None) -> None:
