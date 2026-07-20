@@ -26,12 +26,14 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import os
 import re
 import signal
 import sqlite3
 import sys
 import time
+from array import array
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -719,12 +721,75 @@ def recording_caption(metadata: dict) -> str:
     return f"Запись звонка · {duration}"
 
 
-def audio_document_attributes(output: Path, duration_seconds: float | int | None) -> list:
-    """Describe the OGG as seekable Telegram audio instead of a generic document."""
+def pack_voice_waveform(values: list[int]) -> bytes:
+    """Pack Telegram's 5-bit waveform samples into their wire representation."""
+    packed = bytearray((len(values) * 5 + 7) // 8)
+    bit_offset = 0
+    for value in values:
+        sample = max(0, min(31, int(value)))
+        byte_offset, shift = divmod(bit_offset, 8)
+        packed[byte_offset] |= (sample << shift) & 0xFF
+        if shift > 3:
+            packed[byte_offset + 1] |= sample >> (8 - shift)
+        bit_offset += 5
+    return bytes(packed)
+
+
+def voice_waveform_from_pcm(pcm: bytes, bars: int = 100) -> bytes | None:
+    """Build a normalized Telegram waveform from mono signed 16-bit PCM."""
+    if bars <= 0 or len(pcm) < 2:
+        return None
+    amplitudes = array("h")
+    amplitudes.frombytes(pcm[:len(pcm) - len(pcm) % 2])
+    if sys.byteorder != "little":
+        amplitudes.byteswap()
+    sample_count = len(amplitudes)
+    count = min(bars, sample_count)
+    levels: list[float] = []
+    for index in range(count):
+        start = index * sample_count // count
+        end = max(start + 1, (index + 1) * sample_count // count)
+        energy = sum(int(sample) * int(sample) for sample in amplitudes[start:end])
+        levels.append(math.sqrt(energy / (end - start)))
+    peak = max(levels, default=0)
+    if peak <= 0:
+        return pack_voice_waveform([0] * count)
+    normalized = [round(31 * math.sqrt(level / peak)) for level in levels]
+    return pack_voice_waveform(normalized)
+
+
+async def build_voice_waveform(path: Path) -> bytes | None:
+    """Decode a low-rate mono envelope for Telegram's voice-note waveform."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-v", "error",
+            "-i", str(path),
+            "-map", "0:a:0",
+            "-ac", "1",
+            "-ar", "800",
+            "-f", "s16le",
+            "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        pcm, _ = await process.communicate()
+    except OSError:
+        return None
+    if process.returncode != 0:
+        return None
+    return voice_waveform_from_pcm(pcm)
+
+
+def voice_document_attributes(
+    duration_seconds: float | int | None,
+    waveform: bytes | None,
+) -> list:
+    """Describe the finalized OGG as a downloadable Telegram voice note."""
     duration = max(1, round(float(duration_seconds or 0)))
     return [
-        DocumentAttributeFilename(file_name=output.name),
-        DocumentAttributeAudio(duration=duration, voice=False),
+        DocumentAttributeFilename(file_name="recording.ogg"),
+        DocumentAttributeAudio(duration=duration, voice=True, waveform=waveform),
     ]
 
 
@@ -747,21 +812,28 @@ async def send_recording_to_chat(
                    output=str(output), error=delivery["error"])
         return
 
+    waveform = await build_voice_waveform(output)
     for attempt in range(1, 4):
         delivery.update({"status": "sending", "attempts": attempt, "error": None})
         write_metadata(metadata_path, metadata)
         try:
+            if not delivery.get("notice_message_id"):
+                notice = await client.send_message(
+                    chat_id,
+                    recording_caption(metadata),
+                )
+                delivery["notice_message_id"] = getattr(notice, "id", None)
+                write_metadata(metadata_path, metadata)
             message = await client.send_file(
                 chat_id,
                 file=str(output),
-                caption=recording_caption(metadata),
                 mime_type="audio/ogg",
-                attributes=audio_document_attributes(
-                    output,
+                attributes=voice_document_attributes(
                     metadata.get("duration_seconds"),
+                    waveform,
                 ),
                 force_document=False,
-                voice_note=False,
+                voice_note=True,
             )
         except Exception as exc:
             delivery.update({
@@ -792,6 +864,7 @@ async def send_recording_to_chat(
             chat_id=chat_id,
             output=str(output),
             message_id=delivery["message_id"],
+            notice_message_id=delivery.get("notice_message_id"),
             attempts=attempt,
         )
         return

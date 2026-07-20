@@ -119,15 +119,20 @@ def import_call_recorder():
 
 class FakeClient:
     def __init__(self):
-        self.calls = []
+        self.file_calls = []
+        self.message_calls = []
+
+    async def send_message(self, chat_id, text):
+        self.message_calls.append((chat_id, text))
+        return types.SimpleNamespace(id=7000)
 
     async def send_file(self, chat_id, **kwargs):
-        self.calls.append((chat_id, kwargs))
+        self.file_calls.append((chat_id, kwargs))
         return types.SimpleNamespace(id=7001)
 
 
 class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_send_uses_seekable_audio_attributes(self):
+    async def test_send_uses_voice_note_with_separate_notice(self):
         recorder = import_call_recorder()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -141,31 +146,58 @@ class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "delivery": {"enabled": True},
             }
             client = FakeClient()
+            original_waveform = recorder.build_voice_waveform
 
-            await recorder.send_recording_to_chat(
-                client,
-                -1001,
-                output,
-                metadata_path,
-                metadata,
+            async def fake_waveform(_path):
+                return b"waveform"
+
+            recorder.build_voice_waveform = fake_waveform
+            try:
+                await recorder.send_recording_to_chat(
+                    client,
+                    -1001,
+                    output,
+                    metadata_path,
+                    metadata,
+                )
+            finally:
+                recorder.build_voice_waveform = original_waveform
+
+            self.assertEqual(
+                client.message_calls,
+                [(-1001, "Запись звонка · 10:38")],
             )
-
-            self.assertEqual(len(client.calls), 1)
-            chat_id, kwargs = client.calls[0]
+            self.assertEqual(len(client.file_calls), 1)
+            chat_id, kwargs = client.file_calls[0]
             self.assertEqual(chat_id, -1001)
             self.assertEqual(kwargs["mime_type"], "audio/ogg")
             self.assertFalse(kwargs["force_document"])
-            self.assertFalse(kwargs["voice_note"])
+            self.assertTrue(kwargs["voice_note"])
             filename, audio = kwargs["attributes"]
             self.assertIsInstance(filename, DocumentAttributeFilename)
             self.assertEqual(filename.file_name, "recording.ogg")
             self.assertIsInstance(audio, DocumentAttributeAudio)
             self.assertEqual(audio.duration, 638)
-            self.assertFalse(audio.voice)
+            self.assertTrue(audio.voice)
+            self.assertEqual(audio.waveform, b"waveform")
             self.assertEqual(metadata["delivery"]["status"], "sent")
+            self.assertEqual(metadata["delivery"]["notice_message_id"], 7000)
             self.assertEqual(metadata["delivery"]["message_id"], 7001)
             persisted = json.loads(metadata_path.read_text())
+            self.assertEqual(persisted["delivery"]["notice_message_id"], 7000)
             self.assertEqual(persisted["delivery"]["message_id"], 7001)
+
+    async def test_waveform_uses_telegram_five_bit_packing(self):
+        recorder = import_call_recorder()
+        self.assertEqual(recorder.pack_voice_waveform([31, 31]), bytes([255, 3]))
+
+        pcm = (
+            int(1000).to_bytes(2, "little", signed=True) * 100
+            + int(10000).to_bytes(2, "little", signed=True) * 100
+        )
+        waveform = recorder.voice_waveform_from_pcm(pcm, bars=2)
+        self.assertIsNotNone(waveform)
+        self.assertEqual(len(waveform), 2)
 
     async def test_probe_audio_duration_reads_ffprobe_value(self):
         recorder = import_call_recorder()

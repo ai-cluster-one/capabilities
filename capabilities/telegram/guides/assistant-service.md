@@ -148,11 +148,12 @@ Call recording is disabled unless an allowed group explicitly selects a mode:
   creates a recording request for an already active call.
 - `disabled`: no media worker is allowed to join for this group. This is the default.
 - `send_to_chat: true`: after the OGG container closes, upload it to the same
-  group as seekable Telegram audio, with the duration read from the finalized
-  media, and persist the delivery status and Telegram message id in the JSON
-  sidecar. Failed uploads are retried up to three times. The default is `false`.
-  Delivery starts only after the MP3-to-OGG conversion succeeds; the recorder
-  does not classify or reject a completed recording based on its loudness.
+  group as two messages: a short `Запись звонка · <duration>` notice followed by
+  a downloadable Telegram voice note with a waveform generated from the finalized
+  OGG. The sidecar stores both Telegram message ids. Failed uploads are retried up
+  to three times without repeating a notice that was already sent. The default is
+  `false`. Delivery starts only after the MP3-to-OGG conversion succeeds; the
+  recorder does not classify or reject a completed recording based on its loudness.
 
 Transient Telegram join failures are retried without crashing the assistant
 daemon. After a successful join, one recording runs until Marvin leaves or the
