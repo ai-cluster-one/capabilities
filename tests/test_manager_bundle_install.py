@@ -440,6 +440,42 @@ def test_telegram_worker_wrapper_limits_current_chat_scope() -> None:
     assert payload["error"]["code"] == "chat_scope_denied"
 
 
+def test_telegram_service_authority_pins_connection_and_session() -> None:
+    env = dict(os.environ)
+    env["CAPABILITIES_AUTH_CONTEXT"] = json.dumps({
+        "source": "telegram",
+        "connection": "marvin",
+        "chat_id": "-1001",
+        "sender_role": "group_member",
+        "allowed_capabilities": {
+            "telegram": {"scope": "current_chat"},
+        },
+    })
+    wrong_connection = subprocess.run(
+        [str(TELEGRAM_SCRIPT), "chats", "--connection", "personal"],
+        cwd=str(REPO),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert wrong_connection.returncode == 4
+    payload = json.loads(wrong_connection.stderr)
+    assert payload["error"]["code"] == "connection_scope_denied"
+
+    wrong_session = subprocess.run(
+        [str(TELEGRAM_SCRIPT), "chats", "--session", "/tmp/personal"],
+        cwd=str(REPO),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert wrong_session.returncode == 4
+    payload = json.loads(wrong_session.stderr)
+    assert payload["error"]["code"] == "session_scope_denied"
+
+
 def test_telegram_control_authority_limits_settings_commands() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

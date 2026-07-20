@@ -72,9 +72,11 @@ PROJECT VERBS (run inside a consuming project)
         envelope and skill setup but skips host wiring: ContextKit owns it.
         A legacy project `.capabilities/` envelope is preflighted and migrated
         into visible `capabilities/`; content conflicts refuse before writes.
-  context --claude|--codex
+  context --claude|--codex|--fragment
         Compose the session injection from the gate + snapshots + project
-        envelopes and place it where the host reads it (--claude:
+        envelopes. --fragment prints the manager-owned Markdown block without
+        writing host files; context owners such as ContextKit insert this output
+        verbatim. The host modes place the same block where the host reads it (--claude:
         .claude/rules/CAPABILITIES.md; --codex: the capabilities fragment used
         by the generated .codex context compiler).
         Composition reads files only and degradation is per-capability, never
@@ -86,8 +88,9 @@ PROJECT VERBS (run inside a consuming project)
         Do not create or edit generated context files by hand; rerun this
         command (or the generated Codex compiler hook) after manual envelope
         changes. In a ContextKit-managed project (`.contextkit/config.toml`),
-        ContextKit owns both host bindings and the combined context; this verb
-        delegates without writing and points to `contextkit build`.
+        ContextKit owns both host bindings and the combined context; the host
+        modes delegate without writing and point to `contextkit build`, while
+        --fragment remains the read-only provider surface ContextKit calls.
   ids <name>
         Render <name>'s project identifiers as markdown — the full labelled
         list the session context points to. (`<name> ids get|set|rm` is the
@@ -121,9 +124,11 @@ AUTHORING VERBS (emit agent-executable instructions; judgment stays with the age
   sanitize <name>  The procedure for reviewing this project's envelope for <name>.
 
 I/O CONTRACT
-  Success: JSON on stdout. Failure: {"error": {"code", "message", "hint"?}}
-  on stderr. Exit codes: 0 success, 2 auth, 3 not found, 5 network,
-  6 input/validation, 7 drift or conformance failures (doctor/audit).
+  Success: JSON on stdout, except the documented Markdown renderers
+  (`context --fragment`, `ids`). Failure: {"error": {"code", "message",
+  "hint"?}} on stderr. Exit codes: 0 success, 2 auth, 3 not found,
+  5 network, 6 input/validation, 7 drift or conformance failures
+  (doctor/audit).
 """
 
 from __future__ import annotations
@@ -175,10 +180,23 @@ DEFAULT_CONTEXT_PROMPT = (
     "one, check `capabilities ids <name>` or `<name> ids list` before "
     "rediscovering it. When you discover a reusable value that future sessions "
     "should not rediscover, persist it with `<name> ids set <label> <value> "
-    "--note \"<what it is>\"`, then refresh this generated context with "
-    "`capabilities context --claude` or `capabilities context --codex`. Do not "
+    "--note \"<what it is>\"`, then refresh this generated context through its "
+    "project context owner: `contextkit build` in a ContextKit-bound project, "
+    "otherwise `capabilities context --claude` or `capabilities context "
+    "--codex`. Do not "
     "store secrets, prose, workflows, volatile run results, or one-off record "
     "ids here."
+)
+CAPABILITIES_CONTEXT_INTRO = (
+    "Capabilities are self-contained, project-scoped CLIs installed on PATH and "
+    "managed by `capabilities`. Use `capabilities list` to inspect the installed "
+    "set and project gate, and `capabilities help` for the manager contract. "
+    "For an enabled capability, start with `<name> help`; use `<name> doctor` to "
+    "prove readiness, `<name> connections` to inspect credential resolution, and "
+    "`<name> guide` for its how-to guides. Project policy is controlled by "
+    "`capabilities enable|disable`; do not change a gate without the user's "
+    "instruction. Exit 4 is policy — a disabled capability or a read-only "
+    "connection; ask the user, never lift a gate yourself."
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1165,18 +1183,15 @@ def _compose_context(root: Path) -> str:
     gate = _load_gate(root)
     enabled = sorted(n for n, g in gate["capabilities"].items()
                      if (g or {}).get("enabled") is True)
-    lines: list[str] = ["# Capabilities", "", CONTEXT_BEGIN, ""]
+    lines: list[str] = [
+        "# Capabilities", "", CONTEXT_BEGIN, "",
+        CAPABILITIES_CONTEXT_INTRO, "",
+    ]
     if not enabled:
         lines += ["No capabilities are enabled in this project. "
                   "`capabilities list` shows what is installed; "
                   "`capabilities enable <name>` makes one visible here.", ""]
     else:
-        lines += ["Each enabled capability is a CLI on PATH. "
-                  "`<name> help` is the full contract; `<name> doctor` proves "
-                  "readiness; `<name> connections` shows where credentials "
-                  "resolve from; `<name> guide` lists its how-to guides. "
-                  "Exit 4 is policy — a disabled capability or a read-only "
-                  "connection; ask the user, never lift a gate yourself.", ""]
         lines += [_context_prompt(root), ""]
     for name in enabled:
         stub, manifest = _load_snapshots(name)
@@ -1563,6 +1578,9 @@ def _wire_codex(root: Path) -> dict:
 
 def cmd_context(host: str) -> None:
     root = _require_project()
+    if host == "fragment":
+        _emit(_compose_context(root))
+        return
     if _contextkit_managed(root):
         result = _contextkit_handoff(root, [host])
         result["skipped"] = True
@@ -1655,7 +1673,8 @@ Manager surface: `capabilities list` (what is installed and gated where),
 `capabilities install <name>`, `capabilities enable|disable <name>` (the
 per-project gate), `capabilities init` (wire a project), `capabilities ids
 <name>` (render a capability's project identifiers), `capabilities doctor` /
-`capabilities audit <name>` (verify), `capabilities help` (full contract).
+`capabilities audit <name>` (verify), `capabilities context --fragment`
+(render the manager-owned project block), `capabilities help` (full contract).
 
 Project visibility is host-owner-generated. Without ContextKit, in a Codex project run
 `capabilities init --codex` once, then `capabilities enable <name>`; after
@@ -1669,8 +1688,10 @@ overwritten on each `capabilities init --codex`. In Claude Code use
 Claude wiring) and the manager-owned `.claude/rules/CAPABILITIES.md`.
 
 When `.contextkit/config.toml` is present, ContextKit owns Claude/Codex hooks
-and the combined generated context. `capabilities init` and `capabilities
-context` do not write host wiring there; refresh with `contextkit build`.
+and the combined generated context. It obtains the manager-owned capability
+block through `capabilities context --fragment` and inserts it verbatim.
+`capabilities init` and the host-writing context modes do not write host wiring
+there; refresh with `contextkit build`.
 
 THE GATES (both exit 4 — ask the user, never lift one yourself): a capability
 disabled by project policy (capabilities/settings.json) refuses every verb;
@@ -2657,12 +2678,17 @@ def main() -> None:
     elif cmd == "init":
         cmd_init(flag("--claude"), flag("--codex"))
     elif cmd == "context":
-        if flag("--claude"):
+        modes = [name for name in ("--claude", "--codex", "--fragment") if flag(name)]
+        if len(modes) > 1:
+            _die(6, "input", "context accepts exactly one of --claude, --codex, or --fragment")
+        if flag("--fragment"):
+            cmd_context("fragment")
+        elif flag("--claude"):
             cmd_context("claude")
         elif flag("--codex"):
             cmd_context("codex")
         else:
-            _die(6, "input", "context needs --claude or --codex")
+            _die(6, "input", "context needs --claude, --codex, or --fragment")
     elif cmd == "ids":
         if not pos:
             _die(6, "input", "ids needs a capability name")

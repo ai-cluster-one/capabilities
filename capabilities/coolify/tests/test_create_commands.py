@@ -5,10 +5,9 @@ Run with: uv run --with httpx python3 capabilities/coolify/tests/test_create_com
 (the coolify bin declares httpx in its PEP-723 header, so bare python3 cannot import it)
 """
 
-import json
 import sys
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import types
 
 # Load the coolify script as a module by reading and exec'ing it
@@ -81,6 +80,7 @@ def test_app_create_public_git():
         assert body["git_repository"] == "https://github.com/user/repo"
         assert body["git_branch"] == "main"
         assert body["build_pack"] == "nixpacks"
+        assert result == response
 
 
 def test_app_create_registry_image():
@@ -110,6 +110,7 @@ def test_app_create_registry_image():
         body = calls[0]["body"]
         assert body["docker_registry_image_name"] == "nginx"
         assert body["docker_registry_image_tag"] == "latest"
+        assert result == response
 
 
 def test_service_create():
@@ -149,11 +150,12 @@ def test_service_create():
             assert body["server_uuid"] == "srv-uuid"
             assert body["environment_name"] == "production"
             assert body["name"] == "My Service"
-            assert body["instant_deploy"] == True
+            assert body["instant_deploy"] is True
 
             # Verify base64 encoding
             decoded = base64.b64decode(body["docker_compose_raw"]).decode()
             assert decoded == compose_content
+            assert result == response
 
 
 def test_env_list_typed_application():
@@ -171,6 +173,7 @@ def test_env_list_typed_application():
 
         assert len(calls) == 1
         assert calls[0]["path"] == "/applications/app-uuid/envs"
+        assert result == response
 
 
 def test_env_list_typed_service():
@@ -188,6 +191,7 @@ def test_env_list_typed_service():
 
         assert len(calls) == 1
         assert calls[0]["path"] == "/services/svc-uuid/envs"
+        assert result == response
 
 
 def test_env_bulk():
@@ -213,6 +217,7 @@ def test_env_bulk():
         assert body[0] == {"key": "KEY1", "value": "value1"}
         assert body[1] == {"key": "KEY2", "value": "value2"}
         assert body[2] == {"key": "KEY3", "value": "value3"}
+        assert result == response
 
 
 if __name__ == "__main__":
@@ -236,7 +241,7 @@ if __name__ == "__main__":
             test_fn()
             print(f"✓ {name}")
             passed += 1
-        except Exception as e:
+        except Exception:
             print(f"✗ {name}")
             traceback.print_exc()
             failed += 1

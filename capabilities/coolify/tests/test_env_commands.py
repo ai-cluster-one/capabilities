@@ -5,7 +5,6 @@ Run with: uv run --with httpx python3 capabilities/coolify/tests/test_env_comman
 (the coolify bin declares httpx in its PEP-723 header, so bare python3 cannot import it)
 """
 
-import json
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -57,8 +56,8 @@ def test_env_set_updates_all_matching_entries():
         assert result["updated"] == 2
         assert result["key"] == "SHARED_KEY"
         assert len(patch_calls) == 2
-        assert patch_calls[0]["is_preview"] == False
-        assert patch_calls[1]["is_preview"] == True
+        assert patch_calls[0]["is_preview"] is False
+        assert patch_calls[1]["is_preview"] is True
 
 
 def test_env_rm_deletes_all_matching_entries():
@@ -106,8 +105,8 @@ def test_env_rm_reports_preview_status():
     with patch.object(coolify_module, '_request', side_effect=mock_request):
         result = coolify_module.cmd_env_rm(None, "test-uuid", "TEST_KEY")
 
-        assert result["entries"][0]["is_preview"] == False
-        assert result["entries"][1]["is_preview"] == True
+        assert result["entries"][0]["is_preview"] is False
+        assert result["entries"][1]["is_preview"] is True
 
 
 def test_env_rm_fails_when_key_not_found():
@@ -160,7 +159,7 @@ if __name__ == "__main__":
             test_fn()
             print(f"✓ {name}")
             passed += 1
-        except Exception as e:
+        except Exception:
             print(f"✗ {name}")
             traceback.print_exc()
             failed += 1
