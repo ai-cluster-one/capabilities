@@ -43,6 +43,7 @@ from pytgcalls.types import CallConfig, ChatUpdate, GroupCallConfig
 from pytgcalls.types.raw import AudioParameters, AudioStream, Stream
 from telethon import TelegramClient, events
 from telethon.errors import AuthKeyError, RPCError
+from telethon.errors.common import TypeNotFoundError
 from telethon.tl.types import (
     InputGroupCallInviteMessage,
     InputGroupCallSlug,
@@ -709,16 +710,68 @@ async def watch_groups(
     call_closed_event = asyncio.Event()
     active: dict | None = None
     recorded_call_ids: dict[int, int] = {}
+    schema_fallback_groups: set[int] = set()
     recordings = 0
 
     bridge = getattr(getattr(calls, "_app", None), "_bind_client", None)
+
+    async def active_call_from_history(chat_id: int):
+        """Recover the current call without decoding ChannelFull.
+
+        Telegram can introduce a ChannelFull constructor before Telethon ships
+        its schema. Group-call service messages still carry an InputGroupCall,
+        so the newest start/end action is a safe fallback and lets PyTgCalls
+        join through its cache without repeating the unsupported full-chat read.
+        """
+        try:
+            async for message in client.iter_messages(chat_id, limit=100):
+                action = getattr(message, "action", None)
+                if not isinstance(action, MessageActionGroupCall):
+                    continue
+                if getattr(action, "duration", None) is not None:
+                    return None
+                call_ref = getattr(action, "call", None)
+                if call_ref is None:
+                    return None
+                cache = getattr(bridge, "_cache", None)
+                if cache is not None:
+                    cache.set_cache(chat_id, call_ref)
+                emit_event(
+                    "group_probe_fallback",
+                    chat_id=chat_id,
+                    call_id=str(getattr(call_ref, "id", "")),
+                    source_message_id=message.id,
+                )
+                return call_ref
+        except (RPCError, TypeNotFoundError) as exc:
+            emit_event(
+                "group_probe_failed",
+                chat_id=chat_id,
+                method="service_message_fallback",
+                error=type(exc).__name__,
+            )
+        return None
 
     async def active_call(chat_id: int):
         get_call = getattr(bridge, "get_call", None)
         if get_call is None:
             raise RecorderError(5, "watch_unsupported", "PyTgCalls call inspection is unavailable")
         try:
-            return await get_call(chat_id)
+            call_ref = await get_call(chat_id)
+            schema_fallback_groups.discard(chat_id)
+            cache = getattr(bridge, "_cache", None)
+            if call_ref is not None and cache is not None:
+                cache.set_cache(chat_id, call_ref)
+            return call_ref
+        except TypeNotFoundError:
+            if chat_id not in schema_fallback_groups:
+                emit_event(
+                    "group_probe_schema_fallback",
+                    chat_id=chat_id,
+                    reason="unknown_full_chat_constructor",
+                )
+                schema_fallback_groups.add(chat_id)
+            return await active_call_from_history(chat_id)
         except RPCError as exc:
             emit_event("group_probe_failed", chat_id=chat_id, error=str(exc))
             return None
