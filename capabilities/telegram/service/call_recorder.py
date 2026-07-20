@@ -44,6 +44,7 @@ from pytgcalls.types.raw import AudioParameters, AudioStream, Stream
 from telethon import TelegramClient, events
 from telethon.errors import AuthKeyError, RPCError
 from telethon.errors.common import TypeNotFoundError
+from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.tl.types import (
     InputGroupCallInviteMessage,
@@ -755,6 +756,7 @@ async def watch_groups(
         request_dir.mkdir(parents=True, exist_ok=True)
 
     client = TelegramClient(str(runtime_session), config["api_id"], config["api_hash"])
+    history_client: TelegramClient | None = None
     calls = PyTgCalls(client)
     stop_event = asyncio.Event()
     call_closed_event = asyncio.Event()
@@ -784,7 +786,15 @@ async def watch_groups(
                     reason="unknown_full_chat_constructor",
                 )
                 schema_fallback_groups.add(chat_id)
-            return await active_group_call_from_history(client, bridge, chat_id)
+            if history_client is None:
+                emit_event(
+                    "group_probe_failed",
+                    chat_id=chat_id,
+                    method="service_message_fallback",
+                    error="history_client_unavailable",
+                )
+                return None
+            return await active_group_call_from_history(history_client, bridge, chat_id)
         except RPCError as exc:
             emit_event("group_probe_failed", chat_id=chat_id, error=str(exc))
             return None
@@ -943,6 +953,13 @@ async def watch_groups(
             raise RecorderError(2, "session_unauthorized",
                                 f"Telegram session for {config['id']!r} is not authorized")
         me = await client.get_me()
+        history_client = TelegramClient(
+            StringSession(StringSession.save(client.session)),
+            config["api_id"],
+            config["api_hash"],
+            receive_updates=False,
+        )
+        await history_client.connect()
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
         # calls.start() creates the MTProto bridge used by active_call().
@@ -1025,6 +1042,8 @@ async def watch_groups(
         if active is not None:
             with contextlib.suppress(NotInCallError, NoActiveGroupCall, RPCError):
                 await calls.leave_call(active["chat_id"])
+        if history_client is not None and history_client.is_connected():
+            await history_client.disconnect()
         if client.is_connected():
             await client.disconnect()
 
