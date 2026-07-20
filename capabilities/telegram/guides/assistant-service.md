@@ -114,10 +114,12 @@ Telethon SQLite session.
   reconnect, and incomplete post-worker delivery all terminate that group and move
   the persisted job to a terminal error or startup-retry state.
 - The daemon supervises its media recorder when at least one allowed group opts in.
-  The recorder joins muted, writes the mixed incoming stream directly as OGG/Opus,
-  without an intermediate or post-call conversion, and stores a JSON
-  sidecar with the group, Telegram call id, timestamps, trigger, and participant
-  snapshots. It does not create a call and does not transcribe the recording.
+  The recorder joins muted and uses PyTgCalls' built-in `RecordStream` for the
+  complete joined interval. That supported path captures MP3; after Marvin leaves,
+  FFmpeg converts the closed capture to the final OGG/Opus artifact. The source MP3
+  is removed only after successful conversion and is retained if conversion fails.
+  The JSON sidecar stores the group, Telegram call id, joined interval, trigger,
+  and participant state changes. It does not create a call or transcribe audio.
 
 ## Group Call Recording
 
@@ -147,11 +149,19 @@ Call recording is disabled unless an allowed group explicitly selects a mode:
 - `disabled`: no media worker is allowed to join for this group. This is the default.
 - `send_to_chat: true`: after the OGG container closes, upload it to the same
   group and persist the delivery status and Telegram message id in the JSON sidecar.
-  Failed uploads are retried up to three times. The default is `false`.
+  Failed uploads are retried up to three times. The default is `false`. Delivery
+  starts only after the MP3-to-OGG conversion succeeds; the recorder does not
+  classify or reject a completed recording based on its loudness.
+
+Transient Telegram join failures are retried without crashing the assistant
+daemon. After a successful join, one recording runs until Marvin leaves or the
+voice chat closes. The daemon does not split that interval into media fragments
+or automatically rejoin the same call after Marvin has left it.
 
 Only one call can be recorded by one Telegram account at a time. The first version
 stores the incoming mixed stream; participant IDs and audio-source identifiers are
-captured as metadata, but the OGG does not contain separate per-participant tracks.
+captured in participant snapshots, but the OGG does not contain separate
+per-participant tracks.
 The service never starts a group call itself. It posts the completed recording only
 when `send_to_chat` is enabled; participant notice remains the operator's responsibility.
 

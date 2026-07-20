@@ -28,7 +28,6 @@ import contextlib
 import json
 import os
 import re
-import shlex
 import signal
 import sqlite3
 import sys
@@ -36,11 +35,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ntgcalls import MediaSource
 from pytgcalls import PyTgCalls, filters
 from pytgcalls.exceptions import NoActiveGroupCall, NotInCallError
-from pytgcalls.types import CallConfig, ChatUpdate, GroupCallConfig
-from pytgcalls.types.raw import AudioParameters, AudioStream, Stream
+from pytgcalls.types import (
+    CallConfig,
+    ChatUpdate,
+    GroupCallConfig,
+    RecordStream,
+)
 from telethon import TelegramClient, events
 from telethon.errors import AuthKeyError, RPCError
 from telethon.errors.common import TypeNotFoundError
@@ -59,6 +61,9 @@ CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 USER_CONNECTIONS = CONFIG_HOME / "telegram" / "connections.json"
 USER_CREDENTIALS = CONFIG_HOME / "telegram" / "credentials.env"
+JOIN_ATTEMPTS = 3
+JOIN_TIMEOUT_SECONDS = 20
+JOIN_RETRY_COOLDOWN_SECONDS = 15
 
 
 class RecorderError(RuntimeError):
@@ -246,39 +251,80 @@ def watch_output(connection_id: str, chat_id: int, call_id: int) -> Path:
             / f"{timestamp}-{safe_part(str(chat_id))}-call-{call_id}.ogg")
 
 
-def ogg_opus_record_stream(output: Path) -> Stream:
-    """Write playback PCM directly to an OGG container with the Opus codec.
-
-    PyTgCalls' convenience ``RecordStream(path)`` always invokes libmp3lame for
-    48 kHz audio, regardless of the filename extension.  Supplying a raw shell
-    stream lets the media engine encode the final OGG/Opus artifact while the
-    call is in progress, without creating or converting an intermediate MP3.
-    """
+def mp3_capture_path(output: Path) -> Path:
     if output.suffix.lower() != ".ogg":
         raise RecorderError(6, "ogg_output_required", "recording output must end in .ogg")
-    command = shlex.join([
-        "ffmpeg",
-        "-y",
-        "-loglevel", "quiet",
-        "-f", "s16le",
-        "-ar", "48000",
-        "-ac", "2",
-        "-i", "pipe:0",
-        "-codec:a", "libopus",
-        "-b:a", "96k",
-        "-vbr", "on",
-        "-application", "voip",
-        "-f", "ogg",
-        "-flush_packets", "1",
-        str(output),
-    ])
-    return Stream(
-        microphone=AudioStream(
-            media_source=MediaSource.SHELL,
-            path=command,
-            parameters=AudioParameters(bitrate=48000, channels=2),
-        ),
-    )
+    return output.with_suffix(".mp3")
+
+
+def built_in_record_stream(capture: Path) -> RecordStream:
+    """Use PyTgCalls' supported MP3 recorder for the live call."""
+    if capture.suffix.lower() != ".mp3":
+        raise RecorderError(6, "mp3_capture_required", "capture path must end in .mp3")
+    return RecordStream(capture)
+
+
+async def finalize_mp3_capture(capture: Path, output: Path) -> dict:
+    """Convert a closed built-in MP3 capture to the final OGG/Opus artifact."""
+    result = {
+        "status": "failed",
+        "error": None,
+        "source_path": str(capture),
+        "source_bytes": capture.stat().st_size if capture.exists() else 0,
+        "source_retained": capture.exists(),
+        "output_bytes": 0,
+    }
+    if not result["source_bytes"]:
+        result["error"] = "mp3_capture_is_empty"
+        return result
+
+    temporary = output.with_name(f".{output.stem}.{os.getpid()}.tmp.ogg")
+    with contextlib.suppress(OSError):
+        temporary.unlink()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-loglevel", "error",
+            "-i", str(capture),
+            "-map", "0:a:0",
+            "-codec:a", "libopus",
+            "-b:a", "96k",
+            "-vbr", "on",
+            "-application", "voip",
+            "-f", "ogg",
+            str(temporary),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+    except OSError as exc:
+        result["error"] = f"ffmpeg_unavailable: {exc}"[:500]
+        return result
+
+    if process.returncode != 0:
+        detail = stderr.decode(errors="replace").strip()
+        result["error"] = f"ffmpeg_exit_{process.returncode}: {detail}"[:500]
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        return result
+    if not temporary.exists() or temporary.stat().st_size == 0:
+        result["error"] = "ogg_output_is_empty"
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        return result
+
+    os.replace(temporary, output)
+    result.update({
+        "status": "complete",
+        "output_bytes": output.stat().st_size,
+    })
+    try:
+        capture.unlink()
+    except OSError as exc:
+        result["cleanup_error"] = f"{type(exc).__name__}: {exc}"[:500]
+    result["source_retained"] = capture.exists()
+    return result
 
 
 def iso_utc(value: datetime | None = None) -> str:
@@ -430,6 +476,7 @@ async def run(args: argparse.Namespace, config: dict, runtime_session: Path) -> 
     joined = False
     chat_id: int | None = None
     output: Path | None = None
+    capture: Path | None = None
     started_at: float | None = None
     stop_reason = "signal"
     try:
@@ -462,8 +509,10 @@ async def run(args: argparse.Namespace, config: dict, runtime_session: Path) -> 
 
         output = (Path(args.output).expanduser().resolve() if args.output
                   else default_output(config["id"], str(chat_id)))
-        if output.exists():
-            raise RecorderError(6, "output_exists", f"recording already exists: {output}")
+        capture = mp3_capture_path(output)
+        existing = next((path for path in (output, capture) if path.exists()), None)
+        if existing is not None:
+            raise RecorderError(6, "output_exists", f"recording already exists: {existing}")
         output.parent.mkdir(parents=True, exist_ok=True)
 
         stop_event = asyncio.Event()
@@ -482,7 +531,7 @@ async def run(args: argparse.Namespace, config: dict, runtime_session: Path) -> 
 
         await calls.record(
             chat_id,
-            ogg_opus_record_stream(output),
+            built_in_record_stream(capture),
             config=GroupCallConfig(auto_start=False),
         )
         await calls.mute(chat_id)
@@ -494,8 +543,14 @@ async def run(args: argparse.Namespace, config: dict, runtime_session: Path) -> 
         with contextlib.suppress(NotInCallError, NoActiveGroupCall, RPCError):
             await calls.leave_call(chat_id)
             joined = False
-        # The recording subprocess flushes its container as the call source closes.
-        await asyncio.sleep(0.25)
+        finalized = await finalize_mp3_capture(capture, output)
+        if finalized["status"] != "complete":
+            raise RecorderError(
+                5,
+                "recording_finalize_failed",
+                finalized["error"] or "recording conversion failed",
+                f"the source MP3 was retained at {capture}",
+            )
         return {
             "ok": True,
             "mode": "record",
@@ -504,7 +559,7 @@ async def run(args: argparse.Namespace, config: dict, runtime_session: Path) -> 
             "chat_id": chat_id,
             "chat": title,
             "output": str(output),
-            "bytes": output.stat().st_size if output.exists() else 0,
+            "bytes": finalized["output_bytes"],
             "duration_seconds": round(time.time() - started_at, 3),
             "stopped": stop_reason,
         }
@@ -536,7 +591,9 @@ def participant_row(participant) -> dict:
 async def participant_snapshot(calls: PyTgCalls, chat_id: int) -> list[dict]:
     try:
         participants = await calls.get_participants(chat_id) or []
-    except (NotInCallError, NoActiveGroupCall, RPCError):
+    except Exception:
+        # Participant data is diagnostic.  A transient native-media or MTProto
+        # failure here must not tear down an otherwise healthy recording.
         return []
     return sorted(
         (participant_row(participant) for participant in participants),
@@ -559,7 +616,7 @@ async def group_call_started_at(
                 continue
             if getattr(action, "duration", None) is None:
                 return iso_utc(getattr(message, "date", None))
-    except RPCError:
+    except (RPCError, TypeNotFoundError):
         return None
     return None
 
@@ -622,27 +679,6 @@ def load_request(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-async def settled_file_size(path: Path, attempts: int = 20) -> tuple[int, bool]:
-    """Wait until the encoder has stopped growing the finalized container."""
-    previous = -1
-    stable_reads = 0
-    size = 0
-    for _ in range(attempts):
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
-        if size > 0 and size == previous:
-            stable_reads += 1
-            if stable_reads >= 2:
-                return size, True
-        else:
-            stable_reads = 0
-        previous = size
-        await asyncio.sleep(0.25)
-    return size, False
-
-
 def display_duration(seconds: float | int | None) -> str:
     total = max(0, round(float(seconds or 0)))
     hours, remainder = divmod(total, 3600)
@@ -668,7 +704,7 @@ async def send_recording_to_chat(
         write_metadata(metadata_path, metadata)
         return
     if not metadata["audio"].get("settled"):
-        delivery.update({"status": "failed", "error": "recording_file_did_not_settle"})
+        delivery.update({"status": "failed", "error": "recording_file_not_finalized"})
         write_metadata(metadata_path, metadata)
         emit_event("recording_send_failed", chat_id=chat_id,
                    output=str(output), error=delivery["error"])
@@ -755,14 +791,21 @@ async def watch_groups(
     if request_groups:
         request_dir.mkdir(parents=True, exist_ok=True)
 
-    client = TelegramClient(str(runtime_session), config["api_id"], config["api_hash"])
-    history_client: TelegramClient | None = None
+    client = TelegramClient(
+        str(runtime_session),
+        config["api_id"],
+        config["api_hash"],
+        request_retries=1,
+    )
+    history_session: str | None = None
     calls = PyTgCalls(client)
     stop_event = asyncio.Event()
     call_closed_event = asyncio.Event()
     active: dict | None = None
     recorded_call_ids: dict[int, int] = {}
     schema_fallback_groups: set[int] = set()
+    schema_retry_after: dict[int, float] = {}
+    join_retry_after: dict[tuple[int, int], float] = {}
     recordings = 0
 
     bridge = getattr(getattr(calls, "_app", None), "_bind_client", None)
@@ -786,15 +829,34 @@ async def watch_groups(
                     reason="unknown_full_chat_constructor",
                 )
                 schema_fallback_groups.add(chat_id)
-            if history_client is None:
+            if history_session is None or time.monotonic() < schema_retry_after.get(chat_id, 0):
+                return None
+            fallback_client = TelegramClient(
+                StringSession(history_session),
+                config["api_id"],
+                config["api_hash"],
+                receive_updates=False,
+                request_retries=1,
+            )
+            try:
+                await fallback_client.connect()
+                call_ref = await active_group_call_from_history(
+                    fallback_client, bridge, chat_id
+                )
+            except (RPCError, TypeNotFoundError) as exc:
                 emit_event(
                     "group_probe_failed",
                     chat_id=chat_id,
                     method="service_message_fallback",
-                    error="history_client_unavailable",
+                    error=type(exc).__name__,
                 )
-                return None
-            return await active_group_call_from_history(history_client, bridge, chat_id)
+                call_ref = None
+            finally:
+                if fallback_client.is_connected():
+                    await fallback_client.disconnect()
+            if call_ref is None:
+                schema_retry_after[chat_id] = time.monotonic() + 30
+            return call_ref
         except RPCError as exc:
             emit_event("group_probe_failed", chat_id=chat_id, error=str(exc))
             return None
@@ -813,21 +875,29 @@ async def watch_groups(
                        trigger=trigger, reason="call_already_recorded")
             return False
 
-        entity = await client.get_entity(chat_id)
-        title = getattr(entity, "title", None) or str(chat_id)
+        retry_key = (chat_id, call_id)
+        if time.monotonic() < join_retry_after.get(retry_key, 0):
+            return False
+
+        try:
+            entity = await client.get_entity(chat_id)
+            title = getattr(entity, "title", None) or str(chat_id)
+        except (RPCError, TypeNotFoundError, ValueError):
+            title = str(chat_id)
         output = watch_output(config["id"], chat_id, call_id)
+        capture = mp3_capture_path(output)
         metadata_path = output.with_suffix(".json")
         output.parent.mkdir(parents=True, exist_ok=True)
         detected_at = iso_utc()
         metadata = {
-            "schema_version": 1,
+            "schema_version": 3,
             "status": "joining",
             "connection": config["id"],
             "account_id": str((await client.get_me()).id),
             "chat_id": str(chat_id),
             "chat_title": title,
             "telegram_call_id": str(call_id),
-            "telegram_call_started_at": await group_call_started_at(client, chat_id, call_id),
+            "telegram_call_started_at": None,
             "detected_at": detected_at,
             "recording_started_at": None,
             "recording_ended_at": None,
@@ -835,14 +905,33 @@ async def watch_groups(
             "trigger": trigger,
             "request": request,
             "stop_reason": None,
+            "join": {
+                "attempts": 0,
+                "status": "joining",
+                "errors": [],
+            },
             "audio": {
                 "path": str(output),
                 "format": output.suffix.lstrip("."),
                 "codec": "opus",
                 "bytes": 0,
+                "settled": False,
+                "capture_method": "pytgcalls_mp3_then_ffmpeg_ogg",
+                "source": {
+                    "path": str(capture),
+                    "format": "mp3",
+                    "bytes": 0,
+                    "retained": False,
+                },
+                "conversion": {
+                    "status": "pending",
+                    "error": None,
+                },
                 "tracks": [{"kind": "mixed", "participants_separated": False}],
             },
             "participants_at_start": [],
+            "participants_last_seen": [],
+            "participant_state_changes": [],
             "participants_at_end": [],
             "delivery": {
                 "enabled": chat_id in send_to_chat_groups,
@@ -854,15 +943,92 @@ async def watch_groups(
             },
         }
         write_metadata(metadata_path, metadata)
-        try:
-            await calls.record(
-                chat_id,
-                ogg_opus_record_stream(output),
-                config=GroupCallConfig(auto_start=False),
+
+        joined = False
+        for attempt in range(1, JOIN_ATTEMPTS + 1):
+            metadata["join"].update({"attempts": attempt, "status": "joining"})
+            write_metadata(metadata_path, metadata)
+            cache = getattr(bridge, "_cache", None)
+            if cache is not None:
+                cache.set_cache(chat_id, call_ref)
+            try:
+                await asyncio.wait_for(
+                    calls.record(
+                        chat_id,
+                        built_in_record_stream(capture),
+                        config=GroupCallConfig(auto_start=False),
+                    ),
+                    timeout=JOIN_TIMEOUT_SECONDS,
+                )
+                await calls.mute(chat_id)
+            except NoActiveGroupCall:
+                with contextlib.suppress(OSError):
+                    capture.unlink()
+                metadata.update({
+                    "status": "not_started",
+                    "stop_reason": "no_active_voice_chat",
+                })
+                metadata["join"]["status"] = "no_active_voice_chat"
+                metadata["delivery"].update({
+                    "status": "skipped",
+                    "error": "no_active_voice_chat",
+                })
+                write_metadata(metadata_path, metadata)
+                return False
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"[:500]
+                metadata["join"]["errors"].append({
+                    "attempt": attempt,
+                    "error": error,
+                    "at": iso_utc(),
+                })
+                metadata["join"]["status"] = "retrying"
+                write_metadata(metadata_path, metadata)
+                emit_event(
+                    "recording_join_failed",
+                    chat_id=chat_id,
+                    call_id=str(call_id),
+                    attempt=attempt,
+                    error=error,
+                )
+                with contextlib.suppress(Exception):
+                    await calls.leave_call(chat_id)
+                with contextlib.suppress(OSError):
+                    capture.unlink()
+                if attempt < JOIN_ATTEMPTS:
+                    current_call = await active_call(chat_id)
+                    if current_call is None or int(current_call.id) != call_id:
+                        metadata.update({
+                            "status": "not_started",
+                            "stop_reason": "voice_chat_closed_during_join",
+                        })
+                        metadata["join"]["status"] = "call_closed"
+                        metadata["delivery"].update({
+                            "status": "skipped",
+                            "error": "voice_chat_closed_during_join",
+                        })
+                        write_metadata(metadata_path, metadata)
+                        return False
+                    call_ref = current_call
+                    await asyncio.sleep(2 * attempt)
+                    continue
+                break
+            else:
+                joined = True
+                metadata["join"]["status"] = "joined"
+                join_retry_after.pop(retry_key, None)
+                break
+
+        if not joined:
+            metadata.update({"status": "join_failed", "stop_reason": "join_failed"})
+            metadata["join"]["status"] = "failed"
+            metadata["delivery"].update({
+                "status": "skipped",
+                "error": "join_failed",
+            })
+            join_retry_after[retry_key] = (
+                time.monotonic() + JOIN_RETRY_COOLDOWN_SECONDS
             )
-            await calls.mute(chat_id)
-        except NoActiveGroupCall:
-            metadata.update({"status": "not_started", "stop_reason": "no_active_voice_chat"})
             write_metadata(metadata_path, metadata)
             return False
 
@@ -872,17 +1038,30 @@ async def watch_groups(
             "chat_id": chat_id,
             "call_id": call_id,
             "output": output,
+            "capture": capture,
             "metadata_path": metadata_path,
             "metadata": metadata,
             "started_monotonic": started_monotonic,
             "stop_reason": None,
+            "trigger": trigger,
+            "request": request,
         }
-        await asyncio.sleep(0.25)
+        call_closed_event.clear()
+        recording_started_at = iso_utc()
+        await asyncio.sleep(0.5)
+        participants = await participant_snapshot(calls, chat_id)
+        account_id = metadata["account_id"]
         metadata.update({
             "status": "recording",
-            "recording_started_at": iso_utc(),
-            "participants_at_start": await participant_snapshot(calls, chat_id),
+            "recording_started_at": recording_started_at,
+            "participants_at_start": participants,
+            "participants_last_seen": participants,
+            "participant_state_changes": [{"at": iso_utc(), "participants": participants}],
         })
+        active["last_participants"] = participants
+        metadata["join"]["participant_confirmed"] = any(
+            row["user_id"] == account_id for row in participants
+        )
         write_metadata(metadata_path, metadata)
         emit_event(
             "recording_started",
@@ -896,28 +1075,40 @@ async def watch_groups(
         )
         return True
 
-    async def finish_recording(reason: str) -> None:
+    async def finish_recording(reason: str) -> dict | None:
         nonlocal active, recordings
         if active is None:
-            return
+            return None
         current = active
         chat_id = current["chat_id"]
         metadata = current["metadata"]
-        metadata["participants_at_end"] = await participant_snapshot(calls, chat_id)
-        with contextlib.suppress(NotInCallError, NoActiveGroupCall, RPCError):
+        recording_ended_at = iso_utc()
+        wall_duration = round(time.monotonic() - current["started_monotonic"], 3)
+        metadata["participants_at_end"] = metadata.get("participants_last_seen", [])
+        with contextlib.suppress(Exception):
             await calls.leave_call(chat_id)
         output = current["output"]
-        duration = round(time.monotonic() - current["started_monotonic"], 3)
-        recording_ended_at = iso_utc()
-        size, settled = await settled_file_size(output)
+        capture = current["capture"]
+        finalized = await finalize_mp3_capture(capture, output)
+        status = "complete" if finalized["status"] == "complete" else "conversion_failed"
         metadata.update({
-            "status": "complete" if size else "empty",
+            "status": status,
             "recording_ended_at": recording_ended_at,
-            "duration_seconds": duration,
+            "duration_seconds": wall_duration,
             "stop_reason": reason,
         })
-        metadata["audio"]["bytes"] = size
-        metadata["audio"]["settled"] = settled
+        metadata["audio"]["bytes"] = finalized["output_bytes"]
+        metadata["audio"]["settled"] = finalized["status"] == "complete"
+        metadata["audio"]["source"].update({
+            "bytes": finalized["source_bytes"],
+            "retained": finalized["source_retained"],
+        })
+        metadata["audio"]["conversion"].update({
+            "status": finalized["status"],
+            "error": finalized["error"],
+        })
+        if finalized.get("cleanup_error"):
+            metadata["audio"]["source"]["cleanup_error"] = finalized["cleanup_error"]
         write_metadata(current["metadata_path"], metadata)
         emit_event(
             "recording_finished",
@@ -925,8 +1116,11 @@ async def watch_groups(
             call_id=str(current["call_id"]),
             output=str(output),
             metadata=str(current["metadata_path"]),
-            bytes=size,
-            duration_seconds=duration,
+            bytes=finalized["output_bytes"],
+            source_bytes=finalized["source_bytes"],
+            duration_seconds=wall_duration,
+            status=status,
+            conversion_error=finalized["error"],
             stop_reason=reason,
         )
         if metadata["delivery"]["enabled"]:
@@ -940,6 +1134,7 @@ async def watch_groups(
         recordings += 1
         active = None
         call_closed_event.clear()
+        return current
 
     @calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))
     async def call_closed(_client: PyTgCalls, update: ChatUpdate):
@@ -953,13 +1148,7 @@ async def watch_groups(
             raise RecorderError(2, "session_unauthorized",
                                 f"Telegram session for {config['id']!r} is not authorized")
         me = await client.get_me()
-        history_client = TelegramClient(
-            StringSession(StringSession.save(client.session)),
-            config["api_id"],
-            config["api_hash"],
-            receive_updates=False,
-        )
-        await history_client.connect()
+        history_session = StringSession.save(client.session)
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
         # calls.start() creates the MTProto bridge used by active_call().
@@ -983,12 +1172,39 @@ async def watch_groups(
                 try:
                     await asyncio.wait_for(call_closed_event.wait(), timeout=args.poll_seconds)
                 except asyncio.TimeoutError:
-                    call_ref = await active_call(active["chat_id"])
-                    if call_ref is None or int(call_ref.id) != active["call_id"]:
-                        active["stop_reason"] = "voice_chat_closed"
-                        call_closed_event.set()
+                    pass
+                if stop_event.is_set():
+                    break
                 if call_closed_event.is_set():
                     await finish_recording(active["stop_reason"] or "voice_chat_closed")
+                    continue
+
+                chat_id = active["chat_id"]
+                participants = await participant_snapshot(calls, chat_id)
+                if participants and participants != active.get("last_participants"):
+                    active["last_participants"] = participants
+                    active["metadata"]["participants_last_seen"] = participants
+                    active["metadata"]["participant_state_changes"].append({
+                        "at": iso_utc(),
+                        "participants": participants,
+                    })
+                    write_metadata(active["metadata_path"], active["metadata"])
+                if (participants and not any(
+                        row["user_id"] == active["metadata"]["account_id"]
+                        for row in participants)):
+                    active["stop_reason"] = "recorder_left_call"
+                    call_closed_event.set()
+
+                if call_closed_event.is_set():
+                    await finish_recording(active["stop_reason"] or "recorder_left_call")
+                    continue
+
+                call_ref = await active_call(chat_id)
+                if call_ref is None or int(call_ref.id) != active["call_id"]:
+                    active["stop_reason"] = "voice_chat_closed"
+                    call_closed_event.set()
+                    await finish_recording("voice_chat_closed")
+                    continue
                 continue
 
             for path in sorted(request_dir.glob("*.json")) if request_groups else ():
@@ -1042,8 +1258,6 @@ async def watch_groups(
         if active is not None:
             with contextlib.suppress(NotInCallError, NoActiveGroupCall, RPCError):
                 await calls.leave_call(active["chat_id"])
-        if history_client is not None and history_client.is_connected():
-            await history_client.disconnect()
         if client.is_connected():
             await client.disconnect()
 
@@ -1074,8 +1288,10 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             return
         output = (Path(args.output).expanduser().resolve() if args.output
                   else default_output(config["id"], f"{mode}-{caller_id}"))
-        if output.exists():
-            failure = f"recording already exists: {output}"
+        capture = mp3_capture_path(output)
+        existing = next((path for path in (output, capture) if path.exists()), None)
+        if existing is not None:
+            failure = f"recording already exists: {existing}"
             stop_event.set()
             return
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1092,6 +1308,7 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             "mode": mode,
             "source_message_id": source_message_id,
             "output": output,
+            "capture": capture,
             "started_at": time.time(),
         }
         emit_event(
@@ -1108,7 +1325,7 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             )
             await call_client.record(
                 caller_id,
-                ogg_opus_record_stream(output),
+                built_in_record_stream(capture),
                 config=call_config,
             )
         except Exception as exc:
@@ -1257,15 +1474,17 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
         caller_id = active["caller_id"]
         with contextlib.suppress(NotInCallError, NoActiveGroupCall, RPCError):
             await calls.leave_call(caller_id)
-        await asyncio.sleep(0.25)
         output = active["output"]
+        finalized = await finalize_mp3_capture(active["capture"], output)
+        if finalized["status"] != "complete" and failure is None:
+            failure = finalized["error"] or "recording conversion failed"
         result = {
             "ok": failure is None,
             "mode": "listen",
             "connection": config["id"],
             "caller_id": caller_id,
             "output": str(output),
-            "bytes": output.stat().st_size if output.exists() else 0,
+            "bytes": finalized["output_bytes"],
             "duration_seconds": round(time.time() - active["started_at"], 3),
             "stopped": stop_reason,
         }
