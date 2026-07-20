@@ -49,6 +49,8 @@ from telethon.errors.common import TypeNotFoundError
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.tl.types import (
+    DocumentAttributeAudio,
+    DocumentAttributeFilename,
     InputGroupCallInviteMessage,
     InputGroupCallSlug,
     MessageActionConferenceCall,
@@ -264,6 +266,30 @@ def built_in_record_stream(capture: Path) -> RecordStream:
     return RecordStream(capture)
 
 
+async def probe_audio_duration(path: Path) -> float | None:
+    """Return the finalized media duration without making delivery depend on probing."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await process.communicate()
+    except OSError:
+        return None
+    if process.returncode != 0:
+        return None
+    try:
+        duration = float(stdout.decode().strip())
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
+
+
 async def finalize_mp3_capture(capture: Path, output: Path) -> dict:
     """Convert a closed built-in MP3 capture to the final OGG/Opus artifact."""
     result = {
@@ -273,6 +299,7 @@ async def finalize_mp3_capture(capture: Path, output: Path) -> dict:
         "source_bytes": capture.stat().st_size if capture.exists() else 0,
         "source_retained": capture.exists(),
         "output_bytes": 0,
+        "duration_seconds": None,
     }
     if not result["source_bytes"]:
         result["error"] = "mp3_capture_is_empty"
@@ -318,6 +345,7 @@ async def finalize_mp3_capture(capture: Path, output: Path) -> dict:
     result.update({
         "status": "complete",
         "output_bytes": output.stat().st_size,
+        "duration_seconds": await probe_audio_duration(output),
     })
     try:
         capture.unlink()
@@ -691,6 +719,15 @@ def recording_caption(metadata: dict) -> str:
     return f"Запись звонка · {duration}"
 
 
+def audio_document_attributes(output: Path, duration_seconds: float | int | None) -> list:
+    """Describe the OGG as seekable Telegram audio instead of a generic document."""
+    duration = max(1, round(float(duration_seconds or 0)))
+    return [
+        DocumentAttributeFilename(file_name=output.name),
+        DocumentAttributeAudio(duration=duration, voice=False),
+    ]
+
+
 async def send_recording_to_chat(
     client: TelegramClient,
     chat_id: int,
@@ -718,6 +755,13 @@ async def send_recording_to_chat(
                 chat_id,
                 file=str(output),
                 caption=recording_caption(metadata),
+                mime_type="audio/ogg",
+                attributes=audio_document_attributes(
+                    output,
+                    metadata.get("duration_seconds"),
+                ),
+                force_document=False,
+                voice_note=False,
             )
         except Exception as exc:
             delivery.update({
@@ -1091,10 +1135,12 @@ async def watch_groups(
         capture = current["capture"]
         finalized = await finalize_mp3_capture(capture, output)
         status = "complete" if finalized["status"] == "complete" else "conversion_failed"
+        media_duration = finalized.get("duration_seconds") or wall_duration
         metadata.update({
             "status": status,
             "recording_ended_at": recording_ended_at,
-            "duration_seconds": wall_duration,
+            "duration_seconds": media_duration,
+            "wall_duration_seconds": wall_duration,
             "stop_reason": reason,
         })
         metadata["audio"]["bytes"] = finalized["output_bytes"]
@@ -1118,7 +1164,8 @@ async def watch_groups(
             metadata=str(current["metadata_path"]),
             bytes=finalized["output_bytes"],
             source_bytes=finalized["source_bytes"],
-            duration_seconds=wall_duration,
+            duration_seconds=media_duration,
+            wall_duration_seconds=wall_duration,
             status=status,
             conversion_error=finalized["error"],
             stop_reason=reason,
