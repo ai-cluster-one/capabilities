@@ -86,6 +86,40 @@ def test_contextkit_init_and_context_preserve_owned_files(tmp_path: Path) -> Non
     assert not (project / ".claude" / "rules" / "CAPABILITIES.md").exists()
 
 
+def test_context_fragment_is_manager_owned_and_write_free(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True)
+    capability_dir = project / "capabilities" / "asana"
+    capability_dir.mkdir(parents=True)
+    (project / "capabilities" / "settings.json").write_text(json.dumps({
+        "capabilities": {"asana": {"enabled": True}},
+    }))
+    (capability_dir / "identifiers.json").write_text(json.dumps({
+        "workspace": {"value": "123", "note": "Asana workspace"},
+    }))
+    registry = tmp_path / "registry" / "asana"
+    registry.mkdir(parents=True)
+    (registry / "asana").write_text("#!/bin/sh\n")
+    (registry / "stub").write_text("Create and update work in Asana.\n")
+    (registry / "manifest.json").write_text(json.dumps({
+        "docs": {"topics": ["tasks", "projects"]},
+    }))
+
+    result = _run(tmp_path, project, "context", "--fragment")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("# Capabilities\n")
+    assert "managed by `capabilities`" in result.stdout
+    assert "`capabilities list`" in result.stdout
+    assert "`contextkit build` in a ContextKit-bound project" in result.stdout
+    assert "## asana" in result.stdout
+    assert "Create and update work in Asana." in result.stdout
+    assert "Identifiers (1): run `capabilities ids asana`" in result.stdout
+    assert "Guides (`asana guide <topic>`): projects, tasks" in result.stdout
+    assert "<!-- capabilities:end -->" in result.stdout
+    assert not (project / ".claude").exists()
+    assert not (project / ".codex").exists()
+
+
 def test_contextkit_enable_updates_gate_without_generating_context(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True)
 

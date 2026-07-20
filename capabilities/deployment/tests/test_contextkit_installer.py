@@ -11,7 +11,6 @@ Validates that deployment capability:
 """
 
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -82,9 +81,9 @@ def setup_test_project(tmpdir: Path, with_contextkit: bool = True, name: str = "
     return project
 
 
-def test_dry_run_no_contextkit_copy(tmpdir: Path) -> None:
+def test_dry_run_no_contextkit_copy(tmp_path: Path) -> None:
     """Verify dry-run output shows no .contextkit/manager/contextkit copy."""
-    project = setup_test_project(tmpdir, with_contextkit=True, name="test-dry-run")
+    project = setup_test_project(tmp_path, with_contextkit=True, name="test-dry-run")
 
     result = run_cmd(
         ["deployment", "setup", "--dry-run"],
@@ -103,9 +102,9 @@ def test_dry_run_no_contextkit_copy(tmpdir: Path) -> None:
     print("✓ Dry-run shows no ContextKit manager copy")
 
 
-def test_dockerignore_excludes_contextkit(tmpdir: Path) -> None:
+def test_dockerignore_excludes_contextkit(tmp_path: Path) -> None:
     """Verify .dockerignore excludes ContextKit manager and generated files."""
-    project = setup_test_project(tmpdir, with_contextkit=True, name="test-dockerignore")
+    project = setup_test_project(tmp_path, with_contextkit=True, name="test-dockerignore")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
@@ -146,9 +145,9 @@ def test_dockerignore_excludes_contextkit(tmpdir: Path) -> None:
     print("✓ .dockerignore excludes ContextKit product paths and generated files")
 
 
-def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
+def test_dockerfile_uses_public_installer(tmp_path: Path) -> None:
     """Verify Dockerfile uses public installer instead of local copy."""
-    project = setup_test_project(tmpdir, with_contextkit=True, name="test-dockerfile")
+    project = setup_test_project(tmp_path, with_contextkit=True, name="test-dockerfile")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
@@ -273,9 +272,9 @@ def test_dockerfile_uses_public_installer(tmpdir: Path) -> None:
     print("✓ Dockerfile uses public installer with correct build order")
 
 
-def test_compose_includes_contextkit_ref(tmpdir: Path) -> None:
+def test_compose_includes_contextkit_ref(tmp_path: Path) -> None:
     """Verify docker-compose.yaml includes CONTEXTKIT_REF build arg."""
-    project = setup_test_project(tmpdir, with_contextkit=True, name="test-compose")
+    project = setup_test_project(tmp_path, with_contextkit=True, name="test-compose")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
@@ -290,9 +289,9 @@ def test_compose_includes_contextkit_ref(tmpdir: Path) -> None:
     print("✓ docker-compose.yaml includes CONTEXTKIT_REF")
 
 
-def test_env_example_includes_contextkit_ref(tmpdir: Path) -> None:
+def test_env_example_includes_contextkit_ref(tmp_path: Path) -> None:
     """Verify .env.example includes CONTEXTKIT_REF for ContextKit projects."""
-    project = setup_test_project(tmpdir, with_contextkit=True, name="test-env")
+    project = setup_test_project(tmp_path, with_contextkit=True, name="test-env")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
@@ -305,9 +304,9 @@ def test_env_example_includes_contextkit_ref(tmpdir: Path) -> None:
     print("✓ .env.example includes CONTEXTKIT_REF")
 
 
-def test_non_contextkit_behavior_preserved(tmpdir: Path) -> None:
+def test_non_contextkit_behavior_preserved(tmp_path: Path) -> None:
     """Verify non-ContextKit projects work as before."""
-    project = setup_test_project(tmpdir, with_contextkit=False, name="test-no-contextkit")
+    project = setup_test_project(tmp_path, with_contextkit=False, name="test-no-contextkit")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
@@ -329,9 +328,9 @@ def test_non_contextkit_behavior_preserved(tmpdir: Path) -> None:
     print("✓ Non-ContextKit behavior preserved")
 
 
-def test_build_fails_on_missing_steps(tmpdir: Path) -> None:
+def test_build_fails_on_missing_steps(tmp_path: Path) -> None:
     """Verify build includes failure checks for installer, hooks, and doctor."""
-    project = setup_test_project(tmpdir, with_contextkit=True, name="test-failure-checks")
+    project = setup_test_project(tmp_path, with_contextkit=True, name="test-failure-checks")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 

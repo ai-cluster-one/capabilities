@@ -43,8 +43,11 @@ cannot scroll back. When authoring or reviewing one, hold it against:
 - **The voice medium** — conversational tone and short turns; graceful handling
   of interruptions and of silence; read critical values (numbers, dates, names)
   back to the caller and confirm before acting on them.
-- **Clarity** — name the edge cases; stay internally consistent; every variable
-  the prompt references must exist.
+- **Clarity** — name the edge cases; give each instruction one clear home;
+  consolidate duplicates and conflicts; every referenced variable must exist.
+- **Precision** — enumerate genuinely closed sets. Express open-ended behaviour
+  as a concise rule with representative examples, adding detail only when
+  evaluation justifies it.
 
 ## Revise in place vs. new version
 
@@ -57,11 +60,20 @@ cannot scroll back. When authoring or reviewing one, hold it against:
 Name versions so the distinction is legible at a glance — encode the axis that
 varies (audience, length, language, iteration), not just a number.
 
+Treat each language variant as independently tested. Apply shared semantic
+changes across variants deliberately, then validate each in its own language.
+
 ## Diff before you push
+
+Ground behaviour changes in transcript or evaluation evidence, or in an explicit
+requirement; safety, compliance, and business constraints may define edge cases
+before drift is observed. Make the smallest coherent edit that fits the existing
+structure, and expand it only when evaluation justifies more detail.
 
 Before overwriting a prompt, compare your intended content against the live
 asset (`callva assets get <id>`). If the live version carries changes your copy
 does not, someone revised it outside this flow — **stop and surface the
 divergence; never blind-overwrite**. Push only once the content is the
-deliberate next state. After any write, report the asset id so the change is
-traceable and the agent linkage can be verified.
+deliberate next state. After any write, re-read the intended asset and agent
+binding, report the asset id, and rerun the target scenario plus an adjacent
+regression scenario.

@@ -225,6 +225,64 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)
 
+    async def test_call_recording_modes_build_supervised_media_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-1001": {
+                    "call_recording": {"mode": "auto", "send_to_chat": True},
+                },
+                "-1002": {"call_recording": {"mode": "on_request"}},
+                "-1003": {"call_recording": {"mode": "disabled"}},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+
+            self.assertEqual(
+                daemon.configured_call_recording_groups(),
+                {"auto": [-1001], "on_request": [-1002], "send_to_chat": [-1001]},
+            )
+            command = daemon.call_recorder_command()
+            self.assertEqual(command[0], str(daemon.CALL_RECORDER_BIN))
+            self.assertIn("--watch-groups", command)
+            self.assertEqual(command[command.index("--auto-group") + 1], "-1001")
+            self.assertEqual(command[command.index("--request-group") + 1], "-1002")
+            self.assertEqual(command[command.index("--send-to-chat-group") + 1], "-1001")
+
+    async def test_call_recording_request_is_explicit_and_persisted(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.assertTrue(daemon._is_call_recording_request("/record"))
+            self.assertTrue(daemon._is_call_recording_request("Марвин, запиши звонок"))
+            self.assertTrue(daemon._is_call_recording_request("Marvin, record the call"))
+            self.assertFalse(daemon._is_call_recording_request("Марвин, привет"))
+
+            path = daemon.queue_call_recording_request(
+                -1002,
+                77,
+                {"id": "42", "name": "Test User", "role": "group_member"},
+            )
+            payload = json.loads(path.read_text())
+            self.assertEqual(payload["chat_id"], "-1002")
+            self.assertEqual(payload["message_id"], 77)
+            self.assertEqual(payload["requested_by"]["user_id"], "42")
+
+    async def test_record_slash_command_addresses_assistant_in_on_request_group(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            message = SimpleNamespace(
+                raw_text="/record",
+                text="/record",
+                message="/record",
+                mentioned=False,
+                is_reply=False,
+            )
+            policy = {"call_recording": {"mode": "on_request"}}
+            self.assertTrue(await daemon._message_addresses_me(
+                message,
+                SimpleNamespace(username="assistant", id=42),
+                policy,
+            ))
+
     async def test_worker_process_stdin_is_closed(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
@@ -269,6 +327,27 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.send_attempts, 2)  # one voice echo + one final reply
             self.assertEqual(len(client.sent), 2)
             self.assertEqual(daemon.load_register()["123"]["jobs"], {})
+            await self.stop_session(client, task)
+
+    async def test_long_final_reply_is_delivered_in_telegram_sized_chunks(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            reply = "A" * (daemon.TELEGRAM_MESSAGE_LIMIT + 1)
+            daemon.WORKERS["stub"] = lambda *_args: successful_result(reply)
+            message = Message(324)
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            await client.handler(Event(message))
+            await wait_until(lambda: daemon.load_register()["123"]["last_processed_message_id"] == 324)
+
+            self.assertEqual([item["text"] for item in client.sent], [
+                "A" * daemon.TELEGRAM_MESSAGE_LIMIT,
+                "A",
+            ])
+            self.assertTrue(all(len(item["text"]) <= daemon.TELEGRAM_MESSAGE_LIMIT
+                                for item in client.sent))
             await self.stop_session(client, task)
 
     async def test_startup_catch_up_runs_once_per_connection_without_periodic_polling(self):

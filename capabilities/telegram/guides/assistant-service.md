@@ -31,6 +31,8 @@ capability bundle.
    - Review `authority.roles`: this request-scoped hard gate limits which
      capability CLIs a worker may invoke for each sender role.
    - Set group `aliases` / `address_aliases` if the assistant should react to names other than the default.
+   - Set a group's `call_recording.mode` to `auto`, `on_request`, or `disabled`.
+     Recording is opt-in per group and defaults to `disabled`.
    - Choose `defaults.worker`: `codex`, `claude`, or `stub`.
 
 4. Ensure the selected connection can send replies:
@@ -79,6 +81,8 @@ $XDG_STATE_HOME/telegram/assistant/service/progress/
 $XDG_STATE_HOME/telegram/assistant/service/worker-sessions/
 $XDG_STATE_HOME/telegram/assistant/service/daemon.log
 $XDG_STATE_HOME/telegram/assistant/service/daemon.pid
+$XDG_STATE_HOME/telegram/assistant/calls/recordings/<timestamp>-<chat>-call-<id>.ogg
+$XDG_STATE_HOME/telegram/assistant/calls/recordings/<timestamp>-<chat>-call-<id>.json
 ```
 
 The auth session and service runtime files are separate. Worker session copies
@@ -109,6 +113,47 @@ Telethon SQLite session.
 - Worker subprocesses run in dedicated process groups. Timeout, task cancellation,
   reconnect, and incomplete post-worker delivery all terminate that group and move
   the persisted job to a terminal error or startup-retry state.
+- The daemon supervises its media recorder when at least one allowed group opts in.
+  The recorder joins muted, writes the mixed incoming stream directly as OGG/Opus,
+  without an intermediate or post-call conversion, and stores a JSON
+  sidecar with the group, Telegram call id, timestamps, trigger, and participant
+  snapshots. It does not create a call and does not transcribe the recording.
+
+## Group Call Recording
+
+Call recording is disabled unless an allowed group explicitly selects a mode:
+
+```json
+{
+  "allowed_groups": {
+    "-100123": {
+      "name": "Recorded automatically",
+      "call_recording": {
+        "mode": "auto",
+        "send_to_chat": true
+      }
+    },
+    "-100456": {
+      "name": "Recorded when asked",
+      "call_recording": {"mode": "on_request"}
+    }
+  }
+}
+```
+
+- `auto`: the daemon detects an active group voice/video chat and joins to record it.
+- `on_request`: an addressed `Marvin, запиши звонок`-style message or `/record`
+  creates a recording request for an already active call.
+- `disabled`: no media worker is allowed to join for this group. This is the default.
+- `send_to_chat: true`: after the OGG container closes, upload it to the same
+  group and persist the delivery status and Telegram message id in the JSON sidecar.
+  Failed uploads are retried up to three times. The default is `false`.
+
+Only one call can be recorded by one Telegram account at a time. The first version
+stores the incoming mixed stream; participant IDs and audio-source identifiers are
+captured as metadata, but the OGG does not contain separate per-participant tracks.
+The service never starts a group call itself. It posts the completed recording only
+when `send_to_chat` is enabled; participant notice remains the operator's responsibility.
 
 ## Channel Context
 

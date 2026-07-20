@@ -55,6 +55,7 @@ logging.getLogger("telethon").setLevel(logging.CRITICAL)
 
 HERE = Path(__file__).resolve().parent
 WORKER_BIN = HERE / "worker-bin"
+CALL_RECORDER_BIN = HERE / "call_recorder.py"
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
@@ -71,6 +72,7 @@ CODEX_REASONING_CHOICES = ("default", "low", "medium", "high", "xhigh")
 CODEX_REASONING_EFFORTS = set(CODEX_REASONING_CHOICES)
 CODEX_SERVICE_TIER_CHOICES = ("default", "fast", "priority")
 CODEX_SERVICE_TIERS = set(CODEX_SERVICE_TIER_CHOICES)
+TELEGRAM_MESSAGE_LIMIT = 4096
 
 
 def _find_project_root():
@@ -299,6 +301,7 @@ LOG_FILE = SERVICE_STATE_DIR / "daemon.log"
 PROGRESS_DIR = SERVICE_STATE_DIR / "progress"
 WORKER_SESSION_DIR = SERVICE_STATE_DIR / "worker-sessions"
 AUTHORITY_DIR = SERVICE_STATE_DIR / "authority"
+CALL_RECORDING_REQUEST_DIR = SERVICE_STATE_DIR / "call-recording-requests"
 
 
 def now():
@@ -377,6 +380,63 @@ def _deep_merge(base, overlay):
         else:
             out[key] = value
     return out
+
+
+def _call_recording_mode(group_policy):
+    policy = _as_mapping(_as_mapping(group_policy).get("call_recording"))
+    value = str(policy.get("mode") or "disabled").strip().lower().replace("-", "_")
+    aliases = {
+        "off": "disabled",
+        "none": "disabled",
+        "automatic": "auto",
+        "request": "on_request",
+        "command": "on_request",
+        "manual": "on_request",
+    }
+    return aliases.get(value, value) if aliases.get(value, value) in {
+        "disabled", "auto", "on_request"
+    } else "disabled"
+
+
+def configured_call_recording_groups():
+    groups = {"auto": [], "on_request": [], "send_to_chat": []}
+    for key, raw_policy in ALLOWED_GROUPS.items():
+        policy = raw_policy if isinstance(raw_policy, dict) else {}
+        mode = _call_recording_mode(policy)
+        if mode == "disabled":
+            continue
+        try:
+            chat_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if chat_id < 0:
+            groups[mode].append(chat_id)
+            call_policy = _as_mapping(policy.get("call_recording"))
+            if call_policy.get("send_to_chat") is True:
+                groups["send_to_chat"].append(chat_id)
+    for values in groups.values():
+        values.sort()
+    return groups
+
+
+def call_recorder_command():
+    groups = configured_call_recording_groups()
+    if not groups["auto"] and not groups["on_request"]:
+        return None
+    command = [
+        str(CALL_RECORDER_BIN),
+        "--watch-groups",
+        "--connection", CONNECTION,
+        "--project-root", str(PROJECT_ROOT),
+        "--request-dir", str(CALL_RECORDING_REQUEST_DIR),
+    ]
+    for chat_id in groups["auto"]:
+        command.extend(("--auto-group", str(chat_id)))
+    for chat_id in groups["on_request"]:
+        command.extend(("--request-group", str(chat_id)))
+    for chat_id in groups["send_to_chat"]:
+        command.extend(("--send-to-chat-group", str(chat_id)))
+    return command
 
 
 def _policy_allowed_capabilities(policy):
@@ -553,6 +613,19 @@ def _text_names_me(text, me, policy):
     return False
 
 
+def _is_call_recording_request(text):
+    value = str(text or "").strip()
+    if _command_name(value) == "/record":
+        return True
+    normalized = value.casefold().replace("ё", "е")
+    asks_to_record = re.search(
+        r"\b(?:запиши|записывай|начни\s+запись|включи\s+запись|record)\b",
+        normalized,
+    )
+    names_call = re.search(r"\b(?:звонок|созвон|разговор|call)\b", normalized)
+    return bool(asks_to_record and names_call)
+
+
 async def _reply_is_to_me(message, me):
     if not getattr(message, "is_reply", False):
         return False
@@ -567,6 +640,9 @@ async def _reply_is_to_me(message, me):
 
 async def _message_addresses_me(message, me, policy):
     if (policy or {}).get("require_reference") is False:
+        return True
+    if (_call_recording_mode(policy) == "on_request"
+            and _command_name(_message_text(message)) == "/record"):
         return True
     if getattr(message, "mentioned", False):
         return True
@@ -1237,6 +1313,27 @@ def _safe_file_part(value):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_") or "chat"
 
 
+def queue_call_recording_request(chat_id, message_id, profile):
+    CALL_RECORDING_REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "chat_id": str(chat_id),
+        "message_id": int(message_id),
+        "requested_at": now(),
+        "requested_by": {
+            "user_id": str((profile or {}).get("id") or ""),
+            "name": (profile or {}).get("name"),
+            "role": (profile or {}).get("role"),
+        },
+    }
+    name = f"{_safe_file_part(chat_id)}-{int(message_id)}.json"
+    path = CALL_RECORDING_REQUEST_DIR / name
+    temporary = path.with_name(f".{name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    os.replace(temporary, path)
+    return path
+
+
 def prepare_worker_session(key, message_id):
     src = Path(str(SESSION) + ".session")
     if not src.exists():
@@ -1494,10 +1591,60 @@ async def run_session(client):
     def proc_key_for(chat_key, job):
         return f"{chat_key}:{job.get('message_id')}"
 
+    def message_chunks(text):
+        """Split outbound text without exceeding Telegram's message length limit."""
+        text = str(text)
+        if len(text) <= TELEGRAM_MESSAGE_LIMIT:
+            return [text]
+
+        chunks = []
+        while len(text) > TELEGRAM_MESSAGE_LIMIT:
+            boundary = max(
+                text.rfind("\n", 0, TELEGRAM_MESSAGE_LIMIT + 1),
+                text.rfind(" ", 0, TELEGRAM_MESSAGE_LIMIT + 1),
+            )
+            if boundary <= 0:
+                boundary = TELEGRAM_MESSAGE_LIMIT
+            else:
+                boundary += 1  # Keep the whitespace with the preceding chunk.
+            chunks.append(text[:boundary])
+            text = text[boundary:]
+        chunks.append(text)
+        return chunks
+
     async def send_channel_message(ent_id, text, is_direct, reply_to=None, **kwargs):
-        if is_direct or reply_to is None:
-            return await client.send_message(ent_id, text, **kwargs)
-        return await client.send_message(ent_id, text, reply_to=reply_to, **kwargs)
+        sent = None
+        for chunk in message_chunks(text):
+            if is_direct or reply_to is None:
+                sent = await client.send_message(ent_id, chunk, **kwargs)
+            else:
+                sent = await client.send_message(ent_id, chunk, reply_to=reply_to, **kwargs)
+        return sent
+
+    async def handle_call_recording_request(key, message, group_policy, chat_ref):
+        text = _message_text(message)
+        if not _is_call_recording_request(text):
+            return False
+        mode = _call_recording_mode(group_policy)
+        if mode == "disabled" and _command_name(text) != "/record":
+            return False
+        profile = await _sender_profile(message, group_policy, direct=False)
+        if mode == "on_request":
+            request_path = queue_call_recording_request(key, message.id, profile)
+            reply = "Пробую присоединиться к активному звонку и начать запись."
+            log(f"{key}: call recording requested by {profile['id']} ({request_path.name})")
+        elif mode == "auto":
+            reply = "Для этой группы уже включена автоматическая запись звонков."
+            log(f"{key}: call recording request received; automatic mode is enabled")
+        else:
+            reply = "Запись звонков отключена в настройках этой группы."
+            log(f"{key}: call recording request denied; group mode is disabled")
+        row = reg.setdefault(key, {})
+        row["last_processed_message_id"] = max(
+            message.id, row.get("last_processed_message_id", 0))
+        save_register(reg)
+        await send_channel_message(chat_ref, reply, False, reply_to=message.id)
+        return True
 
     async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset):
         path = Path(outbox)
@@ -1998,6 +2145,9 @@ async def run_session(client):
                         continue
                 elif not _incoming_in_scope(m, group_policy):
                     continue
+                if group_policy is not None and await handle_call_recording_request(
+                        key, m, group_policy, ent):
+                    continue
                 job = reserve_job(key, m, group_policy, is_direct, f"catch-up/{reason}")
                 if job is None:
                     continue
@@ -2030,6 +2180,9 @@ async def run_session(client):
         chat_ref = await _event_chat_ref(event, is_direct=is_direct)
         if _message_is_known(reg, key, event.message.id):
             log(f"{key}: already queued/done msg={event.message.id}")
+            return
+        if not is_direct and await handle_call_recording_request(
+                key, event.message, group_policy, chat_ref):
             return
         if text.startswith("/"):                          # control path — act now
             profile = await _sender_profile(event.message, group_policy, direct=is_direct)
@@ -2100,6 +2253,52 @@ async def run_session(client):
         kill_all_workers("session closing cleanup")
 
 
+async def stop_call_recorder_process(process, reason):
+    if process is None or process.returncode is not None:
+        return
+    log(f"call recorder: stopping ({reason})")
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        log("call recorder: SIGTERM timeout; killing process group")
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+
+
+async def supervise_call_recorder():
+    command = call_recorder_command()
+    if command is None:
+        return
+    backoff = 2
+    process = None
+    try:
+        while True:
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                log(f"call recorder: cannot start ({_short_error(exc)}); retrying in {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            groups = configured_call_recording_groups()
+            log(f"call recorder: started pid={process.pid} auto={groups['auto']} "
+                f"on_request={groups['on_request']} send_to_chat={groups['send_to_chat']}")
+            return_code = await process.wait()
+            process = None
+            log(f"call recorder: exited code={return_code}; retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+    finally:
+        await stop_call_recorder_process(process, "telegram daemon shutdown")
+
+
 async def main():
     """Supervise the session so neither a transient crash nor a missing login kills the
     daemon. Telegram bumps its MTProto layer faster than Telethon 1.x ships schema updates,
@@ -2122,6 +2321,7 @@ async def main():
             loop.add_signal_handler(sig, request_shutdown)
     lock_handle = None
     wrote_pid = False
+    call_recorder_task = None
     try:
         if not CHANNEL_ENABLED:
             log("telegram channel disabled (TELEGRAM_SERVICE_ENABLED not truthy) — idling; "
@@ -2134,6 +2334,8 @@ async def main():
         backoff = 2                                 # the connection-namespace dir may not exist yet (fresh volume)
         PID_FILE.write_text(f"{os.getpid()}\n")
         wrote_pid = True
+        if call_recorder_command() is not None:
+            call_recorder_task = asyncio.create_task(supervise_call_recorder())
         while True:
             client = TelegramClient(str(SESSION), api_id, api_hash)
             try:
@@ -2163,6 +2365,10 @@ async def main():
             raise
         log("shutdown requested; stopping telegram daemon")
     finally:
+        if call_recorder_task is not None:
+            call_recorder_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call_recorder_task
         if wrote_pid:
             with contextlib.suppress(OSError):
                 if PID_FILE.read_text().strip() == str(os.getpid()):

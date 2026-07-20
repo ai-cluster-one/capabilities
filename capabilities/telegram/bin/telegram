@@ -627,6 +627,30 @@ def _contract(argv: list[str]) -> None:
 # <<< contract: capability core <<<
 
 
+def _auth_connection_gate(connection_flag: str | None,
+                          session_flag: str | None) -> tuple[str | None, str | None]:
+    """Pin Telegram service workers to the daemon's own connection/session.
+
+    A service authority context names the connection that received the request.
+    Workers must not switch to another project connection or substitute an
+    arbitrary session file, even when their role may otherwise use Telegram.
+    Ordinary CLI use has no authority context and remains unchanged.
+    """
+    ctx = _auth_context()
+    if not ctx or ctx.get("source") != "telegram":
+        return connection_flag, session_flag
+    allowed = str(ctx.get("connection") or "").strip()
+    if allowed and connection_flag and connection_flag != allowed:
+        _die(4, "connection_scope_denied",
+             "telegram connection is fixed for this service request",
+             f"requested={connection_flag}; allowed={allowed}")
+    worker_session = os.environ.get("TELEGRAM_WORKER_SESSION")
+    if session_flag and session_flag != worker_session:
+        _die(4, "session_scope_denied",
+             "telegram session override is not allowed for this service request")
+    return allowed or connection_flag, session_flag
+
+
 # >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
 def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
@@ -2071,6 +2095,8 @@ def main() -> None:
         if a.startswith("--connection="):
             connection_flag = a.split("=", 1)[1]; i += 1; continue
         cleaned.append(a); i += 1
+
+    connection_flag, session_flag = _auth_connection_gate(connection_flag, session_flag)
 
     args = p.parse_args(cleaned)
 
