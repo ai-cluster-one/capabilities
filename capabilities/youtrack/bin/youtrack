@@ -45,6 +45,9 @@ Read:
   youtrack projects [--query TEXT]           Projects visible to the token.
   youtrack task ISSUE                        Read one issue (ID or URL).
   youtrack comments ISSUE [--limit N]        Read recent comments.
+  youtrack issues QUERY [--limit N]          Search issues server-side; returns
+                                             structured issue data (id, idReadable,
+                                             summary, description, State).
 
 Write:
   youtrack create --project ID --summary S   Create an issue. Project is the
@@ -52,6 +55,9 @@ Write:
                                              not its short name. Store stable ids
                                              with `youtrack ids set project …`.
   youtrack comment ISSUE [--text TEXT|-]     Add a comment; omitted text reads stdin.
+  youtrack update ISSUE --state STATE        Update issue workflow state. STATE is
+                                             a state name (e.g. "In Progress").
+                                             Respects allow_write connection policy.
 
 Global options accepted anywhere:
   --connection ID                            Select a named connection.
@@ -75,7 +81,7 @@ import httpx
 
 NAME = "youtrack"
 PROTOCOL = 2
-SUMMARY = "YouTrack CLI for discovering projects, creating and reading issues, and reading or adding comments."
+SUMMARY = "YouTrack CLI for discovering projects, creating and reading issues, reading or adding comments, and updating issue state."
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,
@@ -83,7 +89,7 @@ CRED_KEYS = [
     {"key": "YOUTRACK_TOKEN", "secret": True, "required": True,
      "note": "permanent token (perm:…); alternates via --token-env"},
 ]
-WRITE_VERBS = {"create", "comment"}
+WRITE_VERBS = {"create", "comment", "update"}
 WRITE_DEFAULT = True
 DOCS_BASE = ""
 TOPICS: list = []
@@ -725,7 +731,7 @@ def _request(client: httpx.Client, method: str, path: str, **kwargs):
 
 USER_FIELDS = "id,login,name,fullName,email"
 PROJECT_FIELDS = "id,name,shortName"
-ISSUE_FIELDS = "id,idReadable,summary,description,created,updated,resolved,project(id,name,shortName),reporter(id,login,fullName)"
+ISSUE_FIELDS = "id,idReadable,summary,description,created,updated,resolved,project(id,name,shortName),reporter(id,login,fullName),customFields(name,value(name))"
 COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 
 def cmd_whoami(c):
@@ -751,6 +757,26 @@ def cmd_comments(c, issue, limit):
 def cmd_comment(c, issue, text):
     return _request(c, "POST", f"/issues/{_issue_ref(issue)}/comments",
                     params={"fields": COMMENT_FIELDS}, json={"text": text})
+
+def cmd_issues(c, query, limit):
+    params = {"fields": ISSUE_FIELDS, "query": query}
+    if limit is not None: params["$top"] = limit
+    result = _request(c, "GET", "/issues", params=params)
+    def extract_state(issue):
+        for field in (issue.get("customFields") or []):
+            if field.get("name") == "State":
+                value = field.get("value")
+                if isinstance(value, dict):
+                    return value.get("name")
+                return value
+        return None
+    return [{"id": i["id"], "idReadable": i["idReadable"],
+             "summary": i["summary"], "description": i.get("description"),
+             "State": extract_state(i)} for i in result]
+
+def cmd_update(c, issue, state):
+    return _request(c, "POST", f"/issues/{_issue_ref(issue)}/fields/State",
+                    params={"fields": "name,value(name)"}, json={"value": {"name": state}})
 
 def _check_connection(base_url, token):
     with _client(base_url, token) as c:
@@ -778,8 +804,10 @@ def main() -> None:
     p = sub.add_parser("projects"); p.add_argument("--query")
     p = sub.add_parser("task"); p.add_argument("issue")
     p = sub.add_parser("comments"); p.add_argument("issue"); p.add_argument("--limit", type=int, default=50)
+    p = sub.add_parser("issues"); p.add_argument("query"); p.add_argument("--limit", type=int)
     p = sub.add_parser("create"); p.add_argument("--project", required=True); p.add_argument("--summary", required=True); p.add_argument("--description")
     p = sub.add_parser("comment"); p.add_argument("issue"); p.add_argument("--text")
+    p = sub.add_parser("update"); p.add_argument("issue"); p.add_argument("--state", required=True)
     sub.add_parser("doctor")
 
     token_key = wanted = None
@@ -809,6 +837,9 @@ def main() -> None:
         elif args.cmd == "comments":
             if args.limit < 1: _die(6, "input", "--limit must be positive")
             _emit(cmd_comments(client, args.issue, args.limit))
+        elif args.cmd == "issues":
+            if args.limit is not None and args.limit < 1: _die(6, "input", "--limit must be positive")
+            _emit(cmd_issues(client, args.query, args.limit))
         elif args.cmd == "create":
             description = _read_text(args.description) if args.description is not None else None
             _emit(cmd_create(client, args.project, args.summary, description))
@@ -816,6 +847,8 @@ def main() -> None:
             text = _read_text(args.text if args.text is not None else "-")
             if not text.strip(): _die(6, "input", "comment text cannot be empty")
             _emit(cmd_comment(client, args.issue, text))
+        elif args.cmd == "update":
+            _emit(cmd_update(client, args.issue, args.state))
 
 if __name__ == "__main__":
     main()
