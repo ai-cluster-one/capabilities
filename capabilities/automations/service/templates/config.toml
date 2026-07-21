@@ -1,0 +1,20 @@
+version = 1
+
+[engine]
+tick_seconds = 1.0
+max_parallel = 4
+timezone = "UTC"
+shutdown_grace_seconds = 15
+recovery = "fail"
+
+[[automations]]
+id = "example"
+enabled = false
+environments = ["development"]
+script = "capabilities/automations/scripts/example.py"
+every_seconds = 60
+timeout_seconds = 300
+max_parallel = 1
+max_pending = 1
+overlap = "skip"
+retries = 0

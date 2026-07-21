@@ -23,12 +23,13 @@ USAGE
   deployment setup [--profile agent-box] [--target production]
                    [--provider coolify|dockerhost|manual]
                    [--with-telegram auto|yes|no] [--project-name NAME]
+                   [--with-automations auto|yes|no]
                    [--force] [--dry-run]
       Full bootstrap for a non-technical deployment path. Creates the deployment
       declarations plus Dockerfile, docker-compose.yaml, .dockerignore,
       .env.example, and entrypoint.sh. Defaults are safe for an agent box: one
-      idle agent service plus an optional Telegram service. If --dry-run is
-      passed, print the files that would be written.
+      idle agent service plus optional Telegram and automations services. If
+      --dry-run is passed, print the files that would be written.
 
   deployment scaffold
       Alias for `deployment setup`.
@@ -645,6 +646,15 @@ def _with_telegram(root: Path, choice: str) -> bool:
         (_project_capabilities_dir(root) / "telegram" / "service").is_dir()
 
 
+def _with_automations(root: Path, choice: str) -> bool:
+    if choice == "yes":
+        return True
+    if choice == "no":
+        return False
+    return _has_enabled(root, "automations") or \
+        (_project_capabilities_dir(root) / "automations" / "service").is_dir()
+
+
 def _has_contextkit(root: Path) -> bool:
     return (root / ".contextkit" / "config.toml").is_file()
 
@@ -689,7 +699,8 @@ def _dockerignore_template(has_contextkit: bool) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _env_example_template(with_telegram: bool, has_contextkit: bool = False) -> str:
+def _env_example_template(with_telegram: bool, has_contextkit: bool = False,
+                          with_automations: bool = False) -> str:
     lines = [
         "# Image/build knobs",
         "AGENT_IMAGE=agent-box",
@@ -708,6 +719,12 @@ def _env_example_template(with_telegram: bool, has_contextkit: bool = False) -> 
             "DEEPGRAM_API_KEY=",
             "TELEGRAM_CHANNEL_ENABLED=true",
             "TG_WORKER=codex",
+            "",
+        ]
+    if with_automations:
+        lines += [
+            "AUTOMATIONS_ENVIRONMENT=production",
+            "AUTOMATIONS_NAMESPACE=",
             "",
         ]
     lines += [
@@ -856,13 +873,16 @@ RUN while read -r name; do \\
     done < /app/deployment/capabilities.lock
 
 # Capability state used by services is volume-backed.
-RUN mkdir -p "$XDG_STATE_HOME/telegram" "$HOME/.claude" "$HOME/.codex"
+RUN mkdir -p "$XDG_STATE_HOME/telegram" "$HOME/.claude" "$HOME/.codex" \
+    /app/capabilities/automations/state
 {contextkit_build}
 ENTRYPOINT ["/app/entrypoint.sh"]
 """
 
 
-def _compose_template(project_name: str, with_telegram: bool, has_contextkit: bool = False) -> str:
+def _compose_template(project_name: str, with_telegram: bool,
+                      has_contextkit: bool = False,
+                      with_automations: bool = False) -> str:
     slug = _slug(project_name)
     env_lines = [
         "x-agent-env: &agent-env",
@@ -877,6 +897,9 @@ def _compose_template(project_name: str, with_telegram: bool, has_contextkit: bo
             "  TG_WORKER: ${TG_WORKER:-codex}",
             "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
         ]
+    if with_automations:
+        env_lines.insert(-1, "  AUTOMATIONS_ENVIRONMENT: ${AUTOMATIONS_ENVIRONMENT:-production}")
+        env_lines.insert(-1, "  AUTOMATIONS_NAMESPACE: ${AUTOMATIONS_NAMESPACE:-}")
     build_args = [
         "        CAPABILITIES_REF: ${CAPABILITIES_REF:-main}",
         "        CODEX_REF: ${CODEX_REF:-rust-v0.142.5}",
@@ -906,6 +929,28 @@ def _compose_template(project_name: str, with_telegram: bool, has_contextkit: bo
       - telegram_state:/home/agent/.local/state/telegram
 """
         telegram_volume = "  telegram_state:\n"
+    automations_service = ""
+    automations_volume = ""
+    if with_automations:
+        automations_service = f"""
+  automations:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+{build_args_text}
+    image: ${{AGENT_IMAGE:-{slug}-agent}}
+    container_name: {slug}-automations
+    restart: unless-stopped
+    command: ["automations", "service", "run"]
+    environment:
+      <<: *agent-env
+    volumes:
+      - claude_state:/home/agent/.claude
+      - codex_state:/home/agent/.codex
+      - automations_state:/app/capabilities/automations/state
+"""
+        automations_volume = "  automations_state:\n"
     return "\n".join(env_lines) + f"""
 
 services:
@@ -923,13 +968,15 @@ services:
       - claude_state:/home/agent/.claude
       - codex_state:/home/agent/.codex
 {telegram_service}
+{automations_service}
 volumes:
   claude_state:
   codex_state:
-{telegram_volume}"""
+{telegram_volume}{automations_volume}"""
 
 
-def _runtime_template(profile: str, project_name: str, with_telegram: bool = True) -> dict:
+def _runtime_template(profile: str, project_name: str, with_telegram: bool = True,
+                      with_automations: bool = False) -> dict:
     slug = _slug(project_name)
     services: dict = {
         "app": {
@@ -963,6 +1010,16 @@ def _runtime_template(profile: str, project_name: str, with_telegram: bool = Tru
                 "optional_env": ["DEEPGRAM_API_KEY", "TELEGRAM_CHANNEL_ENABLED", "TG_WORKER"],
                 "state": ["telegram_state", "claude_state", "codex_state"],
             }
+        if with_automations:
+            services["automations"] = {
+                "role": "automation-service",
+                "capability": "automations",
+                "compose_service": "automations",
+                "description": "Project-local scheduler and subprocess worker service.",
+                "required_env": [],
+                "optional_env": ["AUTOMATIONS_ENVIRONMENT", "AUTOMATIONS_NAMESPACE"],
+                "state": ["automations_state", "claude_state", "codex_state"],
+            }
         volumes = {
             "claude_state": {
                 "description": "Claude login and session continuity.",
@@ -977,6 +1034,11 @@ def _runtime_template(profile: str, project_name: str, with_telegram: bool = Tru
             volumes["telegram_state"] = {
                 "description": "Telegram MTProto session and channel-service state.",
                 "mount": "/home/agent/.local/state/telegram",
+            }
+        if with_automations:
+            volumes["automations_state"] = {
+                "description": "Automation SQLite ledger, queue, and run logs.",
+                "mount": "/app/capabilities/automations/state",
             }
     return {
         "schema": RUNTIME_SCHEMA,
@@ -1301,23 +1363,37 @@ def _deployment_questions() -> list[dict]:
             "default": "auto",
             "plain_language": "Auto turns it on when the telegram capability or service config is already present.",
         },
+        {
+            "id": "automations",
+            "question": "Should this project run its automation scheduler service?",
+            "default": "auto",
+            "plain_language": "Auto turns it on when the automations capability or service config is already present.",
+        },
     ]
 
 
 def _setup_writes(root: Path, profile: str, provider: str, target: str,
-                  project_name: str, with_telegram: bool) -> tuple[list[tuple[Path, str]], list[str]]:
+                  project_name: str, with_telegram: bool,
+                  with_automations: bool) -> tuple[list[tuple[Path, str]], list[str]]:
     warnings: list[str] = []
     _require_envelope(root)
     has_contextkit = _has_contextkit(root)
     writes: list[tuple[Path, str]] = [
-        (_runtime_path(root), _json_text(_runtime_template(profile, project_name, with_telegram))),
+        (_runtime_path(root), _json_text(_runtime_template(
+            profile, project_name, with_telegram, with_automations))),
         (_target_path(root, target), _json_text(_target_template(provider, target, project_name))),
         (root / "deployment" / "capabilities.lock",
-         _lock_text(root, ["telegram"] if with_telegram else [])),
+         _lock_text(root, [
+             name for name, enabled in (
+                 ("telegram", with_telegram), ("automations", with_automations)
+             ) if enabled
+         ])),
         (root / ".dockerignore", _dockerignore_template(has_contextkit)),
-        (root / ".env.example", _env_example_template(with_telegram, has_contextkit)),
+        (root / ".env.example", _env_example_template(
+            with_telegram, has_contextkit, with_automations)),
         (root / "Dockerfile", _dockerfile_template(has_contextkit)),
-        (root / "docker-compose.yaml", _compose_template(project_name, with_telegram, has_contextkit)),
+        (root / "docker-compose.yaml", _compose_template(
+            project_name, with_telegram, has_contextkit, with_automations)),
         (root / "entrypoint.sh", _entrypoint_template(project_name)),
     ]
     return writes, warnings
@@ -1333,8 +1409,9 @@ def cmd_setup(args) -> None:
     target = _slug(args.target)
     project_name = args.project_name or root.name
     with_telegram = _with_telegram(root, args.with_telegram)
+    with_automations = _with_automations(root, args.with_automations)
     writes, warnings = _setup_writes(root, args.profile, args.provider, target,
-                                     project_name, with_telegram)
+                                     project_name, with_telegram, with_automations)
     if args.dry_run:
         _emit({
             "ok": True,
@@ -1344,6 +1421,7 @@ def cmd_setup(args) -> None:
             "provider": args.provider,
             "target": target,
             "with_telegram": with_telegram,
+            "with_automations": with_automations,
             "would_write": [_rel(root, path) for path, _text in writes],
             "warnings": warnings,
             "questions": _deployment_questions(),
@@ -1361,6 +1439,7 @@ def cmd_setup(args) -> None:
         "provider": args.provider,
         "target": target,
         "with_telegram": with_telegram,
+        "with_automations": with_automations,
         "written": results,
         "warnings": warnings,
         "next": f"Run `deployment next --target {target}` for the human deployment checklist.",
@@ -1642,6 +1721,7 @@ def main(argv: list[str] | None = None) -> None:
     p_setup.add_argument("--target", default="production")
     p_setup.add_argument("--provider", choices=PROVIDERS, default="coolify")
     p_setup.add_argument("--with-telegram", choices=("auto", "yes", "no"), default="auto")
+    p_setup.add_argument("--with-automations", choices=("auto", "yes", "no"), default="auto")
     p_setup.add_argument("--project-name")
     p_setup.add_argument("--force", action="store_true")
     p_setup.add_argument("--dry-run", action="store_true")
@@ -1652,6 +1732,7 @@ def main(argv: list[str] | None = None) -> None:
     p_scaffold.add_argument("--target", default="production")
     p_scaffold.add_argument("--provider", choices=PROVIDERS, default="coolify")
     p_scaffold.add_argument("--with-telegram", choices=("auto", "yes", "no"), default="auto")
+    p_scaffold.add_argument("--with-automations", choices=("auto", "yes", "no"), default="auto")
     p_scaffold.add_argument("--project-name")
     p_scaffold.add_argument("--force", action="store_true")
     p_scaffold.add_argument("--dry-run", action="store_true")

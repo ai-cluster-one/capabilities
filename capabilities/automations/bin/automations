@@ -1,0 +1,1016 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""automations — project-local scheduler and subprocess runner.
+
+Automations keeps schedules and executable scripts in the consuming repository,
+runs the same way on a developer machine and in an agent container, and records
+operational state in a SQLite ledger.
+
+Configuration:
+  capabilities/automations/service/config.toml
+
+Scripts:
+  Relative paths declared by config.toml. Python files may be ordinary scripts or
+  executable PEP-723/shebang scripts. Every job inherits the daemon environment and
+  receives AUTOMATION_ID, AUTOMATION_RUN_ID, AUTOMATION_ATTEMPT,
+  AUTOMATION_TRIGGER, AUTOMATION_ENVIRONMENT, AUTOMATION_NAMESPACE,
+  AUTOMATION_PROJECT_ROOT, and AUTOMATION_STATE_DIR.
+
+Commands:
+  automations help
+  automations doctor
+      Validate config, scripts, state storage, and daemon status.
+  automations list
+      List configured automations and whether they apply to this environment.
+  automations run <automation-id>
+      Enqueue one manual run. The daemon dispatches it asynchronously.
+  automations runs [--limit N] [--status STATUS]
+      List recent run records from SQLite.
+  automations show <run-id>
+      Show one run record.
+  automations logs <run-id> [--tail N]
+      Read the captured stdout/stderr for one run.
+  automations cancel <run-id>
+      Cancel a pending run or request termination of a running process.
+  automations retry <run-id>
+      Enqueue a new attempt for a completed run.
+  automations service init [--force]
+      Create project-local config and an example script.
+  automations service doctor|run|start|stop|status|logs
+      Manage the bundled scheduler service. `run` stays in the foreground for
+      Docker Compose; `start` is the local background convenience.
+
+Environment:
+  AUTOMATIONS_ENVIRONMENT  Active environment selector (default: development).
+  AUTOMATIONS_NAMESPACE    Coordination namespace (default: project directory name).
+  AUTOMATIONS_CONFIG       Optional config path override.
+  AUTOMATIONS_STATE_DIR    Optional state root override.
+
+Scheduling:
+  Each automation may use a numeric five-field cron `schedule`, an
+  `every_seconds` interval, or neither (manual only). The one-second ticker only
+  registers due runs and dispatches subprocesses; job logic never runs inside the
+  ticker. `overlap = "skip"` or `"queue"` controls overlapping scheduled runs.
+
+I/O contract:
+  Success is JSON on stdout. Failure is {"error": {"code", "message", "hint"?}}
+  on stderr with a non-zero exit code.
+
+Contract commands:
+  automations stub
+  automations manifest --json
+  automations connections
+  automations guide [<topic>]
+  automations ids list|get|set|rm
+  automations refs
+
+Exit codes:
+  0 success · 3 not found · 4 disabled by project policy · 5 runtime failure ·
+  6 malformed input, invalid config, or missing project setup
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import importlib.util
+import json
+import os
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, NoReturn
+
+
+NAME = "automations"
+PROTOCOL = 2
+SUMMARY = (
+    "Project-local scheduler and subprocess runner with versioned config, "
+    "SQLite run history, concurrency, retries, timeouts, and cancellation."
+)
+SCOPE = "project"
+CRED_KEYS: list = []
+WRITE_VERBS: set = set()
+WRITE_DEFAULT = False
+DOCS_BASE = (
+    "https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+    "main/capabilities/automations/guides/"
+)
+TOPICS = ["authoring", "operations"]
+STATE = True
+POST_INSTALL: list = []
+SERVICE = {
+    "name": "scheduler",
+    "summary": "Project-local scheduler, SQLite queue, and subprocess workers.",
+    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
+    "config": "capabilities/automations/service/config.toml",
+    "state": "capabilities/automations/state",
+}
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
+def _log(message: str) -> None:
+    sys.stderr.write(message + "\n")
+    sys.stderr.flush()
+
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding capabilities/, legacy .capabilities/,
+    .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    `capabilities/` is canonical. A legacy `.capabilities/` remains readable
+    until `capabilities init` migrates it. If both exist, the canonical tree
+    wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _auth_context() -> dict | None:
+    """Optional runtime authority envelope passed by an ingress/service.
+
+    Absence means the ordinary project gate is the whole policy. Presence means
+    a request-scoped authority layer exists and must fail closed before any
+    credential or network work happens.
+    """
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return None
+    try:
+        if raw.lstrip().startswith("{"):
+            data = json.loads(raw)
+        else:
+            data = json.loads(Path(raw).read_text())
+    except (OSError, ValueError) as e:
+        _die(4, "auth_context_unreadable",
+             "runtime authority context could not be read",
+             f"{raw}: {e}")
+    if not isinstance(data, dict):
+        _die(4, "auth_context_invalid",
+             "runtime authority context is not an object")
+    return data
+
+
+def _auth_capability_allowed(rule) -> bool:
+    if rule is True or rule == "*":
+        return True
+    if rule in (False, None):
+        return False
+    if isinstance(rule, dict):
+        if rule.get("deny") is True:
+            return False
+        if rule.get("enabled") is False or rule.get("allow") is False:
+            return False
+        return True
+    return False
+
+
+def _auth_gate() -> None:
+    ctx = _auth_context()
+    if ctx is None:
+        return
+    allowed = ctx.get("allowed_capabilities")
+    if allowed is None:
+        return
+    if allowed is True or allowed == "*":
+        return
+    if isinstance(allowed, list):
+        if NAME in allowed or "*" in allowed:
+            return
+    elif isinstance(allowed, dict):
+        if _auth_capability_allowed(allowed.get(NAME, allowed.get("*"))):
+            return
+    else:
+        _die(4, "auth_context_invalid",
+             "runtime authority context has invalid allowed_capabilities")
+    source = ctx.get("source") or "runtime"
+    role = ctx.get("sender_role") or ctx.get("role") or "unknown"
+    chat = ctx.get("chat_id") or "unknown"
+    _die(4, "capability_not_authorized",
+         f"{NAME} is not authorized for this {source} request",
+         f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
+
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks.
+
+    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
+    is stricter and also runs here, before credentials or network calls.
+    """
+    _auth_gate()
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = _project_capabilities_dir(root) / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project's active capabilities/."""
+    root = _project_root()
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract (protocol 2) — the declaration surface --------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import urllib.error as _ue
+    import urllib.request as _ur
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10.0) as resp:
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(text); return
+    except _ue.HTTPError as e:
+        if e.code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if e.code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        err = f"upstream returned {e.code}"
+    except _ue.URLError as e:
+        err = str(e.reason)
+    except OSError as e:
+        err = str(e)
+    if cache.exists():
+        sys.stderr.write(json.dumps(
+            {"warning": f"upstream unreachable; serving cached copy ({err})"},
+            ensure_ascii=False) + "\n")
+        _emit(cache.read_text()); return
+    _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _render_ids_markdown(data: dict) -> str:
+    """Render the {label: {value, note}} envelope as the labelled markdown
+    list the manager's `capabilities ids <NAME>` also produces — one shared
+    format across the ids surface and the identifiers section of `help`."""
+    lines: list[str] = []
+    for label, entry in sorted(data.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        v = entry.get("value")
+        vs = f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+        line = f"- **{label}**: {vs}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _identifiers_section() -> str:
+    """The Identifiers block appended to the bare top-level help — deterministic
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
+    agent following the `<NAME> help` startup protocol loads the discovered
+    labels/values/notes into context at once. Empty when no project envelope
+    or nothing recorded (do not bloat help with an empty section)."""
+    envdir = _env_dir()
+    if envdir is None:
+        return ""
+    ids_file = envdir / "identifiers.json"
+    if not ids_file.exists():
+        return ""
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    header = (
+        "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
+        f"Structural lookups discovered for `{NAME}` in this project. Fetch a single\n"
+        f"raw value with `{NAME} ids get <label>`; the full envelope is also at\n"
+        f"`capabilities ids {NAME}`.\n\n"
+    )
+    return header + _render_ids_markdown(data) + "\n"
+
+
+def _cmd_help() -> None:
+    """Bare top-level help: the CLI's HELP body (module-level `HELP` if
+    defined, else the module docstring), then the project's Identifiers
+    section. Only fires when no extra args follow — per-verb help stays
+    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    g = globals()
+    text = g.get("HELP") or g.get("__doc__") or ""
+    if text.startswith("\n"):
+        text = text.lstrip("\n")
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    section = _identifiers_section()
+    if section:
+        sys.stdout.write(section)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved.
+
+    `help` is a contract verb only when bare (no extra args) — the top-level
+    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
+    through to the CLI so per-verb help stays clean."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    elif cmd == "help" and len(argv) == 1:
+        _cmd_help()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+
+def _cmd_connections() -> None:
+    _emit({"connections": {}})
+
+
+def _manifest_payload() -> dict[str, Any]:
+    return {
+        "name": NAME,
+        "protocol": PROTOCOL,
+        "summary": SUMMARY,
+        "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+        "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+        "state": STATE,
+        "post_install": POST_INSTALL,
+        "service": SERVICE,
+    }
+
+
+def _bundle_dir() -> Path:
+    here = Path(__file__).resolve()
+    return here.parent.parent if here.parent.name == "bin" else here.parent
+
+
+def _runtime_path() -> Path:
+    return _bundle_dir() / "service" / "runtime.py"
+
+
+def _template(name: str) -> Path:
+    return _bundle_dir() / "service" / "templates" / name
+
+
+def _root_required() -> Path:
+    root = _project_root()
+    if root is None:
+        _die(6, "no_project", "not inside a project", "run from a project with a capabilities envelope")
+    envelope = _project_capabilities_dir(root)
+    if not (envelope / "settings.json").is_file():
+        _die(6, "no_envelope", "no capabilities envelope in this project", "run `capabilities init` first")
+    return root
+
+
+def _service_dir(root: Path) -> Path:
+    return _project_capabilities_dir(root) / NAME / "service"
+
+
+def _config_path(root: Path) -> Path:
+    override = os.environ.get("AUTOMATIONS_CONFIG") or _project_env().get("AUTOMATIONS_CONFIG")
+    if override:
+        path = Path(override).expanduser()
+        return path if path.is_absolute() else root / path
+    return _service_dir(root) / "config.toml"
+
+
+def _state_path(root: Path) -> Path:
+    override = os.environ.get("AUTOMATIONS_STATE_DIR") or _project_env().get(
+        "AUTOMATIONS_STATE_DIR"
+    )
+    if override:
+        path = Path(override).expanduser()
+        return path if path.is_absolute() else root / path
+    return _project_capabilities_dir(root) / NAME / "state"
+
+
+def _db_path(root: Path) -> Path:
+    return _state_path(root) / "automations.db"
+
+
+def _runtime_module():
+    path = _runtime_path()
+    if not path.is_file():
+        _die(
+            3,
+            "service_bundle_missing",
+            f"bundled automations runtime not found: {path}",
+            "reinstall/update automations from a bundled source directory",
+        )
+    spec = importlib.util.spec_from_file_location("automations_runtime", path)
+    if spec is None or spec.loader is None:
+        _die(5, "runtime_load_failed", f"cannot load bundled runtime: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load(root: Path):
+    runtime = _runtime_module()
+    try:
+        config = runtime.load_config(root, _config_path(root))
+    except runtime.ConfigError as exc:
+        _die(6, "invalid_config", str(exc), "run `automations service init` or repair config.toml")
+    project_env = _project_env()
+    config["engine"]["environment"] = (
+        os.environ.get("AUTOMATIONS_ENVIRONMENT")
+        or project_env.get("AUTOMATIONS_ENVIRONMENT")
+        or config["engine"]["environment"]
+    )
+    config["engine"]["namespace"] = (
+        os.environ.get("AUTOMATIONS_NAMESPACE")
+        or project_env.get("AUTOMATIONS_NAMESPACE")
+        or config["engine"]["namespace"]
+    )
+    return runtime, config
+
+
+def _read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _service_env(root: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env.update({key: str(value) for key, value in _project_env().items()})
+    env.update(
+        {
+            "AUTOMATIONS_PROJECT_ROOT": str(root),
+            "AUTOMATIONS_CONFIG": str(_config_path(root)),
+            "AUTOMATIONS_STATE_DIR": str(_state_path(root)),
+        }
+    )
+    return env
+
+
+def cmd_service_init(force: bool) -> dict[str, Any]:
+    root = _root_required()
+    config_template = _template("config.toml")
+    script_template = _template("example.py")
+    missing = [str(path) for path in (config_template, script_template) if not path.is_file()]
+    if missing:
+        _die(3, "service_bundle_missing", "bundled automations templates are missing", ", ".join(missing))
+    config_path = _service_dir(root) / "config.toml"
+    script_path = _project_capabilities_dir(root) / NAME / "scripts" / "example.py"
+    written: list[str] = []
+    skipped: list[str] = []
+    for source, target in ((config_template, config_path), (script_template, script_path)):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and not force:
+            skipped.append(str(target))
+            continue
+        target.write_text(source.read_text())
+        written.append(str(target))
+    if script_path.exists():
+        script_path.chmod(script_path.stat().st_mode | 0o755)
+    return {
+        "initialized": NAME,
+        "project": str(root),
+        "config": str(config_path),
+        "written": written,
+        "skipped": skipped,
+        "next": [
+            "edit config.toml and add project scripts",
+            "run `automations doctor`",
+            "run `automations service start` or `automations service run`",
+        ],
+    }
+
+
+def service_status(root: Path) -> dict[str, Any]:
+    state = _state_path(root)
+    pid_file = state / "daemon.pid"
+    pid = _read_pid(pid_file)
+    running = _pid_alive(pid)
+    counts: dict[str, int] = {}
+    db_path = state / "automations.db"
+    if db_path.exists():
+        try:
+            runtime = _runtime_module()
+            counts = runtime.counts(db_path)
+        except (OSError, sqlite3.Error):
+            counts = {}
+    return {
+        "initialized": _config_path(root).is_file(),
+        "running": running,
+        "pid": pid if running else None,
+        "stale_pid": bool(pid and not running),
+        "project": str(root),
+        "environment": os.environ.get("AUTOMATIONS_ENVIRONMENT")
+        or _project_env().get("AUTOMATIONS_ENVIRONMENT")
+        or "development",
+        "config": str(_config_path(root)),
+        "state_dir": str(state),
+        "database": str(db_path),
+        "pid_file": str(pid_file),
+        "log_file": str(state / "daemon.log"),
+        "counts": counts,
+    }
+
+
+def cmd_doctor() -> dict[str, Any]:
+    root = _root_required()
+    runtime, config = _load(root)
+    state = _state_path(root)
+    state.mkdir(parents=True, exist_ok=True)
+    missing_scripts = [
+        item["script"] for item in config["automations"] if not item["script_path"].is_file()
+    ]
+    try:
+        with contextlib.closing(runtime.connect(_db_path(root))) as db:
+            db.execute("SELECT 1").fetchone()
+    except (OSError, sqlite3.Error) as exc:
+        _die(5, "state_unavailable", f"SQLite state is unavailable: {exc}")
+    status = service_status(root)
+    return {
+        "ok": not missing_scripts,
+        "project": str(root),
+        "environment": config["engine"]["environment"],
+        "namespace": config["engine"]["namespace"],
+        "automations": len(config["automations"]),
+        "missing_scripts": missing_scripts,
+        "service": status,
+    }
+
+
+def cmd_list() -> dict[str, Any]:
+    root = _root_required()
+    runtime, config = _load(root)
+    environment = config["engine"]["environment"]
+    items = []
+    for item in config["automations"]:
+        items.append(
+            {
+                "id": item["id"],
+                "enabled": item["enabled"],
+                "applies": runtime.applies(item, environment),
+                "environments": item["environments"],
+                "script": item["script"],
+                "schedule": item["schedule"],
+                "every_seconds": item["every_seconds"],
+                "overlap": item["overlap"],
+                "max_parallel": item["max_parallel"],
+                "timeout_seconds": item["timeout_seconds"],
+                "retries": item["retries"],
+            }
+        )
+    return {"environment": environment, "automations": items}
+
+
+def cmd_run(automation_id: str) -> dict[str, Any]:
+    root = _root_required()
+    runtime, config = _load(root)
+    try:
+        row = runtime.enqueue_manual(_db_path(root), config, _state_path(root), automation_id)
+    except KeyError:
+        _die(3, "not_found", f"unknown automation {automation_id!r}", "run `automations list`")
+    except runtime.ConfigError as exc:
+        _die(6, "not_runnable", str(exc))
+    return {"queued": True, "run": row, "service": service_status(root)}
+
+
+def cmd_runs(limit: int, status: str | None) -> dict[str, Any]:
+    root = _root_required()
+    runtime, _config = _load(root)
+    if status and status not in {*runtime.ACTIVE_STATUSES, *runtime.FINAL_STATUSES}:
+        _die(6, "invalid_status", f"unknown run status {status!r}")
+    return {"runs": runtime.list_runs(_db_path(root), limit=limit, status=status)}
+
+
+def _run_required(root: Path, run_id: str):
+    runtime, config = _load(root)
+    row = runtime.get_run(_db_path(root), run_id)
+    if row is None:
+        _die(3, "not_found", f"unknown run {run_id!r}", "run `automations runs`")
+    return runtime, config, row
+
+
+def cmd_show(run_id: str) -> dict[str, Any]:
+    root = _root_required()
+    _runtime, _config, row = _run_required(root, run_id)
+    return row
+
+
+def cmd_logs(run_id: str, tail: int) -> dict[str, Any]:
+    root = _root_required()
+    _runtime, _config, row = _run_required(root, run_id)
+    path = Path(row["log_path"])
+    if not path.exists():
+        _die(3, "logs_not_found", f"run log does not exist yet: {path}")
+    lines = path.read_text(errors="replace").splitlines()
+    return {"run_id": run_id, "log_file": str(path), "lines": lines[-max(0, tail) :]}
+
+
+def cmd_cancel(run_id: str) -> dict[str, Any]:
+    root = _root_required()
+    runtime, _config = _load(root)
+    row = runtime.request_cancel(_db_path(root), run_id)
+    if row is None:
+        _die(3, "not_found", f"unknown run {run_id!r}")
+    return {"cancel_requested": bool(row["cancel_requested"]), "run": row}
+
+
+def cmd_retry(run_id: str) -> dict[str, Any]:
+    root = _root_required()
+    runtime, config = _load(root)
+    try:
+        row = runtime.retry_run(_db_path(root), config, _state_path(root), run_id)
+    except runtime.ConfigError as exc:
+        _die(6, "not_retryable", str(exc))
+    if row is None:
+        _die(3, "not_found", f"unknown run {run_id!r}")
+    return {"queued": True, "run": row}
+
+
+def cmd_service_start() -> dict[str, Any]:
+    root = _root_required()
+    _load(root)
+    status = service_status(root)
+    if status["running"]:
+        status["already_running"] = True
+        return status
+    state = _state_path(root)
+    state.mkdir(parents=True, exist_ok=True)
+    log_path = state / "daemon.log"
+    runtime_path = _runtime_path()
+    with log_path.open("a", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            [sys.executable, str(runtime_path)],
+            cwd=str(root),
+            env=_service_env(root),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        tail = log_path.read_text(errors="replace").splitlines()[-8:]
+        _die(5, "service_start_failed", f"automations daemon exited with {proc.returncode}", "\n".join(tail))
+    out = service_status(root)
+    out["started"] = True
+    return out
+
+
+def cmd_service_stop(timeout: float, force: bool) -> dict[str, Any]:
+    root = _root_required()
+    state = _state_path(root)
+    pid_file = state / "daemon.pid"
+    pid = _read_pid(pid_file)
+    if not _pid_alive(pid):
+        pid_file.unlink(missing_ok=True)
+        return {"stopped": False, "running": False, "pid": None}
+
+    def send(sig: signal.Signals) -> None:
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, sig)
+
+    send(signal.SIGTERM)
+    deadline = time.time() + max(timeout, 0.0)
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            pid_file.unlink(missing_ok=True)
+            return {"stopped": True, "running": False, "pid": pid}
+        time.sleep(0.1)
+    if force:
+        send(signal.SIGKILL)
+        pid_file.unlink(missing_ok=True)
+        return {"stopped": True, "killed": True, "running": False, "pid": pid}
+    _die(5, "service_stop_timeout", f"automations daemon did not stop within {timeout:g}s", "retry with `automations service stop --force`")
+
+
+def cmd_service_logs(tail: int) -> dict[str, Any]:
+    root = _root_required()
+    path = _state_path(root) / "daemon.log"
+    if not path.exists():
+        _die(3, "logs_not_found", f"service log does not exist: {path}")
+    lines = path.read_text(errors="replace").splitlines()
+    return {"log_file": str(path), "lines": lines[-max(0, tail) :]}
+
+
+def cmd_service_run() -> NoReturn:
+    root = _root_required()
+    _load(root)
+    runtime = _runtime_path()
+    os.execvpe(sys.executable, [sys.executable, str(runtime)], _service_env(root))
+
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    if argv[:1] == ["manifest"]:
+        _emit(_manifest_payload())
+        return
+    _contract(argv)
+
+    parser = argparse.ArgumentParser(prog=NAME, add_help=False)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("help", add_help=False)
+    sub.add_parser("doctor", add_help=False)
+    sub.add_parser("list", add_help=False)
+    run = sub.add_parser("run", add_help=False)
+    run.add_argument("automation_id")
+    runs = sub.add_parser("runs", add_help=False)
+    runs.add_argument("--limit", type=int, default=50)
+    runs.add_argument("--status")
+    show = sub.add_parser("show", add_help=False)
+    show.add_argument("run_id")
+    logs = sub.add_parser("logs", add_help=False)
+    logs.add_argument("run_id")
+    logs.add_argument("--tail", type=int, default=100)
+    cancel = sub.add_parser("cancel", add_help=False)
+    cancel.add_argument("run_id")
+    retry = sub.add_parser("retry", add_help=False)
+    retry.add_argument("run_id")
+
+    service = sub.add_parser("service", add_help=False)
+    service_sub = service.add_subparsers(dest="service_cmd", required=True)
+    init = service_sub.add_parser("init", add_help=False)
+    init.add_argument("--force", action="store_true")
+    service_sub.add_parser("doctor", add_help=False)
+    service_sub.add_parser("run", add_help=False)
+    service_sub.add_parser("start", add_help=False)
+    stop = service_sub.add_parser("stop", add_help=False)
+    stop.add_argument("--timeout", type=float, default=15.0)
+    stop.add_argument("--force", action="store_true")
+    service_sub.add_parser("status", add_help=False)
+    service_logs = service_sub.add_parser("logs", add_help=False)
+    service_logs.add_argument("--tail", type=int, default=100)
+
+    args = parser.parse_args(argv)
+    if args.cmd == "help":
+        _cmd_help()
+    elif args.cmd == "doctor":
+        result = cmd_doctor()
+        _emit(result)
+        if not result["ok"]:
+            raise SystemExit(6)
+    elif args.cmd == "list":
+        _emit(cmd_list())
+    elif args.cmd == "run":
+        _emit(cmd_run(args.automation_id))
+    elif args.cmd == "runs":
+        if args.limit < 1:
+            _die(6, "invalid_limit", "--limit must be positive")
+        _emit(cmd_runs(args.limit, args.status))
+    elif args.cmd == "show":
+        _emit(cmd_show(args.run_id))
+    elif args.cmd == "logs":
+        _emit(cmd_logs(args.run_id, args.tail))
+    elif args.cmd == "cancel":
+        _emit(cmd_cancel(args.run_id))
+    elif args.cmd == "retry":
+        _emit(cmd_retry(args.run_id))
+    elif args.cmd == "service":
+        if args.service_cmd == "init":
+            _emit(cmd_service_init(args.force))
+        elif args.service_cmd == "doctor":
+            result = cmd_doctor()
+            _emit(result)
+            if not result["ok"]:
+                raise SystemExit(6)
+        elif args.service_cmd == "run":
+            cmd_service_run()
+        elif args.service_cmd == "start":
+            _emit(cmd_service_start())
+        elif args.service_cmd == "stop":
+            _emit(cmd_service_stop(args.timeout, args.force))
+        elif args.service_cmd == "status":
+            _emit(service_status(_root_required()))
+        elif args.service_cmd == "logs":
+            _emit(cmd_service_logs(args.tail))
+
+
+if __name__ == "__main__":
+    main()
