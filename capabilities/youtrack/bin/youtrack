@@ -775,8 +775,11 @@ def cmd_issues(c, query, limit):
              "State": extract_state(i)} for i in result]
 
 def cmd_update(c, issue, state):
-    return _request(c, "POST", f"/issues/{_issue_ref(issue)}/fields/State",
-                    params={"fields": "name,value(name)"}, json={"value": {"name": state}})
+    return _request(c, "POST", f"/issues/{_issue_ref(issue)}",
+                    params={"fields": "customFields(name,value(name))"},
+                    json={"customFields": [
+                        {"name": "State", "$type": "StateIssueCustomField", "value": {"name": state}}
+                    ]})
 
 def _check_connection(base_url, token):
     with _client(base_url, token) as c:

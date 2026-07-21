@@ -174,15 +174,28 @@ def test_update_http_request_shape(tmp_path):
             pass
 
         def do_POST(self):
+            # Reject old invalid endpoint
+            if "/fields/State" in self.path:
+                self.send_response(404)
+                self.end_headers()
+                return
+
             raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             payload = json.loads(raw)
             self.__class__.requests.append(("POST", self.path, self.headers, payload))
-            body = json.dumps({"name": "State", "value": {"name": payload["value"]["name"]}}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+
+            # Validate correct payload structure
+            if "customFields" in payload and len(payload["customFields"]) > 0:
+                field = payload["customFields"][0]
+                body = json.dumps({"customFields": [field]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(400)
+                self.end_headers()
 
     UpdateHandler.requests = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), UpdateHandler)
@@ -199,8 +212,14 @@ def test_update_http_request_shape(tmp_path):
     assert len(UpdateHandler.requests) == 1
     method, path, headers, payload = UpdateHandler.requests[0]
     assert method == "POST"
-    assert path.startswith("/api/issues/DEMO-1/fields/State")
-    assert payload == {"value": {"name": "In Progress"}}
+    assert path.startswith("/api/issues/DEMO-1")
+    assert "/fields/State" not in path, "Must not use old invalid /fields/State endpoint"
+    assert "customFields" in payload
+    assert len(payload["customFields"]) == 1
+    field = payload["customFields"][0]
+    assert field["name"] == "State"
+    assert field["$type"] == "StateIssueCustomField"
+    assert field["value"] == {"name": "In Progress"}
     assert headers["Authorization"] == "Bearer perm:test"
 
 
@@ -228,7 +247,7 @@ def test_update_handles_api_errors(tmp_path):
             pass
 
         def do_POST(self):
-            if self.path.startswith("/api/issues/DEMO-1/fields/State"):
+            if self.path.startswith("/api/issues/DEMO-1"):
                 self.send_response(400)
                 body = json.dumps({"error": "Invalid state"}).encode()
                 self.send_header("Content-Type", "application/json")
