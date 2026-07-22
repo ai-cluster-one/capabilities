@@ -731,7 +731,8 @@ def _request(client: httpx.Client, method: str, path: str, **kwargs):
 
 USER_FIELDS = "id,login,name,fullName,email"
 PROJECT_FIELDS = "id,name,shortName"
-ISSUE_FIELDS = "id,idReadable,summary,description,created,updated,resolved,project(id,name,shortName),reporter(id,login,fullName),customFields(name,value(name))"
+ISSUE_FIELDS = "id,idReadable,summary,description,created,updated,resolved,project(id,name,shortName),reporter(id,login,fullName)"
+ISSUE_SEARCH_FIELDS = "id,idReadable,summary,description,customFields(name,value(name))"
 COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 
 def cmd_whoami(c):
@@ -759,8 +760,8 @@ def cmd_comment(c, issue, text):
                     params={"fields": COMMENT_FIELDS}, json={"text": text})
 
 def cmd_issues(c, query, limit):
-    params = {"fields": ISSUE_FIELDS, "query": query}
-    if limit is not None: params["$top"] = limit
+    params = {"fields": ISSUE_SEARCH_FIELDS, "query": query,
+              "customFields": "State", "$top": limit}
     result = _request(c, "GET", "/issues", params=params)
     def extract_state(issue):
         for field in (issue.get("customFields") or []):
@@ -807,7 +808,7 @@ def main() -> None:
     p = sub.add_parser("projects"); p.add_argument("--query")
     p = sub.add_parser("task"); p.add_argument("issue")
     p = sub.add_parser("comments"); p.add_argument("issue"); p.add_argument("--limit", type=int, default=50)
-    p = sub.add_parser("issues"); p.add_argument("query"); p.add_argument("--limit", type=int)
+    p = sub.add_parser("issues"); p.add_argument("query"); p.add_argument("--limit", type=int, default=100)
     p = sub.add_parser("create"); p.add_argument("--project", required=True); p.add_argument("--summary", required=True); p.add_argument("--description")
     p = sub.add_parser("comment"); p.add_argument("issue"); p.add_argument("--text")
     p = sub.add_parser("update"); p.add_argument("issue"); p.add_argument("--state", required=True)
@@ -841,7 +842,7 @@ def main() -> None:
             if args.limit < 1: _die(6, "input", "--limit must be positive")
             _emit(cmd_comments(client, args.issue, args.limit))
         elif args.cmd == "issues":
-            if args.limit is not None and args.limit < 1: _die(6, "input", "--limit must be positive")
+            if args.limit < 1: _die(6, "input", "--limit must be positive")
             _emit(cmd_issues(client, args.query, args.limit))
         elif args.cmd == "create":
             description = _read_text(args.description) if args.description is not None else None

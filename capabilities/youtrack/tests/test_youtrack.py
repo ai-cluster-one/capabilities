@@ -145,11 +145,13 @@ def test_issues_http_request_and_parsing(tmp_path):
     base_url = f"http://127.0.0.1:{server.server_port}"
     try:
         result = run_cli(tmp_path, base_url, "issues", "state:Open", "--limit", "10")
+        default_result = run_cli(tmp_path, base_url, "issues", "state:Open")
     finally:
         server.shutdown()
         thread.join()
 
     assert result.returncode == 0, result.stderr
+    assert default_result.returncode == 0, default_result.stderr
     parsed = json.loads(result.stdout)
     assert len(parsed) == 2
     assert parsed[0]["idReadable"] == "DEMO-1"
@@ -158,6 +160,8 @@ def test_issues_http_request_and_parsing(tmp_path):
     assert parsed[1]["State"] == "In Progress"
     assert "query=state%3AOpen" in IssuesHandler.requests[0][1]
     assert "$top=10" in IssuesHandler.requests[0][1] or "%24top=10" in IssuesHandler.requests[0][1]
+    assert "customFields=State" in IssuesHandler.requests[0][1]
+    assert "$top=100" in IssuesHandler.requests[1][1] or "%24top=100" in IssuesHandler.requests[1][1]
 
 
 def test_update_requires_state(tmp_path):
