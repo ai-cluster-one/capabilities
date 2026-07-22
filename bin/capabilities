@@ -64,7 +64,7 @@ MACHINE VERBS
         Listing never executes catalogue capability code.
   source init ID [--remote GIT_URL]
         Create the canonical editable source workspace at
-        ~/capabilities-sources/ID, initialize git, vendor the authoring contract,
+        ~/.capabilities/sources/ID, initialize git, vendor the authoring contract,
         register it, and emit the exact authoring/publishing path.
   source add ID GIT_URL [--ref REF]
         Register and fetch a remote capability source into the manager-owned
@@ -181,11 +181,13 @@ SOURCE = os.environ.get("CAPABILITIES_SOURCE") or \
 CAP_HOME = Path(os.environ.get("CAPABILITIES_HOME") or (Path.home() / ".capabilities"))
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 _CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
-SOURCE_WORKSPACE_ROOT = Path.home() / "capabilities-sources"
+SOURCE_WORKSPACE_ROOT = CAP_HOME / "sources"
+LEGACY_SOURCE_WORKSPACE_ROOT = Path.home() / "capabilities-sources"
 SOURCES_FILE = _CONFIG_HOME / "capabilities" / "sources.json"
 SOURCE_CACHE_ROOT = _CACHE_HOME / "capabilities" / "sources"
 OFFICIAL_SOURCE_ID = "official"
 OFFICIAL_GIT_URL = "https://github.com/ai-cluster-one/capabilities.git"
+RESERVED_CAPABILITY_NAMES = {"sources"}
 
 PROJECT_CAPABILITIES_REL = Path("capabilities")
 LEGACY_PROJECT_CAPABILITIES_REL = Path(".capabilities")
@@ -480,6 +482,13 @@ def _sha256(path: Path) -> str:
 
 def _registry_dir(name: str) -> Path:
     return CAP_HOME / name
+
+
+def _reject_reserved_capability_name(name: str) -> None:
+    if name in RESERVED_CAPABILITY_NAMES:
+        _die(6, "reserved_capability_name",
+             f"{name!r} is reserved for manager-owned storage under {CAP_HOME}",
+             "choose another capability name")
 
 
 def _script_path(name: str) -> Path:
@@ -891,6 +900,7 @@ def _scaffold_credentials(name: str, manifest: dict) -> list[str]:
 
 def cmd_install(name: str, from_ref: str | None, source_id: str | None,
                 yes: bool) -> None:
+    _reject_reserved_capability_name(name)
     provenance = {}
     if source_id:
         if from_ref:
@@ -934,6 +944,7 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
 
 
 def cmd_uninstall(name: str, purge_credentials: bool) -> None:
+    _reject_reserved_capability_name(name)
     reg = _registry_dir(name)
     if not reg.is_dir():
         _die(3, "not_found", f"{name} is not installed")
@@ -956,6 +967,8 @@ def cmd_uninstall(name: str, purge_credentials: bool) -> None:
 
 
 def cmd_update(name: str | None) -> None:
+    if name:
+        _reject_reserved_capability_name(name)
     targets = [name] if name else sorted(_installed())
     if name and not _registry_dir(name).is_dir():
         _die(3, "not_found", f"{name} is not installed")
@@ -1774,7 +1787,7 @@ per-project gate), `capabilities init` (wire a project), `capabilities ids
 `capabilities audit <name>` (verify), `capabilities context --fragment`
 (render the manager-owned project block), `capabilities help` (full contract).
 Custom managed source code lives only under
-`~/capabilities-sources/<source-id>/`: create it with `capabilities source init
+`~/.capabilities/sources/<source-id>/`: create it with `capabilities source init
 <id>`, create packages with `capabilities new <name> --source <id>`, and run
 `capabilities source index <id>` plus `source check <id>` before committing.
 Remote catalogues attach through `capabilities source add`; `capabilities
@@ -2310,13 +2323,39 @@ def _source_entry(source_id: str) -> dict:
     if source_id == OFFICIAL_SOURCE_ID:
         return {"kind": "git", "url": OFFICIAL_GIT_URL, "ref": "main",
                 "builtin": True}
-    entry = (_sources_config().get("sources") or {}).get(source_id)
+    cfg = _sources_config()
+    entry = (cfg.get("sources") or {}).get(source_id)
     if not isinstance(entry, dict):
         _die(3, "source_not_found", f"unknown capability source {source_id!r}",
              "`capabilities source list` shows registered sources")
     if entry.get("kind") == "workspace":
         configured = Path(entry.get("path") or "").expanduser()
         canonical = _source_workspace(source_id)
+        legacy = LEGACY_SOURCE_WORKSPACE_ROOT / source_id
+        if configured.resolve() == legacy.resolve():
+            if legacy.exists() and canonical.exists():
+                _die(6, "workspace_migration_conflict",
+                     f"both legacy and canonical workspaces exist for {source_id!r}",
+                     f"keep one deliberately, then place it at {canonical}")
+            if legacy.exists():
+                canonical.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    legacy.rename(canonical)
+                except OSError as e:
+                    _die(6, "workspace_migration_failed",
+                         f"could not move legacy workspace to {canonical}: {e}",
+                         f"move {legacy} to {canonical} manually, then retry")
+                try:
+                    LEGACY_SOURCE_WORKSPACE_ROOT.rmdir()
+                except OSError:
+                    pass
+                entry["path"] = str(canonical)
+                _write_json(SOURCES_FILE, cfg)
+                configured = canonical
+            elif canonical.exists():
+                entry["path"] = str(canonical)
+                _write_json(SOURCES_FILE, cfg)
+                configured = canonical
         if configured.resolve() != canonical.resolve():
             _die(6, "noncanonical_workspace",
                  f"source {source_id!r} workspace is not canonical: {configured}",
@@ -2636,6 +2675,10 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
         return {"capabilities": {}}, {"repository": ["missing capabilities/ directory"]}
     for capdir in sorted(p for p in cap_root.iterdir() if p.is_dir()):
         name = capdir.name
+        if name in RESERVED_CAPABILITY_NAMES:
+            failures[name] = [
+                f"capability name is reserved for manager-owned storage: {name}"]
+            continue
         script = capdir / "bin" / name
         if not script.is_file():
             failures[name] = [f"missing canonical executable capabilities/{name}/bin/{name}"]
@@ -2875,6 +2918,7 @@ def cmd_new_capability(name: str, source_id: str, core_only: bool) -> None:
     if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
         _die(6, "bad_name", f"invalid capability name {name!r}",
              "use lowercase letters, digits, and hyphens; start with a letter")
+    _reject_reserved_capability_name(name)
     entry = _source_entry(source_id)
     official_checkout = source_id == OFFICIAL_SOURCE_ID and \
         (_REPO_ROOT / "capabilities.repo.json").is_file()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -40,13 +41,24 @@ def _run(env: dict[str, str], *args: str, check: bool = True):
 def test_authoring_workspace_is_canonical_and_install_is_strict(tmp_path):
     env = _env(tmp_path)
     initialized = json.loads(_run(env, "source", "init", "personal").stdout)
-    workspace = tmp_path / "home" / "capabilities-sources" / "personal"
+    workspace = tmp_path / "registry" / "sources" / "personal"
     assert initialized["path"] == str(workspace)
     assert (workspace / ".git").is_dir()
     assert (workspace / "AUTHORING.md").is_file()
     assert (workspace / "AGENTS.md").is_file()
     assert (workspace / "contract" / "preamble.py").read_bytes() == \
         (REPO / "contract" / "preamble.py").read_bytes()
+    listed = json.loads(_run(env, "source", "list").stdout)
+    assert listed["workspace_root"] == str(tmp_path / "registry" / "sources")
+
+    reserved = _run(
+        env, "new", "sources", "--source", "personal", check=False)
+    assert reserved.returncode == 6
+    assert json.loads(reserved.stderr)["error"]["code"] == \
+        "reserved_capability_name"
+    refused_uninstall = _run(env, "uninstall", "sources", check=False)
+    assert refused_uninstall.returncode == 6
+    assert workspace.is_dir()
 
     created = json.loads(_run(
         env, "new", "demo", "--source", "personal").stdout)
@@ -112,7 +124,7 @@ def test_remote_source_catalog_search_and_install(tmp_path):
         "Test readiness uses",
     ))
     _run(author_env, "source", "index", "personal")
-    workspace = tmp_path / "author" / "home" / "capabilities-sources" / "personal"
+    workspace = tmp_path / "author" / "registry" / "sources" / "personal"
     subprocess.run(["git", "add", "."], cwd=workspace, check=True)
     subprocess.run(
         ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
@@ -141,6 +153,53 @@ def test_remote_source_catalog_search_and_install(tmp_path):
     cloned = json.loads(_run(
         clone_env, "source", "clone", "personal", str(workspace)).stdout)
     assert cloned["path"] == str(
-        tmp_path / "clone" / "home" / "capabilities-sources" / "personal")
+        tmp_path / "clone" / "registry" / "sources" / "personal")
     assert json.loads(_run(
         clone_env, "source", "check", "personal").stdout)["ok"] is True
+
+
+def test_legacy_workspace_is_migrated_into_capabilities_home(tmp_path):
+    env = _env(tmp_path)
+    _run(env, "source", "init", "personal")
+    canonical = tmp_path / "registry" / "sources" / "personal"
+    legacy = tmp_path / "home" / "capabilities-sources" / "personal"
+    legacy.parent.mkdir(parents=True)
+    canonical.rename(legacy)
+
+    config_path = tmp_path / "config" / "capabilities" / "sources.json"
+    config = json.loads(config_path.read_text())
+    config["sources"]["personal"]["path"] = str(legacy)
+    config_path.write_text(json.dumps(config))
+
+    resolved = json.loads(_run(env, "source", "path", "personal").stdout)
+    assert resolved["path"] == str(canonical)
+    assert canonical.is_dir()
+    assert not (tmp_path / "home" / "capabilities-sources").exists()
+    migrated = json.loads(config_path.read_text())
+    assert migrated["sources"]["personal"]["path"] == str(canonical)
+
+
+def test_standalone_manager_has_complete_authoring_kit(tmp_path):
+    env = _env(tmp_path)
+    manager_dir = tmp_path / "registry" / ".manager"
+    manager_dir.mkdir(parents=True)
+    standalone = manager_dir / "capabilities"
+    shutil.copy2(MANAGER, standalone)
+    for relative in (
+        "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
+        "contract/preamble.py",
+    ):
+        target = manager_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / relative, target)
+
+    result = subprocess.run(
+        [str(standalone), "source", "init", "friend"], cwd=tmp_path,
+        env=env, text=True, capture_output=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    initialized = json.loads(result.stdout)
+    assert initialized["path"] == str(
+        tmp_path / "registry" / "sources" / "friend")
+    assert Path(initialized["path"], "AUTHORING.md").is_file()
+    assert Path(initialized["path"], "contract", "preamble.py").is_file()

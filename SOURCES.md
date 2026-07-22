@@ -5,14 +5,15 @@ these roles separate:
 
 | Role | Canonical path | Editable |
 |---|---|---|
-| Author workspace | `~/capabilities-sources/<source-id>/` | yes |
+| Author workspace | `~/.capabilities/sources/<source-id>/` | yes |
 | Remote source cache | `~/.cache/capabilities/sources/<source-id>/` | no |
 | Installed payload | `~/.capabilities/<name>/` | no |
 | Consuming-project envelope | `<project>/capabilities/<name>/` | configuration only |
 
-The workspace root is fixed by the manager. Source commits and pushes happen
-only there. Registry payloads, remote caches, and project envelopes are never
-capability source code.
+The workspace root is fixed by the manager under `CAPABILITIES_HOME` (default
+`~/.capabilities`). Source commits and pushes happen only there. Registry
+payloads, remote caches, and project envelopes are never capability source
+code. The name `sources` is reserved and cannot be used as a capability name.
 
 The manager owns the source registry at
 `~/.config/capabilities/sources.json` (or the platform's `XDG_CONFIG_HOME`
@@ -39,7 +40,7 @@ inspect both this registry and the built-in `official` source.
 ```sh
 capabilities source init personal \
   --remote git@github.com:alice/my-capabilities.git
-cd ~/capabilities-sources/personal
+cd ~/.capabilities/sources/personal
 capabilities new my-service --source personal
 ```
 
@@ -96,10 +97,10 @@ pins its checksum. The manager owns generated regions:
 capabilities source sync personal
 ```
 
-This deterministically updates the vendored authoring kit and restamps existing regions. There is
-no force or skip-conformance flag. A tool that does not follow this contract is
-still free to exist and run as an ordinary CLI, but the capabilities manager
-will not install it as a managed capability.
+This deterministically updates the vendored authoring kit and restamps existing
+regions. There is no force or skip-conformance flag. A tool that does not
+follow this contract is still free to exist and run as an ordinary CLI, but
+the capabilities manager will not install it as a managed capability.
 
 ## Repository shape
 
