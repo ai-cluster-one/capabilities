@@ -89,7 +89,6 @@ from typing import Any, NoReturn
 
 
 NAME = "automations"
-PROTOCOL = 2
 SUMMARY = (
     "Project-local scheduler and subprocess runner with versioned config, "
     "SQLite run history, concurrency, retries, timeouts, and cancellation."
@@ -316,7 +315,7 @@ def _state_dir() -> Path:
     return _STATE_HOME / NAME
 
 
-# --- Capability contract (protocol 2) — the declaration surface --------------
+# --- Capability contract — the declaration surface --------------------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -512,7 +511,7 @@ def _contract(argv: list[str]) -> None:
     if cmd == "stub":
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
-        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+        _emit({"name": NAME, "summary": SUMMARY,
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
                "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
                "state": STATE, "post_install": POST_INSTALL})
@@ -540,7 +539,6 @@ def _cmd_connections() -> None:
 def _manifest_payload() -> dict[str, Any]:
     return {
         "name": NAME,
-        "protocol": PROTOCOL,
         "summary": SUMMARY,
         "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
         "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},

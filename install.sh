@@ -53,8 +53,13 @@ if (exec < /dev/tty) 2>/dev/null; then
 fi
 
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+assets_tmp="$(mktemp -d)"
+trap 'rm -f "$tmp"; rm -rf "$assets_tmp"' EXIT
 curl -fsSL "$REPO/bin/capabilities" -o "$tmp" || err "fetch failed: $REPO/bin/capabilities"
+for asset in SHEBANG.md DOCTRINE.md TEMPLATE.md SOURCES.md contract/preamble.py; do
+    mkdir -p "$assets_tmp/$(dirname "$asset")"
+    curl -fsSL "$REPO/$asset" -o "$assets_tmp/$asset" || err "fetch failed: $REPO/$asset"
+done
 
 if [ -n "$SHA256" ]; then
     actual="$( (shasum -a 256 "$tmp" 2>/dev/null || sha256sum "$tmp") | cut -d' ' -f1 )"
@@ -64,6 +69,10 @@ head -1 "$tmp" | grep -q "uv run" || err "fetched file does not look like the ma
 
 mkdir -p "$MANAGER_DIR" "$BIN_DIR"
 cp "$tmp" "$MANAGER"
+for asset in SHEBANG.md DOCTRINE.md TEMPLATE.md SOURCES.md contract/preamble.py; do
+    mkdir -p "$MANAGER_DIR/$(dirname "$asset")"
+    cp "$assets_tmp/$asset" "$MANAGER_DIR/$asset"
+done
 chmod +x "$MANAGER"
 ln -sf "$MANAGER" "$BIN_DIR/capabilities"
 

@@ -22,7 +22,7 @@ The `-S` passes `--script` through `env`; the `# /// script` block is PEP-723 in
 
 ## The contract verbs
 
-Every script implements the same contract verbs alongside its domain verbs. The contract is **protocol 2** — this document is its specification — and it is a **spec, never a shared runtime library**: each script realizes it by copying the patterns in this file, and `capabilities audit` verifies conformance by calling the verbs and validating output shapes. No script imports from the manager, so a manager update can never break a deployed script.
+Every script implements the same contract verbs alongside its domain verbs. This document is the contract specification, and it is a **spec, never a shared runtime library**: each script realizes it by copying the patterns in this file, and `capabilities audit` verifies conformance by calling the verbs and validating output shapes. No script imports from the manager, so a manager update can never break a deployed script.
 
 | Verb | Returns |
 |---|---|
@@ -39,7 +39,6 @@ The declaration facts feed the contract from **constants at the top of the scrip
 
 ```python
 NAME = "asana"
-PROTOCOL = 2        # contract version this script implements
 SUMMARY = "Asana CLI over the REST API — list/read/create tasks, comment, complete."
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
@@ -89,7 +88,6 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 ```json
 {
   "name": "asana",
-  "protocol": 2,
   "summary": "Asana CLI over the REST API — list/read/create tasks, comment, complete.",
   "credentials": {
     "scope": "project",
@@ -113,7 +111,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 
 | Field | Meaning |
 |---|---|
-| `name`, `protocol`, `summary` | The constants, verbatim. |
+| `name`, `summary` | The constants, verbatim. |
 | `credentials.scope` | `project` or `user` — where the secret lives (see [the credential cascade](#the-credential-cascade)). |
 | `credentials.keys[]` | Every key the cascade resolves: `key`, `secret`, `required`, `note`. Install scaffolding and `doctor`'s remediation both derive from this list. |
 | `docs.base` | The upstream guides base URL; `""` when no guides ship. Overridable through the cascade as `<NAME>_DOCS_BASE`, so storage can move without touching the contract. |

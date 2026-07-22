@@ -349,10 +349,9 @@ API_BASE = "https://api.clickup.com/api/v2"
 TIMEOUT = httpx.Timeout(30.0)
 MAX_RETRIES = 3
 
-# --- Capability declaration (protocol 2) — one home for every contract fact --
+# --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "clickup"
-PROTOCOL = 2
 SUMMARY = ("ClickUp CLI over the REST API — read/create/update/comment-on tasks and "
            "subtasks, complete via status, manage assignees, tags, dependencies, "
            "custom fields, attachments, and webhooks across spaces and lists.")
@@ -572,7 +571,7 @@ def _state_dir() -> Path:
     return _STATE_HOME / NAME
 
 
-# --- Capability contract (protocol 2) — the declaration surface --------------
+# --- Capability contract — the declaration surface --------------------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -768,7 +767,7 @@ def _contract(argv: list[str]) -> None:
     if cmd == "stub":
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
-        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+        _emit({"name": NAME, "summary": SUMMARY,
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
                "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
                "state": STATE, "post_install": POST_INSTALL})

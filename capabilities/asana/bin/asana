@@ -315,10 +315,9 @@ API_BASE = "https://app.asana.com/api/1.0"
 TIMEOUT = httpx.Timeout(30.0)
 MAX_RETRIES = 3
 
-# --- Capability declaration (protocol 2) — one home for every contract fact --
+# --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "asana"
-PROTOCOL = 2
 SUMMARY = ("Asana CLI over the REST API — read/create/comment-on tasks and "
            "subtasks, @mention, manage tags, board sections, dependencies, "
            "and the API-only machine-state field.")
@@ -539,7 +538,7 @@ def _state_dir() -> Path:
     return _STATE_HOME / NAME
 
 
-# --- Capability contract (protocol 2) — the declaration surface --------------
+# --- Capability contract — the declaration surface --------------------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -735,7 +734,7 @@ def _contract(argv: list[str]) -> None:
     if cmd == "stub":
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
-        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+        _emit({"name": NAME, "summary": SUMMARY,
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
                "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
                "state": STATE, "post_install": POST_INSTALL})

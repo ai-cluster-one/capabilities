@@ -130,10 +130,9 @@ STRIPE_API = "https://api.stripe.com/v1"
 TIMEOUT = httpx.Timeout(60.0)
 MAX_RETRIES = 3
 
-# --- Capability declaration (protocol 2) — one home for every contract fact --
+# --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "stripe"
-PROTOCOL = 2
 SUMMARY = ("Read-only Stripe CLI over the REST API — emit a neutral JSON "
            "contract of account activity (sync-plan), check "
            "identity/reachability (doctor), list invoices and download their "
@@ -349,7 +348,7 @@ def _state_dir() -> Path:
     return _STATE_HOME / NAME
 
 
-# --- Capability contract (protocol 2) — the declaration surface --------------
+# --- Capability contract — the declaration surface --------------------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -545,7 +544,7 @@ def _contract(argv: list[str]) -> None:
     if cmd == "stub":
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
-        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+        _emit({"name": NAME, "summary": SUMMARY,
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
                "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
                "state": STATE, "post_install": POST_INSTALL})

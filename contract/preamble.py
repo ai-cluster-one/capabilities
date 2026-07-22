@@ -16,7 +16,7 @@ TWO TIERS
 =========
 The preamble has two independent fenced regions:
 
-  - **capability core** — the protocol-2 declaration surface (summary/manifest,
+  - **capability core** — the capability declaration surface (summary/manifest,
     references, guide, ids) plus the file/project/IO plumbing. EVERY capability
     carries it, connection-bearing or not. A capability with no connections takes
     the core fence and stops; that absence is not a deviation, just an absence.
@@ -30,7 +30,7 @@ tier; a core-only capability has no archetype because it has no connection.
 
 WHAT EACH CAPABILITY MUST DEFINE *ABOVE* THE FENCES (the vendored blocks read
 these module-level names; they are the only coupling):
-    core:        NAME, PROTOCOL, SUMMARY, SCOPE, DOCS_BASE, TOPICS, STATE,
+    core:        NAME, SUMMARY, SCOPE, DOCS_BASE, TOPICS, STATE,
                  POST_INSTALL, _CONFIG_HOME, _STATE_HOME
     connections: CREDENTIALS_ENV, CRED_KEYS, WRITE_VERBS, WRITE_DEFAULT
     plus the stdlib imports the helpers use: os, sys, json, Path, NoReturn.
@@ -253,7 +253,7 @@ def _state_dir() -> Path:
     return _STATE_HOME / NAME
 
 
-# --- Capability contract (protocol 2) — the declaration surface --------------
+# --- Capability contract — the declaration surface --------------------------
 
 def _docs_base() -> str:
     key = f"{NAME.upper()}_DOCS_BASE"
@@ -449,7 +449,7 @@ def _contract(argv: list[str]) -> None:
     if cmd == "stub":
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
-        _emit({"name": NAME, "protocol": PROTOCOL, "summary": SUMMARY,
+        _emit({"name": NAME, "summary": SUMMARY,
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
                "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
                "state": STATE, "post_install": POST_INSTALL})

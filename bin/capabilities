@@ -30,7 +30,7 @@ ENVIRONMENT
                        for the generated agent instruction paragraph.
 
 MACHINE VERBS
-  install <name> [--from <path|url>] [--yes]
+  install <name> [--from <path|url> | --source ID] [--yes]
         Fetch the capability into the registry, symlink its executable onto
         PATH, snapshot `stub` + `manifest --json` (keyed by payload hash),
         scaffold credentials per the declared scope, surface declared
@@ -40,6 +40,10 @@ MACHINE VERBS
         a URL. Source directories, and script paths inside source directories,
         install the complete bundle, excluding bytecode/cache files. Default
         catalogue sources install from the public repo bundle when available.
+        --source installs from one explicitly named registered source and records
+        its repository/ref/commit provenance. An unqualified name remains an
+        explicit request for the built-in official catalogue; custom sources
+        never shadow it.
   uninstall <name> [--purge-credentials]
         Remove the PATH symlink and the registry entry; regenerate the skill.
         Credentials are kept and reported; --purge-credentials deletes the
@@ -55,6 +59,24 @@ MACHINE VERBS
   list
         Installed capabilities with summaries; inside a project, each entry
         also carries its gate state (enabled / disabled / ungated).
+  search [QUERY] [--source ID]
+        Search cached catalogues from the official and registered sources.
+        Listing never executes catalogue capability code.
+  source init ID [--remote GIT_URL]
+        Create the canonical editable source workspace at
+        ~/capabilities-sources/ID, initialize git, vendor the authoring contract,
+        register it, and emit the exact authoring/publishing path.
+  source add ID GIT_URL [--ref REF]
+        Register and fetch a remote capability source into the manager-owned
+        read-only cache. Existing git/SSH credentials are used; no token is stored.
+  source clone ID GIT_URL [--ref REF]
+        Clone an existing source into the canonical editable workspace and
+        register it for authoring on this machine.
+  source list | path ID | refresh [ID] | sync ID | check ID | index ID | remove ID
+        Inspect sources, resolve the one editable path, refresh remote caches,
+        verify every capability and generated catalogue, rebuild that catalogue
+        after clean audits, or unregister a source. Removing never deletes an
+        editable workspace.
 
 PROJECT VERBS (run inside a consuming project)
   enable <name> / disable <name> [--deny]
@@ -118,8 +140,13 @@ VERIFICATION VERBS
         actually has, and every doc link resolves. Exit 0 whole, 7 otherwise.
 
 AUTHORING VERBS (emit agent-executable instructions; judgment stays with the agent)
-  new              The procedure for creating a capability from scratch.
-  conform <ref>    The procedure for bringing an existing script to the protocol.
+  new [<name> --source ID [--core-only]]
+                   With no name, emit the authoring procedure. With a name,
+                   create a canonical capability skeleton in that source;
+                   generated contract regions are stamped by the manager.
+  guide <authoring|repositories|publishing|contract>
+                   Manager-bundled offline guidance for custom sources.
+  conform <ref>    The procedure for bringing an existing script to the contract.
   groom <name>     The procedure for reviewing an installed capability.
   sanitize <name>  The procedure for reviewing this project's envelope for <name>.
 
@@ -149,11 +176,16 @@ from typing import NoReturn
 
 import httpx
 
-PROTOCOL = 2
 SOURCE = os.environ.get("CAPABILITIES_SOURCE") or \
     "https://raw.githubusercontent.com/ai-cluster-one/capabilities/main"
 CAP_HOME = Path(os.environ.get("CAPABILITIES_HOME") or (Path.home() / ".capabilities"))
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+_CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+SOURCE_WORKSPACE_ROOT = Path.home() / "capabilities-sources"
+SOURCES_FILE = _CONFIG_HOME / "capabilities" / "sources.json"
+SOURCE_CACHE_ROOT = _CACHE_HOME / "capabilities" / "sources"
+OFFICIAL_SOURCE_ID = "official"
+OFFICIAL_GIT_URL = "https://github.com/ai-cluster-one/capabilities.git"
 
 PROJECT_CAPABILITIES_REL = Path("capabilities")
 LEGACY_PROJECT_CAPABILITIES_REL = Path(".capabilities")
@@ -199,9 +231,14 @@ CAPABILITIES_CONTEXT_INTRO = (
     "connection; ask the user, never lift a gate yourself."
 )
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-_PREAMBLE = _REPO_ROOT / "contract" / "preamble.py"
+_MANAGER_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _MANAGER_DIR.parent
+_ASSET_ROOT = _REPO_ROOT if (_REPO_ROOT / "contract" / "preamble.py").is_file() \
+    else _MANAGER_DIR
+_PREAMBLE = _ASSET_ROOT / "contract" / "preamble.py"
 _CONTRACT_REGIONS = ("capability core", "connections")
+_AUTHORING_ASSETS = ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
+                     "contract/preamble.py")
 
 # ---------------------------------------------------------------- I/O contract
 
@@ -497,7 +534,7 @@ def _bin_dir() -> Path:
 
 # ---------------------------------------------------------------- manifest
 
-REQUIRED_MANIFEST_FIELDS = ("name", "protocol", "summary", "credentials",
+REQUIRED_MANIFEST_FIELDS = ("name", "summary", "credentials",
                             "docs", "state", "post_install")
 
 
@@ -505,14 +542,14 @@ def _validate_manifest(name: str, manifest) -> list[str]:
     """Mechanical shape check; returns a list of problems (empty = conformant)."""
     problems: list[str] = []
     if not isinstance(manifest, dict):
-        return [f"manifest is not a JSON object"]
+        return ["manifest is not a JSON object"]
     for field in REQUIRED_MANIFEST_FIELDS:
         if field not in manifest:
             problems.append(f"manifest missing field: {field}")
+    if "protocol" in manifest:
+        problems.append("manifest field 'protocol' was removed; the capability contract is unversioned")
     if manifest.get("name") != name:
         problems.append(f"manifest name {manifest.get('name')!r} != {name!r}")
-    if manifest.get("protocol") != PROTOCOL:
-        problems.append(f"manifest protocol {manifest.get('protocol')!r} != {PROTOCOL}")
     if not isinstance(manifest.get("summary"), str) or not manifest.get("summary", "").strip():
         problems.append("manifest summary missing or empty")
     creds = manifest.get("credentials")
@@ -561,9 +598,9 @@ def _validate_manifest(name: str, manifest) -> list[str]:
 
 # ---------------------------------------------------------------- snapshots
 
-def _snapshot(name: str, script: Path) -> dict:
+def _snapshot(name: str, script: Path, registry: Path | None = None) -> dict:
     """Run stub + manifest outside any project; persist snapshots keyed by hash."""
-    reg = _registry_dir(name)
+    reg = registry or _registry_dir(name)
     rc, stub_out, err = _run_script(script, ["stub"])
     if rc != 0:
         _die(6, "snapshot_failed", f"`{name} stub` exited {rc}", err.strip() or None)
@@ -723,36 +760,67 @@ def _resolve_source(name: str, from_ref: str | None) -> tuple[bytes, str, Path |
     return resp.content, url, None, None
 
 
-def _install_payload(name: str, content: bytes, bundle_dir: Path | None) -> Path:
-    reg = _registry_dir(name)
-    if reg.exists():
-        shutil.rmtree(reg)
+def _install_payload(name: str, content: bytes, bundle_dir: Path | None,
+                     registry: Path) -> Path:
+    reg = registry
     reg.mkdir(parents=True, exist_ok=True)
     if bundle_dir is not None:
         shutil.copytree(bundle_dir, reg, dirs_exist_ok=True, ignore=_bundle_ignore)
-    script = _script_path(name)
+    script = reg / name
     script.write_bytes(content)
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return script
 
 
-def _install_resolved_payload(name: str, content: bytes, bundle_dir: Path | None,
-                              temp_root: Path | None) -> Path:
+def _validate_installed_payload(name: str, manifest: dict,
+                                registry: Path | None = None) -> None:
+    reg = registry or _registry_dir(name)
+    if manifest.get("service") is not None and not (reg / "service").is_dir():
+        _die(6, "service_bundle_missing",
+             f"{name}: manifest declares a service but service/ was not installed",
+             "reinstall/update from a bundled source; public catalogue sources should "
+             "install the full capability bundle")
+
+
+def _prepare_payload(name: str, content: bytes, bundle_dir: Path | None,
+                     temp_root: Path | None, source: str) -> tuple[Path, dict]:
+    """Build and fully audit a candidate away from the live registry."""
+    _require_authoring_assets()
+    CAP_HOME.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{name}-stage-", dir=CAP_HOME))
     try:
-        return _install_payload(name, content, bundle_dir)
+        script = _install_payload(name, content, bundle_dir, stage)
+        failures = _audit_script(name, script)
+        if failures:
+            _die(7, "audit_failed", f"{name} from {source} fails capability audit",
+                 "; ".join(failures))
+        manifest = _snapshot(name, script, stage)
+        _validate_installed_payload(name, manifest, stage)
+        return stage, manifest
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
     finally:
         if temp_root is not None:
             shutil.rmtree(temp_root, ignore_errors=True)
 
 
-def _validate_installed_payload(name: str, manifest: dict) -> None:
+def _activate_payload(name: str, stage: Path) -> Path:
+    """Atomically replace one registry entry, restoring the old copy on error."""
     reg = _registry_dir(name)
-    if manifest.get("service") is not None and not (reg / "service").is_dir():
-        shutil.rmtree(reg, ignore_errors=True)
-        _die(6, "service_bundle_missing",
-             f"{name}: manifest declares a service but service/ was not installed",
-             "reinstall/update from a bundled source; public catalogue sources should "
-             "install the full capability bundle")
+    backup = CAP_HOME / f".{name}-previous"
+    if backup.exists():
+        shutil.rmtree(backup)
+    if reg.exists():
+        reg.rename(backup)
+    try:
+        stage.rename(reg)
+    except BaseException:
+        if backup.exists() and not reg.exists():
+            backup.rename(reg)
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
+    return reg / name
 
 
 def _payload_sha256(reg: Path) -> str:
@@ -821,17 +889,22 @@ def _scaffold_credentials(name: str, manifest: dict) -> list[str]:
     return notes
 
 
-def cmd_install(name: str, from_ref: str | None, yes: bool) -> None:
+def cmd_install(name: str, from_ref: str | None, source_id: str | None,
+                yes: bool) -> None:
+    provenance = {}
+    if source_id:
+        if from_ref:
+            _die(6, "input", "install accepts either --from or --source, not both")
+        from_ref, provenance = _source_install_ref(name, source_id)
     content, source, bundle_dir, temp_root = _resolve_source(name, from_ref)
-    reg = _registry_dir(name)
-    script = _install_resolved_payload(name, content, bundle_dir, temp_root)
-    manifest = _snapshot(name, script)
-    _validate_installed_payload(name, manifest)
-    _write_json(reg / "meta.json", {
+    stage, manifest = _prepare_payload(name, content, bundle_dir, temp_root, source)
+    _write_json(stage / "meta.json", {
         "name": name, "source": source, "source_type": "directory" if bundle_dir else "script",
-        "sha256": _sha256(script), "payload_sha256": _payload_sha256(reg),
-        "protocol": manifest.get("protocol"),
+        "sha256": _sha256(stage / name), "payload_sha256": _payload_sha256(stage),
+        **provenance,
     })
+    script = _activate_payload(name, stage)
+    reg = _registry_dir(name)
     link = _symlink(name, script)
     notes = _scaffold_credentials(name, manifest)
     post = manifest.get("post_install") or []
@@ -889,20 +962,24 @@ def cmd_update(name: str | None) -> None:
     results = []
     for n in targets:
         meta = _read_json(_registry_dir(n) / "meta.json") or {}
-        source = meta.get("source")
+        source_id = meta.get("source_id")
+        provenance = {}
+        if source_id:
+            source, provenance = _source_install_ref(n, source_id)
+        else:
+            source = meta.get("source")
         before = meta.get("payload_sha256")
         if before is None and _script_path(n).exists():
             before = _sha256(_script_path(n))
         content, source, bundle_dir, temp_root = _resolve_source(n, source)
-        script = _install_resolved_payload(n, content, bundle_dir, temp_root)
-        manifest = _snapshot(n, script)
-        _validate_installed_payload(n, manifest)
-        after = _payload_sha256(_registry_dir(n))
-        _write_json(_registry_dir(n) / "meta.json", {
+        stage, manifest = _prepare_payload(n, content, bundle_dir, temp_root, source)
+        after = _payload_sha256(stage)
+        _write_json(stage / "meta.json", {
             "name": n, "source": source, "source_type": "directory" if bundle_dir else "script",
-            "sha256": _sha256(script), "payload_sha256": after,
-            "protocol": manifest.get("protocol"),
+            "sha256": _sha256(stage / n), "payload_sha256": after,
+            **provenance,
         })
+        _activate_payload(n, stage)
         results.append({"name": n, "changed": before != after})
     _regen_skills()
     _emit({"updated": results})
@@ -925,6 +1002,17 @@ def cmd_self_update() -> None:
     if resp.status_code != 200:
         _die(5, "server_error", f"fetch returned {resp.status_code}", url)
     content = resp.content
+    assets: dict[str, bytes] = {}
+    for rel in _AUTHORING_ASSETS:
+        asset_url = f"{SOURCE}/{rel}"
+        try:
+            asset_resp = httpx.get(asset_url, follow_redirects=True, timeout=30.0)
+        except httpx.HTTPError as e:
+            _die(5, "network_error", f"authoring asset fetch failed: {e}", asset_url)
+        if asset_resp.status_code != 200:
+            _die(5, "server_error",
+                 f"authoring asset fetch returned {asset_resp.status_code}", asset_url)
+        assets[rel] = asset_resp.content
     # The fetched bytes must actually be the manager script, not an error page
     # or a redirect body — mirror install.sh's shebang guard.
     if b"uv run" not in content.split(b"\n", 1)[0]:
@@ -934,8 +1022,13 @@ def cmd_self_update() -> None:
     before = _sha256(manager) if manager.exists() and not manager.is_symlink() else None
     after = hashlib.sha256(content).hexdigest()
     if before == after:
+        for rel, body in assets.items():
+            target = manager.parent / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
         _emit({"self_update": "already current",
-               "manager": str(manager), "sha256": after, "source": url})
+               "manager": str(manager), "sha256": after, "source": url,
+               "authoring_assets": sorted(assets)})
         return
     manager.parent.mkdir(parents=True, exist_ok=True)
     # Never write through a stray symlink into a working tree — the same
@@ -945,10 +1038,15 @@ def cmd_self_update() -> None:
         manager.unlink()
     manager.write_bytes(content)
     manager.chmod(manager.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    for rel, body in assets.items():
+        target = manager.parent / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
     link = _symlink("capabilities", manager)
     _emit({"self_update": "updated", "manager": str(manager),
            "sha256_before": before, "sha256_after": after,
-           "symlink": str(link), "source": url})
+           "symlink": str(link), "source": url,
+           "authoring_assets": sorted(assets)})
 
 
 def cmd_list() -> None:
@@ -1675,6 +1773,14 @@ per-project gate), `capabilities init` (wire a project), `capabilities ids
 <name>` (render a capability's project identifiers), `capabilities doctor` /
 `capabilities audit <name>` (verify), `capabilities context --fragment`
 (render the manager-owned project block), `capabilities help` (full contract).
+Custom managed source code lives only under
+`~/capabilities-sources/<source-id>/`: create it with `capabilities source init
+<id>`, create packages with `capabilities new <name> --source <id>`, and run
+`capabilities source index <id>` plus `source check <id>` before committing.
+Remote catalogues attach through `capabilities source add`; `capabilities
+search` lists their generated indexes without executing package code. Never
+edit the read-only source cache, installed registry, or a project's capability
+envelope as source code.
 
 Project visibility is host-owner-generated. Without ContextKit, in a Codex project run
 `capabilities init --codex` once, then `capabilities enable <name>`; after
@@ -1763,7 +1869,6 @@ def cmd_doctor() -> None:
     findings: list[str] = []
     bin_dir = _bin_dir()
     for name, meta in _installed().items():
-        reg = _registry_dir(name)
         script = _script_path(name)
         # The registry copy is the canonical binary — a real file the manager
         # wrote, never a symlink into a working tree. A dev-time `ln -s` back to
@@ -1978,6 +2083,10 @@ def _audit_script(name: str, script: Path) -> list[str]:
             failures.append("manifest: not JSON")
     if manifest is not None:
         failures += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
+        if str(manifest.get("summary", "")).startswith("TODO:"):
+            failures.append("manifest: scaffold summary placeholder remains")
+    if "Replace this scaffold check with" in script_text:
+        failures.append("doctor: scaffold readiness placeholder remains")
 
     rc, out, err = _run_script(script, ["help"])
     if rc != 0:
@@ -2177,6 +2286,662 @@ def cmd_audit(name: str, from_ref: str | None) -> None:
     _emit(report)
     if failures:
         sys.exit(7)
+
+
+# ---------------------------------------------------------------- sources / authoring
+
+def _validate_source_id(source_id: str) -> None:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", source_id):
+        _die(6, "bad_source_id", f"invalid source id {source_id!r}",
+             "use lowercase letters, digits, dots, underscores, or hyphens")
+
+
+def _sources_config() -> dict:
+    raw = _read_json(SOURCES_FILE)
+    if raw is None:
+        return {"sources": {}}
+    if not isinstance(raw, dict) or not isinstance(raw.get("sources"), dict):
+        _die(6, "bad_sources", f"{SOURCES_FILE} is not a sources registry",
+             'expected {"sources": {"<id>": {"kind", ...}}}')
+    return raw
+
+
+def _source_entry(source_id: str) -> dict:
+    if source_id == OFFICIAL_SOURCE_ID:
+        return {"kind": "git", "url": OFFICIAL_GIT_URL, "ref": "main",
+                "builtin": True}
+    entry = (_sources_config().get("sources") or {}).get(source_id)
+    if not isinstance(entry, dict):
+        _die(3, "source_not_found", f"unknown capability source {source_id!r}",
+             "`capabilities source list` shows registered sources")
+    if entry.get("kind") == "workspace":
+        configured = Path(entry.get("path") or "").expanduser()
+        canonical = _source_workspace(source_id)
+        if configured.resolve() != canonical.resolve():
+            _die(6, "noncanonical_workspace",
+                 f"source {source_id!r} workspace is not canonical: {configured}",
+                 f"managed source workspaces must live at {canonical}")
+    elif entry.get("kind") != "git":
+        _die(6, "bad_source", f"source {source_id!r} has unknown kind {entry.get('kind')!r}")
+    return entry
+
+
+def _source_workspace(source_id: str) -> Path:
+    return SOURCE_WORKSPACE_ROOT / source_id
+
+
+def _source_cache(source_id: str) -> Path:
+    return SOURCE_CACHE_ROOT / source_id
+
+
+def _source_root(source_id: str) -> Path:
+    entry = _source_entry(source_id)
+    if entry.get("kind") == "workspace":
+        return Path(entry.get("path") or _source_workspace(source_id)).expanduser()
+    return _source_cache(source_id)
+
+
+def _source_author_root(source_id: str) -> Path:
+    """Editable root for a registered workspace or the official repo checkout."""
+    if source_id == OFFICIAL_SOURCE_ID and \
+            (_REPO_ROOT / "capabilities.repo.json").is_file():
+        return _REPO_ROOT
+    return _source_root(source_id)
+
+
+def _git(args: list[str], cwd: Path | None = None) -> str:
+    try:
+        proc = subprocess.run(["git", *args], cwd=str(cwd) if cwd else None,
+                              capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        _die(6, "missing_git", "git is required for capability sources")
+    except subprocess.TimeoutExpired:
+        _die(5, "git_timeout", "git command timed out", " ".join(args))
+    if proc.returncode != 0:
+        _die(5, "git_failed", proc.stderr.strip() or "git command failed",
+             "git " + " ".join(args))
+    return proc.stdout.strip()
+
+
+def _require_authoring_assets() -> None:
+    missing = [rel for rel in _AUTHORING_ASSETS if not (_ASSET_ROOT / rel).is_file()]
+    if missing:
+        _die(5, "authoring_assets_missing",
+             f"manager authoring kit is incomplete: {', '.join(missing)}",
+             "run `capabilities self-update`; bootstrap installs the manager and its authoring kit")
+
+
+def _authoring_markdown(source_id: str) -> str:
+    root = _source_workspace(source_id)
+    return f"""\
+# Authoring managed capabilities
+
+This repository is the sole editable source for `{source_id}`. Its canonical
+workspace is `{root}`. Never edit installed payloads under `~/.capabilities/`,
+manager caches under `~/.cache/capabilities/`, or a consuming project's
+`capabilities/` envelope as capability source code.
+
+Create a capability only with:
+
+```sh
+capabilities new <name> --source {source_id}
+```
+
+The manager stamps generated contract regions from `contract/preamble.py`.
+Never edit text between `# >>> contract:` and `# <<< contract:` markers.
+Before every commit run:
+
+```sh
+capabilities source index {source_id}
+capabilities source check {source_id}
+```
+
+Install for a local smoke test with `capabilities install <name> --source
+{source_id}`. Commit and push only from this workspace with ordinary git.
+There is no conformance override: a managed capability must pass the contract
+and audit. A free-form CLI remains usable directly, outside this manager.
+"""
+
+
+def _repo_agent_markdown(source_id: str) -> str:
+    return f"""\
+# Managed capability source
+
+Read `AUTHORING.md` before editing. Create packages with `capabilities new
+<name> --source {source_id}`. Never hand-edit generated contract regions.
+Run `capabilities source index {source_id}` and `capabilities source check
+{source_id}` before committing. Source code lives only under
+`capabilities/<name>/`; installed and project-envelope copies are not source.
+"""
+
+
+def _scaffold_source_repo(source_id: str, root: Path) -> None:
+    _require_authoring_assets()
+    (root / "capabilities").mkdir(parents=True, exist_ok=True)
+    (root / ".capability-source").mkdir(parents=True, exist_ok=True)
+    for rel in _AUTHORING_ASSETS:
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source_asset = _ASSET_ROOT / rel
+        if source_asset.resolve() != target.resolve():
+            shutil.copy2(source_asset, target)
+    _write_json(root / "capabilities.repo.json", {"kind": "capability-source"})
+    _write_json(root / "contract" / "contract.json", {
+        "preamble_sha256": _sha256(root / "contract" / "preamble.py")})
+    _write_json(root / ".capability-source" / "catalog.json", {"capabilities": {}})
+    (root / "AUTHORING.md").write_text(_authoring_markdown(source_id))
+    agent_text = _repo_agent_markdown(source_id)
+    (root / "AGENTS.md").write_text(agent_text)
+    (root / "CLAUDE.md").write_text(agent_text)
+    (root / "README.md").write_text(
+        f"# {source_id} capabilities\n\nSee [AUTHORING.md](AUTHORING.md).\n")
+    (root / ".gitignore").write_text("**/__pycache__/\n*.pyc\n")
+
+
+def cmd_source_init(source_id: str, remote: str | None) -> None:
+    _validate_source_id(source_id)
+    if source_id == OFFICIAL_SOURCE_ID:
+        _die(6, "reserved_source", f"{OFFICIAL_SOURCE_ID!r} is reserved")
+    cfg = _sources_config()
+    if source_id in cfg["sources"]:
+        _die(6, "source_exists", f"source {source_id!r} is already registered")
+    root = _source_workspace(source_id)
+    if root.exists():
+        _die(6, "workspace_exists", f"canonical workspace already exists: {root}",
+             "move or remove it deliberately before initializing this source")
+    root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir()
+        _scaffold_source_repo(source_id, root)
+        _git(["init", "--initial-branch", "main"], cwd=root)
+        if remote:
+            _git(["remote", "add", "origin", remote], cwd=root)
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    cfg["sources"][source_id] = {
+        "kind": "workspace", "path": str(root), "ref": "main",
+        **({"url": remote} if remote else {})}
+    _write_json(SOURCES_FILE, cfg)
+    _emit({"source": source_id, "kind": "workspace", "path": str(root),
+           "remote": remote, "next": [
+               f"cd {shlex.quote(str(root))}",
+               f"capabilities new <name> --source {source_id}",
+               f"capabilities source index {source_id}",
+               f"capabilities source check {source_id}"]})
+
+
+def _refresh_source(source_id: str) -> dict:
+    entry = _source_entry(source_id)
+    root = _source_root(source_id)
+    if entry.get("kind") == "workspace":
+        if not (root / ".git").is_dir():
+            _die(6, "bad_workspace", f"source workspace is not a git repository: {root}")
+        commit = _git(["rev-parse", "HEAD"], cwd=root) if \
+            _git(["rev-list", "--all", "--count"], cwd=root) != "0" else None
+        dirty = bool(_git(["status", "--porcelain"], cwd=root))
+        return {"source": source_id, "kind": "workspace", "path": str(root),
+                "commit": commit, "dirty": dirty}
+    url = entry.get("url")
+    ref = entry.get("ref") or "main"
+    if not isinstance(url, str) or not url:
+        _die(6, "bad_source", f"source {source_id!r} has no git URL")
+    SOURCE_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    if root.exists():
+        if not (root / ".git").is_dir():
+            shutil.rmtree(root)
+        else:
+            _git(["fetch", "--depth", "1", "origin", ref], cwd=root)
+            _git(["reset", "--hard", "FETCH_HEAD"], cwd=root)
+    if not root.exists():
+        _git(["clone", "--depth", "1", "--branch", ref, url, str(root)])
+    marker = _read_json(root / "capabilities.repo.json")
+    catalog = _read_json(root / ".capability-source" / "catalog.json")
+    if not isinstance(marker, dict) or marker.get("kind") != "capability-source":
+        _die(7, "source_invalid", f"{source_id!r} is not a managed capability source",
+             "missing capabilities.repo.json capability-source marker")
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("capabilities"), dict):
+        _die(7, "source_invalid", f"{source_id!r} has no generated capability catalog",
+             "the source owner must run `capabilities source index <id>` and publish it")
+    return {"source": source_id, "kind": "git", "path": str(root),
+            "ref": ref, "commit": _git(["rev-parse", "HEAD"], cwd=root)}
+
+
+def _source_install_ref(name: str, source_id: str) -> tuple[str, dict]:
+    entry = _source_entry(source_id)
+    state = _refresh_source(source_id)
+    root = _source_root(source_id)
+    capdir = root / "capabilities" / name
+    script = capdir / "bin" / name
+    if not script.is_file():
+        _die(3, "not_found", f"source {source_id!r} has no capability {name!r}",
+             f"expected {script}")
+    catalog = _read_json(root / ".capability-source" / "catalog.json") or {}
+    listed = (catalog.get("capabilities") or {}).get(name)
+    if not isinstance(listed, dict):
+        _die(7, "catalog_missing", f"{name!r} is not present in source {source_id!r} catalog",
+             f"the source owner must run `capabilities source index {source_id}` and publish it")
+    expected_hash = listed.get("payload_sha256")
+    actual_hash = _payload_sha256(capdir)
+    if expected_hash != actual_hash:
+        _die(7, "catalog_drift", f"{source_id}/{name} payload differs from its catalog",
+             f"run `capabilities source index {source_id}` before installing")
+    return str(capdir), {
+        "source_id": source_id,
+        "source_url": entry.get("url"),
+        "source_ref": entry.get("ref") or "main",
+        "source_commit": state.get("commit"),
+        "source_dirty": state.get("dirty", False),
+    }
+
+
+def cmd_source_add(source_id: str, url: str, ref: str) -> None:
+    _validate_source_id(source_id)
+    if source_id == OFFICIAL_SOURCE_ID:
+        _die(6, "reserved_source", f"{OFFICIAL_SOURCE_ID!r} is reserved")
+    cfg = _sources_config()
+    if source_id in cfg["sources"]:
+        _die(6, "source_exists", f"source {source_id!r} is already registered")
+    cfg["sources"][source_id] = {"kind": "git", "url": url, "ref": ref}
+    _write_json(SOURCES_FILE, cfg)
+    try:
+        result = _refresh_source(source_id)
+    except BaseException:
+        cfg["sources"].pop(source_id, None)
+        _write_json(SOURCES_FILE, cfg)
+        shutil.rmtree(_source_cache(source_id), ignore_errors=True)
+        raise
+    _emit({"registered": source_id, **result})
+
+
+def cmd_source_clone(source_id: str, url: str, ref: str) -> None:
+    _validate_source_id(source_id)
+    if source_id == OFFICIAL_SOURCE_ID:
+        _die(6, "reserved_source", f"{OFFICIAL_SOURCE_ID!r} is reserved")
+    cfg = _sources_config()
+    if source_id in cfg["sources"]:
+        _die(6, "source_exists", f"source {source_id!r} is already registered")
+    root = _source_workspace(source_id)
+    if root.exists():
+        _die(6, "workspace_exists", f"canonical workspace already exists: {root}")
+    root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _git(["clone", "--branch", ref, url, str(root)])
+        failures = _source_contract_failures(root)
+        if failures:
+            _die(7, "source_invalid", "; ".join(failures),
+                 "the repository owner must publish a manager-created capability source")
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    cfg["sources"][source_id] = {
+        "kind": "workspace", "path": str(root), "url": url, "ref": ref}
+    _write_json(SOURCES_FILE, cfg)
+    _emit({"source": source_id, "kind": "workspace", "path": str(root),
+           "url": url, "ref": ref,
+           "next": [f"cd {shlex.quote(str(root))}",
+                    f"capabilities source check {source_id}"]})
+
+
+def cmd_source_list() -> None:
+    entries = [{"id": OFFICIAL_SOURCE_ID, "kind": "git",
+                "url": OFFICIAL_GIT_URL, "ref": "main", "builtin": True,
+                "cached": _source_cache(OFFICIAL_SOURCE_ID).is_dir()}]
+    for source_id, entry in sorted((_sources_config().get("sources") or {}).items()):
+        root = _source_root(source_id)
+        entries.append({"id": source_id, **entry, "available": root.is_dir()})
+    _emit({"sources": entries, "workspace_root": str(SOURCE_WORKSPACE_ROOT),
+           "cache_root": str(SOURCE_CACHE_ROOT)})
+
+
+def cmd_source_path(source_id: str) -> None:
+    entry = _source_entry(source_id)
+    if entry.get("kind") != "workspace":
+        _die(6, "not_editable", f"source {source_id!r} is a remote cache, not an editable workspace",
+             f"authoring workspaces are created by `capabilities source init <id>` under {SOURCE_WORKSPACE_ROOT}")
+    _emit({"source": source_id, "path": str(_source_root(source_id))})
+
+
+def cmd_source_refresh(source_id: str | None) -> None:
+    ids = [source_id] if source_id else [OFFICIAL_SOURCE_ID, *sorted(
+        (_sources_config().get("sources") or {}).keys())]
+    _emit({"refreshed": [_refresh_source(sid) for sid in ids]})
+
+
+def cmd_source_remove(source_id: str) -> None:
+    if source_id == OFFICIAL_SOURCE_ID:
+        _die(6, "reserved_source", "the built-in official source cannot be removed")
+    cfg = _sources_config()
+    entry = cfg["sources"].get(source_id)
+    if not isinstance(entry, dict):
+        _die(3, "source_not_found", f"unknown capability source {source_id!r}")
+    root = Path(entry.get("path") or _source_workspace(source_id)) if \
+        entry.get("kind") == "workspace" else _source_cache(source_id)
+    cfg["sources"].pop(source_id)
+    _write_json(SOURCES_FILE, cfg)
+    cache = _source_cache(source_id)
+    if cache.is_dir() and entry.get("kind") != "workspace":
+        shutil.rmtree(cache)
+    result = {"removed": source_id}
+    if entry.get("kind") == "workspace":
+        result["workspace_kept"] = str(root)
+    _emit(result)
+
+
+def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]]]:
+    cap_root = root / "capabilities"
+    entries: dict = {}
+    failures: dict[str, list[str]] = {}
+    if not cap_root.is_dir():
+        return {"capabilities": {}}, {"repository": ["missing capabilities/ directory"]}
+    for capdir in sorted(p for p in cap_root.iterdir() if p.is_dir()):
+        name = capdir.name
+        script = capdir / "bin" / name
+        if not script.is_file():
+            failures[name] = [f"missing canonical executable capabilities/{name}/bin/{name}"]
+            continue
+        problems = _audit_script(name, script) if audit else []
+        rc, out, err = _run_script(script, ["manifest", "--json"])
+        manifest = None
+        if rc == 0:
+            try:
+                manifest = json.loads(out)
+            except ValueError:
+                problems.append("manifest: not JSON")
+        else:
+            problems.append(f"manifest: exit {rc}: {err.strip()}")
+        if manifest is not None:
+            problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
+        if problems:
+            failures[name] = sorted(set(problems))
+            continue
+        entries[name] = {
+            "path": f"capabilities/{name}",
+            "summary": manifest.get("summary", ""),
+            "payload_sha256": _payload_sha256(capdir),
+        }
+    return {"capabilities": entries}, failures
+
+
+def _source_contract_failures(root: Path) -> list[str]:
+    _require_authoring_assets()
+    failures = []
+    marker = _read_json(root / "capabilities.repo.json")
+    if not isinstance(marker, dict) or marker.get("kind") != "capability-source":
+        failures.append("capabilities.repo.json: missing capability-source marker")
+    source_preamble = root / "contract" / "preamble.py"
+    if not source_preamble.is_file():
+        failures.append("contract: missing contract/preamble.py")
+    elif source_preamble.read_bytes() != _PREAMBLE.read_bytes():
+        failures.append("contract: preamble differs from the manager's canonical contract")
+    lock = _read_json(root / "contract" / "contract.json")
+    if not isinstance(lock, dict) or lock.get("preamble_sha256") != _sha256(_PREAMBLE):
+        failures.append("contract: contract.json checksum is stale")
+    return failures
+
+
+def cmd_source_index(source_id: str) -> None:
+    root = _source_author_root(source_id)
+    if not root.is_dir():
+        _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
+             f"run `capabilities source refresh {source_id}`")
+    contract_failures = _source_contract_failures(root)
+    catalog, failures = _catalog_payload(root, audit=True)
+    if contract_failures or failures:
+        _emit({"source": source_id, "ok": False,
+               "contract": contract_failures, "failures": failures})
+        sys.exit(7)
+    path = root / ".capability-source" / "catalog.json"
+    _write_json(path, catalog)
+    _emit({"source": source_id, "indexed": sorted(catalog["capabilities"]),
+           "catalog": str(path), "ok": True})
+
+
+def cmd_source_check(source_id: str) -> None:
+    root = _source_author_root(source_id)
+    if not root.is_dir():
+        _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
+             f"run `capabilities source refresh {source_id}`")
+    contract_failures = _source_contract_failures(root)
+    expected, failures = _catalog_payload(root, audit=True)
+    current = _read_json(root / ".capability-source" / "catalog.json")
+    if current != expected:
+        failures.setdefault("catalog", []).append(
+            f"generated catalog is stale — run `capabilities source index {source_id}`")
+    ok = not contract_failures and not failures
+    _emit({"source": source_id, "root": str(root), "ok": ok,
+           "contract": contract_failures, "failures": failures,
+           "capabilities": sorted(expected["capabilities"])})
+    if not ok:
+        sys.exit(7)
+
+
+def cmd_search(query: str | None, source_id: str | None) -> None:
+    ids = [source_id] if source_id else [OFFICIAL_SOURCE_ID, *sorted(
+        (_sources_config().get("sources") or {}).keys())]
+    needle = (query or "").lower()
+    matches = []
+    unavailable = []
+    for sid in ids:
+        root = _source_author_root(sid)
+        catalog = _read_json(root / ".capability-source" / "catalog.json") if root.is_dir() else None
+        if not isinstance(catalog, dict) or not isinstance(catalog.get("capabilities"), dict):
+            unavailable.append({"source": sid,
+                                "hint": f"capabilities source refresh {sid}"})
+            continue
+        for name, entry in sorted(catalog["capabilities"].items()):
+            summary = (entry or {}).get("summary", "")
+            if needle and needle not in name.lower() and needle not in summary.lower():
+                continue
+            matches.append({"name": name, "source": sid, "summary": summary,
+                            "installed": _registry_dir(name).is_dir()})
+    _emit({"matches": matches, "unavailable_sources": unavailable})
+
+
+def _capability_skeleton(name: str, core_only: bool) -> str:
+    canonical = _canonical_regions()
+    core_open, core_close = _fence_markers("capability core")
+    conn_open, conn_close = _fence_markers("connections")
+    connections = ""
+    report = """\
+def _connections_report() -> dict:
+    reg, _reg_file = _connections_registry()
+    out: dict = {"default": None, "connections": {}}
+    if reg is None:
+        rows = []
+        for spec in CRED_KEYS:
+            value, tier, source = _resolve_env_key(spec["key"])
+            rows.append(_key_report(spec["key"], bool(spec.get("secret")),
+                                    bool(spec.get("required")), value, tier, source))
+        out["default"] = "default"
+        out["connections"]["default"] = {
+            "allow_write": WRITE_DEFAULT, "keys": rows}
+        return out
+    conns = reg["connections"]
+    out["default"] = reg.get("default") or (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, raw in conns.items():
+        entry = raw if isinstance(raw, dict) else {}
+        rows = []
+        for spec in CRED_KEYS:
+            value, tier, source = _resolve_env_key(spec["key"])
+            rows.append(_key_report(spec["key"], bool(spec.get("secret")),
+                                    bool(spec.get("required")), value, tier, source))
+        out["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": rows}
+    return out
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+"""
+    doctor = """\
+def cmd_doctor(wanted: str | None) -> None:
+    report = _connections_report()
+    _doctor_gate(report, wanted)
+    _emit({"ok": True, "connections": report["connections"],
+           "note": "Replace this scaffold check with the cheapest real readiness round-trip."})
+"""
+    if not core_only:
+        connections = (f"\n{conn_open}\n{canonical['connections']}{conn_close}\n\n" +
+                       report + "\n" + doctor)
+    else:
+        report = """\
+def _cmd_connections() -> None:
+    _emit({"default": None, "connections": {}})
+"""
+        doctor = """\
+def cmd_doctor(_wanted: str | None) -> None:
+    _emit({"ok": True, "note": "Replace this scaffold check with a real readiness proof."})
+"""
+        connections = "\n" + report + "\n" + doctor
+    return f'''#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""{name} — managed capability scaffold.
+
+Contract:
+  {name} help
+  {name} doctor [--connection ID]
+  {name} connections
+  {name} stub
+  {name} manifest --json
+  {name} guide [topic]
+  {name} ids list|get|set|rm
+  {name} refs
+
+Add the smallest useful domain verb surface below the generated contract
+regions. Never edit text inside those regions. Success is JSON on stdout;
+errors are JSON on stderr. Exit 4 is policy refusal.
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+NAME = {name!r}
+SUMMARY = "TODO: describe the capability's smallest useful surface."
+SCOPE = "project"
+CRED_KEYS = []  # Add credential declarations; never put secret values here.
+WRITE_VERBS = set()
+WRITE_DEFAULT = True
+DOCS_BASE = ""
+TOPICS: list[str] = []
+STATE = False
+POST_INSTALL: list[dict] = []
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+{core_open}
+{canonical['capability core']}{core_close}
+{connections}
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    _contract(argv)
+    wanted = None
+    cleaned = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--connection" and i + 1 < len(argv):
+            wanted = argv[i + 1]
+            i += 2
+            continue
+        if argv[i].startswith("--connection="):
+            wanted = argv[i].split("=", 1)[1]
+            i += 1
+            continue
+        cleaned.append(argv[i])
+        i += 1
+    if cleaned == ["doctor"]:
+        cmd_doctor(wanted)
+        return
+    _die(6, "input", "unknown or incomplete command",
+         f"run `{{NAME}} help`; add domain verbs to this scaffold")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def cmd_new_capability(name: str, source_id: str, core_only: bool) -> None:
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+        _die(6, "bad_name", f"invalid capability name {name!r}",
+             "use lowercase letters, digits, and hyphens; start with a letter")
+    entry = _source_entry(source_id)
+    official_checkout = source_id == OFFICIAL_SOURCE_ID and \
+        (_REPO_ROOT / "capabilities.repo.json").is_file()
+    if entry.get("kind") != "workspace" and not official_checkout:
+        _die(6, "not_editable", f"source {source_id!r} is not an editable workspace",
+             "create one with `capabilities source init <id>`")
+    root = _source_author_root(source_id)
+    contract_failures = _source_contract_failures(root)
+    if contract_failures:
+        _die(7, "contract_drift", "; ".join(contract_failures),
+             f"run `capabilities source sync {source_id}`")
+    capdir = root / "capabilities" / name
+    if capdir.exists():
+        _die(6, "capability_exists", f"capability source already exists: {capdir}")
+    script = capdir / "bin" / name
+    script.parent.mkdir(parents=True)
+    (capdir / "guides").mkdir()
+    script.write_text(_capability_skeleton(name, core_only))
+    script.chmod(0o755)
+    _emit({"created": name, "source": source_id, "path": str(capdir),
+           "executable": str(script), "core_only": core_only,
+           "next": [f"edit only outside generated contract regions in {script}",
+                    f"capabilities source index {source_id}",
+                    f"capabilities source check {source_id}",
+                    f"capabilities install {name} --source {source_id}"]})
+
+
+def cmd_source_sync(source_id: str) -> None:
+    entry = _source_entry(source_id)
+    official_checkout = source_id == OFFICIAL_SOURCE_ID and \
+        (_REPO_ROOT / "capabilities.repo.json").is_file()
+    if entry.get("kind") != "workspace" and not official_checkout:
+        _die(6, "not_editable", "contract sync is only available for an editable workspace")
+    root = _source_author_root(source_id)
+    _require_authoring_assets()
+    for rel in _AUTHORING_ASSETS:
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source_asset = _ASSET_ROOT / rel
+        if source_asset.resolve() != target.resolve():
+            shutil.copy2(source_asset, target)
+    canonical = _canonical_regions()
+    stamped = []
+    for capdir in sorted(p for p in (root / "capabilities").iterdir() if p.is_dir()):
+        script = capdir / "bin" / capdir.name
+        if not script.is_file():
+            continue
+        source_text = script.read_text()
+        updated = source_text
+        regions = []
+        for region, body in canonical.items():
+            split = _split_region(updated, region)
+            if split is None:
+                if region == "capability core":
+                    _die(7, "contract_missing", f"{capdir.name}: missing generated core region")
+                continue
+            head, interior, tail = split
+            if interior != body:
+                updated = head + body + tail
+                regions.append(region)
+        if updated != source_text:
+            script.write_text(updated)
+            stamped.append({"capability": capdir.name, "regions": regions})
+    _write_json(root / "contract" / "contract.json", {
+        "preamble_sha256": _sha256(_PREAMBLE)})
+    _emit({"source": source_id, "contract": str(root / "contract"),
+           "stamped": stamped, "ok": True})
 
 # ---------------------------------------------------------------- selfcheck
 
@@ -2381,13 +3146,82 @@ def cmd_selfcheck() -> None:
 
 # ---------------------------------------------------------------- authoring
 
+def _manager_guide(topic: str) -> str:
+    guides = {
+        "authoring": f"""\
+# Authoring a managed capability
+
+Create a source with `capabilities source init <id> [--remote <git-url>]`.
+Its one editable checkout always lives at `{SOURCE_WORKSPACE_ROOT}/<id>`; ask
+the manager for the concrete path with `capabilities source path <id>`.
+
+Create a package only with `capabilities new <name> --source <id>` (add
+`--core-only` only when it genuinely has no connections). The manager writes
+`capabilities/<name>/bin/<name>` and stamps the generated contract fences.
+Replace every scaffold placeholder and implement domain declarations, doctor,
+and the smallest useful verb surface outside those fences.
+
+Acceptance is fixed: `capabilities source index <id>`, `capabilities source
+check <id>`, then `capabilities install <name> --source <id>` for a local smoke
+test. Indexing and installation both run the full audit. There is no
+conformance override; free-form CLIs remain outside the manager.
+""",
+        "repositories": f"""\
+# Capability source repositories
+
+Editable source: `{SOURCE_WORKSPACE_ROOT}/<id>`. Remote read-only cache:
+`{SOURCE_CACHE_ROOT}/<id>`. Installed payload: `{CAP_HOME}/<name>`. Project
+configuration: `<project>/capabilities/<name>/`. Only the editable source is a
+git authoring workspace. Never commit from the cache, registry, or project
+envelope. `capabilities source path <id>` returns the exact editable path.
+
+The manager owns `{SOURCES_FILE}`. Its shape is
+`{{"sources": {{"<id>": {{"kind": "git", "url": "<git-url>", "ref":
+"main"}}}}}}`; use `source init`, `source clone`, `source add`, and `source
+remove` instead of editing it. `source list` is the supported inspection
+surface. A source repository is recognized by `capabilities.repo.json`, its
+vendored `contract/`, and generated `.capability-source/catalog.json`.
+""",
+        "publishing": """\
+# Publishing a capability source
+
+Before committing, run `capabilities source index <id>` and `capabilities source
+check <id>`, then smoke-install changed packages with `capabilities install
+<name> --source <id>`. Use ordinary git only from the path returned by
+`capabilities source path <id>`: `git add .`, commit intentionally, and `git
+push -u origin main`. The manager validates and records provenance; it does not
+commit or push.
+
+Consumers attach the published repository with `capabilities source add <id>
+<git-url> [--ref <ref>]`, inspect it with `capabilities search --source <id>`,
+and install explicitly with `capabilities install <name> --source <id>`.
+Unqualified installs always mean the official catalogue, so custom sources
+cannot shadow it.
+""",
+        "contract": """\
+# Generated capability contract
+
+`contract/preamble.py` is vendored by `source init`. `capabilities new` stamps
+its fenced regions; agents never write them by hand. `capabilities source sync
+<id>` deterministically updates the authoring kit and every existing generated region.
+`source check` and installation reject missing or changed regions. No force or
+skip flag exists.
+""",
+    }
+    if topic not in guides:
+        _die(3, "not_found", f"unknown manager guide {topic!r}",
+             "topics: " + ", ".join(sorted(guides)))
+    return guides[topic]
+
+
 def _instructions_new() -> str:
     return f"""\
 # Create a capability — agent procedure
 
-The unit you are building: ONE self-contained PEP-723 script, `bin/<name>`,
-that implements protocol {PROTOCOL}. The spec is SHEBANG.md in the capability
-repo — read it first; everything below assumes it.
+The unit you are building is a managed source bundle under the canonical
+workspace `{SOURCE_WORKSPACE_ROOT}/<source-id>/capabilities/<name>/`. Start with
+`capabilities source init <source-id>`; its vendored SHEBANG.md and AUTHORING.md
+are the source-local specification.
 
 ## 1. Discover, then gate honestly
 
@@ -2414,20 +3248,20 @@ Say no plainly when it is not a capability.
   lands per the state-resolution rules, keyed per connection.
 - I/O: JSON on stdout, the error envelope on stderr, the exit-code taxonomy.
 
-## 3. Write the script
+## 3. Create, then edit only the owned surface
 
-Copy the SHEBANG patterns verbatim: the declaration constants (NAME,
-PROTOCOL, SUMMARY, SCOPE, CRED_KEYS, WRITE_VERBS, WRITE_DEFAULT, DOCS_BASE,
-TOPICS, STATE, POST_INSTALL), `_project_root`/`_gate` (every verb gated), the credential
-cascade, connection selection + the write gate (`--connection`, the registry,
-`_select_connection`/`_write_gate`), `_emit`/`_die`, the contract verbs (help,
-doctor, connections, stub, manifest --json, guide, ids, refs), resilient
-HTTP, an agent-first docstring. No consumer identity baked in — placeholders
-in examples, values from the cascade.
+Run `capabilities new <name> --source <source-id>`. The manager creates the
+bundle and stamps the credential cascade, gates, I/O helpers, and contract verbs
+inside generated fences. Never copy or edit those regions manually. Edit the
+declaration constants and domain implementation outside the fences: the smallest
+useful verbs, a real doctor round-trip, resilient transport, and agent-first help.
+No consumer identity is baked in — placeholders in examples, values from the
+cascade.
 
 ## 4. Verify mechanically, then by judgment
 
-- `capabilities audit <name> --from <path>` until it passes.
+- `capabilities source index <source-id>` to regenerate discovery metadata.
+- `capabilities source check <source-id>` until the full repository passes.
 - Smoke-test: `doctor` against the real service; one read verb; one write
   verb if any.
 - Judgment pass: is each verb worth its place? Is the help written for an
@@ -2435,15 +3269,16 @@ in examples, values from the cascade.
 
 ## 5. Install
 
-`capabilities install <name> --from <path>`, then `capabilities enable
-<name>` in the consuming project. Record any deliberate departure from the
-spec in the capability's own deviations file.
+`capabilities install <name> --source <source-id>`, then `capabilities enable
+<name>` in the consuming project. Installation reruns full audit in staging and
+atomically activates the payload. Record deliberate domain-level departures in
+the capability's own deviations file; the generated contract has no override.
 """
 
 
 def _instructions_conform(ref: str) -> str:
     return f"""\
-# Conform `{ref}` to protocol {PROTOCOL} — agent procedure
+# Conform `{ref}` to the capability contract — agent procedure
 
 Bring an existing script to the contract without changing what its domain
 verbs do. The spec is SHEBANG.md in the capability repo — read it first.
@@ -2452,7 +3287,7 @@ verbs do. The spec is SHEBANG.md in the capability repo — read it first.
 
 Check for each, in this order:
 
-- Declaration constants: NAME, PROTOCOL, SUMMARY, SCOPE, CRED_KEYS,
+- Declaration constants: NAME, SUMMARY, SCOPE, CRED_KEYS,
   WRITE_VERBS, WRITE_DEFAULT, DOCS_BASE, TOPICS, STATE, POST_INSTALL — one
   home each, top of script.
 - `_project_root()` + `_gate()` called before any verb dispatch; exit 4 with
@@ -2635,6 +3470,10 @@ def main() -> None:
             if i + 1 >= len(rest):
                 _die(6, "input", f"{name} needs a value")
             return rest[i + 1]
+        prefix = name + "="
+        for value in rest:
+            if value.startswith(prefix):
+                return value.split("=", 1)[1]
         return None
 
     def positional() -> list[str]:
@@ -2643,7 +3482,7 @@ def main() -> None:
             if skip:
                 skip = False
                 continue
-            if a in ("--from",):
+            if a in ("--from", "--source", "--remote", "--ref"):
                 skip = True
                 continue
             if a.startswith("--"):
@@ -2656,7 +3495,7 @@ def main() -> None:
     if cmd == "install":
         if not pos:
             _die(6, "input", "install needs a capability name")
-        cmd_install(pos[0], opt("--from"), flag("--yes"))
+        cmd_install(pos[0], opt("--from"), opt("--source"), flag("--yes"))
     elif cmd == "uninstall":
         if not pos:
             _die(6, "input", "uninstall needs a capability name")
@@ -2667,6 +3506,50 @@ def main() -> None:
         cmd_self_update()
     elif cmd == "list":
         cmd_list()
+    elif cmd == "search":
+        cmd_search(pos[0] if pos else None, opt("--source"))
+    elif cmd == "source":
+        if not pos:
+            _die(6, "input", "source needs a subcommand")
+        sub = pos[0]
+        if sub == "init":
+            if len(pos) < 2:
+                _die(6, "input", "source init needs an id")
+            cmd_source_init(pos[1], opt("--remote"))
+        elif sub == "add":
+            if len(pos) < 3:
+                _die(6, "input", "source add needs an id and git URL")
+            cmd_source_add(pos[1], pos[2], opt("--ref") or "main")
+        elif sub == "clone":
+            if len(pos) < 3:
+                _die(6, "input", "source clone needs an id and git URL")
+            cmd_source_clone(pos[1], pos[2], opt("--ref") or "main")
+        elif sub == "list":
+            cmd_source_list()
+        elif sub == "path":
+            if len(pos) < 2:
+                _die(6, "input", "source path needs an id")
+            cmd_source_path(pos[1])
+        elif sub == "refresh":
+            cmd_source_refresh(pos[1] if len(pos) > 1 else None)
+        elif sub == "sync":
+            if len(pos) < 2:
+                _die(6, "input", "source sync needs an id")
+            cmd_source_sync(pos[1])
+        elif sub == "check":
+            if len(pos) < 2:
+                _die(6, "input", "source check needs an id")
+            cmd_source_check(pos[1])
+        elif sub == "index":
+            if len(pos) < 2:
+                _die(6, "input", "source index needs an id")
+            cmd_source_index(pos[1])
+        elif sub == "remove":
+            if len(pos) < 2:
+                _die(6, "input", "source remove needs an id")
+            cmd_source_remove(pos[1])
+        else:
+            _die(6, "input", f"unknown source subcommand: {sub}")
     elif cmd == "enable":
         if not pos:
             _die(6, "input", "enable needs a capability name")
@@ -2704,7 +3587,18 @@ def main() -> None:
     elif cmd == "selfcheck":
         cmd_selfcheck()
     elif cmd == "new":
-        _emit(_instructions_new())
+        if not pos:
+            _emit(_instructions_new())
+        else:
+            source_id = opt("--source")
+            if not source_id:
+                _die(6, "input", "new <name> needs --source ID",
+                     "create a canonical workspace with `capabilities source init <id>`")
+            cmd_new_capability(pos[0], source_id, flag("--core-only"))
+    elif cmd == "guide":
+        if not pos:
+            _die(6, "input", "guide needs a topic: authoring, repositories, publishing, or contract")
+        _emit(_manager_guide(pos[0]))
     elif cmd == "conform":
         if not pos:
             _die(6, "input", "conform needs a capability name or path")
