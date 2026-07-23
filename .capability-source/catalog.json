@@ -17,7 +17,7 @@
     },
     "callva": {
       "path": "capabilities/callva",
-      "payload_sha256": "3844d419b22aa721c5a91acfca01b9e0116b824b5a786ee9a51f22bcbbc21346",
+      "payload_sha256": "cc4cc0e4f59804ff8e07256325dbc66735904fd0227534c94c019878273e5951",
       "summary": "CallVA voice-AI platform CLI over the External API — read/create/update/delete agents, assets (prompts), calls, transcripts, recordings, call analytics, custom fields, webhook schedules, automations (Windmill scripts), webhook logs, variables, settings, projects, phone numbers, and providers."
     },
     "clickup": {
