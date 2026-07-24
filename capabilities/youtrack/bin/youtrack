@@ -733,6 +733,13 @@ PROJECT_FIELDS = "id,name,shortName"
 ISSUE_FIELDS = "id,idReadable,summary,description,created,updated,resolved,project(id,name,shortName),reporter(id,login,fullName)"
 ISSUE_SEARCH_FIELDS = "id,idReadable,summary,description,customFields(name,value(name))"
 COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
+ARTICLE_FIELDS = ("id,idReadable,summary,content,created,updated,"
+                  "project(id,name,shortName),reporter(id,login,fullName),"
+                  "parentArticle(id,idReadable,summary),"
+                  "childArticles(id,idReadable,summary)")
+ARTICLE_LIST_FIELDS = ("id,idReadable,summary,updated,"
+                       "project(id,name,shortName),parentArticle(idReadable)")
+ARTICLE_COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 
 def cmd_whoami(c):
     return _request(c, "GET", "/users/me", params={"fields": USER_FIELDS})
@@ -781,6 +788,24 @@ def cmd_update(c, issue, state):
                         {"name": "State", "$type": "StateIssueCustomField", "value": {"name": state}}
                     ]})
 
+def _article_ref(value):
+    value = value.strip()
+    match = re.search(r"/articles/([^/?#]+)", value)
+    return match.group(1) if match else value
+
+def cmd_articles(c, project, limit):
+    path = f"/admin/projects/{project}/articles" if project else "/articles"
+    return _request(c, "GET", path,
+                    params={"fields": ARTICLE_LIST_FIELDS, "$top": limit})
+
+def cmd_article(c, article):
+    return _request(c, "GET", f"/articles/{_article_ref(article)}",
+                    params={"fields": ARTICLE_FIELDS})
+
+def cmd_article_comments(c, article, limit):
+    return _request(c, "GET", f"/articles/{_article_ref(article)}/comments",
+                    params={"fields": ARTICLE_COMMENT_FIELDS, "$top": limit})
+
 def _check_connection(base_url, token):
     with _client(base_url, token) as c:
         return {"ok": True, "base_url": base_url, "identity": cmd_whoami(c)}
@@ -811,6 +836,9 @@ def main() -> None:
     p = sub.add_parser("create"); p.add_argument("--project", required=True); p.add_argument("--summary", required=True); p.add_argument("--description")
     p = sub.add_parser("comment"); p.add_argument("issue"); p.add_argument("--text")
     p = sub.add_parser("update"); p.add_argument("issue"); p.add_argument("--state", required=True)
+    p = sub.add_parser("articles"); p.add_argument("--project"); p.add_argument("--limit", type=int, default=100)
+    p = sub.add_parser("article"); p.add_argument("article")
+    p = sub.add_parser("article-comments"); p.add_argument("article"); p.add_argument("--limit", type=int, default=50)
     sub.add_parser("doctor")
 
     token_key = wanted = None
@@ -852,6 +880,14 @@ def main() -> None:
             _emit(cmd_comment(client, args.issue, text))
         elif args.cmd == "update":
             _emit(cmd_update(client, args.issue, args.state))
+        elif args.cmd == "articles":
+            if args.limit < 1: _die(6, "input", "--limit must be positive")
+            _emit(cmd_articles(client, args.project, args.limit))
+        elif args.cmd == "article":
+            _emit(cmd_article(client, args.article))
+        elif args.cmd == "article-comments":
+            if args.limit < 1: _die(6, "input", "--limit must be positive")
+            _emit(cmd_article_comments(client, args.article, args.limit))
 
 if __name__ == "__main__":
     main()
