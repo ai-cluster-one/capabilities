@@ -70,7 +70,8 @@ Write:
         [--parent ID]                        create a sub-article under an article.
   youtrack article-update ID                 Update an article's summary and/or
         [--summary S] [--content TEXT|-]     content. Respects allow_write policy.
-  youtrack article-comment ID [--text TEXT|-] Add a comment to an article.
+  youtrack article-comment ID [--text TEXT|-]
+                                             Add a comment to an article.
 
 Global options accepted anywhere:
   --connection ID                            Select a named connection.
