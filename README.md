@@ -45,7 +45,7 @@ Short version: reach for a **skill** when the reusable thing is *instructions*; 
 | Capability | What it gives you |
 |---|---|
 | [Asana](capabilities/asana/) | drive Asana projects & tasks over the REST API (tasks/subtasks, comments with @mentions, sections-as-status, tags, dependencies, the API-only `external` field, attachments) |
-| [YouTrack](capabilities/youtrack/) | drive YouTrack issue work over the REST API (discover projects, search/create/read issues, read/add comments, update workflow state); stable project entity ids fit the project identifiers envelope |
+| [YouTrack](capabilities/youtrack/) | drive YouTrack issues and knowledge-base articles over the REST API (discover projects, search/create/read issues, read/add comments, update workflow state, read/create/update articles); stable project entity ids fit the project identifiers envelope |
 | [Windmill](capabilities/windmill/) | drive a Windmill instance (deploy scripts, cron, jobs, vars) + the SSH-dispatch script pattern |
 | [Directo](capabilities/directo/) | drive a Directo ERP database over its browser-session endpoints (login ceremony, location selection, authed reads) |
 | [Mail](capabilities/mail/) | read and draft mail across Mail.app's configured accounts over macOS Automation (read/search/show/links/attachments/draft/export; never sends) |
