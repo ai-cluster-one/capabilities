@@ -6,7 +6,7 @@
 # ]
 # ///
 """
-youtrack — agent-first CLI for basic YouTrack issue work.
+youtrack — agent-first CLI for YouTrack issues and knowledge-base articles.
 
 Run `youtrack help` before use; this is the complete contract.
 
@@ -65,9 +65,9 @@ Write:
   youtrack update ISSUE --state STATE        Update issue workflow state. STATE is
                                              a state name (e.g. "In Progress").
                                              Respects allow_write connection policy.
-  youtrack article-create --summary S        Create an article. Give --project ID
-        [--content TEXT|-] [--project ID]    (database entity id) OR --parent ID to
-        [--parent ID]                        create a sub-article under an article.
+  youtrack article-create --project ID       Create an article in a project
+        --summary S [--content TEXT|-]        (database entity id); optionally give
+        [--parent ID|URL]                    a parent article to create a sub-article.
   youtrack article-update ID                 Update an article's summary and/or
         [--summary S] [--content TEXT|-]     content. Respects allow_write policy.
   youtrack article-comment ID [--text TEXT|-]
@@ -823,10 +823,23 @@ def cmd_article_comments(c, article, limit):
                     params={"fields": ARTICLE_COMMENT_FIELDS, "$top": limit})
 
 def cmd_article_create(c, summary, content, project, parent):
-    body = {"summary": summary}
+    body = {"summary": summary, "project": {"id": project}}
     if content is not None: body["content"] = content
-    if parent: body["parentArticle"] = {"id": _article_ref(parent)}
-    if project: body["project"] = {"id": project}
+    if parent:
+        parent_article = _request(
+            c, "GET", f"/articles/{_article_ref(parent)}",
+            params={"fields": "id,idReadable,project(id)"})
+        parent_id = parent_article.get("id") if isinstance(parent_article, dict) else None
+        parent_project = (
+            (parent_article.get("project") or {}).get("id")
+            if isinstance(parent_article, dict) else None)
+        if not parent_id or not parent_project:
+            _die(5, "bad_response",
+                 "YouTrack returned a parent article without id/project")
+        if parent_project != project:
+            _die(6, "input",
+                 f"--parent belongs to project {parent_project!r}, not {project!r}")
+        body["parentArticle"] = {"id": parent_id}
     return _request(c, "POST", "/articles",
                     params={"fields": ARTICLE_FIELDS}, json=body)
 
@@ -927,10 +940,8 @@ def main() -> None:
             if args.limit < 1: _die(6, "input", "--limit must be positive")
             _emit(cmd_article_comments(client, args.article, args.limit))
         elif args.cmd == "article-create":
-            if args.project and args.parent:
-                _die(6, "input", "article-create takes --project or --parent, not both")
-            if not args.project and not args.parent:
-                _die(6, "input", "article-create needs --project or --parent")
+            if not args.project:
+                _die(6, "input", "article-create needs --project")
             content = _read_text(args.content) if args.content is not None else None
             _emit(cmd_article_create(client, args.summary, content, args.project, args.parent))
         elif args.cmd == "article-update":

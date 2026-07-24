@@ -5,13 +5,16 @@ articles. Article quality comes from the authored content and its placement
 in the article tree, not from the CLI. Run `youtrack help` for the current
 command contract; this guide focuses on the reusable authoring method.
 
-## Give the article a home
+## Give the article a project and, optionally, a parent
 
-Every article needs exactly one home before it can be created:
+Every article belongs to a project. Pass its database entity ID with
+`--project <db-id>` (for example `0-6`) when creating either a top-level
+article or a sub-article.
 
-- `--project <db-id>` (for example `0-6`) makes it a top-level article in
-  that project's knowledge base.
-- `--parent <id|url>` nests it as a sub-article under an existing one.
+Add `--parent <id|url>` to nest the new article under an existing article in
+that same project. Omit it for a top-level article. The CLI resolves the
+parent to its database ID and refuses a cross-project placement before
+creating anything.
 
 Choose the parent when the material is a refinement, exception, or detail of
 an existing topic; choose the project root only for genuinely new topics.

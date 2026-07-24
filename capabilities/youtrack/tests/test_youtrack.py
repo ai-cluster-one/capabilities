@@ -281,14 +281,14 @@ def _serve(handler_cls):
 
 
 def test_articles_list_all_and_by_project(tmp_path):
-    class ArticlesHandler(BaseHTTPRequestHandler):
-        requests = []
+    requests = []
 
+    class ArticlesHandler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
 
         def do_GET(self):
-            self.__class__.requests.append(self.path)
+            requests.append(self.path)
             body = json.dumps([
                 {"id": "150-1", "idReadable": "KB-A-1", "summary": "Onboarding"},
             ]).encode()
@@ -298,7 +298,6 @@ def test_articles_list_all_and_by_project(tmp_path):
             self.end_headers()
             self.wfile.write(body)
 
-    ArticlesHandler.requests = []
     server, thread, base_url = _serve(ArticlesHandler)
     try:
         all_res = run_cli(tmp_path, base_url, "articles", "--limit", "10")
@@ -310,9 +309,9 @@ def test_articles_list_all_and_by_project(tmp_path):
     assert all_res.returncode == 0, all_res.stderr
     assert proj_res.returncode == 0, proj_res.stderr
     assert json.loads(all_res.stdout)[0]["idReadable"] == "KB-A-1"
-    assert ArticlesHandler.requests[0].startswith("/api/articles?")
-    assert "$top=10" in ArticlesHandler.requests[0] or "%24top=10" in ArticlesHandler.requests[0]
-    assert ArticlesHandler.requests[1].startswith("/api/admin/projects/0-6/articles?")
+    assert requests[0].startswith("/api/articles?")
+    assert "$top=10" in requests[0] or "%24top=10" in requests[0]
+    assert requests[1].startswith("/api/admin/projects/0-6/articles?")
 
 
 def test_articles_limit_must_be_positive(tmp_path):
@@ -322,14 +321,14 @@ def test_articles_limit_must_be_positive(tmp_path):
 
 
 def test_article_read_and_comments(tmp_path):
-    class OneHandler(BaseHTTPRequestHandler):
-        requests = []
+    requests = []
 
+    class OneHandler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
 
         def do_GET(self):
-            self.__class__.requests.append(self.path)
+            requests.append(self.path)
             if "/comments" in self.path:
                 payload = [{"id": "160-1", "text": "First note"}]
             else:
@@ -342,7 +341,6 @@ def test_article_read_and_comments(tmp_path):
             self.end_headers()
             self.wfile.write(body)
 
-    OneHandler.requests = []
     server, thread, base_url = _serve(OneHandler)
     try:
         art = run_cli(tmp_path, base_url, "article", "KB-A-1")
@@ -359,37 +357,55 @@ def test_article_read_and_comments(tmp_path):
     assert art_url.returncode == 0, art_url.stderr
     assert coms.returncode == 0, coms.stderr
     assert json.loads(coms.stdout)[0]["text"] == "First note"
-    assert OneHandler.requests[0].startswith("/api/articles/KB-A-1?")
-    assert OneHandler.requests[1].startswith("/api/articles/KB-A-1?")
-    assert OneHandler.requests[2].startswith("/api/articles/KB-A-1/comments?")
+    assert requests[0].startswith("/api/articles/KB-A-1?")
+    assert requests[1].startswith("/api/articles/KB-A-1?")
+    assert requests[2].startswith("/api/articles/KB-A-1/comments?")
 
+
+article_write_requests = []
 
 class ArticleWriteHandler(BaseHTTPRequestHandler):
-    requests = []
-
     def log_message(self, *_args):
         pass
 
-    def do_POST(self):
-        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-        payload = json.loads(raw)
-        self.__class__.requests.append((self.path, payload))
-        body = json.dumps({"id": "150-9", "idReadable": "KB-A-9", **payload}).encode()
-        self.send_response(200)
+    def _reply(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def do_GET(self):
+        article_write_requests.append(("GET", self.path, None))
+        if self.path.startswith("/api/articles/KB-A-1?"):
+            self._reply({
+                "id": "150-1",
+                "idReadable": "KB-A-1",
+                "project": {"id": "0-6"},
+            })
+        else:
+            self._reply({"error": "missing"}, 404)
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        payload = json.loads(raw)
+        article_write_requests.append(("POST", self.path, payload))
+        if self.path.startswith("/api/articles?") and "project" not in payload:
+            self._reply({"error": "project is required"}, 400)
+            return
+        self._reply({"id": "150-9", "idReadable": "KB-A-9", **payload})
+
 
 def test_article_create_update_comment_payloads(tmp_path):
-    ArticleWriteHandler.requests = []
+    article_write_requests.clear()
     server, thread, base_url = _serve(ArticleWriteHandler)
     try:
         created = run_cli(tmp_path, base_url, "article-create",
                           "--summary", "Guide", "--content", "# Hi", "--project", "0-6")
         sub = run_cli(tmp_path, base_url, "article-create",
-                      "--summary", "Child", "--parent", "KB-A-1")
+                      "--summary", "Child", "--project", "0-6",
+                      "--parent", f"{base_url}/articles/KB-A-1")
         updated = run_cli(tmp_path, base_url, "article-update", "KB-A-9",
                           "--summary", "Renamed")
         commented = run_cli(tmp_path, base_url, "article-comment", "KB-A-9",
@@ -402,30 +418,34 @@ def test_article_create_update_comment_payloads(tmp_path):
     assert sub.returncode == 0, sub.stderr
     assert updated.returncode == 0, updated.stderr
     assert commented.returncode == 0, commented.stderr
-    reqs = dict((p, body) for p, body in ArticleWriteHandler.requests)
+    posts = [(path, body) for method, path, body in article_write_requests
+             if method == "POST"]
     # create with project
     assert ("/api/articles", {"summary": "Guide", "content": "# Hi",
                               "project": {"id": "0-6"}}) in \
-        [(p.split("?")[0], b) for p, b in ArticleWriteHandler.requests]
-    # sub-article carries parentArticle, no project
-    sub_bodies = [b for p, b in ArticleWriteHandler.requests
+        [(p.split("?")[0], b) for p, b in posts]
+    # sub-article resolves its parent and carries both required project and parent.
+    parent_reads = [(p, b) for method, p, b in article_write_requests
+                    if method == "GET" and p.startswith("/api/articles/KB-A-1?")]
+    assert parent_reads
+    sub_bodies = [b for p, b in posts
                   if p.split("?")[0] == "/api/articles" and "parentArticle" in b]
-    assert sub_bodies and sub_bodies[0]["parentArticle"] == {"id": "KB-A-1"}
-    assert "project" not in sub_bodies[0]
+    assert sub_bodies and sub_bodies[0]["parentArticle"] == {"id": "150-1"}
+    assert sub_bodies[0]["project"] == {"id": "0-6"}
     # update targets the article
-    upd = [(p, b) for p, b in ArticleWriteHandler.requests
+    upd = [(p, b) for p, b in posts
            if p.split("?")[0] == "/api/articles/KB-A-9" and "/comments" not in p]
     assert upd and upd[0][1] == {"summary": "Renamed"}
     # comment
-    com = [(p, b) for p, b in ArticleWriteHandler.requests
+    com = [(p, b) for p, b in posts
            if p.split("?")[0] == "/api/articles/KB-A-9/comments"]
     assert com and com[0][1] == {"text": "Nice"}
 
 
-def test_article_create_requires_project_or_parent(tmp_path):
+def test_article_create_requires_project(tmp_path):
     result = run_cli(tmp_path, "http://127.0.0.1:1", "article-create", "--summary", "Orphan")
     assert result.returncode == 6
-    assert "--project or --parent" in result.stderr
+    assert "--project" in result.stderr
 
 
 def test_article_update_requires_a_field(tmp_path):
@@ -452,11 +472,30 @@ def test_read_only_connection_refuses_article_create(tmp_path):
     assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
 
 
-def test_article_create_rejects_both_project_and_parent(tmp_path):
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-create",
-                     "--summary", "X", "--project", "0-6", "--parent", "KB-A-1")
+def test_article_create_rejects_parent_from_another_project(tmp_path):
+    article_write_requests.clear()
+
+    class OtherProjectHandler(ArticleWriteHandler):
+        def do_GET(self):
+            article_write_requests.append(("GET", self.path, None))
+            self._reply({
+                "id": "150-1",
+                "idReadable": "KB-A-1",
+                "project": {"id": "0-7"},
+            })
+
+    server, thread, base_url = _serve(OtherProjectHandler)
+    try:
+        result = run_cli(tmp_path, base_url, "article-create",
+                         "--summary", "X", "--project", "0-6",
+                         "--parent", "KB-A-1")
+    finally:
+        server.shutdown()
+        thread.join()
+
     assert result.returncode == 6
-    assert "not both" in result.stderr
+    assert "not '0-6'" in result.stderr
+    assert not [row for row in article_write_requests if row[0] == "POST"]
 
 
 def test_article_update_rejects_empty_summary(tmp_path):
