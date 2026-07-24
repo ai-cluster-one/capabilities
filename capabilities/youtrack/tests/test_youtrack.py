@@ -362,3 +362,91 @@ def test_article_read_and_comments(tmp_path):
     assert OneHandler.requests[0].startswith("/api/articles/KB-A-1?")
     assert OneHandler.requests[1].startswith("/api/articles/KB-A-1?")
     assert OneHandler.requests[2].startswith("/api/articles/KB-A-1/comments?")
+
+
+class ArticleWriteHandler(BaseHTTPRequestHandler):
+    requests = []
+
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        payload = json.loads(raw)
+        self.__class__.requests.append((self.path, payload))
+        body = json.dumps({"id": "150-9", "idReadable": "KB-A-9", **payload}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_article_create_update_comment_payloads(tmp_path):
+    ArticleWriteHandler.requests = []
+    server, thread, base_url = _serve(ArticleWriteHandler)
+    try:
+        created = run_cli(tmp_path, base_url, "article-create",
+                          "--summary", "Guide", "--content", "# Hi", "--project", "0-6")
+        sub = run_cli(tmp_path, base_url, "article-create",
+                      "--summary", "Child", "--parent", "KB-A-1")
+        updated = run_cli(tmp_path, base_url, "article-update", "KB-A-9",
+                          "--summary", "Renamed")
+        commented = run_cli(tmp_path, base_url, "article-comment", "KB-A-9",
+                            "--text", "Nice")
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert created.returncode == 0, created.stderr
+    assert sub.returncode == 0, sub.stderr
+    assert updated.returncode == 0, updated.stderr
+    assert commented.returncode == 0, commented.stderr
+    reqs = dict((p, body) for p, body in ArticleWriteHandler.requests)
+    # create with project
+    assert ("/api/articles", {"summary": "Guide", "content": "# Hi",
+                              "project": {"id": "0-6"}}) in \
+        [(p.split("?")[0], b) for p, b in ArticleWriteHandler.requests]
+    # sub-article carries parentArticle, no project
+    sub_bodies = [b for p, b in ArticleWriteHandler.requests
+                  if p.split("?")[0] == "/api/articles" and "parentArticle" in b]
+    assert sub_bodies and sub_bodies[0]["parentArticle"] == {"id": "KB-A-1"}
+    assert "project" not in sub_bodies[0]
+    # update targets the article
+    upd = [(p, b) for p, b in ArticleWriteHandler.requests
+           if p.split("?")[0] == "/api/articles/KB-A-9" and "/comments" not in p]
+    assert upd and upd[0][1] == {"summary": "Renamed"}
+    # comment
+    com = [(p, b) for p, b in ArticleWriteHandler.requests
+           if p.split("?")[0] == "/api/articles/KB-A-9/comments"]
+    assert com and com[0][1] == {"text": "Nice"}
+
+
+def test_article_create_requires_project_or_parent(tmp_path):
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-create", "--summary", "Orphan")
+    assert result.returncode == 6
+    assert "--project or --parent" in result.stderr
+
+
+def test_article_update_requires_a_field(tmp_path):
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-update", "KB-A-9")
+    assert result.returncode == 6
+    assert "--summary or --content" in result.stderr
+
+
+def test_read_only_connection_refuses_article_create(tmp_path):
+    envelope = tmp_path / "capabilities" / "youtrack"
+    envelope.mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    (envelope / "connections.json").write_text(json.dumps({
+        "default": "work",
+        "connections": {"work": {
+            "secret_env": "YOUTRACK_TOKEN",
+            "base_url": "http://127.0.0.1:1",
+            "allow_write": False,
+        }},
+    }))
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-create",
+                     "--summary", "blocked", "--project", "0-6")
+    assert result.returncode == 4
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"

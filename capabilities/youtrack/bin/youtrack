@@ -88,7 +88,8 @@ CRED_KEYS = [
     {"key": "YOUTRACK_TOKEN", "secret": True, "required": True,
      "note": "permanent token (perm:…); alternates via --token-env"},
 ]
-WRITE_VERBS = {"create", "comment", "update"}
+WRITE_VERBS = {"create", "comment", "update",
+               "article-create", "article-update", "article-comment"}
 WRITE_DEFAULT = True
 DOCS_BASE = ""
 TOPICS: list = []
@@ -806,6 +807,25 @@ def cmd_article_comments(c, article, limit):
     return _request(c, "GET", f"/articles/{_article_ref(article)}/comments",
                     params={"fields": ARTICLE_COMMENT_FIELDS, "$top": limit})
 
+def cmd_article_create(c, summary, content, project, parent):
+    body = {"summary": summary}
+    if content is not None: body["content"] = content
+    if parent: body["parentArticle"] = {"id": _article_ref(parent)}
+    if project: body["project"] = {"id": project}
+    return _request(c, "POST", "/articles",
+                    params={"fields": ARTICLE_FIELDS}, json=body)
+
+def cmd_article_update(c, article, summary, content):
+    body = {}
+    if summary is not None: body["summary"] = summary
+    if content is not None: body["content"] = content
+    return _request(c, "POST", f"/articles/{_article_ref(article)}",
+                    params={"fields": ARTICLE_FIELDS}, json=body)
+
+def cmd_article_comment(c, article, text):
+    return _request(c, "POST", f"/articles/{_article_ref(article)}/comments",
+                    params={"fields": ARTICLE_COMMENT_FIELDS}, json={"text": text})
+
 def _check_connection(base_url, token):
     with _client(base_url, token) as c:
         return {"ok": True, "base_url": base_url, "identity": cmd_whoami(c)}
@@ -839,6 +859,9 @@ def main() -> None:
     p = sub.add_parser("articles"); p.add_argument("--project"); p.add_argument("--limit", type=int, default=100)
     p = sub.add_parser("article"); p.add_argument("article")
     p = sub.add_parser("article-comments"); p.add_argument("article"); p.add_argument("--limit", type=int, default=50)
+    p = sub.add_parser("article-create"); p.add_argument("--summary", required=True); p.add_argument("--content"); p.add_argument("--project"); p.add_argument("--parent")
+    p = sub.add_parser("article-update"); p.add_argument("article"); p.add_argument("--summary"); p.add_argument("--content")
+    p = sub.add_parser("article-comment"); p.add_argument("article"); p.add_argument("--text")
     sub.add_parser("doctor")
 
     token_key = wanted = None
@@ -888,6 +911,20 @@ def main() -> None:
         elif args.cmd == "article-comments":
             if args.limit < 1: _die(6, "input", "--limit must be positive")
             _emit(cmd_article_comments(client, args.article, args.limit))
+        elif args.cmd == "article-create":
+            if not args.project and not args.parent:
+                _die(6, "input", "article-create needs --project or --parent")
+            content = _read_text(args.content) if args.content is not None else None
+            _emit(cmd_article_create(client, args.summary, content, args.project, args.parent))
+        elif args.cmd == "article-update":
+            if args.summary is None and args.content is None:
+                _die(6, "input", "article-update needs --summary or --content")
+            content = _read_text(args.content) if args.content is not None else None
+            _emit(cmd_article_update(client, args.article, args.summary, content))
+        elif args.cmd == "article-comment":
+            text = _read_text(args.text if args.text is not None else "-")
+            if not text.strip(): _die(6, "input", "comment text cannot be empty")
+            _emit(cmd_article_comment(client, args.article, text))
 
 if __name__ == "__main__":
     main()
