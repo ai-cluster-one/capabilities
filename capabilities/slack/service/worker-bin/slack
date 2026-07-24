@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Worker-side `slack` shim (on PATH ahead of the real CLI inside a service worker).
+
+`slack post|send` must not send directly — the daemon owns outbound and scopes to
+the current conversation. We append the message text to the daemon's per-job outbox;
+the daemon posts it to THIS conversation only. A concrete foreign conversation id is
+rejected (scope: current_chat). Every other verb passes through to the real slack."""
+
+import json
+import os
+import sys
+
+OUTBOX = os.environ.get("SLACK_WORKER_OUTBOX", "")
+CONV = os.environ.get("SLACK_WORKER_CONVERSATION", "")
+REAL = os.environ.get("SLACK_REAL_SLACK", "")
+
+
+def _fail(code, msg):
+    sys.stderr.write(json.dumps({"ok": False, "error": msg}) + "\n")
+    sys.exit(code)
+
+
+def _passthrough():
+    if not REAL:
+        _fail(3, "slack shim: real slack unavailable (SLACK_REAL_SLACK unset)")
+    os.execv(REAL, [REAL, *sys.argv[1:]])
+
+
+def _positional(args):
+    out, i = [], 0
+    while i < len(args):
+        if args[i] in ("--connection", "--thread"):
+            i += 2
+            continue
+        out.append(args[i])
+        i += 1
+    return out
+
+
+def main():
+    args = sys.argv[1:]
+    verb = args[0] if args else ""
+    if verb not in ("post", "send"):
+        _passthrough()
+    pos = _positional(args[1:])
+    if len(pos) < 2:
+        _fail(6, "usage: slack post <target> <text>")
+    target, text = pos[0], " ".join(pos[1:])
+    if target and target[:1] in ("C", "D", "G") and CONV and target != CONV:
+        _fail(4, f"scope: worker may only post to the current conversation ({CONV})")
+    if not OUTBOX:
+        _fail(3, "slack shim: no outbox configured (SLACK_WORKER_OUTBOX unset)")
+    with open(OUTBOX, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+    print(json.dumps({"ok": True, "queued": True}))
+
+
+if __name__ == "__main__":
+    main()

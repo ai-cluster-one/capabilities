@@ -1,0 +1,1259 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""slack — managed capability scaffold.
+
+Contract:
+  slack help
+  slack doctor [--connection ID]
+  slack connections
+  slack stub
+  slack manifest --json
+  slack guide [topic]
+  slack ids list|get|set|rm
+  slack refs
+
+Add the smallest useful domain verb surface below the generated contract
+regions. Never edit text inside those regions. Success is JSON on stdout;
+errors are JSON on stderr. Exit 4 is policy refusal.
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+NAME = 'slack'
+SUMMARY = ("Slack CLI over a bot token — post to and read channels, groups, "
+           "threads and DMs, and resolve names to ids; conversation targets "
+           "are gated by a project allow-list policy.")
+SCOPE = "project"
+CRED_KEYS = [
+    {"key": "SLACK_BOT_TOKEN", "secret": True, "required": True,
+     "hint": "Slack app bot token (xoxb-…) with chat:write, channels:read, "
+             "groups:read, users:read, channels:history, groups:history, im:history"},
+]
+WRITE_VERBS = {"post"}
+WRITE_DEFAULT = False
+DOCS_BASE = ""
+TOPICS: list[str] = []
+STATE = False
+POST_INSTALL: list[dict] = []
+
+HELP = """\
+slack — post and read Slack over a bot token, with a project allow-list.
+
+USAGE
+  slack doctor [--connection ID]        auth.test: verify token + show bot identity
+  slack resolve <#channel|@user|id>     resolve a name to a Slack id (discovery)
+  slack read <target> [--limit N] [--thread TS]
+                                        read recent messages (default N=20)
+  slack post <target> <text> [--thread TS]     post a message   (WRITE)
+  slack connections                     show credential / write resolution
+
+TARGET
+  #channel-name / @user-name            resolved by name (needs …:read scopes)
+  C…/G…/D… (channel)   U…/W… (user)      raw Slack ids
+  A user target posts/reads a direct message; a channel/group target the channel.
+
+CREDENTIAL  (scope: project)
+  SLACK_BOT_TOKEN  bot token (xoxb-…). Resolves from project .env/.env.local,
+                   the user credentials.env, or process env. `slack connections`
+                   shows where it resolves.
+
+WRITES
+  post is a write verb and is refused unless the selected connection sets
+  "allow_write": true in capabilities/slack/connections.json. Writes are off
+  by default; do not lift the gate yourself — ask the user.
+
+ALLOW-LIST POLICY  (capabilities/slack/policy.json)
+  Even when writes are allowed, post/read may only touch permitted conversations.
+  Default when the file is absent: fail closed (no DMs, no channels). resolve
+  and doctor are never policy-gated, so ids can still be discovered.
+
+    {
+      "direct_messages":        { "mode": "allowed_users" },   // or "open"
+      "allowed_users":          { "U0ALICE": "Alice" },
+      "allowed_channels":       { "C0ENG": "#eng" },
+      "default_channel_policy": "allowed_only"                 // or "open"
+    }
+
+  DM to a user  → allowed only if the user id is in allowed_users (unless mode=open).
+  channel/group → allowed only if the channel id is in allowed_channels
+                  (unless default_channel_policy=open). Threads follow their parent.
+
+SERVICE (real-time daemon, Socket Mode — needs SLACK_APP_TOKEN xapp-…)
+  slack service init [--connection ID]   write project service settings/context
+  slack service doctor                   verify both tokens + Socket Mode handshake
+  slack service start | stop | status    manage the background daemon
+  slack service run                      run the daemon in the foreground
+  slack service logs [--tail N]          show the daemon log
+
+CONTRACT COMMANDS  (present on every capability)
+  slack stub                            one-line awareness text
+  slack manifest --json                 machine-readable declaration
+  slack connections                     where each connection's values resolve
+  slack guide [<topic>]                 guide topics / one guide body (docs base)
+  slack ids list|get|set|rm <label>     the project identifiers envelope
+  slack refs                            menu of this capability's reference files
+
+OUTPUT  JSON on stdout; errors as JSON on stderr.
+EXITS   0 ok · 2 auth · 3 not found · 4 policy/write refusal · 5 network · 6 input
+"""
+
+SERVICE = {
+    "summary": "Project-local Slack real-time daemon (Socket Mode) using the bundled service engine.",
+    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
+    "config": "capabilities/slack/service",
+    "state": "$XDG_STATE_HOME/slack/<connection>/service",
+}
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding capabilities/, legacy .capabilities/,
+    .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    `capabilities/` is canonical. A legacy `.capabilities/` remains readable
+    until `capabilities init` migrates it. If both exist, the canonical tree
+    wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _auth_context() -> dict | None:
+    """Optional runtime authority envelope passed by an ingress/service.
+
+    Absence means the ordinary project gate is the whole policy. Presence means
+    a request-scoped authority layer exists and must fail closed before any
+    credential or network work happens.
+    """
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return None
+    try:
+        if raw.lstrip().startswith("{"):
+            data = json.loads(raw)
+        else:
+            data = json.loads(Path(raw).read_text())
+    except (OSError, ValueError) as e:
+        _die(4, "auth_context_unreadable",
+             "runtime authority context could not be read",
+             f"{raw}: {e}")
+    if not isinstance(data, dict):
+        _die(4, "auth_context_invalid",
+             "runtime authority context is not an object")
+    return data
+
+
+def _auth_capability_allowed(rule) -> bool:
+    if rule is True or rule == "*":
+        return True
+    if rule in (False, None):
+        return False
+    if isinstance(rule, dict):
+        if rule.get("deny") is True:
+            return False
+        if rule.get("enabled") is False or rule.get("allow") is False:
+            return False
+        return True
+    return False
+
+
+def _auth_gate() -> None:
+    ctx = _auth_context()
+    if ctx is None:
+        return
+    allowed = ctx.get("allowed_capabilities")
+    if allowed is None:
+        return
+    if allowed is True or allowed == "*":
+        return
+    if isinstance(allowed, list):
+        if NAME in allowed or "*" in allowed:
+            return
+    elif isinstance(allowed, dict):
+        if _auth_capability_allowed(allowed.get(NAME, allowed.get("*"))):
+            return
+    else:
+        _die(4, "auth_context_invalid",
+             "runtime authority context has invalid allowed_capabilities")
+    source = ctx.get("source") or "runtime"
+    role = ctx.get("sender_role") or ctx.get("role") or "unknown"
+    chat = ctx.get("chat_id") or "unknown"
+    _die(4, "capability_not_authorized",
+         f"{NAME} is not authorized for this {source} request",
+         f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
+
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks.
+
+    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
+    is stricter and also runs here, before credentials or network calls.
+    """
+    _auth_gate()
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = _project_capabilities_dir(root) / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project's active capabilities/."""
+    root = _project_root()
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract — the declaration surface --------------------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import urllib.error as _ue
+    import urllib.request as _ur
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10.0) as resp:
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(text); return
+    except _ue.HTTPError as e:
+        if e.code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if e.code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        err = f"upstream returned {e.code}"
+    except _ue.URLError as e:
+        err = str(e.reason)
+    except OSError as e:
+        err = str(e)
+    if cache.exists():
+        sys.stderr.write(json.dumps(
+            {"warning": f"upstream unreachable; serving cached copy ({err})"},
+            ensure_ascii=False) + "\n")
+        _emit(cache.read_text()); return
+    _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _render_ids_markdown(data: dict) -> str:
+    """Render the {label: {value, note}} envelope as the labelled markdown
+    list the manager's `capabilities ids <NAME>` also produces — one shared
+    format across the ids surface and the identifiers section of `help`."""
+    lines: list[str] = []
+    for label, entry in sorted(data.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        v = entry.get("value")
+        vs = f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+        line = f"- **{label}**: {vs}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _identifiers_section() -> str:
+    """The Identifiers block appended to the bare top-level help — deterministic
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
+    agent following the `<NAME> help` startup protocol loads the discovered
+    labels/values/notes into context at once. Empty when no project envelope
+    or nothing recorded (do not bloat help with an empty section)."""
+    envdir = _env_dir()
+    if envdir is None:
+        return ""
+    ids_file = envdir / "identifiers.json"
+    if not ids_file.exists():
+        return ""
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    header = (
+        "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
+        f"Structural lookups discovered for `{NAME}` in this project. Fetch a single\n"
+        f"raw value with `{NAME} ids get <label>`; the full envelope is also at\n"
+        f"`capabilities ids {NAME}`.\n\n"
+    )
+    return header + _render_ids_markdown(data) + "\n"
+
+
+def _cmd_help() -> None:
+    """Bare top-level help: the CLI's HELP body (module-level `HELP` if
+    defined, else the module docstring), then the project's Identifiers
+    section. Only fires when no extra args follow — per-verb help stays
+    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    g = globals()
+    text = g.get("HELP") or g.get("__doc__") or ""
+    if text.startswith("\n"):
+        text = text.lstrip("\n")
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    section = _identifiers_section()
+    if section:
+        sys.stdout.write(section)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved.
+
+    `help` is a contract verb only when bare (no extra args) — the top-level
+    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
+    through to the CLI so per-verb help stays clean."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    elif cmd == "help" and len(argv) == 1:
+        _cmd_help()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+# <<< contract: connections <<<
+
+def _connections_report() -> dict:
+    reg, _reg_file = _connections_registry()
+    out: dict = {"default": None, "connections": {}}
+    if reg is None:
+        rows = []
+        for spec in CRED_KEYS:
+            value, tier, source = _resolve_env_key(spec["key"])
+            rows.append(_key_report(spec["key"], bool(spec.get("secret")),
+                                    bool(spec.get("required")), value, tier, source))
+        out["default"] = "default"
+        out["connections"]["default"] = {
+            "allow_write": WRITE_DEFAULT, "keys": rows}
+        return out
+    conns = reg["connections"]
+    out["default"] = reg.get("default") or (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, raw in conns.items():
+        entry = raw if isinstance(raw, dict) else {}
+        rows = []
+        for spec in CRED_KEYS:
+            value, tier, source = _resolve_env_key(spec["key"])
+            rows.append(_key_report(spec["key"], bool(spec.get("secret")),
+                                    bool(spec.get("required")), value, tier, source))
+        out["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": rows}
+    return out
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+# --- Slack transport ---------------------------------------------------------
+
+API_BASE = "https://slack.com/api/"
+
+_AUTH_ERRORS = {"invalid_auth", "not_authed", "account_inactive", "token_revoked",
+                "token_expired", "no_permission", "missing_scope",
+                "ekm_access_denied", "not_allowed_token_type"}
+_NOT_FOUND_ERRORS = {"channel_not_found", "user_not_found", "users_not_found",
+                     "thread_not_found", "message_not_found", "not_in_channel"}
+
+
+def _api(method: str, token: str, params: dict | None = None,
+         json_body: dict | None = None) -> dict:
+    """One Slack Web API call. GET with query params, or POST with a JSON body.
+    Raises through _die on transport failure or a Slack `ok: false` response."""
+    import urllib.error as _ue
+    import urllib.parse as _up
+    import urllib.request as _ur
+
+    url = API_BASE + method
+    headers = {"Authorization": f"Bearer {token}"}
+    data = None
+    http_method = "GET"
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        http_method = "POST"
+    elif params:
+        url += "?" + _up.urlencode(params)
+    req = _ur.Request(url, data=data, headers=headers, method=http_method)
+    try:
+        with _ur.urlopen(req, timeout=15.0) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except _ue.HTTPError as e:
+        _die(5, "http_error", f"Slack {method} returned HTTP {e.code}", method)
+    except _ue.URLError as e:
+        _die(5, "network_error", f"cannot reach Slack: {e.reason}", method)
+    except ValueError:
+        _die(5, "bad_response", f"Slack {method} returned non-JSON")
+    if not body.get("ok"):
+        err = body.get("error", "unknown_error")
+        if err in _AUTH_ERRORS:
+            _die(2, "auth", f"Slack {method}: {err}",
+                 "check the bot token and that the app has the required OAuth scopes")
+        if err in _NOT_FOUND_ERRORS:
+            _die(3, "not_found", f"Slack {method}: {err}")
+        _die(6, "slack_error", f"Slack {method}: {err}")
+    return body
+
+
+# --- Connection / credential resolution --------------------------------------
+
+def _connection_and_write(wanted: str | None) -> tuple[str, bool]:
+    reg, _reg_file = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    allow_write = bool((entry or {}).get("allow_write", WRITE_DEFAULT))
+    return cid, allow_write
+
+
+def _token() -> str:
+    value, _tier, _source = _resolve_env_key("SLACK_BOT_TOKEN")
+    if not value:
+        _die(2, "credentials_missing", "SLACK_BOT_TOKEN is not set",
+             "set it in the project .env/.env.local, the user credentials.env, or "
+             "process env; `slack connections` shows where it resolves")
+    return value
+
+
+# --- Allow-list policy -------------------------------------------------------
+
+_POLICY_DEFAULT = {
+    "direct_messages": {"mode": "allowed_users"},
+    "allowed_users": {},
+    "allowed_channels": {},
+    "default_channel_policy": "allowed_only",
+}
+
+
+def _policy() -> dict:
+    envdir = _env_dir()
+    if envdir is None:
+        return dict(_POLICY_DEFAULT)
+    pfile = envdir / "policy.json"
+    if not pfile.is_file():
+        return dict(_POLICY_DEFAULT)
+    try:
+        data = json.loads(pfile.read_text())
+    except (OSError, ValueError):
+        _die(6, "bad_policy", f"{pfile} is not valid JSON")
+    if not isinstance(data, dict):
+        _die(6, "bad_policy", f"{pfile} must be a JSON object")
+    return {**_POLICY_DEFAULT, **data}
+
+
+def _policy_gate(kind: str, ident: str) -> None:
+    """Refuse (exit 4) when the resolved conversation is outside the allow-list.
+    Applies to post and read; resolve and doctor are never policy-gated."""
+    pol = _policy()
+    if kind == "user":
+        mode = (pol.get("direct_messages") or {}).get("mode", "allowed_users")
+        if mode == "open" or ident in (pol.get("allowed_users") or {}):
+            return
+        _die(4, "policy_refusal",
+             f"direct messages to {ident} are not allowed by policy",
+             'add the user id to allowed_users in capabilities/slack/policy.json, '
+             'or set direct_messages.mode to "open"')
+    else:
+        if pol.get("default_channel_policy", "allowed_only") == "open" \
+                or ident in (pol.get("allowed_channels") or {}):
+            return
+        _die(4, "policy_refusal",
+             f"conversation {ident} is not allowed by policy",
+             'add the channel id to allowed_channels in capabilities/slack/policy.json, '
+             'or set default_channel_policy to "open"')
+
+
+# --- Target resolution -------------------------------------------------------
+
+def _classify(target: str) -> tuple[str, str | None, str | None]:
+    """(kind, id, name). kind is 'channel' or 'user'; exactly one of id/name set."""
+    t = (target or "").strip()
+    if not t:
+        _die(6, "input", "empty target")
+    if t[0] == "#":
+        return "channel", None, t[1:]
+    if t[0] == "@":
+        return "user", None, t[1:]
+    if len(t) > 1 and t.isupper() and t[1:].isalnum():
+        if t[0] in "CGD":
+            return "channel", t, None
+        if t[0] in "UW":
+            return "user", t, None
+    _die(6, "input", f"cannot classify target {target!r}",
+         "prefix a channel name with #, a user name with @, or pass a Slack id "
+         "(C…/G…/D… channel, U…/W… user)")
+
+
+def _resolve_channel_id(token: str, name: str) -> str:
+    cursor = ""
+    for _ in range(25):
+        params = {"limit": 200, "types": "public_channel,private_channel"}
+        if cursor:
+            params["cursor"] = cursor
+        body = _api("conversations.list", token, params=params)
+        for ch in body.get("channels", []):
+            if ch.get("name") == name:
+                return ch["id"]
+        cursor = (body.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            break
+    _die(3, "not_found", f"no channel named #{name}",
+         "check the name, or that the bot can see the channel")
+
+
+def _resolve_user_id(token: str, name: str) -> str:
+    want = name.lstrip("@").lower()
+    cursor = ""
+    for _ in range(25):
+        params = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        body = _api("users.list", token, params=params)
+        for u in body.get("members", []):
+            prof = u.get("profile") or {}
+            names = {u.get("name", ""), prof.get("display_name", ""),
+                     prof.get("real_name", "")}
+            if want in {n.lower() for n in names if n}:
+                return u["id"]
+        cursor = (body.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            break
+    _die(3, "not_found", f"no user matching @{name}")
+
+
+def _target_conv(token: str, target: str) -> tuple[str, str]:
+    """Resolve a target to (kind, id), looking names up when needed."""
+    kind, ident, name = _classify(target)
+    if ident is None:
+        ident = (_resolve_channel_id(token, name) if kind == "channel"
+                 else _resolve_user_id(token, name))
+    return kind, ident
+
+
+# --- Verbs -------------------------------------------------------------------
+
+def cmd_doctor(wanted: str | None) -> None:
+    report = _connections_report()
+    _doctor_gate(report, wanted)
+    body = _api("auth.test", _token(), json_body={})
+    _emit({"ok": True,
+           "identity": {"team": body.get("team"), "team_id": body.get("team_id"),
+                        "user": body.get("user"), "user_id": body.get("user_id"),
+                        "bot_id": body.get("bot_id"), "url": body.get("url")},
+           "connections": report["connections"]})
+
+
+def cmd_resolve(target: str) -> None:
+    kind, ident, name = _classify(target)  # cheap, local — no token needed to reject
+    if ident is None:                      # a name lookup does need the token/network
+        token = _token()
+        ident = (_resolve_channel_id(token, name) if kind == "channel"
+                 else _resolve_user_id(token, name))
+    _emit({"query": target, "kind": kind, "id": ident})
+
+
+def cmd_read(target: str, limit: int, thread: str | None) -> None:
+    token = _token()
+    kind, ident = _target_conv(token, target)
+    _policy_gate(kind, ident)
+    channel = ident
+    if kind == "user":
+        channel = _api("conversations.open", token,
+                       json_body={"users": ident})["channel"]["id"]
+    if thread:
+        body = _api("conversations.replies", token,
+                    params={"channel": channel, "ts": thread, "limit": limit})
+    else:
+        body = _api("conversations.history", token,
+                    params={"channel": channel, "limit": limit})
+    msgs = [{"ts": m.get("ts"), "user": m.get("user") or m.get("bot_id"),
+             "text": m.get("text", ""), "thread_ts": m.get("thread_ts")}
+            for m in body.get("messages", [])]
+    _emit({"channel": channel, "count": len(msgs), "messages": msgs})
+
+
+def cmd_post(cid: str, allow_write: bool, target: str, text: str,
+             thread: str | None) -> None:
+    _write_gate(cid, allow_write, "post")
+    token = _token()
+    kind, ident = _target_conv(token, target)
+    _policy_gate(kind, ident)
+    payload = {"channel": ident, "text": text}
+    if thread:
+        payload["thread_ts"] = thread
+    body = _api("chat.postMessage", token, json_body=payload)
+    _emit({"ok": True, "target": target,
+           "channel": body.get("channel"), "ts": body.get("ts")})
+
+
+# --- Service (bundled real-time daemon) --------------------------------------
+
+def _service_bundle_dir() -> Path:
+    here = Path(__file__).resolve()
+    return here.parent.parent if here.parent.name == "bin" else here.parent
+
+
+def _service_daemon() -> Path:
+    return _service_bundle_dir() / "service" / "daemon.py"
+
+
+def _service_template(name: str) -> Path:
+    return _service_bundle_dir() / "service" / "templates" / name
+
+
+def _service_root() -> Path:
+    root = _project_root()
+    if root is None:
+        _die(6, "no_project", "not inside a project",
+             "run from a project after `capabilities init` and `capabilities enable slack`")
+    return root
+
+
+def _service_dir(root: Path) -> Path:
+    return (_env_dir() or (root / "capabilities" / NAME)) / "service"
+
+
+def _service_settings_path(root: Path) -> Path:
+    return _service_dir(root) / "settings.json"
+
+
+def _service_context_path(root: Path) -> Path:
+    return _service_dir(root) / "context.md"
+
+
+def _service_settings(root: Path) -> dict:
+    try:
+        data = json.loads(_service_settings_path(root).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _service_connection_id(root: Path, flag: str | None) -> str:
+    reg, _ = _connections_registry()
+    wanted = flag or _service_settings(root).get("connection")
+    cid, _entry = _select_connection(reg, wanted)
+    return cid
+
+
+def _service_state_dir(cid: str) -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+    return base / NAME / cid / "service"
+
+
+def _read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def cmd_service_init(flag: str | None) -> None:
+    root = _service_root()
+    target = _service_dir(root)
+    target.mkdir(parents=True, exist_ok=True)
+    written = []
+    for name, dst in (("settings.json", _service_settings_path(root)),
+                      ("context.md", _service_context_path(root))):
+        if not dst.exists():
+            src = _service_template(name)
+            if not src.is_file():
+                _die(3, "service_bundle_missing", f"missing bundled template: {src}",
+                     "reinstall slack from the source bundle")
+            content = src.read_text()
+            if name == "settings.json" and flag:
+                data = json.loads(content)
+                data["connection"] = flag
+                content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+            dst.write_text(content)
+            written.append(str(dst))
+    _emit({"initialized": NAME, "service_dir": str(target), "written": written,
+           "next": ["set SLACK_APP_TOKEN (xapp-…) in .env.local",
+                    "edit settings.json allowed_users/auto_answer",
+                    "run `slack service doctor`, then `slack service start`"]})
+
+
+def cmd_service_status(flag: str | None) -> None:
+    root = _service_root()
+    cid = _service_connection_id(root, flag)
+    state = _service_state_dir(cid)
+    pid = _read_pid(state / "daemon.pid")
+    running = _pid_alive(pid)
+    _emit({"initialized": _service_settings_path(root).exists(),
+           "running": running, "pid": pid if running else None,
+           "connection": cid, "state_dir": str(state),
+           "settings": str(_service_settings_path(root)),
+           "log_file": str(state / "daemon.log"),
+           "inbox": str(state / "inbox.jsonl")})
+
+
+def _service_tokens() -> tuple[str, str]:
+    bot = _resolve_env_key("SLACK_BOT_TOKEN")[0]
+    app = _resolve_env_key("SLACK_APP_TOKEN")[0]
+    missing = [k for k, v in (("SLACK_BOT_TOKEN", bot), ("SLACK_APP_TOKEN", app)) if not v]
+    if missing:
+        _die(2, "credentials_missing", f"unset: {', '.join(missing)}",
+             "set them in the project .env/.env.local, the user credentials.env, or env")
+    return bot, app
+
+
+def cmd_service_doctor(flag: str | None) -> None:
+    root = _service_root()
+    cid = _service_connection_id(root, flag)
+    bot, app = _service_tokens()
+    identity = _api("auth.test", bot, json_body={})
+    # apps.connections.open validates the app-level token and Socket Mode enablement.
+    _api("apps.connections.open", app, json_body={})
+    _emit({"ok": True, "connection": cid,
+           "bot_identity": {"user": identity.get("user"), "team": identity.get("team")},
+           "socket_mode": "app token accepted",
+           "settings": str(_service_settings_path(root)),
+           "initialized": _service_settings_path(root).exists()})
+
+
+def _service_env(root: Path, cid: str, state: Path, bot: str, app: str) -> dict:
+    env = dict(os.environ)
+    env["SLACK_SERVICE_PROJECT_ROOT"] = str(root)
+    env["SLACK_SERVICE_SETTINGS"] = str(_service_settings_path(root))
+    env["SLACK_SERVICE_CONTEXT"] = str(_service_context_path(root))
+    env["SLACK_SERVICE_STATE_DIR"] = str(state)
+    env["SLACK_SERVICE_CONNECTION"] = cid
+    env["SLACK_BOT_TOKEN"] = bot
+    env["SLACK_APP_TOKEN"] = app
+    return env
+
+
+def cmd_service_start(flag: str | None) -> None:
+    import subprocess
+    import time
+    root = _service_root()
+    if not _service_settings_path(root).exists():
+        _die(6, "service_not_initialized", "run `slack service init` first")
+    cid = _service_connection_id(root, flag)
+    state = _service_state_dir(cid)
+    if _pid_alive(_read_pid(state / "daemon.pid")):
+        _emit({"already_running": True, "connection": cid}); return
+    bot, app = _service_tokens()
+    daemon = _service_daemon()
+    if not daemon.is_file():
+        _die(3, "service_bundle_missing", f"daemon not found: {daemon}")
+    state.mkdir(parents=True, exist_ok=True)
+    log = state / "daemon.log"
+    with log.open("a", encoding="utf-8") as fh:
+        proc = subprocess.Popen([str(daemon)], cwd=str(root),
+                                env=_service_env(root, cid, state, bot, app),
+                                stdout=fh, stderr=subprocess.STDOUT, text=True,
+                                start_new_session=True)
+    (state / "daemon.pid").write_text(f"{proc.pid}\n")
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        (state / "daemon.pid").unlink(missing_ok=True)
+        tail = log.read_text(errors="replace").splitlines()[-8:] if log.exists() else []
+        _die(5, "service_start_failed", f"daemon exited with {proc.returncode}",
+             "\n".join(tail) or "check tokens and settings")
+    _emit({"started": True, "pid": proc.pid, "connection": cid, "log_file": str(log)})
+
+
+def cmd_service_stop(flag: str | None) -> None:
+    import signal
+    import time
+    root = _service_root()
+    cid = _service_connection_id(root, flag)
+    state = _service_state_dir(cid)
+    pidfile = state / "daemon.pid"
+    pid = _read_pid(pidfile)
+    if not _pid_alive(pid):
+        pidfile.unlink(missing_ok=True)
+        _emit({"stopped": False, "running": False, "connection": cid}); return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.2)
+    if _pid_alive(pid):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        kill_deadline = time.time() + 2.0
+        while time.time() < kill_deadline:
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.2)
+    if _pid_alive(pid):
+        _die(6, "service_stop_failed", f"daemon {pid} survived SIGTERM and SIGKILL",
+             "check for zombie/uninterruptible process state")
+    pidfile.unlink(missing_ok=True)
+    _emit({"stopped": True, "pid": pid, "connection": cid})
+
+
+def cmd_service_run(flag: str | None) -> None:
+    import subprocess
+    root = _service_root()
+    if not _service_settings_path(root).exists():
+        _die(6, "service_not_initialized", "run `slack service init` first")
+    cid = _service_connection_id(root, flag)
+    state = _service_state_dir(cid)
+    state.mkdir(parents=True, exist_ok=True)
+    bot, app = _service_tokens()
+    daemon = _service_daemon()
+    if not daemon.is_file():
+        _die(3, "service_bundle_missing", f"daemon not found: {daemon}")
+    # Foreground: inherit stdio so a supervisor sees the log stream.
+    raise SystemExit(subprocess.call([str(daemon)], cwd=str(root),
+                                     env=_service_env(root, cid, state, bot, app)))
+
+
+def cmd_service_logs(flag: str | None, tail: int) -> None:
+    root = _service_root()
+    cid = _service_connection_id(root, flag)
+    log = _service_state_dir(cid) / "daemon.log"
+    if not log.is_file():
+        _emit({"log_file": str(log), "lines": []}); return
+    lines = log.read_text(errors="replace").splitlines()[-tail:]
+    _emit({"log_file": str(log), "lines": lines})
+
+
+def cmd_service(rest: list[str], wanted: str | None = None) -> None:
+    flag, rest = _pop_opt(rest, "--connection")
+    flag = flag or wanted
+    sub = rest[0] if rest else ""
+    if sub == "init":
+        cmd_service_init(flag)
+    elif sub == "status":
+        cmd_service_status(flag)
+    elif sub == "doctor":
+        cmd_service_doctor(flag)
+    elif sub == "start":
+        cmd_service_start(flag)
+    elif sub == "stop":
+        cmd_service_stop(flag)
+    elif sub == "run":
+        cmd_service_run(flag)
+    elif sub == "logs":
+        tail_s, _ = _pop_opt(rest[1:], "--tail")
+        try:
+            tail = int(tail_s) if tail_s else 40
+        except ValueError:
+            _die(6, "input", "--tail must be an integer")
+        cmd_service_logs(flag, tail)
+    else:
+        _die(6, "input", f"unknown service subcommand {sub!r}",
+             "slack service init|doctor|run|start|stop|status|logs")
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def _pop_opt(args: list[str], name: str) -> tuple[str | None, list[str]]:
+    """Extract `--opt VALUE` or `--opt=VALUE`; return (value|None, remaining)."""
+    val, out, i = None, [], 0
+    while i < len(args):
+        a = args[i]
+        if a == name and i + 1 < len(args):
+            val = args[i + 1]; i += 2; continue
+        if a.startswith(name + "="):
+            val = a.split("=", 1)[1]; i += 1; continue
+        out.append(a); i += 1
+    return val, out
+
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    _contract(argv)
+    wanted, argv = _pop_opt(argv, "--connection")
+    if not argv:
+        _die(6, "input", "no command", "run `slack help`")
+    verb, rest = argv[0], argv[1:]
+
+    if verb == "service":
+        cmd_service(rest, wanted)
+        return
+
+    if verb == "doctor":
+        cmd_doctor(wanted); return
+
+    if verb == "resolve":
+        if len(rest) != 1:
+            _die(6, "input", "usage: slack resolve <#channel|@user|id>")
+        cmd_resolve(rest[0]); return
+
+    if verb == "read":
+        thread, rest = _pop_opt(rest, "--thread")
+        limit_s, rest = _pop_opt(rest, "--limit")
+        if len(rest) != 1:
+            _die(6, "input", "usage: slack read <target> [--limit N] [--thread TS]")
+        try:
+            limit = int(limit_s) if limit_s else 20
+        except ValueError:
+            _die(6, "input", "--limit must be an integer")
+        cmd_read(rest[0], limit, thread); return
+
+    if verb == "post":
+        thread, rest = _pop_opt(rest, "--thread")
+        if len(rest) < 2:
+            _die(6, "input", "usage: slack post <target> <text> [--thread TS]")
+        cid, allow_write = _connection_and_write(wanted)
+        cmd_post(cid, allow_write, rest[0], " ".join(rest[1:]), thread); return
+
+    _die(6, "input", f"unknown command {verb!r}", "run `slack help`")
+
+
+if __name__ == "__main__":
+    main()
