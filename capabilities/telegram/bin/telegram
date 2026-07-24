@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
-#     "telethon>=1.36",
+#     "telethon==1.43.2",
 # ]
 # ///
 """
@@ -1837,6 +1837,7 @@ def _service_state_dir(root: Path, connection_flag: str | None,
         "state": state,
         "pid": state / "daemon.pid",
         "log": state / "daemon.log",
+        "health": state / "health.json",
         "register": state / "register.json",
         "progress": state / "progress",
         "worker_sessions": state / "worker-sessions",
@@ -1862,17 +1863,57 @@ def _pid_alive(pid: int | None) -> bool:
         return True
 
 
+def _service_runtime_health(path: Path, running: bool) -> dict:
+    raw = _json_file(path)
+    health = dict(raw) if isinstance(raw, dict) else {}
+    state = str(health.get("state") or ("unknown" if running else "stopped"))
+    last_sync = health.get("last_sync_at")
+    age_seconds = None
+    if last_sync:
+        try:
+            stamp = datetime.fromisoformat(str(last_sync).replace("Z", "+00:00"))
+            age_seconds = max(
+                0.0,
+                (datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds(),
+            )
+        except (TypeError, ValueError):
+            pass
+    try:
+        stale_after = float(health.get("stale_after_seconds") or 60)
+    except (TypeError, ValueError):
+        stale_after = 60.0
+    healthy = bool(
+        running
+        and state == "healthy"
+        and age_seconds is not None
+        and age_seconds <= stale_after
+    )
+    health.update({
+        "state": state,
+        "healthy": healthy,
+        "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+        "stale_after_seconds": stale_after,
+        "path": str(path),
+    })
+    if running and state == "healthy" and not healthy:
+        health["state"] = "stale"
+    return health
+
+
 def cmd_service_status(connection_flag: str | None, session_flag: str | None) -> dict:
     root = _service_project_root()
     initialized = _service_settings_path(root).exists() and _service_context_path(root).exists()
     cid, paths = _service_state_dir(root, connection_flag, session_flag)
     pid = _read_pid(paths["pid"])
     running = _pid_alive(pid)
+    health = _service_runtime_health(paths["health"], running)
     return {
         "initialized": initialized,
         "running": running,
+        "healthy": health["healthy"],
         "pid": pid if running else None,
         "stale_pid": bool(pid and not running),
+        "health": health,
         "connection": cid,
         "project": str(root),
         "daemon": str(_service_daemon()),
@@ -1882,6 +1923,7 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
         "state_dir": str(paths["state"]),
         "pid_file": str(paths["pid"]),
         "log_file": str(paths["log"]),
+        "health_file": str(paths["health"]),
         "register": str(paths["register"]),
         "progress_dir": str(paths["progress"]),
         "worker_sessions": str(paths["worker_sessions"]),
@@ -2007,10 +2049,12 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) ->
     status = cmd_service_status(cfg["id"], session_flag)
     session_file = Path(cfg["session"] + ".session")
     status["session_file_exists"] = session_file.exists()
-    return {"ok": status["initialized"] and cfg["allow_write"],
+    runtime_ok = not status["running"] or status["healthy"]
+    return {"ok": status["initialized"] and cfg["allow_write"] and runtime_ok,
             "service": status,
             "connection": cfg["id"],
-            "note": "`telegram doctor` performs the authenticated Telegram round-trip"}
+            "note": ("`telegram doctor` performs the authenticated Telegram round-trip; "
+                     "a running service is healthy only while its update sync stays fresh")}
 
 
 def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> None:

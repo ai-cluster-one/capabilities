@@ -45,6 +45,8 @@
   },
   "defaults": {
     "tail_size": 40,
+    "sync_interval": 20,
+    "sync_stale_after": 60,
     "debounce": 5,
     "worker_timeout": 120,
     "progress_after": 15,

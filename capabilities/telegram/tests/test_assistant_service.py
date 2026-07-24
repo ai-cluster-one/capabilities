@@ -150,6 +150,7 @@ class FakeClient:
         self.send_attempts = 0
         self.sent = []
         self.get_messages_calls = 0
+        self.catch_up_calls = 0
         self.handler = None
         self.started = asyncio.Event()
         self.disconnected = asyncio.Event()
@@ -175,6 +176,10 @@ class FakeClient:
     async def get_messages(self, _chat, limit=None):
         self.get_messages_calls += 1
         return self.messages[-limit:] if limit else list(self.messages)
+
+    async def catch_up(self):
+        self.catch_up_calls += 1
+        await asyncio.sleep(0)
 
     @asynccontextmanager
     async def action(self, _chat, _kind):
@@ -350,23 +355,30 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                                 for item in client.sent))
             await self.stop_session(client, task)
 
-    async def test_startup_catch_up_runs_once_per_connection_without_periodic_polling(self):
+    async def test_periodic_sync_recovers_message_missed_by_live_updates(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
+            daemon = import_daemon(
+                Path(td),
+                settings(sync_interval=0.02, sync_stale_after=0.2),
+            )
             daemon.save_register({"123": {"last_processed_message_id": 320}})
             message = Message(323, voice=True)
             transcriptions = []
             daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append(message.id) or "recovered"
 
-            first = FakeClient([message])
+            first = FakeClient([])
             first_task = asyncio.create_task(daemon.run_session(first))
             await first.started.wait()
+            first.messages.append(message)
             await wait_until(lambda: daemon.load_register()["123"]["last_processed_message_id"] == 323)
             self.assertEqual(transcriptions, [323])
             self.assertEqual(first.send_attempts, 2)
-            calls_after_recovery = first.get_messages_calls
-            await asyncio.sleep(0.05)
-            self.assertEqual(first.get_messages_calls, calls_after_recovery)
+            self.assertGreaterEqual(first.get_messages_calls, 2)
+            self.assertGreaterEqual(first.catch_up_calls, 1)
+            health = json.loads(daemon.HEALTH_FILE.read_text())
+            self.assertEqual(health["state"], "healthy")
+            self.assertEqual(health["last_catch_up_reason"], "periodic")
+            self.assertIsNotNone(health["last_sync_at"])
             await self.stop_session(first, first_task)
 
             second = FakeClient([message])
@@ -378,8 +390,42 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.stop_session(second, second_task)
 
             source = DAEMON_PATH.read_text()
-            self.assertNotIn("periodic_catch_up", source)
-            self.assertNotIn('catch_up_known("periodic")', source)
+            self.assertIn('catch_up_known("periodic")', source)
+
+    async def test_periodic_tl_decode_failure_marks_health_and_reconnects(self):
+        class TypeNotFoundError(Exception):
+            pass
+
+        class BrokenClient(FakeClient):
+            async def get_messages(self, chat, limit=None):
+                self.get_messages_calls += 1
+                if self.get_messages_calls > 1:
+                    raise TypeNotFoundError("matching Constructor ID")
+                return await super().get_messages(chat, limit=limit)
+
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td),
+                settings(sync_interval=0.02, sync_stale_after=0.2),
+            )
+            daemon.save_register({"123": {"last_processed_message_id": 320}})
+            client = BrokenClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            with self.assertRaises(daemon.SessionUnhealthy):
+                await asyncio.wait_for(task, timeout=3)
+            health = json.loads(daemon.HEALTH_FILE.read_text())
+            self.assertEqual(health["state"], "unhealthy")
+            self.assertIn("TL decode failed", health["last_error"])
+
+    async def test_telethon_compatibility_version_is_pinned_across_bundle(self):
+        expected = '"telethon==1.43.2"'
+        for path in (
+            TELEGRAM_DIR / "bin" / "telegram",
+            TELEGRAM_DIR / "service" / "daemon.py",
+            TELEGRAM_DIR / "service" / "call_recorder.py",
+        ):
+            self.assertIn(expected, path.read_text(), path)
 
     async def test_cancelled_worker_is_killed_and_persisted_for_startup_retry(self):
         with tempfile.TemporaryDirectory() as td:

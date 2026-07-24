@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["telethon>=1.36"]
+# dependencies = ["telethon==1.43.2"]
 # ///
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
@@ -49,6 +49,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import telethon
 from telethon import TelegramClient, events
 
 logging.getLogger("telethon").setLevel(logging.CRITICAL)
@@ -155,6 +156,20 @@ DEFAULT_WORKER = (
 ).strip().lower()
 if DEFAULT_WORKER not in WORKER_NAMES:
     DEFAULT_WORKER = "stub"
+
+
+def _positive_seconds(name, default, minimum=0.01):
+    try:
+        return max(minimum, float(DEFAULTS.get(name, default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+SYNC_INTERVAL = _positive_seconds("sync_interval", 20)
+SYNC_STALE_AFTER = max(
+    SYNC_INTERVAL * 2,
+    _positive_seconds("sync_stale_after", 60),
+)
 
 
 # --- config/state resolution --------------------------------------------------
@@ -298,6 +313,7 @@ REGISTER = SERVICE_STATE_DIR / "register.json"
 LOCK_FILE = SERVICE_STATE_DIR / "daemon.lock"
 PID_FILE = SERVICE_STATE_DIR / "daemon.pid"
 LOG_FILE = SERVICE_STATE_DIR / "daemon.log"
+HEALTH_FILE = SERVICE_STATE_DIR / "health.json"
 PROGRESS_DIR = SERVICE_STATE_DIR / "progress"
 WORKER_SESSION_DIR = SERVICE_STATE_DIR / "worker-sessions"
 AUTHORITY_DIR = SERVICE_STATE_DIR / "authority"
@@ -310,6 +326,33 @@ def now():
 
 def log(msg):
     print(f"[{now()}] {msg}", flush=True)
+
+
+def write_health(state=None, **updates):
+    """Atomically publish update-stream liveness for `telegram service status`."""
+    health = {}
+    if state != "starting":
+        try:
+            current = json.loads(HEALTH_FILE.read_text())
+            if isinstance(current, dict):
+                health.update(current)
+        except (OSError, ValueError):
+            pass
+    health.update({
+        "connection": CONNECTION,
+        "pid": os.getpid(),
+        "updated_at": now(),
+        "sync_interval_seconds": SYNC_INTERVAL,
+        "stale_after_seconds": SYNC_STALE_AFTER,
+        "telethon_version": getattr(telethon, "__version__", None),
+        **updates,
+    })
+    if state is not None:
+        health["state"] = state
+    SERVICE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    temp = HEALTH_FILE.with_name(f".{HEALTH_FILE.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(health, indent=2, ensure_ascii=False) + "\n")
+    os.replace(temp, HEALTH_FILE)
 
 
 def _short_error(exc, limit=220):
@@ -2109,10 +2152,13 @@ async def run_session(client):
         return cid
 
     async def catch_up_known(reason):
-        # Recover messages missed while the daemon was down. This runs once for every
-        # supervised connection/reconnection, before live processing resumes.
+        # Reconcile allowed chats against their durable message-id watermarks. Startup
+        # recovers downtime; the periodic pass closes gaps left by a silently dropped
+        # MTProto update packet.
         tl_failures = 0
         checked = 0
+        failures = 0
+        total_enqueued = 0
         for key in list(reg.keys()):
             ent = await registered_chat_ref(key)
             if ent is None:
@@ -2130,6 +2176,7 @@ async def run_session(client):
                 raw = await client.get_messages(ent, limit=channel_settings(reg, key)["tail_size"])
             except Exception as e:
                 log(f"{key}: catch-up skipped; cannot resolve chat: {_short_error(e)}")
+                failures += 1
                 if _is_tl_layer_error(e):
                     tl_failures += 1
                 continue
@@ -2159,16 +2206,25 @@ async def run_session(client):
                         text_override=spoken):
                     enqueued += 1
             if enqueued:
+                total_enqueued += enqueued
                 log(f"{key}: catch-up/{reason} enqueued {enqueued} since watermark {wm}")
                 arm(key, ent)
-        if checked and tl_failures >= checked:
+        if tl_failures:
             raise SessionUnhealthy(
                 f"Telegram TL decode failed for {tl_failures}/{checked} catch-up chats")
+        return {
+            "checked": checked,
+            "failures": failures,
+            "enqueued": total_enqueued,
+        }
 
     @client.on(events.NewMessage(incoming=True))
     async def on_message(event):
         if event.out:
             return
+        write_health(
+            last_live_update_at=now(),
+        )
         access = await _event_access(event, me)          # gate 1: the door
         if not access:
             log(f"{event.chat_id}: ignored {_message_kind(event.message)} from {event.sender_id}")
@@ -2223,8 +2279,56 @@ async def run_session(client):
             return
         arm(key, chat_ref)
 
-    # catch-up over known rooms (register keys are chat_ids) since the watermark
-    await catch_up_known("startup")
+    async def periodic_sync():
+        while True:
+            await asyncio.sleep(SYNC_INTERVAL)
+            try:
+                # Ask Telethon to run the protocol-native getDifference path, then
+                # reconcile bounded recent history by our durable watermarks. The
+                # second pass remains authoritative if Telethon dropped an undecodable
+                # update packet without disconnecting the socket.
+                catch_up = getattr(client, "catch_up", None)
+                if catch_up is not None:
+                    await catch_up()
+                    await asyncio.sleep(0)
+                stats = await catch_up_known("periodic")
+                state = "degraded" if stats["failures"] else "healthy"
+                write_health(
+                    state,
+                    last_sync_at=now(),
+                    last_catch_up_reason="periodic",
+                    last_sync_stats=stats,
+                    last_error=(
+                        f"{stats['failures']} chat sync failure(s)"
+                        if stats["failures"] else None
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                write_health(
+                    "unhealthy",
+                    last_error=_short_error(exc),
+                )
+                if isinstance(exc, SessionUnhealthy):
+                    raise
+                raise SessionUnhealthy(
+                    f"periodic Telegram sync failed: {_short_error(exc)}") from exc
+
+    # Catch up over known rooms (register keys are chat_ids) since the watermark.
+    startup_stats = await catch_up_known("startup")
+    startup_state = "degraded" if startup_stats["failures"] else "healthy"
+    write_health(
+        startup_state,
+        session_started_at=now(),
+        last_sync_at=now(),
+        last_catch_up_reason="startup",
+        last_sync_stats=startup_stats,
+        last_error=(
+            f"{startup_stats['failures']} chat sync failure(s)"
+            if startup_stats["failures"] else None
+        ),
+    )
     for key in list(reg.keys()):
         if not _has_pending_jobs(reg, key):
             continue
@@ -2233,10 +2337,23 @@ async def run_session(client):
             arm(key, ent)
 
     log("live — reacting in real time. Ctrl-C to stop.")
+    sync_task = asyncio.create_task(periodic_sync())
+    disconnected_task = asyncio.create_task(client.run_until_disconnected())
     try:
-        await client.run_until_disconnected()
+        done, _ = await asyncio.wait(
+            (sync_task, disconnected_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if sync_task in done:
+            await sync_task
+            raise SessionUnhealthy("periodic Telegram sync stopped unexpectedly")
+        await disconnected_task
     finally:
         closing = True
+        for task in (sync_task, disconnected_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(sync_task, disconnected_task, return_exceptions=True)
         pending_timers = list(timers.values())
         for task in pending_timers:
             task.cancel()
@@ -2301,11 +2418,12 @@ async def supervise_call_recorder():
 
 async def main():
     """Supervise the session so neither a transient crash nor a missing login kills the
-    daemon. Telegram bumps its MTProto layer faster than Telethon 1.x ships schema updates,
-    so getDifference can raise TypeNotFoundError mid-run; reconnect with backoff and
-    catch-up recovers what was missed. A not-yet-authorized session (first deploy on the
-    box, or a revoked session) is not fatal either — the container stays up and retries so
-    `telegram login` can be run inside it. Complements the box's `restart: unless-stopped`."""
+    daemon. Telegram's rolling MTProto schema can diverge from Telethon's generated
+    layer, so getDifference can raise TypeNotFoundError mid-run; reconnect with backoff
+    and watermark reconciliation recover what was missed. A not-yet-authorized session
+    (first deploy on the box, or a revoked session) is not fatal either — the container
+    stays up and retries so `telegram login` can be run inside it. Complements the box's
+    `restart: unless-stopped`."""
     main_task = asyncio.current_task()
     loop = asyncio.get_running_loop()
 
@@ -2334,6 +2452,7 @@ async def main():
         backoff = 2                                 # the connection-namespace dir may not exist yet (fresh volume)
         PID_FILE.write_text(f"{os.getpid()}\n")
         wrote_pid = True
+        write_health("starting", last_error=None)
         if call_recorder_command() is not None:
             call_recorder_task = asyncio.create_task(supervise_call_recorder())
         while True:
@@ -2344,13 +2463,16 @@ async def main():
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except NotAuthorized as e:
+                write_health("unhealthy", last_error=str(e))
                 log(f"{e} — container stays up; retrying in 15s")
                 await asyncio.sleep(15)
             except SessionUnhealthy as e:
+                write_health("unhealthy", last_error=str(e))
                 log(f"{e}; reconnecting in {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             except Exception as e:
+                write_health("unhealthy", last_error=_short_error(e))
                 log(f"session crashed ({_short_error(e, 120)}) — "
                     f"likely Telegram TL-layer drift; reconnecting in {backoff}s")
                 await asyncio.sleep(backoff)
@@ -2365,6 +2487,8 @@ async def main():
             raise
         log("shutdown requested; stopping telegram daemon")
     finally:
+        with contextlib.suppress(Exception):
+            write_health("stopped", stopped_at=now())
         if call_recorder_task is not None:
             call_recorder_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

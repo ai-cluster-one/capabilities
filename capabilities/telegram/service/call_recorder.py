@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "py-tgcalls==2.3.3",
-#     "telethon>=1.36",
+#     "telethon==1.43.2",
 # ]
 # ///
 """Record an existing Telegram group voice chat through a full MTProto account.

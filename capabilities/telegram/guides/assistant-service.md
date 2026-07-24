@@ -77,6 +77,7 @@ For a connection named `assistant`, runtime state is:
 ```text
 $XDG_STATE_HOME/telegram/assistant/session.session
 $XDG_STATE_HOME/telegram/assistant/service/register.json
+$XDG_STATE_HOME/telegram/assistant/service/health.json
 $XDG_STATE_HOME/telegram/assistant/service/progress/
 $XDG_STATE_HOME/telegram/assistant/service/worker-sessions/
 $XDG_STATE_HOME/telegram/assistant/service/daemon.log
@@ -97,9 +98,12 @@ Telethon SQLite session.
   by mention, reply, or configured alias unless the group policy sets
   `require_reference` to `false`.
 - Each addressed message becomes its own queued job.
-- The daemon performs one catch-up pass when a Telegram session connects, including
-  supervisor-driven reconnects, to recover messages received while it was down. It
-  does not poll chat history periodically while the live update stream is healthy.
+- The daemon performs protocol catch-up plus bounded watermark reconciliation when a
+  Telegram session connects and at the configured sync interval. This recovers
+  messages received while it was down and update packets the MTProto client could
+  not deserialize.
+- `telegram service status` reports update-stream health from `health.json`; a live
+  PID with a stale sync watermark is not reported as healthy.
 - A message is reserved in the persistent job register before voice transcription or
   any echo is attempted. Live re-delivery and startup catch-up therefore cannot
   transcribe or echo the same voice message twice.
