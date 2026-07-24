@@ -24,9 +24,14 @@ def parse_event(payload_event: dict) -> dict | None:
     ts = payload_event.get("ts")
     if not (user and channel and ts):
         return None
-    return {"kind": kind, "user": user, "channel": channel, "ts": ts,
-            "text": payload_event.get("text", ""),
-            "thread_ts": payload_event.get("thread_ts")}
+    return {
+        "kind": kind,
+        "user": user,
+        "channel": channel,
+        "ts": ts,
+        "text": payload_event.get("text", ""),
+        "thread_ts": payload_event.get("thread_ts"),
+    }
 
 
 def accept(evt: dict, settings: dict) -> bool:
@@ -62,7 +67,7 @@ def conversation_key(evt: dict) -> str:
     if evt["kind"] == "im":
         return evt["channel"]
     root = evt.get("thread_ts") or evt["ts"]
-    return f'{evt["channel"]}:{root}'
+    return f"{evt['channel']}:{root}"
 
 
 def resolve_role(evt: dict, settings: dict) -> str:
@@ -124,5 +129,5 @@ def select_catchup(messages, *, watermark, now_ts, max_age_seconds, max_messages
         out.append(m)
     out.sort(key=lambda m: float(m["ts"]))
     if max_messages is not None and len(out) > max_messages:
-        out = out[-int(max_messages):]
+        out = out[-int(max_messages) :]
     return out

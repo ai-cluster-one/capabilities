@@ -15,23 +15,37 @@ connect_and_listen() so process_event and the pure helpers stay unit-testable wi
 
 import json
 import os
+import shutil
 import signal
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # policy/register siblings
 
-from policy import (parse_event, accept, route, conversation_key,
-                    resolve_role, control_command, control_allowed,
-                    select_catchup)  # noqa: E402
-from register import Register  # noqa: E402
-from watermark import Watermark  # noqa: E402
-from dispatcher import Dispatcher  # noqa: E402
-from workers import WORKERS, WorkerTimeout  # noqa: E402
-from authority import build_auth_context, summarize  # noqa: E402
-from prompt import build_prompt  # noqa: E402
-import threading  # noqa: E402
-import time  # noqa: E402
+import threading
+
+from authority import (
+    allowed_capability_names,
+    build_auth_context,
+    network_domains,
+    summarize,
+)
+from dispatcher import Dispatcher
+from policy import (
+    accept,
+    control_allowed,
+    control_command,
+    conversation_key,
+    parse_event,
+    resolve_role,
+    route,
+    select_catchup,
+)
+from prompt import build_prompt
+from register import Register
+from validation import require_valid_settings
+from watermark import Watermark
+from workers import WORKERS, WorkerTimeout, sanitized_worker_env
 
 
 def event_key(evt: dict) -> str:
@@ -42,10 +56,20 @@ def _append_inbox(inbox_path: Path, evt: dict) -> None:
     inbox_path.parent.mkdir(parents=True, exist_ok=True)
     with inbox_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(evt, ensure_ascii=False) + "\n")
+    inbox_path.chmod(0o600)
 
 
-def process_event(payload_event, *, settings, register, watermark, inbox_path,
-                  post_message, submit_job, owner_dm=None) -> dict:
+def process_event(
+    payload_event,
+    *,
+    settings,
+    register,
+    watermark,
+    inbox_path,
+    post_message,
+    submit_job,
+    owner_dm=None,
+) -> dict:
     """Handle one Slack event up to the queue boundary (transport-agnostic).
 
     Answer jobs are enqueued via submit_job(conv, job); the worker thread posts
@@ -58,31 +82,54 @@ def process_event(payload_event, *, settings, register, watermark, inbox_path,
         # Parsed a real DM/mention but the accept-gate refused it. Surface it
         # (with the channel id) so an operator can see what to allow; genuine
         # noise (bot/self messages, non-message events) returned above stays silent.
-        return {"action": "ignore", "reason": "not_allowed", "kind": evt["kind"],
-                "channel": evt["channel"], "user": evt["user"], "ts": evt["ts"],
-                "text": evt["text"]}
+        return {
+            "action": "ignore",
+            "reason": "not_allowed",
+            "kind": evt["kind"],
+            "channel": evt["channel"],
+            "user": evt["user"],
+            "ts": evt["ts"],
+            "text": evt["text"],
+        }
+    watermark.observe(evt["channel"])
     key = event_key(evt)
     if not register.reserve(key):
+        if register.is_terminal(key):
+            watermark.advance(evt["channel"], evt["ts"])
         return {"action": "duplicate", "key": key}
     conv = conversation_key(evt)
-    watermark.advance(evt["channel"], evt["ts"])
 
     cmd = control_command(evt["text"])
     if cmd:
         role = resolve_role(evt, settings)
         register.mark_done(key)
+        watermark.advance(evt["channel"], evt["ts"])
         if control_allowed(cmd, role, settings):
-            return {"action": "control", "command": cmd, "conversation": conv,
-                    "role": role, "evt": evt, "key": key}
-        return {"action": "control_denied", "command": cmd, "conversation": conv,
-                "role": role, "evt": evt, "key": key}
+            return {
+                "action": "control",
+                "command": cmd,
+                "conversation": conv,
+                "role": role,
+                "evt": evt,
+                "key": key,
+            }
+        return {
+            "action": "control_denied",
+            "command": cmd,
+            "conversation": conv,
+            "role": role,
+            "evt": evt,
+            "key": key,
+        }
 
     if route(evt, settings) == "relay":
         _append_inbox(Path(inbox_path), evt)
         if owner_dm:
-            post_message(owner_dm,
-                         f"inbox: message from {evt['user']} in {evt['channel']}", None)
+            post_message(
+                owner_dm, f"inbox: message from {evt['user']} in {evt['channel']}", None
+            )
         register.mark_done(key)
+        watermark.advance(evt["channel"], evt["ts"])
         return {"action": "relay", "key": key, "text": evt["text"]}
 
     role = resolve_role(evt, settings)
@@ -120,8 +167,12 @@ def map_tail(messages, bot_user_id):
         if not text:
             continue
         is_bot = bool(m.get("bot_id")) or (bot_user_id and m.get("user") == bot_user_id)
-        out.append({"sender": "assistant" if is_bot else (m.get("user") or "user"),
-                    "text": text})
+        out.append(
+            {
+                "sender": "assistant" if is_bot else (m.get("user") or "user"),
+                "text": text,
+            }
+        )
     out.reverse()
     return out
 
@@ -162,38 +213,80 @@ def synth_payload(channel, message, bot_user_id):
     if not (user and ts):
         return None
     if str(channel).startswith("D"):
-        return {"type": "message", "channel_type": "im", "user": user,
-                "channel": channel, "ts": ts, "text": text,
-                "thread_ts": message.get("thread_ts")}
+        return {
+            "type": "message",
+            "channel_type": "im",
+            "user": user,
+            "channel": channel,
+            "ts": ts,
+            "text": text,
+            "thread_ts": message.get("thread_ts"),
+        }
     if bot_user_id and f"<@{bot_user_id}>" in text:
-        return {"type": "app_mention", "user": user, "channel": channel, "ts": ts,
-                "text": text, "thread_ts": message.get("thread_ts")}
+        return {
+            "type": "app_mention",
+            "user": user,
+            "channel": channel,
+            "ts": ts,
+            "text": text,
+            "thread_ts": message.get("thread_ts"),
+        }
     return None
 
 
-def worker_env(base_env, *, outbox, conversation, authority_path, real_slack, worker_bin):
-    env = dict(base_env)
-    env["PATH"] = f"{worker_bin}{os.pathsep}{env.get('PATH', '')}"
-    env["SLACK_WORKER_OUTBOX"] = str(outbox)
-    env["SLACK_WORKER_CONVERSATION"] = str(conversation)
-    if real_slack:
-        env["SLACK_REAL_SLACK"] = str(real_slack)
-    if authority_path:
-        env["CAPABILITIES_AUTH_CONTEXT"] = str(authority_path)
-    return env
+def worker_env(
+    base_env,
+    *,
+    outbox,
+    conversation,
+    authority_path,
+    worker_bin,
+    worker_home=None,
+):
+    path = f"{worker_bin}{os.pathsep}{(base_env or {}).get('PATH', '')}"
+    extra = {
+        "PATH": path,
+        "SLACK_WORKER_OUTBOX": outbox,
+        "SLACK_WORKER_CONVERSATION": conversation,
+        "CAPABILITIES_AUTH_CONTEXT": authority_path,
+    }
+    if worker_home:
+        home = Path(worker_home).expanduser().resolve()
+        extra.update(
+            {
+                "HOME": home,
+                "CODEX_HOME": home / ".codex",
+                "CLAUDE_CONFIG_DIR": home / ".claude",
+                "XDG_CACHE_HOME": home / ".cache",
+                "XDG_CONFIG_HOME": home / ".config",
+                "XDG_DATA_HOME": home / ".local" / "share",
+                "XDG_STATE_HOME": home / ".local" / "state",
+            }
+        )
+    return sanitized_worker_env(base_env, extra)
 
 
 def _safe(part):
     import re
+
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(part)).strip("_") or "conv"
 
 
-def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
-                       inbox_path, owner_dm, state_dir, log) -> None:
+def connect_and_listen(
+    *,
+    bot_token,
+    app_token,
+    settings,
+    register,
+    watermark,
+    inbox_path,
+    owner_dm,
+    state_dir,
+    log,
+) -> None:
     # Lazy import: keeps every other module testable without slack_sdk installed.
     from slack_sdk import WebClient
     from slack_sdk.socket_mode import SocketModeClient
-    from slack_sdk.socket_mode.request import SocketModeRequest
     from slack_sdk.socket_mode.response import SocketModeResponse
 
     web = WebClient(token=bot_token)
@@ -202,21 +295,44 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
     defaults = settings.get("defaults") or {}
     worker_name = (defaults.get("worker") or "claude").strip().lower()
     if worker_name not in WORKERS:
-        worker_name = "claude"
-    project = defaults.get("project") or os.environ.get("SLACK_SERVICE_PROJECT_ROOT") or os.getcwd()
+        raise ValueError(
+            f"unknown worker {worker_name!r}; expected one of {sorted(WORKERS)}"
+        )
+    project = (
+        defaults.get("project")
+        or os.environ.get("SLACK_SERVICE_PROJECT_ROOT")
+        or os.getcwd()
+    )
+    project = str(Path(project).resolve())
+    if not Path(project).is_dir():
+        raise ValueError(f"worker project directory does not exist: {project}")
     tail_size = int(defaults.get("tail_size") or 30)
     worker_timeout = float(defaults.get("worker_timeout") or 180)
     max_parallel = int(defaults.get("max_parallel_jobs") or 3)
+    workspace_mode = str(defaults.get("workspace_mode") or "read_only")
+    worker_home = defaults.get("worker_home")
+    if tail_size < 1 or tail_size > 200:
+        raise ValueError("tail_size must be between 1 and 200")
+    if worker_timeout < 1 or worker_timeout > 3600:
+        raise ValueError("worker_timeout must be between 1 and 3600 seconds")
+    if max_parallel < 1 or max_parallel > 16:
+        raise ValueError("max_parallel_jobs must be between 1 and 16")
     catch = defaults.get("catch_up") or {}
     max_age = catch.get("max_age_seconds", 3600)
     max_msgs = catch.get("max_messages", 50)
     model = defaults.get("model")
     effort = defaults.get("effort")
-    connection = os.environ.get("SLACK_SERVICE_CONNECTION") or settings.get("connection") or "default"
+    connection = (
+        os.environ.get("SLACK_SERVICE_CONNECTION")
+        or settings.get("connection")
+        or "default"
+    )
+    log_snippets = bool(
+        (settings.get("observability") or {}).get("log_message_snippets", False)
+    )
 
-    import shutil
-    real_slack = os.environ.get("SLACK_REAL_SLACK") or shutil.which("slack") or ""
     worker_bin = str(Path(__file__).resolve().parent / "worker-bin")
+    protected_home = str(Path.home().resolve())
     context_path = os.environ.get("SLACK_SERVICE_CONTEXT") or ""
     context_md = ""
     if context_path and Path(context_path).is_file():
@@ -224,12 +340,12 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
 
     try:
         bot_user_id = web.auth_test().get("user_id")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - SDK boundary; log and continue without identity
         bot_user_id = None
         _log(log, f"auth_test failed: {exc!r}")
 
-    running_procs = {}      # conv -> Popen (for /stop + shutdown)
-    stopping = set()        # conversations whose worker /stop just killed
+    running_procs = {}  # conv -> Popen (for /stop + shutdown)
+    stopping = set()  # conversations whose worker /stop just killed
     procs_lock = threading.Lock()
 
     def post(channel, text, thread_ts):
@@ -239,24 +355,32 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
     def _react(channel, ts, name, add=True):
         try:
             (web.reactions_add if add else web.reactions_remove)(
-                channel=channel, timestamp=ts, name=name)
-        except Exception:
-            pass
+                channel=channel, timestamp=ts, name=name
+            )
+        except Exception as exc:  # noqa: BLE001 - reactions are best-effort
+            _log(log, f"reaction {name} failed for {channel}:{ts}: {exc!r}")
 
     def _fetch_tail(evt):
         try:
             if evt["kind"] == "im":
-                resp = web.conversations_history(channel=evt["channel"], limit=tail_size)
+                resp = web.conversations_history(
+                    channel=evt["channel"], limit=tail_size
+                )
             else:
                 root = evt.get("thread_ts") or evt["ts"]
-                resp = web.conversations_replies(channel=evt["channel"], ts=root, limit=tail_size)
+                resp = web.conversations_replies(
+                    channel=evt["channel"], ts=root, limit=tail_size
+                )
             return map_tail(resp.get("messages") or [], bot_user_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - SDK boundary; empty tail is recoverable
             _log(log, f"tail fetch failed for {evt['channel']}: {exc!r}")
             return []
 
     def run_job(job):
-        evt = job["evt"]; conv = job["conversation"]; key = job["key"]; role = job["role"]
+        evt = job["evt"]
+        conv = job["conversation"]
+        key = job["key"]
+        role = job["role"]
         channel, ts = evt["channel"], evt["ts"]
         # Reply as a normal channel message; only stay in-thread if the incoming
         # mention was itself already inside a thread (don't thread a top-level mention).
@@ -270,25 +394,52 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
         try:
             tail = _fetch_tail(evt)
             sender_entry = (settings.get("allowed_users") or {}).get(evt["user"])
-            sender_name = (sender_entry.get("name") if isinstance(sender_entry, dict)
-                           else sender_entry) or evt["user"]
-            auth = build_auth_context(settings, role=role, connection=connection,
-                                      conversation=conv, sender_id=evt["user"],
-                                      sender_name=sender_name)
-            authority_path = None
-            if auth is not None:
-                authpath.parent.mkdir(parents=True, exist_ok=True)
-                authpath.write_text(json.dumps(auth, ensure_ascii=False, indent=2) + "\n")
-                authority_path = str(authpath)
-            state = {"now": _now(), "conversation": conv, "kind": evt["kind"],
-                     "connection": connection, "worker": worker_name,
-                     "sender_name": sender_name, "sender_role": role,
-                     "authority_summary": summarize((auth or {}).get("allowed_capabilities")),
-                     "request_text": evt.get("text") or ""}
+            sender_name = (
+                sender_entry.get("name")
+                if isinstance(sender_entry, dict)
+                else sender_entry
+            ) or evt["user"]
+            auth = build_auth_context(
+                settings,
+                role=role,
+                connection=connection,
+                conversation=conv,
+                sender_id=evt["user"],
+                sender_name=sender_name,
+            )
+            allowed_capabilities = allowed_capability_names(
+                auth.get("allowed_capabilities")
+            )
+            allowed_network_domains = network_domains(settings, role)
+            capability_roots = []
+            for capability in allowed_capabilities:
+                executable = shutil.which(capability)
+                if executable:
+                    capability_roots.append(str(Path(executable).resolve().parent))
+            authpath.parent.mkdir(parents=True, exist_ok=True)
+            authpath.write_text(json.dumps(auth, ensure_ascii=False, indent=2) + "\n")
+            authpath.chmod(0o400)
+            authority_path = str(authpath)
+            state = {
+                "now": _now(),
+                "conversation": conv,
+                "kind": evt["kind"],
+                "connection": connection,
+                "worker": worker_name,
+                "sender_name": sender_name,
+                "sender_role": role,
+                "authority_summary": summarize(auth.get("allowed_capabilities")),
+                "request_text": evt.get("text") or "",
+            }
             prompt = build_prompt(context_md, state, tail)
-            env = worker_env(os.environ, outbox=str(outbox), conversation=conv,
-                             authority_path=authority_path, real_slack=real_slack,
-                             worker_bin=worker_bin)
+            env = worker_env(
+                os.environ,
+                outbox=str(outbox),
+                conversation=conv,
+                authority_path=authority_path,
+                worker_bin=worker_bin,
+                worker_home=worker_home,
+            )
 
             def _drain_loop():
                 off = 0
@@ -308,33 +459,81 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
                 with procs_lock:
                     running_procs[conv] = proc
 
-            _log(log, f"dispatch conv={conv} worker={worker_name} tail={len(tail)} role={role}")
-            result = WORKERS[worker_name](prompt, cwd=project, env=env,
-                                          timeout=worker_timeout, model=model,
-                                          effort=effort, on_spawn=_on_spawn)
+            _log(
+                log,
+                f"dispatch conv={conv} worker={worker_name} tail={len(tail)} role={role}",
+            )
+            result = WORKERS[worker_name](
+                prompt,
+                cwd=project,
+                env=env,
+                timeout=worker_timeout,
+                model=model,
+                effort=effort,
+                on_spawn=_on_spawn,
+                allowed_capabilities=allowed_capabilities,
+                network_domains=allowed_network_domains,
+                protected_home=protected_home,
+                worker_bin=worker_bin,
+                capability_roots=capability_roots,
+                workspace_mode=workspace_mode,
+            )
             reply = result["reply"]
             post(channel, reply, thread)
             _react(channel, ts, "eyes", add=False)
             _react(channel, ts, "white_check_mark", add=True)
             register.mark_done(key)
-            _log(log, f"answered conv={conv} «{reply[:80]}»")
+            watermark.advance(channel, ts)
+            suffix = f" «{reply[:80]}»" if log_snippets else ""
+            _log(log, f"answered conv={conv}{suffix}")
         except WorkerTimeout as exc:
-            _finish_error(channel, ts, thread, key, conv, role, exc, stopping, register, post, _react, _log, log)
-        except Exception as exc:
+            _finish_error(
+                channel,
+                ts,
+                thread,
+                key,
+                conv,
+                role,
+                exc,
+                stopping,
+                register,
+                watermark,
+                post,
+                _react,
+                _log,
+                log,
+            )
+        except Exception as exc:  # noqa: BLE001 - worker boundary must become a terminal job
             with procs_lock:
                 was_stopped = conv in stopping
             if was_stopped:
                 register.mark_done(key)
+                watermark.advance(channel, ts)
                 _log(log, f"stopped conv={conv}")
             else:
-                _finish_error(channel, ts, thread, key, conv, role, exc, stopping, register, post, _react, _log, log)
+                _finish_error(
+                    channel,
+                    ts,
+                    thread,
+                    key,
+                    conv,
+                    role,
+                    exc,
+                    stopping,
+                    register,
+                    watermark,
+                    post,
+                    _react,
+                    _log,
+                    log,
+                )
         finally:
             stop_drain.set()
             if drainer is not None:
                 drainer.join(timeout=5)
             with procs_lock:
                 running_procs.pop(conv, None)
-                stopping.discard(conv)   # per-job flag: clear on every terminal path
+                stopping.discard(conv)  # per-job flag: clear on every terminal path
             with contextlib_suppress():
                 outbox.unlink()
             with contextlib_suppress():
@@ -345,9 +544,11 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
     def _status_text():
         with procs_lock:
             active = list(running_procs.keys())
-        return (f"running: {len(active)} job(s)"
-                + (f" in {', '.join(active)}" if active else "")
-                + f"\nworker={worker_name}, max_parallel={max_parallel}")
+        return (
+            f"running: {len(active)} job(s)"
+            + (f" in {', '.join(active)}" if active else "")
+            + f"\nworker={worker_name}, max_parallel={max_parallel}"
+        )
 
     def _stop_conversation(conv):
         with procs_lock:
@@ -366,13 +567,17 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
         dispatcher.submit(conv, job)
 
     def _handle_control(out):
-        evt = out["evt"]; conv = out["conversation"]
+        evt = out["evt"]
+        conv = out["conversation"]
         # Reply as a normal channel message; only stay in-thread if the incoming
         # mention was itself already inside a thread (don't thread a top-level mention).
         thread = None if evt["kind"] == "im" else evt.get("thread_ts")
         if out["action"] == "control_denied":
-            post(evt["channel"], f"nope: {out['command']} is not allowed for role {out['role']}",
-                 thread)
+            post(
+                evt["channel"],
+                f"nope: {out['command']} is not allowed for role {out['role']}",
+                thread,
+            )
             return
         if out["command"] == "status":
             post(evt["channel"], _status_text(), thread)
@@ -381,29 +586,43 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
 
     def catch_up(reason):
         now_ts = _now_ts()
-        channels = set(watermark.keys()) | set((settings.get("allowed_channels") or {}).keys())
+        channels = set(watermark.keys()) | set(
+            (settings.get("allowed_channels") or {}).keys()
+        )
         for ch in channels:
             wm = watermark.get(ch)
             if wm is None:
-                watermark.advance(ch, now_ts)   # first sighting: no ancient backlog
+                watermark.advance(ch, now_ts)  # first sighting: no ancient backlog
                 continue
             try:
-                resp = web.conversations_history(channel=ch, limit=int(max_msgs), oldest=wm)
-            except Exception as exc:
+                resp = web.conversations_history(
+                    channel=ch, limit=int(max_msgs), oldest=wm
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate one channel's catch-up failure
                 _log(log, f"catch-up skipped {ch}: {exc!r}")
                 continue
-            selected = select_catchup(resp.get("messages") or [], watermark=wm,
-                                      now_ts=now_ts, max_age_seconds=max_age,
-                                      max_messages=max_msgs)
+            selected = select_catchup(
+                resp.get("messages") or [],
+                watermark=wm,
+                now_ts=now_ts,
+                max_age_seconds=max_age,
+                max_messages=max_msgs,
+            )
             n = 0
             for m in selected:
                 payload = synth_payload(ch, m, bot_user_id)
                 if payload is None:
                     continue
-                out = process_event(payload, settings=settings, register=register,
-                                    watermark=watermark, inbox_path=inbox_path,
-                                    post_message=post, submit_job=submit_job,
-                                    owner_dm=owner_dm)
+                out = process_event(
+                    payload,
+                    settings=settings,
+                    register=register,
+                    watermark=watermark,
+                    inbox_path=inbox_path,
+                    post_message=post,
+                    submit_job=submit_job,
+                    owner_dm=owner_dm,
+                )
                 if out["action"] in ("control", "control_denied"):
                     _handle_control(out)
                 n += 1
@@ -420,29 +639,53 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
                 catchup_lock.release()
 
     def on_request(client, req):
-        client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
+        client.send_socket_mode_response(
+            SocketModeResponse(envelope_id=req.envelope_id)
+        )
         if req.type != "events_api":
             return
         event = (req.payload or {}).get("event", {})
         try:
-            out = process_event(event, settings=settings, register=register,
-                                watermark=watermark, inbox_path=inbox_path,
-                                post_message=post, submit_job=submit_job, owner_dm=owner_dm)
+            out = process_event(
+                event,
+                settings=settings,
+                register=register,
+                watermark=watermark,
+                inbox_path=inbox_path,
+                post_message=post,
+                submit_job=submit_job,
+                owner_dm=owner_dm,
+            )
             if out["action"] in ("control", "control_denied"):
                 _handle_control(out)
-            snip = (out.get("text") or "").replace("\n", " ")[:80]
+            snip = (
+                (out.get("text") or "").replace("\n", " ")[:80] if log_snippets else ""
+            )
             quoted = f" «{snip}»" if snip else ""
             if out["action"] != "ignore":
                 _log(log, f"{out['action']} {out.get('key', '')}{quoted}")
             elif out.get("reason") == "not_allowed":
-                _log(log, f"not_allowed {out['kind']} from {out['user']} "
-                          f"in {out['channel']} ts={out['ts']}{quoted}")
-        except Exception as exc:
+                _log(
+                    log,
+                    f"not_allowed {out['kind']} from {out['user']} "
+                    f"in {out['channel']} ts={out['ts']}{quoted}",
+                )
+        except Exception as exc:  # noqa: BLE001 - listener must isolate malformed deliveries
             _log(log, f"error handling event: {exc!r}")
 
     def on_raw(client, message):
-        if isinstance(message, str) and '"type":"hello"' in message:
-            threading.Thread(target=_run_catch_up, args=("connect",), daemon=True).start()
+        payload = message
+        if isinstance(message, str):
+            try:
+                payload = json.loads(message)
+            except ValueError:
+                return
+        if isinstance(payload, dict) and payload.get("type") == "hello":
+            threading.Thread(
+                target=_run_catch_up, args=("connect",), daemon=True
+            ).start()
+
+    stop_event = threading.Event()
 
     def _graceful_stop(signum, frame):
         _log(log, f"received signal {signum}; killing in-flight workers and exiting")
@@ -453,7 +696,7 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-        os._exit(0)
+        stop_event.set()
 
     for _sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -463,23 +706,65 @@ def connect_and_listen(*, bot_token, app_token, settings, register, watermark,
 
     sm.socket_mode_request_listeners.append(on_request)
     sm.on_message_listeners.append(on_raw)
-    _log(log, f"connecting to Slack Socket Mode (worker={worker_name}, project={project})")
+    _log(
+        log,
+        f"connecting to Slack Socket Mode (worker={worker_name}, project={project})",
+    )
     sm.connect()
-    threading.Event().wait()  # block forever; SIGTERM from `service stop` ends the process
+    ready = Path(state_dir) / "ready.json"
+    ready.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "connection": connection,
+                "worker": worker_name,
+                "ready_at": _now(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n"
+    )
+    ready.chmod(0o600)
+    stop_event.wait()
+    dispatcher.shutdown(cancel_pending=True)
+    try:
+        sm.close()
+    except Exception as exc:  # noqa: BLE001 - third-party close failures are diagnostic
+        _log(log, f"Socket Mode close failed: {exc!r}")
+    ready.unlink(missing_ok=True)
 
 
-def _finish_error(channel, ts, thread, key, conv, role, exc, stopping, register,
-                  post, react, _log, log):
+def _finish_error(
+    channel,
+    ts,
+    thread,
+    key,
+    conv,
+    role,
+    exc,
+    stopping,
+    register,
+    watermark,
+    post,
+    react,
+    _log,
+    log,
+):
     react(channel, ts, "eyes", add=False)
     react(channel, ts, "x", add=True)
     detail = f"{type(exc).__name__}: {str(exc)[:300]}"
-    notice = (f"Worker error: {detail}" if role == "supervisor"
-              else "Something went wrong handling this. Please tell an administrator.")
+    notice = (
+        f"Worker error: {detail}"
+        if role == "supervisor"
+        else "Something went wrong handling this. Please tell an administrator."
+    )
     try:
         post(channel, notice, thread)
-    except Exception as se:
+    except Exception as se:  # noqa: BLE001 - preserve the original worker failure
         _log(log, f"failed to post error notice: {se!r}")
     register.mark_error(key)
+    watermark.advance(channel, ts)
     _log(log, f"error conv={conv} {detail}")
 
 
@@ -502,11 +787,13 @@ def _chunks(text, limit=3900):
 
 def _now():
     from datetime import datetime, timezone
+
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _now_ts():
     import time as _t
+
     return str(_t.time())
 
 
@@ -518,25 +805,42 @@ def contextlib_suppress():
 
 
 def main() -> None:
+    os.umask(0o077)
     settings_path = os.environ.get("SLACK_SERVICE_SETTINGS", "")
     state_dir = Path(os.environ.get("SLACK_SERVICE_STATE_DIR", "."))
     bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
     app_token = os.environ.get("SLACK_APP_TOKEN", "")
     log_path = state_dir / "daemon.log"
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state_dir.chmod(0o700)
 
     if not bot_token or not app_token:
         _log(log_path, "missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN; exiting")
         sys.exit(2)
 
     settings = _load_settings(settings_path)
+    project_root = os.environ.get("SLACK_SERVICE_PROJECT_ROOT") or os.getcwd()
+    try:
+        require_valid_settings(settings, project_root=project_root, check_worker=True)
+    except ValueError as exc:
+        _log(log_path, f"invalid service settings: {exc}")
+        sys.exit(6)
     register = Register(state_dir / "register.json")
     watermark = Watermark(state_dir / "watermarks.json")
     inbox_path = state_dir / "inbox.jsonl"
     owner_dm = (settings.get("inbox") or {}).get("notify_owner")
 
-    connect_and_listen(bot_token=bot_token, app_token=app_token, settings=settings,
-                       register=register, watermark=watermark, inbox_path=inbox_path,
-                       owner_dm=owner_dm, state_dir=state_dir, log=log_path)
+    connect_and_listen(
+        bot_token=bot_token,
+        app_token=app_token,
+        settings=settings,
+        register=register,
+        watermark=watermark,
+        inbox_path=inbox_path,
+        owner_dm=owner_dm,
+        state_dir=state_dir,
+        log=log_path,
+    )
 
 
 if __name__ == "__main__":

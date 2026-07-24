@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Worker-side `slack` shim (on PATH ahead of the real CLI inside a service worker).
 
-`slack post|send` must not send directly — the daemon owns outbound and scopes to
-the current conversation. We append the message text to the daemon's per-job outbox;
-the daemon posts it to THIS conversation only. A concrete foreign conversation id is
-rejected (scope: current_chat). Every other verb passes through to the real slack."""
+The worker never receives Slack credentials and cannot invoke the real Slack CLI.
+`slack post|send` appends text to the daemon's per-job outbox; the daemon posts it
+to the current conversation. Every other verb fails closed."""
 
 import json
 import os
@@ -12,18 +11,11 @@ import sys
 
 OUTBOX = os.environ.get("SLACK_WORKER_OUTBOX", "")
 CONV = os.environ.get("SLACK_WORKER_CONVERSATION", "")
-REAL = os.environ.get("SLACK_REAL_SLACK", "")
 
 
 def _fail(code, msg):
     sys.stderr.write(json.dumps({"ok": False, "error": msg}) + "\n")
     sys.exit(code)
-
-
-def _passthrough():
-    if not REAL:
-        _fail(3, "slack shim: real slack unavailable (SLACK_REAL_SLACK unset)")
-    os.execv(REAL, [REAL, *sys.argv[1:]])
 
 
 def _positional(args):
@@ -41,17 +33,28 @@ def main():
     args = sys.argv[1:]
     verb = args[0] if args else ""
     if verb not in ("post", "send"):
-        _passthrough()
+        _fail(4, "scope: Slack workers may only post through the current-chat outbox")
     pos = _positional(args[1:])
     if len(pos) < 2:
-        _fail(6, "usage: slack post <target> <text>")
+        _fail(6, "usage: slack post current <text>")
     target, text = pos[0], " ".join(pos[1:])
-    if target and target[:1] in ("C", "D", "G") and CONV and target != CONV:
-        _fail(4, f"scope: worker may only post to the current conversation ({CONV})")
+    current_channel = CONV.split(":", 1)[0]
+    if target not in {"current", ".", current_channel}:
+        _fail(4, "scope: worker may only post to target `current`")
     if not OUTBOX:
         _fail(3, "slack shim: no outbox configured (SLACK_WORKER_OUTBOX unset)")
-    with open(OUTBOX, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+    payload = (json.dumps({"text": text}, ensure_ascii=False) + "\n").encode()
+    fd = os.open(OUTBOX, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                _fail(5, "slack shim: could not append to the worker outbox")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     print(json.dumps({"ok": True, "queued": True}))
 
 

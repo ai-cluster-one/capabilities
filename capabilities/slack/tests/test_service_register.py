@@ -1,6 +1,7 @@
 import json
-from pathlib import Path
+import stat
 
+import pytest
 from register import Register
 
 
@@ -20,8 +21,10 @@ def test_terminal_state_persists_across_instances(tmp_path):
 
 def test_reserved_is_reset_on_load(tmp_path):
     path = tmp_path / "register.json"
-    Register(path).reserve("C1:100.1")               # in-progress, never completed
-    assert Register(path).reserve("C1:100.1") is True  # reset-and-recover → re-reservable
+    Register(path).reserve("C1:100.1")  # in-progress, never completed
+    assert (
+        Register(path).reserve("C1:100.1") is True
+    )  # reset-and-recover → re-reservable
 
 
 def test_mark_done_and_is_done(tmp_path):
@@ -39,6 +42,7 @@ def test_file_is_valid_json_after_writes(tmp_path):
     reg.mark_done("C1:100.1")
     data = json.loads(path.read_text())
     assert data["C1:100.1"] == "done"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_missing_parent_dir_is_created(tmp_path):
@@ -52,11 +56,13 @@ def test_mark_error_is_terminal_and_dedups(tmp_path):
     r = Register(path)
     r.reserve("C1:100.1")
     r.mark_error("C1:100.1")
+    assert r.is_terminal("C1:100.1") is True
     assert Register(path).reserve("C1:100.1") is False  # error persists → not retried
 
 
 def test_prune_caps_terminal_keys(tmp_path):
     import register as reg_mod
+
     reg_mod.REGISTER_MAX_KEYS = 3
     path = tmp_path / "register.json"
     r = Register(path)
@@ -69,3 +75,10 @@ def test_prune_caps_terminal_keys(tmp_path):
     assert "C1:5.0" in r._data
     assert "C1:0.0" not in r._data
     reg_mod.REGISTER_MAX_KEYS = 5000
+
+
+def test_corrupt_register_fails_closed(tmp_path):
+    path = tmp_path / "register.json"
+    path.write_text("{not-json")
+    with pytest.raises(ValueError, match="cannot load register"):
+        Register(path)

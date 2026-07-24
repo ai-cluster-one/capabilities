@@ -25,21 +25,35 @@ import sys
 from pathlib import Path
 from typing import NoReturn
 
-NAME = 'slack'
-SUMMARY = ("Slack CLI over a bot token — post to and read channels, groups, "
-           "threads and DMs, and resolve names to ids; conversation targets "
-           "are gated by a project allow-list policy.")
+NAME = "slack"
+SUMMARY = (
+    "Slack CLI over a bot token — post to and read channels, groups, "
+    "threads and DMs, and resolve names to ids; conversation targets "
+    "are gated by a project allow-list policy."
+)
 SCOPE = "project"
 CRED_KEYS = [
-    {"key": "SLACK_BOT_TOKEN", "secret": True, "required": True,
-     "hint": "Slack app bot token (xoxb-…) with chat:write, channels:read, "
-             "groups:read, users:read, channels:history, groups:history, im:history"},
+    {
+        "key": "SLACK_BOT_TOKEN",
+        "secret": True,
+        "required": True,
+        "note": "Slack app bot token (xoxb-…) with the scopes listed in `slack help`",
+    },
+    {
+        "key": "SLACK_APP_TOKEN",
+        "secret": True,
+        "required": False,
+        "note": "optional app-level token (xapp-…) for `slack service`, with connections:write",
+    },
 ]
-WRITE_VERBS = {"post"}
+WRITE_VERBS = {"post", "service"}
 WRITE_DEFAULT = False
-DOCS_BASE = ""
-TOPICS: list[str] = []
-STATE = False
+DOCS_BASE = (
+    "https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+    "main/capabilities/slack/guides/"
+)
+TOPICS = ["service"]
+STATE = True
 POST_INSTALL: list[dict] = []
 
 HELP = """\
@@ -62,6 +76,8 @@ CREDENTIAL  (scope: project)
   SLACK_BOT_TOKEN  bot token (xoxb-…). Resolves from project .env/.env.local,
                    the user credentials.env, or process env. `slack connections`
                    shows where it resolves.
+  SLACK_APP_TOKEN  optional app-level token (xapp-…) used only by
+                   `slack service`; requires connections:write.
 
 WRITES
   post is a write verb and is refused unless the selected connection sets
@@ -75,8 +91,8 @@ ALLOW-LIST POLICY  (capabilities/slack/policy.json)
 
     {
       "direct_messages":        { "mode": "allowed_users" },   // or "open"
-      "allowed_users":          { "U0ALICE": "Alice" },
-      "allowed_channels":       { "C0ENG": "#eng" },
+      "allowed_users":          { "U0123456789": "operator" },
+      "allowed_channels":       { "C0123456789": "#team" },
       "default_channel_policy": "allowed_only"                 // or "open"
     }
 
@@ -86,10 +102,19 @@ ALLOW-LIST POLICY  (capabilities/slack/policy.json)
 
 SERVICE (real-time daemon, Socket Mode — needs SLACK_APP_TOKEN xapp-…)
   slack service init [--connection ID]   write project service settings/context
-  slack service doctor                   verify both tokens + Socket Mode handshake
-  slack service start | stop | status    manage the background daemon
-  slack service run                      run the daemon in the foreground
+  slack service doctor                   verify both tokens + Socket Mode endpoint issuance
+  slack service start | stop | status    manage the background daemon; start is WRITE
+  slack service run                      run the daemon in the foreground   (WRITE)
   slack service logs [--tail N]          show the daemon log
+
+  start/run require the selected connection's allow_write=true. Shipped settings
+  admit nobody, auto-answer nobody, authorize no capabilities, use the stub worker,
+  and keep the workspace read-only. Selecting claude/codex requires an explicit
+  trusted_ingress acknowledgement plus a dedicated worker_home for harness auth
+  and state. Workers receive no Slack tokens or provider API-key environment
+  variables; their only Slack operation is the daemon-mediated
+  `slack post current <text>`.
+  Run `slack guide service` for the trust and configuration model.
 
 CONTRACT COMMANDS  (present on every capability)
   slack stub                            one-line awareness text
@@ -104,6 +129,7 @@ EXITS   0 ok · 2 auth · 3 not found · 4 policy/write refusal · 5 network · 
 """
 
 SERVICE = {
+    "name": "assistant",
     "summary": "Project-local Slack real-time daemon (Socket Mode) using the bundled service engine.",
     "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
     "config": "capabilities/slack/service",
@@ -112,7 +138,9 @@ SERVICE = {
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
-_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+_STATE_HOME = Path(
+    os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
+)
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -650,6 +678,21 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
 
 # <<< contract: connections <<<
 
+
+def _manifest_payload() -> dict:
+    payload = {
+        "name": NAME,
+        "summary": SUMMARY,
+        "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+        "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+        "state": STATE,
+        "post_install": POST_INSTALL,
+    }
+    if SERVICE:
+        payload["service"] = SERVICE
+    return payload
+
+
 def _connections_report() -> dict:
     reg, _reg_file = _connections_registry()
     out: dict = {"default": None, "connections": {}}
@@ -657,43 +700,77 @@ def _connections_report() -> dict:
         rows = []
         for spec in CRED_KEYS:
             value, tier, source = _resolve_env_key(spec["key"])
-            rows.append(_key_report(spec["key"], bool(spec.get("secret")),
-                                    bool(spec.get("required")), value, tier, source))
+            rows.append(
+                _key_report(
+                    spec["key"],
+                    bool(spec.get("secret")),
+                    bool(spec.get("required")),
+                    value,
+                    tier,
+                    source,
+                )
+            )
         out["default"] = "default"
-        out["connections"]["default"] = {
-            "allow_write": WRITE_DEFAULT, "keys": rows}
+        out["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": rows}
         return out
     conns = reg["connections"]
-    out["default"] = reg.get("default") or (next(iter(conns)) if len(conns) == 1 else None)
+    out["default"] = reg.get("default") or (
+        next(iter(conns)) if len(conns) == 1 else None
+    )
     for cid, raw in conns.items():
         entry = raw if isinstance(raw, dict) else {}
         rows = []
         for spec in CRED_KEYS:
             value, tier, source = _resolve_env_key(spec["key"])
-            rows.append(_key_report(spec["key"], bool(spec.get("secret")),
-                                    bool(spec.get("required")), value, tier, source))
+            rows.append(
+                _key_report(
+                    spec["key"],
+                    bool(spec.get("secret")),
+                    bool(spec.get("required")),
+                    value,
+                    tier,
+                    source,
+                )
+            )
         out["connections"][cid] = {
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "keys": rows}
+            "keys": rows,
+        }
     return out
 
 
 def _cmd_connections() -> None:
     _emit(_connections_report())
 
+
 # --- Slack transport ---------------------------------------------------------
 
 API_BASE = "https://slack.com/api/"
 
-_AUTH_ERRORS = {"invalid_auth", "not_authed", "account_inactive", "token_revoked",
-                "token_expired", "no_permission", "missing_scope",
-                "ekm_access_denied", "not_allowed_token_type"}
-_NOT_FOUND_ERRORS = {"channel_not_found", "user_not_found", "users_not_found",
-                     "thread_not_found", "message_not_found", "not_in_channel"}
+_AUTH_ERRORS = {
+    "invalid_auth",
+    "not_authed",
+    "account_inactive",
+    "token_revoked",
+    "token_expired",
+    "no_permission",
+    "missing_scope",
+    "ekm_access_denied",
+    "not_allowed_token_type",
+}
+_NOT_FOUND_ERRORS = {
+    "channel_not_found",
+    "user_not_found",
+    "users_not_found",
+    "thread_not_found",
+    "message_not_found",
+    "not_in_channel",
+}
 
 
-def _api(method: str, token: str, params: dict | None = None,
-         json_body: dict | None = None) -> dict:
+def _api(
+    method: str, token: str, params: dict | None = None, json_body: dict | None = None
+) -> dict:
     """One Slack Web API call. GET with query params, or POST with a JSON body.
     Raises through _die on transport failure or a Slack `ok: false` response."""
     import urllib.error as _ue
@@ -723,8 +800,12 @@ def _api(method: str, token: str, params: dict | None = None,
     if not body.get("ok"):
         err = body.get("error", "unknown_error")
         if err in _AUTH_ERRORS:
-            _die(2, "auth", f"Slack {method}: {err}",
-                 "check the bot token and that the app has the required OAuth scopes")
+            _die(
+                2,
+                "auth",
+                f"Slack {method}: {err}",
+                "check the bot token and that the app has the required OAuth scopes",
+            )
         if err in _NOT_FOUND_ERRORS:
             _die(3, "not_found", f"Slack {method}: {err}")
         _die(6, "slack_error", f"Slack {method}: {err}")
@@ -732,6 +813,7 @@ def _api(method: str, token: str, params: dict | None = None,
 
 
 # --- Connection / credential resolution --------------------------------------
+
 
 def _connection_and_write(wanted: str | None) -> tuple[str, bool]:
     reg, _reg_file = _connections_registry()
@@ -743,9 +825,13 @@ def _connection_and_write(wanted: str | None) -> tuple[str, bool]:
 def _token() -> str:
     value, _tier, _source = _resolve_env_key("SLACK_BOT_TOKEN")
     if not value:
-        _die(2, "credentials_missing", "SLACK_BOT_TOKEN is not set",
-             "set it in the project .env/.env.local, the user credentials.env, or "
-             "process env; `slack connections` shows where it resolves")
+        _die(
+            2,
+            "credentials_missing",
+            "SLACK_BOT_TOKEN is not set",
+            "set it in the project .env/.env.local, the user credentials.env, or "
+            "process env; `slack connections` shows where it resolves",
+        )
     return value
 
 
@@ -772,7 +858,30 @@ def _policy() -> dict:
         _die(6, "bad_policy", f"{pfile} is not valid JSON")
     if not isinstance(data, dict):
         _die(6, "bad_policy", f"{pfile} must be a JSON object")
-    return {**_POLICY_DEFAULT, **data}
+    policy = {**_POLICY_DEFAULT, **data}
+    direct = policy.get("direct_messages")
+    if not isinstance(direct, dict) or direct.get("mode", "allowed_users") not in {
+        "allowed_users",
+        "open",
+    }:
+        _die(
+            6,
+            "bad_policy",
+            "direct_messages.mode must be `allowed_users` or `open`",
+        )
+    for key in ("allowed_users", "allowed_channels"):
+        if not isinstance(policy.get(key), dict):
+            _die(6, "bad_policy", f"{key} must be a JSON object")
+    if policy.get("default_channel_policy", "allowed_only") not in {
+        "allowed_only",
+        "open",
+    }:
+        _die(
+            6,
+            "bad_policy",
+            "default_channel_policy must be `allowed_only` or `open`",
+        )
+    return policy
 
 
 def _policy_gate(kind: str, ident: str) -> None:
@@ -783,21 +892,29 @@ def _policy_gate(kind: str, ident: str) -> None:
         mode = (pol.get("direct_messages") or {}).get("mode", "allowed_users")
         if mode == "open" or ident in (pol.get("allowed_users") or {}):
             return
-        _die(4, "policy_refusal",
-             f"direct messages to {ident} are not allowed by policy",
-             'add the user id to allowed_users in capabilities/slack/policy.json, '
-             'or set direct_messages.mode to "open"')
+        _die(
+            4,
+            "policy_refusal",
+            f"direct messages to {ident} are not allowed by policy",
+            "add the user id to allowed_users in capabilities/slack/policy.json, "
+            'or set direct_messages.mode to "open"',
+        )
     else:
-        if pol.get("default_channel_policy", "allowed_only") == "open" \
-                or ident in (pol.get("allowed_channels") or {}):
+        if pol.get("default_channel_policy", "allowed_only") == "open" or ident in (
+            pol.get("allowed_channels") or {}
+        ):
             return
-        _die(4, "policy_refusal",
-             f"conversation {ident} is not allowed by policy",
-             'add the channel id to allowed_channels in capabilities/slack/policy.json, '
-             'or set default_channel_policy to "open"')
+        _die(
+            4,
+            "policy_refusal",
+            f"conversation {ident} is not allowed by policy",
+            "add the channel id to allowed_channels in capabilities/slack/policy.json, "
+            'or set default_channel_policy to "open"',
+        )
 
 
 # --- Target resolution -------------------------------------------------------
+
 
 def _classify(target: str) -> tuple[str, str | None, str | None]:
     """(kind, id, name). kind is 'channel' or 'user'; exactly one of id/name set."""
@@ -813,9 +930,13 @@ def _classify(target: str) -> tuple[str, str | None, str | None]:
             return "channel", t, None
         if t[0] in "UW":
             return "user", t, None
-    _die(6, "input", f"cannot classify target {target!r}",
-         "prefix a channel name with #, a user name with @, or pass a Slack id "
-         "(C…/G…/D… channel, U…/W… user)")
+    _die(
+        6,
+        "input",
+        f"cannot classify target {target!r}",
+        "prefix a channel name with #, a user name with @, or pass a Slack id "
+        "(C…/G…/D… channel, U…/W… user)",
+    )
 
 
 def _resolve_channel_id(token: str, name: str) -> str:
@@ -831,8 +952,12 @@ def _resolve_channel_id(token: str, name: str) -> str:
         cursor = (body.get("response_metadata") or {}).get("next_cursor") or ""
         if not cursor:
             break
-    _die(3, "not_found", f"no channel named #{name}",
-         "check the name, or that the bot can see the channel")
+    _die(
+        3,
+        "not_found",
+        f"no channel named #{name}",
+        "check the name, or that the bot can see the channel",
+    )
 
 
 def _resolve_user_id(token: str, name: str) -> str:
@@ -845,8 +970,11 @@ def _resolve_user_id(token: str, name: str) -> str:
         body = _api("users.list", token, params=params)
         for u in body.get("members", []):
             prof = u.get("profile") or {}
-            names = {u.get("name", ""), prof.get("display_name", ""),
-                     prof.get("real_name", "")}
+            names = {
+                u.get("name", ""),
+                prof.get("display_name", ""),
+                prof.get("real_name", ""),
+            }
             if want in {n.lower() for n in names if n}:
                 return u["id"]
         cursor = (body.get("response_metadata") or {}).get("next_cursor") or ""
@@ -859,30 +987,46 @@ def _target_conv(token: str, target: str) -> tuple[str, str]:
     """Resolve a target to (kind, id), looking names up when needed."""
     kind, ident, name = _classify(target)
     if ident is None:
-        ident = (_resolve_channel_id(token, name) if kind == "channel"
-                 else _resolve_user_id(token, name))
+        ident = (
+            _resolve_channel_id(token, name)
+            if kind == "channel"
+            else _resolve_user_id(token, name)
+        )
     return kind, ident
 
 
 # --- Verbs -------------------------------------------------------------------
 
+
 def cmd_doctor(wanted: str | None) -> None:
     report = _connections_report()
     _doctor_gate(report, wanted)
     body = _api("auth.test", _token(), json_body={})
-    _emit({"ok": True,
-           "identity": {"team": body.get("team"), "team_id": body.get("team_id"),
-                        "user": body.get("user"), "user_id": body.get("user_id"),
-                        "bot_id": body.get("bot_id"), "url": body.get("url")},
-           "connections": report["connections"]})
+    _emit(
+        {
+            "ok": True,
+            "identity": {
+                "team": body.get("team"),
+                "team_id": body.get("team_id"),
+                "user": body.get("user"),
+                "user_id": body.get("user_id"),
+                "bot_id": body.get("bot_id"),
+                "url": body.get("url"),
+            },
+            "connections": report["connections"],
+        }
+    )
 
 
 def cmd_resolve(target: str) -> None:
     kind, ident, name = _classify(target)  # cheap, local — no token needed to reject
-    if ident is None:                      # a name lookup does need the token/network
+    if ident is None:  # a name lookup does need the token/network
         token = _token()
-        ident = (_resolve_channel_id(token, name) if kind == "channel"
-                 else _resolve_user_id(token, name))
+        ident = (
+            _resolve_channel_id(token, name)
+            if kind == "channel"
+            else _resolve_user_id(token, name)
+        )
     _emit({"query": target, "kind": kind, "id": ident})
 
 
@@ -892,22 +1036,34 @@ def cmd_read(target: str, limit: int, thread: str | None) -> None:
     _policy_gate(kind, ident)
     channel = ident
     if kind == "user":
-        channel = _api("conversations.open", token,
-                       json_body={"users": ident})["channel"]["id"]
+        channel = _api("conversations.open", token, json_body={"users": ident})[
+            "channel"
+        ]["id"]
     if thread:
-        body = _api("conversations.replies", token,
-                    params={"channel": channel, "ts": thread, "limit": limit})
+        body = _api(
+            "conversations.replies",
+            token,
+            params={"channel": channel, "ts": thread, "limit": limit},
+        )
     else:
-        body = _api("conversations.history", token,
-                    params={"channel": channel, "limit": limit})
-    msgs = [{"ts": m.get("ts"), "user": m.get("user") or m.get("bot_id"),
-             "text": m.get("text", ""), "thread_ts": m.get("thread_ts")}
-            for m in body.get("messages", [])]
+        body = _api(
+            "conversations.history", token, params={"channel": channel, "limit": limit}
+        )
+    msgs = [
+        {
+            "ts": m.get("ts"),
+            "user": m.get("user") or m.get("bot_id"),
+            "text": m.get("text", ""),
+            "thread_ts": m.get("thread_ts"),
+        }
+        for m in body.get("messages", [])
+    ]
     _emit({"channel": channel, "count": len(msgs), "messages": msgs})
 
 
-def cmd_post(cid: str, allow_write: bool, target: str, text: str,
-             thread: str | None) -> None:
+def cmd_post(
+    cid: str, allow_write: bool, target: str, text: str, thread: str | None
+) -> None:
     _write_gate(cid, allow_write, "post")
     token = _token()
     kind, ident = _target_conv(token, target)
@@ -916,11 +1072,18 @@ def cmd_post(cid: str, allow_write: bool, target: str, text: str,
     if thread:
         payload["thread_ts"] = thread
     body = _api("chat.postMessage", token, json_body=payload)
-    _emit({"ok": True, "target": target,
-           "channel": body.get("channel"), "ts": body.get("ts")})
+    _emit(
+        {
+            "ok": True,
+            "target": target,
+            "channel": body.get("channel"),
+            "ts": body.get("ts"),
+        }
+    )
 
 
 # --- Service (bundled real-time daemon) --------------------------------------
+
 
 def _service_bundle_dir() -> Path:
     here = Path(__file__).resolve()
@@ -938,8 +1101,12 @@ def _service_template(name: str) -> Path:
 def _service_root() -> Path:
     root = _project_root()
     if root is None:
-        _die(6, "no_project", "not inside a project",
-             "run from a project after `capabilities init` and `capabilities enable slack`")
+        _die(
+            6,
+            "no_project",
+            "not inside a project",
+            "run from a project after `capabilities init` and `capabilities enable slack`",
+        )
     return root
 
 
@@ -963,11 +1130,63 @@ def _service_settings(root: Path) -> dict:
         return {}
 
 
-def _service_connection_id(root: Path, flag: str | None) -> str:
+def _service_settings_strict(root: Path, *, check_worker: bool) -> dict:
+    path = _service_settings_path(root)
+    if not path.is_file():
+        _die(6, "service_not_initialized", "run `slack service init` first")
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        _die(6, "bad_service_settings", f"cannot read {path}: {exc}")
+    if not isinstance(data, dict):
+        _die(6, "bad_service_settings", f"{path} must contain a JSON object")
+
+    import importlib.util
+
+    service_dir = _service_bundle_dir() / "service"
+    validation_path = service_dir / "validation.py"
+    authority_path = service_dir / "authority.py"
+    missing = [str(p) for p in (validation_path, authority_path) if not p.is_file()]
+    if missing:
+        _die(
+            3,
+            "service_bundle_missing",
+            "Slack service validation files are missing",
+            "reinstall/update Slack from a bundled source; missing: "
+            + ", ".join(missing),
+        )
+    sys.path.insert(0, str(service_dir))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_slack_service_validation", validation_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {validation_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        problems = module.validate_settings(
+            data, project_root=root, check_worker=check_worker
+        )
+    except (ImportError, OSError, ValueError) as exc:
+        _die(6, "bad_service_settings", f"cannot validate {path}: {exc}")
+    finally:
+        sys.path.pop(0)
+    if problems:
+        _die(
+            6, "bad_service_settings", f"{path} is not safe to run", "; ".join(problems)
+        )
+    return data
+
+
+def _service_connection_policy(root: Path, flag: str | None) -> tuple[str, bool]:
     reg, _ = _connections_registry()
     wanted = flag or _service_settings(root).get("connection")
-    cid, _entry = _select_connection(reg, wanted)
-    return cid
+    cid, entry = _select_connection(reg, wanted)
+    return cid, bool((entry or {}).get("allow_write", WRITE_DEFAULT))
+
+
+def _service_connection_id(root: Path, flag: str | None) -> str:
+    return _service_connection_policy(root, flag)[0]
 
 
 def _service_state_dir(cid: str) -> Path:
@@ -994,18 +1213,43 @@ def _pid_alive(pid: int | None) -> bool:
         return True
 
 
+def _pid_matches_service(pid: int | None) -> bool:
+    if not _pid_alive(pid):
+        return False
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except OSError:
+        return False
+    daemon = str(_service_daemon().resolve())
+    return proc.returncode == 0 and daemon in proc.stdout
+
+
 def cmd_service_init(flag: str | None) -> None:
     root = _service_root()
     target = _service_dir(root)
     target.mkdir(parents=True, exist_ok=True)
     written = []
-    for name, dst in (("settings.json", _service_settings_path(root)),
-                      ("context.md", _service_context_path(root))):
+    for name, dst in (
+        ("settings.json", _service_settings_path(root)),
+        ("context.md", _service_context_path(root)),
+    ):
         if not dst.exists():
             src = _service_template(name)
             if not src.is_file():
-                _die(3, "service_bundle_missing", f"missing bundled template: {src}",
-                     "reinstall slack from the source bundle")
+                _die(
+                    3,
+                    "service_bundle_missing",
+                    f"missing bundled template: {src}",
+                    "reinstall slack from the source bundle",
+                )
             content = src.read_text()
             if name == "settings.json" and flag:
                 data = json.loads(content)
@@ -1013,10 +1257,18 @@ def cmd_service_init(flag: str | None) -> None:
                 content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
             dst.write_text(content)
             written.append(str(dst))
-    _emit({"initialized": NAME, "service_dir": str(target), "written": written,
-           "next": ["set SLACK_APP_TOKEN (xapp-…) in .env.local",
-                    "edit settings.json allowed_users/auto_answer",
-                    "run `slack service doctor`, then `slack service start`"]})
+    _emit(
+        {
+            "initialized": NAME,
+            "service_dir": str(target),
+            "written": written,
+            "next": [
+                "set SLACK_APP_TOKEN (xapp-…) in .env.local",
+                "edit settings.json allowed_users/auto_answer",
+                "run `slack service doctor`, then `slack service start`",
+            ],
+        }
+    )
 
 
 def cmd_service_status(flag: str | None) -> None:
@@ -1024,37 +1276,60 @@ def cmd_service_status(flag: str | None) -> None:
     cid = _service_connection_id(root, flag)
     state = _service_state_dir(cid)
     pid = _read_pid(state / "daemon.pid")
-    running = _pid_alive(pid)
-    _emit({"initialized": _service_settings_path(root).exists(),
-           "running": running, "pid": pid if running else None,
-           "connection": cid, "state_dir": str(state),
-           "settings": str(_service_settings_path(root)),
-           "log_file": str(state / "daemon.log"),
-           "inbox": str(state / "inbox.jsonl")})
+    running = _pid_matches_service(pid)
+    _emit(
+        {
+            "initialized": _service_settings_path(root).exists(),
+            "running": running,
+            "pid": pid if running else None,
+            "ready": running and (state / "ready.json").is_file(),
+            "connection": cid,
+            "state_dir": str(state),
+            "settings": str(_service_settings_path(root)),
+            "log_file": str(state / "daemon.log"),
+            "inbox": str(state / "inbox.jsonl"),
+        }
+    )
 
 
 def _service_tokens() -> tuple[str, str]:
     bot = _resolve_env_key("SLACK_BOT_TOKEN")[0]
     app = _resolve_env_key("SLACK_APP_TOKEN")[0]
-    missing = [k for k, v in (("SLACK_BOT_TOKEN", bot), ("SLACK_APP_TOKEN", app)) if not v]
+    missing = [
+        k for k, v in (("SLACK_BOT_TOKEN", bot), ("SLACK_APP_TOKEN", app)) if not v
+    ]
     if missing:
-        _die(2, "credentials_missing", f"unset: {', '.join(missing)}",
-             "set them in the project .env/.env.local, the user credentials.env, or env")
+        _die(
+            2,
+            "credentials_missing",
+            f"unset: {', '.join(missing)}",
+            "set them in the project .env/.env.local, the user credentials.env, or env",
+        )
     return bot, app
 
 
 def cmd_service_doctor(flag: str | None) -> None:
     root = _service_root()
-    cid = _service_connection_id(root, flag)
+    _service_settings_strict(root, check_worker=True)
+    cid, allow_write = _service_connection_policy(root, flag)
     bot, app = _service_tokens()
     identity = _api("auth.test", bot, json_body={})
     # apps.connections.open validates the app-level token and Socket Mode enablement.
     _api("apps.connections.open", app, json_body={})
-    _emit({"ok": True, "connection": cid,
-           "bot_identity": {"user": identity.get("user"), "team": identity.get("team")},
-           "socket_mode": "app token accepted",
-           "settings": str(_service_settings_path(root)),
-           "initialized": _service_settings_path(root).exists()})
+    _emit(
+        {
+            "ok": True,
+            "connection": cid,
+            "allow_write": allow_write,
+            "bot_identity": {
+                "user": identity.get("user"),
+                "team": identity.get("team"),
+            },
+            "socket_mode": "app token accepted",
+            "settings": str(_service_settings_path(root)),
+            "initialized": _service_settings_path(root).exists(),
+        }
+    )
 
 
 def _service_env(root: Path, cid: str, state: Path, bot: str, app: str) -> dict:
@@ -1070,39 +1345,72 @@ def _service_env(root: Path, cid: str, state: Path, bot: str, app: str) -> dict:
 
 
 def cmd_service_start(flag: str | None) -> None:
+    import signal
     import subprocess
     import time
+
     root = _service_root()
-    if not _service_settings_path(root).exists():
-        _die(6, "service_not_initialized", "run `slack service init` first")
-    cid = _service_connection_id(root, flag)
+    _service_settings_strict(root, check_worker=True)
+    cid, allow_write = _service_connection_policy(root, flag)
+    _write_gate(cid, allow_write, "service")
     state = _service_state_dir(cid)
-    if _pid_alive(_read_pid(state / "daemon.pid")):
-        _emit({"already_running": True, "connection": cid}); return
+    if _pid_matches_service(_read_pid(state / "daemon.pid")):
+        _emit({"already_running": True, "connection": cid})
+        return
     bot, app = _service_tokens()
     daemon = _service_daemon()
     if not daemon.is_file():
         _die(3, "service_bundle_missing", f"daemon not found: {daemon}")
-    state.mkdir(parents=True, exist_ok=True)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.chmod(0o700)
     log = state / "daemon.log"
+    ready = state / "ready.json"
+    ready.unlink(missing_ok=True)
     with log.open("a", encoding="utf-8") as fh:
-        proc = subprocess.Popen([str(daemon)], cwd=str(root),
-                                env=_service_env(root, cid, state, bot, app),
-                                stdout=fh, stderr=subprocess.STDOUT, text=True,
-                                start_new_session=True)
-    (state / "daemon.pid").write_text(f"{proc.pid}\n")
-    time.sleep(0.5)
+        log.chmod(0o600)
+        proc = subprocess.Popen(
+            [str(daemon)],
+            cwd=str(root),
+            env=_service_env(root, cid, state, bot, app),
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    pidfile = state / "daemon.pid"
+    pidfile.write_text(f"{proc.pid}\n")
+    pidfile.chmod(0o600)
+    deadline = time.time() + 20.0
+    while time.time() < deadline and proc.poll() is None and not ready.is_file():
+        time.sleep(0.2)
     if proc.poll() is not None:
         (state / "daemon.pid").unlink(missing_ok=True)
         tail = log.read_text(errors="replace").splitlines()[-8:] if log.exists() else []
-        _die(5, "service_start_failed", f"daemon exited with {proc.returncode}",
-             "\n".join(tail) or "check tokens and settings")
+        _die(
+            5,
+            "service_start_failed",
+            f"daemon exited with {proc.returncode}",
+            "\n".join(tail) or "check tokens and settings",
+        )
+    if not ready.is_file():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        (state / "daemon.pid").unlink(missing_ok=True)
+        _die(
+            5,
+            "service_start_timeout",
+            "daemon did not confirm a Socket Mode connection within 20 seconds",
+            f"inspect {log}",
+        )
     _emit({"started": True, "pid": proc.pid, "connection": cid, "log_file": str(log)})
 
 
 def cmd_service_stop(flag: str | None) -> None:
     import signal
     import time
+
     root = _service_root()
     cid = _service_connection_id(root, flag)
     state = _service_state_dir(cid)
@@ -1110,7 +1418,16 @@ def cmd_service_stop(flag: str | None) -> None:
     pid = _read_pid(pidfile)
     if not _pid_alive(pid):
         pidfile.unlink(missing_ok=True)
-        _emit({"stopped": False, "running": False, "connection": cid}); return
+        _emit({"stopped": False, "running": False, "connection": cid})
+        return
+    if not _pid_matches_service(pid):
+        pidfile.unlink(missing_ok=True)
+        _die(
+            6,
+            "stale_pid",
+            f"refusing to signal pid {pid}: it is not this Slack service",
+            "the stale daemon.pid was removed; run `slack service status`",
+        )
     try:
         os.killpg(pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
@@ -1137,27 +1454,37 @@ def cmd_service_stop(flag: str | None) -> None:
                 break
             time.sleep(0.2)
     if _pid_alive(pid):
-        _die(6, "service_stop_failed", f"daemon {pid} survived SIGTERM and SIGKILL",
-             "check for zombie/uninterruptible process state")
+        _die(
+            6,
+            "service_stop_failed",
+            f"daemon {pid} survived SIGTERM and SIGKILL",
+            "check for zombie/uninterruptible process state",
+        )
     pidfile.unlink(missing_ok=True)
+    (state / "ready.json").unlink(missing_ok=True)
     _emit({"stopped": True, "pid": pid, "connection": cid})
 
 
 def cmd_service_run(flag: str | None) -> None:
     import subprocess
+
     root = _service_root()
-    if not _service_settings_path(root).exists():
-        _die(6, "service_not_initialized", "run `slack service init` first")
-    cid = _service_connection_id(root, flag)
+    _service_settings_strict(root, check_worker=True)
+    cid, allow_write = _service_connection_policy(root, flag)
+    _write_gate(cid, allow_write, "service")
     state = _service_state_dir(cid)
-    state.mkdir(parents=True, exist_ok=True)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.chmod(0o700)
     bot, app = _service_tokens()
     daemon = _service_daemon()
     if not daemon.is_file():
         _die(3, "service_bundle_missing", f"daemon not found: {daemon}")
     # Foreground: inherit stdio so a supervisor sees the log stream.
-    raise SystemExit(subprocess.call([str(daemon)], cwd=str(root),
-                                     env=_service_env(root, cid, state, bot, app)))
+    raise SystemExit(
+        subprocess.call(
+            [str(daemon)], cwd=str(root), env=_service_env(root, cid, state, bot, app)
+        )
+    )
 
 
 def cmd_service_logs(flag: str | None, tail: int) -> None:
@@ -1165,7 +1492,8 @@ def cmd_service_logs(flag: str | None, tail: int) -> None:
     cid = _service_connection_id(root, flag)
     log = _service_state_dir(cid) / "daemon.log"
     if not log.is_file():
-        _emit({"log_file": str(log), "lines": []}); return
+        _emit({"log_file": str(log), "lines": []})
+        return
     lines = log.read_text(errors="replace").splitlines()[-tail:]
     _emit({"log_file": str(log), "lines": lines})
 
@@ -1194,11 +1522,16 @@ def cmd_service(rest: list[str], wanted: str | None = None) -> None:
             _die(6, "input", "--tail must be an integer")
         cmd_service_logs(flag, tail)
     else:
-        _die(6, "input", f"unknown service subcommand {sub!r}",
-             "slack service init|doctor|run|start|stop|status|logs")
+        _die(
+            6,
+            "input",
+            f"unknown service subcommand {sub!r}",
+            "slack service init|doctor|run|start|stop|status|logs",
+        )
 
 
 # --- CLI ---------------------------------------------------------------------
+
 
 def _pop_opt(args: list[str], name: str) -> tuple[str | None, list[str]]:
     """Extract `--opt VALUE` or `--opt=VALUE`; return (value|None, remaining)."""
@@ -1206,16 +1539,24 @@ def _pop_opt(args: list[str], name: str) -> tuple[str | None, list[str]]:
     while i < len(args):
         a = args[i]
         if a == name and i + 1 < len(args):
-            val = args[i + 1]; i += 2; continue
+            val = args[i + 1]
+            i += 2
+            continue
         if a.startswith(name + "="):
-            val = a.split("=", 1)[1]; i += 1; continue
-        out.append(a); i += 1
+            val = a.split("=", 1)[1]
+            i += 1
+            continue
+        out.append(a)
+        i += 1
     return val, out
 
 
 def main() -> None:
     _gate()
     argv = sys.argv[1:]
+    if argv[:1] == ["manifest"]:
+        _emit(_manifest_payload())
+        return
     _contract(argv)
     wanted, argv = _pop_opt(argv, "--connection")
     if not argv:
@@ -1227,12 +1568,14 @@ def main() -> None:
         return
 
     if verb == "doctor":
-        cmd_doctor(wanted); return
+        cmd_doctor(wanted)
+        return
 
     if verb == "resolve":
         if len(rest) != 1:
             _die(6, "input", "usage: slack resolve <#channel|@user|id>")
-        cmd_resolve(rest[0]); return
+        cmd_resolve(rest[0])
+        return
 
     if verb == "read":
         thread, rest = _pop_opt(rest, "--thread")
@@ -1243,14 +1586,16 @@ def main() -> None:
             limit = int(limit_s) if limit_s else 20
         except ValueError:
             _die(6, "input", "--limit must be an integer")
-        cmd_read(rest[0], limit, thread); return
+        cmd_read(rest[0], limit, thread)
+        return
 
     if verb == "post":
         thread, rest = _pop_opt(rest, "--thread")
         if len(rest) < 2:
             _die(6, "input", "usage: slack post <target> <text> [--thread TS]")
         cid, allow_write = _connection_and_write(wanted)
-        cmd_post(cid, allow_write, rest[0], " ".join(rest[1:]), thread); return
+        cmd_post(cid, allow_write, rest[0], " ".join(rest[1:]), thread)
+        return
 
     _die(6, "input", f"unknown command {verb!r}", "run `slack help`")
 

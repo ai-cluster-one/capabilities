@@ -1,28 +1,27 @@
 {
-  "connection": "ionwater",
+  "connection": null,
   "direct_messages": { "mode": "allowed_users", "default_role": "default" },
   "allowed_users": {},
   "allowed_channels": {},
   "default_channel_policy": "allowed_only",
   "auto_answer": { "users": [], "channels": [] },
   "inbox": { "notify_owner": null },
+  "observability": { "log_message_snippets": false },
   "control": {
     "roles": { "supervisor": { "commands": ["status", "stop"] } }
   },
   "authority": {
     "roles": {
-      "supervisor": { "allowed_capabilities": { "*": true } },
-      "default": {
-        "allowed_capabilities": {
-          "slack": { "scope": "current_chat" },
-          "youtrack": true
-        }
-      }
+      "supervisor": { "allowed_capabilities": {}, "network_domains": [] },
+      "default": { "allowed_capabilities": {}, "network_domains": [] }
     }
   },
   "defaults": {
-    "worker": "claude",
-    "project": "/Users/zjor/projects/ion/agents",
+    "worker": "stub",
+    "worker_home": null,
+    "project": null,
+    "workspace_mode": "read_only",
+    "trusted_ingress": false,
     "tail_size": 30,
     "worker_timeout": 180,
     "max_parallel_jobs": 3,

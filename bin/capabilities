@@ -2098,6 +2098,26 @@ def _audit_script(name: str, script: Path) -> list[str]:
         failures += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
         if str(manifest.get("summary", "")).startswith("TODO:"):
             failures.append("manifest: scaffold summary placeholder remains")
+        bundle = script.parent.parent if script.parent.name == "bin" else script.parent
+        guide_dir = bundle / "guides"
+        shipped_topics = ({p.stem for p in guide_dir.glob("*.md")}
+                          if guide_dir.is_dir() else set())
+        declared_docs = manifest.get("docs") or {}
+        declared_topics = set(declared_docs.get("topics") or [])
+        if shipped_topics != declared_topics:
+            failures.append(
+                "guide: shipped guide files do not match manifest topics "
+                f"(files={sorted(shipped_topics)}, manifest={sorted(declared_topics)})")
+        if shipped_topics and not str(declared_docs.get("base") or "").strip():
+            failures.append("guide: bundled guides require a non-empty manifest docs.base")
+        service_dir = bundle / "service"
+        declared_service = manifest.get("service")
+        if service_dir.is_dir() and declared_service is None:
+            failures.append(
+                "manifest: service/ ships in the bundle but manifest.service is absent")
+        if declared_service is not None and not service_dir.is_dir():
+            failures.append(
+                "manifest: manifest.service is declared but service/ is absent from the bundle")
     if "Replace this scaffold check with" in script_text:
         failures.append("doctor: scaffold readiness placeholder remains")
 

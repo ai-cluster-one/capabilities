@@ -25,16 +25,28 @@ class Watermark:
         if self._path.is_file():
             try:
                 loaded = json.loads(self._path.read_text())
-                if isinstance(loaded, dict):
-                    self._data = {str(k): str(v) for k, v in loaded.items()}
-            except (OSError, ValueError):
-                self._data = {}
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"cannot load watermark {self._path}: {exc}") from exc
+            if not isinstance(loaded, dict):
+                raise ValueError(f"watermark {self._path} must contain a JSON object")
+            self._data = {str(k): str(v) for k, v in loaded.items()}
 
     def get(self, channel: str):
-        return self._data.get(channel)
+        with self._lock:
+            return self._data.get(channel)
 
     def keys(self):
-        return list(self._data.keys())
+        with self._lock:
+            return list(self._data.keys())
+
+    def observe(self, channel: str) -> bool:
+        """Persist a newly seen channel without claiming an event is terminal."""
+        with self._lock:
+            if channel in self._data:
+                return False
+            self._data[channel] = "0"
+            self._flush()
+            return True
 
     def advance(self, channel: str, ts: str) -> bool:
         with self._lock:
@@ -47,6 +59,8 @@ class Watermark:
 
     def _flush(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.parent.chmod(0o700)
         tmp = self._path.with_name(f".{self._path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2) + "\n")
+        tmp.chmod(0o600)
         os.replace(tmp, self._path)

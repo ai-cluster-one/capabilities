@@ -17,15 +17,19 @@ class Dispatcher:
         self._queues = defaultdict(deque)
         self._busy = set()
         self._futures = []
+        self._accepting = True
+        self._cancel_pending = False
 
     def submit(self, conv, job) -> None:
         with self._lock:
+            if not self._accepting:
+                raise RuntimeError("dispatcher is shutting down")
             self._queues[conv].append(job)
             self._maybe_dispatch(conv)
 
     def _maybe_dispatch(self, conv) -> None:
         # caller holds the lock
-        if conv in self._busy:
+        if self._cancel_pending or conv in self._busy:
             return
         q = self._queues.get(conv)
         if not q:
@@ -44,21 +48,23 @@ class Dispatcher:
                 self._busy.discard(conv)
                 self._maybe_dispatch(conv)
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, cancel_pending=False) -> None:
         # Wait for in-flight jobs (and any they re-dispatch) to finish before
         # closing the pool, so a job's finally-block re-dispatch never races the
         # pool shutdown. Job exceptions are swallowed here — shutdown must not
         # raise a worker's error — and the pool is always closed.
         try:
+            with self._lock:
+                self._accepting = False
+                if cancel_pending:
+                    self._cancel_pending = True
+                    self._queues.clear()
             while True:
                 with self._lock:
                     pending = [f for f in self._futures if not f.done()]
                 if not pending:
                     break
                 for future in pending:
-                    try:
-                        future.result()
-                    except Exception:
-                        pass
+                    future.exception()
         finally:
             self._pool.shutdown(wait=True)

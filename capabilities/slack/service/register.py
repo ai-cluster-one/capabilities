@@ -20,10 +20,11 @@ class Register:
         if self._path.is_file():
             try:
                 loaded = json.loads(self._path.read_text())
-                if isinstance(loaded, dict):
-                    self._data = {str(k): str(v) for k, v in loaded.items()}
-            except (OSError, ValueError):
-                self._data = {}
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"cannot load register {self._path}: {exc}") from exc
+            if not isinstance(loaded, dict):
+                raise ValueError(f"register {self._path} must contain a JSON object")
+            self._data = {str(k): str(v) for k, v in loaded.items()}
         # Reset-and-recover: a key still "reserved" means the daemon died mid-job.
         # Drop it so startup catch-up can re-reserve and re-process it exactly once.
         stale = [k for k, v in self._data.items() if v == "reserved"]
@@ -52,13 +53,18 @@ class Register:
             self._flush()
 
     def is_done(self, key: str) -> bool:
-        return self._data.get(key) == "done"
+        with self._lock:
+            return self._data.get(key) == "done"
+
+    def is_terminal(self, key: str) -> bool:
+        with self._lock:
+            return self._data.get(key) in {"done", "error"}
 
     def _prune(self) -> None:
         excess = len(self._data) - REGISTER_MAX_KEYS
         if excess <= 0:
             return
-        for key in list(self._data.keys()):   # insertion order = oldest first
+        for key in list(self._data.keys()):  # insertion order = oldest first
             if excess <= 0:
                 break
             if self._data[key] in ("done", "error"):
@@ -68,6 +74,8 @@ class Register:
     def _flush(self) -> None:
         self._prune()
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.parent.chmod(0o700)
         tmp = self._path.with_name(f".{self._path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2) + "\n")
+        tmp.chmod(0o600)
         os.replace(tmp, self._path)

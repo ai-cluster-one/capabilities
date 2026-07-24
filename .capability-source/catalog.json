@@ -90,6 +90,11 @@
       "payload_sha256": "317c699373efe9e20a2ab4b27345f912e9ec84b405a66d267c07019c05c52e6b",
       "summary": "SimpleBooks accounting CLI over a browser session (no public API) — read clients/invoices/purchases/accounts/bank-transactions/financial_transactions, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist. Stateful — run `simplbooks doctor` first."
     },
+    "slack": {
+      "path": "capabilities/slack",
+      "payload_sha256": "cb59c4894c5f27be0b2a470d485afa87d2ba0330cf8b21959baf4b52a9c3672f",
+      "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
+    },
     "stripe": {
       "path": "capabilities/stripe",
       "payload_sha256": "a099b00eed3c4526908410af8df01ef4d5c0ce329e4da89a84090deb7c481892",
@@ -97,7 +102,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "1c8c43b6ed329bc34b002b854c63ebe659fa6e68d13c97df2a099e29f53d2195",
+      "payload_sha256": "5e23be1b6d3f9da1ae3d9dd962554efa19a1ce41ddd2307b8c38e0f390cd0716",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, send, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
@@ -117,8 +122,8 @@
     },
     "youtrack": {
       "path": "capabilities/youtrack",
-      "payload_sha256": "3a137748da01aca270f20c3b37db2459d6566ef0a607cfbaf76be73b81716fc5",
-      "summary": "YouTrack CLI for discovering projects, creating and reading issues, reading or adding comments, and updating issue state."
+      "payload_sha256": "687423cb666591dc39b15e95247a2b8e7cda5ed9ec329c27cdf317c3a3c911fd",
+      "summary": "YouTrack CLI for issues (read/create/comment/update state) and the knowledge base (read, create, and update articles and article comments)."
     }
   }
 }

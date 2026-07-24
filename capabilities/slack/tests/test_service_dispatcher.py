@@ -1,5 +1,6 @@
 import threading
 import time
+
 from dispatcher import Dispatcher
 
 
@@ -10,7 +11,7 @@ def test_same_conversation_runs_serially():
     def run_job(job):
         order.append(("start", job))
         if job == "a":
-            gate.wait(2)          # hold job a until released
+            gate.wait(2)  # hold job a until released
         order.append(("end", job))
 
     d = Dispatcher(run_job, max_parallel=4)
@@ -68,3 +69,20 @@ def test_global_cap_limits_concurrency():
     assert peak[0] <= 2
     hold.set()
     d.shutdown()
+
+
+def test_shutdown_can_cancel_pending_jobs():
+    started = []
+    hold = threading.Event()
+
+    def run_job(job):
+        started.append(job)
+        hold.wait(2)
+
+    d = Dispatcher(run_job, max_parallel=1)
+    d.submit("C1", "running")
+    d.submit("C1", "queued")
+    time.sleep(0.1)
+    hold.set()
+    d.shutdown(cancel_pending=True)
+    assert started == ["running"]
