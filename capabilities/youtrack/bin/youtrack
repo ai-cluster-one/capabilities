@@ -105,8 +105,9 @@ CRED_KEYS = [
 WRITE_VERBS = {"create", "comment", "update",
                "article-create", "article-update", "article-comment"}
 WRITE_DEFAULT = True
-DOCS_BASE = ""
-TOPICS: list = []
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/youtrack/guides/")
+TOPICS = ["articles"]
 STATE = False
 POST_INSTALL: list = []
 
