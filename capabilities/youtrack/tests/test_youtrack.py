@@ -450,3 +450,42 @@ def test_read_only_connection_refuses_article_create(tmp_path):
                      "--summary", "blocked", "--project", "0-6")
     assert result.returncode == 4
     assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
+
+
+def test_article_create_rejects_both_project_and_parent(tmp_path):
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-create",
+                     "--summary", "X", "--project", "0-6", "--parent", "KB-A-1")
+    assert result.returncode == 6
+    assert "not both" in result.stderr
+
+
+def test_article_update_rejects_empty_summary(tmp_path):
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-update",
+                     "KB-A-9", "--summary", "")
+    assert result.returncode == 6
+    assert "non-empty" in result.stderr
+
+
+def test_article_comment_rejects_empty_text(tmp_path):
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-comment",
+                     "KB-A-9", "--text", "   ")
+    assert result.returncode == 6
+    assert "empty" in result.stderr
+
+
+def test_article_not_found_exits_3(tmp_path):
+    class NotFoundHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+    server, thread, base_url = _serve(NotFoundHandler)
+    try:
+        result = run_cli(tmp_path, base_url, "article", "KB-NOPE")
+    finally:
+        server.shutdown()
+        thread.join()
+    assert result.returncode == 3

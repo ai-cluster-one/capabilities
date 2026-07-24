@@ -927,15 +927,20 @@ def main() -> None:
             if args.limit < 1: _die(6, "input", "--limit must be positive")
             _emit(cmd_article_comments(client, args.article, args.limit))
         elif args.cmd == "article-create":
+            if args.project and args.parent:
+                _die(6, "input", "article-create takes --project or --parent, not both")
             if not args.project and not args.parent:
                 _die(6, "input", "article-create needs --project or --parent")
             content = _read_text(args.content) if args.content is not None else None
             _emit(cmd_article_create(client, args.summary, content, args.project, args.parent))
         elif args.cmd == "article-update":
-            if args.summary is None and args.content is None:
-                _die(6, "input", "article-update needs --summary or --content")
+            summary = args.summary if (args.summary is not None and args.summary.strip()) else None
             content = _read_text(args.content) if args.content is not None else None
-            _emit(cmd_article_update(client, args.article, args.summary, content))
+            if content is not None and not content.strip():
+                content = None
+            if summary is None and content is None:
+                _die(6, "input", "article-update needs a non-empty --summary or --content")
+            _emit(cmd_article_update(client, args.article, summary, content))
         elif args.cmd == "article-comment":
             text = _read_text(args.text if args.text is not None else "-")
             if not text.strip(): _die(6, "input", "comment text cannot be empty")
