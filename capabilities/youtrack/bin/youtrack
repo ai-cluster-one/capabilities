@@ -48,6 +48,13 @@ Read:
   youtrack issues QUERY [--limit N]          Search issues server-side; returns
                                              structured issue data (id, idReadable,
                                              summary, description, State).
+  youtrack articles [--project ID] [--limit N]
+                                             List knowledge-base articles (paged;
+                                             --project scopes to one project). This
+                                             is a listing, not a full-text search.
+  youtrack article ID                        Read one article (ID or URL): summary,
+                                             content, project, parent/child refs.
+  youtrack article-comments ID [--limit N]   Read recent comments on an article.
 
 Write:
   youtrack create --project ID --summary S   Create an issue. Project is the
@@ -58,6 +65,12 @@ Write:
   youtrack update ISSUE --state STATE        Update issue workflow state. STATE is
                                              a state name (e.g. "In Progress").
                                              Respects allow_write connection policy.
+  youtrack article-create --summary S        Create an article. Give --project ID
+        [--content TEXT|-] [--project ID]    (database entity id) OR --parent ID to
+        [--parent ID]                        create a sub-article under an article.
+  youtrack article-update ID                 Update an article's summary and/or
+        [--summary S] [--content TEXT|-]     content. Respects allow_write policy.
+  youtrack article-comment ID [--text TEXT|-] Add a comment to an article.
 
 Global options accepted anywhere:
   --connection ID                            Select a named connection.
@@ -80,7 +93,7 @@ from typing import NoReturn
 import httpx
 
 NAME = "youtrack"
-SUMMARY = "YouTrack CLI for discovering projects, creating and reading issues, reading or adding comments, and updating issue state."
+SUMMARY = "YouTrack CLI for issues (read/create/comment/update state) and the knowledge base (read, create, and update articles and article comments)."
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,
