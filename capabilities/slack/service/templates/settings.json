@@ -1,0 +1,31 @@
+{
+  "connection": "ionwater",
+  "direct_messages": { "mode": "allowed_users", "default_role": "default" },
+  "allowed_users": {},
+  "allowed_channels": {},
+  "default_channel_policy": "allowed_only",
+  "auto_answer": { "users": [], "channels": [] },
+  "inbox": { "notify_owner": null },
+  "control": {
+    "roles": { "supervisor": { "commands": ["status", "stop"] } }
+  },
+  "authority": {
+    "roles": {
+      "supervisor": { "allowed_capabilities": { "*": true } },
+      "default": {
+        "allowed_capabilities": {
+          "slack": { "scope": "current_chat" },
+          "youtrack": true
+        }
+      }
+    }
+  },
+  "defaults": {
+    "worker": "claude",
+    "project": "/Users/zjor/projects/ion/agents",
+    "tail_size": 30,
+    "worker_timeout": 180,
+    "max_parallel_jobs": 3,
+    "catch_up": { "max_age_seconds": 3600, "max_messages": 50 }
+  }
+}
