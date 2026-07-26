@@ -59,7 +59,7 @@ def route(evt: dict, settings: dict) -> str:
     return "answer" if evt["channel"] in (auto.get("channels") or []) else "relay"
 
 
-CONTROL_COMMANDS = ("stop", "status")
+CONTROL_COMMANDS = ("help", "set", "status", "stop")
 
 
 def conversation_key(evt: dict) -> str:
@@ -75,11 +75,17 @@ def resolve_role(evt: dict, settings: dict) -> str:
     if isinstance(entry, dict) and entry.get("role"):
         return entry["role"]
     if evt["kind"] == "im":
-        return (settings.get("direct_messages") or {}).get("default_role") or "default"
+        return (settings.get("direct_messages") or {}).get(
+            "default_role"
+        ) or "direct_user"
     centry = (settings.get("allowed_channels") or {}).get(evt["channel"])
-    if isinstance(centry, dict) and centry.get("default_role"):
-        return centry["default_role"]
-    return "default"
+    if isinstance(centry, dict):
+        member = (centry.get("members") or {}).get(evt["user"])
+        if isinstance(member, dict) and member.get("role"):
+            return member["role"]
+        if centry.get("default_role"):
+            return centry["default_role"]
+    return "channel_member"
 
 
 def strip_mention(text: str) -> str:
@@ -87,13 +93,42 @@ def strip_mention(text: str) -> str:
 
 
 def control_command(text: str) -> str | None:
-    t = strip_mention(text).lstrip("/").strip().lower()
-    return t if t in CONTROL_COMMANDS else None
+    command, _args = control_request(text)
+    return command
 
 
-def control_allowed(command: str, role: str, settings: dict) -> bool:
+def control_request(text: str) -> tuple[str | None, list[str]]:
+    parts = strip_mention(text).lstrip("/").strip().split()
+    if not parts:
+        return None, []
+    command = parts[0].split("@", 1)[0].lower()
+    return (command, parts[1:]) if command in CONTROL_COMMANDS else (None, [])
+
+
+def _deep_merge(base, overlay):
+    out = dict(base or {})
+    for key, value in (overlay or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def control_allowed(command: str, role: str, settings: dict, evt=None) -> bool:
     roles = (settings.get("control") or {}).get("roles") or {}
-    cmds = (roles.get(role) or {}).get("commands")
+    policy = dict(roles.get(role) or {})
+    if evt is not None:
+        sender = (settings.get("allowed_users") or {}).get(evt["user"])
+        if isinstance(sender, dict):
+            policy = _deep_merge(policy, sender.get("control") or {})
+        channel = (settings.get("allowed_channels") or {}).get(evt["channel"])
+        if isinstance(channel, dict):
+            policy = _deep_merge(policy, channel.get("control") or {})
+            member = (channel.get("members") or {}).get(evt["user"])
+            if isinstance(member, dict):
+                policy = _deep_merge(policy, member.get("control") or {})
+    cmds = policy.get("commands")
     if cmds is True or cmds == "*":
         return True
     if isinstance(cmds, list):

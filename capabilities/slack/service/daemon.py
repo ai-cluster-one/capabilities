@@ -15,7 +15,6 @@ connect_and_listen() so process_event and the pure helpers stay unit-testable wi
 
 import json
 import os
-import shutil
 import signal
 import sys
 from pathlib import Path
@@ -25,16 +24,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # policy/register sibl
 import threading
 
 from authority import (
-    allowed_capability_names,
     build_auth_context,
-    network_domains,
     summarize,
 )
 from dispatcher import Dispatcher
 from policy import (
     accept,
     control_allowed,
-    control_command,
+    control_request,
     conversation_key,
     parse_event,
     resolve_role,
@@ -43,6 +40,7 @@ from policy import (
 )
 from prompt import build_prompt
 from register import Register
+from runtime_settings import RuntimeSettings
 from validation import require_valid_settings
 from watermark import Watermark
 from workers import WORKERS, WorkerTimeout, sanitized_worker_env
@@ -99,15 +97,16 @@ def process_event(
         return {"action": "duplicate", "key": key}
     conv = conversation_key(evt)
 
-    cmd = control_command(evt["text"])
+    cmd, command_args = control_request(evt["text"])
     if cmd:
         role = resolve_role(evt, settings)
         register.mark_done(key)
         watermark.advance(evt["channel"], evt["ts"])
-        if control_allowed(cmd, role, settings):
+        if control_allowed(cmd, role, settings, evt):
             return {
                 "action": "control",
                 "command": cmd,
+                "command_args": command_args,
                 "conversation": conv,
                 "role": role,
                 "evt": evt,
@@ -116,6 +115,7 @@ def process_event(
         return {
             "action": "control_denied",
             "command": cmd,
+            "command_args": command_args,
             "conversation": conv,
             "role": role,
             "evt": evt,
@@ -241,7 +241,6 @@ def worker_env(
     conversation,
     authority_path,
     worker_bin,
-    worker_home=None,
 ):
     path = f"{worker_bin}{os.pathsep}{(base_env or {}).get('PATH', '')}"
     extra = {
@@ -250,19 +249,6 @@ def worker_env(
         "SLACK_WORKER_CONVERSATION": conversation,
         "CAPABILITIES_AUTH_CONTEXT": authority_path,
     }
-    if worker_home:
-        home = Path(worker_home).expanduser().resolve()
-        extra.update(
-            {
-                "HOME": home,
-                "CODEX_HOME": home / ".codex",
-                "CLAUDE_CONFIG_DIR": home / ".claude",
-                "XDG_CACHE_HOME": home / ".cache",
-                "XDG_CONFIG_HOME": home / ".config",
-                "XDG_DATA_HOME": home / ".local" / "share",
-                "XDG_STATE_HOME": home / ".local" / "state",
-            }
-        )
     return sanitized_worker_env(base_env, extra)
 
 
@@ -270,6 +256,134 @@ def _safe(part):
     import re
 
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(part)).strip("_") or "conv"
+
+
+WORKER_NAMES = {"claude", "codex", "stub"}
+CLAUDE_EFFORTS = {"default", "low", "medium", "high", "xhigh", "max"}
+CODEX_REASONING = {"default", "low", "medium", "high", "xhigh"}
+CODEX_TIERS = {"default", "fast", "priority"}
+
+
+def _default_none(value):
+    return None if value in (None, "", "default") else value
+
+
+def conversation_settings(defaults, row):
+    """Overlay persisted conversation settings on service defaults."""
+    row = row if isinstance(row, dict) else {}
+    local = row.get("settings") or {}
+    worker = str(local.get("worker") or defaults.get("worker") or "stub").lower()
+    if worker not in WORKER_NAMES:
+        worker = str(defaults.get("worker") or "stub").lower()
+    profile = dict((defaults.get("workers") or {}).get(worker) or {})
+    profile.update((row.get("workers") or {}).get(worker) or {})
+    profile = {key: _default_none(value) for key, value in profile.items()}
+    return {
+        "worker": worker,
+        "tail_size": int(local.get("tail_size", defaults.get("tail_size", 40))),
+        "worker_timeout": float(
+            local.get("worker_timeout", defaults.get("worker_timeout", 120))
+        ),
+        "model": profile.get("model"),
+        "effort": profile.get("effort"),
+        "reasoning_effort": profile.get("reasoning_effort"),
+        "service_tier": profile.get("service_tier"),
+    }
+
+
+def set_conversation_setting(row, defaults, key, value):
+    """Validate and apply one Telegram-compatible /set override."""
+    row = json.loads(json.dumps(row or {}))
+    local = row.setdefault("settings", {})
+    key = str(key or "").strip().lower()
+    value = str(value or "").strip()
+    if key == "tail":
+        size = int(value)
+        if not 1 <= size <= 500:
+            raise ValueError("tail must be 1..500")
+        local["tail_size"] = size
+        return row, f"tail = {size}"
+    if key == "worker":
+        worker = value.lower()
+        if worker not in WORKER_NAMES:
+            raise ValueError("worker must be claude, codex, or stub")
+        local["worker"] = worker
+        return row, f"worker = {worker}"
+
+    active = conversation_settings(defaults, row)["worker"]
+    worker, field = active, key
+    if "." in key:
+        maybe_worker, field = key.split(".", 1)
+        if maybe_worker in WORKER_NAMES:
+            worker = maybe_worker
+    profile = row.setdefault("workers", {}).setdefault(worker, {})
+    if field == "model":
+        profile["model"] = _default_none(value)
+        return row, f"{worker}.model = {value}"
+    if worker == "claude" and field in {"effort", "reasoning"}:
+        effort = value.lower()
+        if effort not in CLAUDE_EFFORTS:
+            raise ValueError(
+                "claude effort must be default, low, medium, high, xhigh, or max"
+            )
+        profile["effort"] = _default_none(effort)
+        return row, f"claude.effort = {effort}"
+    if worker == "codex" and field in {"effort", "reasoning", "reasoning_effort"}:
+        effort = value.lower()
+        if effort not in CODEX_REASONING:
+            raise ValueError(
+                "codex reasoning must be default, low, medium, high, or xhigh"
+            )
+        profile["reasoning_effort"] = _default_none(effort)
+        return row, f"codex.reasoning = {effort}"
+    if worker == "codex" and field in {"speed", "service-tier", "service_tier"}:
+        tier = value.lower()
+        if tier not in CODEX_TIERS:
+            raise ValueError("codex speed must be default, fast, or priority")
+        profile["service_tier"] = (
+            None if tier == "default" else ("priority" if tier == "fast" else tier)
+        )
+        return row, f"codex.service_tier = {profile['service_tier'] or 'default'}"
+    raise ValueError(
+        "unknown setting; use tail, worker, model, reasoning, effort, speed, "
+        "or <worker>.<setting>"
+    )
+
+
+def conversation_settings_text(defaults, row, conversation, active_jobs=0):
+    resolved = conversation_settings(defaults, row)
+    worker = resolved["worker"]
+    lines = [
+        f"settings [{conversation}]:",
+        f"  tail = {resolved['tail_size']}",
+        f"  worker = {worker}",
+        f"  {worker}.model = {resolved['model'] or 'default'}",
+    ]
+    if worker == "claude":
+        lines.append(f"  claude.effort = {resolved['effort'] or 'default'}")
+    elif worker == "codex":
+        lines.append(f"  codex.reasoning = {resolved['reasoning_effort'] or 'default'}")
+        lines.append(f"  codex.service_tier = {resolved['service_tier'] or 'default'}")
+    lines.append(f"  active_jobs = {active_jobs}")
+    return "\n".join(lines)
+
+
+def conversation_settings_help(defaults, row):
+    active = conversation_settings(defaults, row)["worker"]
+    return "\n".join(
+        [
+            "usage: set <setting> <value>",
+            f"active worker: {active}",
+            "  set tail <1..500>",
+            "  set worker <claude|codex|stub>",
+            "  set model <default|model-id>",
+            "  set claude.model <default|model-id>",
+            "  set claude.effort <default|low|medium|high|xhigh|max>",
+            "  set codex.model <default|model-id>",
+            "  set codex.reasoning <default|low|medium|high|xhigh>",
+            "  set codex.speed <default|fast|priority>",
+        ]
+    )
 
 
 def connect_and_listen(
@@ -293,10 +407,11 @@ def connect_and_listen(
     sm = SocketModeClient(app_token=app_token, web_client=web)
 
     defaults = settings.get("defaults") or {}
-    worker_name = (defaults.get("worker") or "claude").strip().lower()
-    if worker_name not in WORKERS:
+    assistant_name = str(settings.get("assistant_name") or "Assistant")
+    default_worker = (defaults.get("worker") or "stub").strip().lower()
+    if default_worker not in WORKERS:
         raise ValueError(
-            f"unknown worker {worker_name!r}; expected one of {sorted(WORKERS)}"
+            f"unknown worker {default_worker!r}; expected one of {sorted(WORKERS)}"
         )
     project = (
         defaults.get("project")
@@ -306,22 +421,12 @@ def connect_and_listen(
     project = str(Path(project).resolve())
     if not Path(project).is_dir():
         raise ValueError(f"worker project directory does not exist: {project}")
-    tail_size = int(defaults.get("tail_size") or 30)
-    worker_timeout = float(defaults.get("worker_timeout") or 180)
-    max_parallel = int(defaults.get("max_parallel_jobs") or 3)
-    workspace_mode = str(defaults.get("workspace_mode") or "read_only")
-    worker_home = defaults.get("worker_home")
-    if tail_size < 1 or tail_size > 200:
-        raise ValueError("tail_size must be between 1 and 200")
-    if worker_timeout < 1 or worker_timeout > 3600:
-        raise ValueError("worker_timeout must be between 1 and 3600 seconds")
+    max_parallel = int(defaults.get("max_parallel_jobs") or 2)
     if max_parallel < 1 or max_parallel > 16:
         raise ValueError("max_parallel_jobs must be between 1 and 16")
     catch = defaults.get("catch_up") or {}
     max_age = catch.get("max_age_seconds", 3600)
     max_msgs = catch.get("max_messages", 50)
-    model = defaults.get("model")
-    effort = defaults.get("effort")
     connection = (
         os.environ.get("SLACK_SERVICE_CONNECTION")
         or settings.get("connection")
@@ -332,7 +437,7 @@ def connect_and_listen(
     )
 
     worker_bin = str(Path(__file__).resolve().parent / "worker-bin")
-    protected_home = str(Path.home().resolve())
+    runtime_settings = RuntimeSettings(Path(state_dir) / "conversation-settings.json")
     context_path = os.environ.get("SLACK_SERVICE_CONTEXT") or ""
     context_md = ""
     if context_path and Path(context_path).is_file():
@@ -360,7 +465,7 @@ def connect_and_listen(
         except Exception as exc:  # noqa: BLE001 - reactions are best-effort
             _log(log, f"reaction {name} failed for {channel}:{ts}: {exc!r}")
 
-    def _fetch_tail(evt):
+    def _fetch_tail(evt, tail_size):
         try:
             if evt["kind"] == "im":
                 resp = web.conversations_history(
@@ -392,7 +497,9 @@ def connect_and_listen(
         stop_drain = threading.Event()
         drainer = None
         try:
-            tail = _fetch_tail(evt)
+            resolved = conversation_settings(defaults, runtime_settings.get(conv))
+            worker_name = resolved["worker"]
+            tail = _fetch_tail(evt, resolved["tail_size"])
             sender_entry = (settings.get("allowed_users") or {}).get(evt["user"])
             sender_name = (
                 sender_entry.get("name")
@@ -406,16 +513,8 @@ def connect_and_listen(
                 conversation=conv,
                 sender_id=evt["user"],
                 sender_name=sender_name,
+                channel_id=channel,
             )
-            allowed_capabilities = allowed_capability_names(
-                auth.get("allowed_capabilities")
-            )
-            allowed_network_domains = network_domains(settings, role)
-            capability_roots = []
-            for capability in allowed_capabilities:
-                executable = shutil.which(capability)
-                if executable:
-                    capability_roots.append(str(Path(executable).resolve().parent))
             authpath.parent.mkdir(parents=True, exist_ok=True)
             authpath.write_text(json.dumps(auth, ensure_ascii=False, indent=2) + "\n")
             authpath.chmod(0o400)
@@ -426,9 +525,13 @@ def connect_and_listen(
                 "kind": evt["kind"],
                 "connection": connection,
                 "worker": worker_name,
+                "assistant_name": assistant_name,
                 "sender_name": sender_name,
                 "sender_role": role,
                 "authority_summary": summarize(auth.get("allowed_capabilities")),
+                "settings_summary": conversation_settings_text(
+                    defaults, runtime_settings.get(conv), conv
+                ),
                 "request_text": evt.get("text") or "",
             }
             prompt = build_prompt(context_md, state, tail)
@@ -438,7 +541,6 @@ def connect_and_listen(
                 conversation=conv,
                 authority_path=authority_path,
                 worker_bin=worker_bin,
-                worker_home=worker_home,
             )
 
             def _drain_loop():
@@ -467,16 +569,15 @@ def connect_and_listen(
                 prompt,
                 cwd=project,
                 env=env,
-                timeout=worker_timeout,
-                model=model,
-                effort=effort,
+                timeout=resolved["worker_timeout"],
+                model=resolved["model"],
+                effort=(
+                    resolved["effort"]
+                    if worker_name == "claude"
+                    else resolved["reasoning_effort"]
+                ),
+                service_tier=resolved["service_tier"],
                 on_spawn=_on_spawn,
-                allowed_capabilities=allowed_capabilities,
-                network_domains=allowed_network_domains,
-                protected_home=protected_home,
-                worker_bin=worker_bin,
-                capability_roots=capability_roots,
-                workspace_mode=workspace_mode,
             )
             reply = result["reply"]
             post(channel, reply, thread)
@@ -541,13 +642,23 @@ def connect_and_listen(
 
     dispatcher = Dispatcher(run_job, max_parallel=max_parallel)
 
-    def _status_text():
+    def _status_text(conv):
         with procs_lock:
-            active = list(running_procs.keys())
-        return (
-            f"running: {len(active)} job(s)"
-            + (f" in {', '.join(active)}" if active else "")
-            + f"\nworker={worker_name}, max_parallel={max_parallel}"
+            active = int(conv in running_procs)
+        return conversation_settings_text(
+            defaults,
+            runtime_settings.get(conv),
+            conv,
+            active_jobs=active,
+        )
+
+    def _help_text(conv):
+        return "\n".join(
+            [
+                "commands: help, status, set, stop",
+                conversation_settings_help(defaults, runtime_settings.get(conv)),
+                "Capability access is controlled by your role's authority policy.",
+            ]
         )
 
     def _stop_conversation(conv):
@@ -579,8 +690,30 @@ def connect_and_listen(
                 thread,
             )
             return
-        if out["command"] == "status":
-            post(evt["channel"], _status_text(), thread)
+        command_args = out.get("command_args") or []
+        if out["command"] == "help":
+            post(evt["channel"], _help_text(conv), thread)
+        elif out["command"] == "status":
+            post(evt["channel"], _status_text(conv), thread)
+        elif out["command"] == "set":
+            if len(command_args) < 2:
+                post(
+                    evt["channel"],
+                    conversation_settings_help(defaults, runtime_settings.get(conv)),
+                    thread,
+                )
+                return
+            try:
+                row, confirmation = set_conversation_setting(
+                    runtime_settings.get(conv),
+                    defaults,
+                    command_args[0],
+                    " ".join(command_args[1:]),
+                )
+                runtime_settings.replace(conv, row)
+                post(evt["channel"], confirmation, thread)
+            except (TypeError, ValueError) as exc:
+                post(evt["channel"], f"invalid setting: {exc}", thread)
         elif out["command"] == "stop":
             post(evt["channel"], _stop_conversation(conv), thread)
 
@@ -708,7 +841,8 @@ def connect_and_listen(
     sm.on_message_listeners.append(on_raw)
     _log(
         log,
-        f"connecting to Slack Socket Mode (worker={worker_name}, project={project})",
+        f"connecting to Slack Socket Mode "
+        f"(default_worker={default_worker}, project={project})",
     )
     sm.connect()
     ready = Path(state_dir) / "ready.json"
@@ -717,7 +851,7 @@ def connect_and_listen(
             {
                 "pid": os.getpid(),
                 "connection": connection,
-                "worker": worker_name,
+                "worker": default_worker,
                 "ready_at": _now(),
             },
             ensure_ascii=False,

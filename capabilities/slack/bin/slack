@@ -108,13 +108,17 @@ SERVICE (real-time daemon, Socket Mode — needs SLACK_APP_TOKEN xapp-…)
   slack service logs [--tail N]          show the daemon log
 
   start/run require the selected connection's allow_write=true. Shipped settings
-  admit nobody, auto-answer nobody, authorize no capabilities, use the stub worker,
-  and keep the workspace read-only. Selecting claude/codex requires an explicit
-  trusted_ingress acknowledgement plus a dedicated worker_home for harness auth
-  and state. Workers receive no Slack tokens or provider API-key environment
-  variables; their only Slack operation is the daemon-mediated
+  admit nobody, auto-answer nobody, and use the stub worker. Selecting claude or
+  codex gives that worker unrestricted project, shell, filesystem, network, and
+  inherited-environment access, matching the Telegram assistant service. The
+  prompt is the behavioral boundary; normal capability CLI calls additionally
+  enforce the request role's CAPABILITIES_AUTH_CONTEXT. A role may intentionally
+  grant all capabilities with {"*": true}. Slack bot/app tokens are removed from
+  the worker environment, but unrestricted host access is not credential
+  isolation. The supported worker Slack operation is
   `slack post current <text>`.
-  Run `slack guide service` for the trust and configuration model.
+  Runtime controls: help, status, set, stop. Run `slack guide service` for the
+  role, authority, override, and risk model.
 
 CONTRACT COMMANDS  (present on every capability)
   slack stub                            one-line awareness text

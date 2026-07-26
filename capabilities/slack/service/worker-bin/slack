@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Worker-side `slack` shim (on PATH ahead of the real CLI inside a service worker).
 
-The worker never receives Slack credentials and cannot invoke the real Slack CLI.
-`slack post|send` appends text to the daemon's per-job outbox; the daemon posts it
-to the current conversation. Every other verb fails closed."""
+The daemon removes Slack credentials from the direct worker environment.
+`slack post|send` appends text to the daemon's per-job outbox; the daemon posts
+it to the current conversation. Every other verb through this shim fails closed.
+An unrestricted worker is not OS-isolated from alternate credential or
+executable paths; context.md supplies that behavioral boundary."""
 
 import json
 import os

@@ -1,4 +1,5 @@
 import daemon
+import pytest
 
 
 def test_map_tail_orders_and_labels():
@@ -68,19 +69,19 @@ def test_synth_payload_skips_bot_and_subtype():
     )
 
 
-def test_worker_env_sets_shim_and_paths(tmp_path):
+def test_worker_env_sets_shim_and_preserves_trusted_worker_environment():
     env = daemon.worker_env(
         {
             "PATH": "/usr/bin",
             "SLACK_BOT_TOKEN": "bot-secret",
             "SLACK_APP_TOKEN": "app-secret",
-            "UNRELATED_SECRET": "nope",
+            "OPENAI_API_KEY": "provider-secret",
+            "DATABASE_URL": "project-secret",
         },
         outbox="/o",
         conversation="D1",
         authority_path="/a.json",
         worker_bin="/wb",
-        worker_home=tmp_path / "worker-home",
     )
     assert env["SLACK_WORKER_OUTBOX"] == "/o"
     assert env["SLACK_WORKER_CONVERSATION"] == "D1"
@@ -88,6 +89,62 @@ def test_worker_env_sets_shim_and_paths(tmp_path):
     assert env["PATH"].startswith("/wb")
     assert "SLACK_BOT_TOKEN" not in env
     assert "SLACK_APP_TOKEN" not in env
-    assert "UNRELATED_SECRET" not in env
-    assert env["HOME"] == str((tmp_path / "worker-home").resolve())
-    assert env["CODEX_HOME"].endswith("worker-home/.codex")
+    assert env["OPENAI_API_KEY"] == "provider-secret"
+    assert env["DATABASE_URL"] == "project-secret"
+
+
+def _defaults():
+    return {
+        "worker": "stub",
+        "tail_size": 40,
+        "worker_timeout": 120,
+        "workers": {
+            "claude": {"model": None, "effort": None},
+            "codex": {
+                "model": None,
+                "reasoning_effort": None,
+                "service_tier": None,
+            },
+            "stub": {"model": None},
+        },
+    }
+
+
+def test_conversation_settings_overlay_worker_profile():
+    row = {
+        "settings": {"worker": "codex", "tail_size": 80},
+        "workers": {
+            "codex": {
+                "model": "gpt-5.6",
+                "reasoning_effort": "high",
+                "service_tier": "priority",
+            }
+        },
+    }
+    resolved = daemon.conversation_settings(_defaults(), row)
+    assert resolved["worker"] == "codex"
+    assert resolved["tail_size"] == 80
+    assert resolved["model"] == "gpt-5.6"
+    assert resolved["reasoning_effort"] == "high"
+    assert resolved["service_tier"] == "priority"
+
+
+def test_set_conversation_setting_supports_telegram_style_role_controls():
+    row, message = daemon.set_conversation_setting({}, _defaults(), "worker", "codex")
+    assert message == "worker = codex"
+    row, message = daemon.set_conversation_setting(
+        row, _defaults(), "reasoning", "high"
+    )
+    assert message == "codex.reasoning = high"
+    row, message = daemon.set_conversation_setting(row, _defaults(), "speed", "fast")
+    assert message == "codex.service_tier = priority"
+    resolved = daemon.conversation_settings(_defaults(), row)
+    assert resolved["reasoning_effort"] == "high"
+    assert resolved["service_tier"] == "priority"
+
+
+def test_set_conversation_setting_rejects_invalid_values():
+    with pytest.raises(ValueError, match="tail"):
+        daemon.set_conversation_setting({}, _defaults(), "tail", "0")
+    with pytest.raises(ValueError, match="worker"):
+        daemon.set_conversation_setting({}, _defaults(), "worker", "unknown")

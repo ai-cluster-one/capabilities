@@ -2,6 +2,7 @@ from policy import (
     accept,
     control_allowed,
     control_command,
+    control_request,
     conversation_key,
     parse_event,
     resolve_role,
@@ -174,8 +175,24 @@ def test_resolve_role_dm_default():
     assert resolve_role(parse_event(_im(user="U1")), s) == "default"
 
 
-def test_resolve_role_falls_back_to_default_literal():
-    assert resolve_role(parse_event(_im(user="U9")), {}) == "default"
+def test_resolve_role_falls_back_to_direct_user():
+    assert resolve_role(parse_event(_im(user="U9")), {}) == "direct_user"
+
+
+def test_resolve_channel_member_and_channel_default_roles():
+    settings = {
+        "allowed_channels": {
+            "C1": {
+                "default_role": "reader",
+                "members": {"U1": {"role": "channel_admin"}},
+            }
+        }
+    }
+    assert resolve_role(parse_event(_mention(user="U1")), settings) == "channel_admin"
+    assert resolve_role(parse_event(_mention(user="U2")), settings) == "reader"
+    assert resolve_role(parse_event(_mention(user="U2", channel="C2")), {}) == (
+        "channel_member"
+    )
 
 
 # --- strip_mention ---
@@ -198,6 +215,13 @@ def test_control_command_detects_keywords():
     assert control_command("what's the status of X") is None
 
 
+def test_control_request_returns_set_arguments():
+    assert control_request("<@B1> /set codex.reasoning high") == (
+        "set",
+        ["codex.reasoning", "high"],
+    )
+
+
 # --- control_allowed ---
 
 
@@ -206,6 +230,21 @@ def test_control_allowed_by_role():
     assert control_allowed("stop", "supervisor", s) is True
     assert control_allowed("stop", "default", s) is False
     assert control_allowed("status", "supervisor", s) is True
+
+
+def test_control_user_channel_and_member_overrides():
+    evt = parse_event(_mention(user="U1", channel="C1"))
+    settings = {
+        "control": {"roles": {"member": {"commands": ["status"]}}},
+        "allowed_users": {"U1": {"control": {"commands": ["status", "set"]}}},
+        "allowed_channels": {
+            "C1": {
+                "control": {"commands": ["status"]},
+                "members": {"U1": {"control": {"commands": "*"}}},
+            }
+        },
+    }
+    assert control_allowed("stop", "member", settings, evt) is True
 
 
 # --- select_catchup ---

@@ -20,8 +20,12 @@ def build_prompt(context_md: str, state: dict, tail) -> str:
         )
     if st.get("sender_name"):
         lines.append(f"From: {st['sender_name']} (role: {st.get('sender_role')})")
+    if st.get("assistant_name"):
+        lines.append(f"Assistant: {st['assistant_name']}")
     if st.get("authority_summary"):
         lines.append(f"Tool authority: {st['authority_summary']}")
+    if st.get("settings_summary"):
+        lines.append("Runtime " + st["settings_summary"].replace("\n", "; "))
     lines.append(
         "Delivery: your final stdout is posted by the daemon as the reply; "
         "use `slack post current <text>` only for intermediate progress "

@@ -1,7 +1,5 @@
-import json
 import os
 import stat
-from pathlib import Path
 
 import pytest
 import workers
@@ -103,7 +101,7 @@ def test_worker_codex_raises_on_empty_output(tmp_path, monkeypatch):
         worker_codex("p", cwd=".", env=dict(os.environ), timeout=10)
 
 
-def test_sanitized_worker_env_drops_slack_and_unrelated_secrets():
+def test_sanitized_worker_env_only_drops_daemon_slack_tokens():
     env = sanitized_worker_env(
         {
             "PATH": "/bin",
@@ -117,13 +115,13 @@ def test_sanitized_worker_env_drops_slack_and_unrelated_secrets():
     )
     assert env["PATH"] == "/bin"
     assert env["CAPABILITIES_AUTH_CONTEXT"] == "/authority.json"
-    assert "OPENAI_API_KEY" not in env
+    assert env["OPENAI_API_KEY"] == "provider-secret"
     assert "SLACK_BOT_TOKEN" not in env
     assert "SLACK_APP_TOKEN" not in env
-    assert "DATABASE_URL" not in env
+    assert env["DATABASE_URL"] == "secret"
 
 
-def test_claude_uses_permissions_and_explicit_capability_tools(monkeypatch):
+def test_claude_uses_unrestricted_permissions(monkeypatch):
     captured = {}
 
     def fake_run(cmd, **kwargs):
@@ -140,35 +138,17 @@ def test_claude_uses_permissions_and_explicit_capability_tools(monkeypatch):
             "CAPABILITIES_AUTH_CONTEXT": "/tmp/slack-authority",
         },
         timeout=10,
-        allowed_capabilities=["youtrack"],
-        network_domains=["tenant.youtrack.cloud"],
-        protected_home="/Users/operator",
-        worker_bin="/opt/slack-worker-bin",
-        workspace_mode="read_only",
+        model="opus",
+        effort="high",
     )
     command = captured["cmd"]
-    assert "--dangerously-skip-permissions" not in command
-    assert command[command.index("--permission-mode") + 1] == "default"
-    assert "--safe-mode" in command
-    assert command[command.index("--setting-sources") + 1] == ""
-    settings = json.loads(command[command.index("--settings") + 1])
-    sandbox = settings["sandbox"]
-    assert sandbox["enabled"] is True
-    assert sandbox["failIfUnavailable"] is True
-    assert sandbox["allowUnsandboxedCommands"] is False
-    assert sandbox["autoAllowBashIfSandboxed"] is False
-    assert sandbox["network"]["allowedDomains"] == ["tenant.youtrack.cloud"]
-    assert str(Path.cwd()) in sandbox["filesystem"]["denyWrite"]
-    allowed = command[command.index("--allowedTools") + 1]
-    assert "Bash(youtrack:*)" in allowed
-    assert "Bash(slack:*)" in allowed
-    assert "Edit" not in allowed
+    assert "--dangerously-skip-permissions" in command
+    assert command[command.index("--model") + 1] == "opus"
+    assert command[command.index("--effort") + 1] == "high"
     assert out["reply"] == "ok"
 
 
-def test_codex_uses_sandbox_ephemeral_mode_and_filtered_shell_env(
-    tmp_path, monkeypatch
-):
+def test_codex_bypasses_approvals_and_sandbox(tmp_path, monkeypatch):
     captured = {}
 
     def fake_run(cmd, **kwargs):
@@ -188,13 +168,15 @@ def test_codex_uses_sandbox_ephemeral_mode_and_filtered_shell_env(
             "SLACK_BOT_TOKEN": "must-not-appear",
         },
         timeout=10,
-        workspace_mode="read_only",
+        model="gpt-5.6",
+        effort="high",
+        service_tier="priority",
     )
     command = captured["cmd"]
-    assert "--dangerously-bypass-approvals-and-sandbox" not in command
-    assert command[command.index("--ask-for-approval") + 1] == "never"
-    assert command[command.index("--sandbox") + 1] == "read-only"
-    assert "--ephemeral" in command
-    assert "shell_environment_policy.inherit=none" in command
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
+    assert "--skip-git-repo-check" in command
+    assert command[command.index("-m") + 1] == "gpt-5.6"
+    assert 'model_reasoning_effort="high"' in command
+    assert 'service_tier="priority"' in command
     assert all("SLACK_BOT_TOKEN" not in part for part in command)
     assert out["reply"] == "ok"

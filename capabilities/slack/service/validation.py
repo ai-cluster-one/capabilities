@@ -1,27 +1,28 @@
 """Validation for project-local Slack service settings.
 
-The daemon and the CLI both use this module so operational policy has one
-parser and one fail-closed verdict.
+The service intentionally mirrors Telegram's trusted-worker model: Claude and
+Codex may use their full host tool surface, while capability CLIs enforce the
+request-scoped authority envelope. Validation therefore checks configuration
+shape and operational bounds, not a sandbox policy.
 """
 
 from __future__ import annotations
 
-import os
-import re
 import shutil
-import stat
-import subprocess
 from pathlib import Path
 
 from authority import allowed_capability_names
 
 WORKERS = {"claude", "codex", "stub"}
-WORKSPACE_MODES = {"read_only", "workspace_write"}
-MIN_CLAUDE_VERSION = (2, 1, 216)
-_DOMAIN = re.compile(
-    r"^(?:\*\.)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*"
-    r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
-)
+CONTROL_COMMANDS = {"help", "set", "status", "stop"}
+WORKER_FIELDS = {
+    "claude": {"model", "effort"},
+    "codex": {"model", "reasoning_effort", "service_tier"},
+    "stub": {"model"},
+}
+CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+CODEX_REASONING = {"low", "medium", "high", "xhigh"}
+CODEX_TIERS = {"fast", "priority"}
 
 
 def _mapping(value, path, problems):
@@ -48,19 +49,57 @@ def _bounded_number(value, path, minimum, maximum, problems):
         problems.append(f"{path} must be between {minimum} and {maximum}")
 
 
-def _worker_version(name):
-    try:
-        result = subprocess.run(
-            [name, "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", result.stdout + result.stderr)
-    return tuple(map(int, match.groups())) if match else None
+def _validate_authority_row(row, path, problems):
+    if not isinstance(row, dict):
+        return
+    caps = row.get("allowed_capabilities", row.get("capabilities"))
+    if caps is not None:
+        if not (isinstance(caps, (bool, list, dict)) or caps == "*"):
+            problems.append(
+                f"{path}.allowed_capabilities must be a boolean, '*', list, or object"
+            )
+        try:
+            allowed_capability_names(caps)
+        except ValueError as exc:
+            problems.append(f"{path}.allowed_capabilities: {exc}")
+    authority = row.get("authority")
+    if authority is not None:
+        authority = _mapping(authority, f"{path}.authority", problems)
+        caps = authority.get("allowed_capabilities", authority.get("capabilities"))
+        if caps is not None:
+            try:
+                allowed_capability_names(caps)
+            except ValueError as exc:
+                problems.append(f"{path}.authority.allowed_capabilities: {exc}")
+
+
+def _validate_control_row(row, path, problems):
+    if not isinstance(row, dict) or "control" not in row:
+        return
+    control = _mapping(row.get("control"), f"{path}.control", problems)
+    _validate_commands(control.get("commands"), f"{path}.control.commands", problems)
+
+
+def _validate_commands(value, path, problems):
+    if value is None:
+        return
+    if value is True or value == "*":
+        return
+    commands = _string_list(value, path, problems)
+    invalid = sorted(
+        {
+            command
+            for command in commands
+            if command.strip().lower().lstrip("/") not in CONTROL_COMMANDS
+        }
+    )
+    if invalid:
+        problems.append(f"{path} contains unknown commands: {', '.join(invalid)}")
+
+
+def _validate_role(value, path, problems):
+    if value is not None and (not isinstance(value, str) or not value.strip()):
+        problems.append(f"{path} must be a non-empty string")
 
 
 def validate_settings(settings, *, project_root=None, check_worker=False) -> list[str]:
@@ -74,15 +113,56 @@ def validate_settings(settings, *, project_root=None, check_worker=False) -> lis
         not isinstance(connection, str) or not connection.strip()
     ):
         problems.append("connection must be null or a non-empty string")
+    assistant_name = settings.get("assistant_name", "Assistant")
+    if not isinstance(assistant_name, str) or not assistant_name.strip():
+        problems.append("assistant_name must be a non-empty string")
 
     direct = _mapping(settings.get("direct_messages", {}), "direct_messages", problems)
     if direct.get("mode", "allowed_users") not in {"allowed_users", "open"}:
         problems.append("direct_messages.mode must be allowed_users or open")
+    _validate_role(direct.get("default_role"), "direct_messages.default_role", problems)
 
     users = _mapping(settings.get("allowed_users", {}), "allowed_users", problems)
     channels = _mapping(
         settings.get("allowed_channels", {}), "allowed_channels", problems
     )
+    for user_id, row in users.items():
+        _validate_authority_row(row, f"allowed_users.{user_id}", problems)
+        if isinstance(row, dict):
+            _validate_role(row.get("role"), f"allowed_users.{user_id}.role", problems)
+            _validate_control_row(row, f"allowed_users.{user_id}", problems)
+    for channel_id, row in channels.items():
+        _validate_authority_row(row, f"allowed_channels.{channel_id}", problems)
+        if isinstance(row, dict):
+            _validate_role(
+                row.get("default_role"),
+                f"allowed_channels.{channel_id}.default_role",
+                problems,
+            )
+            _validate_control_row(row, f"allowed_channels.{channel_id}", problems)
+        members = row.get("members", {}) if isinstance(row, dict) else {}
+        if members is not None:
+            members = _mapping(
+                members, f"allowed_channels.{channel_id}.members", problems
+            )
+            for user_id, member in members.items():
+                _validate_authority_row(
+                    member,
+                    f"allowed_channels.{channel_id}.members.{user_id}",
+                    problems,
+                )
+                if isinstance(member, dict):
+                    _validate_role(
+                        member.get("role"),
+                        f"allowed_channels.{channel_id}.members.{user_id}.role",
+                        problems,
+                    )
+                    _validate_control_row(
+                        member,
+                        f"allowed_channels.{channel_id}.members.{user_id}",
+                        problems,
+                    )
+
     channel_policy = settings.get("default_channel_policy", "allowed_only")
     if channel_policy not in {"allowed_only", "open"}:
         problems.append("default_channel_policy must be allowed_only or open")
@@ -108,7 +188,12 @@ def validate_settings(settings, *, project_root=None, check_worker=False) -> lis
             )
 
     control = _mapping(settings.get("control", {}), "control", problems)
-    _mapping(control.get("roles", {}), "control.roles", problems)
+    control_roles = _mapping(control.get("roles", {}), "control.roles", problems)
+    for role, policy in control_roles.items():
+        policy = _mapping(policy, f"control.roles.{role}", problems)
+        _validate_commands(
+            policy.get("commands"), f"control.roles.{role}.commands", problems
+        )
     observability = _mapping(
         settings.get("observability", {}), "observability", problems
     )
@@ -116,33 +201,11 @@ def validate_settings(settings, *, project_root=None, check_worker=False) -> lis
         problems.append("observability.log_message_snippets must be boolean")
 
     authority = _mapping(settings.get("authority", {}), "authority", problems)
+    _validate_authority_row(authority.get("default", {}), "authority.default", problems)
     roles = _mapping(authority.get("roles", {}), "authority.roles", problems)
-    granted_capabilities: set[str] = set()
     for role, policy in roles.items():
         policy = _mapping(policy, f"authority.roles.{role}", problems)
-        domains = _string_list(
-            policy.get("network_domains", []),
-            f"authority.roles.{role}.network_domains",
-            problems,
-        )
-        invalid_domains = sorted(
-            {
-                domain
-                for domain in domains
-                if domain == "*" or not _DOMAIN.fullmatch(domain)
-            }
-        )
-        if invalid_domains:
-            problems.append(
-                f"authority.roles.{role}.network_domains contains invalid or "
-                f"overbroad domains: {', '.join(invalid_domains)}"
-            )
-        try:
-            granted_capabilities.update(
-                allowed_capability_names(policy.get("allowed_capabilities", {}))
-            )
-        except ValueError as exc:
-            problems.append(f"authority.roles.{role}.allowed_capabilities: {exc}")
+        _validate_authority_row(policy, f"authority.roles.{role}", problems)
 
     defaults = _mapping(settings.get("defaults", {}), "defaults", problems)
     worker = str(defaults.get("worker") or "stub").strip().lower()
@@ -150,68 +213,44 @@ def validate_settings(settings, *, project_root=None, check_worker=False) -> lis
         problems.append(f"defaults.worker must be one of {sorted(WORKERS)}")
     elif check_worker and worker != "stub" and shutil.which(worker) is None:
         problems.append(f"defaults.worker executable is not on PATH: {worker}")
-    elif check_worker and worker == "claude":
-        version = _worker_version("claude")
-        if version is None or version < MIN_CLAUDE_VERSION:
-            required = ".".join(map(str, MIN_CLAUDE_VERSION))
-            actual = ".".join(map(str, version)) if version else "unknown"
-            problems.append(
-                f"claude worker requires Claude Code >= {required} for strict "
-                f"sandbox controls (found {actual})"
-            )
-    if worker == "codex" and granted_capabilities:
-        problems.append(
-            "authority roles cannot grant capabilities to the codex worker: "
-            "its fail-closed sandbox cannot safely provide networked capability CLIs; "
-            "use claude or keep capability authority empty"
-        )
-    if check_worker and worker == "claude":
-        missing_capabilities = sorted(
-            name for name in granted_capabilities if shutil.which(name) is None
-        )
-        if missing_capabilities:
-            problems.append(
-                "authorized capability executables are not on PATH: "
-                + ", ".join(missing_capabilities)
-            )
-    if worker != "stub" and defaults.get("trusted_ingress") is not True:
-        problems.append(
-            "defaults.trusted_ingress must be true for claude/codex workers; "
-            "admitted Slack senders can direct the worker inside the configured workspace"
-        )
-    worker_home = defaults.get("worker_home")
-    if worker != "stub":
-        if not isinstance(worker_home, str) or not worker_home.strip():
-            problems.append(
-                "defaults.worker_home must name a dedicated existing directory "
-                "for claude/codex authentication and state"
-            )
-        elif not Path(worker_home).expanduser().resolve().is_dir():
-            problems.append("defaults.worker_home does not exist")
-        else:
-            resolved_worker_home = Path(worker_home).expanduser().resolve()
-            if resolved_worker_home == Path.home().resolve():
-                problems.append(
-                    "defaults.worker_home must not be the operator's general home directory"
-                )
-            try:
-                worker_home_stat = resolved_worker_home.stat()
-                if worker_home_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-                    problems.append(
-                        "defaults.worker_home must not be accessible by group or other users"
-                    )
-                if hasattr(os, "getuid") and worker_home_stat.st_uid != os.getuid():
-                    problems.append(
-                        "defaults.worker_home must be owned by the service user"
-                    )
-            except OSError as exc:
-                problems.append(f"defaults.worker_home cannot be inspected: {exc}")
 
-    workspace_mode = str(defaults.get("workspace_mode") or "read_only").strip().lower()
-    if workspace_mode not in WORKSPACE_MODES:
-        problems.append(
-            f"defaults.workspace_mode must be one of {sorted(WORKSPACE_MODES)}"
-        )
+    workers = _mapping(defaults.get("workers", {}), "defaults.workers", problems)
+    for name, profile in workers.items():
+        if name not in WORKERS:
+            problems.append(f"defaults.workers contains unknown worker: {name}")
+            continue
+        profile = _mapping(profile, f"defaults.workers.{name}", problems)
+        for field, value in profile.items():
+            if field not in WORKER_FIELDS[name]:
+                problems.append(f"defaults.workers.{name} has unknown field: {field}")
+                continue
+            if value is not None and not isinstance(value, str):
+                problems.append(
+                    f"defaults.workers.{name}.{field} must be null or string"
+                )
+        if name == "claude" and profile.get("effort") not in {
+            None,
+            *CLAUDE_EFFORTS,
+        }:
+            problems.append(
+                "defaults.workers.claude.effort must be null, low, medium, "
+                "high, xhigh, or max"
+            )
+        if name == "codex" and profile.get("reasoning_effort") not in {
+            None,
+            *CODEX_REASONING,
+        }:
+            problems.append(
+                "defaults.workers.codex.reasoning_effort must be null, low, "
+                "medium, high, or xhigh"
+            )
+        if name == "codex" and profile.get("service_tier") not in {
+            None,
+            *CODEX_TIERS,
+        }:
+            problems.append(
+                "defaults.workers.codex.service_tier must be null, fast, or priority"
+            )
 
     configured_project = defaults.get("project")
     root = Path(project_root).resolve() if project_root else None
@@ -220,17 +259,17 @@ def validate_settings(settings, *, project_root=None, check_worker=False) -> lis
         problems.append("defaults.project must resolve to an existing directory")
 
     _bounded_number(
-        defaults.get("tail_size", 30), "defaults.tail_size", 1, 200, problems
+        defaults.get("tail_size", 40), "defaults.tail_size", 1, 500, problems
     )
     _bounded_number(
-        defaults.get("worker_timeout", 180),
+        defaults.get("worker_timeout", 120),
         "defaults.worker_timeout",
         1,
         3600,
         problems,
     )
     _bounded_number(
-        defaults.get("max_parallel_jobs", 3),
+        defaults.get("max_parallel_jobs", 2),
         "defaults.max_parallel_jobs",
         1,
         16,

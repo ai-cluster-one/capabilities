@@ -10,6 +10,7 @@ def test_includes_context_request_and_tail_in_order():
             "kind": "im",
             "connection": "workspace",
             "worker": "claude",
+            "assistant_name": "Project Assistant",
             "sender_name": "Alice",
             "sender_role": "default",
             "authority_summary": "youtrack",
@@ -23,6 +24,7 @@ def test_includes_context_request_and_tail_in_order():
     assert "Alice: hi" in out
     assert "assistant: hello" in out
     assert "Tool authority: youtrack" in out
+    assert "Assistant: Project Assistant" in out
 
 
 def test_works_without_context():

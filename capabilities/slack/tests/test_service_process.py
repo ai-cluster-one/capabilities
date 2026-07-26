@@ -99,7 +99,7 @@ def test_answer_enqueues_and_does_not_post(tmp_path):
     assert posts == []
     assert len(jobs) == 1
     assert jobs[0]["conv"] == "D1"
-    assert jobs[0]["job"]["role"] == "default"
+    assert jobs[0]["job"]["role"] == "direct_user"
     assert out["text"] == "hello"
 
 
@@ -146,6 +146,23 @@ def test_control_stop_allowed_for_supervisor(tmp_path):
     )
     assert out["action"] == "control"
     assert out["command"] == "stop"
+    assert jobs == []
+
+
+def test_control_set_returns_arguments(tmp_path):
+    _posts, jobs, post, submit = _collectors()
+    s = {
+        "direct_messages": {"mode": "open"},
+        "allowed_users": {"U1": {"name": "S", "role": "supervisor"}},
+        "control": {"roles": {"supervisor": {"commands": ["set"]}}},
+    }
+    out = daemon.process_event(
+        _im(user="U1", text="/set codex.reasoning high"),
+        **_args(tmp_path, s, post, submit),
+    )
+    assert out["action"] == "control"
+    assert out["command"] == "set"
+    assert out["command_args"] == ["codex.reasoning", "high"]
     assert jobs == []
 
 
