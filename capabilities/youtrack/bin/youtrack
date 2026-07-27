@@ -41,36 +41,44 @@ Contract commands:
   youtrack refs
 
 Read:
-  youtrack whoami                            Current YouTrack user.
-  youtrack projects [--query TEXT]           Projects visible to the token.
-  youtrack task ISSUE                        Read one issue (ID or URL).
-  youtrack comments ISSUE [--limit N]        Read recent comments.
-  youtrack issues QUERY [--limit N]          Search issues server-side; returns
-                                             structured issue data (id, idReadable,
-                                             summary, description, State).
-  youtrack articles [--project ID] [--limit N]
+  youtrack users me                          Current YouTrack user.
+  youtrack projects find [SUBSTRING]         Projects visible to the token;
+                                             optional substring match on name.
+  youtrack projects fields list ID           Custom-field schema for a project:
+                                             name, type, multiValue, required,
+                                             and allowed values where bundled.
+  youtrack projects fields get ID NAME       One field's schema; NAME matches
+                                             case-insensitively.
+  youtrack issues get ISSUE                  Read one issue (ID or URL).
+  youtrack issues search QUERY [--limit N]   Search issues server-side using
+                                             YouTrack query language.
+  youtrack issues comments list ISSUE [--limit N]
+                                             Read recent comments on an issue.
+  youtrack articles list [--project ID] [--limit N]
                                              List knowledge-base articles (paged;
                                              --project scopes to one project). This
                                              is a listing, not a full-text search.
-  youtrack article ID                        Read one article (ID or URL): summary,
+  youtrack articles get ID                   Read one article (ID or URL): summary,
                                              content, project, parent/child refs.
-  youtrack article-comments ID [--limit N]   Read recent comments on an article.
+  youtrack articles comments list ID [--limit N]
+                                             Read recent comments on an article.
 
 Write:
-  youtrack create --project ID --summary S   Create an issue. Project is the
-        [--description TEXT|-]                database entity id (for example 0-0),
+  youtrack issues create --project ID        Create an issue. Project is the
+        --summary S [--description TEXT|-]    database entity id (for example 0-0),
                                              not its short name. Store stable ids
                                              with `youtrack ids set project …`.
-  youtrack comment ISSUE [--text TEXT|-]     Add a comment; omitted text reads stdin.
-  youtrack update ISSUE --state STATE        Update issue workflow state. STATE is
+  youtrack issues update ISSUE --state STATE Update issue workflow state. STATE is
                                              a state name (e.g. "In Progress").
                                              Respects allow_write connection policy.
-  youtrack article-create --project ID       Create an article in a project
+  youtrack issues comments add ISSUE [--text TEXT|-]
+                                             Add a comment; omitted text reads stdin.
+  youtrack articles create --project ID      Create an article in a project
         --summary S [--content TEXT|-]        (database entity id); optionally give
         [--parent ID|URL]                    a parent article to create a sub-article.
-  youtrack article-update ID                 Update an article's summary and/or
+  youtrack articles update ID                Update an article's summary and/or
         [--summary S] [--content TEXT|-]     content. Respects allow_write policy.
-  youtrack article-comment ID [--text TEXT|-]
+  youtrack articles comments add ID [--text TEXT|-]
                                              Add a comment to an article.
 
 Global options accepted anywhere:
@@ -94,7 +102,7 @@ from typing import NoReturn
 import httpx
 
 NAME = "youtrack"
-SUMMARY = "YouTrack CLI for issues (read/create/comment/update state) and the knowledge base (read, create, and update articles and article comments)."
+SUMMARY = "YouTrack CLI for issues (read/create/comment/update state), project custom-field schemas, and the knowledge base (read, create, and update articles and article comments)."
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,
@@ -102,8 +110,8 @@ CRED_KEYS = [
     {"key": "YOUTRACK_TOKEN", "secret": True, "required": True,
      "note": "permanent token (perm:…); alternates via --token-env"},
 ]
-WRITE_VERBS = {"create", "comment", "update",
-               "article-create", "article-update", "article-comment"}
+WRITE_VERBS = {"issues create", "issues update", "issues comments add",
+               "articles create", "articles update", "articles comments add"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/youtrack/guides/")
@@ -746,8 +754,12 @@ def _request(client: httpx.Client, method: str, path: str, **kwargs):
 
 USER_FIELDS = "id,login,name,fullName,email"
 PROJECT_FIELDS = "id,name,shortName"
-ISSUE_FIELDS = "id,idReadable,summary,description,created,updated,resolved,project(id,name,shortName),reporter(id,login,fullName)"
-ISSUE_SEARCH_FIELDS = "id,idReadable,summary,description,customFields(name,value(name))"
+_CF_PROJECTION = ("customFields(id,name,$type,"
+                  "value(id,name,login,text,minutes,presentation))")
+ISSUE_FIELDS = ("id,idReadable,summary,description,created,updated,resolved,"
+                "project(id,name,shortName),reporter(id,login,fullName),"
+                + _CF_PROJECTION)
+ISSUE_SEARCH_FIELDS = ("id,idReadable,summary,description," + _CF_PROJECTION)
 COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 ARTICLE_FIELDS = ("id,idReadable,summary,content,created,updated,"
                   "project(id,name,shortName),reporter(id,login,fullName),"
@@ -757,106 +769,275 @@ ARTICLE_LIST_FIELDS = ("id,idReadable,summary,updated,"
                        "project(id,name,shortName),parentArticle(idReadable)")
 ARTICLE_COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 
-def cmd_whoami(c):
+def _positive_limit(value: int) -> None:
+    if value < 1:
+        _die(6, "input", "--limit must be positive")
+
+
+# Read order matters: a User value carries both `login` and `name`, and the
+# login is what writes need. Bundle elements (Enum/State/Owned/Version/Build)
+# carry `name`; text fields `text`; periods `presentation`.
+_VALUE_KEYS = ("login", "name", "text", "presentation")
+
+
+def _flatten_value(value):
+    if isinstance(value, list):
+        return [_flatten_value(item) for item in value]
+    if isinstance(value, dict):
+        for key in _VALUE_KEYS:
+            if value.get(key) is not None:
+                return value[key]
+        return value.get("id")
+    return value
+
+
+def _flatten_custom_fields(issue):
+    if not isinstance(issue, dict) or "customFields" not in issue:
+        return issue
+    fields = issue.pop("customFields") or []
+    issue["fields"] = {f["name"]: _flatten_value(f.get("value"))
+                       for f in fields if isinstance(f, dict) and f.get("name")}
+    return issue
+
+
+def users_me(c, a):
     return _request(c, "GET", "/users/me", params={"fields": USER_FIELDS})
 
-def cmd_projects(c, query):
+
+def projects_find(c, a):
     params = {"fields": PROJECT_FIELDS, "$top": 100}
-    if query: params["query"] = query
+    if a.substring:
+        params["query"] = a.substring
     return _request(c, "GET", "/admin/projects", params=params)
 
-def cmd_task(c, issue):
-    return _request(c, "GET", f"/issues/{_issue_ref(issue)}", params={"fields": ISSUE_FIELDS})
 
-def cmd_create(c, project, summary, description):
-    body = {"project": {"id": project}, "summary": summary}
-    if description is not None: body["description"] = description
-    return _request(c, "POST", "/issues", params={"fields": ISSUE_FIELDS}, json=body)
+PROJECT_FIELD_FIELDS = ("id,canBeEmpty,field(id,name,fieldType(id,isMultiValue)),"
+                        "$type,bundle(id,values(name),aggregatedUsers(login))")
 
-def cmd_comments(c, issue, limit):
-    return _request(c, "GET", f"/issues/{_issue_ref(issue)}/comments",
-                    params={"fields": COMMENT_FIELDS, "$top": limit})
 
-def cmd_comment(c, issue, text):
-    return _request(c, "POST", f"/issues/{_issue_ref(issue)}/comments",
-                    params={"fields": COMMENT_FIELDS}, json={"text": text})
+def _shape_project_field(entry):
+    field = entry.get("field") or {}
+    ftype = field.get("fieldType") or {}
+    bundle = entry.get("bundle") or {}
+    users = [u.get("login") for u in (bundle.get("aggregatedUsers") or [])
+             if isinstance(u, dict) and u.get("login")]
+    names = [v.get("name") for v in (bundle.get("values") or [])
+             if isinstance(v, dict) and v.get("name")]
+    # A user field's bundle carries display names under `values` and logins
+    # under `aggregatedUsers`; writes need the login, so prefer it.
+    values = users or names
+    return {"name": field.get("name"),
+            "type": ftype.get("id"),
+            "multiValue": bool(ftype.get("isMultiValue")),
+            "required": not entry.get("canBeEmpty", True),
+            "values": values or None}
 
-def cmd_issues(c, query, limit):
-    params = {"fields": ISSUE_SEARCH_FIELDS, "query": query,
-              "customFields": "State", "$top": limit}
-    result = _request(c, "GET", "/issues", params=params)
-    def extract_state(issue):
-        for field in (issue.get("customFields") or []):
-            if field.get("name") == "State":
-                value = field.get("value")
-                if isinstance(value, dict):
-                    return value.get("name")
-                return value
-        return None
-    return [{"id": i["id"], "idReadable": i["idReadable"],
-             "summary": i["summary"], "description": i.get("description"),
-             "State": extract_state(i)} for i in result]
 
-def cmd_update(c, issue, state):
-    return _request(c, "POST", f"/issues/{_issue_ref(issue)}",
+def _project_fields(c, project):
+    # $top=200 is deliberate headroom, not a default left in place: the
+    # largest real project seen has 45 custom fields.
+    raw = _request(c, "GET", f"/admin/projects/{project}/customFields",
+                   params={"fields": PROJECT_FIELD_FIELDS, "$top": 200})
+    return [_shape_project_field(e) for e in raw if isinstance(e, dict)]
+
+
+def projects_fields_list(c, a):
+    return _project_fields(c, a.project)
+
+
+def projects_fields_get(c, a):
+    fields = _project_fields(c, a.project)
+    wanted = a.name.strip().casefold()
+    for field in fields:
+        if (field["name"] or "").casefold() == wanted:
+            return field
+    known = ", ".join(sorted(f["name"] for f in fields if f["name"]))
+    _die(3, "not_found",
+         f"no custom field named {a.name!r} on project {a.project!r}",
+         f"available: {known}")
+
+
+def issues_get(c, a):
+    return _flatten_custom_fields(
+        _request(c, "GET", f"/issues/{_issue_ref(a.issue)}",
+                 params={"fields": ISSUE_FIELDS}))
+
+
+def issues_create(c, a):
+    body = {"project": {"id": a.project}, "summary": a.summary}
+    if a.description is not None:
+        body["description"] = _read_text(a.description)
+    return _flatten_custom_fields(
+        _request(c, "POST", "/issues", params={"fields": ISSUE_FIELDS}, json=body))
+
+
+def issues_update(c, a):
+    # Deliberately not flattened: this handler uses its own narrow
+    # `customFields(name,value(name))` projection, not ISSUE_FIELDS, and is
+    # slated for a wholesale rewrite next milestone. Leave the raw shape here
+    # until that rewrite lands.
+    return _request(c, "POST", f"/issues/{_issue_ref(a.issue)}",
                     params={"fields": "customFields(name,value(name))"},
                     json={"customFields": [
-                        {"name": "State", "$type": "StateIssueCustomField", "value": {"name": state}}
+                        {"name": "State", "$type": "StateIssueCustomField",
+                         "value": {"name": a.state}}
                     ]})
+
+
+def issues_search(c, a):
+    _positive_limit(a.limit)
+    result = _request(c, "GET", "/issues",
+                      params={"fields": ISSUE_SEARCH_FIELDS, "query": a.query,
+                              "$top": a.limit})
+    return [_flatten_custom_fields(i) for i in result]
+
+
+def issues_comments_list(c, a):
+    _positive_limit(a.limit)
+    return _request(c, "GET", f"/issues/{_issue_ref(a.issue)}/comments",
+                    params={"fields": COMMENT_FIELDS, "$top": a.limit})
+
+
+def issues_comments_add(c, a):
+    text = _read_text(a.text if a.text is not None else "-")
+    if not text.strip():
+        _die(6, "input", "comment text cannot be empty")
+    return _request(c, "POST", f"/issues/{_issue_ref(a.issue)}/comments",
+                    params={"fields": COMMENT_FIELDS}, json={"text": text})
+
 
 def _article_ref(value):
     value = value.strip()
     match = re.search(r"/articles/([^/?#]+)", value)
     return match.group(1) if match else value
 
-def cmd_articles(c, project, limit):
-    path = f"/admin/projects/{project}/articles" if project else "/articles"
-    return _request(c, "GET", path,
-                    params={"fields": ARTICLE_LIST_FIELDS, "$top": limit})
 
-def cmd_article(c, article):
-    return _request(c, "GET", f"/articles/{_article_ref(article)}",
+def articles_list(c, a):
+    _positive_limit(a.limit)
+    path = f"/admin/projects/{a.project}/articles" if a.project else "/articles"
+    return _request(c, "GET", path,
+                    params={"fields": ARTICLE_LIST_FIELDS, "$top": a.limit})
+
+
+def articles_get(c, a):
+    return _request(c, "GET", f"/articles/{_article_ref(a.article)}",
                     params={"fields": ARTICLE_FIELDS})
 
-def cmd_article_comments(c, article, limit):
-    return _request(c, "GET", f"/articles/{_article_ref(article)}/comments",
-                    params={"fields": ARTICLE_COMMENT_FIELDS, "$top": limit})
 
-def cmd_article_create(c, summary, content, project, parent):
-    body = {"summary": summary, "project": {"id": project}}
-    if content is not None: body["content"] = content
-    if parent:
+def articles_comments_list(c, a):
+    _positive_limit(a.limit)
+    return _request(c, "GET", f"/articles/{_article_ref(a.article)}/comments",
+                    params={"fields": ARTICLE_COMMENT_FIELDS, "$top": a.limit})
+
+
+def articles_comments_add(c, a):
+    text = _read_text(a.text if a.text is not None else "-")
+    if not text.strip():
+        _die(6, "input", "comment text cannot be empty")
+    return _request(c, "POST", f"/articles/{_article_ref(a.article)}/comments",
+                    params={"fields": ARTICLE_COMMENT_FIELDS}, json={"text": text})
+
+
+def articles_create(c, a):
+    body = {"summary": a.summary, "project": {"id": a.project}}
+    if a.content is not None:
+        body["content"] = _read_text(a.content)
+    if a.parent:
         parent_article = _request(
-            c, "GET", f"/articles/{_article_ref(parent)}",
+            c, "GET", f"/articles/{_article_ref(a.parent)}",
             params={"fields": "id,idReadable,project(id)"})
         parent_id = parent_article.get("id") if isinstance(parent_article, dict) else None
-        parent_project = (
-            (parent_article.get("project") or {}).get("id")
-            if isinstance(parent_article, dict) else None)
+        parent_project = ((parent_article.get("project") or {}).get("id")
+                          if isinstance(parent_article, dict) else None)
         if not parent_id or not parent_project:
             _die(5, "bad_response",
                  "YouTrack returned a parent article without id/project")
-        if parent_project != project:
+        if parent_project != a.project:
             _die(6, "input",
-                 f"--parent belongs to project {parent_project!r}, not {project!r}")
+                 f"--parent belongs to project {parent_project!r}, not {a.project!r}")
         body["parentArticle"] = {"id": parent_id}
     return _request(c, "POST", "/articles",
                     params={"fields": ARTICLE_FIELDS}, json=body)
 
-def cmd_article_update(c, article, summary, content):
+
+def articles_update(c, a):
+    summary = a.summary if (a.summary is not None and a.summary.strip()) else None
+    content = _read_text(a.content) if a.content is not None else None
+    if content is not None and not content.strip():
+        content = None
+    if summary is None and content is None:
+        _die(6, "input", "articles update needs a non-empty --summary or --content")
     body = {}
-    if summary is not None: body["summary"] = summary
-    if content is not None: body["content"] = content
-    return _request(c, "POST", f"/articles/{_article_ref(article)}",
+    if summary is not None:
+        body["summary"] = summary
+    if content is not None:
+        body["content"] = content
+    return _request(c, "POST", f"/articles/{_article_ref(a.article)}",
                     params={"fields": ARTICLE_FIELDS}, json=body)
 
-def cmd_article_comment(c, article, text):
-    return _request(c, "POST", f"/articles/{_article_ref(article)}/comments",
-                    params={"fields": ARTICLE_COMMENT_FIELDS}, json={"text": text})
+
+ARG_ISSUE         = (("issue",), {})
+ARG_ARTICLE       = (("article",), {})
+ARG_QUERY         = (("query",), {})
+ARG_SUBSTRING_OPT = (("substring",), {"nargs": "?", "default": None})
+ARG_LIMIT50       = (("--limit",), {"type": int, "default": 50})
+ARG_LIMIT100      = (("--limit",), {"type": int, "default": 100})
+ARG_PROJECT_REQ   = (("--project",), {"required": True})
+ARG_PROJECT_OPT   = (("--project",), {})
+ARG_PROJECT_POS   = (("project",), {})
+ARG_FIELD_NAME    = (("name",), {})
+ARG_SUMMARY_REQ   = (("--summary",), {"required": True})
+ARG_SUMMARY_OPT   = (("--summary",), {})
+ARG_DESCRIPTION   = (("--description",), {})
+ARG_CONTENT       = (("--content",), {})
+ARG_TEXT          = (("--text",), {})
+ARG_STATE_REQ     = (("--state",), {"required": True})
+ARG_PARENT        = (("--parent",), {})
+
+COMMANDS = {
+    ("users", "me"):                  (users_me, []),
+    ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT]),
+    ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
+    ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
+    ("issues", "get"):                (issues_get, [ARG_ISSUE]),
+    ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100]),
+    ("issues", "create"):             (issues_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
+                                                       ARG_DESCRIPTION]),
+    ("issues", "update"):             (issues_update, [ARG_ISSUE, ARG_STATE_REQ]),
+    ("issues", "comments", "list"):   (issues_comments_list, [ARG_ISSUE, ARG_LIMIT50]),
+    ("issues", "comments", "add"):    (issues_comments_add, [ARG_ISSUE, ARG_TEXT]),
+    ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100]),
+    ("articles", "get"):              (articles_get, [ARG_ARTICLE]),
+    ("articles", "create"):           (articles_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
+                                                         ARG_CONTENT, ARG_PARENT]),
+    ("articles", "update"):           (articles_update, [ARG_ARTICLE, ARG_SUMMARY_OPT,
+                                                         ARG_CONTENT]),
+    ("articles", "comments", "list"): (articles_comments_list, [ARG_ARTICLE, ARG_LIMIT50]),
+    ("articles", "comments", "add"):  (articles_comments_add, [ARG_ARTICLE, ARG_TEXT]),
+}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=NAME, add_help=True)
+    subs = {(): parser.add_subparsers(dest="_l0", required=True, metavar="verb")}
+    for path, (_handler, argspecs) in COMMANDS.items():
+        for depth in range(1, len(path)):
+            prefix = path[:depth]
+            if prefix not in subs:
+                node = subs[prefix[:-1]].add_parser(prefix[-1])
+                subs[prefix] = node.add_subparsers(dest=f"_l{depth}", required=True,
+                                                   metavar="verb")
+        leaf = subs[path[:-1]].add_parser(path[-1])
+        for names, kwargs in argspecs:
+            leaf.add_argument(*names, **kwargs)
+        leaf.set_defaults(_path=path)
+    subs[()].add_parser("doctor").set_defaults(_path=("doctor",))
+    return parser
+
 
 def _check_connection(base_url, token):
     with _client(base_url, token) as c:
-        return {"ok": True, "base_url": base_url, "identity": cmd_whoami(c)}
+        return {"ok": True, "base_url": base_url, "identity": users_me(c, argparse.Namespace())}
 
 def cmd_doctor(reg, reg_file, wanted, token_key):
     report = _connections_report()
@@ -874,23 +1055,7 @@ def main() -> None:
     _gate()
     argv = sys.argv[1:]
     _contract(argv)
-    parser = argparse.ArgumentParser(prog=NAME, add_help=True)
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("whoami")
-    p = sub.add_parser("projects"); p.add_argument("--query")
-    p = sub.add_parser("task"); p.add_argument("issue")
-    p = sub.add_parser("comments"); p.add_argument("issue"); p.add_argument("--limit", type=int, default=50)
-    p = sub.add_parser("issues"); p.add_argument("query"); p.add_argument("--limit", type=int, default=100)
-    p = sub.add_parser("create"); p.add_argument("--project", required=True); p.add_argument("--summary", required=True); p.add_argument("--description")
-    p = sub.add_parser("comment"); p.add_argument("issue"); p.add_argument("--text")
-    p = sub.add_parser("update"); p.add_argument("issue"); p.add_argument("--state", required=True)
-    p = sub.add_parser("articles"); p.add_argument("--project"); p.add_argument("--limit", type=int, default=100)
-    p = sub.add_parser("article"); p.add_argument("article")
-    p = sub.add_parser("article-comments"); p.add_argument("article"); p.add_argument("--limit", type=int, default=50)
-    p = sub.add_parser("article-create"); p.add_argument("--summary", required=True); p.add_argument("--content"); p.add_argument("--project"); p.add_argument("--parent")
-    p = sub.add_parser("article-update"); p.add_argument("article"); p.add_argument("--summary"); p.add_argument("--content")
-    p = sub.add_parser("article-comment"); p.add_argument("article"); p.add_argument("--text")
-    sub.add_parser("doctor")
+    parser = _build_parser()
 
     token_key = wanted = None
     cleaned = []
@@ -905,57 +1070,17 @@ def main() -> None:
         cleaned.append(argv[i]); i += 1
     args = parser.parse_args(cleaned)
     reg, reg_file = _connections_registry()
-    if args.cmd == "doctor":
+    if args._path == ("doctor",):
         cmd_doctor(reg, reg_file, wanted, token_key); return
     cid, entry = _select_connection(reg, wanted)
-    _write_gate(cid, WRITE_DEFAULT if entry is None else bool(entry.get("allow_write", WRITE_DEFAULT)), args.cmd)
+    allow_write = WRITE_DEFAULT if entry is None else bool(entry.get("allow_write", WRITE_DEFAULT))
+    _write_gate(cid, allow_write, " ".join(args._path))
     key = token_key or (entry or {}).get("secret_env") or "YOUTRACK_TOKEN"
     base_url, _, _ = _resolve_base_url(entry, reg_file)
     if not base_url: _die(2, "missing_url", "YOUTRACK_URL/base_url is not configured")
+    handler, _argspecs = COMMANDS[args._path]
     with _client(base_url, _load_token(key)) as client:
-        if args.cmd == "whoami": _emit(cmd_whoami(client))
-        elif args.cmd == "projects": _emit(cmd_projects(client, args.query))
-        elif args.cmd == "task": _emit(cmd_task(client, args.issue))
-        elif args.cmd == "comments":
-            if args.limit < 1: _die(6, "input", "--limit must be positive")
-            _emit(cmd_comments(client, args.issue, args.limit))
-        elif args.cmd == "issues":
-            if args.limit < 1: _die(6, "input", "--limit must be positive")
-            _emit(cmd_issues(client, args.query, args.limit))
-        elif args.cmd == "create":
-            description = _read_text(args.description) if args.description is not None else None
-            _emit(cmd_create(client, args.project, args.summary, description))
-        elif args.cmd == "comment":
-            text = _read_text(args.text if args.text is not None else "-")
-            if not text.strip(): _die(6, "input", "comment text cannot be empty")
-            _emit(cmd_comment(client, args.issue, text))
-        elif args.cmd == "update":
-            _emit(cmd_update(client, args.issue, args.state))
-        elif args.cmd == "articles":
-            if args.limit < 1: _die(6, "input", "--limit must be positive")
-            _emit(cmd_articles(client, args.project, args.limit))
-        elif args.cmd == "article":
-            _emit(cmd_article(client, args.article))
-        elif args.cmd == "article-comments":
-            if args.limit < 1: _die(6, "input", "--limit must be positive")
-            _emit(cmd_article_comments(client, args.article, args.limit))
-        elif args.cmd == "article-create":
-            if not args.project:
-                _die(6, "input", "article-create needs --project")
-            content = _read_text(args.content) if args.content is not None else None
-            _emit(cmd_article_create(client, args.summary, content, args.project, args.parent))
-        elif args.cmd == "article-update":
-            summary = args.summary if (args.summary is not None and args.summary.strip()) else None
-            content = _read_text(args.content) if args.content is not None else None
-            if content is not None and not content.strip():
-                content = None
-            if summary is None and content is None:
-                _die(6, "input", "article-update needs a non-empty --summary or --content")
-            _emit(cmd_article_update(client, args.article, summary, content))
-        elif args.cmd == "article-comment":
-            text = _read_text(args.text if args.text is not None else "-")
-            if not text.strip(): _die(6, "input", "comment text cannot be empty")
-            _emit(cmd_article_comment(client, args.article, text))
+        _emit(handler(client, args))
 
 if __name__ == "__main__":
     main()
