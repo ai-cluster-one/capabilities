@@ -2,7 +2,9 @@
 
 **Status:** design approved, nothing built. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
 
-> **Base-state warning — resolve before starting.** This design describes the capability as **installed** (`~/.capabilities/youtrack`), which is the state of the local branch `feat/youtrack-knowledge-base`: issue verbs *plus* knowledge-base article verbs. That branch was **deleted on the remote without being merged** — `origin/main`, `upstream/main`, `origin/v2` and `origin/add-slack-capability` all have zero occurrences of `article-create`, and `capabilities/youtrack/` on `main` is only `bin/youtrack` + `tests/`. The local branch is the sole surviving copy and is 14 commits ahead of `main`, carrying the `automations` capability and the managed-sources work as well. **If the base ends up being `main`, every article row below moves from "parity" to "absent" and M4 grows.** Settle the base first.
+**Base:** `upstream/main` (`ai-cluster-one/capabilities`), which carries the knowledge-base article verbs merged in PR #13. The `zjor/capabilities` fork's `main` runs behind upstream — branch from `upstream/main`, not `origin/main`.
+
+**Live-verified against `ion.youtrack.cloud` / IONDEV (project `0-6`, 45 custom fields).** The marshalling and output sections below are measured, not inferred; only the *write* direction remains unproven (see the note there).
 
 ## Why
 
@@ -14,7 +16,7 @@ A second, smaller problem: the surface is a flat list of unique first-level verb
 
 ## Baseline: measured coverage
 
-Against the 23 predefined MCP tools enumerated from [Predefined MCP Tools](https://www.jetbrains.com/help/youtrack/devportal/predefined-ai-tools.html) — the page's own count says 24 and the 24th name did not resolve on fetch, so **reconcile before treating this as exhaustive**: 6 at parity, 6 partial, 11 absent, plus 2 CLI-only verbs.
+Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https://www.jetbrains.com/help/youtrack/devportal/predefined-ai-tools.html), enumerated in page order and counted directly: 6 at parity, 6 partial, 11 absent, plus 2 CLI-only verbs. (An earlier reading reported 24; that was a miscount. There is no 24th tool, and the set below is complete.)
 
 | MCP tool | today | status |
 |---|---|---|
@@ -92,6 +94,8 @@ Links are returned by `issues get`; there is deliberately no `issues links list`
 
 `articles list` keeps `list` rather than `find` because it is a project-scoped listing, not a match.
 
+`articles create --project` becomes **required**, tightening today's optional flag: the current code sends `{"project": {"id": …}}` unconditionally, so omitting it fails server-side regardless. Making it required moves that failure to argparse, as exit `6` with a usable message.
+
 ## projects · users · groups · searches
 
 | Command | Milestone |
@@ -138,21 +142,34 @@ JSON
 
 **Parsing.** `--field NAME=VALUE` splits on the **first** `=` only, so `--field "Description=a=b"` sets `a=b`. Names match **case-insensitively** against the project schema. Repeating a flag for a multi-value field accumulates (`--field "Work Category=Infrastructure" --field "Work Category=Technical Debt"` → both). `--field NAME=` with an empty value clears the field to null — the only way to clear, and explicit.
 
-**Marshalling** is driven by the M1 schema. Expected mapping, **each to be confirmed against the live instance during M1** before implementation:
+**Marshalling** is driven by the M1 schema. The mapping below is **measured** against IONDEV: `fieldType.id` from `GET /admin/projects/0-6/customFields`, issue-side `$type` and value shapes from `GET /issues/{id}?fields=customFields(name,$type,value(...))`, correlated by field name. All 14 types occurring in IONDEV are covered.
 
-| `fieldType.id` | issue-field `$type` | value shape |
-|---|---|---|
-| `state[1]` | `StateIssueCustomField` | `{"name": …}` |
-| `enum[1]` | `SingleEnumIssueCustomField` | `{"name": …}` |
-| `enum[*]` | `MultiEnumIssueCustomField` | `[{"name": …}, …]` |
-| `user[1]` | `SingleUserIssueCustomField` | `{"login": …}` |
-| `version[1]` / `build[1]` | `SingleVersion…` / `SingleBuild…` | `{"name": …}` |
-| `period` | `PeriodIssueCustomField` | `{"presentation": "1d 4h"}` |
-| `integer` / `float` / `string` | `SimpleIssueCustomField` | scalar |
-| `date` | `DateIssueCustomField` | epoch ms |
-| `text` | `TextIssueCustomField` | `{"text": …}` |
+| `fieldType.id` | multi | issue-side `$type` | write value | read flattens to | IONDEV field |
+|---|---|---|---|---|---|
+| `state[1]` | no | `StateIssueCustomField` | `{"name": …}` | `name` | State |
+| `enum[1]` | no | `SingleEnumIssueCustomField` | `{"name": …}` | `name` | Priority, Type |
+| `enum[*]` | yes | `MultiEnumIssueCustomField` | `[{"name": …}, …]` | `[name, …]` | Work Category |
+| `ownedField[1]` | no | `SingleOwnedIssueCustomField` | `{"name": …}` | `name` | Subsystem |
+| `user[1]` | no | `SingleUserIssueCustomField` | `{"login": …}` | `login` | Assignee |
+| `user[*]` | yes | `MultiUserIssueCustomField` | `[{"login": …}, …]` | `[login, …]` | Requestor |
+| `version[1]` | no | `SingleVersionIssueCustomField` | `{"name": …}` | `name` | Release Window |
+| `version[*]` | yes | `MultiVersionIssueCustomField` | `[{"name": …}, …]` | `[name, …]` | Sprints |
+| `build[1]` | no | `SingleBuildIssueCustomField` | `{"name": …}` | `name` | Reported In |
+| `period` | no | `PeriodIssueCustomField` | `{"presentation": "1d 4h"}` | `presentation` | Original Estimate |
+| `integer` | no | `SimpleIssueCustomField` | scalar | scalar | Points |
+| `date` | no | `DateIssueCustomField` | epoch ms | epoch ms | Due Date |
+| `date and time` | no | `SimpleIssueCustomField` | epoch ms | epoch ms | Incident Start Time |
+| `text` | no | `TextIssueCustomField` | `{"text": …}` | `text` | Acceptance Criteria |
+
+**The two traps in that table:** `date` maps to `DateIssueCustomField` but `date and time` maps to `SimpleIssueCustomField` — same-looking types, different `$type`. And bundle-backed values carry distinct element types on read (`EnumBundleElement`, `StateBundleElement`, `OwnedBundleElement`, `VersionBundleElement`), all of which flatten by `name`; only users flatten by `login`.
+
+`float` and `string` do not occur in IONDEV; both are expected to be `SimpleIssueCustomField` like `integer`, and are the only rows in this table not directly measured.
+
+**Write direction is not yet proven.** Every shape above is confirmed on read; the write column assumes YouTrack accepts the same shape it emits, which is its documented convention but was not exercised against the live instance (doing so mutates real IONDEV data). M2's first task is to confirm it on a throwaway draft issue before building on it.
 
 **Validation is atomic and ahead of the wire.** Every named field and value is checked against the schema *before* any request goes out. Unknown field name → exit `6` naming near-misses. Value outside a bundle → exit `6` listing what is allowed. Never a partial write. Correctness is never delegated to YouTrack, which silently ignores an unrecognized `customFields` entry rather than rejecting it.
+
+**Fields are scoped by issue Type, not just by project — measured.** IONDEV declares 45 project custom fields, but `IONDEV-509` (a Task) carries only 34; the 11 missing are the bug/incident set (`Severity`, `Steps to Reproduce`, `Reported In`, `Incident Start Time`, `Root Cause`, `Blocked Reason`, …), which appear on `IONDEV-974` (a Bug). So the project schema is a *superset*: validating a name against it alone will accept `Severity` on a Task, which YouTrack then silently drops. On update, validate against the fields actually present on the target issue; on create, against the fields the chosen `Type` carries. Report a field that exists in the project but not on this issue with a distinct message — it is a different mistake from a typo.
 
 **Schema resolution: fetch per invocation, do not cache.** A write costs one extra `GET /admin/projects/{id}/customFields` before the `POST`. One round trip, no invalidation problem, and no manifest change — the capability declares `state: false`, and a schema cache would flip it to `true` and drag in the whole staleness question. Revisit only if the extra GET measurably hurts.
 
@@ -253,8 +270,9 @@ Read-only plus the rename. No write risk; unblocks M2.
 1. **Noun-verb conversion of the existing surface**, flat verbs removed. Cheapest now, while there are six verbs.
 2. **`issues get` returns custom fields.** Extend `ISSUE_FIELDS` to `customFields(id,name,$type,value(id,name,login,fullName,text,minutes,presentation))` and flatten to the `fields` map above.
 3. **`projects fields list ID` / `projects fields get ID NAME`** — the `get_issue_fields_schema` equivalent: name, required (`canBeEmpty`), type, multi-value-ness, and allowed values for bundle-backed fields.
-4. **Confirm the type model live.** `GET /admin/projects/{id}/customFields` is *expected* to expose `field(fieldType(id))` with ids like `enum[1]`, `user[1]`, `state[1]`, `period`, plus `bundle(values(name))`. **Verify against `ion.youtrack.cloud`** — the marshalling table depends on it, and a wrong assumption fails at write time, not read time.
-5. `users me` replaces `whoami`.
+4. `users me` replaces `whoami`.
+
+The type model is already confirmed: `GET /admin/projects/{id}/customFields?fields=field(name,fieldType(id,isMultiValue)),$type` returns the 14 `fieldType.id` values in the marshalling table. M1 inherits that table rather than rediscovering it.
 
 **Done when:** `issues get IONDEV-509` shows Type/State/Assignee/Priority/Points/Acceptance Criteria, and `projects fields list 0-6` enumerates the field set with allowed values for every bundle field.
 
@@ -262,6 +280,7 @@ Read-only plus the rename. No write risk; unblocks M2.
 
 The milestone that makes the capability usable, and the only one with real design risk.
 
+0. **Prove the write direction first**, on a throwaway draft issue: one write per `$type` in the marshalling table, read back, compare. Everything else in M2 builds on that table being right.
 1. `issues update` with `--field` / `--fields`, plus `--summary` / `--description` (today impossible outside the web UI).
 2. `issues create` on the same marshalling path, so an issue can be born sprint-ready in one call.
 3. Type-aware marshalling per the table above, replacing the hardcoded `{"name": "State", "$type": "StateIssueCustomField", …}`.
