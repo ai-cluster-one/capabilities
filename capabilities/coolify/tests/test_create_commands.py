@@ -64,6 +64,9 @@ def test_app_create_public_git():
         build_pack = "nixpacks"
         docker_compose_location = None
         dockerfile_location = None
+        base_directory = "/apps/api"
+        health_check_enabled = True
+        health_check_path = "/health"
 
     args = Args()
 
@@ -80,6 +83,9 @@ def test_app_create_public_git():
         assert body["git_repository"] == "https://github.com/user/repo"
         assert body["git_branch"] == "main"
         assert body["build_pack"] == "nixpacks"
+        assert body["base_directory"] == "/apps/api"
+        assert body["health_check_enabled"] is True
+        assert body["health_check_path"] == "/health"
         assert result == response
 
 
@@ -173,7 +179,8 @@ def test_env_list_typed_application():
 
         assert len(calls) == 1
         assert calls[0]["path"] == "/applications/app-uuid/envs"
-        assert result == response
+        assert result[0]["value"] == "val"
+        assert result[0]["value_hidden"] is False
 
 
 def test_env_list_typed_service():
@@ -191,7 +198,8 @@ def test_env_list_typed_service():
 
         assert len(calls) == 1
         assert calls[0]["path"] == "/services/svc-uuid/envs"
-        assert result == response
+        assert result[0]["value"] == "val"
+        assert result[0]["value_hidden"] is False
 
 
 def test_env_bulk():
@@ -213,10 +221,11 @@ def test_env_bulk():
         assert calls[0]["method"] == "PATCH"
         assert calls[0]["path"] == "/applications/app-uuid/envs/bulk"
         body = calls[0]["body"]
-        assert len(body) == 3
-        assert body[0] == {"key": "KEY1", "value": "value1"}
-        assert body[1] == {"key": "KEY2", "value": "value2"}
-        assert body[2] == {"key": "KEY3", "value": "value3"}
+        assert list(body) == ["data"]
+        assert len(body["data"]) == 3
+        assert body["data"][0] == {"key": "KEY1", "value": "value1"}
+        assert body["data"][1] == {"key": "KEY2", "value": "value2"}
+        assert body["data"][2] == {"key": "KEY3", "value": "value3"}
         assert result == response
 
 

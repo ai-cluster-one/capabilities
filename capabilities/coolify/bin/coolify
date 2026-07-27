@@ -61,9 +61,11 @@ COMMANDS
       masked). Local only — no network.
 
   doctor [--connection <id>]
-      Validate token + reachability (GET /version, GET /teams/current) and
-      report the Coolify version and the token's team — every connection, or
-      one. Exit 0 all healthy / 2 missing-or-rejected token / 5 unreachable.
+      Validate token + reachability (GET /version, GET /teams/current), report
+      the Coolify version, token team, and effective token abilities — every
+      connection, or one. Ability checks are non-mutating; read:sensitive can
+      be unknown when the team has no secret-bearing resource to inspect.
+      Exit 0 all healthy / 2 missing-or-rejected token / 5 unreachable.
 
   projects [<uuid>]
       List projects, or get one project (its environments come inside it).
@@ -73,6 +75,10 @@ COMMANDS
   resources
       Flat list of every deployable resource (uuid, name, type, status) —
       the lookup an agent runs to find the uuid to act on.
+  sources
+      List GitHub Apps and private/deploy keys with the UUIDs accepted by
+      `app create --github-app` and `--private-deploy-key`. Secret key
+      material is never emitted.
   applications [<uuid>]            List applications, or get one (full detail).
   services [<uuid>]               List services, or get one.
   databases [<uuid>]              List databases, or get one.
@@ -91,7 +97,20 @@ COMMANDS
       --image <registry/name:tag>  (registry image)
       --dockerfile <file|->  (inline dockerfile, raw content)
       Common optional: --name, --domains, --ports-exposes, --instant-deploy,
-      --destination <uuid>. Returns the application uuid.
+      --destination <uuid>, --base-directory, and the health-check flags
+      accepted by `app update`. Returns the application uuid.
+      Write verb - requires allow_write.
+
+  app update <uuid> [options]
+      Patch only the supplied application fields:
+      --name --domains --ports-exposes --base-directory
+      --dockerfile-location --docker-compose-location --build-pack
+      --git-repository --git-branch
+      --health-check-enabled / --no-health-check-enabled
+      --health-check-path --health-check-port --health-check-host
+      --health-check-scheme --health-check-return-code
+      --health-check-interval --health-check-timeout --health-check-retries
+      --health-check-start-period
       Write verb - requires allow_write.
 
   service create --compose <file|-> --project <uuid> --server <uuid>
@@ -111,7 +130,9 @@ COMMANDS
       family (defaults to application).
 
   env list <uuid> [--type application|service]
-      List environment variables for an application or service.
+      List environment variables for an application or service. Every row has
+      `value_hidden`; true means Coolify redacted the value (normally because
+      the token lacks effective read:sensitive access), not that it is empty.
   env set <uuid> <KEY> <VALUE> [--type application|service]
       Set or update an environment variable. For secrets, omit VALUE to read
       from stdin (one line, no echo). Write verb - requires allow_write.
@@ -124,7 +145,7 @@ COMMANDS
 Contract commands (the same on every capability):
   coolify stub                                 One-line awareness text.
   coolify manifest --json                      Machine-readable declaration.
-  coolify guide [<topic>]                      Guide topics / one guide body.
+  coolify guide [headless-apps]                Guide topics / one guide body.
   coolify ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
               [--note <text>]                   (capabilities/coolify/identifiers.json).
   coolify refs                                 Menu of the project's reference files.
@@ -166,10 +187,14 @@ CRED_KEYS = [
     {"key": "COOLIFY_TOKEN", "secret": True, "required": True,
      "note": "API token (Dashboard → Keys & Tokens → API tokens), team-scoped"},
 ]
-WRITE_VERBS = {"deploy", "start", "stop", "restart", "env"}   # verbs that mutate the instance
+WRITE_VERBS = {
+    "deploy", "start", "stop", "restart", "env",
+    "projects", "app", "service",
+}   # verbs that mutate the instance
 WRITE_DEFAULT = True    # writes stay inside an instance the consumer owns
-DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
-TOPICS: list = []   # shipped guide topics
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/coolify/guides/")
+TOPICS = ["headless-apps"]
 STATE = False       # True when the capability writes session/cache state
 POST_INSTALL: list = []
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
@@ -721,6 +746,14 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
 SLIM_FIELDS = ("uuid", "name", "description", "status", "type", "fqdn",
                "domains", "git_repository", "git_branch", "server_uuid",
                "environment_name", "image", "created_at", "updated_at")
+GITHUB_SOURCE_FIELDS = (
+    "uuid", "id", "name", "organization", "html_url", "api_url",
+    "is_system_wide", "is_public", "type",
+)
+PRIVATE_KEY_SOURCE_FIELDS = (
+    "uuid", "id", "name", "description", "fingerprint", "is_git_related",
+    "created_at", "updated_at",
+)
 
 
 def _slim(item):
@@ -738,6 +771,21 @@ def _slim_list(items):
     if isinstance(items, list):
         return [_slim(i) for i in items]
     return items
+
+
+def _list_data(value) -> list:
+    """Return a list from Coolify's bare-list or {"data": [...]} responses."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("data"), list):
+        return value["data"]
+    return []
+
+
+def _pick_fields(item, fields: tuple[str, ...]) -> dict:
+    if not isinstance(item, dict):
+        return {}
+    return {field: item[field] for field in fields if field in item}
 
 
 def _build_conn(cid: str, entry: dict | None, args) -> tuple[dict | None, dict | None]:
@@ -903,6 +951,81 @@ LIFECYCLE_PATHS = {"application": "applications", "service": "services",
                    "database": "databases"}
 
 
+def _probe_effective_ability(c: httpx.Client, path: str) -> bool | None:
+    """Probe middleware with a GET route that cannot mutate state.
+
+    Coolify intentionally exposes GET shims for POST-only write/deploy
+    endpoints. The ability middleware runs before the shim returns its
+    "POST required" response, so a 403 means the token cannot perform the
+    action while any ordinary 4xx means it passed the ability check.
+    """
+    response = c.get(path)
+    if response.status_code == 403:
+        return False
+    if response.status_code in (401, 429) or response.status_code >= 500:
+        return None
+    return True
+
+
+def _probe_sensitive_read(c: httpx.Client) -> bool | None:
+    """Infer effective read:sensitive from redaction on a secret-bearing row.
+
+    Coolify does not expose the stored Sanctum ability list. A private key is
+    the cheapest reliable sentinel; if the team has none, inspect a bounded
+    number of application env lists. No sentinel means "unknown", never a
+    guessed false.
+    """
+    response = c.get("/security/keys")
+    if response.status_code == 200:
+        try:
+            keys = _list_data(response.json())
+        except ValueError:
+            keys = []
+        if keys:
+            return any(isinstance(key, dict) and "private_key" in key for key in keys)
+
+    response = c.get("/applications")
+    if response.status_code != 200:
+        return None
+    try:
+        applications = _list_data(response.json())
+    except ValueError:
+        return None
+    for application in applications[:3]:
+        if not isinstance(application, dict) or not application.get("uuid"):
+            continue
+        env_response = c.get(f"/applications/{application['uuid']}/envs")
+        if env_response.status_code != 200:
+            continue
+        try:
+            envs = _list_data(env_response.json())
+        except ValueError:
+            continue
+        if envs:
+            return any(
+                isinstance(env, dict)
+                and (env.get("value") is not None or env.get("real_value") is not None)
+                for env in envs
+            )
+    return None
+
+
+def _detect_effective_abilities(c: httpx.Client) -> dict:
+    """Report what this token can effectively do without changing resources."""
+    return {
+        "read": True,
+        "read:sensitive": _probe_sensitive_read(c),
+        "write": _probe_effective_ability(c, "/enable"),
+        "deploy": _probe_effective_ability(c, "/deploy"),
+        "root": None,
+        "detection": (
+            "effective non-mutating probes; Coolify does not expose the stored "
+            "token ability list, and root cannot be distinguished from a token "
+            "that has each individual ability"
+        ),
+    }
+
+
 def _check_connection(conn: dict) -> dict:
     """One connection's round-trip, reported rather than died — doctor covers
     every connection, so a broken one becomes a finding, not a stop."""
@@ -926,6 +1049,7 @@ def _check_connection(conn: dict) -> dict:
                 team = {}
             if isinstance(team, dict):
                 out["team"] = {"id": team.get("id"), "name": team.get("name")}
+            out["abilities"] = _detect_effective_abilities(c)
     except httpx.RequestError as e:
         return out | {"ok": False, "category": 5, "error": f"network error: {e}"}
     except ValueError as e:
@@ -968,6 +1092,20 @@ def cmd_collection(c, base_path: str, uuid: str | None):
     return _slim_list(_request(c, "GET", f"/{base_path}"))
 
 
+def cmd_sources(c):
+    """List source UUIDs without ever returning private key material."""
+    github_apps = _list_data(_request(c, "GET", "/github-apps"))
+    private_keys = _list_data(_request(c, "GET", "/security/keys"))
+    return {
+        "github_apps": [
+            _pick_fields(item, GITHUB_SOURCE_FIELDS) for item in github_apps
+        ],
+        "private_deploy_keys": [
+            _pick_fields(item, PRIVATE_KEY_SOURCE_FIELDS) for item in private_keys
+        ],
+    }
+
+
 def cmd_logs(c, uuid: str, lines: int):
     return _request(c, "GET", f"/applications/{uuid}/logs", params={"lines": lines})
 
@@ -997,9 +1135,30 @@ def _normalize_env_list(response):
     return []
 
 
+def _annotate_env_visibility(response):
+    """Make Coolify redaction explicit instead of presenting null as a value."""
+    annotated = []
+    for entry in _normalize_env_list(response):
+        if not isinstance(entry, dict):
+            annotated.append(entry)
+            continue
+        item = dict(entry)
+        hidden = item.get("value") is None and item.get("real_value") is None
+        item["value_hidden"] = hidden
+        if hidden:
+            item["value_hidden_reason"] = (
+                "Coolify withheld this value; the token may lack effective "
+                "read:sensitive access or the variable may be show-once"
+            )
+        annotated.append(item)
+    return annotated
+
+
 def cmd_env_list(c, uuid: str):
     """List environment variables for an application."""
-    return _request(c, "GET", f"/applications/{uuid}/envs")
+    return _annotate_env_visibility(
+        _request(c, "GET", f"/applications/{uuid}/envs")
+    )
 
 
 def cmd_env_set(c, uuid: str, key: str, value: str):
@@ -1060,7 +1219,9 @@ def cmd_env_rm(c, uuid: str, key: str):
 def cmd_env_list_typed(c, uuid: str, rtype: str):
     """List environment variables for an application or service."""
     base = "applications" if rtype == "application" else "services"
-    return _request(c, "GET", f"/{base}/{uuid}/envs")
+    return _annotate_env_visibility(
+        _request(c, "GET", f"/{base}/{uuid}/envs")
+    )
 
 
 def cmd_env_set_typed(c, uuid: str, key: str, value: str, rtype: str):
@@ -1133,7 +1294,10 @@ def cmd_env_bulk(c, uuid: str, env_data: str, rtype: str):
     if not env_vars:
         _die(6, "input", "no valid KEY=VALUE pairs found in input")
 
-    return _request(c, "PATCH", f"/{base}/{uuid}/envs/bulk", json_body=env_vars)
+    return _request(
+        c, "PATCH", f"/{base}/{uuid}/envs/bulk",
+        json_body={"data": env_vars},
+    )
 
 
 def cmd_projects_create(c, name: str, description: str | None):
@@ -1145,16 +1309,48 @@ def cmd_projects_create(c, name: str, description: str | None):
     return result
 
 
+APP_PATCH_FIELDS = (
+    ("name", "name"),
+    ("domains", "domains"),
+    ("ports_exposes", "ports_exposes"),
+    ("base_directory", "base_directory"),
+    ("dockerfile_location", "dockerfile_location"),
+    ("docker_compose_location", "docker_compose_location"),
+    ("build_pack", "build_pack"),
+    ("git_repository", "git_repository"),
+    ("git_branch", "git_branch"),
+    ("health_check_enabled", "health_check_enabled"),
+    ("health_check_path", "health_check_path"),
+    ("health_check_port", "health_check_port"),
+    ("health_check_host", "health_check_host"),
+    ("health_check_scheme", "health_check_scheme"),
+    ("health_check_return_code", "health_check_return_code"),
+    ("health_check_interval", "health_check_interval"),
+    ("health_check_timeout", "health_check_timeout"),
+    ("health_check_retries", "health_check_retries"),
+    ("health_check_start_period", "health_check_start_period"),
+)
+
+
+def _app_patch_payload(args) -> dict:
+    """Map only explicitly supplied argparse values to Coolify API fields."""
+    payload = {}
+    for attribute, field in APP_PATCH_FIELDS:
+        value = getattr(args, attribute, None)
+        if value is not None:
+            payload[field] = value
+    return payload
+
+
 def cmd_app_create(c, args):
     """Create an application with various source types."""
-    import base64
-
     # Build the payload - common fields
     payload = {
         "project_uuid": args.project,
         "server_uuid": args.server,
         "environment_name": args.environment,
     }
+    payload.update(_app_patch_payload(args))
 
     # Optional common fields
     if hasattr(args, 'name') and args.name:
@@ -1208,6 +1404,16 @@ def cmd_app_create(c, args):
     return _request(c, "POST", endpoint, json_body=payload)
 
 
+def cmd_app_update(c, args):
+    """Patch only the application fields supplied on the command line."""
+    payload = _app_patch_payload(args)
+    if not payload:
+        _die(6, "input", "app update requires at least one field flag")
+    return _request(
+        c, "PATCH", f"/applications/{args.uuid}", json_body=payload,
+    )
+
+
 def cmd_service_create(c, args):
     """Create a service from docker-compose file."""
     import base64
@@ -1238,6 +1444,63 @@ def cmd_service_create(c, args):
     return _request(c, "POST", "/services", json_body=payload)
 
 
+def _add_app_patch_arguments(parser: argparse.ArgumentParser) -> None:
+    """Arguments shared by application creation and PATCH updates."""
+    parser.add_argument("--name", help="application name")
+    parser.add_argument(
+        "--domains",
+        help="comma-separated application URLs; pass an empty string to clear",
+    )
+    parser.add_argument(
+        "--ports-exposes", dest="ports_exposes",
+        help="comma-separated container ports exposed by the application",
+    )
+    parser.add_argument(
+        "--base-directory", dest="base_directory",
+        help="repository subdirectory used as build context (for example /mcp-server)",
+    )
+    parser.add_argument(
+        "--dockerfile-location", dest="dockerfile_location",
+        help="Dockerfile path relative to base directory (for example /Dockerfile)",
+    )
+    parser.add_argument(
+        "--docker-compose-location", dest="docker_compose_location",
+        help="Docker Compose path relative to base directory",
+    )
+    parser.add_argument(
+        "--build-pack", dest="build_pack",
+        choices=["nixpacks", "railpack", "static", "dockerfile", "dockercompose"],
+    )
+    parser.add_argument(
+        "--git-repository", dest="git_repository", help="git repository URL",
+    )
+    parser.add_argument("--git-branch", dest="git_branch", help="git branch")
+    parser.add_argument(
+        "--health-check-enabled", dest="health_check_enabled",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="enable or disable the application health check",
+    )
+    parser.add_argument("--health-check-path", dest="health_check_path")
+    parser.add_argument("--health-check-port", dest="health_check_port")
+    parser.add_argument("--health-check-host", dest="health_check_host")
+    parser.add_argument("--health-check-scheme", dest="health_check_scheme")
+    parser.add_argument(
+        "--health-check-return-code", dest="health_check_return_code", type=int,
+    )
+    parser.add_argument(
+        "--health-check-interval", dest="health_check_interval", type=int,
+    )
+    parser.add_argument(
+        "--health-check-timeout", dest="health_check_timeout", type=int,
+    )
+    parser.add_argument(
+        "--health-check-retries", dest="health_check_retries", type=int,
+    )
+    parser.add_argument(
+        "--health-check-start-period", dest="health_check_start_period", type=int,
+    )
+
+
 # ── dispatch ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1257,6 +1520,7 @@ def main() -> None:
     sub.add_parser("help")
     sub.add_parser("doctor")
     sub.add_parser("resources")
+    sub.add_parser("sources")
 
     # projects with create subcommand
     sp = sub.add_parser("projects")
@@ -1285,29 +1549,27 @@ def main() -> None:
         sp.add_argument("--type", dest="rtype", default="application",
                         choices=["application", "service", "database"])
 
-    # app create
-    sp = sub.add_parser("app", help="create application")
+    # app create/update
+    sp = sub.add_parser("app", help="create or update an application")
     app_sub = sp.add_subparsers(dest="app_cmd", required=True)
     sp_create = app_sub.add_parser("create", help="create application")
     sp_create.add_argument("--project", required=True, help="project UUID")
     sp_create.add_argument("--server", required=True, help="server UUID")
     sp_create.add_argument("--environment", required=True, help="environment name")
-    sp_create.add_argument("--name", help="application name")
-    sp_create.add_argument("--domains", help="comma-separated domains")
-    sp_create.add_argument("--ports-exposes", dest="ports_exposes", help="exposed ports")
+    _add_app_patch_arguments(sp_create)
     sp_create.add_argument("--instant-deploy", dest="instant_deploy", action="store_true")
     sp_create.add_argument("--destination", help="destination UUID")
     # Source type flags
-    sp_create.add_argument("--git-repository", dest="git_repository", help="git repository URL")
-    sp_create.add_argument("--git-branch", dest="git_branch", help="git branch")
-    sp_create.add_argument("--build-pack", dest="build_pack",
-                          choices=["nixpacks", "railpack", "static", "dockerfile", "dockercompose"])
-    sp_create.add_argument("--docker-compose-location", dest="docker_compose_location")
-    sp_create.add_argument("--dockerfile-location", dest="dockerfile_location")
     sp_create.add_argument("--private-deploy-key", dest="private_deploy_key", help="deploy key UUID")
     sp_create.add_argument("--github-app", dest="github_app", help="GitHub app UUID")
     sp_create.add_argument("--image", help="registry image (name:tag)")
     sp_create.add_argument("--dockerfile", help="inline dockerfile (file path or - for stdin)")
+
+    sp_update = app_sub.add_parser(
+        "update", help="patch supplied application fields only",
+    )
+    sp_update.add_argument("uuid", help="application UUID")
+    _add_app_patch_arguments(sp_update)
 
     # service create
     sp = sub.add_parser("service", help="create service")
@@ -1356,12 +1618,18 @@ def main() -> None:
 
     conn = _resolve_conn(args)
 
-    # Determine if this is a write operation for gate check
-    is_write = args.cmd in WRITE_VERBS
-    if args.cmd == "projects" and hasattr(args, "subcmd") and args.subcmd == "create":
-        is_write = True
-    elif args.cmd in ("app", "service"):
-        is_write = True
+    # Determine the exact subcommand's policy. Read siblings under a mutating
+    # command family (notably `env list`) must remain usable on read-only
+    # connections.
+    is_write = (
+        args.cmd in {"deploy", "start", "stop", "restart", "app", "service"}
+        or (
+            args.cmd == "projects"
+            and hasattr(args, "subcmd")
+            and args.subcmd == "create"
+        )
+        or (args.cmd == "env" and args.env_cmd != "list")
+    )
 
     if is_write:
         _write_gate(conn["id"], conn["allow_write"], args.cmd)
@@ -1369,6 +1637,8 @@ def main() -> None:
     with _client(conn) as c:
         if args.cmd == "resources":
             _emit(_slim_list(_request(c, "GET", "/resources")))
+        elif args.cmd == "sources":
+            _emit(cmd_sources(c))
         elif args.cmd == "projects":
             if hasattr(args, "subcmd") and args.subcmd == "create":
                 if not args.name:
@@ -1388,6 +1658,8 @@ def main() -> None:
         elif args.cmd == "app":
             if args.app_cmd == "create":
                 _emit(cmd_app_create(c, args))
+            elif args.app_cmd == "update":
+                _emit(cmd_app_update(c, args))
             else:
                 _die(6, "unknown_command", f"no handler for app {args.app_cmd!r}")
         elif args.cmd == "service":
