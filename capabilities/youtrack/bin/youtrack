@@ -44,6 +44,11 @@ Read:
   youtrack users me                          Current YouTrack user.
   youtrack projects find [SUBSTRING]         Projects visible to the token;
                                              optional substring match on name.
+  youtrack projects fields list ID           Custom-field schema for a project:
+                                             name, type, multiValue, required,
+                                             and allowed values where bundled.
+  youtrack projects fields get ID NAME       One field's schema; NAME matches
+                                             case-insensitively.
   youtrack issues get ISSUE                  Read one issue (ID or URL).
   youtrack issues search QUERY [--limit N]   Search issues server-side using
                                              YouTrack query language.
@@ -806,6 +811,48 @@ def projects_find(c, a):
     return _request(c, "GET", "/admin/projects", params=params)
 
 
+PROJECT_FIELD_FIELDS = ("id,canBeEmpty,field(id,name,fieldType(id,isMultiValue)),"
+                        "$type,bundle(id,values(name),aggregatedUsers(login))")
+
+
+def _shape_project_field(entry):
+    field = entry.get("field") or {}
+    ftype = field.get("fieldType") or {}
+    bundle = entry.get("bundle") or {}
+    users = [u.get("login") for u in (bundle.get("aggregatedUsers") or [])]
+    names = [v.get("name") for v in (bundle.get("values") or [])]
+    # A user field's bundle carries display names under `values` and logins
+    # under `aggregatedUsers`; writes need the login, so prefer it.
+    values = users or names
+    return {"name": field.get("name"),
+            "type": ftype.get("id"),
+            "multiValue": bool(ftype.get("isMultiValue")),
+            "required": not entry.get("canBeEmpty", True),
+            "values": values or None}
+
+
+def _project_fields(c, project):
+    raw = _request(c, "GET", f"/admin/projects/{project}/customFields",
+                   params={"fields": PROJECT_FIELD_FIELDS, "$top": 200})
+    return [_shape_project_field(e) for e in raw]
+
+
+def projects_fields_list(c, a):
+    return _project_fields(c, a.project)
+
+
+def projects_fields_get(c, a):
+    fields = _project_fields(c, a.project)
+    wanted = a.name.strip().casefold()
+    for field in fields:
+        if (field["name"] or "").casefold() == wanted:
+            return field
+    known = ", ".join(sorted(f["name"] for f in fields if f["name"]))
+    _die(3, "not_found",
+         f"no custom field named {a.name!r} on project {a.project!r}",
+         f"available: {known}")
+
+
 def issues_get(c, a):
     return _flatten_custom_fields(
         _request(c, "GET", f"/issues/{_issue_ref(a.issue)}",
@@ -928,6 +975,8 @@ ARG_LIMIT50       = (("--limit",), {"type": int, "default": 50})
 ARG_LIMIT100      = (("--limit",), {"type": int, "default": 100})
 ARG_PROJECT_REQ   = (("--project",), {"required": True})
 ARG_PROJECT_OPT   = (("--project",), {})
+ARG_PROJECT_POS   = (("project",), {})
+ARG_FIELD_NAME    = (("name",), {})
 ARG_SUMMARY_REQ   = (("--summary",), {"required": True})
 ARG_SUMMARY_OPT   = (("--summary",), {})
 ARG_DESCRIPTION   = (("--description",), {})
@@ -939,6 +988,8 @@ ARG_PARENT        = (("--parent",), {})
 COMMANDS = {
     ("users", "me"):                  (users_me, []),
     ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT]),
+    ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
+    ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
     ("issues", "get"):                (issues_get, [ARG_ISSUE]),
     ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100]),
     ("issues", "create"):             (issues_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,

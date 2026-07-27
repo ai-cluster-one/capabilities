@@ -177,6 +177,62 @@ def test_projects_find_smoke(tmp_path):
     assert "query=Demo" in ProjectsHandler.requests[0]
 
 
+PROJECT_FIELDS_PAYLOAD = [
+    {"id": "1", "canBeEmpty": False, "$type": "EnumProjectCustomField",
+     "field": {"name": "Priority", "fieldType": {"id": "enum[1]", "isMultiValue": False}},
+     "bundle": {"id": "b1", "values": [{"name": "Critical"}, {"name": "Normal"}]}},
+    {"id": "2", "canBeEmpty": True, "$type": "UserProjectCustomField",
+     "field": {"name": "Assignee", "fieldType": {"id": "user[1]", "isMultiValue": False}},
+     "bundle": {"id": "b2", "values": [{"name": "Sergey Royz"}],
+                "aggregatedUsers": [{"login": "s.royz"}, {"login": "j.howell"}]}},
+    {"id": "3", "canBeEmpty": True, "$type": "SimpleProjectCustomField",
+     "field": {"name": "Points", "fieldType": {"id": "integer", "isMultiValue": False}},
+     "bundle": None},
+]
+
+
+class ProjectFieldsHandler(Handler):
+    requests = []
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, self.headers, None))
+        if "/customFields" in self.path:
+            self._reply(PROJECT_FIELDS_PAYLOAD)
+        else:
+            self._reply({"error": "missing"}, 404)
+
+
+def test_projects_fields_list_shapes_schema(tmp_path):
+    ProjectFieldsHandler.requests = []
+    with serve(ProjectFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        {"name": "Priority", "type": "enum[1]", "multiValue": False,
+         "required": True, "values": ["Critical", "Normal"]},
+        {"name": "Assignee", "type": "user[1]", "multiValue": False,
+         "required": False, "values": ["s.royz", "j.howell"]},
+        {"name": "Points", "type": "integer", "multiValue": False,
+         "required": False, "values": None},
+    ]
+
+
+def test_projects_fields_get_is_case_insensitive(tmp_path):
+    ProjectFieldsHandler.requests = []
+    with serve(ProjectFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "fields", "get", "0-6", "priority")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["name"] == "Priority"
+
+
+def test_projects_fields_get_unknown_field_exits_3(tmp_path):
+    ProjectFieldsHandler.requests = []
+    with serve(ProjectFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "fields", "get", "0-6", "Nope")
+    assert result.returncode == 3
+    assert "Priority" in result.stderr
+
+
 def test_issues_get_smoke(tmp_path):
     class IssueGetHandler(BaseHTTPRequestHandler):
         requests = []
