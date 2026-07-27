@@ -36,8 +36,10 @@ def test_every_documented_command_exists():
     paths = _command_paths()
     documented = set()
     for line in doc.splitlines():
+        if not line.startswith("  "):
+            continue
         parts = line.strip().split()
-        if len(parts) >= 3 and parts[0] == "youtrack" and parts[1] not in contract:
+        if len(parts) >= 2 and parts[0] == "youtrack" and parts[1] not in contract:
             for width in (3, 2):
                 if tuple(parts[1:1 + width]) in paths:
                     documented.add(tuple(parts[1:1 + width]))
@@ -92,6 +94,141 @@ def run_cli(tmp_path, base_url, *args):
         [str(CLI), *args], cwd=tmp_path, env=env, text=True,
         capture_output=True, timeout=30,
     )
+
+
+def test_users_me_smoke(tmp_path):
+    class UsersMeHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps({"id": "1-1", "login": "agent"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    UsersMeHandler.requests = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), UsersMeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        result = run_cli(tmp_path, base_url, "users", "me")
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["login"] == "agent"
+    assert UsersMeHandler.requests[0].startswith("/api/users/me?")
+
+
+def test_projects_find_smoke(tmp_path):
+    class ProjectsHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps([
+                {"id": "0-6", "name": "Demo", "shortName": "DEMO"},
+            ]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    ProjectsHandler.requests = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ProjectsHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        result = run_cli(tmp_path, base_url, "projects", "find", "Demo")
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert result.returncode == 0, result.stderr
+    parsed = json.loads(result.stdout)
+    assert parsed[0]["shortName"] == "DEMO"
+    assert ProjectsHandler.requests[0].startswith("/api/admin/projects?")
+    assert "query=Demo" in ProjectsHandler.requests[0]
+
+
+def test_issues_get_smoke(tmp_path):
+    class IssueGetHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps({"id": "1-1", "idReadable": "DEMO-1",
+                               "summary": "First issue"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    IssueGetHandler.requests = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), IssueGetHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        result = run_cli(tmp_path, base_url, "issues", "get", "DEMO-1")
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["idReadable"] == "DEMO-1"
+    assert IssueGetHandler.requests[0].startswith("/api/issues/DEMO-1?")
+
+
+def test_issues_comments_list_smoke(tmp_path):
+    class IssueCommentsHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps([{"id": "4-1", "text": "A note"}]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    IssueCommentsHandler.requests = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), IssueCommentsHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        result = run_cli(tmp_path, base_url, "issues", "comments", "list", "DEMO-1", "--limit", "5")
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)[0]["text"] == "A note"
+    assert IssueCommentsHandler.requests[0].startswith("/api/issues/DEMO-1/comments?")
+    assert ("$top=5" in IssueCommentsHandler.requests[0]
+            or "%24top=5" in IssueCommentsHandler.requests[0])
 
 
 def test_create_and_comment_payloads(tmp_path):

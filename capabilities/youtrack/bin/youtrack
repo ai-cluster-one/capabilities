@@ -6,7 +6,7 @@
 # ]
 # ///
 """
-Agent-first CLI for YouTrack issues and knowledge-base articles.
+youtrack — agent-first CLI for YouTrack issues and knowledge-base articles.
 
 Run `youtrack help` before use; this is the complete contract.
 
@@ -760,10 +760,9 @@ ARTICLE_LIST_FIELDS = ("id,idReadable,summary,updated,"
                        "project(id,name,shortName),parentArticle(idReadable)")
 ARTICLE_COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 
-def _positive_limit(value: int) -> int:
+def _positive_limit(value: int) -> None:
     if value < 1:
         _die(6, "input", "--limit must be positive")
-    return value
 
 
 def users_me(c, a):

@@ -35,14 +35,14 @@ after the first sentence should already have the correct takeaway.
 ## Update in place; don't fork the tree
 
 Before creating a new article, check whether an existing one already owns the
-topic. Prefer `article-update` to revise it in place over `article-create`-ing
+topic. Prefer `articles update` to revise it in place over `articles create`-ing
 a near-duplicate: duplicates drift apart as one copy gets corrected and the
 other does not, and they compete for the same reader's attention in search
 and listings.
 
 ## Read the tree before you place new material
 
-`youtrack article ID` returns an article's `parentArticle` and `childArticles`
+`youtrack articles get ID` returns an article's `parentArticle` and `childArticles`
 references alongside its summary and content. Read these before adding a
 sibling or a child: a new article belongs under the existing node that owns
 its topic, not floating at the project root because that was the easiest
