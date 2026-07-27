@@ -1,6 +1,6 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status:** design approved, nothing built. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
+**Status:** M1 shipped (PR #14, catalog repair in #15). M2–M4 outstanding. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
 
 **Base:** `upstream/main` (`ai-cluster-one/capabilities`), which carries the knowledge-base article verbs merged in PR #13. The `zjor/capabilities` fork's `main` runs behind upstream — branch from `upstream/main`, not `origin/main`.
 
@@ -263,9 +263,9 @@ The table also enables a **drift test**: assert every `COMMANDS` key appears in 
 
 # Milestones
 
-## M1 — See the fields, and land the grammar
+## M1 — See the fields, and land the grammar — ✅ SHIPPED
 
-Read-only plus the rename. No write risk; unblocks M2.
+Read-only plus the rename. No write risk; unblocks M2. Landed in PR #14; the catalog reindex it omitted landed in PR #15 (see Verification).
 
 1. **Noun-verb conversion of the existing surface**, flat verbs removed. Cheapest now, while there are six verbs.
 2. **`issues get` returns custom fields.** Extend `ISSUE_FIELDS` to `customFields(id,name,$type,value(id,name,login,fullName,text,minutes,presentation))` and flatten to the `fields` map above.
@@ -309,12 +309,30 @@ M2 before M3 because assignment, linking, and paging are conveniences atop a cap
 
 # Verification
 
-Per the repo loop: change → `capabilities audit youtrack --from .` → commit → reinstall (`capabilities install youtrack --from capabilities/youtrack/bin/youtrack`) → verify in the ionwater consumer **as a sub-agent**, never in the main context.
+Per the repo loop: change → `capabilities audit youtrack --from .` → **reindex the catalog** (below) → commit → reinstall → verify in the ionwater consumer **as a sub-agent**, never in the main context.
 
-`tests/test_youtrack.py` covers the existing verbs; extend per milestone. Three tests are load-bearing:
+## Reindex `.capability-source/catalog.json` in the same PR
+
+**Any change to a capability's payload or its manifest `summary` must reindex the source catalog in the same commit.** `.capability-source/catalog.json` records a `payload_sha256` and `summary` per capability, and `capabilities install <name> --source <id>` refuses with `catalog_drift` (exit 7) when either disagrees with the payload. M1 shipped without this and left `main` uninstallable until a follow-up PR; three review passes missed it because the catalog sits outside `capabilities/<name>/` and nothing in the plan pointed at it.
+
+`capabilities source index <id>` does **not** fix a git-backed source: it rewrites the cached clone's catalog, and the next `install` re-clones and restores the committed one. The committed file is what has to change.
+
+The reliable way to regenerate it — the hash covers `capabilities/<name>/` recursively, skipping `meta.json`, `stub`, `manifest.json`, `__pycache__`, and `.pyc`/`.pyo`/`.session*`, feeding `<relpath>\0<bytes>\0` per file in sorted order into one sha256:
+
+1. Recompute every entry with that algorithm and confirm the **unchanged** capabilities reproduce byte-for-byte. If they do not, the algorithm has drifted from `_payload_sha256` in `bin/capabilities` — read it there rather than guessing.
+2. Update only the changed capability's `payload_sha256` and `summary` (the latter from `<name> manifest --json`).
+3. Write with the manager's own conventions — `json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"` — so the diff carries no reformatting noise.
+4. Cross-check against `capabilities source index <id>` run on the same tree, reading the cached catalog **before** any `install` re-clones over it.
+
+## Tests
+
+`tests/test_youtrack.py` covers the existing verbs; extend per milestone. Four tests are load-bearing:
 
 - **One per field type** in the marshalling table — the one place a wrong constant produces a plausible-looking request that YouTrack rejects or, worse, silently drops.
-- **The COMMANDS/docstring drift test** described above.
+- **The COMMANDS/docstring drift tests** described above.
+- **`WRITE_VERBS ⊆ COMMANDS`** — the two are coupled by stringly-typed joined paths, so a typo silently disables the `allow_write` gate for that verb.
 - **Atomicity**: a create with one invalid field among many issues no HTTP request at all.
 
-After the M1 rename lands, run `contextkit build` in the ionwater consumer so its generated context reflects the new surface.
+## Consumer refresh
+
+After a surface change lands and is installed, rebuild the ionwater consumer's context. `contextkit build` alone writes **only the codex target** — the claude target needs `contextkit build --target claude` explicitly. Both files are gitignored build artifacts, so there is nothing to commit; they must be rebuilt per machine.
