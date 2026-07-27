@@ -749,8 +749,12 @@ def _request(client: httpx.Client, method: str, path: str, **kwargs):
 
 USER_FIELDS = "id,login,name,fullName,email"
 PROJECT_FIELDS = "id,name,shortName"
-ISSUE_FIELDS = "id,idReadable,summary,description,created,updated,resolved,project(id,name,shortName),reporter(id,login,fullName)"
-ISSUE_SEARCH_FIELDS = "id,idReadable,summary,description,customFields(name,value(name))"
+_CF_PROJECTION = ("customFields(id,name,$type,"
+                  "value(id,name,login,fullName,text,minutes,presentation))")
+ISSUE_FIELDS = ("id,idReadable,summary,description,created,updated,resolved,"
+                "project(id,name,shortName),reporter(id,login,fullName),"
+                + _CF_PROJECTION)
+ISSUE_SEARCH_FIELDS = ("id,idReadable,summary,description," + _CF_PROJECTION)
 COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 ARTICLE_FIELDS = ("id,idReadable,summary,content,created,updated,"
                   "project(id,name,shortName),reporter(id,login,fullName),"
@@ -765,6 +769,31 @@ def _positive_limit(value: int) -> None:
         _die(6, "input", "--limit must be positive")
 
 
+# Read order matters: a User value carries both `login` and `name`, and the
+# login is what writes need. Bundle elements (Enum/State/Owned/Version/Build)
+# carry `name`; text fields `text`; periods `presentation`.
+_VALUE_KEYS = ("login", "name", "text", "presentation")
+
+
+def _flatten_value(value):
+    if isinstance(value, list):
+        return [_flatten_value(item) for item in value]
+    if isinstance(value, dict):
+        for key in _VALUE_KEYS:
+            if value.get(key) is not None:
+                return value[key]
+        return value.get("id")
+    return value
+
+
+def _flatten_custom_fields(issue):
+    if not isinstance(issue, dict) or "customFields" not in issue:
+        return issue
+    fields = issue.pop("customFields") or []
+    issue["fields"] = {f["name"]: _flatten_value(f.get("value")) for f in fields}
+    return issue
+
+
 def users_me(c, a):
     return _request(c, "GET", "/users/me", params={"fields": USER_FIELDS})
 
@@ -777,8 +806,9 @@ def projects_find(c, a):
 
 
 def issues_get(c, a):
-    return _request(c, "GET", f"/issues/{_issue_ref(a.issue)}",
-                    params={"fields": ISSUE_FIELDS})
+    return _flatten_custom_fields(
+        _request(c, "GET", f"/issues/{_issue_ref(a.issue)}",
+                 params={"fields": ISSUE_FIELDS}))
 
 
 def issues_create(c, a):
@@ -799,20 +829,10 @@ def issues_update(c, a):
 
 def issues_search(c, a):
     _positive_limit(a.limit)
-    params = {"fields": ISSUE_SEARCH_FIELDS, "query": a.query,
-              "customFields": "State", "$top": a.limit}
-    result = _request(c, "GET", "/issues", params=params)
-
-    def extract_state(issue):
-        for field in (issue.get("customFields") or []):
-            if field.get("name") == "State":
-                value = field.get("value")
-                return value.get("name") if isinstance(value, dict) else value
-        return None
-
-    return [{"id": i["id"], "idReadable": i["idReadable"],
-             "summary": i["summary"], "description": i.get("description"),
-             "State": extract_state(i)} for i in result]
+    result = _request(c, "GET", "/issues",
+                      params={"fields": ISSUE_SEARCH_FIELDS, "query": a.query,
+                              "$top": a.limit})
+    return [_flatten_custom_fields(i) for i in result]
 
 
 def issues_comments_list(c, a):

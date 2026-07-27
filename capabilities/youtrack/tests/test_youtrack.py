@@ -1,4 +1,5 @@
 import ast
+import contextlib
 import json
 import os
 import subprocess
@@ -94,6 +95,18 @@ def run_cli(tmp_path, base_url, *args):
         [str(CLI), *args], cwd=tmp_path, env=env, text=True,
         capture_output=True, timeout=30,
     )
+
+
+@contextlib.contextmanager
+def serve(handler_cls):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join()
 
 
 def test_users_me_smoke(tmp_path):
@@ -330,13 +343,89 @@ def test_issues_http_request_and_parsing(tmp_path):
     parsed = json.loads(result.stdout)
     assert len(parsed) == 2
     assert parsed[0]["idReadable"] == "DEMO-1"
-    assert parsed[0]["State"] == "Open"
+    assert parsed[0]["fields"]["State"] == "Open"
+    assert "customFields" not in parsed[0]
     assert parsed[1]["idReadable"] == "DEMO-2"
-    assert parsed[1]["State"] == "In Progress"
+    assert parsed[1]["fields"]["State"] == "In Progress"
     assert "query=state%3AOpen" in IssuesHandler.requests[0][1]
     assert "$top=10" in IssuesHandler.requests[0][1] or "%24top=10" in IssuesHandler.requests[0][1]
-    assert "customFields=State" in IssuesHandler.requests[0][1]
+    assert "customFields=State" not in IssuesHandler.requests[0][1]
     assert "$top=100" in IssuesHandler.requests[1][1] or "%24top=100" in IssuesHandler.requests[1][1]
+
+
+ISSUE_WITH_FIELDS = {
+    "id": "2-1", "idReadable": "DEMO-1", "summary": "s", "description": "d",
+    "customFields": [
+        {"name": "Assignee", "$type": "SingleUserIssueCustomField",
+         "value": {"login": "s.royz", "name": "Sergey Royz", "id": "1-1"}},
+        {"name": "State", "$type": "StateIssueCustomField",
+         "value": {"name": "Done", "id": "126-37"}},
+        {"name": "Points", "$type": "SimpleIssueCustomField", "value": 2},
+        {"name": "Original Estimate", "$type": "PeriodIssueCustomField",
+         "value": {"presentation": "1d", "minutes": 480, "id": "P1D"}},
+        {"name": "Acceptance Criteria", "$type": "TextIssueCustomField",
+         "value": {"id": "text", "text": "- one\n- two"}},
+        {"name": "Work Category", "$type": "MultiEnumIssueCustomField",
+         "value": [{"name": "Infrastructure", "id": "124-49"},
+                   {"name": "Technical Debt", "id": "124-50"}]},
+        {"name": "Requestor", "$type": "MultiUserIssueCustomField",
+         "value": [{"login": "k.shmidt", "name": "Kirill Shmidt", "id": "1-9"}]},
+        {"name": "Due Date", "$type": "DateIssueCustomField", "value": 1781534028493},
+        {"name": "Blocked Reason", "$type": "SingleEnumIssueCustomField", "value": None},
+    ],
+}
+
+
+class CustomFieldsHandler(Handler):
+    requests = []
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, self.headers, None))
+        if self.path.startswith("/api/issues/"):
+            self._reply(ISSUE_WITH_FIELDS)
+        elif self.path.startswith("/api/issues"):
+            self._reply([ISSUE_WITH_FIELDS])
+        else:
+            self._reply({"error": "missing"}, 404)
+
+
+def test_issues_get_flattens_custom_fields(tmp_path):
+    CustomFieldsHandler.requests = []
+    with serve(CustomFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    body = json.loads(result.stdout)
+    assert "customFields" not in body
+    assert body["fields"] == {
+        "Assignee": "s.royz",
+        "State": "Done",
+        "Points": 2,
+        "Original Estimate": "1d",
+        "Acceptance Criteria": "- one\n- two",
+        "Work Category": ["Infrastructure", "Technical Debt"],
+        "Requestor": ["k.shmidt"],
+        "Due Date": 1781534028493,
+        "Blocked Reason": None,
+    }
+
+
+def test_issues_get_requests_custom_fields(tmp_path):
+    CustomFieldsHandler.requests = []
+    with serve(CustomFieldsHandler) as base:
+        run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    path = [r[1] for r in CustomFieldsHandler.requests if r[0] == "GET"][0]
+    assert "customFields(" in path or "customFields%28" in path
+    assert "presentation" in path and "login" in path and "text" in path
+
+
+def test_issues_search_emits_same_fields_shape(tmp_path):
+    CustomFieldsHandler.requests = []
+    with serve(CustomFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO")
+    assert result.returncode == 0, result.stderr
+    row = json.loads(result.stdout)[0]
+    assert row["fields"]["State"] == "Done"
+    assert "customFields" not in row
 
 
 def test_update_requires_state(tmp_path):
