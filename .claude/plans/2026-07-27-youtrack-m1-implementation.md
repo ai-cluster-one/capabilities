@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, `httpx`, PEP-723 inline deps, `uv run --script`, pytest with a stub `ThreadingHTTPServer`.
 
-**Design source:** `.claude/plans/youtrack-mcp-parity.md`. Read its "The command surface" and "Field semantics" sections before starting.
+**Design source:** `.claude/plans/2026-07-27-youtrack-mcp-parity.md`. Read its "The command surface" and "Field semantics" sections before starting.
 
 ## Global Constraints
 
@@ -821,4 +821,4 @@ because writes take a login. This is the schema M2's marshalling reads."
 
 Run `contextkit build` in the ionwater consumer (`/Users/zjor/projects/ion/agents`) so its generated context reflects the new surface. The old flat verbs are gone and nothing aliases them.
 
-M2 begins with proving the write direction on a throwaway draft issue — see the marshalling table in `.claude/plans/youtrack-mcp-parity.md`.
+M2 begins with proving the write direction on a throwaway draft issue — see the marshalling table in `.claude/plans/2026-07-27-youtrack-mcp-parity.md`.
