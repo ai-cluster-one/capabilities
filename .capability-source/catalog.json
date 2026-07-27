@@ -122,8 +122,8 @@
     },
     "youtrack": {
       "path": "capabilities/youtrack",
-      "payload_sha256": "687423cb666591dc39b15e95247a2b8e7cda5ed9ec329c27cdf317c3a3c911fd",
-      "summary": "YouTrack CLI for issues (read/create/comment/update state) and the knowledge base (read, create, and update articles and article comments)."
+      "payload_sha256": "ee6f4cf1d0c8db08fa8f6089e527fc4a40440f7537176008afec53df6c030429",
+      "summary": "YouTrack CLI for issues (read/create/comment/update state), project custom-field schemas, and the knowledge base (read, create, and update articles and article comments)."
     }
   }
 }
