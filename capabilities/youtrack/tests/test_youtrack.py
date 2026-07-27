@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import subprocess
@@ -7,6 +8,43 @@ from pathlib import Path
 
 
 CLI = Path(__file__).parents[1] / "bin" / "youtrack"
+
+
+def _source_tree():
+    return ast.parse(CLI.read_text())
+
+
+def _command_paths():
+    for node in ast.walk(_source_tree()):
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", None) == "COMMANDS" for t in node.targets):
+            return {tuple(ast.literal_eval(k)) for k in node.value.keys}
+    raise AssertionError("COMMANDS table not found in bin/youtrack")
+
+
+def test_every_command_is_documented():
+    doc = ast.get_docstring(_source_tree())
+    missing = [" ".join(p) for p in sorted(_command_paths())
+               if f"youtrack {' '.join(p)}" not in doc]
+    assert not missing, f"commands absent from help docstring: {missing}"
+
+
+def test_every_documented_command_exists():
+    doc = ast.get_docstring(_source_tree())
+    contract = {"help", "connections", "doctor", "stub", "manifest", "guide",
+                "ids", "refs"}
+    paths = _command_paths()
+    documented = set()
+    for line in doc.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 3 and parts[0] == "youtrack" and parts[1] not in contract:
+            for width in (3, 2):
+                if tuple(parts[1:1 + width]) in paths:
+                    documented.add(tuple(parts[1:1 + width]))
+                    break
+            else:
+                documented.add(tuple(parts[1:3]))
+    assert documented <= paths, f"documented but not in COMMANDS: {sorted(documented - paths)}"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -63,9 +101,9 @@ def test_create_and_comment_payloads(tmp_path):
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_port}"
     try:
-        created = run_cli(tmp_path, base_url, "create", "--project", "0-0",
+        created = run_cli(tmp_path, base_url, "issues", "create", "--project", "0-0",
                           "--summary", "First issue", "--description", "Body")
-        commented = run_cli(tmp_path, base_url, "comment", "DEMO-1",
+        commented = run_cli(tmp_path, base_url, "issues", "comments", "add", "DEMO-1",
                             "--text", "A note")
     finally:
         server.shutdown()
@@ -93,20 +131,20 @@ def test_read_only_connection_refuses_create_before_network(tmp_path):
             "allow_write": False,
         }},
     }))
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "create",
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "create",
                      "--project", "0-0", "--summary", "blocked")
     assert result.returncode == 4
     assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
 
 
 def test_issues_requires_query(tmp_path):
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "issues")
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "search")
     assert result.returncode == 2
     assert "required: query" in result.stderr.lower()
 
 
 def test_issues_limit_must_be_positive(tmp_path):
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "state:Open", "--limit", "0")
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "search", "state:Open", "--limit", "0")
     assert result.returncode == 6
     assert "positive" in result.stderr
 
@@ -144,8 +182,8 @@ def test_issues_http_request_and_parsing(tmp_path):
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_port}"
     try:
-        result = run_cli(tmp_path, base_url, "issues", "state:Open", "--limit", "10")
-        default_result = run_cli(tmp_path, base_url, "issues", "state:Open")
+        result = run_cli(tmp_path, base_url, "issues", "search", "state:Open", "--limit", "10")
+        default_result = run_cli(tmp_path, base_url, "issues", "search", "state:Open")
     finally:
         server.shutdown()
         thread.join()
@@ -165,7 +203,7 @@ def test_issues_http_request_and_parsing(tmp_path):
 
 
 def test_update_requires_state(tmp_path):
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "update", "DEMO-1")
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "update", "DEMO-1")
     assert result.returncode == 2
     assert "required: --state" in result.stderr.lower()
 
@@ -207,7 +245,7 @@ def test_update_http_request_shape(tmp_path):
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_port}"
     try:
-        result = run_cli(tmp_path, base_url, "update", "DEMO-1", "--state", "In Progress")
+        result = run_cli(tmp_path, base_url, "issues", "update", "DEMO-1", "--state", "In Progress")
     finally:
         server.shutdown()
         thread.join()
@@ -239,7 +277,7 @@ def test_read_only_connection_refuses_update_before_network(tmp_path):
             "allow_write": False,
         }},
     }))
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "update",
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "update",
                      "DEMO-1", "--state", "Done")
     assert result.returncode == 4
     assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
@@ -264,7 +302,7 @@ def test_update_handles_api_errors(tmp_path):
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_port}"
     try:
-        result = run_cli(tmp_path, base_url, "update", "DEMO-1", "--state", "Invalid")
+        result = run_cli(tmp_path, base_url, "issues", "update", "DEMO-1", "--state", "Invalid")
     finally:
         server.shutdown()
         thread.join()
@@ -300,8 +338,8 @@ def test_articles_list_all_and_by_project(tmp_path):
 
     server, thread, base_url = _serve(ArticlesHandler)
     try:
-        all_res = run_cli(tmp_path, base_url, "articles", "--limit", "10")
-        proj_res = run_cli(tmp_path, base_url, "articles", "--project", "0-6")
+        all_res = run_cli(tmp_path, base_url, "articles", "list", "--limit", "10")
+        proj_res = run_cli(tmp_path, base_url, "articles", "list", "--project", "0-6")
     finally:
         server.shutdown()
         thread.join()
@@ -315,7 +353,7 @@ def test_articles_list_all_and_by_project(tmp_path):
 
 
 def test_articles_limit_must_be_positive(tmp_path):
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "--limit", "0")
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "list", "--limit", "0")
     assert result.returncode == 6
     assert "positive" in result.stderr
 
@@ -343,11 +381,11 @@ def test_article_read_and_comments(tmp_path):
 
     server, thread, base_url = _serve(OneHandler)
     try:
-        art = run_cli(tmp_path, base_url, "article", "KB-A-1")
+        art = run_cli(tmp_path, base_url, "articles", "get", "KB-A-1")
         # ID extraction from a pasted article URL
-        art_url = run_cli(tmp_path, base_url, "article",
+        art_url = run_cli(tmp_path, base_url, "articles", "get",
                           f"{base_url}/articles/KB-A-1")
-        coms = run_cli(tmp_path, base_url, "article-comments", "KB-A-1", "--limit", "5")
+        coms = run_cli(tmp_path, base_url, "articles", "comments", "list", "KB-A-1", "--limit", "5")
     finally:
         server.shutdown()
         thread.join()
@@ -401,14 +439,14 @@ def test_article_create_update_comment_payloads(tmp_path):
     article_write_requests.clear()
     server, thread, base_url = _serve(ArticleWriteHandler)
     try:
-        created = run_cli(tmp_path, base_url, "article-create",
+        created = run_cli(tmp_path, base_url, "articles", "create",
                           "--summary", "Guide", "--content", "# Hi", "--project", "0-6")
-        sub = run_cli(tmp_path, base_url, "article-create",
+        sub = run_cli(tmp_path, base_url, "articles", "create",
                       "--summary", "Child", "--project", "0-6",
                       "--parent", f"{base_url}/articles/KB-A-1")
-        updated = run_cli(tmp_path, base_url, "article-update", "KB-A-9",
+        updated = run_cli(tmp_path, base_url, "articles", "update", "KB-A-9",
                           "--summary", "Renamed")
-        commented = run_cli(tmp_path, base_url, "article-comment", "KB-A-9",
+        commented = run_cli(tmp_path, base_url, "articles", "comments", "add", "KB-A-9",
                             "--text", "Nice")
     finally:
         server.shutdown()
@@ -443,13 +481,13 @@ def test_article_create_update_comment_payloads(tmp_path):
 
 
 def test_article_create_requires_project(tmp_path):
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-create", "--summary", "Orphan")
-    assert result.returncode == 6
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "create", "--summary", "Orphan")
+    assert result.returncode == 2
     assert "--project" in result.stderr
 
 
 def test_article_update_requires_a_field(tmp_path):
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-update", "KB-A-9")
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "update", "KB-A-9")
     assert result.returncode == 6
     assert "--summary or --content" in result.stderr
 
@@ -466,7 +504,7 @@ def test_read_only_connection_refuses_article_create(tmp_path):
             "allow_write": False,
         }},
     }))
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-create",
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "create",
                      "--summary", "blocked", "--project", "0-6")
     assert result.returncode == 4
     assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
@@ -486,7 +524,7 @@ def test_article_create_rejects_parent_from_another_project(tmp_path):
 
     server, thread, base_url = _serve(OtherProjectHandler)
     try:
-        result = run_cli(tmp_path, base_url, "article-create",
+        result = run_cli(tmp_path, base_url, "articles", "create",
                          "--summary", "X", "--project", "0-6",
                          "--parent", "KB-A-1")
     finally:
@@ -499,14 +537,14 @@ def test_article_create_rejects_parent_from_another_project(tmp_path):
 
 
 def test_article_update_rejects_empty_summary(tmp_path):
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-update",
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "update",
                      "KB-A-9", "--summary", "")
     assert result.returncode == 6
-    assert "non-empty" in result.stderr
+    assert "articles update needs a non-empty --summary or --content" in result.stderr
 
 
 def test_article_comment_rejects_empty_text(tmp_path):
-    result = run_cli(tmp_path, "http://127.0.0.1:1", "article-comment",
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "comments", "add",
                      "KB-A-9", "--text", "   ")
     assert result.returncode == 6
     assert "empty" in result.stderr
@@ -523,7 +561,7 @@ def test_article_not_found_exits_3(tmp_path):
 
     server, thread, base_url = _serve(NotFoundHandler)
     try:
-        result = run_cli(tmp_path, base_url, "article", "KB-NOPE")
+        result = run_cli(tmp_path, base_url, "articles", "get", "KB-NOPE")
     finally:
         server.shutdown()
         thread.join()
