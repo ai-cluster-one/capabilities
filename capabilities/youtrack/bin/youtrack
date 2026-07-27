@@ -102,7 +102,7 @@ from typing import NoReturn
 import httpx
 
 NAME = "youtrack"
-SUMMARY = "YouTrack CLI for issues (read/create/comment/update state) and the knowledge base (read, create, and update articles and article comments)."
+SUMMARY = "YouTrack CLI for issues (read/create/comment/update state), project custom-field schemas, and the knowledge base (read, create, and update articles and article comments)."
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,
@@ -819,8 +819,10 @@ def _shape_project_field(entry):
     field = entry.get("field") or {}
     ftype = field.get("fieldType") or {}
     bundle = entry.get("bundle") or {}
-    users = [u.get("login") for u in (bundle.get("aggregatedUsers") or [])]
-    names = [v.get("name") for v in (bundle.get("values") or [])]
+    users = [u.get("login") for u in (bundle.get("aggregatedUsers") or [])
+             if isinstance(u, dict) and u.get("login")]
+    names = [v.get("name") for v in (bundle.get("values") or [])
+             if isinstance(v, dict) and v.get("name")]
     # A user field's bundle carries display names under `values` and logins
     # under `aggregatedUsers`; writes need the login, so prefer it.
     values = users or names
@@ -832,9 +834,11 @@ def _shape_project_field(entry):
 
 
 def _project_fields(c, project):
+    # $top=200 is deliberate headroom, not a default left in place: the
+    # largest real project seen has 45 custom fields.
     raw = _request(c, "GET", f"/admin/projects/{project}/customFields",
                    params={"fields": PROJECT_FIELD_FIELDS, "$top": 200})
-    return [_shape_project_field(e) for e in raw]
+    return [_shape_project_field(e) for e in raw if isinstance(e, dict)]
 
 
 def projects_fields_list(c, a):
@@ -863,10 +867,15 @@ def issues_create(c, a):
     body = {"project": {"id": a.project}, "summary": a.summary}
     if a.description is not None:
         body["description"] = _read_text(a.description)
-    return _request(c, "POST", "/issues", params={"fields": ISSUE_FIELDS}, json=body)
+    return _flatten_custom_fields(
+        _request(c, "POST", "/issues", params={"fields": ISSUE_FIELDS}, json=body))
 
 
 def issues_update(c, a):
+    # Deliberately not flattened: this handler uses its own narrow
+    # `customFields(name,value(name))` projection, not ISSUE_FIELDS, and is
+    # slated for a wholesale rewrite next milestone. Leave the raw shape here
+    # until that rewrite lands.
     return _request(c, "POST", f"/issues/{_issue_ref(a.issue)}",
                     params={"fields": "customFields(name,value(name))"},
                     json={"customFields": [
@@ -1010,13 +1019,14 @@ COMMANDS = {
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=NAME, add_help=True)
-    subs = {(): parser.add_subparsers(dest="_l0", required=True)}
+    subs = {(): parser.add_subparsers(dest="_l0", required=True, metavar="verb")}
     for path, (_handler, argspecs) in COMMANDS.items():
         for depth in range(1, len(path)):
             prefix = path[:depth]
             if prefix not in subs:
                 node = subs[prefix[:-1]].add_parser(prefix[-1])
-                subs[prefix] = node.add_subparsers(dest=f"_l{depth}", required=True)
+                subs[prefix] = node.add_subparsers(dest=f"_l{depth}", required=True,
+                                                   metavar="verb")
         leaf = subs[path[:-1]].add_parser(path[-1])
         for names, kwargs in argspecs:
             leaf.add_argument(*names, **kwargs)
@@ -1027,7 +1037,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _check_connection(base_url, token):
     with _client(base_url, token) as c:
-        return {"ok": True, "base_url": base_url, "identity": users_me(c, None)}
+        return {"ok": True, "base_url": base_url, "identity": users_me(c, argparse.Namespace())}
 
 def cmd_doctor(reg, reg_file, wanted, token_key):
     report = _connections_report()

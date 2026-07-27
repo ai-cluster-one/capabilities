@@ -30,6 +30,18 @@ def test_every_command_is_documented():
     assert not missing, f"commands absent from help docstring: {missing}"
 
 
+def _write_verbs():
+    for node in ast.walk(_source_tree()):
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", None) == "WRITE_VERBS" for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError("WRITE_VERBS not found in bin/youtrack")
+
+
+def test_write_verbs_match_commands():
+    assert _write_verbs() <= {" ".join(p) for p in _command_paths()}
+
+
 def test_every_documented_command_exists():
     doc = ast.get_docstring(_source_tree())
     contract = {"help", "connections", "doctor", "stub", "manifest", "guide",
@@ -126,15 +138,8 @@ def test_users_me_smoke(tmp_path):
             self.wfile.write(body)
 
     UsersMeHandler.requests = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), UsersMeHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_port}"
-    try:
+    with serve(UsersMeHandler) as base_url:
         result = run_cli(tmp_path, base_url, "users", "me")
-    finally:
-        server.shutdown()
-        thread.join()
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["login"] == "agent"
@@ -160,15 +165,8 @@ def test_projects_find_smoke(tmp_path):
             self.wfile.write(body)
 
     ProjectsHandler.requests = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), ProjectsHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_port}"
-    try:
+    with serve(ProjectsHandler) as base_url:
         result = run_cli(tmp_path, base_url, "projects", "find", "Demo")
-    finally:
-        server.shutdown()
-        thread.join()
 
     assert result.returncode == 0, result.stderr
     parsed = json.loads(result.stdout)
@@ -233,6 +231,81 @@ def test_projects_fields_get_unknown_field_exits_3(tmp_path):
     assert "Priority" in result.stderr
 
 
+def test_projects_fields_list_requests_project_field_fields(tmp_path):
+    ProjectFieldsHandler.requests = []
+    with serve(ProjectFieldsHandler) as base:
+        run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
+    path = [r[1] for r in ProjectFieldsHandler.requests if r[0] == "GET"][0]
+    assert "aggregatedUsers" in path
+    assert "canBeEmpty" in path
+    assert "isMultiValue" in path
+    assert "bundle(" in path or "bundle%28" in path
+
+
+NAMELESS_BUNDLE_ENTRIES_PAYLOAD = [
+    {"id": "1", "canBeEmpty": False, "$type": "EnumProjectCustomField",
+     "field": {"name": "Priority", "fieldType": {"id": "enum[1]", "isMultiValue": False}},
+     "bundle": {"id": "b1", "values": [{"id": "nameless"}, {"name": "Critical"}]}},
+    {"id": "2", "canBeEmpty": True, "$type": "UserProjectCustomField",
+     "field": {"name": "Assignee", "fieldType": {"id": "user[1]", "isMultiValue": False}},
+     "bundle": {"id": "b2",
+                "aggregatedUsers": [{"id": "nameless-user"}, {"login": "s.royz"}]}},
+]
+
+
+class NamelessBundleHandler(Handler):
+    requests = []
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, self.headers, None))
+        if "/customFields" in self.path:
+            self._reply(NAMELESS_BUNDLE_ENTRIES_PAYLOAD)
+        else:
+            self._reply({"error": "missing"}, 404)
+
+
+def test_projects_fields_list_drops_nameless_bundle_entries(tmp_path):
+    NamelessBundleHandler.requests = []
+    with serve(NamelessBundleHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
+    assert result.returncode == 0, result.stderr
+    parsed = json.loads(result.stdout)
+    assert parsed[0]["values"] == ["Critical"]
+    assert None not in parsed[0]["values"]
+    assert parsed[1]["values"] == ["s.royz"]
+    assert None not in parsed[1]["values"]
+
+
+class MalformedProjectFieldsHandler(Handler):
+    requests = []
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, self.headers, None))
+        if "/customFields" in self.path:
+            self._reply([
+                {"id": "1", "canBeEmpty": False, "$type": "EnumProjectCustomField",
+                 "field": {"name": "Priority",
+                          "fieldType": {"id": "enum[1]", "isMultiValue": False}},
+                 "bundle": {"id": "b1", "values": [{"name": "Critical"}]}},
+                "not-a-dict",
+                None,
+            ])
+        else:
+            self._reply({"error": "missing"}, 404)
+
+
+def test_projects_fields_list_skips_non_dict_entries(tmp_path):
+    MalformedProjectFieldsHandler.requests = []
+    with serve(MalformedProjectFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
+    assert result.returncode == 0, result.stderr
+    parsed = json.loads(result.stdout)
+    assert parsed == [
+        {"name": "Priority", "type": "enum[1]", "multiValue": False,
+         "required": True, "values": ["Critical"]},
+    ]
+
+
 def test_issues_get_smoke(tmp_path):
     class IssueGetHandler(BaseHTTPRequestHandler):
         requests = []
@@ -251,15 +324,8 @@ def test_issues_get_smoke(tmp_path):
             self.wfile.write(body)
 
     IssueGetHandler.requests = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), IssueGetHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_port}"
-    try:
+    with serve(IssueGetHandler) as base_url:
         result = run_cli(tmp_path, base_url, "issues", "get", "DEMO-1")
-    finally:
-        server.shutdown()
-        thread.join()
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["idReadable"] == "DEMO-1"
@@ -283,15 +349,8 @@ def test_issues_comments_list_smoke(tmp_path):
             self.wfile.write(body)
 
     IssueCommentsHandler.requests = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), IssueCommentsHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_port}"
-    try:
+    with serve(IssueCommentsHandler) as base_url:
         result = run_cli(tmp_path, base_url, "issues", "comments", "list", "DEMO-1", "--limit", "5")
-    finally:
-        server.shutdown()
-        thread.join()
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)[0]["text"] == "A note"
@@ -323,6 +382,33 @@ def test_create_and_comment_payloads(tmp_path):
     }
     assert posts[1][3] == {"text": "A note"}
     assert posts[0][2]["Authorization"] == "Bearer perm:test"
+
+
+class CreateWithFieldsHandler(Handler):
+    requests = []
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        payload = json.loads(raw)
+        self.__class__.requests.append(("POST", self.path, self.headers, payload))
+        if self.path.startswith("/api/issues"):
+            self._reply({"id": "2-1", "idReadable": "DEMO-1", **payload,
+                        "customFields": [
+                            {"name": "State", "$type": "StateIssueCustomField",
+                             "value": {"name": "Open"}}]})
+        else:
+            self._reply({"error": "missing"}, 404)
+
+
+def test_issues_create_flattens_custom_fields(tmp_path):
+    CreateWithFieldsHandler.requests = []
+    with serve(CreateWithFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "create", "--project", "0-0",
+                         "--summary", "First issue")
+    assert result.returncode == 0, result.stderr
+    body = json.loads(result.stdout)
+    assert "customFields" not in body
+    assert body["fields"] == {"State": "Open"}
 
 
 def test_read_only_connection_refuses_create_before_network(tmp_path):
@@ -599,6 +685,24 @@ def test_read_only_connection_refuses_update_before_network(tmp_path):
     assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
 
 
+def test_read_only_connection_refuses_issue_comment_before_network(tmp_path):
+    envelope = tmp_path / "capabilities" / "youtrack"
+    envelope.mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    (envelope / "connections.json").write_text(json.dumps({
+        "default": "work",
+        "connections": {"work": {
+            "secret_env": "YOUTRACK_TOKEN",
+            "base_url": "http://127.0.0.1:1",
+            "allow_write": False,
+        }},
+    }))
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "comments", "add",
+                     "DEMO-1", "--text", "blocked")
+    assert result.returncode == 4
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
+
+
 def test_update_handles_api_errors(tmp_path):
     class ErrorHandler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -822,6 +926,42 @@ def test_read_only_connection_refuses_article_create(tmp_path):
     }))
     result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "create",
                      "--summary", "blocked", "--project", "0-6")
+    assert result.returncode == 4
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
+
+
+def test_read_only_connection_refuses_article_update_before_network(tmp_path):
+    envelope = tmp_path / "capabilities" / "youtrack"
+    envelope.mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    (envelope / "connections.json").write_text(json.dumps({
+        "default": "work",
+        "connections": {"work": {
+            "secret_env": "YOUTRACK_TOKEN",
+            "base_url": "http://127.0.0.1:1",
+            "allow_write": False,
+        }},
+    }))
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "update",
+                     "KB-A-9", "--summary", "blocked")
+    assert result.returncode == 4
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
+
+
+def test_read_only_connection_refuses_article_comment_before_network(tmp_path):
+    envelope = tmp_path / "capabilities" / "youtrack"
+    envelope.mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    (envelope / "connections.json").write_text(json.dumps({
+        "default": "work",
+        "connections": {"work": {
+            "secret_env": "YOUTRACK_TOKEN",
+            "base_url": "http://127.0.0.1:1",
+            "allow_write": False,
+        }},
+    }))
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "comments", "add",
+                     "KB-A-9", "--text", "blocked")
     assert result.returncode == 4
     assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
 
