@@ -138,6 +138,32 @@ def test_normalize_env_list_handles_data_wrapper():
     assert coolify_module._normalize_env_list(wrapped) == [{"uuid": "1", "key": "K"}]
 
 
+def test_env_list_marks_redacted_value_as_hidden():
+    """A redacted null is explicit and cannot be mistaken for an empty value."""
+    response = [{"uuid": "1", "key": "SECRET", "value": None}]
+
+    with patch.object(coolify_module, '_request', return_value=response):
+        result = coolify_module.cmd_env_list_typed(
+            None, "app-uuid", "application",
+        )
+
+    assert result[0]["value"] is None
+    assert result[0]["value_hidden"] is True
+    assert "read:sensitive" in result[0]["value_hidden_reason"]
+
+
+def test_env_list_marks_visible_value():
+    response = [{"uuid": "1", "key": "PUBLIC", "value": ""}]
+
+    with patch.object(coolify_module, '_request', return_value=response):
+        result = coolify_module.cmd_env_list_typed(
+            None, "service-uuid", "service",
+        )
+
+    assert result[0]["value_hidden"] is False
+    assert "value_hidden_reason" not in result[0]
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -149,6 +175,8 @@ if __name__ == "__main__":
         ("env rm fails when key not found", test_env_rm_fails_when_key_not_found),
         ("normalize_env_list handles bare list", test_normalize_env_list_handles_bare_list),
         ("normalize_env_list handles data wrapper", test_normalize_env_list_handles_data_wrapper),
+        ("env list marks redacted values", test_env_list_marks_redacted_value_as_hidden),
+        ("env list marks visible values", test_env_list_marks_visible_value),
     ]
 
     passed = 0
