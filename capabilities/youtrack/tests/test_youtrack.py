@@ -416,6 +416,8 @@ def test_issues_get_requests_custom_fields(tmp_path):
     path = [r[1] for r in CustomFieldsHandler.requests if r[0] == "GET"][0]
     assert "customFields(" in path or "customFields%28" in path
     assert "presentation" in path and "login" in path and "text" in path
+    assert "minutes" in path
+    assert "name" in path
 
 
 def test_issues_search_emits_same_fields_shape(tmp_path):
@@ -426,6 +428,38 @@ def test_issues_search_emits_same_fields_shape(tmp_path):
     row = json.loads(result.stdout)[0]
     assert row["fields"]["State"] == "Done"
     assert "customFields" not in row
+
+
+ISSUE_WITH_MALFORMED_FIELDS = {
+    "id": "2-2", "idReadable": "DEMO-2", "summary": "s", "description": "d",
+    "customFields": [
+        {"name": "State", "$type": "StateIssueCustomField",
+         "value": {"name": "Open", "id": "126-1"}},
+        {"$type": "SimpleIssueCustomField", "value": 2},
+        "not-a-dict",
+    ],
+}
+
+
+class MalformedFieldsHandler(Handler):
+    requests = []
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, self.headers, None))
+        if self.path.startswith("/api/issues/"):
+            self._reply(ISSUE_WITH_MALFORMED_FIELDS)
+        else:
+            self._reply({"error": "missing"}, 404)
+
+
+def test_issues_get_skips_nameless_custom_fields(tmp_path):
+    MalformedFieldsHandler.requests = []
+    with serve(MalformedFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-2")
+    assert result.returncode == 0, result.stderr
+    body = json.loads(result.stdout)
+    assert "customFields" not in body
+    assert body["fields"] == {"State": "Open"}
 
 
 def test_update_requires_state(tmp_path):

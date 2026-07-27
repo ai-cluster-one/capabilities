@@ -750,7 +750,7 @@ def _request(client: httpx.Client, method: str, path: str, **kwargs):
 USER_FIELDS = "id,login,name,fullName,email"
 PROJECT_FIELDS = "id,name,shortName"
 _CF_PROJECTION = ("customFields(id,name,$type,"
-                  "value(id,name,login,fullName,text,minutes,presentation))")
+                  "value(id,name,login,text,minutes,presentation))")
 ISSUE_FIELDS = ("id,idReadable,summary,description,created,updated,resolved,"
                 "project(id,name,shortName),reporter(id,login,fullName),"
                 + _CF_PROJECTION)
@@ -790,7 +790,8 @@ def _flatten_custom_fields(issue):
     if not isinstance(issue, dict) or "customFields" not in issue:
         return issue
     fields = issue.pop("customFields") or []
-    issue["fields"] = {f["name"]: _flatten_value(f.get("value")) for f in fields}
+    issue["fields"] = {f["name"]: _flatten_value(f.get("value"))
+                       for f in fields if isinstance(f, dict) and f.get("name")}
     return issue
 
 
