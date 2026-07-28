@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -513,6 +514,8 @@ ISSUE_WITH_FIELDS = {
         {"name": "Requestor", "$type": "MultiUserIssueCustomField",
          "value": [{"login": "k.shmidt", "name": "Kirill Shmidt", "id": "1-9"}]},
         {"name": "Due Date", "$type": "DateIssueCustomField", "value": 1781534028493},
+        {"name": "Incident Start Time", "$type": "SimpleIssueCustomField",
+         "value": 1781534028493},
         {"name": "Blocked Reason", "$type": "SingleEnumIssueCustomField", "value": None},
     ],
 }
@@ -546,9 +549,30 @@ def test_issues_get_flattens_custom_fields(tmp_path):
         "Acceptance Criteria": "- one\n- two",
         "Work Category": ["Infrastructure", "Technical Debt"],
         "Requestor": ["k.shmidt"],
-        "Due Date": 1781534028493,
+        "Due Date": "2026-06-15",
+        "Incident Start Time": 1781534028493,
         "Blocked Reason": None,
     }
+
+
+def test_issues_get_renders_date_fields_as_calendar_dates(tmp_path):
+    """A `date` field is a calendar date; epoch ms is not a usable interface,
+    and the server snaps the value to noon UTC anyway."""
+    CustomFieldsHandler.requests = []
+    with serve(CustomFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["fields"]["Due Date"] == "2026-06-15"
+
+
+def test_issues_get_keeps_date_and_time_as_epoch_ms(tmp_path):
+    """`date and time` is SimpleIssueCustomField and is not normalized, so it
+    keeps its precision rather than being truncated to a day."""
+    CustomFieldsHandler.requests = []
+    with serve(CustomFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["fields"]["Incident Start Time"] == 1781534028493
 
 
 def test_issues_get_requests_custom_fields(tmp_path):
@@ -604,67 +628,41 @@ def test_issues_get_skips_nameless_custom_fields(tmp_path):
     assert body["fields"] == {"State": "Open"}
 
 
-def test_update_requires_state(tmp_path):
+def test_update_with_nothing_to_change_exits_6_before_network(tmp_path):
     result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "update", "DEMO-1")
-    assert result.returncode == 2
-    assert "required: --state" in result.stderr.lower()
+    assert result.returncode == 6
+    assert "nothing to update" in result.stderr.lower()
 
 
-def test_update_http_request_shape(tmp_path):
-    class UpdateHandler(BaseHTTPRequestHandler):
+def test_update_posts_to_the_issue_endpoint_with_auth(tmp_path):
+    class AuthCheckingHandler(UpdateFieldsHandler):
         requests = []
 
-        def log_message(self, *_args):
-            pass
-
         def do_POST(self):
-            # Reject old invalid endpoint
-            if "/fields/State" in self.path:
-                self.send_response(404)
-                self.end_headers()
-                return
-
             raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            payload = json.loads(raw)
-            self.__class__.requests.append(("POST", self.path, self.headers, payload))
+            self.__class__.requests.append(
+                ("POST", self.path, json.loads(raw), self.headers["Authorization"]))
+            self._reply({"idReadable": "DEMO-1"})
 
-            # Validate correct payload structure
-            if "customFields" in payload and len(payload["customFields"]) > 0:
-                field = payload["customFields"][0]
-                body = json.dumps({"customFields": [field]}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                self.send_response(400)
-                self.end_headers()
-
-    UpdateHandler.requests = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), UpdateHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_port}"
+    AuthCheckingHandler.requests = []
+    server, thread, base_url = _serve(AuthCheckingHandler)
     try:
-        result = run_cli(tmp_path, base_url, "issues", "update", "DEMO-1", "--state", "In Progress")
+        result = run_cli(tmp_path, base_url, "issues", "update", "DEMO-1",
+                         "--field", "State=In Progress")
     finally:
         server.shutdown()
         thread.join()
 
     assert result.returncode == 0, result.stderr
-    assert len(UpdateHandler.requests) == 1
-    method, path, headers, payload = UpdateHandler.requests[0]
-    assert method == "POST"
+    writes = [r for r in AuthCheckingHandler.requests if r[0] == "POST"]
+    assert len(writes) == 1
+    _method, path, payload, auth = writes[0]
     assert path.startswith("/api/issues/DEMO-1")
-    assert "/fields/State" not in path, "Must not use old invalid /fields/State endpoint"
-    assert "customFields" in payload
-    assert len(payload["customFields"]) == 1
-    field = payload["customFields"][0]
-    assert field["name"] == "State"
-    assert field["$type"] == "StateIssueCustomField"
-    assert field["value"] == {"name": "In Progress"}
-    assert headers["Authorization"] == "Bearer perm:test"
+    assert "/fields/State" not in path, "must not use the old /fields/State endpoint"
+    assert payload["customFields"] == [
+        {"name": "State", "$type": "StateIssueCustomField",
+         "value": {"name": "In Progress"}}]
+    assert auth == "Bearer perm:test"
 
 
 def test_read_only_connection_refuses_update_before_network(tmp_path):
@@ -680,7 +678,7 @@ def test_read_only_connection_refuses_update_before_network(tmp_path):
         }},
     }))
     result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "update",
-                     "DEMO-1", "--state", "Done")
+                     "DEMO-1", "--field", "State=Done")
     assert result.returncode == 4
     assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
 
@@ -704,31 +702,11 @@ def test_read_only_connection_refuses_issue_comment_before_network(tmp_path):
 
 
 def test_update_handles_api_errors(tmp_path):
-    class ErrorHandler(BaseHTTPRequestHandler):
-        def log_message(self, *_args):
-            pass
-
-        def do_POST(self):
-            if self.path.startswith("/api/issues/DEMO-1"):
-                self.send_response(400)
-                body = json.dumps({"error": "Invalid state"}).encode()
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), ErrorHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_port}"
-    try:
-        result = run_cli(tmp_path, base_url, "issues", "update", "DEMO-1", "--state", "Invalid")
-    finally:
-        server.shutdown()
-        thread.join()
+    result, _ = run_update(tmp_path, "DEMO-1", "--field", "State=Invalid",
+                           status=400, body={"error": "Invalid state"})
 
     assert result.returncode == 6
-    assert "invalid_request" in result.stderr.lower()
+    assert "invalid" in result.stderr.lower()
 
 
 def _serve(handler_cls):
@@ -736,6 +714,452 @@ def _serve(handler_cls):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread, f"http://127.0.0.1:{server.server_port}"
+
+
+# ── issues update: custom-field writes (M2) ──────────────────────────────
+#
+# $type per field mirrors what IONDEV returns on a real issue read, including
+# the measured traps: `date` is DateIssueCustomField while `date and time` is
+# SimpleIssueCustomField, indistinguishable from `integer` on the issue side.
+UPDATE_FIELD_TYPES = {
+    "State": "StateIssueCustomField",
+    "Priority": "SingleEnumIssueCustomField",
+    "Work Category": "MultiEnumIssueCustomField",
+    "Subsystem": "SingleOwnedIssueCustomField",
+    "Assignee": "SingleUserIssueCustomField",
+    "Requestor": "MultiUserIssueCustomField",
+    "Sprints": "MultiVersionIssueCustomField",
+    "Original Estimate": "PeriodIssueCustomField",
+    "Points": "SimpleIssueCustomField",
+    "Due Date": "DateIssueCustomField",
+    "Acceptance Criteria": "TextIssueCustomField",
+}
+
+
+class UpdateFieldsHandler(BaseHTTPRequestHandler):
+    """Serves the issue read that supplies $type, and records the write."""
+
+    requests = []
+    write_status = 200
+    write_body = {"idReadable": "DEMO-1"}
+
+    def log_message(self, *_args):
+        pass
+
+    def _reply(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, None))
+        if self.path.startswith("/api/issues/DEMO-1"):
+            self._reply({
+                "idReadable": "DEMO-1",
+                "customFields": [{"name": n, "$type": t, "value": None}
+                                 for n, t in UPDATE_FIELD_TYPES.items()],
+            })
+        else:
+            self._reply({"error": "missing"}, 404)
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        payload = json.loads(raw)
+        self.__class__.requests.append(("POST", self.path, payload))
+        self._reply(self.__class__.write_body, self.__class__.write_status)
+
+
+def run_update(tmp_path, *args, handler=UpdateFieldsHandler,
+               status=200, body=None):
+    handler.requests = []
+    handler.write_status = status
+    handler.write_body = body if body is not None else {"idReadable": "DEMO-1"}
+    server, thread, base_url = _serve(handler)
+    try:
+        result = run_cli(tmp_path, base_url, "issues", "update", *args)
+    finally:
+        server.shutdown()
+        thread.join()
+    writes = [r for r in handler.requests if r[0] == "POST"]
+    return result, writes
+
+
+def sent_fields(writes):
+    assert len(writes) == 1, f"expected exactly one write, got {len(writes)}"
+    return {f["name"]: f for f in writes[0][2]["customFields"]}
+
+
+def test_update_field_marshals_single_enum(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Priority=High")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Priority"] == {
+        "name": "Priority",
+        "$type": "SingleEnumIssueCustomField",
+        "value": {"name": "High"},
+    }
+
+
+def test_update_marshals_state_by_name(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "State=In Progress")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["State"]["value"] == {"name": "In Progress"}
+
+
+def test_update_marshals_owned_field_by_name(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Subsystem=Ingestion")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Subsystem"]["value"] == {"name": "Ingestion"}
+
+
+def test_update_marshals_user_field_by_login(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Assignee=s.royz")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Assignee"]["value"] == {"login": "s.royz"}
+
+
+def test_update_marshals_multi_user_as_login_list(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Requestor=s.royz")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Requestor"]["value"] == [{"login": "s.royz"}]
+
+
+def test_update_marshals_multi_enum_as_name_list(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1",
+                               "--field", "Work Category=Infrastructure")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Work Category"]["value"] == [
+        {"name": "Infrastructure"}]
+
+
+def test_update_marshals_multi_version_as_name_list(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1",
+                               "--field", "Sprints=2026-26 Sprint")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Sprints"]["value"] == [{"name": "2026-26 Sprint"}]
+
+
+def test_update_marshals_period_as_presentation(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1",
+                               "--field", "Original Estimate=1d 4h")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Original Estimate"]["value"] == {
+        "presentation": "1d 4h"}
+
+
+def test_update_marshals_text_field_as_text(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1",
+                               "--field", "Acceptance Criteria=- one\n- two")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Acceptance Criteria"]["value"] == {
+        "text": "- one\n- two"}
+
+
+def test_update_marshals_integer_as_json_number(tmp_path):
+    """A quoted "3" from the shell must reach YouTrack as 3; it rejects "3"."""
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Points=3")
+
+    assert result.returncode == 0, result.stderr
+    value = sent_fields(writes)["Points"]["value"]
+    assert value == 3 and isinstance(value, int)
+
+
+def test_update_converts_calendar_date_to_noon_utc(tmp_path):
+    """Measured: YouTrack snaps `date` to 12:00 UTC of the same UTC day."""
+    result, writes = run_update(tmp_path, "DEMO-1",
+                                "--field", "Due Date=2026-08-15")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Due Date"]["value"] == 1786795200000
+
+
+def test_update_empty_value_clears_field_to_null(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Assignee=")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Assignee"]["value"] is None
+
+
+def test_update_field_splits_on_first_equals_only(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1",
+                                "--field", "Acceptance Criteria=a=b")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Acceptance Criteria"]["value"] == {"text": "a=b"}
+
+
+def test_update_field_without_equals_exits_6(tmp_path):
+    result, _ = run_update(tmp_path, "DEMO-1", "--field", "Priority")
+
+    assert result.returncode == 6
+    assert "name=value" in result.stderr.lower()
+
+
+def test_update_matches_field_names_case_insensitively(tmp_path):
+    # Deliberately neither the canonical casing nor its casefold, so a lookup
+    # that skips casefolding the caller's input cannot pass by accident.
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "PRIORITY=High")
+
+    assert result.returncode == 0, result.stderr
+    # The canonical name from the schema is sent, not the caller's casing.
+    assert sent_fields(writes)["Priority"]["name"] == "Priority"
+
+
+def test_update_repeated_field_accumulates_for_multi_value(tmp_path):
+    result, writes = run_update(
+        tmp_path, "DEMO-1",
+        "--field", "Work Category=Infrastructure",
+        "--field", "Work Category=Technical Debt")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Work Category"]["value"] == [
+        {"name": "Infrastructure"}, {"name": "Technical Debt"}]
+
+
+def test_update_clearing_multi_value_field_sends_empty_list(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Work Category=")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Work Category"]["value"] == []
+
+
+def test_update_fields_accepts_inline_json_object(tmp_path):
+    result, writes = run_update(
+        tmp_path, "DEMO-1",
+        "--fields", json.dumps({"Priority": "High", "Points": 3}))
+
+    assert result.returncode == 0, result.stderr
+    sent = sent_fields(writes)
+    assert sent["Priority"]["value"] == {"name": "High"}
+    assert sent["Points"]["value"] == 3
+
+
+def test_update_fields_json_preserves_declared_types(tmp_path):
+    """JSON carries real types, so a numeric string stays a string."""
+    result, writes = run_update(
+        tmp_path, "DEMO-1",
+        "--fields", json.dumps({"Acceptance Criteria": "42"}))
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Acceptance Criteria"]["value"] == {"text": "42"}
+
+
+def test_update_fields_accepts_a_json_list_for_multi_value(tmp_path):
+    result, writes = run_update(
+        tmp_path, "DEMO-1",
+        "--fields", json.dumps({"Work Category": ["Infrastructure", "Technical Debt"]}))
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Work Category"]["value"] == [
+        {"name": "Infrastructure"}, {"name": "Technical Debt"}]
+
+
+def test_update_field_overrides_fields_document(tmp_path):
+    """--fields applies first; an explicit --field patches one value."""
+    result, writes = run_update(
+        tmp_path, "DEMO-1",
+        "--fields", json.dumps({"Priority": "Low", "Points": 1}),
+        "--field", "Priority=Critical")
+
+    assert result.returncode == 0, result.stderr
+    sent = sent_fields(writes)
+    assert sent["Priority"]["value"] == {"name": "Critical"}
+    assert sent["Points"]["value"] == 1
+
+
+def test_update_fields_rejects_non_object_json(tmp_path):
+    result, _ = run_update(tmp_path, "DEMO-1", "--fields", json.dumps(["Priority"]))
+
+    assert result.returncode == 6
+    assert "json object" in result.stderr.lower()
+
+
+def test_update_fields_rejects_malformed_json(tmp_path):
+    result, _ = run_update(tmp_path, "DEMO-1", "--fields", "{not json")
+
+    assert result.returncode == 6
+    assert "not valid json" in result.stderr.lower()
+
+
+def test_update_sends_summary_and_description(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1", "--summary", "new title",
+                                "--description", "new body")
+
+    assert result.returncode == 0, result.stderr
+    payload = writes[0][2]
+    assert payload["summary"] == "new title"
+    assert payload["description"] == "new body"
+    assert "customFields" not in payload
+
+
+def test_update_summary_only_skips_the_issue_read(tmp_path):
+    """No custom fields named means no $type is needed, so no extra GET."""
+    result, _ = run_update(tmp_path, "DEMO-1", "--summary", "just a rename")
+
+    assert result.returncode == 0, result.stderr
+    reads = [r for r in UpdateFieldsHandler.requests if r[0] == "GET"]
+    assert reads == [], f"expected no issue read, got {reads}"
+
+
+def test_update_bad_date_format_exits_6_before_writing(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1",
+                                "--field", "Due Date=15/08/2026")
+
+    assert result.returncode == 6
+    assert "yyyy-mm-dd" in result.stderr.lower()
+    assert writes == [], "must not write when a value cannot be marshalled"
+
+
+# ── issues update: error translation (option C) ──────────────────────────
+#
+# The server validates and rolls a bad batch back on its own (measured), so the
+# project schema is fetched only on the failure path, to turn YouTrack's
+# unusable messages into named fields and allowed values.
+UPDATE_PROJECT_SCHEMA = [
+    {"id": "1", "canBeEmpty": True, "$type": "EnumProjectCustomField",
+     "field": {"name": "Priority",
+               "fieldType": {"id": "enum[1]", "isMultiValue": False}},
+     "bundle": {"id": "b1", "values": [{"name": "Critical"}, {"name": "High"},
+                                       {"name": "Normal"}, {"name": "Low"}]}},
+    {"id": "2", "canBeEmpty": True, "$type": "EnumProjectCustomField",
+     "field": {"name": "Severity",
+               "fieldType": {"id": "enum[1]", "isMultiValue": False}},
+     "bundle": {"id": "b2", "values": [{"name": "Severity 1"}]}},
+]
+
+
+class UpdateErrorHandler(UpdateFieldsHandler):
+    """Serves the issue read, the project schema, and a failing write."""
+
+    requests = []
+    write_status = 400
+    write_body = {}
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, None))
+        if "/admin/projects/" in self.path and "/customFields" in self.path:
+            self._reply(UPDATE_PROJECT_SCHEMA)
+        elif self.path.startswith("/api/issues/DEMO-1"):
+            self._reply({
+                "idReadable": "DEMO-1",
+                "project": {"id": "0-6", "shortName": "DEMO"},
+                "customFields": [{"name": n, "$type": t, "value": None}
+                                 for n, t in UPDATE_FIELD_TYPES.items()],
+            })
+        else:
+            self._reply({"error": "missing"}, 404)
+
+
+def schema_reads(handler):
+    return [r for r in handler.requests
+            if r[0] == "GET" and "/admin/projects/" in r[1]]
+
+
+def test_update_workflow_rejection_exits_7(tmp_path):
+    """A rule said no. The input was valid and the server is healthy, so
+    neither 6 nor 5 is honest, and retrying is pointless."""
+    result, _ = run_update(
+        tmp_path, "DEMO-1", "--field", "State=In Progress",
+        handler=UpdateErrorHandler, status=400,
+        body={"error": "Workflow runtime error",
+              "error_description": "The require_attach_task_to_feature/rule rule "
+                                   "threw an exception when processing DEMO-1",
+              "error_rule_name": "require_attach_task_to_feature/rule",
+              "error_workflow_type": "runtime",
+              "error_type": "workflow"})
+
+    assert result.returncode == 7, result.stderr
+    assert "require_attach_task_to_feature/rule" in result.stderr
+
+
+def test_update_workflow_rejection_does_not_fetch_schema(tmp_path):
+    """A rule rejection is not a value problem; allowed values would mislead."""
+    run_update(tmp_path, "DEMO-1", "--field", "State=In Progress",
+               handler=UpdateErrorHandler, status=400,
+               body={"error_type": "workflow",
+                     "error_rule_name": "some/rule"})
+
+    assert schema_reads(UpdateErrorHandler) == []
+
+
+def test_update_bad_value_reports_allowed_values(tmp_path):
+    """YouTrack's own message names no field and lists nothing."""
+    result, _ = run_update(
+        tmp_path, "DEMO-1", "--field", "Priority=Sideways",
+        handler=UpdateErrorHandler, status=400,
+        body={"error": "Bad Request",
+              "error_description": "An Sideways-type entity with the specified "
+                                   "name ({1}) was not found"})
+
+    assert result.returncode == 6, result.stderr
+    combined = result.stderr
+    assert "Priority" in combined
+    assert "Critical" in combined and "Low" in combined, "must list allowed values"
+    assert "{1}" not in combined, "must not leak the unsubstituted placeholder"
+
+
+def test_update_server_500_for_unknown_field_maps_to_exit_6(tmp_path):
+    """A typo is input, not a server fault, whatever status YouTrack picks."""
+    result, _ = run_update(
+        tmp_path, "DEMO-1", "--field", "Priority=High",
+        handler=UpdateErrorHandler, status=500,
+        body={"error": "Internal Server Error",
+              "error_description": "incompatible-issue-custom-field-name-Priority"})
+
+    assert result.returncode == 6, result.stderr
+
+
+def test_update_happy_path_never_fetches_the_schema(tmp_path):
+    result, _ = run_update(tmp_path, "DEMO-1", "--field", "Priority=High",
+                           handler=UpdateErrorHandler, status=200,
+                           body={"idReadable": "DEMO-1"})
+
+    assert result.returncode == 0, result.stderr
+    assert schema_reads(UpdateErrorHandler) == [], "option (C): no schema on success"
+
+
+def test_update_unknown_field_suggests_a_near_miss(tmp_path):
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Prioritee=High",
+                                handler=UpdateErrorHandler)
+
+    assert result.returncode == 6
+    assert "Priority" in result.stderr
+    assert writes == [], "an unknown name is caught before the write"
+
+
+def test_update_field_on_project_but_not_this_issue_is_distinguished(tmp_path):
+    """Severity exists on the project but only on Bug-typed issues. That is a
+    different mistake from a typo and must not be reported as one."""
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Severity=Severity 1",
+                                handler=UpdateErrorHandler)
+
+    assert result.returncode == 6
+    assert writes == []
+    lowered = result.stderr.lower()
+    assert "did you mean" not in lowered, "not a typo — must not suggest a near-miss"
+    assert "type" in lowered, "must explain the field is not carried by this issue"
+
+
+def test_update_reads_issue_once_then_writes(tmp_path):
+    """$type must come from one issue read, not one per field."""
+    result, _ = run_update(tmp_path, "DEMO-1",
+                           "--field", "Priority=High", "--field", "Points=3")
+
+    assert result.returncode == 0, result.stderr
+    reads = [r for r in UpdateFieldsHandler.requests if r[0] == "GET"]
+    assert len(reads) == 1, f"expected one issue read, got {len(reads)}"
+    assert "$type" in urllib.parse.unquote(reads[0][1]), "the read must project $type"
 
 
 def test_articles_list_all_and_by_project(tmp_path):

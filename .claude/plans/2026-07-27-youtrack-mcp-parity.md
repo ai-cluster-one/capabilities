@@ -1,6 +1,6 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status:** M1 shipped (PR #14, catalog repair in #15). **M2 step 0 (write-direction probe) is closed — measured 2026-07-28; results below.** M2 steps 1–5 and M3–M4 outstanding. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
+**Status:** M1 shipped (PR #14, catalog repair in #15). **M2 step 0 (write-direction probe) closed and step 1 (`issues update`) shipped — 2026-07-28.** M2 steps 2–5 and M3–M4 outstanding. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
 
 **Base:** `upstream/main` (`ai-cluster-one/capabilities`), which carries the knowledge-base article verbs merged in PR #13. The `zjor/capabilities` fork's `main` runs behind upstream — branch from `upstream/main`, not `origin/main`.
 
@@ -30,7 +30,7 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `get_issue` | `task` | partial — **no custom fields at all** |
 | `search_issues` | `issues QUERY --limit` | partial — no offset, 5 hardcoded fields, no sort |
 | `create_issue` | `create` | partial — summary/description only |
-| `update_issue` | `update --state` | partial — **State only** |
+| `update_issue` | `issues update --field/--fields/--summary/--description` | **parity** (M2 step 1) |
 | `search_articles` | `articles` | partial — a listing, not a query |
 | `get_issue_fields_schema` | — | absent |
 | `find_user` | — | absent |
@@ -210,14 +210,25 @@ What pre-flight validation is still worth doing for:
 2. **Exit-code correctness.** An unknown field name — a plain typo — returns **HTTP 500**, which maps to exit `5` (network/server) under this CLI's contract when it is unambiguously exit `6` (input). Without pre-flight, the exit code lies about whose fault it is.
 3. **No wasted mutation risk.** Not correctness, but a rejected write still consumes a round trip and, on a real issue, can fire workflow rules.
 
-**This opens a cheaper design than the plan assumed — decide in M2 step 1.** Because the server validates and rolls back, the schema GET is only needed on the *failure* path:
+**This opens a cheaper design than the plan assumed — decided in M2 step 1.** Because the server validates and rolls back, the schema GET is only needed on the *failure* path:
 
 - **(A) Pre-flight always** — as originally planned: one extra `GET /admin/projects/{id}/customFields` before every write.
-- **(C) Translate on failure** — attempt the write; on 400/500 fetch the schema, and turn the server's message into a named-field, near-miss, allowed-values error with exit `6`. Costs the extra GET only when something is actually wrong, so the happy path is one round trip instead of two.
+- **(C) Translate on failure** — attempt the write; on 400/500 fetch the schema, and turn the server's message into a named-field, near-miss, allowed-values error with exit `6`.
 
-(C) gets the same agent-facing error quality at strictly lower cost, and the atomicity guarantee is what makes it safe. Prefer it unless pre-flight turns out to be needed for a case not measured here.
+**Decision: (C)** — with one correction measured during step 1. `$type` is **mandatory** on every `customFields` write entry: YouTrack answers `$type is required` and infers nothing from the value shape, for any of nine shapes tried (bare string, `{"name": …}`, `{"login": …}`, scalars, lists). So marshalling cannot proceed without type information, a metadata read before the POST is unavoidable, and **(C)'s "one round trip on the happy path" was wrong — both options cost two.** What differs is only where the extra lookup comes from, and it differs per verb:
 
-**Workflow rules are a distinct failure class.** A write can be rejected by project workflow, not by input validity: HTTP 400 with `error_type: workflow`, `error_rule_name`, and `error_issue_is_draft`. That is neither exit `6` (the input was legal) nor really exit `5`. The CLI must surface `error_rule_name` verbatim — an agent told only "400" cannot tell a typo from a business rule it must satisfy. Decide its exit code in M2.
+| verb | pre-write lookup | why that source |
+|---|---|---|
+| `issues update` | `GET /issues/{id}?fields=project(id,shortName),customFields(name,$type)` | Gives the `$type` map *and* the type-scoped field set, so unknown and out-of-scope names are caught pre-wire for free. Only bad *values* reach the server. |
+| `issues create` | `GET /admin/projects/{id}/customFields` | No issue exists yet. The schema also carries allowed values, so create gets full pre-flight validation at no extra cost — effectively (A). |
+
+Under this split the project schema is still fetched only on the failure path for `update`, which is what (C) was chosen for. Verified live: the happy path issues exactly two requests and no schema read.
+
+**Workflow rules are a distinct failure class.** A write can be rejected by project workflow, not by input validity: HTTP 400 with `error_type: workflow`, `error_rule_name`, and `error_issue_is_draft`. That is neither exit `6` (the input was legal) nor really exit `5`. The CLI must surface `error_rule_name` verbatim — an agent told only "400" cannot tell a typo from a business rule it must satisfy.
+
+**Decided in step 1: a new exit code `7`.** Reusing `5` would tell an agent to retry something deterministic, and reusing `4` would conflate a remote rule with the local `allow_write` gate — the caller could no longer tell "my config forbids this" from "YouTrack forbids this". The help contract documents `7` as deterministic and carries the rule name in the error body. This extends the capability's documented exit-code set, which was previously `0/2/3/4/5/6`.
+
+Two consequences for later milestones: a workflow rejection must **not** trigger the failure-path schema fetch (it is not a value problem, and allowed values would misdirect), and `issues create --draft` cannot set State on a draft at all, because IONDEV's rules reject every draft transition.
 
 **Fields are scoped by issue Type, not just by project — measured.** IONDEV declares 45 project custom fields, but `IONDEV-509` (a Task) carries only 34; the 11 missing are the bug/incident set (`Severity`, `Steps to Reproduce`, `Reported In`, `Incident Start Time`, `Root Cause`, `Blocked Reason`, …), which appear on `IONDEV-974` (a Bug). So the project schema is a *superset*: validating a name against it alone will accept `Severity` on a Task. On update, validate against the fields actually present on the target issue; on create, against the fields the chosen `Type` carries. Report a field that exists in the project but not on this issue with a distinct message — it is a different mistake from a typo.
 
@@ -333,8 +344,8 @@ The type model is already confirmed: `GET /admin/projects/{id}/customFields?fiel
 The milestone that makes the capability usable, and the only one with real design risk.
 
 0. ~~**Prove the write direction first**, on a throwaway draft issue: one write per `$type` in the marshalling table, read back, compare.~~ **✅ Done 2026-07-28** — see "Write direction — measured" above. 10 of 14 types confirmed byte-exact; `date` confirmed with a normalization rule; `state[1]`, `version[1]`, `build[1]` unprovable on IONDEV for reasons recorded there. Two of the plan's premises (silent-ignore, client-side atomicity) were disproved and have been rewritten.
-1. `issues update` with `--field` / `--fields`, plus `--summary` / `--description` (today impossible outside the web UI). **Decide (A) pre-flight vs (C) translate-on-failure here** — see Field semantics; (C) is the recommendation.
-2. `issues create` on the same marshalling path, so an issue can be born sprint-ready in one call.
+1. ~~`issues update` with `--field` / `--fields`, plus `--summary` / `--description`.~~ **✅ Done 2026-07-28.** Option (C) chosen, with the per-verb lookup correction above. `--state` is **removed** — `--field State=…` replaces it, per the "a dedicated verb for one field invites one per field" rule. Exit **7** added for workflow-rule rejections. `date` fields take and emit `YYYY-MM-DD`; `date and time` stays epoch ms. 24 new tests, every one mutation-checked; verified live against IONDEV-509 and a throwaway draft.
+2. `issues create` on the same marshalling path, so an issue can be born sprint-ready in one call. Its pre-write lookup is the project schema (see table above), which makes full pre-flight validation free — do not copy `update`'s failure-path translation blindly.
 3. Type-aware marshalling per the table above, replacing the hardcoded `{"name": "State", "$type": "StateIssueCustomField", …}`. Includes the `date` ↔ `YYYY-MM-DD` conversion and the `date`/`date and time` split.
 4. Schema-backed error translation with near-miss and allowed-value messages, and distinct handling for `error_type: workflow` rejections.
 5. `issues create --draft`, via `POST /api/users/me/drafts` with `Type` in the create payload.
