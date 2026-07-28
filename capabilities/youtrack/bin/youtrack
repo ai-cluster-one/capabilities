@@ -62,6 +62,14 @@ Read:
                                              default (measured).
   youtrack projects fields get ID NAME       One field's schema; NAME matches
                                              case-insensitively.
+  youtrack groups find [SUBSTRING] [--limit N] [--offset N]
+                                             Find user groups by substring on
+                                             name. Returns the group id, which
+                                             is what comment visibility needs —
+                                             permittedGroups rejects a name.
+  youtrack groups members GROUPID [--limit N] [--offset N]
+                                             List the users in a group. Takes
+                                             the group id from `groups find`.
   youtrack issues get ISSUE                  Read one issue (ID or URL).
   youtrack issues search QUERY [--limit N] [--offset N] [--select KEY,KEY]
                                              Search issues server-side using
@@ -844,6 +852,7 @@ def _request(client: httpx.Client, method: str, path: str, on_error=None, **kwar
 
 USER_FIELDS = "id,login,name,fullName,email"
 PROJECT_FIELDS = "id,name,shortName"
+GROUP_FIELDS = "id,name,description,usersCount"
 _CF_PROJECTION = ("customFields(id,name,$type,"
                   "value(id,name,login,text,minutes,presentation))")
 LINK_PROJECTION = ("links(direction,linkType(name,sourceToTarget,targetToSource),"
@@ -1357,6 +1366,18 @@ def projects_find(c, a):
     return _request(c, "GET", "/admin/projects", params=params)
 
 
+def groups_find(c, a):
+    params = _page_params(a, GROUP_FIELDS)
+    if a.substring:
+        params["query"] = a.substring
+    return _paged(_request(c, "GET", "/groups", params=params), a.limit)
+
+
+def groups_members(c, a):
+    return _paged(_request(c, "GET", f"/groups/{a.group}/users",
+                           params=_page_params(a, USER_FIELDS)), a.limit)
+
+
 PROJECT_FIELD_FIELDS = ("id,canBeEmpty,field(id,name,fieldType(id,isMultiValue)),"
                         "$type,bundle(id,values(name),aggregatedUsers(login))")
 
@@ -1704,6 +1725,7 @@ ARG_SELECT        = (("--select",), {"metavar": "KEY,KEY"})
 ARG_PROJECT_REQ   = (("--project",), {"required": True})
 ARG_PROJECT_OPT   = (("--project",), {})
 ARG_PROJECT_POS   = (("project",), {})
+ARG_GROUP_POS     = (("group",), {})
 ARG_FIELD_NAME    = (("name",), {})
 ARG_SUMMARY_REQ   = (("--summary",), {"required": True})
 ARG_SUMMARY_OPT   = (("--summary",), {})
@@ -1724,6 +1746,8 @@ COMMANDS = {
     ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT]),
     ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
     ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
+    ("groups", "find"):               (groups_find, [ARG_SUBSTRING_OPT, ARG_LIMIT100, ARG_OFFSET]),
+    ("groups", "members"):            (groups_members, [ARG_GROUP_POS, ARG_LIMIT100, ARG_OFFSET]),
     ("issues", "get"):                (issues_get, [ARG_ISSUE]),
     ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100, ARG_OFFSET, ARG_SELECT]),
     ("issues", "create"):             (issues_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,

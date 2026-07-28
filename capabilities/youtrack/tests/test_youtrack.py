@@ -336,6 +336,45 @@ def test_projects_find_smoke(tmp_path):
     assert "query=Demo" in ProjectsHandler.requests[0]
 
 
+def test_groups_find_pages_and_envelopes(tmp_path):
+    rows = [
+        {"id": "3-4", "name": "Administrative Team", "description": None,
+         "usersCount": 1},
+        {"id": "3-8", "name": "Reports Feature Group", "description": "migrated",
+         "usersCount": 17},
+    ]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "groups", "find", "Team", "--limit", "2")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert query["$top"] == ["3"]              # limit + 1
+    assert query["query"] == ["Team"]
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["name"] == "Administrative Team"
+    assert payload["has_more"] is False
+
+
+def test_groups_find_substring_is_optional(tmp_path):
+    handler = _paging_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "groups", "find")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert "query" not in query
+
+
+def test_groups_members_lists_users(tmp_path):
+    rows = [{"id": "1-1", "login": "s.royz", "fullName": "Sergey Royz",
+             "email": "s@example.com"}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "groups", "members", "3-4", "--limit", "5")
+    assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/groups/3-4/users"
+    assert json.loads(result.stdout)["items"][0]["login"] == "s.royz"
+
+
 PROJECT_FIELDS_PAYLOAD = [
     {"id": "1", "canBeEmpty": False, "$type": "EnumProjectCustomField",
      "field": {"name": "Priority", "fieldType": {"id": "enum[1]", "isMultiValue": False}},
