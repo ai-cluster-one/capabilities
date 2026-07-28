@@ -1,6 +1,6 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status — 2026-07-28: ✅ M1, ✅ M2, ✅ M3 and ✅ M4a are shipped. M1–M3 are merged to `upstream/main`; M4a is on `feat/youtrack-m4a-unblocked-tail`. ⬜ M4b outstanding — the last two gaps.**
+**Status — 2026-07-29: ✅ M1, ✅ M2, ✅ M3, ✅ M4a and ✅ M4b are all shipped. M1–M4a are merged to `upstream/main`; M4b is on `feat/youtrack-m4b-tags-and-work`. Every JetBrains predefined MCP tool is now accounted for — the parity ladder is complete.**
 
 - ✅ **M1** — PR #14, catalog repair in #15.
 - ✅ **M2 step 0** — write-direction probe closed, then extended the same day to the *create* path (see "Create path — measured"), which settled step 2's and step 5's central premises.
@@ -49,8 +49,8 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `find_user` | `users find` | ✅ **parity** (M3) |
 | `link_issues` | `issues links add` · `issues links remove` | ✅ **parity** (M3) |
 | `change_issue_assignee` | `issues update --field Assignee=…` | ✅ covered — deliberate drop, no own verb |
-| `manage_issue_tags` | — | ⬜ absent (M4b) |
-| `log_work` | — | ⬜ absent (M4b) |
+| `manage_issue_tags` | `issues tags add` · `issues tags remove` | ✅ **parity** (M4b) |
+| `log_work` | `issues work log` · `issues work list` | ✅ **parity** (M4b) |
 | `get_project` | `projects get` | ✅ **parity** (M4a) |
 | `get_saved_issue_searches` | `searches list` | ✅ **parity** (M4a) |
 | `find_user_groups` | `groups find` | ✅ **parity** (M4a) |
@@ -58,7 +58,9 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `create_draft_issue` | `issues create --draft` | ✅ **parity** (M2 step 5) |
 | — | `articles comments list`, `articles comments add` | CLI-only; MCP has no article-comment tools |
 
-**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1, M2, M3 and M4a all shipped: 20 at parity, 0 near/partial, 2 absent (`manage_issue_tags`, `log_work` — both M4b), plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** 20 + 0 + 2 + 1 = 23, counted over the table's 23 MCP rows (the CLI-only row is not a parity item). **Only M4b remains.**
+**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-29, with M1, M2, M3, M4a and M4b all shipped: 22 at parity, 0 near/partial, 0 absent, plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** 22 + 0 + 0 + 1 = 23, counted over the table's 23 MCP rows (the CLI-only row is not a parity item). **The ladder is complete — every JetBrains predefined MCP tool is accounted for.**
+
+**Do not hand-edit these numbers.** `python3 .claude/plans/recount-parity.py` recounts the table and fails if this sentence disagrees with it; it is what caught this line still reading `20 … 2 absent` after M4b's rows moved to parity.
 
 This one line has now been miscounted three times — "1 near/partial, 8 absent" (didn't sum to 23), "31 at parity … = 34" (a row heuristic that swept in other tables), and a revision that left the previous milestone's `13 + 3 + 6 + 1 = 23` standing beside the new figure so the sentence asserted both. **Recount it against the table programmatically rather than editing the numbers in place.** `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
 
@@ -675,7 +677,7 @@ Exercised through the installed CLI. The one throwaway issue (ION-1440) was dele
 
 **The group name→id resolution is the load-bearing result here.** `permittedGroups` rejects a name, so without it the flag could not accept the group name a caller actually knows.
 
-## M4b — Tags and work items — ⬜ NEXT
+## M4b — Tags and work items — ✅ SHIPPED
 
 Group C. The last two MCP gaps, and the only ones with unmeasured behaviour. **Both are probeable on ION — confirmed 2026-07-28 by reading the live instance**, so unlike M2's Group 1 this milestone is not blocked by the ION-only constraint.
 
@@ -702,6 +704,45 @@ Also fold in, since neither is a parity gap but both are the last of their kind:
 - **A self-parent guard on `articles update --parent`** — **the premise here was wrong.** The server does **not** silently accept a self-parent: it returns 400 *"recursive chain … sub-article of itself"* and applies nothing, which already maps to exit 6. The guard is therefore a message and round-trip improvement, **not** the correctness fix the self-link guard was. It is still worth shipping, and it must compare **resolved internal ids** so that `--parent 138-277` against `ION-A-240` is caught.
 
 **Done when:** parity is **22 of 23** at parity plus 1 (`change_issue_assignee`) covered by design — every JetBrains predefined tool accounted for.
+
+### ✅ M4b verified live against ION — 2026-07-29
+
+Exercised through the installed CLI on one throwaway issue (ION-1444) and one throwaway article (ION-A-242), both deleted afterwards and confirmed gone (`GET` → 404 on the internal id *and* the readable key). Closing sweeps: `summary: PROBE` → `[]`, `project: ION created: Today` → `[]`, drafts → `[]`, instance tag count still **17**, work-item types still **6**.
+
+| Check | Result |
+|---|---|
+| `issues tags add "Question"` | ✅ exit 0 |
+| the same add repeated | ✅ exit 0, **no duplicate** — idempotent through the CLI, as measured |
+| `issues tags add "Data Team"` (owned by `k.shmidt`) | ✅ applied — a foreign-owned tag is usable |
+| `issues tags add "devops"` | ✅ resolved case-insensitively to `DevOps` |
+| **tags accumulate rather than replace** | ✅ `['Question', 'DevOps', 'Data Team']` after four adds — the measured replace-semantics footgun is absent |
+| `issues get` | ✅ returns `tags` flattened to names |
+| `issues tags remove "Question"` | ✅ exit 0, only that tag removed |
+| removing a tag the issue no longer carries | ✅ exit **3**, `ION-1444 has no 'Question' tag` — blames the tag, not the issue |
+| `issues tags add "Questin"` | ✅ exit **6**, `no tag named 'Questin' is visible to this token`, hint `did you mean: Question, Design?`, **nothing written** |
+| `issues work log --duration "1h 30m"` | ✅ `{"minutes": 90, "presentation": "1h 30m"}`, date defaulted, `type: null`, `author: s.royz` |
+| `--duration 45m --type Development --date 2026-07-20 --text …` | ✅ type resolved by name; **`date` read back as `2026-07-20`** — noon-out/midnight-stored round-trips to the right calendar day |
+| **`--duration "1d 4h"`** | ✅ reads back **`12h` / 720** — the falsified round-trip, confirmed through the CLI |
+| `issues work list --limit 2` / `--offset 2` | ✅ `has_more: true` then `false`, pages differ |
+| **`--duration 90`** | ✅ exit **6** before any request: *"has no unit, and YouTrack reads a bare number as HOURS — 90 would log 90 hours"* |
+| `--duration 1.5h` | ✅ exit **6**, server message translated with the grammar hint |
+| `--duration ""` | ✅ exit **6** |
+| **`--type Review`** (instance-legal, absent from ION) | ✅ exit **6**, hint lists ION's five project types — the project-scoping decision, proven live |
+| `--type Developmnt` | ✅ exit **6**, `did you mean: Development?` |
+| `--date 20/07/2026` | ✅ exit **6** |
+| nothing logged by any refusal | ✅ the work list still held exactly the three legitimate entries |
+| `Spent time` after logging | ✅ `1d 6h 15m` = 855 min = 90 + 45 + 720 — derived from the log |
+| `issues update --field "Spent time=1h"` | ✅ exit **6**, server: *"automatically calculated based on time tracking settings"* — confirms the field cannot be written directly |
+| `projects fields list 0-1 --limit 3` / `--offset 3` | ✅ envelope with `has_more`, pages differ — the last silent truncation is gone |
+| `projects fields get 0-1 Estimation` | ✅ resolves a field **past page 1** — internal callers still read the complete schema |
+| `issues create --field "Estimation=1h" --field "NoSuchField=x"` | ✅ exit **6**, `no field named 'NoSuchField' on project 0-1`, while `Estimation` (also past page 1) validated — the F14 guarantee, live |
+| `articles update --parent` with the article's own key | ✅ exit **6**, `ION-A-242 cannot be its own parent` |
+| the same **across notations** (readable key vs internal id `138-280`) | ✅ exit **6** — the resolved-id comparison catches what an argument comparison would miss |
+| `articles update --summary` | ✅ still works — the guard does not block the legitimate path |
+
+**Not covered live, and why:** a tag invisible to this token (none exists to name — the only private tag is owned by this very token), and a work-item log against a project with time tracking disabled (writes are confined to ION). Both remain **UNPROVABLE-HERE**.
+
+One rough edge, recorded rather than fixed: the direct `Spent time` write surfaces YouTrack's raw JSON body as the error message rather than a translated one. The exit code is correct (6) and the server's wording is self-explanatory, so this is message polish, not a defect.
 
 ---
 
