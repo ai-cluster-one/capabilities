@@ -545,11 +545,37 @@ Exercised through the installed CLI on two throwaway ION issues (ION-1437, ION-1
 
 ## M4a — Close the unblocked tail — ⬜ NEXT
 
-Groups A and B from "What remains", plus `projects find` paging. **7 parity items, 5 new verbs, no probe needed** — every gap is a known endpoint with no unmeasured behaviour. A and B ship together because they have a real dependency: the comment-visibility flags in A want `groups find` from B to validate group names.
+Groups A and B from "What remains", plus `projects find` paging. **7 parity items, 5 new verbs.**
 
-1. `articles update --parent` · `articles search QUERY` · `issues comments add --permitted-users/--permitted-groups` (Group A)
-2. `projects get ID` · `searches list` · `groups find [SUBSTRING]` · `groups members GROUPID` (Group B)
-3. `projects find` paging — the last verb that still truncates silently (`$top: 100`, no `--limit`/`--offset`/`has_more`)
+**Endpoint shapes measured live on ION, 2026-07-28** — all five read endpoints confirmed, plus the one write this milestone carries:
+
+| Item | Endpoint | Measured |
+|---|---|---|
+| `projects get` | `GET /admin/projects/{id}` | ✅ returns `name`, `shortName`, `description`, `archived`, `leader`. An unknown field in the projection is **silently dropped**, not an error — `issuesCount` came back absent rather than 400. |
+| `searches list` | `GET /savedQueries` | ✅ `id`, `name`, `query`, `owner`, `visibleFor` |
+| `groups find` | `GET /groups` | ✅ `id`, `name`, `description`, `usersCount`; `$type` is `NestedGroup` |
+| `groups members` | `GET /groups/{id}/users` | ✅ standard user shape |
+| `articles search` | `GET /articles?query=…` | ✅ **same endpoint as `articles list`.** `summary: DWH` → 1 hit, bare `DWH` → 3 (full-text), nonsense → 0. So this is a query param on a shipped verb's endpoint, sharing its projection and paging. |
+
+### The comment-visibility write, measured — it reorders this milestone
+
+`issues comments add --permitted-users/--permitted-groups` is not the flag-only change it looked like:
+
+- **`permittedUsers` resolves by `login`.** `{"login": "s.royz"}` → 200.
+- **`permittedGroups` requires the group `id`, and rejects a name.** `{"name": "ION Team"}` → 400 `unable to locate an UserGroup-type entity unless its ID is also provided`; `{"id": "3-4"}` → 200. **So a caller-facing `--permitted-groups` naming groups by name is impossible without an id lookup — `groups find` is a hard prerequisite, not a convenience.** Build Group B's `groups find` *before* this item, not alongside it.
+- **`visibility` needs an explicit `$type`.** Omitting it returns 400 with a type-mismatch message — the same mandatory-`$type` trap M2 hit on custom fields. Send `{"$type": "LimitedVisibility", …}`.
+- **A bogus group name and a name-instead-of-id produce the identical 400**, so the message cannot distinguish them. Client-side resolution is the only way to tell the caller which mistake they made.
+- **A rejected comment write leaves no comment.** Three 400s created nothing, verified by reading the comment list back — the same property M2 measured for rejected creates, even though one error message named an allocated entity id.
+
+An unrestricted comment reads back `visibility: {"$type": "UnlimitedVisibility"}`, so the read projection must include `$type` to tell restricted from public.
+
+### Order
+
+1. **`groups find [SUBSTRING]` · `groups members GROUPID`** (Group B) — `groups find` first, because the visibility item depends on it.
+2. **`projects get ID` · `searches list`** (Group B) — independent read verbs.
+3. **`articles search QUERY` · `articles update --parent`** (Group A).
+4. **`issues comments add --permitted-users/--permitted-groups`** (Group A) — last, on top of `groups find`.
+5. **`projects find` paging** — the last verb that still truncates silently (`$top: 100`, no `--limit`/`--offset`/`has_more`).
 
 **Done when:** parity is **20 of 23**, with only `manage_issue_tags` and `log_work` outstanding, and no list verb truncates without saying so.
 
