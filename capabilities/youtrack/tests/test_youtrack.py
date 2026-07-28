@@ -766,6 +766,88 @@ def test_issues_get_requests_custom_fields(tmp_path):
     assert "name" in path
 
 
+# Measured shape: GET /issues/{id}/links returns every possible slot, empty or
+# not — 7 on an instance with 4 link types. See the parity plan's "Link model".
+_ALL_LINK_SLOTS = [
+    {"direction": "BOTH", "linkType": {"name": "Relates",
+     "sourceToTarget": "relates to", "targetToSource": ""}, "issues": []},
+    {"direction": "OUTWARD", "linkType": {"name": "Depend",
+     "sourceToTarget": "is required for", "targetToSource": "depends on"},
+     "issues": []},
+    {"direction": "INWARD", "linkType": {"name": "Depend",
+     "sourceToTarget": "is required for", "targetToSource": "depends on"},
+     "issues": []},
+    {"direction": "OUTWARD", "linkType": {"name": "Duplicate",
+     "sourceToTarget": "is duplicated by", "targetToSource": "duplicates"},
+     "issues": []},
+    {"direction": "INWARD", "linkType": {"name": "Duplicate",
+     "sourceToTarget": "is duplicated by", "targetToSource": "duplicates"},
+     "issues": []},
+    {"direction": "OUTWARD", "linkType": {"name": "Subtask",
+     "sourceToTarget": "parent for", "targetToSource": "subtask of"},
+     "issues": []},
+    {"direction": "INWARD", "linkType": {"name": "Subtask",
+     "sourceToTarget": "parent for", "targetToSource": "subtask of"},
+     "issues": [{"idReadable": "DEMO-9"}]},
+]
+
+
+def test_issues_get_filters_empty_link_slots(tmp_path):
+    class LinkReadHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps({
+                "idReadable": "DEMO-1", "summary": "s",
+                "customFields": [],
+                "links": _ALL_LINK_SLOTS,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    LinkReadHandler.requests = []
+    with serve(LinkReadHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["links"] == [{"type": "subtask of", "issues": ["DEMO-9"]}]
+
+
+def test_issues_get_requests_the_links_projection(tmp_path):
+    class LinkFieldHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps({"idReadable": "DEMO-1", "customFields": [],
+                               "links": []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    LinkFieldHandler.requests = []
+    with serve(LinkFieldHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(LinkFieldHandler.requests[0]).query)
+    assert "links(" in query["fields"][0]
+    # An issue with no links must emit no `links` key at all, not [].
+    assert "links" not in json.loads(result.stdout)
+
+
 def test_issues_search_emits_same_fields_shape(tmp_path):
     CustomFieldsHandler.requests = []
     with serve(CustomFieldsHandler) as base:

@@ -828,9 +828,11 @@ USER_FIELDS = "id,login,name,fullName,email"
 PROJECT_FIELDS = "id,name,shortName"
 _CF_PROJECTION = ("customFields(id,name,$type,"
                   "value(id,name,login,text,minutes,presentation))")
+LINK_PROJECTION = ("links(direction,linkType(name,sourceToTarget,targetToSource),"
+                   "issues(idReadable))")
 ISSUE_FIELDS = ("id,idReadable,summary,description,created,updated,resolved,"
                 "project(id,name,shortName),reporter(id,login,fullName),"
-                + _CF_PROJECTION)
+                + _CF_PROJECTION + "," + LINK_PROJECTION)
 ISSUE_SEARCH_FIELDS = ("id,idReadable,summary,description," + _CF_PROJECTION)
 COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 ARTICLE_FIELDS = ("id,idReadable,summary,content,created,updated,"
@@ -949,6 +951,42 @@ def _flatten_custom_fields(issue):
     fields = issue.pop("customFields") or []
     issue["fields"] = {f["name"]: _flatten_field(f)
                        for f in fields if isinstance(f, dict) and f.get("name")}
+    return issue
+
+
+def _link_phrase(link: dict) -> str | None:
+    """The phrase naming this link from the read issue's side.
+
+    INWARD reads as targetToSource ("subtask of"), OUTWARD and BOTH as
+    sourceToTarget. An undirected type reports targetToSource as "" — measured —
+    so BOTH must not consult it.
+    """
+    link_type = link.get("linkType") or {}
+    key = "targetToSource" if link.get("direction") == "INWARD" else "sourceToTarget"
+    return (link_type.get(key) or "").strip() or None
+
+
+def _flatten_links(issue):
+    """Drop the empty slots and reduce each link to phrase + issue keys.
+
+    The endpoint returns every possible slot on every issue — 7 where there are
+    4 link types — so passing them through would put 7 near-empty entries on
+    every single issue read (measured).
+    """
+    if not isinstance(issue, dict) or "links" not in issue:
+        return issue
+    links = issue.pop("links") or []
+    shaped = []
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        targets = [i.get("idReadable") for i in (link.get("issues") or [])
+                   if isinstance(i, dict) and i.get("idReadable")]
+        phrase = _link_phrase(link)
+        if targets and phrase:
+            shaped.append({"type": phrase, "issues": targets})
+    if shaped:
+        issue["links"] = shaped
     return issue
 
 
@@ -1353,9 +1391,9 @@ def projects_fields_get(c, a):
 
 
 def issues_get(c, a):
-    return _flatten_custom_fields(
+    return _flatten_links(_flatten_custom_fields(
         _request(c, "GET", f"/issues/{_issue_ref(a.issue)}",
-                 params={"fields": ISSUE_FIELDS}))
+                 params={"fields": ISSUE_FIELDS})))
 
 
 def issues_create(c, a):
