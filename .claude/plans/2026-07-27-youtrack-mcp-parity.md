@@ -1,6 +1,17 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status:** M1 shipped (PR #14, catalog repair in #15). **M2 step 0 (write-direction probe) closed and step 1 (`issues update`) shipped — 2026-07-28. Step 0 was then extended, same day, to cover the *create* path** (see "Create path — measured"), which settled step 2's and step 5's central premises. **Steps 2 (`issues create`) and 5 (`issues create --draft`) are in implementation**; steps 3–4 and M3–M4 outstanding. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
+**Status — 2026-07-28: ✅ M1 and ✅ M2 are both shipped and merged to `upstream/main`. M3 is next; M4 outstanding.**
+
+- ✅ **M1** — PR #14, catalog repair in #15.
+- ✅ **M2 step 0** — write-direction probe closed, then extended the same day to the *create* path (see "Create path — measured"), which settled step 2's and step 5's central premises.
+- ✅ **M2 step 1** (`issues update`) — PR #19.
+- ✅ **M2 steps 2–5** (`issues create` with `--field`/`--fields`, type-aware marshalling, schema-backed error translation, `--draft`) — PR #20, whose commit declares "Completes M2". 42 new tests; 105 tests total in `capabilities/youtrack/tests/test_youtrack.py`.
+- ✅ **Decision D1** — the misnamed `required` key is gone; `projects fields *` now emit `canBeEmpty` faithfully (breaking change, landed in PR #20).
+- ⬜ **M2 "Done when" is code-complete but not live-demonstrated** — the one-call sprint-ready IONDEV create over `text` fields is still unproven against the live server; see the note under M2's "Done when".
+- 🔨 **M3** — design approved and step 0 (link probe) closed 2026-07-28; steps 1–3 outstanding. ⬜ **M4** — outstanding.
+- **Standing constraint (owner, 2026-07-28): all experiments run against the ION project; IONDEV is not to be touched.** What ION cannot prove stays recorded as unproven — which permanently blocks M2's Group 1 gap, since ION carries no `text` field.
+
+This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
 
 **Base:** `upstream/main` (`ai-cluster-one/capabilities`), which carries the knowledge-base article verbs merged in PR #13. The `zjor/capabilities` fork's `main` runs behind upstream — branch from `upstream/main`, not `origin/main`.
 
@@ -20,32 +31,34 @@ A second, smaller problem: the surface is a flat list of unique first-level verb
 
 Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https://www.jetbrains.com/help/youtrack/devportal/predefined-ai-tools.html), enumerated in page order and counted directly: 6 at parity, 6 partial, 11 absent, plus 2 CLI-only verbs. (An earlier reading reported 24; that was a miscount. There is no 24th tool, and the set below is complete.)
 
-| MCP tool | today | status |
+| MCP tool | CLI verb today | status |
 |---|---|---|
-| `get_current_user` | `whoami` | parity |
-| `find_projects` | `projects --query` | parity |
-| `get_article` | `article` | parity |
-| `create_article` | `article-create` (also `--parent`) | parity+ |
-| `update_article` | `article-update` | near — cannot re-parent |
-| `add_issue_comment` | `comment` | near — no `permittedUsers`/`permittedGroups` |
-| `get_issue_comments` | `comments --limit` | partial — no offset |
-| `get_issue` | `task` | partial — **no custom fields at all** |
-| `search_issues` | `issues QUERY --limit` | partial — no offset, 5 hardcoded fields, no sort |
-| `create_issue` | `create` | partial — summary/description only |
-| `update_issue` | `issues update --field/--fields/--summary/--description` | **parity** (M2 step 1) |
-| `search_articles` | `articles` | partial — a listing, not a query |
-| `get_issue_fields_schema` | — | absent |
-| `find_user` | — | absent |
-| `link_issues` | — | absent |
-| `change_issue_assignee` | — | absent |
-| `manage_issue_tags` | — | absent |
-| `log_work` | — | absent |
-| `get_project` | — | absent |
-| `get_saved_issue_searches` | — | absent |
-| `find_user_groups` | — | absent |
-| `get_user_group_members` | — | absent |
-| `create_draft_issue` | — | absent |
-| — | `article-comments`, `article-comment` | CLI-only; MCP has no article-comment tools |
+| `get_current_user` | `users me` | ✅ parity |
+| `find_projects` | `projects find` | ✅ parity |
+| `get_article` | `articles get` | ✅ parity |
+| `create_article` | `articles create` (also `--parent`) | ✅ parity+ |
+| `update_article` | `articles update` | ⬜ near — cannot re-parent (M4) |
+| `add_issue_comment` | `issues comments add` | ⬜ near — no `permittedUsers`/`permittedGroups` (M4) |
+| `get_issue_comments` | `issues comments list --limit` | ⬜ partial — no offset (M3) |
+| `get_issue` | `issues get` | ✅ **parity** (M1 — custom fields now returned) |
+| `search_issues` | `issues search QUERY --limit` | ⬜ partial — no offset, no `--select`, no sort (M3) |
+| `create_issue` | `issues create --project/--summary/--description/--field/--fields` | ✅ **parity** (M2 step 2) |
+| `update_issue` | `issues update --field/--fields/--summary/--description` | ✅ **parity** (M2 step 1) |
+| `search_articles` | `articles list` | ⬜ partial — a listing, not a query (M4) |
+| `get_issue_fields_schema` | `projects fields list` · `projects fields get` | ✅ **parity** (M1) |
+| `find_user` | — | ⬜ absent (M3) |
+| `link_issues` | — | ⬜ absent (M3) |
+| `change_issue_assignee` | `issues update --field Assignee=…` | ✅ covered — deliberate drop, no own verb |
+| `manage_issue_tags` | — | ⬜ absent (M4) |
+| `log_work` | — | ⬜ absent (M4) |
+| `get_project` | — | ⬜ absent (M4) |
+| `get_saved_issue_searches` | — | ⬜ absent (M4) |
+| `find_user_groups` | — | ⬜ absent (M4) |
+| `get_user_group_members` | — | ⬜ absent (M4) |
+| `create_draft_issue` | `issues create --draft` | ✅ **parity** (M2 step 5) |
+| — | `articles comments list`, `articles comments add` | CLI-only; MCP has no article-comment tools |
+
+**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1 and M2 shipped: 9 at parity, 5 near/partial, 8 absent, plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** M3 closes 4 of the 13 remaining — `find_user`, `link_issues`, and the paging gaps on `search_issues` and `get_issue_comments` — leaving M4 the long tail.
 
 Attachments are in **neither** surface — they belong to the 44-tool community server, not JetBrains'. Not a parity item.
 
@@ -69,17 +82,17 @@ Six nouns: `issues`, `articles`, `projects`, `users`, `groups`, `searches`.
 
 | Command | Milestone |
 |---|---|
-| `issues get ISSUE` | M1 |
-| `issues search QUERY [--limit N] [--offset N] [--select F,F]` | M1 / M3 |
-| `issues create --project ID --summary S [--description TEXT\|-] [--field N=V]… [--fields JSON\|-] [--draft]` | M2 |
-| `issues update ISSUE [--summary S] [--description TEXT\|-] [--field N=V]… [--fields JSON\|-]` | M2 |
-| `issues comments list ISSUE [--limit N] [--offset N]` | M1 |
-| `issues comments add ISSUE [--text TEXT\|-]` | M1 |
-| `issues links add ISSUE --to ISSUE --type TYPE` | M3 |
-| `issues links remove ISSUE --to ISSUE --type TYPE` | M3 |
-| `issues tags add ISSUE TAG` · `issues tags remove ISSUE TAG` | M4 |
-| `issues work log ISSUE --duration D [--date D] [--type T] [--text TEXT\|-]` | M4 |
-| `issues work list ISSUE` | M4 |
+| `issues get ISSUE` | ✅ M1 |
+| `issues search QUERY [--limit N] [--offset N] [--select F,F]` | ✅ M1 · ⬜ M3 (`--offset`, `--select`) |
+| `issues create --project ID --summary S [--description TEXT\|-] [--field N=V]… [--fields JSON\|-] [--draft]` | ✅ M2 |
+| `issues update ISSUE [--summary S] [--description TEXT\|-] [--field N=V]… [--fields JSON\|-]` | ✅ M2 |
+| `issues comments list ISSUE [--limit N] [--offset N]` | ✅ M1 · ⬜ M3 (`--offset`) |
+| `issues comments add ISSUE [--text TEXT\|-]` | ✅ M1 |
+| `issues links add ISSUE --to ISSUE --type TYPE` | ⬜ M3 |
+| `issues links remove ISSUE --to ISSUE --type TYPE` | ⬜ M3 |
+| `issues tags add ISSUE TAG` · `issues tags remove ISSUE TAG` | ⬜ M4 |
+| `issues work log ISSUE --duration D [--date D] [--type T] [--text TEXT\|-]` | ⬜ M4 |
+| `issues work list ISSUE` | ⬜ M4 |
 
 Links are returned by `issues get`; there is deliberately no `issues links list`.
 
@@ -87,12 +100,12 @@ Links are returned by `issues get`; there is deliberately no `issues links list`
 
 | Command | Milestone |
 |---|---|
-| `articles get ID` | — |
-| `articles list [--project ID] [--limit N] [--offset N]` | — |
-| `articles search QUERY [--limit N] [--offset N]` | M4 |
-| `articles create --project ID --summary S [--content TEXT\|-] [--parent ID]` | — |
-| `articles update ID [--summary S] [--content TEXT\|-] [--parent ID]` | M4 (re-parent) |
-| `articles comments list ID [--limit N]` · `articles comments add ID [--text TEXT\|-]` | — |
+| `articles get ID` | ✅ shipped pre-M1 |
+| `articles list [--project ID] [--limit N] [--offset N]` | ✅ shipped · ⬜ `--offset` |
+| `articles search QUERY [--limit N] [--offset N]` | ⬜ M4 |
+| `articles create --project ID --summary S [--content TEXT\|-] [--parent ID]` | ✅ shipped |
+| `articles update ID [--summary S] [--content TEXT\|-] [--parent ID]` | ✅ shipped · ⬜ M4 (re-parent) |
+| `articles comments list ID [--limit N]` · `articles comments add ID [--text TEXT\|-]` | ✅ shipped |
 
 `articles list` keeps `list` rather than `find` because it is a project-scoped listing, not a match.
 
@@ -102,12 +115,12 @@ Links are returned by `issues get`; there is deliberately no `issues links list`
 
 | Command | Milestone |
 |---|---|
-| `projects find [SUBSTRING]` | — |
-| `projects get ID` | M4 |
-| `projects fields list ID` · `projects fields get ID NAME` | **M1** |
-| `users me` · `users find SUBSTRING` | M1 / M3 |
-| `groups find [SUBSTRING]` · `groups members GROUPID` | M4 |
-| `searches list` | M4 |
+| `projects find [SUBSTRING]` | ✅ shipped |
+| `projects get ID` | ⬜ M4 |
+| `projects fields list ID` · `projects fields get ID NAME` | ✅ **M1** |
+| `users me` · `users find SUBSTRING` | ✅ M1 (`me`) · ⬜ M3 (`find`) |
+| `groups find [SUBSTRING]` · `groups members GROUPID` | ⬜ M4 |
+| `searches list` | ⬜ M4 |
 
 ## Deliberate drops
 
@@ -318,6 +331,63 @@ The honest summary: **the create *mechanism* is measured; create *marshalling* i
 
 **The cheap way to close Group 1** is to re-run the same create shape against IONDEV — the only project carrying all 14 types — once step 2 exists, covering `text` in particular. That needs write authorization the extension did not have, which is why the gap is recorded rather than closed.
 
+**Group 1 remains open, and is now explicitly out of bounds — decided 2026-07-28.** The owner scoped all experiments to the **ION** project and ruled IONDEV untouchable, accepting that whatever ION cannot prove stays unproven. ION's schema was read live and carries **11 fields across 8 types — none of them `text`**, and no `enum[*]`, `user[*]`, `integer`, or `date and time` either. So all five Group 1 types are unprovable on the only project available for writes. This is a standing constraint, not a scheduling gap: closing Group 1 requires either IONDEV write authorization or a `text` field added to ION.
+
+---
+
+# Link model — measured 2026-07-28 (M3 step 0, closed)
+
+Probed live against **ION** on two throwaway issues (ION-1435, ION-1436), both left link-free afterwards. Every row below is measured unless tagged otherwise.
+
+**Link types are global, not per-project.** `GET /api/issueLinkTypes` returns the instance-wide set — 4 types here (`Relates`, `Depend`, `Duplicate`, `Subtask`). Resolution therefore needs **no project argument**, which removes a parameter the design had assumed.
+
+**All direction phrases are unique, so a phrase alone identifies a type *and* a direction.** This is what licenses the approved `--type "subtask of"` grammar:
+
+| Phrase | Type | Link id | `direction` |
+|---|---|---|---|
+| `relates to` | Relates (undirected) | `137-0` | `BOTH` |
+| `is required for` | Depend | `137-1s` | `OUTWARD` |
+| `depends on` | Depend | `137-1t` | `INWARD` |
+| `is duplicated by` | Duplicate | `137-2s` | `OUTWARD` |
+| `duplicates` | Duplicate | `137-2t` | `INWARD` |
+| `parent for` | Subtask | `137-3s` | `OUTWARD` |
+| `subtask of` | Subtask | `137-3t` | `INWARD` |
+
+An **undirected** type contributes exactly one phrase: `Relates` reports `targetToSource: ""` (empty string, not a copy of `sourceToTarget`), so there is no self-collision to disambiguate. **That the 7 phrases are globally unique is measured on this instance only** — a custom link type could in principle collide, so resolution must fail loudly on an ambiguous phrase rather than pick one.
+
+**`readOnly: true` is not a write gate — ignore it.** `Duplicate` and `Subtask` both report `readOnly: true`, and links of both were created successfully. The flag governs editing the *type definition*, not link creation. This one needs a source comment: it reads exactly like a permission gate, and treating it as one would disable `subtask of` — the single verb M3 exists to deliver.
+
+**`GET /issues/{id}/links` returns all 7 slots regardless of content**, each with an empty `issues: []` when unused. Two consequences:
+
+- **`links` embeds in the issue projection**, so `issues get` gains links in the same GET with no second call — the design's assumption holds.
+- **Output must filter to non-empty slots.** A pass-through flatten would emit 7 mostly-empty entries on every single issue read.
+
+**The link id encodes direction:** `{typeId}` when undirected, `{typeId}s` for OUTWARD, `{typeId}t` for INWARD. **Do not build that suffix by string arithmetic — read the ids off `GET /issues/{id}/links`.** The same payload carries both the phrase and the exact id to write to, so one call resolves everything measured; the `s`/`t` convention is an observed pattern, not a documented contract, and both verbs already have an issue in hand.
+
+**Add — `POST /api/issues/{id}/links/{linkId}/issues`:**
+
+- Body accepts **either** `{"idReadable": "ION-1436"}` **or** `{"id": "2-5186"}`. The readable key works, so add needs no id resolution.
+- **Reciprocity is automatic.** One write populated `subtask of → ION-1436` on one side and `parent for → ION-1435` on the other.
+- **Idempotent.** Repeating the identical write returned `200` and produced no duplicate entry.
+
+**Remove — `DELETE /api/issues/{id}/links/{linkId}/issues/{targetId}`** → `200`, empty body, clears both sides. **Two asymmetries with add, both measured:**
+
+- **The target must be the internal id.** A readable key returns `404`. So `remove` pays one resolution GET that `add` does not.
+- **It is not idempotent.** Removing a link that does not exist returns `404` — and its message names the *target issue* (`Entity with id 2-5186 not found`) even though that issue exists. Passing it through would tell the caller the issue is missing when the *link* is. Must be translated.
+
+**Write path B — the commands API works but loses.** `POST /api/commands` with `{"query": "relates to ION-1436", "issues": [{"idReadable": "ION-1435"}]}` returned `200` and created the link. It returns a bare `{}`: no confirmation of what changed and no structured error detail. **Path A is chosen** — direction-explicit, echoes the target, and carries translatable errors.
+
+**Error shapes — the reason resolution belongs client-side:**
+
+| Case | Server response | Translation |
+|---|---|---|
+| unknown link id | **`404`** `Entity with id 137-9t not found` | resolve phrases client-side; exit **6** with near-miss over the 7 legal phrases. The server's own 404 names no field and would land on exit 3. |
+| nonexistent target | **`400`** `YouTrack is unable to locate an Issue-type entity unless its ID is also provided` | exit **3** naming the target. The raw message describes an id-format problem, which is not what happened. |
+| **self-link** | **`200` — and silently creates nothing** | **Refuse client-side at exit 6.** The server accepts and ignores, so reporting success would be a lie about a no-op. |
+| remove a nonexistent link | **`404`** naming the target issue | exit **3** naming the *link* and both issues. |
+
+**Not proven on ION: workflow-rule rejection of a link (exit 7).** No link rule fired on ION, and whether one exists on IONDEV is unknown and now unaskable under the ION-only constraint. Tag: **UNTESTED** — do not claim exit 7 coverage for links.
+
 # Output shape
 
 Custom fields nest under their own key rather than merging top-level, so a field named `Summary` or `ID` cannot collide with core attributes:
@@ -419,34 +489,41 @@ The type model is already confirmed: `GET /admin/projects/{id}/customFields?fiel
 
 **Done when:** `issues get IONDEV-509` shows Type/State/Assignee/Priority/Points/Acceptance Criteria, and `projects fields list 0-6` enumerates the field set with allowed values for every bundle field.
 
-**Defect shipped in M1, surfaced by the 2026-07-28 create-path probe — the `"required"` key is a misnomer.** Item 3 above emits `"required": not entry.get("canBeEmpty", True)` from `_shape_project_field` (`capabilities/youtrack/bin/youtrack`, ~line 1085). Since **`canBeEmpty: false` does not mean required-at-create** (measured — see the call-out under "Create path"), that key reports `required: true` for State/Type/Priority on ION while a create omitting all three succeeds and the server defaults them. So the capability's own schema output tells an agent a field is mandatory when a create may legally omit it — steering the reader toward exactly the pre-flight step 2 must not build. **Decision D1: report `canBeEmpty` faithfully instead** — pass the flag through under its own name rather than restating it as a claim it does not support. **This is a read-path defect already on `main`**, not new step-2 work, which is why the `canBeEmpty` finding cannot be left as a footnote.
+**✅ FIXED in PR #20 — Defect shipped in M1, surfaced by the 2026-07-28 create-path probe: the `"required"` key was a misnomer.** `projects fields list` / `get` now emit `canBeEmpty` under its own name (a documented breaking change), and the source carries a comment recording why it is deliberately not inverted into `required`. Record of the defect follows. Item 3 above emits `"required": not entry.get("canBeEmpty", True)` from `_shape_project_field` (`capabilities/youtrack/bin/youtrack`, ~line 1085). Since **`canBeEmpty: false` does not mean required-at-create** (measured — see the call-out under "Create path"), that key reports `required: true` for State/Type/Priority on ION while a create omitting all three succeeds and the server defaults them. So the capability's own schema output tells an agent a field is mandatory when a create may legally omit it — steering the reader toward exactly the pre-flight step 2 must not build. **Decision D1: report `canBeEmpty` faithfully instead** — pass the flag through under its own name rather than restating it as a claim it does not support. **This is a read-path defect already on `main`**, not new step-2 work, which is why the `canBeEmpty` finding cannot be left as a footnote.
 
-## M2 — Set the fields
+## M2 — Set the fields — ✅ SHIPPED
 
-The milestone that makes the capability usable, and the only one with real design risk.
+The milestone that makes the capability usable, and the only one with real design risk. All five steps landed 2026-07-28 across PRs #18 (step 0 evidence), #19 (step 1) and #20 (steps 2–5, "Completes M2"). **The code is complete; the live "Done when" demonstration is not — see the note at the end of this section.**
 
 0. ~~**Prove the write direction first**, on a throwaway draft issue: one write per `$type` in the marshalling table, read back, compare.~~ **✅ Done 2026-07-28** — see "Write direction — measured" above. 10 of 14 types confirmed byte-exact; `date` confirmed with a normalization rule; `state[1]`, `version[1]`, `build[1]` unprovable on IONDEV for reasons recorded there. Two of the plan's premises (silent-ignore, client-side atomicity) were disproved and have been rewritten. **✅ Extended the same day to the create path** — see "Create path — measured" above: `POST /api/issues` takes `customFields` inline (no draft-then-promote), `$type` is mandatory on create as on update, a rejected create leaves no issue, and **`canBeEmpty: false` is not required-at-create**. Two further recorded claims were falsified (draft writability via `/issues/{id}`, and "a draft cannot take State"). `state[1]` and `float` moved to measured; `version[1]` and `build[1]` did **not** move. **7 of the 14 marshalling rows were never sent on a create** — read the coverage section before assuming otherwise.
 1. ~~`issues update` with `--field` / `--fields`, plus `--summary` / `--description`.~~ **✅ Done 2026-07-28.** Option (C) chosen, with the per-verb lookup correction above. `--state` is **removed** — `--field State=…` replaces it, per the "a dedicated verb for one field invites one per field" rule. Exit **7** added for workflow-rule rejections. `date` fields take and emit `YYYY-MM-DD`; `date and time` stays epoch ms. 24 new tests, every one mutation-checked; verified live against IONDEV-509 and a throwaway draft.
-2. `issues create` — **in implementation.** A single `POST /api/issues` with inline `customFields`, on the same marshalling path, so an issue can be born sprint-ready in one call; the premise is measured, not assumed. Its pre-write lookup is the project schema (see table above), which makes full pre-flight validation free — do not copy `update`'s failure-path translation blindly. Four measured constraints from step 0's create-path extension:
+2. `issues create` — **✅ Done 2026-07-28 (PR #20).** `--field NAME=VALUE`, `--fields JSON|FILE|-`. `$type` is resolved from the project schema's `fieldType.id`, never from its project-side `$type`. Because the schema is already in hand, create gets full allowed-value pre-flight for free — with user-typed fields deliberately excluded from that pre-check, since the visible user set is token-scoped and refusing there would invent a rejection the server would not make. An unmapped `fieldType.id` fails by name at exit 6 rather than sending an entry the server would reject. Design record follows. A single `POST /api/issues` with inline `customFields`, on the same marshalling path, so an issue can be born sprint-ready in one call; the premise is measured, not assumed. Its pre-write lookup is the project schema (see table above), which makes full pre-flight validation free — do not copy `update`'s failure-path translation blindly. Four measured constraints from step 0's create-path extension:
    - **Resolve `$type` from `fieldType.id`, never from the schema's own `$type`** — that one is *project-side* (`SimpleProjectCustomField` for a `date` field) and passing it through earns a type-mismatch 400.
    - **No required-field pre-flight.** `canBeEmpty: false` does not gate creation; refusing to send would reject creates YouTrack accepts. Warn at most, and only in the consumer's readiness terms.
    - **Report by reading the issue back**, not by echoing the request — the server defaults State/Type/Priority and auto-assigns Assignee.
    - **No client-side atomicity work and no compensating deletes** — a rejected create creates nothing.
-3. Type-aware marshalling per the table above, replacing the hardcoded `{"name": "State", "$type": "StateIssueCustomField", …}`. Includes the `date` ↔ `YYYY-MM-DD` conversion and the `date`/`date and time` split, and `float`'s string→number coercion alongside `integer`'s. **Coverage caveat, do not lose it: 7 of the table's 14 rows were never sent on a create** — unprovable on ION, which carries none of them. Five (`enum[*]`, `user[*]`, `integer`, `date and time`, `text`) inherit their shape from the *update* path only, and the argument that this makes create-path risk low is **INFERRED, not measured** (see the coverage section). Two (`version[1]`, `build[1]`) have **no successful write on any path at all**. **`text` gates M2's own "Done when"** below.
-4. Schema-backed error translation with near-miss and allowed-value messages, and distinct handling for `error_type: workflow` rejections. Note the two mappings the create-path extension could **not** reproduce and which still rest solely on the IONDEV measurement: the **HTTP 500** unknown-field-name → exit `6` mapping, and the **exit-`7`** workflow path.
-5. `issues create --draft` — **in implementation.** Via `POST /api/users/me/drafts` with `Type` in the create payload; measured to accept a full field set (6/6 across five types) in that one call, so a draft can be born sprint-ready. **Do not hard-code a refusal to set State on a draft** — that was an IONDEV workflow artifact. Draft writes still go to `/users/me/drafts/{id}` and must always be read back, but not because `/issues/{draftId}` is inert — it is not. Output must return the **internal id** (drafts have no readable key). **Document the promotion path `POST /api/issues?draftId={id}` and its properties** (fields carry over, the draft is consumed, the new issue has a different internal id, and the Assignee auto-default does not fire) so `--draft` does not hand the caller a dead end — **documentation only; no promote verb is in M2's scope.**
+3. **✅ Done 2026-07-28 (PRs #19, #20).** Type-aware marshalling per the table above, replacing the hardcoded `{"name": "State", "$type": "StateIssueCustomField", …}`. Includes the `date` ↔ `YYYY-MM-DD` conversion and the `date`/`date and time` split, and `float`'s string→number coercion alongside `integer`'s. **Coverage caveat, do not lose it: 7 of the table's 14 rows were never sent on a create** — unprovable on ION, which carries none of them. Five (`enum[*]`, `user[*]`, `integer`, `date and time`, `text`) inherit their shape from the *update* path only, and the argument that this makes create-path risk low is **INFERRED, not measured** (see the coverage section). Two (`version[1]`, `build[1]`) have **no successful write on any path at all**. **`text` gates M2's own "Done when"** below.
+4. **✅ Done 2026-07-28 (PRs #19, #20).** Schema-backed error translation with near-miss (`difflib`) and allowed-value messages, and distinct handling for `error_type: workflow` rejections at exit 7. Note the two mappings the create-path extension could **not** reproduce and which still rest solely on the IONDEV measurement: the **HTTP 500** unknown-field-name → exit `6` mapping, and the **exit-`7`** workflow path.
+5. `issues create --draft` — **✅ Done 2026-07-28 (PR #20).** Via `POST /api/users/me/drafts` with `Type` in the create payload; measured to accept a full field set (6/6 across five types) in that one call, so a draft can be born sprint-ready. **Do not hard-code a refusal to set State on a draft** — that was an IONDEV workflow artifact. Draft writes still go to `/users/me/drafts/{id}` and must always be read back, but not because `/issues/{draftId}` is inert — it is not. Output must return the **internal id** (drafts have no readable key). **Document the promotion path `POST /api/issues?draftId={id}` and its properties** (fields carry over, the draft is consumed, the new issue has a different internal id, and the Assignee auto-default does not fire) so `--draft` does not hand the caller a dead end — **documentation only; no promote verb is in M2's scope.**
 
-**Done when:** one `issues create` call produces an IONDEV issue satisfying the consumer's Ready-for-Sprint rules, and `issues update --field` moves each afterwards. **Note what this still requires proving:** those rules are gated by Acceptance Criteria and Definition of Done, both `text` fields, and `text` has **never been sent on a create** — so this "Done when" is not satisfied by step 0's evidence and must be demonstrated against IONDEV once step 2 exists.
+**Done when:** one `issues create` call produces an IONDEV issue satisfying the consumer's Ready-for-Sprint rules, and `issues update --field` moves each afterwards.
 
-## M3 — Work the board
+**⬜ STILL OPEN — the code shipped, this demonstration did not.** Those rules are gated by Acceptance Criteria and Definition of Done, both `text` fields, and `text` has **never been sent on a create** against the live server. PR #20's 42 tests parametrize all 14 marshalling rows plus `float` against exact request bodies, which pins the *client's* request shape — but a test fixture cannot prove the server accepts `text` on `POST /api/issues`, which is the residual risk the coverage section flags. **So M2 is shipped-and-tested but not live-accepted for its own acceptance criterion.**
 
-1. **`users find`** — a hard prerequisite for Assignee/Requestor/Approver. M2 can marshal `{"login": …}` blind, but nothing can confirm the login exists.
-2. **`issues links add` / `remove`**, plus links on `issues get`. The consumer's guide requires `parentIssue` for Sub-Tasks; today parentage is prose in descriptions ("Part of IONDEV-867") and invisible to any query.
-3. **`--offset`** on `issues search` and `issues comments list`; **`--select`** on `issues search`. The current limit silently truncates, so a sprint rollup is quietly wrong rather than obviously wrong. Paging matters more than projection.
+**And it is now blocked indefinitely, by decision rather than by effort (2026-07-28).** Closing it needs one real `issues create` carrying both `text` fields, but the owner has scoped all experiments to **ION** and ruled IONDEV untouchable — and ION's live schema carries no `text` field (11 fields, 8 types, none of them `text`). Unblocking requires either IONDEV write authorization or a `text` field added to ION. Until then this criterion stays open on purpose; do not let a later reader mistake it for an oversight.
 
-**Done when:** an agent can assign to a person it looked up, file a Sub-Task linked to its parent, and page a full sprint without truncation.
+## M3 — Work the board — 🔨 IN PROGRESS
 
-## M4 — Long tail
+Design approved 2026-07-28. **All experiments are confined to the ION project; IONDEV is not to be touched** — anything ION cannot prove stays recorded as unproven.
+
+0. **✅ Probe the link model first — done 2026-07-28**, see "Link model — measured" above. Scoped to links only: `users find` and paging needed no probe. Seven questions closed; it changed three things in the approved design (noted inline below) and produced one finding that would have broken the milestone silently — `readOnly: true` on `Subtask` is not a write gate.
+1. **`users find`** — a hard prerequisite for Assignee/Requestor/Approver. M2 can marshal `{"login": …}` blind, but nothing can confirm the login exists. `GET /api/users?query=…`, reusing the existing `USER_FIELDS` projection. **Decision: it stays a standalone lookup verb and is not wired into create/update pre-flight**, continuous with M2's deliberate exclusion of user-typed fields from the allowed-value pre-check — the visible user set is token-scoped, so a client-side refusal would invent a rejection the server would not make.
+2. **`issues links add` / `remove`**, plus links on `issues get`. The consumer's guide requires `parentIssue` for Sub-Tasks; today parentage is prose in descriptions ("Part of IONDEV-867") and invisible to any query. Grammar: `issues links add ISSUE --to ISSUE --type "subtask of"` — **the direction phrase is the type**, which the probe confirms is unambiguous. Bad phrases reuse the `difflib` near-miss plus `_die_bad_value` machinery M2 already shipped, so link errors need no new translation code. No `issues links list`; `issues get` covers reads. Three probe-driven changes from the approved design: **link ids are read off `GET /issues/{id}/links`, not built by suffix arithmetic**; **empty link slots are filtered out** of `issues get` (the endpoint returns all 7 regardless); and **self-links are refused client-side at exit 6**, because the server returns 200 and silently creates nothing.
+3. **`--offset`** on `issues search` and `issues comments list`; **`--select`** on `issues search`. The current limit silently truncates, so a sprint rollup is quietly wrong rather than obviously wrong. Paging matters more than projection. **`--select` filters the CLI's own flattened output on dotted paths** (`idReadable,summary,fields.State`), applied after shaping, so it cannot emit a wire shape a consumer has not seen. Truncation is signalled by fetching `$top = limit + 1`, returning `limit`, and emitting `has_more` — which requires an **envelope** (`{"items": […], "has_more": bool}`) and is therefore a **breaking output change**, the second in this series after M2's `canBeEmpty` rename.
+
+**Done when:** an agent can assign to a person it looked up, file a Sub-Task linked to its parent, and page a full sprint without truncation. **All three are demonstrable on ION** — link types are instance-global and paging is project-independent, so unlike M2's acceptance criterion this one is not blocked by the ION-only constraint.
+
+## M4 — Long tail — ⬜ OUTSTANDING
 
 Fill on demand, not speculatively: `articles search` · `articles update --parent` · `projects get` · `issues tags` · `issues work` · `searches list` · `groups find` + `groups members` · `permittedUsers`/`permittedGroups` visibility on comments and articles.
 
