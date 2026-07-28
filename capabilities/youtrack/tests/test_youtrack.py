@@ -428,7 +428,13 @@ class ProjectFieldsHandler(Handler):
     def do_GET(self):
         self.__class__.requests.append(("GET", self.path, self.headers, None))
         if "/customFields" in self.path:
-            self._reply(PROJECT_FIELDS_PAYLOAD)
+            # Honors $top/$skip like a real backend would, so paging tests
+            # against this fixture exercise genuine truncation/has_more
+            # behaviour rather than always returning the fixed payload.
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            top = int(query["$top"][0])
+            skip = int(query.get("$skip", ["0"])[0])
+            self._reply(PROJECT_FIELDS_PAYLOAD[skip:skip + top])
         else:
             self._reply({"error": "missing"}, 404)
 
@@ -438,7 +444,7 @@ def test_projects_fields_list_shapes_schema(tmp_path):
     with serve(ProjectFieldsHandler) as base:
         result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == [
+    assert json.loads(result.stdout)["items"] == [
         {"name": "Priority", "type": "enum[1]", "multiValue": False,
          "canBeEmpty": False, "values": ["Critical", "Normal"]},
         {"name": "Assignee", "type": "user[1]", "multiValue": False,
@@ -458,7 +464,7 @@ def test_projects_fields_report_can_be_empty_not_required(tmp_path):
         got = run_cli(tmp_path, base, "projects", "fields", "get", "0-6", "Priority")
     assert listed.returncode == 0, listed.stderr
     assert got.returncode == 0, got.stderr
-    for row in json.loads(listed.stdout):
+    for row in json.loads(listed.stdout)["items"]:
         assert "required" not in row, "the misnamed `required` key must be gone"
         assert isinstance(row["canBeEmpty"], bool)
     one = json.loads(got.stdout)
@@ -519,7 +525,7 @@ def test_projects_fields_list_drops_nameless_bundle_entries(tmp_path):
     with serve(NamelessBundleHandler) as base:
         result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
     assert result.returncode == 0, result.stderr
-    parsed = json.loads(result.stdout)
+    parsed = json.loads(result.stdout)["items"]
     assert parsed[0]["values"] == ["Critical"]
     assert None not in parsed[0]["values"]
     assert parsed[1]["values"] == ["s.royz"]
@@ -549,11 +555,41 @@ def test_projects_fields_list_skips_non_dict_entries(tmp_path):
     with serve(MalformedProjectFieldsHandler) as base:
         result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
     assert result.returncode == 0, result.stderr
-    parsed = json.loads(result.stdout)
+    parsed = json.loads(result.stdout)["items"]
     assert parsed == [
         {"name": "Priority", "type": "enum[1]", "multiValue": False,
          "canBeEmpty": False, "values": ["Critical"]},
     ]
+
+
+def test_projects_fields_list_pages_and_envelopes(tmp_path):
+    ProjectFieldsHandler.requests = []
+    with serve(ProjectFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6",
+                         "--limit", "2", "--offset", "1")
+    assert result.returncode == 0, result.stderr
+    path = [r[1] for r in ProjectFieldsHandler.requests if r[0] == "GET"][0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["$top"] == ["3"]        # limit + 1, replacing the hardcoded 200
+    assert query["$skip"] == ["1"]
+    payload = json.loads(result.stdout)
+    assert "items" in payload and isinstance(payload["items"], list)
+    assert payload["has_more"] is False
+
+
+def test_project_field_validation_still_reads_the_complete_set(tmp_path):
+    """The paging belongs to the verb, not to _project_fields: `fields get` and
+    both write verbs validate against the schema, and a paged helper would
+    narrow validation into false 'unknown field' errors."""
+    ProjectFieldsHandler.requests = []
+    with serve(ProjectFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "fields", "get", "0-6",
+                         "Points")
+    assert result.returncode == 0, result.stderr
+    path = [r[1] for r in ProjectFieldsHandler.requests if r[0] == "GET"][0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["$top"] == ["200"]
+    assert "$skip" not in query
 
 
 def test_issues_get_smoke(tmp_path):

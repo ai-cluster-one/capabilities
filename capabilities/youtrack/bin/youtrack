@@ -53,7 +53,8 @@ Read:
                                              optional substring match on name.
   youtrack projects get ID                   One project: name, shortName,
                                              description, archived, leader.
-  youtrack projects fields list ID           Custom-field schema for a project:
+  youtrack projects fields list ID [--limit N] [--offset N]
+                                             Custom-field schema for a project:
                                              name, type, multiValue, canBeEmpty,
                                              and allowed values where bundled.
                                              canBeEmpty is YouTrack's own flag and
@@ -1504,16 +1505,19 @@ def _shape_project_field(entry):
             "values": values or None}
 
 
-def _project_fields(c, project):
-    # $top=200 is deliberate headroom, not a default left in place: the
-    # largest real project seen has 45 custom fields.
+def _project_fields(c, project, params=None):
+    # $top=200 is deliberate headroom for the internal callers — `projects
+    # fields get` and both write verbs' validation need the COMPLETE set, since
+    # a truncated schema turns a legal field name into a false "unknown field".
+    # Only the `projects fields list` verb passes paging params.
     raw = _request(c, "GET", f"/admin/projects/{project}/customFields",
-                   params={"fields": PROJECT_FIELD_FIELDS, "$top": 200})
+                   params=params or {"fields": PROJECT_FIELD_FIELDS, "$top": 200})
     return [_shape_project_field(e) for e in raw if isinstance(e, dict)]
 
 
 def projects_fields_list(c, a):
-    return _project_fields(c, a.project)
+    return _paged(_project_fields(c, a.project,
+                                  _page_params(a, PROJECT_FIELD_FIELDS)), a.limit)
 
 
 def projects_fields_get(c, a):
@@ -2173,7 +2177,9 @@ COMMANDS = {
     ("users", "find"):                (users_find, [ARG_SUBSTRING_REQ, ARG_LIMIT50, ARG_OFFSET]),
     ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("projects", "get"):              (projects_get, [ARG_PROJECT_POS]),
-    ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
+    ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS,
+                                                              ARG_LIMIT100,
+                                                              ARG_OFFSET]),
     ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
     ("searches", "list"):             (searches_list, [ARG_LIMIT100, ARG_OFFSET]),
     ("groups", "find"):               (groups_find, [ARG_SUBSTRING_OPT, ARG_LIMIT100, ARG_OFFSET]),
