@@ -187,7 +187,11 @@ The other four:
 - `date and time` is *not* normalized — it returns exactly what was written. The two date-ish types therefore differ on the write path as well as in `$type`, widening the trap already noted above.
 - **Recommendation for M2:** accept and emit `YYYY-MM-DD` for `date` fields, converting to/from noon UTC internally. Raw epoch ms is a hostile interface for a calendar date, and the normalization makes it actively misleading. Keep epoch ms for `date and time`. The two rows in the marshalling table above now carry this distinction.
 
+**Clearing differs by cardinality — and the wrong choice is rejected, not ignored.** Measured on a multi-value field: `[]` clears it (200), while `null` returns **400**. A single-value field takes `null`. So `--field NAME=` cannot emit one shape for both; the single/multi split is load-bearing, not cosmetic.
+
 **Also established:** `Type` can be set in the same `POST /api/users/me/drafts` call that creates the draft, so `issues create --draft` can be born with its type-scoped field set. `DELETE /api/users/me/drafts/{id}` works and leaves no trace.
+
+**Drafts are not writable through `/issues/{id}`.** A `POST /api/issues/{draftId}` returns **200 and silently applies nothing** — found while trying to verify `issues update` against a draft. Draft writes must go to `/users/me/drafts/{id}`. Worth knowing before `issues create --draft` in step 5: a draft-targeted write that appears to succeed may have done nothing at all.
 
 **Validation is ahead of the wire — but the reason has changed. Measured 2026-07-28.**
 
