@@ -256,6 +256,10 @@ def test_comments_list_sends_skip_and_envelopes(tmp_path):
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
     assert query["$skip"] == ["20"]
     assert query["$top"] == ["11"]
+    # The read projection must keep asking for visibility, or an unknown-field
+    # silent drop server-side would regress this invisibly (measured: YouTrack
+    # drops an unrecognised field from `fields=` rather than erroring).
+    assert "visibility($type" in query["fields"][0]
     assert json.loads(result.stdout)["has_more"] is False
 
 
@@ -331,9 +335,77 @@ def test_projects_find_smoke(tmp_path):
 
     assert result.returncode == 0, result.stderr
     parsed = json.loads(result.stdout)
-    assert parsed[0]["shortName"] == "DEMO"
+    assert parsed["items"][0]["shortName"] == "DEMO"
     assert ProjectsHandler.requests[0].startswith("/api/admin/projects?")
     assert "query=Demo" in ProjectsHandler.requests[0]
+
+
+def test_projects_find_pages_and_envelopes(tmp_path):
+    rows = [{"id": "0-1", "name": "ION", "shortName": "ION"},
+            {"id": "0-6", "name": "ION Development", "shortName": "IONDEV"}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "projects", "find", "ION",
+                         "--limit", "2", "--offset", "1")
+    assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/admin/projects"
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert query["$top"] == ["3"]        # limit + 1, replacing the hardcoded 100
+    assert query["$skip"] == ["1"]
+    assert query["query"] == ["ION"]
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["shortName"] == "ION"
+    assert payload["has_more"] is False
+
+
+def test_projects_find_substring_is_optional(tmp_path):
+    handler = _paging_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "projects", "find")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert "query" not in query
+
+
+def test_groups_find_pages_and_envelopes(tmp_path):
+    rows = [
+        {"id": "3-4", "name": "Administrative Team", "description": None,
+         "usersCount": 1},
+        {"id": "3-8", "name": "Reports Feature Group", "description": "migrated",
+         "usersCount": 17},
+    ]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "groups", "find", "Team", "--limit", "2")
+    assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/groups"
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert query["$top"] == ["3"]              # limit + 1
+    assert query["query"] == ["Team"]
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["name"] == "Administrative Team"
+    assert payload["has_more"] is False
+
+
+def test_groups_find_substring_is_optional(tmp_path):
+    handler = _paging_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "groups", "find")
+    assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/groups"
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert "query" not in query
+
+
+def test_groups_members_lists_users(tmp_path):
+    rows = [{"id": "1-1", "login": "s.royz", "fullName": "Sergey Royz",
+             "email": "s@example.com"}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "groups", "members", "3-4", "--limit", "5")
+    assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/groups/3-4/users"
+    assert json.loads(result.stdout)["items"][0]["login"] == "s.royz"
 
 
 PROJECT_FIELDS_PAYLOAD = [
@@ -2375,7 +2447,7 @@ def test_article_create_requires_project(tmp_path):
 def test_article_update_requires_a_field(tmp_path):
     result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "update", "KB-A-9")
     assert result.returncode == 6
-    assert "--summary or --content" in result.stderr
+    assert "--summary, --content or --parent" in result.stderr
 
 
 def test_read_only_connection_refuses_article_create(tmp_path):
@@ -2462,7 +2534,8 @@ def test_article_update_rejects_empty_summary(tmp_path):
     result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "update",
                      "KB-A-9", "--summary", "")
     assert result.returncode == 6
-    assert "articles update needs a non-empty --summary or --content" in result.stderr
+    assert ("articles update needs a non-empty --summary, --content or --parent"
+            in result.stderr)
 
 
 def test_article_comment_rejects_empty_text(tmp_path):
@@ -2488,3 +2561,275 @@ def test_article_not_found_exits_3(tmp_path):
         server.shutdown()
         thread.join()
     assert result.returncode == 3
+
+
+def test_projects_get_returns_a_single_object_not_an_envelope(tmp_path):
+    class ProjectGetHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps({
+                "id": "0-1", "name": "ION", "shortName": "ION",
+                "description": None, "archived": False,
+                "leader": {"login": "s.royz", "fullName": "Sergey Royz"},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    ProjectGetHandler.requests = []
+    with serve(ProjectGetHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "get", "0-1")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    # Single-entity read: no envelope, matching issues get and articles get.
+    assert "items" not in payload
+    assert payload["shortName"] == "ION"
+    assert payload["leader"]["login"] == "s.royz"
+    assert urllib.parse.urlparse(ProjectGetHandler.requests[0]).path == \
+        "/api/admin/projects/0-1"
+
+
+def test_searches_list_pages_and_envelopes(tmp_path):
+    rows = [{"id": "7-0", "name": "Assigned to me", "query": "for: me",
+             "owner": {"login": "s.royz"}, "visibleFor": {"name": "All Users"}}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "searches", "list", "--limit", "5")
+    assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/savedQueries"
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["query"] == "for: me"
+    assert payload["has_more"] is False
+
+
+def test_articles_search_sends_the_query_to_the_articles_endpoint(tmp_path):
+    rows = [{"idReadable": "IONDEV-A-36", "summary": "DWH (TimeScale)"}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "articles", "search", "summary: DWH",
+                         "--limit", "3")
+    assert result.returncode == 0, result.stderr
+    parsed = urllib.parse.urlparse(handler.requests[0])
+    # Measured: articles search is the same endpoint as articles list, plus query.
+    assert parsed.path == "/api/articles"
+    query = urllib.parse.parse_qs(parsed.query)
+    assert query["query"] == ["summary: DWH"]
+    assert query["$top"] == ["4"]
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["idReadable"] == "IONDEV-A-36"
+    assert payload["has_more"] is False
+
+
+def test_articles_update_reparents(tmp_path):
+    class ReparentHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route.endswith("/A-2"):
+                self._reply({"id": "5-2", "idReadable": "A-2",
+                             "project": {"id": "0-1"}})
+            else:
+                self._reply({"id": "5-1", "idReadable": "A-1",
+                             "project": {"id": "0-1"}})
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+            self._reply({"id": "5-1", "idReadable": "A-1"})
+
+    ReparentHandler.requests = []
+    with serve(ReparentHandler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "A-2")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in ReparentHandler.requests if r[0] == "POST"][0]
+    assert post[2] == {"parentArticle": {"id": "5-2"}}
+
+
+def test_articles_update_refuses_a_cross_project_parent(tmp_path):
+    class CrossProjectHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route.endswith("/A-2"):
+                self._reply({"id": "5-2", "idReadable": "A-2",
+                             "project": {"id": "0-9"}})   # different project
+            else:
+                self._reply({"id": "5-1", "idReadable": "A-1",
+                             "project": {"id": "0-1"}})
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, None))
+            self._reply({})
+
+    CrossProjectHandler.requests = []
+    with serve(CrossProjectHandler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "A-2")
+    assert result.returncode == 6
+    # Same pre-check articles create already performs — must not reach the write.
+    assert not any(r[0] == "POST" for r in CrossProjectHandler.requests)
+
+
+def _visibility_handler(groups):
+    """Serves /groups for name->id resolution, records the comment POST."""
+    class VisibilityHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            self._reply(groups)
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+            self._reply({"id": "4-1", "text": "hi"})
+
+    VisibilityHandler.requests = []
+    return VisibilityHandler
+
+
+_GROUPS = [{"id": "3-4", "name": "Administrative Team"},
+           {"id": "3-9", "name": "ION Team"}]
+
+
+def test_comment_permitted_groups_are_sent_as_ids(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-groups", "ION Team")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    # Measured: permittedGroups rejects a name; only an id works.
+    assert post[2]["visibility"] == {
+        "$type": "LimitedVisibility",
+        "permittedGroups": [{"id": "3-9"}],
+    }
+
+
+def test_comment_permitted_users_are_sent_as_logins(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-users", "s.royz")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2]["visibility"] == {
+        "$type": "LimitedVisibility",
+        "permittedUsers": [{"login": "s.royz"}],
+    }
+    # No group lookup is needed when no group was named.
+    assert not any(r[0] == "GET" for r in handler.requests)
+
+
+def test_comment_visibility_always_carries_the_type(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-users", "s.royz",
+                         "--permitted-groups", "ION Team")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    # Measured: omitting $type returns 400 with a type mismatch.
+    assert post[2]["visibility"]["$type"] == "LimitedVisibility"
+    assert post[2]["visibility"]["permittedUsers"] == [{"login": "s.royz"}]
+    assert post[2]["visibility"]["permittedGroups"] == [{"id": "3-9"}]
+
+
+def test_unknown_group_name_exits_6_with_near_miss_and_no_write(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-groups", "ION Teem")
+    assert result.returncode == 6
+    assert "ION Team" in result.stderr, "must offer the near-miss"
+    # The server cannot distinguish a bad name from a name-instead-of-id, so the
+    # refusal must happen client-side, before any write.
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_ambiguous_group_name_exits_6_with_no_write(tmp_path):
+    # Two groups sharing a name: resolving must refuse rather than pick a
+    # winner, mirroring _resolve_link's refusal of an ambiguous link phrase.
+    dup_groups = [{"id": "3-4", "name": "Incidents"},
+                  {"id": "3-9", "name": "Incidents"}]
+    handler = _visibility_handler(dup_groups)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-groups", "Incidents")
+    assert result.returncode == 6
+    assert "ambiguous" in result.stderr
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_comment_permitted_users_rejects_empty_login(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-users", "")
+    assert result.returncode == 6
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_comment_permitted_groups_rejects_empty_name(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-groups", "   ")
+    assert result.returncode == 6
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_comment_without_visibility_flags_sends_no_visibility_key(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert "visibility" not in post[2]

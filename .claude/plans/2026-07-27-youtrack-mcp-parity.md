@@ -1,6 +1,6 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status — 2026-07-28: ✅ M1, ✅ M2 and ✅ M3 are shipped and all merged to `upstream/main`. M4 outstanding.**
+**Status — 2026-07-28: ✅ M1, ✅ M2, ✅ M3 and ✅ M4a are shipped. M1–M3 are merged to `upstream/main`; M4a is on `feat/youtrack-m4a-unblocked-tail`. ⬜ M4b outstanding — the last two gaps.**
 
 - ✅ **M1** — PR #14, catalog repair in #15.
 - ✅ **M2 step 0** — write-direction probe closed, then extended the same day to the *create* path (see "Create path — measured"), which settled step 2's and step 5's central premises.
@@ -37,28 +37,30 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `find_projects` | `projects find` | ✅ parity |
 | `get_article` | `articles get` | ✅ parity |
 | `create_article` | `articles create` (also `--parent`) | ✅ parity+ |
-| `update_article` | `articles update` | ⬜ near — cannot re-parent (M4a) |
-| `add_issue_comment` | `issues comments add` | ⬜ near — no `permittedUsers`/`permittedGroups` (M4a) |
+| `update_article` | `articles update` (also `--parent`) | ✅ **parity** (M4a) |
+| `add_issue_comment` | `issues comments add --permitted-users/--permitted-groups` | ✅ **parity** (M4a) |
 | `get_issue_comments` | `issues comments list --limit --offset` | ✅ **parity** (M3) |
 | `get_issue` | `issues get` | ✅ **parity** (M1 — custom fields now returned) |
 | `search_issues` | `issues search QUERY --limit --offset --select` | ✅ **parity** (M3 — sort still absent, deliberately) |
 | `create_issue` | `issues create --project/--summary/--description/--field/--fields` | ✅ **parity** (M2 step 2) |
 | `update_issue` | `issues update --field/--fields/--summary/--description` | ✅ **parity** (M2 step 1) |
-| `search_articles` | `articles list` | ⬜ partial — a listing, not a query (M4a) |
+| `search_articles` | `articles search` | ✅ **parity** (M4a) |
 | `get_issue_fields_schema` | `projects fields list` · `projects fields get` | ✅ **parity** (M1) |
 | `find_user` | `users find` | ✅ **parity** (M3) |
 | `link_issues` | `issues links add` · `issues links remove` | ✅ **parity** (M3) |
 | `change_issue_assignee` | `issues update --field Assignee=…` | ✅ covered — deliberate drop, no own verb |
 | `manage_issue_tags` | — | ⬜ absent (M4b) |
 | `log_work` | — | ⬜ absent (M4b) |
-| `get_project` | — | ⬜ absent (M4a) |
-| `get_saved_issue_searches` | — | ⬜ absent (M4a) |
-| `find_user_groups` | — | ⬜ absent (M4a) |
-| `get_user_group_members` | — | ⬜ absent (M4a) |
+| `get_project` | `projects get` | ✅ **parity** (M4a) |
+| `get_saved_issue_searches` | `searches list` | ✅ **parity** (M4a) |
+| `find_user_groups` | `groups find` | ✅ **parity** (M4a) |
+| `get_user_group_members` | `groups members` | ✅ **parity** (M4a) |
 | `create_draft_issue` | `issues create --draft` | ✅ **parity** (M2 step 5) |
 | — | `articles comments list`, `articles comments add` | CLI-only; MCP has no article-comment tools |
 
-**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1, M2 and M3 all merged: 13 at parity, 3 near/partial (`update_article`, `add_issue_comment`, `search_articles`), 6 absent, plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** 13 + 3 + 6 + 1 = 23. (An earlier revision of this line said "1 near/partial, 8 absent" — a miscount that did not sum to 23; corrected against the table above.) Everything still open is M4's long tail. `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
+**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1, M2, M3 and M4a all shipped: 20 at parity, 0 near/partial, 2 absent (`manage_issue_tags`, `log_work` — both M4b), plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** 20 + 0 + 2 + 1 = 23, counted over the table's 23 MCP rows (the CLI-only row is not a parity item). **Only M4b remains.**
+
+This one line has now been miscounted three times — "1 near/partial, 8 absent" (didn't sum to 23), "31 at parity … = 34" (a row heuristic that swept in other tables), and a revision that left the previous milestone's `13 + 3 + 6 + 1 = 23` standing beside the new figure so the sentence asserted both. **Recount it against the table programmatically rather than editing the numbers in place.** `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
 
 Attachments are in **neither** surface — they belong to the 44-tool community server, not JetBrains'. Not a parity item.
 
@@ -543,7 +545,7 @@ Exercised through the installed CLI on two throwaway ION issues (ION-1437, ION-1
 
 **Still unproven, and now unprovable under the ION-only constraint:** exit **7** for a workflow-rule rejection of a link. No link rule fired on ION, and whether one exists on IONDEV cannot be asked. Tag: **UNTESTED** — do not claim exit 7 coverage for links.
 
-## M4a — Close the unblocked tail — ⬜ NEXT
+## M4a — Close the unblocked tail — ✅ SHIPPED
 
 Groups A and B from "What remains", plus `projects find` paging. **7 parity items, 5 new verbs.**
 
@@ -553,7 +555,7 @@ Groups A and B from "What remains", plus `projects find` paging. **7 parity item
 |---|---|---|
 | `projects get` | `GET /admin/projects/{id}` | ✅ returns `name`, `shortName`, `description`, `archived`, `leader`. An unknown field in the projection is **silently dropped**, not an error — `issuesCount` came back absent rather than 400. |
 | `searches list` | `GET /savedQueries` | ✅ `id`, `name`, `query`, `owner`, `visibleFor` |
-| `groups find` | `GET /groups` | ✅ `id`, `name`, `description`, `usersCount`; `$type` is `NestedGroup` |
+| `groups find` | `GET /groups` | ✅ `id`, `name`, `description`, `usersCount`; `$type` is `NestedGroup`. **`query=` is honoured server-side** — measured after the fact, when the final review pointed out the original table recorded only the projection: `query=zzznomatch` → 0 rows, `query=Incidents` → exactly `Incidents Team`, no query → unfiltered. `_resolve_group_ids` deliberately omits `query` because name resolution needs the full set. |
 | `groups members` | `GET /groups/{id}/users` | ✅ standard user shape |
 | `articles search` | `GET /articles?query=…` | ✅ **same endpoint as `articles list`.** `summary: DWH` → 1 hit, bare `DWH` → 3 (full-text), nonsense → 0. So this is a query param on a shipped verb's endpoint, sharing its projection and paging. |
 
@@ -577,9 +579,31 @@ An unrestricted comment reads back `visibility: {"$type": "UnlimitedVisibility"}
 4. **`issues comments add --permitted-users/--permitted-groups`** (Group A) — last, on top of `groups find`.
 5. **`projects find` paging** — the last verb that still truncates silently (`$top: 100`, no `--limit`/`--offset`/`has_more`).
 
-**Done when:** parity is **20 of 23**, with only `manage_issue_tags` and `log_work` outstanding, and no list verb truncates without saying so.
+**Done when:** parity is **20 of 23**, with only `manage_issue_tags` and `log_work` outstanding, and no verb **that takes `--limit`** truncates without saying so.
 
-## M4b — Tags and work items — ⬜ AFTER M4a
+**Correction, from the final review:** the original wording said "no list verb truncates without saying so", which is not literally true. **`projects fields list` still does** — it hardcodes `$top: 200`, returns a bare array, and takes no `--limit`. It is contract-compliant, because the envelope rule binds only `--limit` verbs, but it is the last silent truncation in the surface. Tracked in M4b's list below rather than left implicit.
+
+### ✅ M4a verified live against ION — 2026-07-28
+
+Exercised through the installed CLI. The one throwaway issue (ION-1440) was deleted afterwards and confirmed gone (`GET` → 404).
+
+| Check | Result |
+|---|---|
+| `groups find Team --limit 3` | ✅ envelope, `has_more: true`; returned `ION Team` id `531-0` — the id the visibility flag needs |
+| `groups members 531-0 --limit 4` | ✅ envelope, 4 of 11 members, `has_more: true` |
+| `projects get 0-1` | ✅ **no envelope** (`items` absent), `shortName: ION`, `leader: s.royz`, `archived: false` |
+| `searches list --limit 3` | ✅ envelope with queries (`for: me`, `by: me`, `commenter: me`) |
+| `articles search "summary: DWH"` | ✅ 1 hit (`IONDEV-A-36`) — matches the measured field-scoped behaviour |
+| `articles search "DWH"` | ✅ 3 hits — full-text, matching the measured behaviour |
+| `projects find --limit 2` / `--offset 2` | ✅ page 1 `IONDEV, IES`; page 2 `INC, ION` — real paging, and the verb no longer truncates silently |
+| `comments add --permitted-groups "ION Team"` | ✅ the **name resolved to id `531-0`** and applied; reads back `LimitedVisibility` |
+| `comments add --permitted-users s.royz` | ✅ login passed through; reads back `LimitedVisibility` |
+| `comments add` with neither flag | ✅ reads back `UnlimitedVisibility` — no `visibility` key was sent |
+| `comments add --permitted-groups "ION Teem"` | ✅ exit **6**, `did you mean: ION Team, IES Team?`, **and nothing written** — the comment count stayed at 3 after two typo attempts, not 5 |
+
+**The group name→id resolution is the load-bearing result here.** `permittedGroups` rejects a name, so without it the flag could not accept the group name a caller actually knows.
+
+## M4b — Tags and work items — ⬜ NEXT
 
 Group C. The last two MCP gaps, and the only ones with unmeasured behaviour. **Both are probeable on ION — confirmed 2026-07-28 by reading the live instance**, so unlike M2's Group 1 this milestone is not blocked by the ION-only constraint.
 
@@ -590,6 +614,11 @@ Group C. The last two MCP gaps, and the only ones with unmeasured behaviour. **B
 *Work items — measured so far:* time tracking is **enabled** on ION, with five `workItemTypes` (`Development`, `Testing`, `Documentation`, `Investigation`, `Implementation`). **Unknown:** the duration write shape — `{"minutes": N}` versus `{"presentation": "1d 4h"}` — and its round-trip fidelity. M2 measured that a `period` custom field round-trips byte-exact as `presentation` while reading back as **minutes**, with workday length coming from server-side project settings, so a work item very likely carries the same dual representation. Also unknown: whether `type` is required, and how the work item's date behaves relative to the `date` normalization M2 measured.
 
 **Scope boundary, so M4b does not duplicate what already ships.** ION's `estimate` and `timeSpent` are `PeriodProjectCustomField`s, which means the `Estimation` and `Spent time` *fields* are already writable through `issues update --field` on the M2 marshalling path. M4b is about the additive **work-item log** — `POST` a new entry, list the entries — which is what `log_work` actually covers. Do not add a verb that re-writes those two fields.
+
+Also fold in, since neither is a parity gap but both are the last of their kind:
+
+- **`projects fields list` paging** — hardcodes `$top: 200`, bare array, no `--limit`. The last silent truncation in the surface, per M4a's final review.
+- **A self-parent guard on `articles update --parent`** — `issues links add`/`remove` refuse a self-reference client-side; re-parenting an article to itself is currently sent to the server, whose behaviour there is unmeasured.
 
 **Done when:** parity is **22 of 23** at parity plus 1 (`change_issue_assignee`) covered by design — every JetBrains predefined tool accounted for.
 

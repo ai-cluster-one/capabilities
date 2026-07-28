@@ -48,8 +48,11 @@ Read:
                                              set is token-scoped, so absence
                                              here does not prove a login is
                                              invalid.
-  youtrack projects find [SUBSTRING]         Projects visible to the token;
+  youtrack projects find [SUBSTRING] [--limit N] [--offset N]
+                                             Projects visible to the token;
                                              optional substring match on name.
+  youtrack projects get ID                   One project: name, shortName,
+                                             description, archived, leader.
   youtrack projects fields list ID           Custom-field schema for a project:
                                              name, type, multiValue, canBeEmpty,
                                              and allowed values where bundled.
@@ -62,6 +65,17 @@ Read:
                                              default (measured).
   youtrack projects fields get ID NAME       One field's schema; NAME matches
                                              case-insensitively.
+  youtrack groups find [SUBSTRING] [--limit N] [--offset N]
+                                             Find user groups by substring on
+                                             name. Returns the group id, which
+                                             is what comment visibility needs —
+                                             permittedGroups rejects a name.
+  youtrack groups members GROUPID [--limit N] [--offset N]
+                                             List the users in a group. Takes
+                                             the group id from `groups find`.
+  youtrack searches list [--limit N] [--offset N]
+                                             Saved issue searches visible to
+                                             the token, with their queries.
   youtrack issues get ISSUE                  Read one issue (ID or URL).
   youtrack issues search QUERY [--limit N] [--offset N] [--select KEY,KEY]
                                              Search issues server-side using
@@ -127,7 +141,14 @@ Write:
                                              time` fields are epoch milliseconds.
                                              Respects allow_write connection policy.
   youtrack issues comments add ISSUE [--text TEXT|-]
-                                             Add a comment; omitted text reads stdin.
+        [--permitted-users LOGIN]…           Restrict who can see the comment.
+        [--permitted-groups NAME]…           Users are named by login, groups by
+                                             name — the name is resolved to an
+                                             id here because YouTrack's
+                                             permittedGroups rejects names. An
+                                             unknown group exits 6 before any
+                                             write. Omit both flags and the
+                                             comment is unrestricted.
   youtrack issues links add ISSUE --to ISSUE --type PHRASE
                                              Link two issues. --type takes the
                                              direction phrase, not a type name:
@@ -144,8 +165,13 @@ Write:
   youtrack articles create --project ID      Create an article in a project
         --summary S [--content TEXT|-]        (database entity id); optionally give
         [--parent ID|URL]                    a parent article to create a sub-article.
+  youtrack articles search QUERY [--limit N] [--offset N]
+                                             Full-text / query-language search
+                                             over articles. Same endpoint as
+                                             `articles list`, with a query.
   youtrack articles update ID                Update an article's summary and/or
-        [--summary S] [--content TEXT|-]     content. Respects allow_write policy.
+        [--summary S] [--content TEXT|-]     content and/or parent (ID|URL).
+        [--parent ID|URL]                    Respects allow_write policy.
   youtrack articles comments add ID [--text TEXT|-]
                                              Add a comment to an article.
 
@@ -179,7 +205,7 @@ from typing import NoReturn
 import httpx
 
 NAME = "youtrack"
-SUMMARY = "YouTrack CLI for issues (read with links, paged search with field projection, comment, create — as a numbered issue or a draft, with any custom field set in the create call — update of summary, description, and any custom field, and add/remove issue links by direction phrase), user lookup, project custom-field schemas, and the knowledge base (read, create, and update articles and article comments)."
+SUMMARY = "YouTrack CLI for issues (read with links, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, and add/remove issue links by direction phrase), user and group lookup, project reads and custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments)."
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,
@@ -844,6 +870,10 @@ def _request(client: httpx.Client, method: str, path: str, on_error=None, **kwar
 
 USER_FIELDS = "id,login,name,fullName,email"
 PROJECT_FIELDS = "id,name,shortName"
+PROJECT_GET_FIELDS = ("id,name,shortName,description,archived,"
+                      "leader(login,fullName)")
+SAVED_QUERY_FIELDS = "id,name,query,owner(login),visibleFor(name)"
+GROUP_FIELDS = "id,name,description,usersCount"
 _CF_PROJECTION = ("customFields(id,name,$type,"
                   "value(id,name,login,text,minutes,presentation))")
 LINK_PROJECTION = ("links(direction,linkType(name,sourceToTarget,targetToSource),"
@@ -852,7 +882,8 @@ ISSUE_FIELDS = ("id,idReadable,summary,description,created,updated,resolved,"
                 "project(id,name,shortName),reporter(id,login,fullName),"
                 + _CF_PROJECTION + "," + LINK_PROJECTION)
 ISSUE_SEARCH_FIELDS = ("id,idReadable,summary,description," + _CF_PROJECTION)
-COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
+COMMENT_FIELDS = ("id,text,created,updated,author(id,login,fullName),"
+                  "visibility($type,permittedUsers(login),permittedGroups(id,name))")
 ARTICLE_FIELDS = ("id,idReadable,summary,content,created,updated,"
                   "project(id,name,shortName),reporter(id,login,fullName),"
                   "parentArticle(id,idReadable,summary),"
@@ -1351,10 +1382,38 @@ def users_find(c, a):
 
 
 def projects_find(c, a):
-    params = {"fields": PROJECT_FIELDS, "$top": 100}
+    params = _page_params(a, PROJECT_FIELDS)
     if a.substring:
         params["query"] = a.substring
-    return _request(c, "GET", "/admin/projects", params=params)
+    return _paged(_request(c, "GET", "/admin/projects", params=params), a.limit)
+
+
+def projects_get(c, a):
+    return _request(c, "GET", f"/admin/projects/{a.project}",
+                    params={"fields": PROJECT_GET_FIELDS})
+
+
+def searches_list(c, a):
+    return _paged(_request(c, "GET", "/savedQueries",
+                           params=_page_params(a, SAVED_QUERY_FIELDS)), a.limit)
+
+
+# Measured 2026-07-28: GET /groups honours `query=` server-side — a nonsense
+# substring (`query=zzznomatch`) returned 0 rows, a real one (`query=Incidents`)
+# returned exactly "Incidents Team", and no query never silently returned an
+# unfiltered list instead. `_resolve_group_ids` below deliberately does NOT
+# pass `query`: it needs the complete set to resolve a name (and to notice a
+# duplicate), not a filtered subset.
+def groups_find(c, a):
+    params = _page_params(a, GROUP_FIELDS)
+    if a.substring:
+        params["query"] = a.substring
+    return _paged(_request(c, "GET", "/groups", params=params), a.limit)
+
+
+def groups_members(c, a):
+    return _paged(_request(c, "GET", f"/groups/{a.group}/users",
+                           params=_page_params(a, USER_FIELDS)), a.limit)
 
 
 PROJECT_FIELD_FIELDS = ("id,canBeEmpty,field(id,name,fieldType(id,isMultiValue)),"
@@ -1490,12 +1549,81 @@ def issues_comments_list(c, a):
                            params=_page_params(a, COMMENT_FIELDS)), a.limit)
 
 
+def _resolve_group_ids(c, names: list) -> list:
+    """Group names -> `{"id": …}` entries.
+
+    Measured: `permittedGroups` requires the group id and rejects a name, and a
+    bogus name returns the same 400 as a name-instead-of-id — so the server
+    cannot tell the caller which mistake they made. Resolving here is the only
+    way to say "no such group" precisely.
+
+    Fetches `/groups` once with a fixed `$top: 1000` and no continuation — an
+    instance with more than 1000 groups can have a *valid* group past that page
+    reported as unknown here; this deliberately does not paginate to find it.
+
+    Group names are not guaranteed unique. Mirroring `_resolve_link`'s refusal
+    of an ambiguous link phrase rather than picking one, a name shared by more
+    than one group here is refused (exit 6) instead of silently resolving to
+    whichever row a dict comprehension happened to keep last — guessing here
+    could grant or restrict comment visibility to the wrong group.
+    """
+    rows = _request(c, "GET", "/groups",
+                    params={"fields": GROUP_FIELDS, "$top": 1000})
+    by_name: dict = {}
+    for r in (rows if isinstance(rows, list) else []):
+        if isinstance(r, dict) and r.get("name"):
+            by_name.setdefault(r["name"].casefold(), []).append(r)
+    resolved = []
+    for name in names:
+        matches = by_name.get(name.strip().casefold(), [])
+        if len(matches) > 1:
+            _die(6, "ambiguous_group_name",
+                 f"{name!r} is ambiguous on this instance: it names "
+                 f"{len(matches)} groups",
+                 "rename one of the colliding groups so the name is unique, "
+                 "or resolve it to an id with `groups find` first")
+        if not matches or not matches[0].get("id"):
+            known = sorted({r["name"] for lst in by_name.values() for r in lst})
+            near = difflib.get_close_matches(name, known, n=3, cutoff=0.6)
+            hint = (f"did you mean: {', '.join(near)}?" if near
+                    else f"groups visible to this token: {', '.join(known)}")
+            _die(6, "unknown_group", f"no group named {name!r}", hint)
+        resolved.append({"id": matches[0]["id"]})
+    return resolved
+
+
+def _comment_visibility(c, users: list, groups: list):
+    """The `visibility` object, or None when the caller restricted nothing.
+
+    `$type` is mandatory — omitting it returns 400 with a type mismatch
+    (measured), exactly as custom-field entries do.
+    """
+    if not users and not groups:
+        return None
+    for login in users:
+        if not login.strip():
+            _die(6, "input", "--permitted-users cannot be empty")
+    for group_name in groups:
+        if not group_name.strip():
+            _die(6, "input", "--permitted-groups cannot be empty")
+    visibility = {"$type": "LimitedVisibility"}
+    if users:
+        visibility["permittedUsers"] = [{"login": u.strip()} for u in users]
+    if groups:
+        visibility["permittedGroups"] = _resolve_group_ids(c, groups)
+    return visibility
+
+
 def issues_comments_add(c, a):
     text = _read_text(a.text if a.text is not None else "-")
     if not text.strip():
         _die(6, "input", "comment text cannot be empty")
+    body = {"text": text}
+    visibility = _comment_visibility(c, a.permitted_users, a.permitted_groups)
+    if visibility is not None:
+        body["visibility"] = visibility
     return _request(c, "POST", f"/issues/{_issue_ref(a.issue)}/comments",
-                    params={"fields": COMMENT_FIELDS}, json={"text": text})
+                    params={"fields": COMMENT_FIELDS}, json=body)
 
 
 # ── issues: links ────────────────────────────────────────────────────────
@@ -1654,26 +1782,40 @@ def articles_comments_add(c, a):
                     params={"fields": ARTICLE_COMMENT_FIELDS}, json={"text": text})
 
 
+def _parent_article_id(c, parent_ref: str, project_id: str) -> str:
+    """Resolve a parent article reference to its id, refusing a cross-project one.
+
+    Shared by `articles create` and `articles update` so re-parenting cannot
+    develop behaviour that differs from parenting at creation.
+    """
+    parent = _request(c, "GET", f"/articles/{_article_ref(parent_ref)}",
+                      params={"fields": "id,idReadable,project(id)"})
+    parent_id = parent.get("id") if isinstance(parent, dict) else None
+    parent_project = ((parent.get("project") or {}).get("id")
+                      if isinstance(parent, dict) else None)
+    if not parent_id or not parent_project:
+        _die(5, "bad_response",
+             "YouTrack returned a parent article without id/project")
+    if parent_project != project_id:
+        _die(6, "input",
+             f"--parent belongs to project {parent_project!r}, not {project_id!r}")
+    return parent_id
+
+
 def articles_create(c, a):
     body = {"summary": a.summary, "project": {"id": a.project}}
     if a.content is not None:
         body["content"] = _read_text(a.content)
     if a.parent:
-        parent_article = _request(
-            c, "GET", f"/articles/{_article_ref(a.parent)}",
-            params={"fields": "id,idReadable,project(id)"})
-        parent_id = parent_article.get("id") if isinstance(parent_article, dict) else None
-        parent_project = ((parent_article.get("project") or {}).get("id")
-                          if isinstance(parent_article, dict) else None)
-        if not parent_id or not parent_project:
-            _die(5, "bad_response",
-                 "YouTrack returned a parent article without id/project")
-        if parent_project != a.project:
-            _die(6, "input",
-                 f"--parent belongs to project {parent_project!r}, not {a.project!r}")
-        body["parentArticle"] = {"id": parent_id}
+        body["parentArticle"] = {"id": _parent_article_id(c, a.parent, a.project)}
     return _request(c, "POST", "/articles",
                     params={"fields": ARTICLE_FIELDS}, json=body)
+
+
+def articles_search(c, a):
+    params = _page_params(a, ARTICLE_LIST_FIELDS)
+    params["query"] = a.query
+    return _paged(_request(c, "GET", "/articles", params=params), a.limit)
 
 
 def articles_update(c, a):
@@ -1681,13 +1823,24 @@ def articles_update(c, a):
     content = _read_text(a.content) if a.content is not None else None
     if content is not None and not content.strip():
         content = None
-    if summary is None and content is None:
-        _die(6, "input", "articles update needs a non-empty --summary or --content")
+    if summary is None and content is None and not a.parent:
+        _die(6, "input",
+             "articles update needs a non-empty --summary, --content or --parent")
     body = {}
     if summary is not None:
         body["summary"] = summary
     if content is not None:
         body["content"] = content
+    if a.parent:
+        # The same-project rule is enforced against *this* article's project, so
+        # re-parenting needs one read of the target before the write.
+        target = _request(c, "GET", f"/articles/{_article_ref(a.article)}",
+                          params={"fields": "id,project(id)"})
+        project_id = ((target.get("project") or {}).get("id")
+                      if isinstance(target, dict) else None)
+        if not project_id:
+            _die(5, "bad_response", "YouTrack returned an article without a project")
+        body["parentArticle"] = {"id": _parent_article_id(c, a.parent, project_id)}
     return _request(c, "POST", f"/articles/{_article_ref(a.article)}",
                     params={"fields": ARTICLE_FIELDS}, json=body)
 
@@ -1704,6 +1857,7 @@ ARG_SELECT        = (("--select",), {"metavar": "KEY,KEY"})
 ARG_PROJECT_REQ   = (("--project",), {"required": True})
 ARG_PROJECT_OPT   = (("--project",), {})
 ARG_PROJECT_POS   = (("project",), {})
+ARG_GROUP_POS     = (("group",), {})
 ARG_FIELD_NAME    = (("name",), {})
 ARG_SUMMARY_REQ   = (("--summary",), {"required": True})
 ARG_SUMMARY_OPT   = (("--summary",), {})
@@ -1717,13 +1871,21 @@ ARG_FIELDS        = (("--fields",), {"metavar": "JSON|FILE|-"})
 ARG_DRAFT         = (("--draft",), {"action": "store_true"})
 ARG_LINK_TO       = (("--to",), {"required": True})
 ARG_LINK_TYPE     = (("--type",), {"required": True, "metavar": "PHRASE"})
+ARG_PERMITTED_USERS  = (("--permitted-users",), {"action": "append", "default": [],
+                                                 "metavar": "LOGIN"})
+ARG_PERMITTED_GROUPS = (("--permitted-groups",), {"action": "append", "default": [],
+                                                  "metavar": "NAME"})
 
 COMMANDS = {
     ("users", "me"):                  (users_me, []),
     ("users", "find"):                (users_find, [ARG_SUBSTRING_REQ, ARG_LIMIT50, ARG_OFFSET]),
-    ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT]),
+    ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT, ARG_LIMIT100, ARG_OFFSET]),
+    ("projects", "get"):              (projects_get, [ARG_PROJECT_POS]),
     ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
     ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
+    ("searches", "list"):             (searches_list, [ARG_LIMIT100, ARG_OFFSET]),
+    ("groups", "find"):               (groups_find, [ARG_SUBSTRING_OPT, ARG_LIMIT100, ARG_OFFSET]),
+    ("groups", "members"):            (groups_members, [ARG_GROUP_POS, ARG_LIMIT100, ARG_OFFSET]),
     ("issues", "get"):                (issues_get, [ARG_ISSUE]),
     ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100, ARG_OFFSET, ARG_SELECT]),
     ("issues", "create"):             (issues_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
@@ -1732,15 +1894,18 @@ COMMANDS = {
     ("issues", "update"):             (issues_update, [ARG_ISSUE, ARG_FIELD, ARG_FIELDS,
                                                        ARG_SUMMARY_OPT, ARG_DESCRIPTION]),
     ("issues", "comments", "list"):   (issues_comments_list, [ARG_ISSUE, ARG_LIMIT50, ARG_OFFSET]),
-    ("issues", "comments", "add"):    (issues_comments_add, [ARG_ISSUE, ARG_TEXT]),
+    ("issues", "comments", "add"):    (issues_comments_add, [ARG_ISSUE, ARG_TEXT,
+                                                             ARG_PERMITTED_USERS,
+                                                             ARG_PERMITTED_GROUPS]),
     ("issues", "links", "add"):        (issues_links_add, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
     ("issues", "links", "remove"):     (issues_links_remove, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
     ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("articles", "get"):              (articles_get, [ARG_ARTICLE]),
     ("articles", "create"):           (articles_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
                                                          ARG_CONTENT, ARG_PARENT]),
+    ("articles", "search"):           (articles_search, [ARG_QUERY, ARG_LIMIT100, ARG_OFFSET]),
     ("articles", "update"):           (articles_update, [ARG_ARTICLE, ARG_SUMMARY_OPT,
-                                                         ARG_CONTENT]),
+                                                         ARG_CONTENT, ARG_PARENT]),
     ("articles", "comments", "list"): (articles_comments_list, [ARG_ARTICLE, ARG_LIMIT50, ARG_OFFSET]),
     ("articles", "comments", "add"):  (articles_comments_add, [ARG_ARTICLE, ARG_TEXT]),
 }
