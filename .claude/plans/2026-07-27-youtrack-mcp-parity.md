@@ -8,7 +8,7 @@
 - ✅ **M2 steps 2–5** (`issues create` with `--field`/`--fields`, type-aware marshalling, schema-backed error translation, `--draft`) — PR #20, whose commit declares "Completes M2". 42 new tests; 105 tests total in `capabilities/youtrack/tests/test_youtrack.py`.
 - ✅ **Decision D1** — the misnamed `required` key is gone; `projects fields *` now emit `canBeEmpty` faithfully (breaking change, landed in PR #20).
 - ⬜ **M2 "Done when" is code-complete but not live-demonstrated** — the one-call sprint-ready IONDEV create over `text` fields is still unproven against the live server; see the note under M2's "Done when".
-- ✅ **M3** — PR #21, merged 2026-07-28: `users find`, `issues links add`/`remove`, links on `issues get`, `--offset` on every `--limit` verb, `--select` on `issues search`. 151 tests pass; verified live against ION. Surface is now **19 domain verbs**. ⬜ **M4** — outstanding, see "What remains" below.
+- ✅ **M3** — PR #21, merged 2026-07-28: `users find`, `issues links add`/`remove`, links on `issues get`, `--offset` on every `--limit` verb, `--select` on `issues search`. 151 tests pass; verified live against ION. Surface is now **19 domain verbs**. ⬜ **M4a** (unblocked tail) and ⬜ **M4b** (tags and work items) — see "What remains" below. M4 was split into these two because Group C needs a probe and Groups A/B do not.
 - **Standing constraint (owner, 2026-07-28): all experiments run against the ION project; IONDEV is not to be touched.** What ION cannot prove stays recorded as unproven — which permanently blocks M2's Group 1 gap, since ION carries no `text` field.
 
 This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
@@ -37,24 +37,24 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `find_projects` | `projects find` | ✅ parity |
 | `get_article` | `articles get` | ✅ parity |
 | `create_article` | `articles create` (also `--parent`) | ✅ parity+ |
-| `update_article` | `articles update` | ⬜ near — cannot re-parent (M4) |
-| `add_issue_comment` | `issues comments add` | ⬜ near — no `permittedUsers`/`permittedGroups` (M4) |
+| `update_article` | `articles update` | ⬜ near — cannot re-parent (M4a) |
+| `add_issue_comment` | `issues comments add` | ⬜ near — no `permittedUsers`/`permittedGroups` (M4a) |
 | `get_issue_comments` | `issues comments list --limit --offset` | ✅ **parity** (M3) |
 | `get_issue` | `issues get` | ✅ **parity** (M1 — custom fields now returned) |
 | `search_issues` | `issues search QUERY --limit --offset --select` | ✅ **parity** (M3 — sort still absent, deliberately) |
 | `create_issue` | `issues create --project/--summary/--description/--field/--fields` | ✅ **parity** (M2 step 2) |
 | `update_issue` | `issues update --field/--fields/--summary/--description` | ✅ **parity** (M2 step 1) |
-| `search_articles` | `articles list` | ⬜ partial — a listing, not a query (M4) |
+| `search_articles` | `articles list` | ⬜ partial — a listing, not a query (M4a) |
 | `get_issue_fields_schema` | `projects fields list` · `projects fields get` | ✅ **parity** (M1) |
 | `find_user` | `users find` | ✅ **parity** (M3) |
 | `link_issues` | `issues links add` · `issues links remove` | ✅ **parity** (M3) |
 | `change_issue_assignee` | `issues update --field Assignee=…` | ✅ covered — deliberate drop, no own verb |
-| `manage_issue_tags` | — | ⬜ absent (M4) |
-| `log_work` | — | ⬜ absent (M4) |
-| `get_project` | — | ⬜ absent (M4) |
-| `get_saved_issue_searches` | — | ⬜ absent (M4) |
-| `find_user_groups` | — | ⬜ absent (M4) |
-| `get_user_group_members` | — | ⬜ absent (M4) |
+| `manage_issue_tags` | — | ⬜ absent (M4b) |
+| `log_work` | — | ⬜ absent (M4b) |
+| `get_project` | — | ⬜ absent (M4a) |
+| `get_saved_issue_searches` | — | ⬜ absent (M4a) |
+| `find_user_groups` | — | ⬜ absent (M4a) |
+| `get_user_group_members` | — | ⬜ absent (M4a) |
 | `create_draft_issue` | `issues create --draft` | ✅ **parity** (M2 step 5) |
 | — | `articles comments list`, `articles comments add` | CLI-only; MCP has no article-comment tools |
 
@@ -543,9 +543,29 @@ Exercised through the installed CLI on two throwaway ION issues (ION-1437, ION-1
 
 **Still unproven, and now unprovable under the ION-only constraint:** exit **7** for a workflow-rule rejection of a link. No link rule fired on ION, and whether one exists on IONDEV cannot be asked. Tag: **UNTESTED** — do not claim exit 7 coverage for links.
 
-## M4 — Long tail — ⬜ OUTSTANDING
+## M4a — Close the unblocked tail — ⬜ NEXT
 
-Fill on demand, not speculatively. Full enumeration and cost in "What remains" below.
+Groups A and B from "What remains", plus `projects find` paging. **7 parity items, 5 new verbs, no probe needed** — every gap is a known endpoint with no unmeasured behaviour. A and B ship together because they have a real dependency: the comment-visibility flags in A want `groups find` from B to validate group names.
+
+1. `articles update --parent` · `articles search QUERY` · `issues comments add --permitted-users/--permitted-groups` (Group A)
+2. `projects get ID` · `searches list` · `groups find [SUBSTRING]` · `groups members GROUPID` (Group B)
+3. `projects find` paging — the last verb that still truncates silently (`$top: 100`, no `--limit`/`--offset`/`has_more`)
+
+**Done when:** parity is **20 of 23**, with only `manage_issue_tags` and `log_work` outstanding, and no list verb truncates without saying so.
+
+## M4b — Tags and work items — ⬜ AFTER M4a
+
+Group C. The last two MCP gaps, and the only ones with unmeasured behaviour. **Both are probeable on ION — confirmed 2026-07-28 by reading the live instance**, so unlike M2's Group 1 this milestone is not blocked by the ION-only constraint.
+
+**Step 0 — probe first, on ION.** This is the class that has already burned the project twice: M2's step 0 falsified four documented-looking claims, and M3's probe found `readOnly: true` is not a write gate — which would have shipped `subtask of` as unavailable with every test passing. Do not build either verb from the REST docs.
+
+*Tags — measured so far:* instance-scoped, not project-scoped (`GET /issueTags` returned 17 visible), each with an `owner` and a `visibleFor` group; one tag has `visibleFor: None`, i.e. private to its owner. **Unknown, and each changes the design:** whether writing an unknown tag name creates it or returns 400 (decides pre-flight versus error translation); whether a tag owned by another user can be applied; what happens with a tag the token cannot see; whether add is idempotent as link-add was; and the removal path's shape.
+
+*Work items — measured so far:* time tracking is **enabled** on ION, with five `workItemTypes` (`Development`, `Testing`, `Documentation`, `Investigation`, `Implementation`). **Unknown:** the duration write shape — `{"minutes": N}` versus `{"presentation": "1d 4h"}` — and its round-trip fidelity. M2 measured that a `period` custom field round-trips byte-exact as `presentation` while reading back as **minutes**, with workday length coming from server-side project settings, so a work item very likely carries the same dual representation. Also unknown: whether `type` is required, and how the work item's date behaves relative to the `date` normalization M2 measured.
+
+**Scope boundary, so M4b does not duplicate what already ships.** ION's `estimate` and `timeSpent` are `PeriodProjectCustomField`s, which means the `Estimation` and `Spent time` *fields* are already writable through `issues update --field` on the M2 marshalling path. M4b is about the additive **work-item log** — `POST` a new entry, list the entries — which is what `log_work` actually covers. Do not add a verb that re-writes those two fields.
+
+**Done when:** parity is **22 of 23** at parity plus 1 (`change_issue_assignee`) covered by design — every JetBrains predefined tool accounted for.
 
 ---
 
@@ -555,7 +575,7 @@ Fill on demand, not speculatively. Full enumeration and cost in "What remains" b
 
 **All of Groups A and B are unblocked; Group C is not.** Every A and B gap is a known endpoint on a surface the CLI already models, with no unmeasured behaviour. Group C's two items both touch bundle-backed or unit-parsed values and need a step-0 probe first — see Group C for what specifically is unknown.
 
-Grouped by what a caller can do afterwards, cheapest first. **All three groups are substructure inside M4** — they are not new milestones.
+Grouped by what a caller can do afterwards, cheapest first. **Groups A and B are delivered as M4a; Group C is M4b.** The letters are substructure, not a parallel numbering scheme.
 
 ## Group A — three near-misses on verbs that already exist
 
