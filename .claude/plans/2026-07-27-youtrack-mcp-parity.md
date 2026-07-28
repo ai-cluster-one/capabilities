@@ -545,7 +545,7 @@ Exercised through the installed CLI on two throwaway ION issues (ION-1437, ION-1
 
 ## M4 — Long tail — ⬜ OUTSTANDING
 
-Fill on demand, not speculatively: `articles search` · `articles update --parent` · `projects get` · `issues tags` · `issues work` · `searches list` · `groups find` + `groups members` · `permittedUsers`/`permittedGroups` visibility on comments and articles.
+Fill on demand, not speculatively: `articles search` · `articles update --parent` · `projects get` · `projects find` paging (`--limit`/`--offset`/`has_more`; it still hardcodes `$top: 100` and truncates silently) · `issues tags` · `issues work` · `searches list` · `groups find` + `groups members` · `permittedUsers`/`permittedGroups` visibility on comments and articles.
 
 ## Sequencing rationale
 

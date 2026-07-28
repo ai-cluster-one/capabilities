@@ -976,13 +976,16 @@ def test_ambiguous_phrase_fails_rather_than_picking(tmp_path, link_handler):
 def test_self_link_is_refused_without_any_request(tmp_path, link_handler):
     # Measured: the server returns 200 for a self-link and silently creates
     # nothing. Asserting the exit code alone would pass for a client that sent
-    # it, so assert that no write left the process.
+    # it, so assert that no write left the process. The refusal happens
+    # before the direction phrase is even resolved, so no request of any
+    # kind — not just no POST — should be issued; asserting only "no POST"
+    # would still pass a refactor that issued a GET first.
     with serve(link_handler) as base:
         result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
                          "--to", "DEMO-1", "--type", "relates to")
     assert result.returncode == 6
     assert "itself" in result.stderr.lower()
-    assert not any(r[0] == "POST" for r in link_handler.requests)
+    assert link_handler.requests == []
 
 
 def test_links_add_sends_the_readable_key(tmp_path, link_handler):
@@ -1021,6 +1024,13 @@ def test_links_add_is_a_write_verb():
     assert "issues links add" in _write_verbs()
 
 
+def test_links_remove_is_a_write_verb():
+    # Mirrors test_links_add_is_a_write_verb. WRITE_VERBS <= COMMANDS only
+    # catches a stray/typo'd entry; it cannot catch an omission, which would
+    # silently disable the allow_write gate for this verb.
+    assert "issues links remove" in _write_verbs()
+
+
 def test_links_remove_resolves_the_internal_target_id(tmp_path, link_handler):
     # Measured asymmetry: POST accepts a readable key, DELETE demands the
     # internal id and 404s on a readable one. So remove pays a resolution GET.
@@ -1053,6 +1063,72 @@ def test_links_remove_retranslates_the_missing_link_404(tmp_path):
     # Must blame the link, not the issue: the issue in YouTrack's message exists.
     assert "subtask of" in result.stderr
     assert "link" in result.stderr.lower()
+
+
+def test_links_remove_translates_a_bad_target(tmp_path):
+    # Mirrors test_links_add_translates_a_bad_target. Add's nonexistent-target
+    # failure surfaces as a 400 on the write POST; remove's surfaces as a 404
+    # on the target-resolution GET instead (measured asymmetry) — both must
+    # produce the same specific "no issue named" message, not the generic
+    # "resource not found".
+    class BadTargetHandler(_LinkHandler):
+        requests = []
+        slots = None
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route.endswith("/links"):
+                self._reply(self.__class__.slots)
+            else:
+                self._reply({"error": "Not Found", "error_description":
+                             "Entity with id DEMO-404 not found"}, 404)
+
+    BadTargetHandler.requests = []
+    BadTargetHandler.slots = _link_slots_with_ids()
+    with serve(BadTargetHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "remove", "DEMO-1",
+                         "--to", "DEMO-404", "--type", "relates to")
+    assert result.returncode == 3
+    assert "DEMO-404" in result.stderr
+
+
+def test_links_remove_self_link_is_refused_without_any_request(tmp_path, link_handler):
+    # Mirrors test_self_link_is_refused_without_any_request. `add` refuses a
+    # self-link before any request; `remove` had no such guard and would spend
+    # three HTTP calls (resolve direction, resolve target, DELETE) before
+    # failing on the third. Assert it now fails before the first.
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "remove", "DEMO-1",
+                         "--to", "DEMO-1", "--type", "relates to")
+    assert result.returncode == 6
+    assert "itself" in result.stderr.lower()
+    assert link_handler.requests == []
+
+
+def test_bare_404_at_a_write_still_exits_3_via_the_generic_mapping(tmp_path):
+    # Pins the property the `on_error`-before-hardcoded-404 reorder in
+    # `_request` relies on: a verb that passes `on_error` must still exit 3 on
+    # a plain 404 whose body matches none of that callback's conditions. Here
+    # `issues links add`'s POST returns a 404 with a body `_link_target_error`
+    # does not recognise (no "not found" text), so `on_error` returns without
+    # dying and the hardcoded `if response.status_code == 404` a few lines
+    # below must be the thing that produces exit 3.
+    class Bare404Handler(_LinkHandler):
+        requests = []
+        slots = None
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, None))
+            self._reply({"error": "Oops"}, 404)
+
+    Bare404Handler.requests = []
+    Bare404Handler.slots = _link_slots_with_ids()
+    with serve(Bare404Handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "relates to")
+    assert result.returncode == 3
 
 
 def test_issues_search_emits_same_fields_shape(tmp_path):

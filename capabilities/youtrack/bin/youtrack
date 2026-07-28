@@ -803,11 +803,15 @@ def _client(base_url: str, token: str) -> httpx.Client:
                                  "Content-Type": "application/json"})
 
 def _request(client: httpx.Client, method: str, path: str, on_error=None, **kwargs):
-    """`on_error` sees any >=400 response before the generic mapping.
+    """`on_error` sees every >=400 response except 401/403, before the
+    generic mapping.
 
-    It exists so a write can translate YouTrack's own error text — which names
-    no field, leaks `{1}` placeholders, and returns 500 for a mere typo — into
-    something an agent can act on. It either _die()s or returns to fall through.
+    401 and 403 die a few lines above as auth failures and never reach the
+    hook. For every other status >= 400 — including 404 — `on_error` runs
+    first; it exists so a write can translate YouTrack's own error text —
+    which names no field, leaks `{1}` placeholders, and returns 500 for a
+    mere typo — into something an agent can act on. It either _die()s or
+    returns to fall through to the generic mapping below.
     """
     for attempt in range(3):
         try:
@@ -1474,6 +1478,7 @@ def issues_search(c, a):
     rows = _request(c, "GET", "/issues",
                     params={**_page_params(a, ISSUE_SEARCH_FIELDS),
                             "query": a.query})
+    rows = rows if isinstance(rows, list) else []
     shaped = [_flatten_custom_fields(i) for i in rows]
     if keys:
         shaped = [_apply_select(i, keys) for i in shaped]
@@ -1545,17 +1550,29 @@ def _resolve_link(c, ref: str, phrase: str) -> str:
 
 
 def _link_target_error(target: str):
-    """Translate the measured add-path failures.
+    """Translate the measured add-path failures, and remove's analogous 404.
 
     A nonexistent target returns 400 "YouTrack is unable to locate an
-    Issue-type entity unless its ID is also provided" — a message about id
-    format, which is not what went wrong.
+    Issue-type entity unless its ID is also provided" on add's POST — a
+    message about id format, which is not what went wrong. On remove's
+    target-resolution GET, the identical mistake surfaces as a plain 404
+    naming the missing entity instead of that 400.
+
+    Both call sites reach this hook only after `ref` and the link direction
+    are already confirmed to exist — add resolves the direction phrase
+    against `ref` first, and remove's GET addresses `target` directly with
+    nothing else in play — so a 404 here can only be about `target`. The 404
+    branch still requires "not found" in the body rather than firing on bare
+    status alone, so an unrelated 404 shape (see the reorder-safety test)
+    keeps falling through to the generic mapping.
     """
     def on_error(response):
-        if response.status_code == 400 and "unable to locate" in response.text:
+        text = response.text
+        if (response.status_code == 400 and "unable to locate" in text) or (
+                response.status_code == 404 and "not found" in text.lower()):
             _die(3, "not_found", f"no issue named {target!r}",
                  "check the target key; links accept a readable key like "
-                 "PROJ-123", status=400)
+                 "PROJ-123", status=response.status_code)
     return on_error
 
 
@@ -1591,6 +1608,10 @@ def _missing_link_error(ref: str, target: str, phrase: str):
 
 def issues_links_remove(c, a):
     ref, target = _issue_ref(a.issue), _issue_ref(a.to)
+    if ref.casefold() == target.casefold():
+        _die(6, "input", f"{ref} cannot be unlinked from itself",
+             "YouTrack never creates a self-link — add refuses it — so "
+             "there is nothing here for remove to delete")
     link_id = _resolve_link(c, ref, a.type)
     # DELETE needs the internal id; a readable key 404s (measured).
     resolved = _request(c, "GET", f"/issues/{target}", params={"fields": "id"},
