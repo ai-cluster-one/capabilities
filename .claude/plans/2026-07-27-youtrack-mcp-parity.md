@@ -58,7 +58,9 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `create_draft_issue` | `issues create --draft` | ✅ **parity** (M2 step 5) |
 | — | `articles comments list`, `articles comments add` | CLI-only; MCP has no article-comment tools |
 
-**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1, M2, M3 and M4a all shipped: 20 at parity, 0 near/partial, 2 absent (`manage_issue_tags`, `log_work` — both M4b), plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** 20 + 0 + 2 + 1 = 23, over the table's 23 MCP rows (plus one CLI-only row that is not a parity item). **Only M4b remains.** 13 + 3 + 6 + 1 = 23. (An earlier revision of this line said "1 near/partial, 8 absent" — a miscount that did not sum to 23; corrected against the table above.) Everything still open is M4's long tail. `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
+**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1, M2, M3 and M4a all shipped: 20 at parity, 0 near/partial, 2 absent (`manage_issue_tags`, `log_work` — both M4b), plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** 20 + 0 + 2 + 1 = 23, counted over the table's 23 MCP rows (the CLI-only row is not a parity item). **Only M4b remains.**
+
+This one line has now been miscounted three times — "1 near/partial, 8 absent" (didn't sum to 23), "31 at parity … = 34" (a row heuristic that swept in other tables), and a revision that left the previous milestone's `13 + 3 + 6 + 1 = 23` standing beside the new figure so the sentence asserted both. **Recount it against the table programmatically rather than editing the numbers in place.** `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
 
 Attachments are in **neither** surface — they belong to the 44-tool community server, not JetBrains'. Not a parity item.
 
@@ -553,7 +555,7 @@ Groups A and B from "What remains", plus `projects find` paging. **7 parity item
 |---|---|---|
 | `projects get` | `GET /admin/projects/{id}` | ✅ returns `name`, `shortName`, `description`, `archived`, `leader`. An unknown field in the projection is **silently dropped**, not an error — `issuesCount` came back absent rather than 400. |
 | `searches list` | `GET /savedQueries` | ✅ `id`, `name`, `query`, `owner`, `visibleFor` |
-| `groups find` | `GET /groups` | ✅ `id`, `name`, `description`, `usersCount`; `$type` is `NestedGroup` |
+| `groups find` | `GET /groups` | ✅ `id`, `name`, `description`, `usersCount`; `$type` is `NestedGroup`. **`query=` is honoured server-side** — measured after the fact, when the final review pointed out the original table recorded only the projection: `query=zzznomatch` → 0 rows, `query=Incidents` → exactly `Incidents Team`, no query → unfiltered. `_resolve_group_ids` deliberately omits `query` because name resolution needs the full set. |
 | `groups members` | `GET /groups/{id}/users` | ✅ standard user shape |
 | `articles search` | `GET /articles?query=…` | ✅ **same endpoint as `articles list`.** `summary: DWH` → 1 hit, bare `DWH` → 3 (full-text), nonsense → 0. So this is a query param on a shipped verb's endpoint, sharing its projection and paging. |
 
@@ -577,7 +579,9 @@ An unrestricted comment reads back `visibility: {"$type": "UnlimitedVisibility"}
 4. **`issues comments add --permitted-users/--permitted-groups`** (Group A) — last, on top of `groups find`.
 5. **`projects find` paging** — the last verb that still truncates silently (`$top: 100`, no `--limit`/`--offset`/`has_more`).
 
-**Done when:** parity is **20 of 23**, with only `manage_issue_tags` and `log_work` outstanding, and no list verb truncates without saying so.
+**Done when:** parity is **20 of 23**, with only `manage_issue_tags` and `log_work` outstanding, and no verb **that takes `--limit`** truncates without saying so.
+
+**Correction, from the final review:** the original wording said "no list verb truncates without saying so", which is not literally true. **`projects fields list` still does** — it hardcodes `$top: 200`, returns a bare array, and takes no `--limit`. It is contract-compliant, because the envelope rule binds only `--limit` verbs, but it is the last silent truncation in the surface. Tracked in M4b's list below rather than left implicit.
 
 ### ✅ M4a verified live against ION — 2026-07-28
 
@@ -610,6 +614,11 @@ Group C. The last two MCP gaps, and the only ones with unmeasured behaviour. **B
 *Work items — measured so far:* time tracking is **enabled** on ION, with five `workItemTypes` (`Development`, `Testing`, `Documentation`, `Investigation`, `Implementation`). **Unknown:** the duration write shape — `{"minutes": N}` versus `{"presentation": "1d 4h"}` — and its round-trip fidelity. M2 measured that a `period` custom field round-trips byte-exact as `presentation` while reading back as **minutes**, with workday length coming from server-side project settings, so a work item very likely carries the same dual representation. Also unknown: whether `type` is required, and how the work item's date behaves relative to the `date` normalization M2 measured.
 
 **Scope boundary, so M4b does not duplicate what already ships.** ION's `estimate` and `timeSpent` are `PeriodProjectCustomField`s, which means the `Estimation` and `Spent time` *fields* are already writable through `issues update --field` on the M2 marshalling path. M4b is about the additive **work-item log** — `POST` a new entry, list the entries — which is what `log_work` actually covers. Do not add a verb that re-writes those two fields.
+
+Also fold in, since neither is a parity gap but both are the last of their kind:
+
+- **`projects fields list` paging** — hardcodes `$top: 200`, bare array, no `--limit`. The last silent truncation in the surface, per M4a's final review.
+- **A self-parent guard on `articles update --parent`** — `issues links add`/`remove` refuse a self-reference client-side; re-parenting an article to itself is currently sent to the server, whose behaviour there is unmeasured.
 
 **Done when:** parity is **22 of 23** at parity plus 1 (`change_issue_assignee`) covered by design — every JetBrains predefined tool accounted for.
 
