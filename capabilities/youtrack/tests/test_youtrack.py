@@ -2527,3 +2527,49 @@ def test_article_not_found_exits_3(tmp_path):
         server.shutdown()
         thread.join()
     assert result.returncode == 3
+
+
+def test_projects_get_returns_a_single_object_not_an_envelope(tmp_path):
+    class ProjectGetHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps({
+                "id": "0-1", "name": "ION", "shortName": "ION",
+                "description": None, "archived": False,
+                "leader": {"login": "s.royz", "fullName": "Sergey Royz"},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    ProjectGetHandler.requests = []
+    with serve(ProjectGetHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "get", "0-1")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    # Single-entity read: no envelope, matching issues get and articles get.
+    assert "items" not in payload
+    assert payload["shortName"] == "ION"
+    assert payload["leader"]["login"] == "s.royz"
+    assert urllib.parse.urlparse(ProjectGetHandler.requests[0]).path == \
+        "/api/admin/projects/0-1"
+
+
+def test_searches_list_pages_and_envelopes(tmp_path):
+    rows = [{"id": "7-0", "name": "Assigned to me", "query": "for: me",
+             "owner": {"login": "s.royz"}, "visibleFor": {"name": "All Users"}}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "searches", "list", "--limit", "5")
+    assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/savedQueries"
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["query"] == "for: me"
+    assert payload["has_more"] is False
