@@ -535,7 +535,7 @@ Exercised through the installed CLI on two throwaway ION issues (ION-1437, ION-1
 | Self-link refused | ✅ exit **6**, no request sent |
 | Unknown phrase (`subtask off`) | ✅ exit **6**, hint `did you mean: subtask of?` |
 | Remove a link that is not there | ✅ exit **3**, `ION-1437 has no 'relates to' link to ION-1438` — blames the link, not the issue |
-| Nonexistent target | ✅ exit **3**, `no issue named 'ION-99999'` |
+| Nonexistent target | ✅ exit **3**, `no issue named 'ION-99999'` — **on both `add` and `remove`.** They translate different upstream statuses to the same message: `add`'s POST returns 400, `remove`'s target lookup returns 404. The first pass shipped this for `add` only, leaving `remove` on the generic "YouTrack resource not found"; the final review caught the asymmetry. |
 | `--limit 2` / `--limit 2 --offset 2` | ✅ `has_more: true` on both, and page 2 returns different keys — real paging, not a repeated first page |
 | `--select idReadable,fields.State` | ✅ trims to exactly those keys inside the envelope |
 | `--offset -1`, `--select idReadabel` | ✅ exit **6** each |
