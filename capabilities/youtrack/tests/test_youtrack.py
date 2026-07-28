@@ -2677,3 +2677,101 @@ def test_articles_update_still_requires_something_to_change(tmp_path):
         result = run_cli(tmp_path, base, "articles", "update", "A-1")
     assert result.returncode == 6
     assert "summary" in result.stderr
+
+
+def _visibility_handler(groups):
+    """Serves /groups for name->id resolution, records the comment POST."""
+    class VisibilityHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            self._reply(groups)
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+            self._reply({"id": "4-1", "text": "hi"})
+
+    VisibilityHandler.requests = []
+    return VisibilityHandler
+
+
+_GROUPS = [{"id": "3-4", "name": "Administrative Team"},
+           {"id": "3-9", "name": "ION Team"}]
+
+
+def test_comment_permitted_groups_are_sent_as_ids(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-groups", "ION Team")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    # Measured: permittedGroups rejects a name; only an id works.
+    assert post[2]["visibility"] == {
+        "$type": "LimitedVisibility",
+        "permittedGroups": [{"id": "3-9"}],
+    }
+
+
+def test_comment_permitted_users_are_sent_as_logins(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-users", "s.royz")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2]["visibility"] == {
+        "$type": "LimitedVisibility",
+        "permittedUsers": [{"login": "s.royz"}],
+    }
+    # No group lookup is needed when no group was named.
+    assert not any(r[0] == "GET" for r in handler.requests)
+
+
+def test_comment_visibility_always_carries_the_type(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-users", "s.royz",
+                         "--permitted-groups", "ION Team")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    # Measured: omitting $type returns 400 with a type mismatch.
+    assert post[2]["visibility"]["$type"] == "LimitedVisibility"
+    assert post[2]["visibility"]["permittedUsers"] == [{"login": "s.royz"}]
+    assert post[2]["visibility"]["permittedGroups"] == [{"id": "3-9"}]
+
+
+def test_unknown_group_name_exits_6_with_near_miss_and_no_write(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-groups", "ION Teem")
+    assert result.returncode == 6
+    assert "ION Team" in result.stderr, "must offer the near-miss"
+    # The server cannot distinguish a bad name from a name-instead-of-id, so the
+    # refusal must happen client-side, before any write.
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_comment_without_visibility_flags_sends_no_visibility_key(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert "visibility" not in post[2]

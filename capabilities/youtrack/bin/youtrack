@@ -140,7 +140,14 @@ Write:
                                              time` fields are epoch milliseconds.
                                              Respects allow_write connection policy.
   youtrack issues comments add ISSUE [--text TEXT|-]
-                                             Add a comment; omitted text reads stdin.
+        [--permitted-users LOGIN]…           Restrict who can see the comment.
+        [--permitted-groups NAME]…           Users are named by login, groups by
+                                             name — the name is resolved to an
+                                             id here because YouTrack's
+                                             permittedGroups rejects names. An
+                                             unknown group exits 6 before any
+                                             write. Omit both flags and the
+                                             comment is unrestricted.
   youtrack issues links add ISSUE --to ISSUE --type PHRASE
                                              Link two issues. --type takes the
                                              direction phrase, not a type name:
@@ -874,7 +881,8 @@ ISSUE_FIELDS = ("id,idReadable,summary,description,created,updated,resolved,"
                 "project(id,name,shortName),reporter(id,login,fullName),"
                 + _CF_PROJECTION + "," + LINK_PROJECTION)
 ISSUE_SEARCH_FIELDS = ("id,idReadable,summary,description," + _CF_PROJECTION)
-COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
+COMMENT_FIELDS = ("id,text,created,updated,author(id,login,fullName),"
+                  "visibility($type,permittedUsers(login),permittedGroups(id,name))")
 ARTICLE_FIELDS = ("id,idReadable,summary,content,created,updated,"
                   "project(id,name,shortName),reporter(id,login,fullName),"
                   "parentArticle(id,idReadable,summary),"
@@ -1534,12 +1542,58 @@ def issues_comments_list(c, a):
                            params=_page_params(a, COMMENT_FIELDS)), a.limit)
 
 
+def _resolve_group_ids(c, names: list) -> list:
+    """Group names -> `{"id": …}` entries.
+
+    Measured: `permittedGroups` requires the group id and rejects a name, and a
+    bogus name returns the same 400 as a name-instead-of-id — so the server
+    cannot tell the caller which mistake they made. Resolving here is the only
+    way to say "no such group" precisely.
+    """
+    rows = _request(c, "GET", "/groups",
+                    params={"fields": GROUP_FIELDS, "$top": 1000})
+    by_name = {(r.get("name") or "").casefold(): r
+               for r in (rows if isinstance(rows, list) else [])
+               if isinstance(r, dict)}
+    resolved = []
+    for name in names:
+        entry = by_name.get(name.strip().casefold())
+        if entry is None or not entry.get("id"):
+            known = sorted(r["name"] for r in by_name.values() if r.get("name"))
+            near = difflib.get_close_matches(name, known, n=3, cutoff=0.6)
+            hint = (f"did you mean: {', '.join(near)}?" if near
+                    else f"groups visible to this token: {', '.join(known)}")
+            _die(6, "unknown_group", f"no group named {name!r}", hint)
+        resolved.append({"id": entry["id"]})
+    return resolved
+
+
+def _comment_visibility(c, users: list, groups: list):
+    """The `visibility` object, or None when the caller restricted nothing.
+
+    `$type` is mandatory — omitting it returns 400 with a type mismatch
+    (measured), exactly as custom-field entries do.
+    """
+    if not users and not groups:
+        return None
+    visibility = {"$type": "LimitedVisibility"}
+    if users:
+        visibility["permittedUsers"] = [{"login": u.strip()} for u in users]
+    if groups:
+        visibility["permittedGroups"] = _resolve_group_ids(c, groups)
+    return visibility
+
+
 def issues_comments_add(c, a):
     text = _read_text(a.text if a.text is not None else "-")
     if not text.strip():
         _die(6, "input", "comment text cannot be empty")
+    body = {"text": text}
+    visibility = _comment_visibility(c, a.permitted_users, a.permitted_groups)
+    if visibility is not None:
+        body["visibility"] = visibility
     return _request(c, "POST", f"/issues/{_issue_ref(a.issue)}/comments",
-                    params={"fields": COMMENT_FIELDS}, json={"text": text})
+                    params={"fields": COMMENT_FIELDS}, json=body)
 
 
 # ── issues: links ────────────────────────────────────────────────────────
@@ -1787,6 +1841,10 @@ ARG_FIELDS        = (("--fields",), {"metavar": "JSON|FILE|-"})
 ARG_DRAFT         = (("--draft",), {"action": "store_true"})
 ARG_LINK_TO       = (("--to",), {"required": True})
 ARG_LINK_TYPE     = (("--type",), {"required": True, "metavar": "PHRASE"})
+ARG_PERMITTED_USERS  = (("--permitted-users",), {"action": "append", "default": [],
+                                                 "metavar": "LOGIN"})
+ARG_PERMITTED_GROUPS = (("--permitted-groups",), {"action": "append", "default": [],
+                                                  "metavar": "NAME"})
 
 COMMANDS = {
     ("users", "me"):                  (users_me, []),
@@ -1806,7 +1864,9 @@ COMMANDS = {
     ("issues", "update"):             (issues_update, [ARG_ISSUE, ARG_FIELD, ARG_FIELDS,
                                                        ARG_SUMMARY_OPT, ARG_DESCRIPTION]),
     ("issues", "comments", "list"):   (issues_comments_list, [ARG_ISSUE, ARG_LIMIT50, ARG_OFFSET]),
-    ("issues", "comments", "add"):    (issues_comments_add, [ARG_ISSUE, ARG_TEXT]),
+    ("issues", "comments", "add"):    (issues_comments_add, [ARG_ISSUE, ARG_TEXT,
+                                                             ARG_PERMITTED_USERS,
+                                                             ARG_PERMITTED_GROUPS]),
     ("issues", "links", "add"):        (issues_links_add, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
     ("issues", "links", "remove"):     (issues_links_remove, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
     ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100, ARG_OFFSET]),
