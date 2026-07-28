@@ -205,7 +205,7 @@ from typing import NoReturn
 import httpx
 
 NAME = "youtrack"
-SUMMARY = "YouTrack CLI for issues (read with links, paged search with field projection, comment, create — as a numbered issue or a draft, with any custom field set in the create call — update of summary, description, and any custom field, and add/remove issue links by direction phrase), user lookup, project custom-field schemas, and the knowledge base (read, create, and update articles and article comments)."
+SUMMARY = "YouTrack CLI for issues (read with links, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, and add/remove issue links by direction phrase), user and group lookup, project reads and custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments)."
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,
