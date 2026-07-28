@@ -204,7 +204,9 @@ Write:
                                              `articles list`, with a query.
   youtrack articles update ID                Update an article's summary and/or
         [--summary S] [--content TEXT|-]     content and/or parent (ID|URL).
-        [--parent ID|URL]                    Respects allow_write policy.
+        [--parent ID|URL]                    Respects allow_write policy. An
+                                             article cannot be given itself as
+                                             --parent (refused before the write).
   youtrack articles comments add ID [--text TEXT|-]
                                              Add a comment to an article.
 
@@ -2132,7 +2134,18 @@ def articles_update(c, a):
                       if isinstance(target, dict) else None)
         if not project_id:
             _die(5, "bad_response", "YouTrack returned an article without a project")
-        body["parentArticle"] = {"id": _parent_article_id(c, a.parent, project_id)}
+        parent_id = _parent_article_id(c, a.parent, project_id)
+        # Compare resolved internal ids, not the arguments: `--parent 5-1`
+        # against `A-1` is one article in two notations. YouTrack does refuse a
+        # self-parent (400, "recursive chain … sub-article of itself"), so this
+        # is a clearer message and one saved round trip rather than a
+        # correctness fix — unlike the self-link guard, where the server
+        # returned 200 and silently created nothing.
+        if isinstance(target, dict) and parent_id == target.get("id"):
+            _die(6, "input", f"{a.article} cannot be its own parent",
+                 "an article cannot be a sub-article of itself; YouTrack "
+                 "refuses this too")
+        body["parentArticle"] = {"id": parent_id}
     return _request(c, "POST", f"/articles/{_article_ref(a.article)}",
                     params={"fields": ARTICLE_FIELDS}, json=body)
 

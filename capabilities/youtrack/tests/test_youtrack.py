@@ -2864,7 +2864,8 @@ def test_articles_search_sends_the_query_to_the_articles_endpoint(tmp_path):
     assert payload["has_more"] is False
 
 
-def test_articles_update_reparents(tmp_path):
+def _reparent_handler():
+    """Serves A-1/5-1 and A-2/5-2 in the same project; records the parent POST."""
     class ReparentHandler(BaseHTTPRequestHandler):
         requests = []
 
@@ -2895,11 +2896,16 @@ def test_articles_update_reparents(tmp_path):
             self._reply({"id": "5-1", "idReadable": "A-1"})
 
     ReparentHandler.requests = []
-    with serve(ReparentHandler) as base:
+    return ReparentHandler
+
+
+def test_articles_update_reparents(tmp_path):
+    handler = _reparent_handler()
+    with serve(handler) as base:
         result = run_cli(tmp_path, base, "articles", "update", "A-1",
                          "--parent", "A-2")
     assert result.returncode == 0, result.stderr
-    post = [r for r in ReparentHandler.requests if r[0] == "POST"][0]
+    post = [r for r in handler.requests if r[0] == "POST"][0]
     assert post[2] == {"parentArticle": {"id": "5-2"}}
 
 
@@ -2940,6 +2946,38 @@ def test_articles_update_refuses_a_cross_project_parent(tmp_path):
     assert result.returncode == 6
     # Same pre-check articles create already performs — must not reach the write.
     assert not any(r[0] == "POST" for r in CrossProjectHandler.requests)
+
+
+def test_articles_update_refuses_self_parent_by_the_same_ref(tmp_path):
+    handler = _reparent_handler()          # reuse the Task-3 M4a handler shape
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "A-1")
+    assert result.returncode == 6
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_articles_update_refuses_self_parent_across_notations(tmp_path):
+    """The measured reason this compares resolved internal ids: --parent 5-1
+    against A-1 is one article in two notations, which comparing the raw
+    arguments would miss."""
+    handler = _reparent_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "5-1")
+    assert result.returncode == 6
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_articles_update_still_reparents_to_a_different_article(tmp_path):
+    """The guard must not break the legitimate case."""
+    handler = _reparent_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "A-2")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2] == {"parentArticle": {"id": "5-2"}}
 
 
 def _visibility_handler(groups):
