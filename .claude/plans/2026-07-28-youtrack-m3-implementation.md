@@ -19,7 +19,7 @@
 - **Output contract:** values flatten to scalars, arrays, or null — never YouTrack's `{"name": …, "$type": …}` wire shape.
 - **`readOnly: true` on a link type is NOT a write gate.** Measured: `Subtask` and `Duplicate` both report it and both accept writes. Never branch on it.
 - **Every new write verb must be added to `WRITE_VERBS`** or the `allow_write` gate silently does not apply to it.
-- **Any payload change requires reindexing `.capability-source/catalog.json` in the same commit** (Task 9). Skipping this left `main` uninstallable after M1.
+- **Any payload change requires reindexing `.capability-source/catalog.json` in the same commit** (Task 8). Skipping this left `main` uninstallable after M1.
 
 ---
 
@@ -47,8 +47,8 @@
 | `capabilities/youtrack/bin/youtrack` | All implementation. New helpers in the existing banner sections: paging + select next to the other shaping helpers; link resolution in a new `── issues: links ──` block before dispatch. |
 | `capabilities/youtrack/bin/youtrack` (module docstring) | The help contract. SHEBANG makes it the single source of truth for the surface; the drift tests fail if it disagrees with `COMMANDS`. |
 | `capabilities/youtrack/tests/test_youtrack.py` | All tests. Extends the existing local-HTTP-server pattern; no new dependency. |
-| `.capability-source/catalog.json` | `payload_sha256` + `summary` reindex, Task 9, same commit as the last payload change. |
-| `.claude/plans/2026-07-27-youtrack-mcp-parity.md` | Mark M3 shipped, Task 9. |
+| `.capability-source/catalog.json` | `payload_sha256` + `summary` reindex, Task 8, same commit as the last payload change. |
+| `.claude/plans/2026-07-27-youtrack-mcp-parity.md` | Mark M3 shipped, Task 8. |
 
 ---
 
@@ -550,7 +550,7 @@ so failing there would break every cross-project search."
 
 ### Task 4: Links on `issues get`
 
-Read side first, so the write verbs in Tasks 6–7 have something to verify against. Implements **D5**.
+Read side first, so the write verbs in Tasks 5–6 have something to verify against. Implements **D5**.
 
 **Files:**
 - Modify: `capabilities/youtrack/bin/youtrack` — `_CF_PROJECTION` area (~line 811), `_flatten_custom_fields` neighbourhood (~line 859), `issues_get`
@@ -741,17 +741,19 @@ key at all."
 
 ---
 
-### Task 5: Link phrase resolution
+### Task 5: Link phrase resolution and `issues links add`
 
-The core of M3. Implements **D2** and **D3**, plus the `readOnly` regression guard.
+The core of M3. Implements **D1**, **D2**, **D3** and **D4**, plus the `readOnly` regression guard.
+
+Resolution and the verb land together deliberately: the resolution helpers have no caller of their own, so splitting them would leave a task whose tests cannot pass until the next one.
 
 **Files:**
-- Modify: `capabilities/youtrack/bin/youtrack` — new `── issues: links ──` section after the comments verbs (~line 1345)
+- Modify: `capabilities/youtrack/bin/youtrack` — new `── issues: links ──` section after the comments verbs (~line 1345), `WRITE_VERBS` (~line 159), `ARG_*` block, `COMMANDS`, module docstring
 - Test: `capabilities/youtrack/tests/test_youtrack.py`
 
 **Interfaces:**
-- Consumes: `_link_phrase` (Task 4).
-- Produces: `_link_slots(c, ref: str) -> list[dict]` returning the raw slot list; `_resolve_link(c, ref: str, phrase: str) -> str` returning the direction-encoded link id.
+- Consumes: `_link_phrase` and `issues_get` (Task 4), `_issue_ref`.
+- Produces: `_link_slots(c, ref: str) -> list`; `_resolve_link(c, ref: str, phrase: str) -> str` returning the direction-encoded link id; `_link_target_error(target: str)` returning an `on_error` callable; `issues_links_add(c, a)`; `ARG_LINK_TO`, `ARG_LINK_TYPE`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -881,6 +883,58 @@ def test_ambiguous_phrase_fails_rather_than_picking(tmp_path, link_handler):
     assert not any(r[0] == "POST" for r in _LinkHandler.requests)
 ```
 
+Then, in the same file, the tests for the verb these helpers serve:
+
+
+```python
+def test_self_link_is_refused_without_any_request(tmp_path, link_handler):
+    # Measured: the server returns 200 for a self-link and silently creates
+    # nothing. Asserting the exit code alone would pass for a client that sent
+    # it, so assert that no write left the process.
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-1", "--type", "relates to")
+    assert result.returncode == 6
+    assert "itself" in result.stderr.lower()
+    assert not any(r[0] == "POST" for r in link_handler.requests)
+
+
+def test_links_add_sends_the_readable_key(tmp_path, link_handler):
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in link_handler.requests if r[0] == "POST"][0]
+    assert post[2] == {"idReadable": "DEMO-9"}
+
+
+def test_links_add_translates_a_bad_target(tmp_path):
+    class BadTargetHandler(_LinkHandler):
+        requests = []
+        slots = None
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, None))
+            self._reply({"error": "Bad Request", "error_description":
+                         "YouTrack is unable to locate an Issue-type entity "
+                         "unless its ID is also provided"}, 400)
+
+    BadTargetHandler.requests = []
+    BadTargetHandler.slots = _link_slots_with_ids()
+    with serve(BadTargetHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-404", "--type", "relates to")
+    # The raw message describes an id-format problem, which is not what
+    # happened. Exit 3 naming the target is the honest translation.
+    assert result.returncode == 3
+    assert "DEMO-404" in result.stderr
+
+
+def test_links_add_is_a_write_verb():
+    assert "issues links add" in _write_verbs()
+```
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cd capabilities/youtrack && python3 -m pytest tests/test_youtrack.py -k "phrase or readonly_link" -v`
@@ -942,104 +996,8 @@ def _resolve_link(c, ref: str, phrase: str) -> str:
     return matches[0]
 ```
 
-- [ ] **Step 4: Stop here — these helpers have no verb yet**
+- [ ] **Step 4: Write the verb, and register it**
 
-The tests written in Step 1 exercise `issues links add`, which Task 6 adds. Do not implement the verb in this task; run only:
-
-Run: `cd capabilities/youtrack && python3 -m pytest tests/test_youtrack.py -q`
-Expected: all pre-existing tests pass; the phrase tests still fail on argparse. That is correct at this point.
-
-- [ ] **Step 5: Commit the helpers**
-
-```bash
-git add capabilities/youtrack/bin/youtrack
-git commit -m "feat(youtrack): resolve link direction phrases client-side
-
-A phrase like \"subtask of\" identifies both a link type and a direction, since
-all 7 phrases on the instance are unique (measured). Ids are read from
-GET /issues/{id}/links rather than built by appending s/t to a type id: that
-suffix is an observed pattern, not a documented contract, and the same call
-already carries the phrase.
-
-An ambiguous phrase fails rather than picking. Uniqueness is measured on one
-instance and a custom link type could collide, where guessing would silently
-create the wrong link.
-
-Records that linkType.readOnly is not a write gate — Duplicate and Subtask both
-report it and both accept links."
-```
-
----
-
-### Task 6: `issues links add`
-
-Implements **D1** and **D4**.
-
-**Files:**
-- Modify: `capabilities/youtrack/bin/youtrack` — `── issues: links ──` section, `WRITE_VERBS` (~line 159), `ARG_*`, `COMMANDS`, docstring
-- Test: `capabilities/youtrack/tests/test_youtrack.py`
-
-**Interfaces:**
-- Consumes: `_resolve_link` (Task 5), `_issue_ref`.
-- Produces: `issues_links_add(c, a)`; `ARG_LINK_TO`, `ARG_LINK_TYPE`.
-
-- [ ] **Step 1: Write the failing tests — the self-link one asserts no request**
-
-```python
-def test_self_link_is_refused_without_any_request(tmp_path, link_handler):
-    # Measured: the server returns 200 for a self-link and silently creates
-    # nothing. Asserting the exit code alone would pass for a client that sent
-    # it, so assert that no write left the process.
-    with serve(link_handler) as base:
-        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
-                         "--to", "DEMO-1", "--type", "relates to")
-    assert result.returncode == 6
-    assert "itself" in result.stderr.lower()
-    assert not any(r[0] == "POST" for r in link_handler.requests)
-
-
-def test_links_add_sends_the_readable_key(tmp_path, link_handler):
-    with serve(link_handler) as base:
-        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
-                         "--to", "DEMO-9", "--type", "subtask of")
-    assert result.returncode == 0, result.stderr
-    post = [r for r in link_handler.requests if r[0] == "POST"][0]
-    assert post[2] == {"idReadable": "DEMO-9"}
-
-
-def test_links_add_translates_a_bad_target(tmp_path):
-    class BadTargetHandler(_LinkHandler):
-        requests = []
-        slots = None
-
-        def do_POST(self):
-            self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            self.__class__.requests.append(("POST", self.path, None))
-            self._reply({"error": "Bad Request", "error_description":
-                         "YouTrack is unable to locate an Issue-type entity "
-                         "unless its ID is also provided"}, 400)
-
-    BadTargetHandler.requests = []
-    BadTargetHandler.slots = _link_slots_with_ids()
-    with serve(BadTargetHandler) as base:
-        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
-                         "--to", "DEMO-404", "--type", "relates to")
-    # The raw message describes an id-format problem, which is not what
-    # happened. Exit 3 naming the target is the honest translation.
-    assert result.returncode == 3
-    assert "DEMO-404" in result.stderr
-
-
-def test_links_add_is_a_write_verb():
-    assert "issues links add" in _write_verbs()
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cd capabilities/youtrack && python3 -m pytest tests/test_youtrack.py -k "self_link or links_add" -v`
-Expected: FAIL — argparse exits 2 for the verb; `test_links_add_is_a_write_verb` fails on the missing `WRITE_VERBS` entry.
-
-- [ ] **Step 3: Write the implementation**
 
 Append to the `── issues: links ──` section:
 
@@ -1109,24 +1067,35 @@ Add to the docstring's `Write:` block:
 
 > `issues_links_add` calls `issues_get`, which needs `argparse` in scope. It is already imported at module top; do not re-import.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cd capabilities/youtrack && python3 -m pytest tests/test_youtrack.py -k "self_link or links_add or phrase or readonly_link" -v`
-Expected: PASS — the Task 5 phrase tests now pass too, since their verb exists.
+Expected: PASS — 13 tests (7 parametrized phrases, plus readOnly, case-insensitivity, unknown phrase, ambiguous phrase, self-link, readable-key body, bad target, and the `WRITE_VERBS` membership check).
 
-- [ ] **Step 5: Run the whole suite**
+- [ ] **Step 6: Run the whole suite**
 
 Run: `cd capabilities/youtrack && python3 -m pytest tests/test_youtrack.py -q`
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add capabilities/youtrack/bin/youtrack capabilities/youtrack/tests/test_youtrack.py
-git commit -m "feat(youtrack): issues links add
+git commit -m "feat(youtrack): issues links add, with client-side phrase resolution
 
 --type takes the direction phrase, so no second flag is needed and the caller
-cannot pair a type with a direction it does not have.
+cannot pair a type with a direction it does not have. All 7 phrases on the
+instance are unique (measured), so a phrase identifies both type and direction.
+
+Ids are read from GET /issues/{id}/links rather than built by appending s/t to
+a type id: that suffix is an observed pattern, not a documented contract, and
+the same call already carries the phrase. An ambiguous phrase fails rather than
+picking — uniqueness is measured on one instance and a custom link type could
+collide, where guessing would silently create the wrong link.
+
+linkType.readOnly is not a write gate: Duplicate and Subtask both report it and
+both accept links. A test pins this, because respecting the flag would disable
+subtask of while every other test still passed.
 
 Self-links are refused before any request. Measured: YouTrack returns 200 and
 silently creates nothing, so sending one would report success for a no-op — the
@@ -1140,7 +1109,7 @@ response echoes only the target."
 
 ---
 
-### Task 7: `issues links remove`
+### Task 6: `issues links remove`
 
 Implements **D8**.
 
@@ -1149,7 +1118,7 @@ Implements **D8**.
 - Test: `capabilities/youtrack/tests/test_youtrack.py`
 
 **Interfaces:**
-- Consumes: `_resolve_link` (Task 5), `_link_target_error` (Task 6), `issues_get`.
+- Consumes: `_resolve_link` and `_link_target_error` (Task 5), `issues_get`.
 - Produces: `issues_links_remove(c, a)`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1270,7 +1239,7 @@ caller looking for a deleted issue."
 
 ---
 
-### Task 8: Live verification against ION
+### Task 7: Live verification against ION
 
 No new code. This is where the shipped verbs meet the real server, under the ION-only constraint.
 
@@ -1374,7 +1343,7 @@ git commit -m "docs(youtrack): record M3 live verification against ION"
 
 ---
 
-### Task 9: Catalog reindex, audit, and consumer refresh
+### Task 8: Catalog reindex, audit, and consumer refresh
 
 The step M1 skipped, which left `main` uninstallable.
 
@@ -1499,7 +1468,7 @@ Expected: 105 pre-existing tests plus ~22 new, all passing. `test_every_command_
 
 ## Rollback
 
-Every task is a single commit on `feat/youtrack-m3-work-the-board`; nothing is pushed. To undo one task, `git revert <sha>`. To abandon M3 entirely, `git checkout main && git branch -D feat/youtrack-m3-work-the-board` — no installed artifact changes until Task 8 Step 1, and reinstalling from `upstream/main` restores the M2 build.
+Every task is a single commit on `feat/youtrack-m3-work-the-board`; nothing is pushed. To undo one task, `git revert <sha>`. To abandon M3 entirely, `git checkout main && git branch -D feat/youtrack-m3-work-the-board` — no installed artifact changes until Task 7 Step 1, and reinstalling from `upstream/main` restores the M2 build.
 
 ## Out of scope
 
