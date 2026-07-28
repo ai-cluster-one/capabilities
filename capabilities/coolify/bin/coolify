@@ -97,20 +97,23 @@ COMMANDS
       --image <registry/name:tag>  (registry image)
       --dockerfile <file|->  (inline dockerfile, raw content)
       Common optional: --name, --domains, --ports-exposes, --instant-deploy,
-      --destination <uuid>, --base-directory, and the health-check flags
-      accepted by `app update`. Returns the application uuid.
+      --destination <uuid>, --base-directory, --watch-paths, and the
+      health-check flags accepted by `app update`. Returns the application uuid.
       Write verb - requires allow_write.
 
   app update <uuid> [options]
       Patch only the supplied application fields:
       --name --domains --ports-exposes --base-directory
       --dockerfile-location --docker-compose-location --build-pack
-      --git-repository --git-branch
+      --git-repository --git-branch --watch-paths
       --health-check-enabled / --no-health-check-enabled
       --health-check-path --health-check-port --health-check-host
       --health-check-scheme --health-check-return-code
       --health-check-interval --health-check-timeout --health-check-retries
       --health-check-start-period
+      --watch-paths accepts newline-separated glob patterns that filter which
+      repository changes trigger a webhook deploy (e.g. "backend/**"). Pass an
+      empty string to clear the field (deploy on all changes).
       Write verb - requires allow_write.
 
   service create --compose <file|-> --project <uuid> --server <uuid>
@@ -1319,6 +1322,7 @@ APP_PATCH_FIELDS = (
     ("build_pack", "build_pack"),
     ("git_repository", "git_repository"),
     ("git_branch", "git_branch"),
+    ("watch_paths", "watch_paths"),
     ("health_check_enabled", "health_check_enabled"),
     ("health_check_path", "health_check_path"),
     ("health_check_port", "health_check_port"),
@@ -1475,6 +1479,10 @@ def _add_app_patch_arguments(parser: argparse.ArgumentParser) -> None:
         "--git-repository", dest="git_repository", help="git repository URL",
     )
     parser.add_argument("--git-branch", dest="git_branch", help="git branch")
+    parser.add_argument(
+        "--watch-paths", dest="watch_paths",
+        help="newline-separated glob patterns filtering which changes trigger deploys; empty string clears",
+    )
     parser.add_argument(
         "--health-check-enabled", dest="health_check_enabled",
         action=argparse.BooleanOptionalAction, default=None,

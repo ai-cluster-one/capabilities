@@ -188,10 +188,55 @@ def test_app_writes_obey_read_only_policy():
     assert exc.value.code == 4
 
 
+def test_app_update_sets_watch_paths():
+    """watch_paths is accepted on app update and passed to the API."""
+    calls = []
+
+    def mock_request(c, method, path, params=None, json_body=None):
+        calls.append({
+            "method": method,
+            "path": path,
+            "body": json_body,
+        })
+        return {"uuid": "app-uuid"}
+
+    args = SimpleNamespace(
+        uuid="app-uuid",
+        watch_paths="backend/**\nmcp-server/**",
+    )
+    with patch.object(coolify_module, "_request", side_effect=mock_request):
+        result = coolify_module.cmd_app_update(None, args)
+
+    assert result == {"uuid": "app-uuid"}
+    assert calls == [{
+        "method": "PATCH",
+        "path": "/applications/app-uuid",
+        "body": {
+            "watch_paths": "backend/**\nmcp-server/**",
+        },
+    }]
+
+
+def test_app_update_clears_watch_paths_with_empty_string():
+    """Empty string clears watch_paths (deploy on all changes)."""
+    calls = []
+
+    def mock_request(c, method, path, params=None, json_body=None):
+        calls.append({"body": json_body})
+        return {"uuid": "app-uuid"}
+
+    args = SimpleNamespace(uuid="app-uuid", watch_paths="")
+    with patch.object(coolify_module, "_request", side_effect=mock_request):
+        coolify_module.cmd_app_update(None, args)
+
+    assert calls[0]["body"] == {"watch_paths": ""}
+
+
 def test_help_and_manifest_declare_new_surface():
     help_text = coolify_module.__doc__ or ""
     assert "sources" in help_text
     assert "app update <uuid>" in help_text
     assert "--base-directory" in help_text
     assert "--health-check-start-period" in help_text
+    assert "--watch-paths" in help_text
     assert coolify_module.TOPICS == ["headless-apps"]
