@@ -1032,11 +1032,11 @@ def issues_links_add(c, a):
     return issues_get(c, argparse.Namespace(issue=ref))
 ```
 
-Add to `WRITE_VERBS`:
+Add to `WRITE_VERBS` — **`issues links add` only.** `issues links remove` joins it in Task 6, alongside its `COMMANDS` row: the existing `test_write_verbs_match_commands` asserts `WRITE_VERBS ⊆ COMMANDS`, so a write verb listed before its dispatch row exists turns the suite red.
 
 ```python
 WRITE_VERBS = {"issues create", "issues update", "issues comments add",
-               "issues links add", "issues links remove",
+               "issues links add",
                "articles create", "articles update", "articles comments add"}
 ```
 
@@ -1197,10 +1197,16 @@ def issues_links_remove(c, a):
     return issues_get(c, argparse.Namespace(issue=ref))
 ```
 
-Add the `COMMANDS` row:
+Add the `COMMANDS` row **and** the `WRITE_VERBS` entry in the same step — the existing `test_write_verbs_match_commands` asserts `WRITE_VERBS ⊆ COMMANDS`, so these two must always land together:
 
 ```python
     ("issues", "links", "remove"):     (issues_links_remove, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
+```
+
+```python
+WRITE_VERBS = {"issues create", "issues update", "issues comments add",
+               "issues links add", "issues links remove",
+               "articles create", "articles update", "articles comments add"}
 ```
 
 Add to the docstring's `Write:` block:
