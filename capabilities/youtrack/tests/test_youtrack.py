@@ -8,6 +8,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 
 CLI = Path(__file__).parents[1] / "bin" / "youtrack"
 
@@ -41,6 +43,15 @@ def _write_verbs():
 
 def test_write_verbs_match_commands():
     assert _write_verbs() <= {" ".join(p) for p in _command_paths()}
+
+
+def _issue_type_map():
+    for node in ast.walk(_source_tree()):
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", None) == "_ISSUE_TYPE_BY_FIELD_TYPE"
+                for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError("_ISSUE_TYPE_BY_FIELD_TYPE not found in bin/youtrack")
 
 
 def test_every_documented_command_exists():
@@ -208,12 +219,29 @@ def test_projects_fields_list_shapes_schema(tmp_path):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == [
         {"name": "Priority", "type": "enum[1]", "multiValue": False,
-         "required": True, "values": ["Critical", "Normal"]},
+         "canBeEmpty": False, "values": ["Critical", "Normal"]},
         {"name": "Assignee", "type": "user[1]", "multiValue": False,
-         "required": False, "values": ["s.royz", "j.howell"]},
+         "canBeEmpty": True, "values": ["s.royz", "j.howell"]},
         {"name": "Points", "type": "integer", "multiValue": False,
-         "required": False, "values": None},
+         "canBeEmpty": True, "values": None},
     ]
+
+
+def test_projects_fields_report_can_be_empty_not_required(tmp_path):
+    """Measured: canBeEmpty=false does not make a field required at create —
+    the server defaults it. Reporting `required` said the opposite, so the key
+    is YouTrack's own flag and no `required` key is emitted at all."""
+    ProjectFieldsHandler.requests = []
+    with serve(ProjectFieldsHandler) as base:
+        listed = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
+        got = run_cli(tmp_path, base, "projects", "fields", "get", "0-6", "Priority")
+    assert listed.returncode == 0, listed.stderr
+    assert got.returncode == 0, got.stderr
+    for row in json.loads(listed.stdout):
+        assert "required" not in row, "the misnamed `required` key must be gone"
+        assert isinstance(row["canBeEmpty"], bool)
+    one = json.loads(got.stdout)
+    assert one["canBeEmpty"] is False and "required" not in one
 
 
 def test_projects_fields_get_is_case_insensitive(tmp_path):
@@ -303,7 +331,7 @@ def test_projects_fields_list_skips_non_dict_entries(tmp_path):
     parsed = json.loads(result.stdout)
     assert parsed == [
         {"name": "Priority", "type": "enum[1]", "multiValue": False,
-         "required": True, "values": ["Critical"]},
+         "canBeEmpty": False, "values": ["Critical"]},
     ]
 
 
@@ -1160,6 +1188,502 @@ def test_update_reads_issue_once_then_writes(tmp_path):
     reads = [r for r in UpdateFieldsHandler.requests if r[0] == "GET"]
     assert len(reads) == 1, f"expected one issue read, got {len(reads)}"
     assert "$type" in urllib.parse.unquote(reads[0][1]), "the read must project $type"
+
+
+# ── issues create: custom fields in the create call (M2) ─────────────────
+#
+# Create cannot read $type off an issue that does not exist yet, so it resolves
+# $type from the project schema — which reports `fieldType.id` and *not* the
+# issue-side $type. That mapping is create's only genuinely new logic, so every
+# fieldType.id gets its own assertion on the exact request body: a wrong constant
+# produces a plausible-looking request that YouTrack rejects at the wire.
+#
+# One row per `fieldType.id`: (fieldType.id, field name, isMultiValue,
+# bundle names, bundle logins, --field input, expected $type, expected value).
+CREATE_TYPE_CASES = [
+    ("state[1]", "State", False, ["Open", "In Progress"], None,
+     "Open", "StateIssueCustomField", {"name": "Open"}),
+    ("enum[1]", "Priority", False, ["Critical", "Normal"], None,
+     "Normal", "SingleEnumIssueCustomField", {"name": "Normal"}),
+    ("enum[*]", "Work Category", True, ["Infrastructure", "Technical Debt"], None,
+     "Infrastructure", "MultiEnumIssueCustomField", [{"name": "Infrastructure"}]),
+    ("ownedField[1]", "Subsystem", False, ["Ingestion"], None,
+     "Ingestion", "SingleOwnedIssueCustomField", {"name": "Ingestion"}),
+    ("user[1]", "Assignee", False, None, ["s.royz", "k.shmidt"],
+     "s.royz", "SingleUserIssueCustomField", {"login": "s.royz"}),
+    ("user[*]", "Requestor", True, None, ["s.royz", "k.shmidt"],
+     "k.shmidt", "MultiUserIssueCustomField", [{"login": "k.shmidt"}]),
+    ("version[1]", "Release Window", False, ["2026.1"], None,
+     "2026.1", "SingleVersionIssueCustomField", {"name": "2026.1"}),
+    ("version[*]", "Sprints", True, ["Sprint W13", "Sprint W14"], None,
+     "Sprint W13", "MultiVersionIssueCustomField", [{"name": "Sprint W13"}]),
+    ("build[1]", "Reported In", False, ["build-42"], None,
+     "build-42", "SingleBuildIssueCustomField", {"name": "build-42"}),
+    ("period", "Original Estimate", False, None, None,
+     "1d 4h", "PeriodIssueCustomField", {"presentation": "1d 4h"}),
+    ("integer", "Points", False, None, None, "3", "SimpleIssueCustomField", 3),
+    ("float", "Story points", False, None, None, "3.5",
+     "SimpleIssueCustomField", 3.5),
+    ("date", "Due Date", False, None, None, "2026-08-15",
+     "DateIssueCustomField", 1786795200000),
+    ("date and time", "Incident Start Time", False, None, None, "1781534028493",
+     "SimpleIssueCustomField", 1781534028493),
+    ("text", "Acceptance Criteria", False, None, None, "- one\n- two",
+     "TextIssueCustomField", {"text": "- one\n- two"}),
+]
+
+
+def _schema_row(idx, ftype, name, multi, names, logins, can_be_empty=True):
+    bundle = None
+    if names is not None or logins is not None:
+        bundle = {"id": f"b{idx}"}
+        if names is not None:
+            bundle["values"] = [{"name": v} for v in names]
+        if logins is not None:
+            bundle["aggregatedUsers"] = [{"login": v} for v in logins]
+    return {
+        "id": str(idx),
+        "canBeEmpty": can_be_empty,
+        # Deliberately the *project*-side $type on every row, and deliberately
+        # the wrong one for most of them. Measured: the schema reports
+        # SimpleProjectCustomField even for a `date` field, so an implementation
+        # that passed this value through would send a type mismatch. Every
+        # expectation below therefore fails unless the fieldType.id map is used.
+        "$type": "SimpleProjectCustomField",
+        "field": {"name": name,
+                  "fieldType": {"id": ftype, "isMultiValue": multi}},
+        "bundle": bundle,
+    }
+
+
+CREATE_PROJECT_SCHEMA = [
+    _schema_row(i, ftype, name, multi, names, logins,
+                # State/Priority are canBeEmpty=false on every real project, and
+                # that must not become a client-side required-field check.
+                can_be_empty=name not in ("State", "Priority"))
+    for i, (ftype, name, multi, names, logins, _v, _t, _e)
+    in enumerate(CREATE_TYPE_CASES, start=1)
+]
+
+
+class CreateFieldsHandler(BaseHTTPRequestHandler):
+    """Serves the project schema that supplies $type, and records the write."""
+
+    requests = []
+    write_status = 200
+    write_body = None       # None → echo the created entity back
+
+    def log_message(self, *_args):
+        pass
+
+    def _reply(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, None))
+        if "/admin/projects/" in self.path and "/customFields" in self.path:
+            self._reply(self.schema())
+        else:
+            self._reply({"error": "missing"}, 404)
+
+    def schema(self):
+        return CREATE_PROJECT_SCHEMA
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        payload = json.loads(raw)
+        self.__class__.requests.append(("POST", self.path, payload))
+        status = self.__class__.write_status
+        if self.__class__.write_body is not None:
+            self._reply(self.__class__.write_body, status)
+        elif self.path.startswith("/api/users/me/drafts"):
+            self._reply({"id": "2-9", "idReadable": "Issue.Draft", **payload}, status)
+        else:
+            self._reply({"id": "2-9", "idReadable": "DEMO-9", **payload}, status)
+
+
+def run_create(tmp_path, *args, handler=CreateFieldsHandler,
+               status=200, body=None):
+    handler.requests = []
+    handler.write_status = status
+    handler.write_body = body
+    server, thread, base_url = _serve(handler)
+    try:
+        result = run_cli(tmp_path, base_url, "issues", "create",
+                         "--project", "0-6", *args)
+    finally:
+        server.shutdown()
+        thread.join()
+    writes = [r for r in handler.requests if r[0] == "POST"]
+    return result, writes
+
+
+@pytest.mark.parametrize(
+    "ftype,name,_multi,_names,_logins,given,dollar,expected",
+    CREATE_TYPE_CASES, ids=[row[0] for row in CREATE_TYPE_CASES])
+def test_create_marshals_each_project_field_type(
+        tmp_path, ftype, name, _multi, _names, _logins, given, dollar, expected):
+    """One row per fieldType.id, asserting the exact request entry."""
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", f"{name}={given}")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)[name] == {
+        "name": name, "$type": dollar, "value": expected}, f"{ftype} marshalled wrong"
+
+
+def test_create_sends_project_summary_and_every_field_in_one_call(tmp_path):
+    """The whole body, so an extra or missing key is caught too."""
+    flags = []
+    for _ftype, name, _multi, _names, _logins, given, _t, _e in CREATE_TYPE_CASES:
+        flags += ["--field", f"{name}={given}"]
+    result, writes = run_create(tmp_path, "--summary", "Born ready",
+                                "--description", "Body", *flags)
+
+    assert result.returncode == 0, result.stderr
+    assert len(writes) == 1
+    _method, path, payload = writes[0]
+    assert path.startswith("/api/issues")
+    assert payload["project"] == {"id": "0-6"}
+    assert payload["summary"] == "Born ready"
+    assert payload["description"] == "Body"
+    assert payload["customFields"] == [
+        {"name": name, "$type": dollar, "value": expected}
+        for _ftype, name, _m, _n, _l, _given, dollar, expected in CREATE_TYPE_CASES
+    ]
+
+
+class EveryMappedTypeHandler(CreateFieldsHandler):
+    """A project carrying exactly one field per _ISSUE_TYPE_BY_FIELD_TYPE row."""
+
+    requests = []
+
+    def schema(self):
+        return [_schema_row(i, ftype, f"F {ftype}",
+                            ftype.endswith("[*]"), None, None)
+                for i, ftype in enumerate(sorted(_issue_type_map()), start=1)]
+
+
+def test_every_mapped_field_type_is_dispatched_by_marshal_one(tmp_path):
+    """Coverage guard driven by the map itself, so a row added later cannot
+    escape it. Fifteen rows have their exact body asserted individually above;
+    this one only proves no row falls through _marshal_one's final branch to
+    `unsupported_field_type`, which is how an unhandled $type would surface."""
+    mapping = _issue_type_map()
+    flags = []
+    for ftype in sorted(mapping):
+        given = "2026-08-15" if ftype == "date" else "x"
+        flags += ["--field", f"F {ftype}={given}"]
+    result, writes = run_create(tmp_path, "--summary", "s", *flags,
+                                handler=EveryMappedTypeHandler)
+
+    assert result.returncode == 0, result.stderr
+    sent = sent_fields(writes)
+    assert set(sent) == {f"F {ftype}" for ftype in mapping}
+    for ftype, dollar in mapping.items():
+        entry = sent[f"F {ftype}"]
+        assert entry["$type"] == dollar, ftype
+        assert entry["value"] is not None, f"{ftype} marshalled to nothing"
+
+
+def create_schema_reads(handler=CreateFieldsHandler):
+    return [r for r in handler.requests
+            if r[0] == "GET" and "/admin/projects/" in r[1]]
+
+
+def test_create_happy_path_fetches_the_schema_exactly_once(tmp_path):
+    """$type is mandatory and no issue exists to read it off, so create must
+    fetch the schema — once. Zero would mean it guessed; two would mean it
+    re-read what it already had."""
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "Priority=Normal",
+                                "--field", "Points=3")
+
+    assert result.returncode == 0, result.stderr
+    assert len(create_schema_reads()) == 1, create_schema_reads()
+    assert len(writes) == 1
+
+
+def test_create_without_fields_never_fetches_the_schema(tmp_path):
+    result, writes = run_create(tmp_path, "--summary", "plain")
+
+    assert result.returncode == 0, result.stderr
+    assert create_schema_reads() == [], "no fields named means no $type needed"
+    assert "customFields" not in writes[0][2]
+
+
+def test_create_converts_calendar_date_to_noon_utc(tmp_path):
+    """Measured live: 2026-08-15 is stored as 1786795200000, i.e. 12:00 UTC of
+    the same UTC day. An ISO string is rejected at the wire, so the conversion
+    has to happen here."""
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "Due Date=2026-08-15")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Due Date"]["value"] == 1786795200000
+
+
+def test_create_date_field_reads_back_as_a_calendar_date(tmp_path):
+    """Never assert epoch equality across a `date` round trip — compare the
+    calendar day, which is what survives the server's noon-UTC snap."""
+    result, _writes = run_create(tmp_path, "--summary", "s",
+                                 "--field", "Due Date=2026-08-15")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["fields"]["Due Date"] == "2026-08-15"
+
+
+def test_create_date_and_time_keeps_epoch_ms_exactly(tmp_path):
+    """`date and time` is SimpleIssueCustomField and is not normalized, so here
+    epoch equality does hold, on the way out and back."""
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "Incident Start Time=1781534028493")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Incident Start Time"] == {
+        "name": "Incident Start Time", "$type": "SimpleIssueCustomField",
+        "value": 1781534028493}
+    assert json.loads(result.stdout)["fields"]["Incident Start Time"] == 1781534028493
+
+
+def test_create_draft_posts_to_the_drafts_endpoint(tmp_path):
+    result, writes = run_create(tmp_path, "--summary", "draft me", "--draft")
+
+    assert result.returncode == 0, result.stderr
+    assert len(writes) == 1
+    assert writes[0][1].startswith("/api/users/me/drafts")
+    assert not writes[0][1].startswith("/api/issues")
+    assert json.loads(result.stdout)["idReadable"] == "Issue.Draft"
+
+
+def test_create_draft_carries_the_full_field_set(tmp_path):
+    """Measured: POST /api/users/me/drafts applies a whole custom-field set in
+    the create call, so a draft can be born ready."""
+    result, writes = run_create(
+        tmp_path, "--summary", "draft me", "--draft",
+        "--field", "Priority=Normal", "--field", "Points=3",
+        "--field", "Sprints=Sprint W13")
+
+    assert result.returncode == 0, result.stderr
+    assert writes[0][1].startswith("/api/users/me/drafts")
+    sent = sent_fields(writes)
+    assert sent["Priority"]["value"] == {"name": "Normal"}
+    assert sent["Points"]["value"] == 3
+    assert sent["Sprints"]["value"] == [{"name": "Sprint W13"}]
+
+
+def test_create_draft_may_set_state(tmp_path):
+    """State on a draft is settable (measured on ION). Where a project's
+    workflow rejects it that is exit 7, not a refusal the CLI invents."""
+    result, writes = run_create(tmp_path, "--summary", "draft me", "--draft",
+                                "--field", "State=Open")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["State"] == {
+        "name": "State", "$type": "StateIssueCustomField",
+        "value": {"name": "Open"}}
+
+
+def test_read_only_connection_refuses_draft_create_before_network(tmp_path):
+    envelope = tmp_path / "capabilities" / "youtrack"
+    envelope.mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    (envelope / "connections.json").write_text(json.dumps({
+        "default": "work",
+        "connections": {"work": {
+            "secret_env": "YOUTRACK_TOKEN",
+            "base_url": "http://127.0.0.1:1",
+            "allow_write": False,
+        }},
+    }))
+    result = run_cli(tmp_path, "http://127.0.0.1:1", "issues", "create",
+                     "--project", "0-6", "--summary", "blocked", "--draft",
+                     "--field", "Priority=Normal")
+    assert result.returncode == 4
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "read_only"
+
+
+def test_create_omitting_can_be_empty_false_fields_succeeds(tmp_path):
+    """Guards a measured fact against a well-meant regression: canBeEmpty=false
+    means "may not be emptied", NOT "required at create". A create omitting
+    State and Priority returns 200 and the server defaults them, so a
+    client-side required-field check would reject creates YouTrack accepts."""
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "Points=3")
+
+    assert result.returncode == 0, result.stderr
+    assert len(writes) == 1, "must send, not refuse"
+    names = {f["name"] for f in writes[0][2]["customFields"]}
+    assert names == {"Points"}
+    assert "required" not in result.stderr.lower()
+
+
+def test_create_with_no_fields_at_all_is_not_blocked_by_required_fields(tmp_path):
+    result, writes = run_create(tmp_path, "--summary", "bare")
+
+    assert result.returncode == 0, result.stderr
+    assert writes[0][2] == {"project": {"id": "0-6"}, "summary": "bare"}
+
+
+def test_create_unknown_field_suggests_a_near_miss_and_does_not_write(tmp_path):
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "Prioritee=Normal")
+
+    assert result.returncode == 6
+    assert "Priority" in result.stderr
+    assert writes == [], "an unknown name is caught before the write"
+
+
+def test_create_unknown_field_message_names_the_project_not_the_issue(tmp_path):
+    """There is no issue yet, so "no field named X on this issue" would be a
+    lie about what was checked."""
+    result, _writes = run_create(tmp_path, "--summary", "s",
+                                 "--field", "Nonexistent Field=1")
+
+    assert result.returncode == 6
+    assert "0-6" in result.stderr
+    assert "on this issue" not in result.stderr
+
+
+def test_create_rejects_a_value_outside_its_bundle_before_writing(tmp_path):
+    """The schema is already in hand, so full value validation is free here —
+    unlike update, where it would cost an extra request."""
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "Priority=Sideways")
+
+    assert result.returncode == 6
+    assert writes == [], "a bad value is caught before the write"
+    assert "Priority" in result.stderr
+    assert "Critical" in result.stderr and "Normal" in result.stderr
+    assert len(create_schema_reads()) == 1
+
+
+def test_create_does_not_pre_reject_an_unrecognised_login(tmp_path):
+    """A user field's legal set is bundle.aggregatedUsers, which is
+    permission-scoped — measured: the server itself assigns logins absent from
+    the list a token can see. So an unknown login is a soft signal and must
+    reach the server rather than be refused locally."""
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "Assignee=c.wootson")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Assignee"]["value"] == {"login": "c.wootson"}
+
+
+def test_create_bad_date_exits_6_before_writing(tmp_path):
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "Due Date=15/08/2026")
+
+    assert result.returncode == 6
+    assert "yyyy-mm-dd" in result.stderr.lower()
+    assert writes == []
+
+
+def test_create_repeated_field_accumulates_for_multi_value(tmp_path):
+    result, writes = run_create(
+        tmp_path, "--summary", "s",
+        "--field", "Work Category=Infrastructure",
+        "--field", "Work Category=Technical Debt")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Work Category"]["value"] == [
+        {"name": "Infrastructure"}, {"name": "Technical Debt"}]
+
+
+def test_create_field_overrides_the_fields_document(tmp_path):
+    """Same merge order as update: --fields first, then --field patches it."""
+    result, writes = run_create(
+        tmp_path, "--summary", "s",
+        "--fields", json.dumps({"Priority": "Critical", "Points": 1}),
+        "--field", "Priority=Normal")
+
+    assert result.returncode == 0, result.stderr
+    sent = sent_fields(writes)
+    assert sent["Priority"]["value"] == {"name": "Normal"}
+    assert sent["Points"]["value"] == 1
+
+
+def test_create_matches_field_names_case_insensitively(tmp_path):
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "PRIORITY=Normal")
+
+    assert result.returncode == 0, result.stderr
+    assert sent_fields(writes)["Priority"]["name"] == "Priority"
+
+
+class UnmappedTypeHandler(CreateFieldsHandler):
+    requests = []
+
+    def schema(self):
+        return [_schema_row(1, "quantum[1]", "Spin", False, None, None)]
+
+
+def test_create_unmapped_field_type_exits_6_before_writing(tmp_path):
+    """No mapping means no $type, and YouTrack would answer "$type is required".
+    Say so by name instead of sending an entry that cannot succeed."""
+    result, writes = run_create(tmp_path, "--summary", "s",
+                                "--field", "Spin=up",
+                                handler=UnmappedTypeHandler)
+
+    assert result.returncode == 6
+    assert writes == []
+    assert "quantum[1]" in result.stderr
+
+
+def test_create_workflow_rejection_exits_7_without_a_second_schema_read(tmp_path):
+    result, _writes = run_create(
+        tmp_path, "--summary", "s", "--field", "State=Open",
+        status=400,
+        body={"error": "Workflow runtime error",
+              "error_description": "The require_attach_task_to_feature/rule rule "
+                                   "threw an exception",
+              "error_rule_name": "require_attach_task_to_feature/rule",
+              "error_type": "workflow"})
+
+    assert result.returncode == 7, result.stderr
+    assert "require_attach_task_to_feature/rule" in result.stderr
+    assert len(create_schema_reads()) == 1, "the schema is read once, not again"
+
+
+def test_create_type_scoped_rejection_surfaces_the_server_message(tmp_path):
+    """The Type-scoped subset does not exist until the issue does, so this one
+    cannot be pre-flighted; the server's 400 must come through as input error."""
+    result, _writes = run_create(
+        tmp_path, "--summary", "s", "--field", "Reported In=build-42",
+        status=400,
+        body={"error": "Bad Request",
+              "error_description": "You can only update the value for the "
+                                   "Reported In field when the value for the "
+                                   "Type field is Bug"})
+
+    assert result.returncode == 6, result.stderr
+    assert "Reported In" in result.stderr
+    assert "Type field" in result.stderr
+
+
+def test_create_server_500_for_unknown_field_maps_to_exit_6(tmp_path):
+    result, _writes = run_create(
+        tmp_path, "--summary", "s", "--field", "Priority=Normal",
+        status=500,
+        body={"error": "Internal Server Error",
+              "error_description": "incompatible-issue-custom-field-name-Priority"})
+
+    assert result.returncode == 6, result.stderr
+
+
+def test_create_flattens_the_created_issue_fields(tmp_path):
+    result, _writes = run_create(tmp_path, "--summary", "s",
+                                 "--field", "Priority=Normal")
+
+    assert result.returncode == 0, result.stderr
+    body = json.loads(result.stdout)
+    assert "customFields" not in body
+    assert body["fields"]["Priority"] == "Normal"
 
 
 def test_articles_list_all_and_by_project(tmp_path):
