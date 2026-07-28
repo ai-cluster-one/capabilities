@@ -137,6 +137,10 @@ Write:
                                              duplicated by". One write fills in
                                              both sides. Linking an issue to
                                              itself is refused.
+  youtrack issues links remove ISSUE --to ISSUE --type PHRASE
+                                             Remove a link. Not idempotent:
+                                             removing a link that is not there
+                                             exits 3.
   youtrack articles create --project ID      Create an article in a project
         --summary S [--content TEXT|-]        (database entity id); optionally give
         [--parent ID|URL]                    a parent article to create a sub-article.
@@ -184,7 +188,7 @@ CRED_KEYS = [
      "note": "permanent token (perm:…); alternates via --token-env"},
 ]
 WRITE_VERBS = {"issues create", "issues update", "issues comments add",
-               "issues links add",
+               "issues links add", "issues links remove",
                "articles create", "articles update", "articles comments add"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
@@ -819,10 +823,10 @@ def _request(client: httpx.Client, method: str, path: str, on_error=None, **kwar
         break
     if response.status_code in (401, 403):
         _die(2, "auth", "YouTrack rejected the credentials or permission", status=response.status_code)
-    if response.status_code == 404:
-        _die(3, "not_found", "YouTrack resource not found", status=404)
     if on_error is not None and response.status_code >= 400:
         on_error(response)
+    if response.status_code == 404:
+        _die(3, "not_found", "YouTrack resource not found", status=404)
     if response.status_code >= 500 or response.status_code == 429:
         _die(5, "server_error", response.text[:500] or "YouTrack server error", status=response.status_code)
     if response.status_code >= 400:
@@ -1570,6 +1574,35 @@ def issues_links_add(c, a):
     return issues_get(c, argparse.Namespace(issue=ref))
 
 
+def _missing_link_error(ref: str, target: str, phrase: str):
+    """Retranslate remove's 404.
+
+    Measured: deleting a link that does not exist returns 404 whose message
+    names the *target issue* — which exists. Passing it through would tell the
+    caller the issue is missing when the link is.
+    """
+    def on_error(response):
+        if response.status_code == 404:
+            _die(3, "not_found",
+                 f"{ref} has no {phrase!r} link to {target}",
+                 "read the issue to see the links it does have", status=404)
+    return on_error
+
+
+def issues_links_remove(c, a):
+    ref, target = _issue_ref(a.issue), _issue_ref(a.to)
+    link_id = _resolve_link(c, ref, a.type)
+    # DELETE needs the internal id; a readable key 404s (measured).
+    resolved = _request(c, "GET", f"/issues/{target}", params={"fields": "id"},
+                        on_error=_link_target_error(target))
+    internal = (resolved or {}).get("id")
+    if not internal:
+        _die(3, "not_found", f"no issue named {target!r}")
+    _request(c, "DELETE", f"/issues/{ref}/links/{link_id}/issues/{internal}",
+             on_error=_missing_link_error(ref, target, a.type))
+    return issues_get(c, argparse.Namespace(issue=ref))
+
+
 def _article_ref(value):
     value = value.strip()
     match = re.search(r"/articles/([^/?#]+)", value)
@@ -1680,6 +1713,7 @@ COMMANDS = {
     ("issues", "comments", "list"):   (issues_comments_list, [ARG_ISSUE, ARG_LIMIT50, ARG_OFFSET]),
     ("issues", "comments", "add"):    (issues_comments_add, [ARG_ISSUE, ARG_TEXT]),
     ("issues", "links", "add"):        (issues_links_add, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
+    ("issues", "links", "remove"):     (issues_links_remove, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
     ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("articles", "get"):              (articles_get, [ARG_ARTICLE]),
     ("articles", "create"):           (articles_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,

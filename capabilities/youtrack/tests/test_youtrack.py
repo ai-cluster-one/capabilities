@@ -1021,6 +1021,40 @@ def test_links_add_is_a_write_verb():
     assert "issues links add" in _write_verbs()
 
 
+def test_links_remove_resolves_the_internal_target_id(tmp_path, link_handler):
+    # Measured asymmetry: POST accepts a readable key, DELETE demands the
+    # internal id and 404s on a readable one. So remove pays a resolution GET.
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "remove", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 0, result.stderr
+    deletes = [r for r in link_handler.requests if r[0] == "DELETE"]
+    assert len(deletes) == 1
+    assert deletes[0][1].endswith("/links/137-3t/issues/2-99")
+
+
+def test_links_remove_retranslates_the_missing_link_404(tmp_path):
+    class NoSuchLinkHandler(_LinkHandler):
+        requests = []
+        slots = None
+
+        def do_DELETE(self):
+            self.__class__.requests.append(("DELETE", self.path, None))
+            # Measured: the message names the *target issue*, which exists.
+            self._reply({"error": "Not Found", "error_description":
+                         "Entity with id 2-99 not found"}, 404)
+
+    NoSuchLinkHandler.requests = []
+    NoSuchLinkHandler.slots = _link_slots_with_ids()
+    with serve(NoSuchLinkHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "remove", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 3
+    # Must blame the link, not the issue: the issue in YouTrack's message exists.
+    assert "subtask of" in result.stderr
+    assert "link" in result.stderr.lower()
+
+
 def test_issues_search_emits_same_fields_shape(tmp_path):
     CustomFieldsHandler.requests = []
     with serve(CustomFieldsHandler) as base:
