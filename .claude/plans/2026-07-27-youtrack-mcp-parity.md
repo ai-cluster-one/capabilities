@@ -523,6 +523,26 @@ Design approved 2026-07-28. **All experiments are confined to the ION project; I
 
 **Done when:** an agent can assign to a person it looked up, file a Sub-Task linked to its parent, and page a full sprint without truncation. **All three are demonstrable on ION** — link types are instance-global and paging is project-independent, so unlike M2's acceptance criterion this one is not blocked by the ION-only constraint.
 
+### ✅ M3 verified live against ION — 2026-07-28
+
+Exercised through the installed CLI on two throwaway ION issues (ION-1437, ION-1438), both deleted afterwards and confirmed gone (`GET` → 404).
+
+| Check | Result |
+|---|---|
+| `issues links add --type "subtask of"` | ✅ exit 0; **reciprocity through the CLI** — `subtask of → ION-1438` on one side, `parent for → ION-1437` on the other |
+| `issues links remove` | ✅ exit 0; both sides cleared, and the `links` key is absent (not `[]`) when an issue has none |
+| Undirected type (`relates to`) | ✅ renders as `relates to` on **both** sides — confirms `_link_phrase` never consults the empty `targetToSource` on a `BOTH` link, the one regression the read shaper could plausibly have |
+| Self-link refused | ✅ exit **6**, no request sent |
+| Unknown phrase (`subtask off`) | ✅ exit **6**, hint `did you mean: subtask of?` |
+| Remove a link that is not there | ✅ exit **3**, `ION-1437 has no 'relates to' link to ION-1438` — blames the link, not the issue |
+| Nonexistent target | ✅ exit **3**, `no issue named 'ION-99999'` |
+| `--limit 2` / `--limit 2 --offset 2` | ✅ `has_more: true` on both, and page 2 returns different keys — real paging, not a repeated first page |
+| `--select idReadable,fields.State` | ✅ trims to exactly those keys inside the envelope |
+| `--offset -1`, `--select idReadabel` | ✅ exit **6** each |
+| `users find royz` | ✅ returns `s.royz` in the envelope |
+
+**Still unproven, and now unprovable under the ION-only constraint:** exit **7** for a workflow-rule rejection of a link. No link rule fired on ION, and whether one exists on IONDEV cannot be asked. Tag: **UNTESTED** — do not claim exit 7 coverage for links.
+
 ## M4 — Long tail — ⬜ OUTSTANDING
 
 Fill on demand, not speculatively: `articles search` · `articles update --parent` · `projects get` · `issues tags` · `issues work` · `searches list` · `groups find` + `groups members` · `permittedUsers`/`permittedGroups` visibility on comments and articles.
