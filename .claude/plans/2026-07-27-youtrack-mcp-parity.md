@@ -579,6 +579,26 @@ An unrestricted comment reads back `visibility: {"$type": "UnlimitedVisibility"}
 
 **Done when:** parity is **20 of 23**, with only `manage_issue_tags` and `log_work` outstanding, and no list verb truncates without saying so.
 
+### ✅ M4a verified live against ION — 2026-07-28
+
+Exercised through the installed CLI. The one throwaway issue (ION-1440) was deleted afterwards and confirmed gone (`GET` → 404).
+
+| Check | Result |
+|---|---|
+| `groups find Team --limit 3` | ✅ envelope, `has_more: true`; returned `ION Team` id `531-0` — the id the visibility flag needs |
+| `groups members 531-0 --limit 4` | ✅ envelope, 4 of 11 members, `has_more: true` |
+| `projects get 0-1` | ✅ **no envelope** (`items` absent), `shortName: ION`, `leader: s.royz`, `archived: false` |
+| `searches list --limit 3` | ✅ envelope with queries (`for: me`, `by: me`, `commenter: me`) |
+| `articles search "summary: DWH"` | ✅ 1 hit (`IONDEV-A-36`) — matches the measured field-scoped behaviour |
+| `articles search "DWH"` | ✅ 3 hits — full-text, matching the measured behaviour |
+| `projects find --limit 2` / `--offset 2` | ✅ page 1 `IONDEV, IES`; page 2 `INC, ION` — real paging, and the verb no longer truncates silently |
+| `comments add --permitted-groups "ION Team"` | ✅ the **name resolved to id `531-0`** and applied; reads back `LimitedVisibility` |
+| `comments add --permitted-users s.royz` | ✅ login passed through; reads back `LimitedVisibility` |
+| `comments add` with neither flag | ✅ reads back `UnlimitedVisibility` — no `visibility` key was sent |
+| `comments add --permitted-groups "ION Teem"` | ✅ exit **6**, `did you mean: ION Team, IES Team?`, **and nothing written** — the comment count stayed at 3 after two typo attempts, not 5 |
+
+**The group name→id resolution is the load-bearing result here.** `permittedGroups` rejects a name, so without it the flag could not accept the group name a caller actually knows.
+
 ## M4b — Tags and work items — ⬜ AFTER M4a
 
 Group C. The last two MCP gaps, and the only ones with unmeasured behaviour. **Both are probeable on ION — confirmed 2026-07-28 by reading the live instance**, so unlike M2's Group 1 this milestone is not blocked by the ION-only constraint.
