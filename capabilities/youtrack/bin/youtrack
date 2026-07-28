@@ -63,17 +63,18 @@ Read:
   youtrack projects fields get ID NAME       One field's schema; NAME matches
                                              case-insensitively.
   youtrack issues get ISSUE                  Read one issue (ID or URL).
-  youtrack issues search QUERY [--limit N]   Search issues server-side using
+  youtrack issues search QUERY [--limit N] [--offset N]
+                                             Search issues server-side using
                                              YouTrack query language.
-  youtrack issues comments list ISSUE [--limit N]
+  youtrack issues comments list ISSUE [--limit N] [--offset N]
                                              Read recent comments on an issue.
-  youtrack articles list [--project ID] [--limit N]
+  youtrack articles list [--project ID] [--limit N] [--offset N]
                                              List knowledge-base articles (paged;
                                              --project scopes to one project). This
                                              is a listing, not a full-text search.
   youtrack articles get ID                   Read one article (ID or URL): summary,
                                              content, project, parent/child refs.
-  youtrack articles comments list ID [--limit N]
+  youtrack articles comments list ID [--limit N] [--offset N]
                                              Read recent comments on an article.
 
 Write:
@@ -133,6 +134,10 @@ Global options accepted anywhere:
   --token-env KEY                            Select the env key holding the token.
 
 Text arguments accept inline text, a readable file path, or `-` for stdin.
+Every verb that takes --limit returns {"items": [...], "has_more": bool}
+rather than a bare array. has_more is true when the server had more rows
+than --limit; page on with --offset. This is how a sprint rollup detects
+that it was cut short instead of quietly reporting a partial total.
 Success is JSON on stdout. Errors are JSON on stderr. Exit codes: 0 success,
 2 auth/config, 3 not found, 4 policy refusal (this connection is read-only),
 5 network/server, 6 input, 7 a YouTrack workflow rule rejected the change.
@@ -1363,17 +1368,15 @@ def issues_update(c, a):
 
 
 def issues_search(c, a):
-    _positive_limit(a.limit)
-    result = _request(c, "GET", "/issues",
-                      params={"fields": ISSUE_SEARCH_FIELDS, "query": a.query,
-                              "$top": a.limit})
-    return [_flatten_custom_fields(i) for i in result]
+    rows = _request(c, "GET", "/issues",
+                    params={**_page_params(a, ISSUE_SEARCH_FIELDS),
+                            "query": a.query})
+    return _paged([_flatten_custom_fields(i) for i in rows], a.limit)
 
 
 def issues_comments_list(c, a):
-    _positive_limit(a.limit)
-    return _request(c, "GET", f"/issues/{_issue_ref(a.issue)}/comments",
-                    params={"fields": COMMENT_FIELDS, "$top": a.limit})
+    return _paged(_request(c, "GET", f"/issues/{_issue_ref(a.issue)}/comments",
+                           params=_page_params(a, COMMENT_FIELDS)), a.limit)
 
 
 def issues_comments_add(c, a):
@@ -1391,10 +1394,9 @@ def _article_ref(value):
 
 
 def articles_list(c, a):
-    _positive_limit(a.limit)
     path = f"/admin/projects/{a.project}/articles" if a.project else "/articles"
-    return _request(c, "GET", path,
-                    params={"fields": ARTICLE_LIST_FIELDS, "$top": a.limit})
+    return _paged(_request(c, "GET", path,
+                           params=_page_params(a, ARTICLE_LIST_FIELDS)), a.limit)
 
 
 def articles_get(c, a):
@@ -1403,9 +1405,8 @@ def articles_get(c, a):
 
 
 def articles_comments_list(c, a):
-    _positive_limit(a.limit)
-    return _request(c, "GET", f"/articles/{_article_ref(a.article)}/comments",
-                    params={"fields": ARTICLE_COMMENT_FIELDS, "$top": a.limit})
+    return _paged(_request(c, "GET", f"/articles/{_article_ref(a.article)}/comments",
+                           params=_page_params(a, ARTICLE_COMMENT_FIELDS)), a.limit)
 
 
 def articles_comments_add(c, a):
@@ -1484,21 +1485,21 @@ COMMANDS = {
     ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
     ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
     ("issues", "get"):                (issues_get, [ARG_ISSUE]),
-    ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100]),
+    ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100, ARG_OFFSET]),
     ("issues", "create"):             (issues_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
                                                        ARG_DESCRIPTION, ARG_FIELD,
                                                        ARG_FIELDS, ARG_DRAFT]),
     ("issues", "update"):             (issues_update, [ARG_ISSUE, ARG_FIELD, ARG_FIELDS,
                                                        ARG_SUMMARY_OPT, ARG_DESCRIPTION]),
-    ("issues", "comments", "list"):   (issues_comments_list, [ARG_ISSUE, ARG_LIMIT50]),
+    ("issues", "comments", "list"):   (issues_comments_list, [ARG_ISSUE, ARG_LIMIT50, ARG_OFFSET]),
     ("issues", "comments", "add"):    (issues_comments_add, [ARG_ISSUE, ARG_TEXT]),
-    ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100]),
+    ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("articles", "get"):              (articles_get, [ARG_ARTICLE]),
     ("articles", "create"):           (articles_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
                                                          ARG_CONTENT, ARG_PARENT]),
     ("articles", "update"):           (articles_update, [ARG_ARTICLE, ARG_SUMMARY_OPT,
                                                          ARG_CONTENT]),
-    ("articles", "comments", "list"): (articles_comments_list, [ARG_ARTICLE, ARG_LIMIT50]),
+    ("articles", "comments", "list"): (articles_comments_list, [ARG_ARTICLE, ARG_LIMIT50, ARG_OFFSET]),
     ("articles", "comments", "add"):  (articles_comments_add, [ARG_ARTICLE, ARG_TEXT]),
 }
 

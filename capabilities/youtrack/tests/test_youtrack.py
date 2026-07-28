@@ -133,6 +133,28 @@ def serve(handler_cls):
         thread.join()
 
 
+def _paging_handler(rows):
+    class PagingHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            top = int(query["$top"][0])
+            body = json.dumps(rows[:top]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    PagingHandler.requests = []
+    return PagingHandler
+
+
 def test_users_me_smoke(tmp_path):
     class UsersMeHandler(BaseHTTPRequestHandler):
         requests = []
@@ -197,6 +219,53 @@ def test_users_find_rejects_negative_offset(tmp_path):
         result = run_cli(tmp_path, base, "users", "find", "x", "--offset", "-1")
     assert result.returncode == 6
     assert "offset" in result.stderr
+
+
+def test_search_reports_has_more_false_at_exactly_limit(tmp_path):
+    rows = [{"idReadable": f"DEMO-{n}", "summary": "s"} for n in range(2)]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--limit", "2")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 2
+    assert payload["has_more"] is False
+
+
+def test_search_reports_has_more_true_and_trims_to_limit(tmp_path):
+    rows = [{"idReadable": f"DEMO-{n}", "summary": "s"} for n in range(5)]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--limit", "2")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 2, "the extra probe row must not be emitted"
+    assert payload["has_more"] is True
+    assert [i["idReadable"] for i in payload["items"]] == ["DEMO-0", "DEMO-1"]
+
+
+def test_comments_list_sends_skip_and_envelopes(tmp_path):
+    rows = [{"id": "4-1", "text": "hi"}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "list", "DEMO-1",
+                         "--limit", "10", "--offset", "20")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert query["$skip"] == ["20"]
+    assert query["$top"] == ["11"]
+    assert json.loads(result.stdout)["has_more"] is False
+
+
+def test_offset_zero_is_omitted_from_the_request(tmp_path):
+    handler = _paging_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert "$skip" not in query
 
 
 def test_projects_find_smoke(tmp_path):
@@ -423,10 +492,11 @@ def test_issues_comments_list_smoke(tmp_path):
         result = run_cli(tmp_path, base_url, "issues", "comments", "list", "DEMO-1", "--limit", "5")
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)[0]["text"] == "A note"
+    assert json.loads(result.stdout)["items"][0]["text"] == "A note"
     assert IssueCommentsHandler.requests[0].startswith("/api/issues/DEMO-1/comments?")
-    assert ("$top=5" in IssueCommentsHandler.requests[0]
-            or "%24top=5" in IssueCommentsHandler.requests[0])
+    # $top is limit + 1 (6), not limit (5): the extra row makes truncation detectable.
+    assert ("$top=6" in IssueCommentsHandler.requests[0]
+            or "%24top=6" in IssueCommentsHandler.requests[0])
 
 
 def test_create_and_comment_payloads(tmp_path):
@@ -552,7 +622,7 @@ def test_issues_http_request_and_parsing(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert default_result.returncode == 0, default_result.stderr
-    parsed = json.loads(result.stdout)
+    parsed = json.loads(result.stdout)["items"]
     assert len(parsed) == 2
     assert parsed[0]["idReadable"] == "DEMO-1"
     assert parsed[0]["fields"]["State"] == "Open"
@@ -560,9 +630,11 @@ def test_issues_http_request_and_parsing(tmp_path):
     assert parsed[1]["idReadable"] == "DEMO-2"
     assert parsed[1]["fields"]["State"] == "In Progress"
     assert "query=state%3AOpen" in IssuesHandler.requests[0][1]
-    assert "$top=10" in IssuesHandler.requests[0][1] or "%24top=10" in IssuesHandler.requests[0][1]
+    # $top is limit + 1 (11), not limit (10): the extra row makes truncation detectable.
+    assert "$top=11" in IssuesHandler.requests[0][1] or "%24top=11" in IssuesHandler.requests[0][1]
     assert "customFields=State" not in IssuesHandler.requests[0][1]
-    assert "$top=100" in IssuesHandler.requests[1][1] or "%24top=100" in IssuesHandler.requests[1][1]
+    # default --limit is 100, so $top is 101 for the same reason.
+    assert "$top=101" in IssuesHandler.requests[1][1] or "%24top=101" in IssuesHandler.requests[1][1]
 
 
 ISSUE_WITH_FIELDS = {
@@ -660,7 +732,7 @@ def test_issues_search_emits_same_fields_shape(tmp_path):
     with serve(CustomFieldsHandler) as base:
         result = run_cli(tmp_path, base, "issues", "search", "project: DEMO")
     assert result.returncode == 0, result.stderr
-    row = json.loads(result.stdout)[0]
+    row = json.loads(result.stdout)["items"][0]
     assert row["fields"]["State"] == "Done"
     assert "customFields" not in row
 
@@ -1755,9 +1827,10 @@ def test_articles_list_all_and_by_project(tmp_path):
 
     assert all_res.returncode == 0, all_res.stderr
     assert proj_res.returncode == 0, proj_res.stderr
-    assert json.loads(all_res.stdout)[0]["idReadable"] == "KB-A-1"
+    assert json.loads(all_res.stdout)["items"][0]["idReadable"] == "KB-A-1"
     assert requests[0].startswith("/api/articles?")
-    assert "$top=10" in requests[0] or "%24top=10" in requests[0]
+    # $top is limit + 1 (11), not limit (10): the extra row makes truncation detectable.
+    assert "$top=11" in requests[0] or "%24top=11" in requests[0]
     assert requests[1].startswith("/api/admin/projects/0-6/articles?")
 
 
@@ -1803,7 +1876,7 @@ def test_article_read_and_comments(tmp_path):
     assert json.loads(art.stdout)["content"] == "# Body"
     assert art_url.returncode == 0, art_url.stderr
     assert coms.returncode == 0, coms.stderr
-    assert json.loads(coms.stdout)[0]["text"] == "First note"
+    assert json.loads(coms.stdout)["items"][0]["text"] == "First note"
     assert requests[0].startswith("/api/articles/KB-A-1?")
     assert requests[1].startswith("/api/articles/KB-A-1?")
     assert requests[2].startswith("/api/articles/KB-A-1/comments?")
