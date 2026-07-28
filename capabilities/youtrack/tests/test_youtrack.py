@@ -848,6 +848,179 @@ def test_issues_get_requests_the_links_projection(tmp_path):
     assert "links" not in json.loads(result.stdout)
 
 
+def _link_slots_with_ids():
+    """`_ALL_LINK_SLOTS` plus the measured direction-encoded ids."""
+    ids = ["137-0", "137-1s", "137-1t", "137-2s", "137-2t", "137-3s", "137-3t"]
+    slots = []
+    for link_id, slot in zip(ids, _ALL_LINK_SLOTS):
+        entry = json.loads(json.dumps(slot))
+        entry["id"] = link_id
+        entry["issues"] = []
+        # Measured: Duplicate and Subtask report readOnly true, and both accept
+        # writes. The flag governs editing the type definition, not linking.
+        entry["linkType"]["readOnly"] = entry["linkType"]["name"] in (
+            "Duplicate", "Subtask")
+        slots.append(entry)
+    return slots
+
+
+class _LinkHandler(BaseHTTPRequestHandler):
+    """Serves the link slots for GET, records POST/DELETE."""
+    requests = []
+    slots = None
+
+    def log_message(self, *_args):
+        pass
+
+    def _reply(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, None))
+        # Match on the path only. A substring test would also hit the `links(...)`
+        # projection inside the ?fields= query that issues_get sends.
+        route = urllib.parse.urlparse(self.path).path
+        if route.endswith("/links"):
+            self._reply(self.__class__.slots)
+        elif route.startswith("/api/issues/"):
+            self._reply({"id": "2-99", "idReadable": "DEMO-9"})
+        else:
+            self._reply({"error": "missing"}, 404)
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+        self._reply({"idReadable": "DEMO-9"})
+
+    def do_DELETE(self):
+        self.__class__.requests.append(("DELETE", self.path, None))
+        self._reply({})
+
+
+@pytest.fixture
+def link_handler():
+    _LinkHandler.requests = []
+    _LinkHandler.slots = _link_slots_with_ids()
+    return _LinkHandler
+
+
+@pytest.mark.parametrize("phrase,link_id", [
+    ("relates to", "137-0"),
+    ("is required for", "137-1s"),
+    ("depends on", "137-1t"),
+    ("is duplicated by", "137-2s"),
+    ("duplicates", "137-2t"),
+    ("parent for", "137-3s"),
+    ("subtask of", "137-3t"),
+])
+def test_every_direction_phrase_resolves(tmp_path, link_handler, phrase, link_id):
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", phrase)
+    assert result.returncode == 0, result.stderr
+    posts = [r for r in link_handler.requests if r[0] == "POST"]
+    assert len(posts) == 1
+    assert f"/links/{link_id}/issues" in posts[0][1]
+
+
+def test_readonly_link_type_is_still_writable(tmp_path, link_handler):
+    # Regression guard. `Subtask` reports readOnly true and accepts writes; a
+    # later tidy-up that treats the flag as a gate would disable the one verb
+    # M3 exists to deliver, and every other test would still pass.
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 0, result.stderr
+    assert any(r[0] == "POST" for r in link_handler.requests)
+
+
+def test_phrase_matching_is_case_insensitive(tmp_path, link_handler):
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "SubTask Of")
+    assert result.returncode == 0, result.stderr
+
+
+def test_unknown_phrase_exits_6_with_near_miss(tmp_path, link_handler):
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask off")
+    assert result.returncode == 6
+    assert "subtask of" in result.stderr
+    assert not any(r[0] == "POST" for r in link_handler.requests)
+
+
+def test_ambiguous_phrase_fails_rather_than_picking(tmp_path, link_handler):
+    # Phrase uniqueness is measured on one instance only; a custom link type
+    # could collide. Picking one silently would create the wrong link.
+    slots = _link_slots_with_ids()
+    slots.append({"id": "137-4s", "direction": "OUTWARD",
+                  "linkType": {"name": "Custom", "sourceToTarget": "subtask of",
+                               "targetToSource": "parent of",
+                               "readOnly": False},
+                  "issues": []})
+    _LinkHandler.slots = slots
+    with serve(_LinkHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 6
+    assert "ambiguous" in result.stderr.lower()
+    assert not any(r[0] == "POST" for r in _LinkHandler.requests)
+
+
+def test_self_link_is_refused_without_any_request(tmp_path, link_handler):
+    # Measured: the server returns 200 for a self-link and silently creates
+    # nothing. Asserting the exit code alone would pass for a client that sent
+    # it, so assert that no write left the process.
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-1", "--type", "relates to")
+    assert result.returncode == 6
+    assert "itself" in result.stderr.lower()
+    assert not any(r[0] == "POST" for r in link_handler.requests)
+
+
+def test_links_add_sends_the_readable_key(tmp_path, link_handler):
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in link_handler.requests if r[0] == "POST"][0]
+    assert post[2] == {"idReadable": "DEMO-9"}
+
+
+def test_links_add_translates_a_bad_target(tmp_path):
+    class BadTargetHandler(_LinkHandler):
+        requests = []
+        slots = None
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, None))
+            self._reply({"error": "Bad Request", "error_description":
+                         "YouTrack is unable to locate an Issue-type entity "
+                         "unless its ID is also provided"}, 400)
+
+    BadTargetHandler.requests = []
+    BadTargetHandler.slots = _link_slots_with_ids()
+    with serve(BadTargetHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-404", "--type", "relates to")
+    # The raw message describes an id-format problem, which is not what
+    # happened. Exit 3 naming the target is the honest translation.
+    assert result.returncode == 3
+    assert "DEMO-404" in result.stderr
+
+
+def test_links_add_is_a_write_verb():
+    assert "issues links add" in _write_verbs()
+
+
 def test_issues_search_emits_same_fields_shape(tmp_path):
     CustomFieldsHandler.requests = []
     with serve(CustomFieldsHandler) as base:
