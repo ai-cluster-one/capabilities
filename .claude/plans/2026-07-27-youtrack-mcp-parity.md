@@ -1,6 +1,6 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status:** M1 shipped (PR #14, catalog repair in #15). M2–M4 outstanding. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
+**Status:** M1 shipped (PR #14, catalog repair in #15). **M2 step 0 (write-direction probe) is closed — measured 2026-07-28; results below.** M2 steps 1–5 and M3–M4 outstanding. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
 
 **Base:** `upstream/main` (`ai-cluster-one/capabilities`), which carries the knowledge-base article verbs merged in PR #13. The `zjor/capabilities` fork's `main` runs behind upstream — branch from `upstream/main`, not `origin/main`.
 
@@ -157,21 +157,73 @@ JSON
 | `build[1]` | no | `SingleBuildIssueCustomField` | `{"name": …}` | `name` | Reported In |
 | `period` | no | `PeriodIssueCustomField` | `{"presentation": "1d 4h"}` | `presentation` | Original Estimate |
 | `integer` | no | `SimpleIssueCustomField` | scalar | scalar | Points |
-| `date` | no | `DateIssueCustomField` | epoch ms | epoch ms | Due Date |
-| `date and time` | no | `SimpleIssueCustomField` | epoch ms | epoch ms | Incident Start Time |
+| `date` | no | `DateIssueCustomField` | epoch ms, **noon UTC** | epoch ms (snapped to noon UTC) | Due Date |
+| `date and time` | no | `SimpleIssueCustomField` | epoch ms | epoch ms (verbatim) | Incident Start Time |
 | `text` | no | `TextIssueCustomField` | `{"text": …}` | `text` | Acceptance Criteria |
 
 **The two traps in that table:** `date` maps to `DateIssueCustomField` but `date and time` maps to `SimpleIssueCustomField` — same-looking types, different `$type`. And bundle-backed values carry distinct element types on read (`EnumBundleElement`, `StateBundleElement`, `OwnedBundleElement`, `VersionBundleElement`), all of which flatten by `name`; only users flatten by `login`.
 
 `float` and `string` do not occur in IONDEV; both are expected to be `SimpleIssueCustomField` like `integer`, and are the only rows in this table not directly measured.
 
-**Write direction is not yet proven.** Every shape above is confirmed on read; the write column assumes YouTrack accepts the same shape it emits, which is its documented convention but was not exercised against the live instance (doing so mutates real IONDEV data). M2's first task is to confirm it on a throwaway draft issue before building on it.
+## Write direction — measured 2026-07-28 (M2 step 0, closed)
 
-**Validation is atomic and ahead of the wire.** Every named field and value is checked against the schema *before* any request goes out. Unknown field name → exit `6` naming near-misses. Value outside a bundle → exit `6` listing what is allowed. Never a partial write. Correctness is never delegated to YouTrack, which silently ignores an unrecognized `customFields` entry rather than rejecting it.
+Probed on two throwaway draft issues in IONDEV (`POST /api/users/me/drafts`, `Type=Task` and `Type=Bug`), one write per request so failures stay attributable, each read back and compared. Both drafts deleted afterwards; drafts never receive an `IONDEV-n` id (`idReadable` is `Issue.Draft`) and are invisible to search, so nothing leaked into the project.
 
-**Fields are scoped by issue Type, not just by project — measured.** IONDEV declares 45 project custom fields, but `IONDEV-509` (a Task) carries only 34; the 11 missing are the bug/incident set (`Severity`, `Steps to Reproduce`, `Reported In`, `Incident Start Time`, `Root Cause`, `Blocked Reason`, …), which appear on `IONDEV-974` (a Bug). So the project schema is a *superset*: validating a name against it alone will accept `Severity` on a Task, which YouTrack then silently drops. On update, validate against the fields actually present on the target issue; on create, against the fields the chosen `Type` carries. Report a field that exists in the project but not on this issue with a distinct message — it is a different mistake from a typo.
+**The write column is confirmed as documented for 10 of 14 types**, sending `{"name": <field>, "$type": <issue-side $type>, "value": <write value>}`: `enum[1]`, `enum[*]`, `ownedField[1]`, `user[1]`, `user[*]`, `version[*]`, `period`, `integer`, `text`, and `date and time`. Round-trip is byte-exact for all ten.
 
-**Schema resolution: fetch per invocation, do not cache.** A write costs one extra `GET /admin/projects/{id}/customFields` before the `POST`. One round trip, no invalidation problem, and no manifest change — the capability declares `state: false`, and a schema cache would flip it to `true` and drag in the whole staleness question. Revisit only if the extra GET measurably hurts.
+The other four:
+
+| type | outcome |
+|---|---|
+| `date` | Shape correct, **but the value is normalized** — see below. Not byte-exact on round-trip. |
+| `state[1]` | **Unproven.** Every State *transition* on a draft is rejected by an IONDEV workflow rule (`require_attach_task_to_feature/rule` on Task, a generated `vwe-…` rule on Bug), HTTP 400 `error_type: workflow`. Writing the state it already holds returns 200, so the payload shape parses. Shape stands on the shipped `issues update --state` path, not on this probe. |
+| `version[1]` (Release Window) | **Unmeasurable on IONDEV — the bundle is empty.** No legal value exists to write. Shape inferred from `version[*]`, which shares the bundle type. |
+| `build[1]` (Reported In) | **Unmeasurable — bundle also empty.** Writing a bogus name returns HTTP 400 *from the bundle lookup* (`An nonexistent-build-type entity with the specified name ({1}) was not found`), which proves the `{"name": …}` shape parses and reaches value resolution; only a valid value could not be tested. |
+
+**`date` snaps to 12:00 UTC of the same UTC calendar day.** Measured across four inputs — `00:00Z`, `12:00Z`, `23:59Z`, and `00:26Z` next day — every one read back at noon UTC on its own UTC date, with **no day shift**. Consequences:
+
+- Noon UTC is the canonical form. Send it and the round-trip is exact; send midnight and it is not.
+- **A naive write-then-compare test on a `date` field will fail.** Compare calendar dates, or write noon-UTC values.
+- `date and time` is *not* normalized — it returns exactly what was written. The two date-ish types therefore differ on the write path as well as in `$type`, widening the trap already noted above.
+- **Recommendation for M2:** accept and emit `YYYY-MM-DD` for `date` fields, converting to/from noon UTC internally. Raw epoch ms is a hostile interface for a calendar date, and the normalization makes it actively misleading. Keep epoch ms for `date and time`. The two rows in the marshalling table above now carry this distinction.
+
+**Also established:** `Type` can be set in the same `POST /api/users/me/drafts` call that creates the draft, so `issues create --draft` can be born with its type-scoped field set. `DELETE /api/users/me/drafts/{id}` works and leaves no trace.
+
+**Validation is ahead of the wire — but the reason has changed. Measured 2026-07-28.**
+
+The original rationale here was wrong and is retracted: **YouTrack does not silently ignore a bad `customFields` entry, and it does not write partially.** Measured on a draft:
+
+| bad input | response |
+|---|---|
+| unknown field name | **HTTP 500** `incompatible-issue-custom-field-name-Nonexistent Field` |
+| value outside a bundle | HTTP 400 `An Sideways-type entity with the specified name ({1}) was not found` |
+| wrong `$type` for the field | HTTP 400 `Due to a type mismatch, the value property for entity 143-33 could not be updated` |
+| bug-set field on a Task | HTTP 400 `You can only update the value for the Severity field when the value for the Type field is…` |
+| ISO date string for `date` | HTTP 400 `Incompatible value format for type date` |
+| `"7"` for `integer` | HTTP 400 `Incompatible value format for type integer` |
+
+**Atomicity is already guaranteed by the server.** A batch of two valid fields plus one invalid one returned 400 and left *both* valid fields at their prior values — the server rolled the whole request back. So "never a partial write" needs no client-side enforcement, and pre-flight validation is **not** load-bearing for correctness.
+
+What pre-flight validation is still worth doing for:
+
+1. **Error quality.** The server's messages are unusable by an agent: an unsubstituted `{1}` placeholder where the field name belongs, opaque internal entity ids (`143-33`) instead of field names, and no list of legal values. Near-miss suggestions and allowed-value lists can only come from the schema.
+2. **Exit-code correctness.** An unknown field name — a plain typo — returns **HTTP 500**, which maps to exit `5` (network/server) under this CLI's contract when it is unambiguously exit `6` (input). Without pre-flight, the exit code lies about whose fault it is.
+3. **No wasted mutation risk.** Not correctness, but a rejected write still consumes a round trip and, on a real issue, can fire workflow rules.
+
+**This opens a cheaper design than the plan assumed — decide in M2 step 1.** Because the server validates and rolls back, the schema GET is only needed on the *failure* path:
+
+- **(A) Pre-flight always** — as originally planned: one extra `GET /admin/projects/{id}/customFields` before every write.
+- **(C) Translate on failure** — attempt the write; on 400/500 fetch the schema, and turn the server's message into a named-field, near-miss, allowed-values error with exit `6`. Costs the extra GET only when something is actually wrong, so the happy path is one round trip instead of two.
+
+(C) gets the same agent-facing error quality at strictly lower cost, and the atomicity guarantee is what makes it safe. Prefer it unless pre-flight turns out to be needed for a case not measured here.
+
+**Workflow rules are a distinct failure class.** A write can be rejected by project workflow, not by input validity: HTTP 400 with `error_type: workflow`, `error_rule_name`, and `error_issue_is_draft`. That is neither exit `6` (the input was legal) nor really exit `5`. The CLI must surface `error_rule_name` verbatim — an agent told only "400" cannot tell a typo from a business rule it must satisfy. Decide its exit code in M2.
+
+**Fields are scoped by issue Type, not just by project — measured.** IONDEV declares 45 project custom fields, but `IONDEV-509` (a Task) carries only 34; the 11 missing are the bug/incident set (`Severity`, `Steps to Reproduce`, `Reported In`, `Incident Start Time`, `Root Cause`, `Blocked Reason`, …), which appear on `IONDEV-974` (a Bug). So the project schema is a *superset*: validating a name against it alone will accept `Severity` on a Task. On update, validate against the fields actually present on the target issue; on create, against the fields the chosen `Type` carries. Report a field that exists in the project but not on this issue with a distinct message — it is a different mistake from a typo.
+
+Two corrections from the 2026-07-28 probe. First, **YouTrack enforces type scoping rather than silently dropping** an out-of-scope field: writing `Severity` to a Task draft returns HTTP 400 `You can only update the value for the Severity field when the value for the Type field is…`. The client-side check is therefore for message quality, not to prevent silent data loss. Second, the draft field counts are **32 on a Task and 40 on a Bug**, against 34 for `IONDEV-509`; the superset relationship holds, but the exact count is not a fixed property of the Type, so validation must read the field set off the target issue (or the freshly created draft) rather than assume a per-Type count.
+
+**Schema resolution: fetch per invocation, do not cache.** No invalidation problem, and no manifest change — the capability declares `state: false`, and a schema cache would flip it to `true` and drag in the whole staleness question. Under option (A) a write costs one extra `GET /admin/projects/{id}/customFields` before the `POST`; under (C) that GET happens only on the failure path. Either way it is never cached across invocations.
 
 **Write gating.** Every new write path respects `allow_write`, per the standard.
 
@@ -280,12 +332,12 @@ The type model is already confirmed: `GET /admin/projects/{id}/customFields?fiel
 
 The milestone that makes the capability usable, and the only one with real design risk.
 
-0. **Prove the write direction first**, on a throwaway draft issue: one write per `$type` in the marshalling table, read back, compare. Everything else in M2 builds on that table being right.
-1. `issues update` with `--field` / `--fields`, plus `--summary` / `--description` (today impossible outside the web UI).
+0. ~~**Prove the write direction first**, on a throwaway draft issue: one write per `$type` in the marshalling table, read back, compare.~~ **✅ Done 2026-07-28** — see "Write direction — measured" above. 10 of 14 types confirmed byte-exact; `date` confirmed with a normalization rule; `state[1]`, `version[1]`, `build[1]` unprovable on IONDEV for reasons recorded there. Two of the plan's premises (silent-ignore, client-side atomicity) were disproved and have been rewritten.
+1. `issues update` with `--field` / `--fields`, plus `--summary` / `--description` (today impossible outside the web UI). **Decide (A) pre-flight vs (C) translate-on-failure here** — see Field semantics; (C) is the recommendation.
 2. `issues create` on the same marshalling path, so an issue can be born sprint-ready in one call.
-3. Type-aware marshalling per the table above, replacing the hardcoded `{"name": "State", "$type": "StateIssueCustomField", …}`.
-4. Atomic pre-flight validation with near-miss and allowed-value errors.
-5. `issues create --draft`.
+3. Type-aware marshalling per the table above, replacing the hardcoded `{"name": "State", "$type": "StateIssueCustomField", …}`. Includes the `date` ↔ `YYYY-MM-DD` conversion and the `date`/`date and time` split.
+4. Schema-backed error translation with near-miss and allowed-value messages, and distinct handling for `error_type: workflow` rejections.
+5. `issues create --draft`, via `POST /api/users/me/drafts` with `Type` in the create payload.
 
 **Done when:** one `issues create` call produces an IONDEV issue satisfying the consumer's Ready-for-Sprint rules, and `issues update --field` moves each afterwards.
 
@@ -328,10 +380,14 @@ The reliable way to regenerate it — the hash covers `capabilities/<name>/` rec
 
 `tests/test_youtrack.py` covers the existing verbs; extend per milestone. Four tests are load-bearing:
 
-- **One per field type** in the marshalling table — the one place a wrong constant produces a plausible-looking request that YouTrack rejects or, worse, silently drops.
+- **One per field type** in the marshalling table — the one place a wrong constant produces a plausible-looking request that YouTrack rejects. Assert the exact request body per type; the measured shapes above are the fixtures.
+- **`date` normalization**: writing `2026-08-15` must send noon UTC (`1786795200000`), and reading noon UTC back must render `2026-08-15`. Assert the *calendar date*, never epoch equality across a round trip — and cover `date and time` separately, where epoch equality *does* hold.
 - **The COMMANDS/docstring drift tests** described above.
 - **`WRITE_VERBS ⊆ COMMANDS`** — the two are coupled by stringly-typed joined paths, so a typo silently disables the `allow_write` gate for that verb.
-- **Atomicity**: a create with one invalid field among many issues no HTTP request at all.
+- **Error translation**: a 400 carrying `{1}` and an entity id, and the HTTP **500** for an unknown field name, must both surface as exit `6` naming the field — the 500 mapping is the one most likely to regress into exit `5`.
+- **Workflow rejection**: a 400 with `error_type: workflow` must surface `error_rule_name` and must *not* be reported as an input error.
+
+Dropped from this list: the original client-side atomicity test. The server rolls a mixed-validity batch back on its own (measured), so there is nothing client-side to assert — and under option (C) the request is deliberately sent.
 
 ## Consumer refresh
 
