@@ -19,8 +19,8 @@
 - **Every new write verb must be added to `WRITE_VERBS`, in the same step as its `COMMANDS` row.** An existing test asserts `WRITE_VERBS ⊆ COMMANDS`; adding one without the other turns the suite red. (M3 lost a round to exactly this.)
 - **The module docstring is the single source of truth for the command surface.** Two existing tests fail if it disagrees with `COMMANDS`.
 - **Any payload change requires reindexing `.capability-source/catalog.json` in the same commit** (Task 7). Skipping it left `main` uninstallable after M1.
-- **Run the test suite in the FOREGROUND**, never backgrounded, never via a monitor. It takes ~4 minutes. Every M3 implementer that backgrounded it lost the result and had to be resumed:
-  `cd capabilities/youtrack && python3 -m pytest tests/test_youtrack.py -q 2>&1 | tail -20`
+- **Run the test suite in the foreground, and pass an explicit timeout of at least 300000 ms.** The suite takes ~240s while the default Bash tool timeout is 120s, so **it gets auto-backgrounded regardless of intent** unless the timeout is raised — which is what actually happened to every M3 implementer that appeared to background it deliberately. Command:
+  `cd capabilities/youtrack && python3 -m pytest tests/test_youtrack.py -q 2>&1 | tail -20` with `timeout: 300000`.
 - **Live checks run from `/Users/zjor/projects/ion/agents`, never from the capabilities repo.** The `ionwater` connection lives in that project's envelope and is invisible elsewhere, so a call from the wrong directory silently falls back to a *different YouTrack instance* that also has `allow_write: true`. This has already created stray issues on the wrong server twice. `--connection ionwater` is not a workaround — that connection does not resolve outside the project.
 - **All live experiments use the ION project only. IONDEV must not be touched** (owner decision). Verify `project.shortName == "ION"` on anything created.
 
