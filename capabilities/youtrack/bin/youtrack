@@ -48,7 +48,8 @@ Read:
                                              set is token-scoped, so absence
                                              here does not prove a login is
                                              invalid.
-  youtrack projects find [SUBSTRING]         Projects visible to the token;
+  youtrack projects find [SUBSTRING] [--limit N] [--offset N]
+                                             Projects visible to the token;
                                              optional substring match on name.
   youtrack projects get ID                   One project: name, shortName,
                                              description, archived, leader.
@@ -1381,10 +1382,10 @@ def users_find(c, a):
 
 
 def projects_find(c, a):
-    params = {"fields": PROJECT_FIELDS, "$top": 100}
+    params = _page_params(a, PROJECT_FIELDS)
     if a.substring:
         params["query"] = a.substring
-    return _request(c, "GET", "/admin/projects", params=params)
+    return _paged(_request(c, "GET", "/admin/projects", params=params), a.limit)
 
 
 def projects_get(c, a):
@@ -1849,7 +1850,7 @@ ARG_PERMITTED_GROUPS = (("--permitted-groups",), {"action": "append", "default":
 COMMANDS = {
     ("users", "me"):                  (users_me, []),
     ("users", "find"):                (users_find, [ARG_SUBSTRING_REQ, ARG_LIMIT50, ARG_OFFSET]),
-    ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT]),
+    ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("projects", "get"):              (projects_get, [ARG_PROJECT_POS]),
     ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
     ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),

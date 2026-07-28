@@ -331,9 +331,26 @@ def test_projects_find_smoke(tmp_path):
 
     assert result.returncode == 0, result.stderr
     parsed = json.loads(result.stdout)
-    assert parsed[0]["shortName"] == "DEMO"
+    assert parsed["items"][0]["shortName"] == "DEMO"
     assert ProjectsHandler.requests[0].startswith("/api/admin/projects?")
     assert "query=Demo" in ProjectsHandler.requests[0]
+
+
+def test_projects_find_pages_and_envelopes(tmp_path):
+    rows = [{"id": "0-1", "name": "ION", "shortName": "ION"},
+            {"id": "0-6", "name": "ION Development", "shortName": "IONDEV"}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "projects", "find", "ION",
+                         "--limit", "2", "--offset", "1")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert query["$top"] == ["3"]        # limit + 1, replacing the hardcoded 100
+    assert query["$skip"] == ["1"]
+    assert query["query"] == ["ION"]
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["shortName"] == "ION"
+    assert payload["has_more"] is False
 
 
 def test_groups_find_pages_and_envelopes(tmp_path):
