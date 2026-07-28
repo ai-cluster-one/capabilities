@@ -2414,7 +2414,7 @@ def test_article_create_requires_project(tmp_path):
 def test_article_update_requires_a_field(tmp_path):
     result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "update", "KB-A-9")
     assert result.returncode == 6
-    assert "--summary or --content" in result.stderr
+    assert "--summary, --content or --parent" in result.stderr
 
 
 def test_read_only_connection_refuses_article_create(tmp_path):
@@ -2501,7 +2501,8 @@ def test_article_update_rejects_empty_summary(tmp_path):
     result = run_cli(tmp_path, "http://127.0.0.1:1", "articles", "update",
                      "KB-A-9", "--summary", "")
     assert result.returncode == 6
-    assert "articles update needs a non-empty --summary or --content" in result.stderr
+    assert ("articles update needs a non-empty --summary, --content or --parent"
+            in result.stderr)
 
 
 def test_article_comment_rejects_empty_text(tmp_path):
@@ -2573,3 +2574,106 @@ def test_searches_list_pages_and_envelopes(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["items"][0]["query"] == "for: me"
     assert payload["has_more"] is False
+
+
+def test_articles_search_sends_the_query_to_the_articles_endpoint(tmp_path):
+    rows = [{"idReadable": "IONDEV-A-36", "summary": "DWH (TimeScale)"}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "articles", "search", "summary: DWH",
+                         "--limit", "3")
+    assert result.returncode == 0, result.stderr
+    parsed = urllib.parse.urlparse(handler.requests[0])
+    # Measured: articles search is the same endpoint as articles list, plus query.
+    assert parsed.path == "/api/articles"
+    query = urllib.parse.parse_qs(parsed.query)
+    assert query["query"] == ["summary: DWH"]
+    assert query["$top"] == ["4"]
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["idReadable"] == "IONDEV-A-36"
+    assert payload["has_more"] is False
+
+
+def test_articles_update_reparents(tmp_path):
+    class ReparentHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route.endswith("/A-2"):
+                self._reply({"id": "5-2", "idReadable": "A-2",
+                             "project": {"id": "0-1"}})
+            else:
+                self._reply({"id": "5-1", "idReadable": "A-1",
+                             "project": {"id": "0-1"}})
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+            self._reply({"id": "5-1", "idReadable": "A-1"})
+
+    ReparentHandler.requests = []
+    with serve(ReparentHandler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "A-2")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in ReparentHandler.requests if r[0] == "POST"][0]
+    assert post[2] == {"parentArticle": {"id": "5-2"}}
+
+
+def test_articles_update_refuses_a_cross_project_parent(tmp_path):
+    class CrossProjectHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route.endswith("/A-2"):
+                self._reply({"id": "5-2", "idReadable": "A-2",
+                             "project": {"id": "0-9"}})   # different project
+            else:
+                self._reply({"id": "5-1", "idReadable": "A-1",
+                             "project": {"id": "0-1"}})
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, None))
+            self._reply({})
+
+    CrossProjectHandler.requests = []
+    with serve(CrossProjectHandler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "A-2")
+    assert result.returncode == 6
+    # Same pre-check articles create already performs — must not reach the write.
+    assert not any(r[0] == "POST" for r in CrossProjectHandler.requests)
+
+
+def test_articles_update_still_requires_something_to_change(tmp_path):
+    with serve(Handler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1")
+    assert result.returncode == 6
+    assert "summary" in result.stderr

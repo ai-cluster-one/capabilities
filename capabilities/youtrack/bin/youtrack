@@ -157,8 +157,13 @@ Write:
   youtrack articles create --project ID      Create an article in a project
         --summary S [--content TEXT|-]        (database entity id); optionally give
         [--parent ID|URL]                    a parent article to create a sub-article.
+  youtrack articles search QUERY [--limit N] [--offset N]
+                                             Full-text / query-language search
+                                             over articles. Same endpoint as
+                                             `articles list`, with a query.
   youtrack articles update ID                Update an article's summary and/or
-        [--summary S] [--content TEXT|-]     content. Respects allow_write policy.
+        [--summary S] [--content TEXT|-]     content and/or parent (ID|URL).
+        [--parent ID|URL]                    Respects allow_write policy.
   youtrack articles comments add ID [--text TEXT|-]
                                              Add a comment to an article.
 
@@ -1693,26 +1698,40 @@ def articles_comments_add(c, a):
                     params={"fields": ARTICLE_COMMENT_FIELDS}, json={"text": text})
 
 
+def _parent_article_id(c, parent_ref: str, project_id: str) -> str:
+    """Resolve a parent article reference to its id, refusing a cross-project one.
+
+    Shared by `articles create` and `articles update` so re-parenting cannot
+    develop behaviour that differs from parenting at creation.
+    """
+    parent = _request(c, "GET", f"/articles/{_article_ref(parent_ref)}",
+                      params={"fields": "id,idReadable,project(id)"})
+    parent_id = parent.get("id") if isinstance(parent, dict) else None
+    parent_project = ((parent.get("project") or {}).get("id")
+                      if isinstance(parent, dict) else None)
+    if not parent_id or not parent_project:
+        _die(5, "bad_response",
+             "YouTrack returned a parent article without id/project")
+    if parent_project != project_id:
+        _die(6, "input",
+             f"--parent belongs to project {parent_project!r}, not {project_id!r}")
+    return parent_id
+
+
 def articles_create(c, a):
     body = {"summary": a.summary, "project": {"id": a.project}}
     if a.content is not None:
         body["content"] = _read_text(a.content)
     if a.parent:
-        parent_article = _request(
-            c, "GET", f"/articles/{_article_ref(a.parent)}",
-            params={"fields": "id,idReadable,project(id)"})
-        parent_id = parent_article.get("id") if isinstance(parent_article, dict) else None
-        parent_project = ((parent_article.get("project") or {}).get("id")
-                          if isinstance(parent_article, dict) else None)
-        if not parent_id or not parent_project:
-            _die(5, "bad_response",
-                 "YouTrack returned a parent article without id/project")
-        if parent_project != a.project:
-            _die(6, "input",
-                 f"--parent belongs to project {parent_project!r}, not {a.project!r}")
-        body["parentArticle"] = {"id": parent_id}
+        body["parentArticle"] = {"id": _parent_article_id(c, a.parent, a.project)}
     return _request(c, "POST", "/articles",
                     params={"fields": ARTICLE_FIELDS}, json=body)
+
+
+def articles_search(c, a):
+    params = _page_params(a, ARTICLE_LIST_FIELDS)
+    params["query"] = a.query
+    return _paged(_request(c, "GET", "/articles", params=params), a.limit)
 
 
 def articles_update(c, a):
@@ -1720,13 +1739,24 @@ def articles_update(c, a):
     content = _read_text(a.content) if a.content is not None else None
     if content is not None and not content.strip():
         content = None
-    if summary is None and content is None:
-        _die(6, "input", "articles update needs a non-empty --summary or --content")
+    if summary is None and content is None and not a.parent:
+        _die(6, "input",
+             "articles update needs a non-empty --summary, --content or --parent")
     body = {}
     if summary is not None:
         body["summary"] = summary
     if content is not None:
         body["content"] = content
+    if a.parent:
+        # The same-project rule is enforced against *this* article's project, so
+        # re-parenting needs one read of the target before the write.
+        target = _request(c, "GET", f"/articles/{_article_ref(a.article)}",
+                          params={"fields": "id,project(id)"})
+        project_id = ((target.get("project") or {}).get("id")
+                      if isinstance(target, dict) else None)
+        if not project_id:
+            _die(5, "bad_response", "YouTrack returned an article without a project")
+        body["parentArticle"] = {"id": _parent_article_id(c, a.parent, project_id)}
     return _request(c, "POST", f"/articles/{_article_ref(a.article)}",
                     params={"fields": ARTICLE_FIELDS}, json=body)
 
@@ -1783,8 +1813,9 @@ COMMANDS = {
     ("articles", "get"):              (articles_get, [ARG_ARTICLE]),
     ("articles", "create"):           (articles_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
                                                          ARG_CONTENT, ARG_PARENT]),
+    ("articles", "search"):           (articles_search, [ARG_QUERY, ARG_LIMIT100, ARG_OFFSET]),
     ("articles", "update"):           (articles_update, [ARG_ARTICLE, ARG_SUMMARY_OPT,
-                                                         ARG_CONTENT]),
+                                                         ARG_CONTENT, ARG_PARENT]),
     ("articles", "comments", "list"): (articles_comments_list, [ARG_ARTICLE, ARG_LIMIT50, ARG_OFFSET]),
     ("articles", "comments", "add"):  (articles_comments_add, [ARG_ARTICLE, ARG_TEXT]),
 }
