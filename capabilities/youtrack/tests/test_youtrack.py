@@ -158,6 +158,47 @@ def test_users_me_smoke(tmp_path):
     assert UsersMeHandler.requests[0].startswith("/api/users/me?")
 
 
+def test_users_find_sends_query_and_paging(tmp_path):
+    class UsersFindHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps([
+                {"id": "1-1", "login": "s.royz", "fullName": "Sergey Royz"},
+                {"id": "1-2", "login": "s.other", "fullName": "Other Person"},
+            ]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    UsersFindHandler.requests = []
+    with serve(UsersFindHandler) as base:
+        result = run_cli(tmp_path, base, "users", "find", "royz",
+                         "--limit", "2", "--offset", "5")
+    assert result.returncode == 0, result.stderr
+    path = UsersFindHandler.requests[0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["query"] == ["royz"]
+    assert query["$top"] == ["3"]          # limit + 1, so truncation is detectable
+    assert query["$skip"] == ["5"]
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["login"] == "s.royz"
+    assert payload["has_more"] is False    # 2 rows returned for limit 2
+
+
+def test_users_find_rejects_negative_offset(tmp_path):
+    with serve(Handler) as base:
+        result = run_cli(tmp_path, base, "users", "find", "x", "--offset", "-1")
+    assert result.returncode == 6
+    assert "offset" in result.stderr
+
+
 def test_projects_find_smoke(tmp_path):
     class ProjectsHandler(BaseHTTPRequestHandler):
         requests = []

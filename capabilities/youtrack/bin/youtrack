@@ -42,6 +42,12 @@ Contract commands:
 
 Read:
   youtrack users me                          Current YouTrack user.
+  youtrack users find SUBSTRING [--limit N] [--offset N]
+                                             Find users by substring across
+                                             login, name and email. The visible
+                                             set is token-scoped, so absence
+                                             here does not prove a login is
+                                             invalid.
   youtrack projects find [SUBSTRING]         Projects visible to the token;
                                              optional substring match on name.
   youtrack projects fields list ID           Custom-field schema for a project:
@@ -828,6 +834,32 @@ def _positive_limit(value: int) -> None:
         _die(6, "input", "--limit must be positive")
 
 
+def _nonnegative_offset(value: int) -> None:
+    if value < 0:
+        _die(6, "input", "--offset cannot be negative")
+
+
+def _page_params(a, fields: str) -> dict:
+    """Paging params that fetch one extra row so truncation is detectable.
+
+    `$top = limit + 1` is deliberate: YouTrack has no total-count field on these
+    endpoints, so the only way to know the caller's page was cut short is to ask
+    for one more row than we intend to return. `_paged` discards it.
+    """
+    _positive_limit(a.limit)
+    _nonnegative_offset(a.offset)
+    params = {"fields": fields, "$top": a.limit + 1}
+    if a.offset:
+        params["$skip"] = a.offset
+    return params
+
+
+def _paged(rows, limit: int) -> dict:
+    """The list envelope: `limit` items, plus whether the server had more."""
+    rows = rows if isinstance(rows, list) else []
+    return {"items": rows[:limit], "has_more": len(rows) > limit}
+
+
 # Read order matters: a User value carries both `login` and `name`, and the
 # login is what writes need. Bundle elements (Enum/State/Owned/Version/Build)
 # carry `name`; text fields `text`; periods `presentation`.
@@ -1201,6 +1233,12 @@ def users_me(c, a):
     return _request(c, "GET", "/users/me", params={"fields": USER_FIELDS})
 
 
+def users_find(c, a):
+    params = _page_params(a, USER_FIELDS)
+    params["query"] = a.substring
+    return _paged(_request(c, "GET", "/users", params=params), a.limit)
+
+
 def projects_find(c, a):
     params = {"fields": PROJECT_FIELDS, "$top": 100}
     if a.substring:
@@ -1420,6 +1458,8 @@ ARG_ISSUE         = (("issue",), {})
 ARG_ARTICLE       = (("article",), {})
 ARG_QUERY         = (("query",), {})
 ARG_SUBSTRING_OPT = (("substring",), {"nargs": "?", "default": None})
+ARG_SUBSTRING_REQ = (("substring",), {})
+ARG_OFFSET        = (("--offset",), {"type": int, "default": 0})
 ARG_LIMIT50       = (("--limit",), {"type": int, "default": 50})
 ARG_LIMIT100      = (("--limit",), {"type": int, "default": 100})
 ARG_PROJECT_REQ   = (("--project",), {"required": True})
@@ -1439,6 +1479,7 @@ ARG_DRAFT         = (("--draft",), {"action": "store_true"})
 
 COMMANDS = {
     ("users", "me"):                  (users_me, []),
+    ("users", "find"):                (users_find, [ARG_SUBSTRING_REQ, ARG_LIMIT50, ARG_OFFSET]),
     ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT]),
     ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
     ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
