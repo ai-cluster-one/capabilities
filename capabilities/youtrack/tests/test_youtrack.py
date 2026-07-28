@@ -1178,6 +1178,207 @@ def test_links_remove_self_link_is_refused_without_any_request(tmp_path, link_ha
     assert link_handler.requests == []
 
 
+_TAGS = [{"id": "6-3", "name": "Question", "owner": {"login": "s.royz"}},
+         {"id": "6-11", "name": "DevOps", "owner": {"login": "s.royz"}},
+         {"id": "6-31", "name": "Data Team", "owner": {"login": "k.shmidt"}}]
+
+
+def _tag_handler(tags=None, *, delete_status=200, delete_body=None,
+                 issue_tags=None):
+    """Serves /issueTags for name->id resolution, the tag write, and issues get."""
+    tags = _TAGS if tags is None else tags
+
+    class TagHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = b"" if payload is None else json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route == "/api/issueTags":
+                self._reply(tags)
+            else:                                   # the issues get read-back
+                self._reply({"idReadable": "DEMO-1", "summary": "s",
+                             "tags": issue_tags if issue_tags is not None
+                                     else [{"id": "6-3", "name": "Question"}]})
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+            self._reply({"id": "6-3", "name": "Question"})
+
+        def do_DELETE(self):
+            self.__class__.requests.append(("DELETE", self.path, None))
+            self._reply(delete_body, delete_status)
+
+    TagHandler.requests = []
+    return TagHandler
+
+
+def test_tags_add_resolves_the_name_to_an_id(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Data Team")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert urllib.parse.urlparse(post[1]).path == "/api/issues/DEMO-1/tags"
+    # Measured: the tag write rejects a name and takes only an id.
+    assert post[2] == {"id": "6-31"}
+
+
+def test_tags_add_matches_the_name_case_insensitively(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "devops")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2] == {"id": "6-11"}
+
+
+def test_tags_add_never_sends_a_name_alongside_the_id(tmp_path):
+    """Measured: with both, the id wins and the name is silently ignored."""
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Question")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert "name" not in post[2]
+
+
+def test_tags_add_never_writes_the_issue_level_tags_array(tmp_path):
+    """Measured: POST /issues/{id} with a tags array REPLACES the tag set and
+    wiped two tags the caller never named. Only the additive sub-resource is
+    acceptable, so no POST may target the issue itself."""
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Question")
+    assert result.returncode == 0, result.stderr
+    for method, path, body in handler.requests:
+        if method == "POST":
+            assert urllib.parse.urlparse(path).path.endswith("/tags")
+            assert "tags" not in (body or {})
+
+
+def test_tags_unknown_name_exits_6_with_near_miss_and_no_write(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Questin")
+    assert result.returncode == 6
+    assert "Question" in result.stderr, "must offer the near-miss"
+    # The server returns the same 400 for a typo as for a name-instead-of-id,
+    # so the refusal has to happen here, before any write.
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_tags_unknown_name_does_not_claim_the_tag_does_not_exist(tmp_path):
+    """A tag private to another user is invisible to this token and
+    indistinguishable from a typo, so the message must not overclaim."""
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Secret")
+    assert result.returncode == 6
+    assert "visible" in result.stderr.lower()
+
+
+def test_tags_ambiguous_name_is_refused_not_guessed(tmp_path):
+    collide = [{"id": "6-3", "name": "Shared", "owner": {"login": "s.royz"}},
+               {"id": "6-9", "name": "Shared", "owner": {"login": "k.shmidt"}}]
+    handler = _tag_handler(collide)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Shared")
+    assert result.returncode == 6
+    assert "ambiguous" in result.stderr.lower()
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_tags_remove_deletes_by_resolved_id(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "remove", "DEMO-1",
+                         "Data Team")
+    assert result.returncode == 0, result.stderr
+    delete = [r for r in handler.requests if r[0] == "DELETE"][0]
+    assert urllib.parse.urlparse(delete[1]).path == "/api/issues/DEMO-1/tags/6-31"
+
+
+def test_tags_remove_of_a_tag_the_issue_lacks_blames_the_tag(tmp_path):
+    """Measured: that 404's message names the TAG, which exists — passing it
+    through would say the tag is missing when the issue merely lacks it."""
+    handler = _tag_handler(delete_status=404,
+                           delete_body={"error": "Not Found",
+                                        "error_description":
+                                            "Entity with id 6-31 not found"})
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "remove", "DEMO-1",
+                         "Data Team")
+    assert result.returncode == 3
+    assert "Data Team" in result.stderr
+    assert "DEMO-1" in result.stderr
+
+
+def test_tags_remove_of_an_unknown_issue_is_not_reported_as_a_missing_tag(tmp_path):
+    """The same status, a different message: this 404 names the ISSUE."""
+    handler = _tag_handler(delete_status=404,
+                           delete_body={"error": "Not Found",
+                                        "error_description":
+                                            "Entity with id DEMO-1 not found"})
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "remove", "DEMO-1",
+                         "Data Team")
+    assert result.returncode == 3
+    assert "has no" not in result.stderr, \
+        "must not blame the tag when the issue is what is missing"
+
+
+def test_issues_get_flattens_tags_to_names(tmp_path):
+    handler = _tag_handler(issue_tags=[{"id": "6-3", "name": "Question"},
+                                       {"id": "6-11", "name": "DevOps"}])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["tags"] == ["Question", "DevOps"]
+
+
+def test_issues_get_omits_the_tags_key_when_there_are_none(tmp_path):
+    """Matches _flatten_links, which omits `links` rather than emitting []."""
+    handler = _tag_handler(issue_tags=[])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    assert "tags" not in json.loads(result.stdout)
+
+
+def test_issue_fields_projection_requests_tags(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    path = [r[1] for r in handler.requests if r[0] == "GET"][0]
+    assert "tags(" in urllib.parse.unquote(path)
+
+
+def test_tag_write_verbs_are_gated(tmp_path):
+    verbs = _write_verbs()
+    assert "issues tags add" in verbs
+    assert "issues tags remove" in verbs
+
+
 def test_bare_404_at_a_write_still_exits_3_via_the_generic_mapping(tmp_path):
     # Pins the property the `on_error`-before-hardcoded-404 reorder in
     # `_request` relies on: a verb that passes `on_error` must still exit 3 on

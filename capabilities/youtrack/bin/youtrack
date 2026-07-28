@@ -162,6 +162,17 @@ Write:
                                              Remove a link. Not idempotent:
                                              removing a link that is not there
                                              exits 3.
+  youtrack issues tags add ISSUE TAG         Tag an issue. TAG is the tag name;
+  youtrack issues tags remove ISSUE TAG      it is resolved to an id here
+                                             because YouTrack's tag endpoint
+                                             rejects a name. Tags are
+                                             instance-wide, not per project, and
+                                             a tag owned by someone else can be
+                                             applied. A name that is not visible
+                                             to this token exits 6 before any
+                                             write. add is idempotent; removing
+                                             a tag the issue does not carry
+                                             exits 3.
   youtrack articles create --project ID      Create an article in a project
         --summary S [--content TEXT|-]        (database entity id); optionally give
         [--parent ID|URL]                    a parent article to create a sub-article.
@@ -215,6 +226,7 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {"issues create", "issues update", "issues comments add",
                "issues links add", "issues links remove",
+               "issues tags add", "issues tags remove",
                "articles create", "articles update", "articles comments add"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
@@ -878,9 +890,10 @@ _CF_PROJECTION = ("customFields(id,name,$type,"
                   "value(id,name,login,text,minutes,presentation))")
 LINK_PROJECTION = ("links(direction,linkType(name,sourceToTarget,targetToSource),"
                    "issues(idReadable))")
+TAG_FIELDS = "id,name,owner(login)"
 ISSUE_FIELDS = ("id,idReadable,summary,description,created,updated,resolved,"
                 "project(id,name,shortName),reporter(id,login,fullName),"
-                + _CF_PROJECTION + "," + LINK_PROJECTION)
+                + _CF_PROJECTION + "," + LINK_PROJECTION + ",tags(id,name)")
 ISSUE_SEARCH_FIELDS = ("id,idReadable,summary,description," + _CF_PROJECTION)
 COMMENT_FIELDS = ("id,text,created,updated,author(id,login,fullName),"
                   "visibility($type,permittedUsers(login),permittedGroups(id,name))")
@@ -1036,6 +1049,21 @@ def _flatten_links(issue):
             shaped.append({"type": phrase, "issues": targets})
     if shaped:
         issue["links"] = shaped
+    return issue
+
+
+def _flatten_tags(issue):
+    """Reduce tags to their names, dropping the key when there are none.
+
+    Matches _flatten_links: an absent key rather than an empty list, so a
+    consumer handles "no tags" the same way it already handles "no links".
+    """
+    if not isinstance(issue, dict) or "tags" not in issue:
+        return issue
+    names = [t.get("name") for t in (issue.pop("tags") or [])
+             if isinstance(t, dict) and t.get("name")]
+    if names:
+        issue["tags"] = names
     return issue
 
 
@@ -1468,9 +1496,9 @@ def projects_fields_get(c, a):
 
 
 def issues_get(c, a):
-    return _flatten_links(_flatten_custom_fields(
+    return _flatten_tags(_flatten_links(_flatten_custom_fields(
         _request(c, "GET", f"/issues/{_issue_ref(a.issue)}",
-                 params={"fields": ISSUE_FIELDS})))
+                 params={"fields": ISSUE_FIELDS}))))
 
 
 def issues_create(c, a):
@@ -1752,6 +1780,89 @@ def issues_links_remove(c, a):
     return issues_get(c, argparse.Namespace(issue=ref))
 
 
+# ── issues: tags ─────────────────────────────────────────────────────────
+#
+# Measured 2026-07-28, see .claude/plans/2026-07-27-youtrack-mcp-parity.md.
+#
+# The write path takes an id and REJECTS a name — and an unknown name returns
+# the byte-identical 400 — so the name a caller knows has to be resolved here
+# or it cannot be accepted at all. Same shape as permittedGroups.
+#
+# Do NOT implement add/remove as POST /issues/{id} with a `tags` array. That
+# endpoint works, but it REPLACES the whole tag set: measured, it wiped two
+# tags the caller never named. Only the additive sub-resource below is safe.
+
+def _resolve_tag_id(c, name: str) -> str:
+    """A tag name -> its id.
+
+    Fetches /issueTags once with a fixed `$top` and no `query`: the complete
+    visible set is needed both to resolve a name and to notice a duplicate, and
+    a filtered subset cannot show a collision.
+
+    Tag names are not guaranteed unique — 17 distinct on ION, but nothing
+    server-side enforces it — so a collision is refused rather than resolved to
+    whichever row a comprehension kept last, mirroring _resolve_link and
+    _resolve_group_ids.
+    """
+    rows = _request(c, "GET", "/issueTags",
+                    params={"fields": TAG_FIELDS, "$top": 1000})
+    by_name: dict = {}
+    for row in (rows if isinstance(rows, list) else []):
+        if isinstance(row, dict) and row.get("name"):
+            by_name.setdefault(row["name"].casefold(), []).append(row)
+    matches = by_name.get(name.strip().casefold(), [])
+    if len(matches) > 1:
+        _die(6, "ambiguous_tag_name",
+             f"{name!r} is ambiguous on this instance: it names "
+             f"{len(matches)} tags",
+             "rename one of the colliding tags so the name is unique")
+    if not matches or not matches[0].get("id"):
+        known = sorted({r["name"] for lst in by_name.values() for r in lst})
+        near = difflib.get_close_matches(name, known, n=3, cutoff=0.6)
+        hint = (f"did you mean: {', '.join(near)}?" if near
+                else f"tags visible to this token: {', '.join(known)}")
+        # Deliberately "not visible" rather than "does not exist": a tag
+        # private to another user is invisible here and indistinguishable from
+        # a typo, so non-existence is not something this CLI can assert.
+        _die(6, "unknown_tag", f"no tag named {name!r} is visible to this token",
+             hint)
+    return matches[0]["id"]
+
+
+def issues_tags_add(c, a):
+    ref = _issue_ref(a.issue)
+    tag_id = _resolve_tag_id(c, a.tag)
+    # Idempotent server-side (measured), so no pre-check: a second identical
+    # add returns 200 and creates no duplicate.
+    _request(c, "POST", f"/issues/{ref}/tags",
+             params={"fields": "id,name"}, json={"id": tag_id})
+    return issues_get(c, argparse.Namespace(issue=ref))
+
+
+def _missing_tag_error(ref: str, tag: str, tag_id: str):
+    """Retranslate remove's 404 — but only the one that names the tag.
+
+    Measured: removing a tag the issue does not carry returns 404 whose message
+    names the *tag id*, which exists as a tag; an unknown *issue* returns 404
+    naming the issue instead. They are separable only by message content, so
+    this fires on the tag id alone and lets the issue case fall through to the
+    generic not-found mapping.
+    """
+    def on_error(response):
+        if response.status_code == 404 and tag_id in response.text:
+            _die(3, "not_found", f"{ref} has no {tag!r} tag",
+                 "read the issue to see the tags it does have", status=404)
+    return on_error
+
+
+def issues_tags_remove(c, a):
+    ref = _issue_ref(a.issue)
+    tag_id = _resolve_tag_id(c, a.tag)
+    _request(c, "DELETE", f"/issues/{ref}/tags/{tag_id}",
+             on_error=_missing_tag_error(ref, a.tag, tag_id))
+    return issues_get(c, argparse.Namespace(issue=ref))
+
+
 def _article_ref(value):
     value = value.strip()
     match = re.search(r"/articles/([^/?#]+)", value)
@@ -1869,6 +1980,7 @@ ARG_FIELD         = (("--field",), {"action": "append", "default": [],
                                     "metavar": "NAME=VALUE"})
 ARG_FIELDS        = (("--fields",), {"metavar": "JSON|FILE|-"})
 ARG_DRAFT         = (("--draft",), {"action": "store_true"})
+ARG_TAG_POS       = (("tag",), {"metavar": "TAG"})
 ARG_LINK_TO       = (("--to",), {"required": True})
 ARG_LINK_TYPE     = (("--type",), {"required": True, "metavar": "PHRASE"})
 ARG_PERMITTED_USERS  = (("--permitted-users",), {"action": "append", "default": [],
@@ -1899,6 +2011,8 @@ COMMANDS = {
                                                              ARG_PERMITTED_GROUPS]),
     ("issues", "links", "add"):        (issues_links_add, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
     ("issues", "links", "remove"):     (issues_links_remove, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
+    ("issues", "tags", "add"):         (issues_tags_add, [ARG_ISSUE, ARG_TAG_POS]),
+    ("issues", "tags", "remove"):      (issues_tags_remove, [ARG_ISSUE, ARG_TAG_POS]),
     ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("articles", "get"):              (articles_get, [ARG_ARTICLE]),
     ("articles", "create"):           (articles_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
