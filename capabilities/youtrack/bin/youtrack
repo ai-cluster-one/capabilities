@@ -184,7 +184,7 @@ CRED_KEYS = [
      "note": "permanent token (perm:…); alternates via --token-env"},
 ]
 WRITE_VERBS = {"issues create", "issues update", "issues comments add",
-               "issues links add", "issues links remove",
+               "issues links add",
                "articles create", "articles update", "articles comments add"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
