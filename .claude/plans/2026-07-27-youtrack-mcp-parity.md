@@ -1,16 +1,18 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status:** M1 shipped (PR #14, catalog repair in #15). **M2 step 0 (write-direction probe) closed and step 1 (`issues update`) shipped — 2026-07-28.** M2 steps 2–5 and M3–M4 outstanding. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
+**Status:** M1 shipped (PR #14, catalog repair in #15). **M2 step 0 (write-direction probe) closed and step 1 (`issues update`) shipped — 2026-07-28. Step 0 was then extended, same day, to cover the *create* path** (see "Create path — measured"), which settled step 2's and step 5's central premises. **Steps 2 (`issues create`) and 5 (`issues create --draft`) are in implementation**; steps 3–4 and M3–M4 outstanding. This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
 
 **Base:** `upstream/main` (`ai-cluster-one/capabilities`), which carries the knowledge-base article verbs merged in PR #13. The `zjor/capabilities` fork's `main` runs behind upstream — branch from `upstream/main`, not `origin/main`.
 
-**Live-verified against `ion.youtrack.cloud` / IONDEV (project `0-6`, 45 custom fields).** The marshalling and output sections below are measured, not inferred; only the *write* direction remains unproven (see the note there).
+**Live-verified against `ion.youtrack.cloud` — IONDEV (project `0-6`, 45 custom fields) for reads and update-path writes, ION (project `0-1`, 11 custom fields) for create-path writes.** The marshalling and output sections below are measured, not inferred. The *write* direction is measured too — for both verbs — but **not for every type on every verb**: the exact coverage, and the rows that remain inferred or unconfirmed, are recorded under "Write direction" and "Create path" below. Read those before treating any marshalling row as proven.
 
 ## Why
 
 The capability was built issue-and-article shaped: read a task, comment, flip State, author articles. JetBrains' predefined MCP tool set is the surface an agent is now expected to have, and the gap is not evenly spread — it concentrates in **custom fields**, which is where consuming projects keep the material that makes an issue actionable.
 
 The forcing example is the ionwater.io consumer. Its `docs/process/youtrack-field-guide.md` defines ~45 custom fields on the IONDEV project, ~18 required before an issue may enter a sprint (Type, Subsystem, Team, Assignee, Readiness, Priority, Effort Level, Points, Original Estimate, Acceptance Criteria, Definition of Done, …). The capability today **writes exactly one of them** (State) and **reads none** — `ISSUE_FIELDS` omits `customFields` entirely. An agent using this CLI cannot create a sprint-ready issue and cannot check whether an existing one is ready.
+
+**That "~18 required" is a *consumer readiness rule*, not a schema constraint** — it comes from the field guide, and YouTrack knows nothing about it. In the schema sense IONDEV has exactly **4** fields with `canBeEmpty: false`: State, Type, Priority (all single-value) and **Work Category** (`enum[*]`, multi-value) — read live from IONDEV's schema on 2026-07-28. Conflating the consumer's 18 with the schema's 4 is precisely what makes a client-side required-field pre-flight look justified; it is not (see the `canBeEmpty` call-out under "Create path").
 
 A second, smaller problem: the surface is a flat list of unique first-level verbs (`task`, `issues`, `article-create`, `article-comments`). That scales badly — full parity would mean ~30 top-level verbs with no grouping. This design converts it to noun-verb in the same pass.
 
@@ -163,7 +165,7 @@ JSON
 
 **The two traps in that table:** `date` maps to `DateIssueCustomField` but `date and time` maps to `SimpleIssueCustomField` — same-looking types, different `$type`. And bundle-backed values carry distinct element types on read (`EnumBundleElement`, `StateBundleElement`, `OwnedBundleElement`, `VersionBundleElement`), all of which flatten by `name`; only users flatten by `login`.
 
-`float` and `string` do not occur in IONDEV; both are expected to be `SimpleIssueCustomField` like `integer`, and are the only rows in this table not directly measured.
+`float` and `string` do not occur in IONDEV. **`float` is no longer inferred — measured 2026-07-28** on ION's `Story points` field (`fieldType.id: float`): issue-side `$type` is **`SimpleIssueCustomField`**, the write value is a bare scalar, and `3.5` round-trips byte-exact on the create path. A string write is rejected: `"3.5"` → `400` `Incompatible value format for type float`, `error_field: "value"` — exactly parallel to `integer`'s rejection of `"7"`, so `float` needs the same string→number coercion `integer` already gets in `_coerce`, not a special case. **`string` remains inferred**: it occurs on neither project probed, so nothing has been sent for it.
 
 ## Write direction — measured 2026-07-28 (M2 step 0, closed)
 
@@ -171,14 +173,16 @@ Probed on two throwaway draft issues in IONDEV (`POST /api/users/me/drafts`, `Ty
 
 **The write column is confirmed as documented for 10 of 14 types**, sending `{"name": <field>, "$type": <issue-side $type>, "value": <write value>}`: `enum[1]`, `enum[*]`, `ownedField[1]`, `user[1]`, `user[*]`, `version[*]`, `period`, `integer`, `text`, and `date and time`. Round-trip is byte-exact for all ten.
 
-The other four:
+The other four — `state[1]` since resolved by the create-path extension, `version[1]` and `build[1]` **not** resolved and downgraded further:
 
 | type | outcome |
 |---|---|
 | `date` | Shape correct, **but the value is normalized** — see below. Not byte-exact on round-trip. |
-| `state[1]` | **Unproven.** Every State *transition* on a draft is rejected by an IONDEV workflow rule (`require_attach_task_to_feature/rule` on Task, a generated `vwe-…` rule on Bug), HTTP 400 `error_type: workflow`. Writing the state it already holds returns 200, so the payload shape parses. Shape stands on the shipped `issues update --state` path, not on this probe. |
-| `version[1]` (Release Window) | **Unmeasurable on IONDEV — the bundle is empty.** No legal value exists to write. Shape inferred from `version[*]`, which shares the bundle type. |
-| `build[1]` (Reported In) | **Unmeasurable — bundle also empty.** Writing a bogus name returns HTTP 400 *from the bundle lookup* (`An nonexistent-build-type entity with the specified name ({1}) was not found`), which proves the `{"name": …}` shape parses and reaches value resolution; only a valid value could not be tested. |
+| `state[1]` | **Measured 2026-07-28 — on ION.** Set inline at create (`{"name":"Open"}` → read back `{"name":"Open","$type":"StateBundleElement"}`, demonstrably not the `Backlog` default) *and* as a real transition on the numbered issue (→ `In Progress`), and on a draft. So the documented `{"name": …}` / `StateIssueCustomField` shape is confirmed on a real, non-draft issue. **What blocked it on IONDEV was a workflow rule** (`require_attach_task_to_feature/rule` on Task, a generated `vwe-…` rule on Bug; HTTP 400 `error_type: workflow`) — **per-project workflow configuration, not a YouTrack or draft-level limitation.** Scope the claim honestly: measured on ION, still blocked on IONDEV. |
+| `version[1]` (Release Window) | **No successful write on any path, ever — never sent at all.** Bundle empty on IONDEV, so no legal value exists to write; field absent from ION. The shape is *inferred* from `version[*]`, which merely shares the bundle type. Zero write attempts anywhere. |
+| `build[1]` (Reported In) | **No successful write on any path, ever.** Bundle empty on IONDEV; field absent from ION. Writing a bogus name returns HTTP 400 *from the bundle lookup* (`An nonexistent-build-type entity with the specified name ({1}) was not found`), which proves the `{"name": …}` envelope parses and reaches value resolution — but **no valid value has ever been accepted**. |
+
+**Do not read `version[1]` and `build[1]` at the same confidence as the other twelve marshalling rows.** Neither has a confirmed round-trip on `update`, on `create`, or on a draft, and the 2026-07-28 create-path extension did not improve their standing. **No probe can close them**: it is blocked on someone populating the Release Window and Reported In bundles — project configuration, not testing effort.
 
 **`date` snaps to 12:00 UTC of the same UTC calendar day.** Measured across four inputs — `00:00Z`, `12:00Z`, `23:59Z`, and `00:26Z` next day — every one read back at noon UTC on its own UTC date, with **no day shift**. Consequences:
 
@@ -191,7 +195,11 @@ The other four:
 
 **Also established:** `Type` can be set in the same `POST /api/users/me/drafts` call that creates the draft, so `issues create --draft` can be born with its type-scoped field set. `DELETE /api/users/me/drafts/{id}` works and leaves no trace.
 
-**Drafts are not writable through `/issues/{id}`.** A `POST /api/issues/{draftId}` returns **200 and silently applies nothing** — found while trying to verify `issues update` against a draft. Draft writes must go to `/users/me/drafts/{id}`. Worth knowing before `issues create --draft` in step 5: a draft-targeted write that appears to succeed may have done nothing at all.
+**Write drafts through `/users/me/drafts/{id}` — but the original reason for that rule is false. Corrected 2026-07-28.** Step 0 first recorded that "drafts are not writable through `/issues/{id}`", because a `POST /api/issues/{draftId}` on IONDEV returned **200 and silently applied nothing**, and flagged that as the dangerous gotcha to know before step 5. **On ION that endpoint does apply writes.** Measured on a draft (`2-5170`), twice, read back through the drafts path both times: Priority `Minor` → **`Critical`** landed; a summary change plus `Story points=42.5` **both** landed. Three values across two requests, all applied.
+
+Why IONDEV behaved otherwise cannot be determined from ION. The likeliest explanation — **tag: INFERRED, not measured** — is that the step-0 write which "applied nothing" was one IONDEV itself rejected or no-opped for an unrelated reason; the `state[1]` row above records that writing a State a draft already holds returns 200 on IONDEV, which is exactly a 200-with-nothing-applied that is *not* caused by the endpoint.
+
+**The recommendation survives; the justification does not.** Keep draft writes on `/users/me/drafts/{id}`, and always read back. But `POST /api/issues/{draftId}` is **not** a harmless no-op, the old claim must not be relied on as a YouTrack-wide invariant, and **nothing in step 5 may depend on that endpoint doing nothing** — treating a real mutation as inert is the more dangerous of the two errors.
 
 **Validation is ahead of the wire — but the reason has changed. Measured 2026-07-28.**
 
@@ -206,12 +214,12 @@ The original rationale here was wrong and is retracted: **YouTrack does not sile
 | ISO date string for `date` | HTTP 400 `Incompatible value format for type date` |
 | `"7"` for `integer` | HTTP 400 `Incompatible value format for type integer` |
 
-**Atomicity is already guaranteed by the server.** A batch of two valid fields plus one invalid one returned 400 and left *both* valid fields at their prior values — the server rolled the whole request back. So "never a partial write" needs no client-side enforcement, and pre-flight validation is **not** load-bearing for correctness.
+**Atomicity is already guaranteed by the server.** A batch of two valid fields plus one invalid one returned 400 and left *both* valid fields at their prior values — the server rolled the whole request back. So "never a partial write" needs no client-side enforcement, and pre-flight validation is **not** load-bearing for correctness. **On the create path the guarantee is stronger than rollback — no issue is created at all**, so create carries no partial-issue risk whatsoever; see "Create path" below.
 
 What pre-flight validation is still worth doing for:
 
 1. **Error quality.** The server's messages are unusable by an agent: an unsubstituted `{1}` placeholder where the field name belongs, opaque internal entity ids (`143-33`) instead of field names, and no list of legal values. Near-miss suggestions and allowed-value lists can only come from the schema.
-2. **Exit-code correctness.** An unknown field name — a plain typo — returns **HTTP 500**, which maps to exit `5` (network/server) under this CLI's contract when it is unambiguously exit `6` (input). Without pre-flight, the exit code lies about whose fault it is.
+2. **Exit-code correctness.** An unknown field name — a plain typo — returns **HTTP 500**, which maps to exit `5` (network/server) under this CLI's contract when it is unambiguously exit `6` (input). Without pre-flight, the exit code lies about whose fault it is. (Measured on IONDEV only. **Not reproducible on ION** — see Limits under "Create path" — so this mapping rests on that single measurement.)
 3. **No wasted mutation risk.** Not correctness, but a rejected write still consumes a round trip and, on a real issue, can fire workflow rules.
 
 **This opens a cheaper design than the plan assumed — decided in M2 step 1.** Because the server validates and rolls back, the schema GET is only needed on the *failure* path:
@@ -232,7 +240,11 @@ Under this split the project schema is still fetched only on the failure path fo
 
 **Decided in step 1: a new exit code `7`.** Reusing `5` would tell an agent to retry something deterministic, and reusing `4` would conflate a remote rule with the local `allow_write` gate — the caller could no longer tell "my config forbids this" from "YouTrack forbids this". The help contract documents `7` as deterministic and carries the rule name in the error body. This extends the capability's documented exit-code set, which was previously `0/2/3/4/5/6`.
 
-Two consequences for later milestones: a workflow rejection must **not** trigger the failure-path schema fetch (it is not a value problem, and allowed values would misdirect), and `issues create --draft` cannot set State on a draft at all, because IONDEV's rules reject every draft transition.
+Two consequences for later milestones: a workflow rejection must **not** trigger the failure-path schema fetch (it is not a value problem, and allowed values would misdirect), and `issues create --draft` must **surface** a workflow rejection when one happens (exit `7`, already designed) rather than pre-emptively refuse to send a field some project might reject.
+
+**Retracted 2026-07-28:** this section previously concluded that "`issues create --draft` cannot set State on a draft at all, because IONDEV's rules reject every draft transition." That is an **IONDEV workflow artifact, not YouTrack behaviour.** On ION, State is settable on a draft at creation and on a numbered issue both at create and as a transition (see `state[1]` above and "Create path" below). **Step 5 must not hard-code a refusal to set State on drafts.**
+
+**The exit-`7` path itself was not re-exercised by the create-path extension.** No ION workflow rule fired on any write there, so no rejection could be observed; the exit-`7` design still rests **solely on the original IONDEV measurement**. Tag: UNPROVABLE-HERE on ION (it has no rule that rejects these writes).
 
 **Fields are scoped by issue Type, not just by project — measured.** IONDEV declares 45 project custom fields, but `IONDEV-509` (a Task) carries only 34; the 11 missing are the bug/incident set (`Severity`, `Steps to Reproduce`, `Reported In`, `Incident Start Time`, `Root Cause`, `Blocked Reason`, …), which appear on `IONDEV-974` (a Bug). So the project schema is a *superset*: validating a name against it alone will accept `Severity` on a Task. On update, validate against the fields actually present on the target issue; on create, against the fields the chosen `Type` carries. Report a field that exists in the project but not on this issue with a distinct message — it is a different mistake from a typo.
 
@@ -241,6 +253,70 @@ Two corrections from the 2026-07-28 probe. First, **YouTrack enforces type scopi
 **Schema resolution: fetch per invocation, do not cache.** No invalidation problem, and no manifest change — the capability declares `state: false`, and a schema cache would flip it to `true` and drag in the whole staleness question. Under option (A) a write costs one extra `GET /admin/projects/{id}/customFields` before the `POST`; under (C) that GET happens only on the failure path. Either way it is never cached across invocations.
 
 **Write gating.** Every new write path respects `allow_write`, per the standard.
+
+## Create path — measured 2026-07-28 (M2 step 0, extended)
+
+Step 0's first pass ran on IONDEV drafts and left the *create* verb unproven, which is what put step 2's and step 5's premises at risk. It was extended the same day against **ION (project `0-1`)**: raw HTTP, one write per request so failures stay attributable, **every write read back** — no conclusion here rests on a 2xx alone. 9 numbered issues created and all 9 deleted, each deletion verified by a follow-up `404`; 2 drafts created, one consumed by a promotion (whose resulting issue was itself deleted) and one deleted directly, both verified gone. Final sweeps of `project: ION created: Today`, instance-wide `summary: PROBE`, and `GET /api/users/me/drafts` all returned `[]`. No write of any kind was issued against IONDEV or any other project.
+
+ION carries only 11 custom fields, spanning **7 of the marshalling table's 14 `fieldType.id` values**. That is the ceiling on what this extension could prove — see "Create-path type coverage" below before treating any row as confirmed on create.
+
+**The pivot is positive: `POST /api/issues` accepts `customFields` inline and applies them.** One create carrying `Type`, `Priority` and `Subsystem` (three different types) returned 200 → `ION-1415`, and all three read back landed. So **step 2 needs no draft-then-promote path and no second write to set fields** — its central design premise is sound. Step 5's premise holds too: a single `POST /api/users/me/drafts` carrying six custom fields across five types landed **6 of 6, including State**.
+
+**`$type` is mandatory on create, exactly as on update.** `{"name":"Priority","value":{"name":"Minor"}}` → `400` `$type is required`, and so does `{"name":"Story points","value":3.5}` — a bare scalar for a `float` field, the shape where inference would be most trivially available. There is no inference from value shape at creation. So **`issues create` cannot skip its schema read**: the metadata lookup before the POST is mandatory, not an optimization, and the per-verb lookup table above stands unchanged.
+
+**⚠️ `canBeEmpty: false` does NOT mean required-at-create.** It means *"this field may not be emptied"*. A create omitting **all three** of ION's `canBeEmpty: false` fields returned **200** and the server supplied defaults — State `Backlog`, Type `Task`, Priority `Normal` (plus Assignee `s.royz`, though that field is `canBeEmpty: true`). Consequence: **`issues create` must not implement a client-side required-field pre-flight that refuses to send when a `canBeEmpty: false` field is missing** — it would reject creates YouTrack accepts, making the CLI strictly less useful than raw HTTP. The step-0 framing "pre-flight or rely on the server" resolves to **rely on the server**. A "sprint-ready" completeness check belongs to the consumer's readiness rules and should at most *warn*.
+
+**Scope that claim precisely — one cell of the matrix is open.** What was measured is three `canBeEmpty: false` fields that are all **single-value and bundle-backed** (`state[1]`, `enum[1]`, `enum[1]`). It does **not** establish that YouTrack defaults every required field of every cardinality, and cardinality is exactly the axis the clearing rule above makes load-bearing. IONDEV's fourth required field, **`Work Category` (`enum[*]`, multi-value)**, was never written to — whether a create omitting it gets a default, an empty list, or a 400 is **unmeasured**, because writes were confined to ION. This residual does not undermine the recommendation: three of IONDEV's four required fields are the same shapes measured here and all four are bundle-backed, so a `canBeEmpty`-driven pre-flight would be wrong for at least three of the four however `Work Category` behaves.
+
+**⚠️ The project schema's `$type` is *project-side* and must never be passed through as the write's `$type`.** `GET /api/admin/projects/{id}/customFields` — step 2's own pre-write lookup — reports `SimpleProjectCustomField` for a `date` field and for `float`, whereas the write requires the **issue-side** types `DateIssueCustomField` and `SimpleIssueCustomField`. Taking the schema's own `$type` earns a type-mismatch 400. **Build the mapping from `fieldType.id` through the marshalling table**, never from the schema's `$type` key.
+
+**Create is atomic, and safer than update on this axis.** A mixed-validity create — two valid fields plus `Subsystem: "Sideways"` (outside the bundle) — returned `400` with the same mangled `An Sideways-type entity with the specified name ({1}) was not found`, and **no issue was created at all.** Verified twice: an immediate `summary: PROBE` query returned exactly the previously-created issues and no extra, and an end-of-probe `created: Today` sweep accounted for every one. The same held for all four rejected creates. So **create carries no partial-issue risk** — unlike update, where the server rolls field values back on an issue that continues to exist. **No client-side atomicity work and no compensating deletes**; there is nothing to clean up after a rejected create. (Internal entity ids *are* consumed by rejected creates and gaps appear in the internal id sequence, one per rejection; the visible `ION-n` sequence has no gaps. Reading those gaps as "allocate, validate, discard" is **INFERRED** from id arithmetic — a discarded entity is not observable. The load-bearing part, *no issue exists afterwards*, rests on the two sweeps.)
+
+**The request body is not a description of the resulting issue.** ION defaults State/Type/Priority when omitted and **auto-assigns Assignee to the creating user** even though that field is `canBeEmpty: true`. So `issues create` must report the created issue by **reading it back**, not by echoing the request, or it will under-report what it wrote.
+
+**Draft promotion exists — measured, and explicitly not built in M2.** `POST /api/issues?draftId={id}` with body `{}` promotes a draft to a real numbered issue. Measured properties, all read back:
+
+- **Fields carry over intact** — all six custom fields of the probe draft appeared on `ION-1423` (Type, Priority, State, Story points, Sprints, Estimation).
+- **The draft is consumed**, not copied: `GET /api/users/me/drafts/{id}` afterwards → `404`.
+- **The promoted issue gets a new internal id**, not the draft's, so a caller holding a draft id must read the result id from the promotion response.
+- **The Assignee auto-default does not fire on promotion** (Assignee came out `null`), whereas a direct `POST /api/issues` sets it. So promote-a-draft and create-directly are **not** equivalent operations — equivalent inputs produce different issues.
+- Drafts are **addressable but not searchable**: `idReadable` is the literal `Issue.Draft`, they are invisible to `GET /api/issues?query=…`, yet readable via `GET /api/issues/{internalId}`. So `--draft` output must return the **internal id** — there is no readable key for the caller to hold.
+
+**This is a follow-up, not M2 scope. No promote verb is in scope for M2** — step 5 ships `--draft` and *documents* this path so a caller is not handed an object with no way forward.
+
+### Limits of the create-path extension — what it could not prove
+
+Two things ION cannot decide. Both still rest **solely on the earlier IONDEV measurement** and must not be re-attributed to this probe:
+
+| item | why ION cannot decide it | tag |
+|---|---|---|
+| The **HTTP 500** mapping for an unknown field name (the exit-`6`-vs-`5` correctness argument above) | ION's 11 fields gave no occasion to send a name ION would treat as unknown. | UNPROVABLE-HERE |
+| The **exit-`7` workflow-rejection path** | No ION workflow rule fired on any write, so no rejection could be observed. | UNPROVABLE-HERE |
+
+Also unexercised: **type scoping**. All 11 ION fields appear on every issue and on the draft regardless of `Type`, so ION cannot exercise the type-scoping logic above — that remains an **IONDEV-only** measurement. This is a property of ION being a small project, not a contradiction.
+
+One error-translation set *was* confirmed on the create path: bundle miss → `400` with `{1}` unsubstituted and the value spliced into the type slot; format mismatch → `400` `Incompatible value format for type <t>` with `error_field: "value"`; missing `$type` → `400` `$type is required`. The exit-`6` mapping applies to all three.
+
+Two incidental corrections, both worth keeping:
+
+- **For `user[1]` allowed values read `bundle.aggregatedUsers`, never `bundle.values`.** On ION's Assignee bundle the two disagree: `values` lists 4 users **plus a login-less `ProjectTeam` entry**, and carries display names under `name`; `aggregatedUsers` lists 11 logins. Measured: `c.wootson` is in `aggregatedUsers` but not `values`, and writing it succeeded — and the server itself auto-assigned `s.royz`, also absent from `values`. So `values` is a subset that would produce false rejections. The current code already prefers `aggregatedUsers` (`bin/youtrack` ~line 1082) — step 2 must not "simplify" that. Because `aggregatedUsers` is **permission-scoped**, an unrecognized login must **never be a hard refusal** — the visible set depends on the token, so refusing would invent a rejection the server would not make. This CLI has no warning channel (JSON on stdout, errors on stderr, nothing in between), so the implementable form of that rule is to **exclude user-typed fields from the pre-wire allowed-value check entirely** and let the server judge the login. That is what `issues create` does; the bundle check still covers every non-user field, and the failure-path translation covers user fields once a write has actually been refused.
+- **`period`: assert `presentation`, not `minutes`, in tests.** `1d 4h` round-tripped byte-exact as `presentation` but read back **720** minutes — ION counts a workday as 8h, from server-side project settings, so a `minutes` assertion tests a server configuration value rather than CLI behaviour. (That 1d = 8h specifically is **INFERRED** from a single 720-minute datapoint, not a settings read; the `presentation` round-trip itself is measured.)
+
+### Create-path type coverage — 7 of the 14 rows were never sent on a create
+
+This exists so step 2 cannot inherit an unearned "all types confirmed on create". The extension sent **7 of 14** marshalling rows on a create or draft-create request, each read back: `state[1]` (State), `enum[1]` (Type, Priority), `ownedField[1]` (Subsystem), `user[1]` (Assignee), `version[*]` (Sprints), `period` (Estimation), `date` (Start Date) — plus **`float`** (Story points), the extra type discussed under the marshalling table rather than in it. `version[*]` carried **two values in one create call, order preserved**, so the repeated-`--field` accumulation semantics work on create and not only on update.
+
+The other **7 do not exist on ION at all**, so no create request could carry them. Confirmed against IONDEV's live schema: IONDEV's 14 distinct `fieldType.id` values are exactly this table's 14 rows, and these 7 are the complement of what ION carries. **Tag: UNPROVABLE-HERE on ION.** They split into two materially different groups, and folding them into one list understates the position of the last two:
+
+**Group 1 — five types confirmed on the `update` path, untested on `create`:** `enum[*]`, `user[*]`, `integer`, `date and time`, **`text`**. Each is a member of step 0's confirmed-byte-exact list above, so its `{"name", "$type", "value"}` write shape has a live round-trip; only the `create` verb is untested. **`text` is the consequential one** — it is the type behind Acceptance Criteria and Definition of Done, the two fields that gate M2's own "Done when". **So the create path has not been demonstrated end-to-end for M2's acceptance criterion.**
+
+**Group 2 — two types with no successful write anywhere, on any path:** `version[1]` and `build[1]`. This is worse than "untested on create": neither has a confirmed round-trip on update, on create, or on a draft, `version[1]` has **never been sent at all**, and `build[1]` has never had a valid value accepted. **Not closable by any probe** — the bundles are empty, so it is blocked on **YouTrack project configuration, not testing effort**. See the downgraded rows above.
+
+**Why Group 1's residual create-path risk is assessed as low — this is reasoning, not measurement. Tag: INFERRED.** It is **the most consequential inference in the whole record**, because it is what would license step 2 proceeding against types never sent on a create. The argument: (1) all five Group 1 shapes were measured byte-exact on the **update** path, so per-type marshalling is established; (2) what the create-path extension adds is that the create endpoint accepts and applies the `customFields` array *at all* — a property of the endpoint, not of any type — and once `$type` is resolved both verbs converge on the same per-entry marshalling, with no type-specific behaviour observed across the 8 types create did carry, including the awkward ones (`date` normalization identical to update, `version[*]` accepted as a list); (3) the one place create genuinely differs — server-supplied defaults for omitted fields — is orthogonal to marshalling. **That is an argument, not evidence. It does not license writing "confirmed on create" against those rows, and it does not extend to Group 2**, whose shapes have no confirmed write anywhere to inherit from.
+
+The honest summary: **the create *mechanism* is measured; create *marshalling* is measured for 7 of 14 types, inherited from `update` for 5 more, and unconfirmed everywhere for the remaining 2.**
+
+**The cheap way to close Group 1** is to re-run the same create shape against IONDEV — the only project carrying all 14 types — once step 2 exists, covering `text` in particular. That needs write authorization the extension did not have, which is why the gap is recorded rather than closed.
 
 # Output shape
 
@@ -343,18 +419,24 @@ The type model is already confirmed: `GET /admin/projects/{id}/customFields?fiel
 
 **Done when:** `issues get IONDEV-509` shows Type/State/Assignee/Priority/Points/Acceptance Criteria, and `projects fields list 0-6` enumerates the field set with allowed values for every bundle field.
 
+**Defect shipped in M1, surfaced by the 2026-07-28 create-path probe — the `"required"` key is a misnomer.** Item 3 above emits `"required": not entry.get("canBeEmpty", True)` from `_shape_project_field` (`capabilities/youtrack/bin/youtrack`, ~line 1085). Since **`canBeEmpty: false` does not mean required-at-create** (measured — see the call-out under "Create path"), that key reports `required: true` for State/Type/Priority on ION while a create omitting all three succeeds and the server defaults them. So the capability's own schema output tells an agent a field is mandatory when a create may legally omit it — steering the reader toward exactly the pre-flight step 2 must not build. **Decision D1: report `canBeEmpty` faithfully instead** — pass the flag through under its own name rather than restating it as a claim it does not support. **This is a read-path defect already on `main`**, not new step-2 work, which is why the `canBeEmpty` finding cannot be left as a footnote.
+
 ## M2 — Set the fields
 
 The milestone that makes the capability usable, and the only one with real design risk.
 
-0. ~~**Prove the write direction first**, on a throwaway draft issue: one write per `$type` in the marshalling table, read back, compare.~~ **✅ Done 2026-07-28** — see "Write direction — measured" above. 10 of 14 types confirmed byte-exact; `date` confirmed with a normalization rule; `state[1]`, `version[1]`, `build[1]` unprovable on IONDEV for reasons recorded there. Two of the plan's premises (silent-ignore, client-side atomicity) were disproved and have been rewritten.
+0. ~~**Prove the write direction first**, on a throwaway draft issue: one write per `$type` in the marshalling table, read back, compare.~~ **✅ Done 2026-07-28** — see "Write direction — measured" above. 10 of 14 types confirmed byte-exact; `date` confirmed with a normalization rule; `state[1]`, `version[1]`, `build[1]` unprovable on IONDEV for reasons recorded there. Two of the plan's premises (silent-ignore, client-side atomicity) were disproved and have been rewritten. **✅ Extended the same day to the create path** — see "Create path — measured" above: `POST /api/issues` takes `customFields` inline (no draft-then-promote), `$type` is mandatory on create as on update, a rejected create leaves no issue, and **`canBeEmpty: false` is not required-at-create**. Two further recorded claims were falsified (draft writability via `/issues/{id}`, and "a draft cannot take State"). `state[1]` and `float` moved to measured; `version[1]` and `build[1]` did **not** move. **7 of the 14 marshalling rows were never sent on a create** — read the coverage section before assuming otherwise.
 1. ~~`issues update` with `--field` / `--fields`, plus `--summary` / `--description`.~~ **✅ Done 2026-07-28.** Option (C) chosen, with the per-verb lookup correction above. `--state` is **removed** — `--field State=…` replaces it, per the "a dedicated verb for one field invites one per field" rule. Exit **7** added for workflow-rule rejections. `date` fields take and emit `YYYY-MM-DD`; `date and time` stays epoch ms. 24 new tests, every one mutation-checked; verified live against IONDEV-509 and a throwaway draft.
-2. `issues create` on the same marshalling path, so an issue can be born sprint-ready in one call. Its pre-write lookup is the project schema (see table above), which makes full pre-flight validation free — do not copy `update`'s failure-path translation blindly.
-3. Type-aware marshalling per the table above, replacing the hardcoded `{"name": "State", "$type": "StateIssueCustomField", …}`. Includes the `date` ↔ `YYYY-MM-DD` conversion and the `date`/`date and time` split.
-4. Schema-backed error translation with near-miss and allowed-value messages, and distinct handling for `error_type: workflow` rejections.
-5. `issues create --draft`, via `POST /api/users/me/drafts` with `Type` in the create payload.
+2. `issues create` — **in implementation.** A single `POST /api/issues` with inline `customFields`, on the same marshalling path, so an issue can be born sprint-ready in one call; the premise is measured, not assumed. Its pre-write lookup is the project schema (see table above), which makes full pre-flight validation free — do not copy `update`'s failure-path translation blindly. Four measured constraints from step 0's create-path extension:
+   - **Resolve `$type` from `fieldType.id`, never from the schema's own `$type`** — that one is *project-side* (`SimpleProjectCustomField` for a `date` field) and passing it through earns a type-mismatch 400.
+   - **No required-field pre-flight.** `canBeEmpty: false` does not gate creation; refusing to send would reject creates YouTrack accepts. Warn at most, and only in the consumer's readiness terms.
+   - **Report by reading the issue back**, not by echoing the request — the server defaults State/Type/Priority and auto-assigns Assignee.
+   - **No client-side atomicity work and no compensating deletes** — a rejected create creates nothing.
+3. Type-aware marshalling per the table above, replacing the hardcoded `{"name": "State", "$type": "StateIssueCustomField", …}`. Includes the `date` ↔ `YYYY-MM-DD` conversion and the `date`/`date and time` split, and `float`'s string→number coercion alongside `integer`'s. **Coverage caveat, do not lose it: 7 of the table's 14 rows were never sent on a create** — unprovable on ION, which carries none of them. Five (`enum[*]`, `user[*]`, `integer`, `date and time`, `text`) inherit their shape from the *update* path only, and the argument that this makes create-path risk low is **INFERRED, not measured** (see the coverage section). Two (`version[1]`, `build[1]`) have **no successful write on any path at all**. **`text` gates M2's own "Done when"** below.
+4. Schema-backed error translation with near-miss and allowed-value messages, and distinct handling for `error_type: workflow` rejections. Note the two mappings the create-path extension could **not** reproduce and which still rest solely on the IONDEV measurement: the **HTTP 500** unknown-field-name → exit `6` mapping, and the **exit-`7`** workflow path.
+5. `issues create --draft` — **in implementation.** Via `POST /api/users/me/drafts` with `Type` in the create payload; measured to accept a full field set (6/6 across five types) in that one call, so a draft can be born sprint-ready. **Do not hard-code a refusal to set State on a draft** — that was an IONDEV workflow artifact. Draft writes still go to `/users/me/drafts/{id}` and must always be read back, but not because `/issues/{draftId}` is inert — it is not. Output must return the **internal id** (drafts have no readable key). **Document the promotion path `POST /api/issues?draftId={id}` and its properties** (fields carry over, the draft is consumed, the new issue has a different internal id, and the Assignee auto-default does not fire) so `--draft` does not hand the caller a dead end — **documentation only; no promote verb is in M2's scope.**
 
-**Done when:** one `issues create` call produces an IONDEV issue satisfying the consumer's Ready-for-Sprint rules, and `issues update --field` moves each afterwards.
+**Done when:** one `issues create` call produces an IONDEV issue satisfying the consumer's Ready-for-Sprint rules, and `issues update --field` moves each afterwards. **Note what this still requires proving:** those rules are gated by Acceptance Criteria and Definition of Done, both `text` fields, and `text` has **never been sent on a create** — so this "Done when" is not satisfied by step 0's evidence and must be demonstrated against IONDEV once step 2 exists.
 
 ## M3 — Work the board
 

@@ -45,8 +45,15 @@ Read:
   youtrack projects find [SUBSTRING]         Projects visible to the token;
                                              optional substring match on name.
   youtrack projects fields list ID           Custom-field schema for a project:
-                                             name, type, multiValue, required,
+                                             name, type, multiValue, canBeEmpty,
                                              and allowed values where bundled.
+                                             canBeEmpty is YouTrack's own flag and
+                                             governs whether an existing value may
+                                             be emptied — it does NOT mean a create
+                                             must supply the field. A create that
+                                             omits a canBeEmpty=false field
+                                             succeeds; YouTrack supplies its own
+                                             default (measured).
   youtrack projects fields get ID NAME       One field's schema; NAME matches
                                              case-insensitively.
   youtrack issues get ISSUE                  Read one issue (ID or URL).
@@ -64,10 +71,33 @@ Read:
                                              Read recent comments on an article.
 
 Write:
-  youtrack issues create --project ID        Create an issue. Project is the
-        --summary S [--description TEXT|-]    database entity id (for example 0-0),
-                                             not its short name. Store stable ids
-                                             with `youtrack ids set project …`.
+  youtrack issues create --project ID        Create an issue, with its custom
+        --summary S [--description TEXT|-]    fields set in the same call. Project
+        [--field NAME=VALUE]…                 is the database entity id (for
+        [--fields JSON|FILE|-] [--draft]      example 0-0), not its short name;
+                                             store stable ids with `youtrack ids
+                                             set project …`. --field and --fields
+                                             take the same values as on `issues
+                                             update` below. Omitted fields are left
+                                             to YouTrack, which fills in its own
+                                             defaults. --draft creates an
+                                             unnumbered draft instead: its
+                                             idReadable is the literal
+                                             `Issue.Draft`, it is invisible to
+                                             search, and only the returned `id`
+                                             addresses it — keep it. There is no
+                                             promote verb; to turn a draft into a
+                                             numbered issue call
+                                             `POST /api/issues?draftId={id}`
+                                             directly. Measured: the draft's
+                                             fields carry over intact, the draft
+                                             is consumed (it 404s afterwards), the
+                                             new issue gets a *different* internal
+                                             id that must be read from the
+                                             promotion response, and the Assignee
+                                             auto-default does NOT fire — so
+                                             promoting a draft and creating
+                                             directly are not equivalent.
   youtrack issues update ISSUE               Update an issue's summary, description,
         [--summary S] [--description TEXT|-]  and custom fields. Field names match
         [--field NAME=VALUE]…                 case-insensitively. --field splits on
@@ -118,7 +148,7 @@ from typing import NoReturn
 import httpx
 
 NAME = "youtrack"
-SUMMARY = "YouTrack CLI for issues (read/create/comment, and update summary, description, and any custom field), project custom-field schemas, and the knowledge base (read, create, and update articles and article comments)."
+SUMMARY = "YouTrack CLI for issues (read, search, comment, create — as a numbered issue or a draft, with any custom field set in the create call — and update of summary, description, and any custom field), project custom-field schemas, and the knowledge base (read, create, and update articles and article comments)."
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,
@@ -854,6 +884,51 @@ _BY_NAME_MULTI = ("MultiEnumIssueCustomField", "MultiVersionIssueCustomField",
                   "MultiOwnedIssueCustomField", "MultiBuildIssueCustomField",
                   "MultiGroupIssueCustomField")
 
+# `issues create` has no issue to read a $type off, so it resolves $type from the
+# project schema — which exposes `fieldType.id` (`enum[1]`) and *not* the
+# issue-side $type (`SingleEnumIssueCustomField`). The schema's own `$type` is the
+# project-side one (`SimpleProjectCustomField` for a `date` field) and sending it
+# earns a type mismatch, so this table is the only correct bridge.
+#
+# Measured: 12 of the 14 rows occurring in IONDEV, plus `float` (ION's Story
+# points). Not measured: `version[1]` was never sent at all, and `build[1]` has
+# never had a valid value accepted — its envelope did reach bundle resolution, so
+# the $type pairing has partial evidence. Do not read those two at the same
+# confidence as the other twelve; the plan's marshalling rows record why.
+# Inferred, in descending order of confidence: `ownedField[*]` extrapolates from
+# its measured single-valued row through the Single/Multi naming that row
+# establishes; `build[*]` from `build[1]`'s partial evidence plus the same naming;
+# `string` from the rest of the Simple family; `group[1]` and `group[*]` have no
+# sibling of any cardinality — no `group` field exists on either project — so they
+# rest on the naming convention alone.
+# This table is better conditioned than the issue-side map: here `date` and `date
+# and time` are distinguishable, where on the issue side both collapse into
+# DateIssueCustomField / SimpleIssueCustomField and cannot be told apart.
+_ISSUE_TYPE_BY_FIELD_TYPE = {
+    "state[1]": "StateIssueCustomField",
+    "enum[1]": "SingleEnumIssueCustomField",
+    "enum[*]": "MultiEnumIssueCustomField",
+    "ownedField[1]": "SingleOwnedIssueCustomField",
+    "ownedField[*]": "MultiOwnedIssueCustomField",
+    "user[1]": "SingleUserIssueCustomField",
+    "user[*]": "MultiUserIssueCustomField",
+    "version[1]": "SingleVersionIssueCustomField",
+    "version[*]": "MultiVersionIssueCustomField",
+    "build[1]": "SingleBuildIssueCustomField",
+    "build[*]": "MultiBuildIssueCustomField",
+    "group[1]": "SingleGroupIssueCustomField",
+    "group[*]": "MultiGroupIssueCustomField",
+    "period": "PeriodIssueCustomField",
+    "text": "TextIssueCustomField",
+    "date": "DateIssueCustomField",
+    # The Simple family. `date and time` is deliberately *not*
+    # DateIssueCustomField: it keeps its time of day and is not snapped to noon.
+    "integer": "SimpleIssueCustomField",
+    "float": "SimpleIssueCustomField",
+    "string": "SimpleIssueCustomField",
+    "date and time": "SimpleIssueCustomField",
+}
+
 
 def _scalar(raw: str):
     """`--field` values arrive as strings; YouTrack rejects "3" for an integer.
@@ -912,7 +987,8 @@ def _marshal_one(field: str, dollar: str, values: list):
          "text, date, and simple (integer/float/string/date-and-time) fields")
 
 
-def _unknown_field(field: str, known: dict, c=None, project=None) -> NoReturn:
+def _unknown_field(field: str, known: dict, c=None, project=None,
+                   subject: str = "this issue") -> NoReturn:
     # A field the project defines but this issue does not carry is a different
     # mistake from a typo: the field is real, the issue's Type just excludes it.
     # Saying "did you mean" there sends the caller looking for a spelling error.
@@ -928,19 +1004,61 @@ def _unknown_field(field: str, known: dict, c=None, project=None) -> NoReturn:
     names = sorted(v["name"] for v in known.values())
     near = difflib.get_close_matches(field, names, n=3, cutoff=0.6)
     hint = (f"did you mean: {', '.join(near)}?" if near
-            else f"fields on this issue: {', '.join(names)}")
-    _die(6, "unknown_field", f"no field named {field!r} on this issue", hint)
+            else f"fields on {subject}: {', '.join(names)}")
+    _die(6, "unknown_field", f"no field named {field!r} on {subject}", hint)
+
+
+def _bad_bundle_value(requested: dict, schema: list, *, users: bool):
+    """The first requested value outside its field's bundle, or None.
+
+    `users=False` skips user-typed fields, which is what the pre-wire pass on
+    create wants: a user field's legal set is `bundle.aggregatedUsers`, which is
+    permission-scoped, so a login this token cannot see is not necessarily one
+    YouTrack will reject (measured: the server itself assigns logins absent from
+    `bundle.values`). Refusing there would invent a rejection the server would
+    not make. On the failure path the write has already been refused, so every
+    field is fair game for explaining why.
+    """
+    by_name = {(f.get("name") or "").casefold(): f for f in schema}
+    for field, values in requested.items():
+        entry = by_name.get(field.strip().casefold())
+        if entry is None:
+            continue
+        if not users and str(entry.get("type") or "").startswith("user"):
+            continue
+        allowed = entry.get("values")
+        if not allowed:
+            continue
+        legal = {str(v).casefold() for v in allowed}
+        bad = [v for v in values
+               if isinstance(v, str) and v != "" and v.casefold() not in legal]
+        if bad:
+            return entry, bad, allowed
+    return None
+
+
+def _die_bad_value(entry, bad, allowed, status=None) -> NoReturn:
+    _die(6, "invalid_value",
+         f"{entry['name']}: {', '.join(repr(b) for b in bad)} "
+         "is not an allowed value",
+         f"allowed: {', '.join(allowed)}", status=status)
 
 
 _UNKNOWN_NAME_RE = re.compile(r"incompatible-issue-custom-field-name-(.+)")
 
 
-def _explain_write_failure(response, requested: dict, c, project) -> None:
+def _explain_write_failure(response, requested: dict, c, project,
+                           schema: list | None = None) -> None:
     """Turn a rejected write into something actionable, or fall through.
 
     Only reached on failure: the server validates and rolls a bad batch back by
     itself, so nothing here is load-bearing for correctness — it exists because
     YouTrack's messages are not usable by an agent as written.
+
+    `schema` is the already-fetched project schema. `issues create` has one in
+    hand, so passing it keeps the create path at exactly one schema read whether
+    it succeeds or fails; `issues update` passes None and pays for the read only
+    here, on the failure path.
     """
     try:
         body = response.json()
@@ -966,25 +1084,17 @@ def _explain_write_failure(response, requested: dict, c, project) -> None:
              f"YouTrack does not recognise the field {unknown.group(1).strip()!r}",
              status=response.status_code)
 
-    if not project:
-        return
+    if not requested:
+        return          # nothing named, so no value of ours can be the cause
+    if schema is None:
+        if not project:
+            return
+        schema = _project_fields(c, project)
     # The server names the offending *value* but never the field, and lists no
     # alternatives. Re-check the named fields against the bundles to say both.
-    schema = {(f.get("name") or "").casefold(): f for f in _project_fields(c, project)}
-    for field, values in requested.items():
-        entry = schema.get(field.strip().casefold())
-        allowed = (entry or {}).get("values")
-        if not allowed:
-            continue
-        legal = {str(v).casefold() for v in allowed}
-        bad = [v for v in values
-               if isinstance(v, str) and v != "" and v.casefold() not in legal]
-        if bad:
-            _die(6, "invalid_value",
-                 f"{entry['name']}: {', '.join(repr(b) for b in bad)} "
-                 "is not an allowed value",
-                 f"allowed: {', '.join(allowed)}",
-                 status=response.status_code)
+    found = _bad_bundle_value(requested, schema, users=True)
+    if found:
+        _die_bad_value(*found, status=response.status_code)
 
 
 def _split_field_arg(pair: str) -> tuple:
@@ -1025,12 +1135,24 @@ def _collect_field_args(a) -> dict:
     return requested
 
 
-def _marshal_fields(requested: dict, known: dict, c=None, project=None) -> list:
+def _marshal_fields(requested: dict, known: dict, c=None, project=None,
+                    subject: str = "this issue") -> list:
     entries = []
     for field, values in requested.items():
         target = known.get(field.strip().casefold())
         if target is None:
-            _unknown_field(field, known, c, project)
+            _unknown_field(field, known, c, project, subject)
+        if target["$type"] is None:
+            # Only reachable from create: the project schema carries a
+            # fieldType.id that _ISSUE_TYPE_BY_FIELD_TYPE does not map, so no
+            # $type can be sent and YouTrack would answer "$type is required".
+            named = (f"project type {target['fieldType']!r}"
+                     if target.get("fieldType") else "an unreported type")
+            _die(6, "unsupported_field_type",
+                 f"{target['name']}: cannot write a field of {named}",
+                 "supported: enum, state, ownedField, version, build, user, "
+                 "group, period, text, date, date and time, integer, float, "
+                 "and string")
         entries.append({"name": target["name"], "$type": target["$type"],
                         "value": _marshal_one(field, target["$type"], values)})
     return entries
@@ -1052,6 +1174,27 @@ def _issue_write_context(c, ref: str) -> tuple:
              for e in (issue.get("customFields") or [])
              if isinstance(e, dict) and e.get("name")}
     return known, (issue.get("project") or {}).get("id")
+
+
+def _create_write_context(schema: list) -> dict:
+    """The $type map for a create, derived from the project schema.
+
+    The schema is the only source available before the issue exists, and it
+    reports `fieldType.id`, not the issue-side $type — hence the table. A
+    fieldType.id with no mapping yields $type None, which _marshal_fields
+    refuses by name rather than sending an entry YouTrack would reject.
+    """
+    known = {}
+    for entry in schema:
+        name = entry.get("name")
+        if not name:
+            continue
+        known[name.casefold()] = {
+            "name": name,
+            "$type": _ISSUE_TYPE_BY_FIELD_TYPE.get(entry.get("type")),
+            "fieldType": entry.get("type"),
+        }
+    return known
 
 
 def users_me(c, a):
@@ -1080,10 +1223,15 @@ def _shape_project_field(entry):
     # A user field's bundle carries display names under `values` and logins
     # under `aggregatedUsers`; writes need the login, so prefer it.
     values = users or names
+    # canBeEmpty is reported as YouTrack states it, deliberately not inverted
+    # into a `required` flag. Measured: a create omitting every canBeEmpty=false
+    # field returns 200 with server-chosen defaults, so canBeEmpty governs
+    # emptying an existing value, not supplying one at creation. Calling it
+    # `required` told an agent to pre-fill fields it does not have to.
     return {"name": field.get("name"),
             "type": ftype.get("id"),
             "multiValue": bool(ftype.get("isMultiValue")),
-            "required": not entry.get("canBeEmpty", True),
+            "canBeEmpty": bool(entry.get("canBeEmpty", True)),
             "values": values or None}
 
 
@@ -1118,11 +1266,41 @@ def issues_get(c, a):
 
 
 def issues_create(c, a):
+    """Create an issue, or a draft, with its custom fields in the same call.
+
+    Measured, and the reason there is no required-field check here: `canBeEmpty:
+    false` in the project schema means "an existing value may not be emptied",
+    NOT "a create must supply this". A create omitting every canBeEmpty=false
+    field returns 200 and YouTrack fills in its own defaults, so refusing to
+    send would reject creates the server accepts.
+
+    Create is also atomic — a batch with one bad value produces no issue at all,
+    not a half-populated one — so there is nothing to clean up after a failure.
+    """
     body = {"project": {"id": a.project}, "summary": a.summary}
     if a.description is not None:
         body["description"] = _read_text(a.description)
+    requested = _collect_field_args(a)
+    schema = None
+    if requested:
+        # The one schema read, and the one place create differs from update:
+        # $type is mandatory on every entry and no issue exists to read it off.
+        schema = _project_fields(c, a.project)
+        subject = f"project {a.project}"
+        body["customFields"] = _marshal_fields(
+            requested, _create_write_context(schema), subject=subject)
+        # Unlike update, full value validation is free here — the schema already
+        # in hand carries the bundles. Type-scoped fields cannot be pre-flighted
+        # (the scoped subset does not exist until the issue does), so an
+        # out-of-scope name reaches the server and its 400 is translated below.
+        found = _bad_bundle_value(requested, schema, users=False)
+        if found:
+            _die_bad_value(*found)
+    path = "/users/me/drafts" if getattr(a, "draft", False) else "/issues"
     return _flatten_custom_fields(
-        _request(c, "POST", "/issues", params={"fields": ISSUE_FIELDS}, json=body))
+        _request(c, "POST", path, params={"fields": ISSUE_FIELDS}, json=body,
+                 on_error=lambda r: _explain_write_failure(
+                     r, requested, c, a.project, schema)))
 
 
 def issues_update(c, a):
@@ -1257,6 +1435,7 @@ ARG_PARENT        = (("--parent",), {})
 ARG_FIELD         = (("--field",), {"action": "append", "default": [],
                                     "metavar": "NAME=VALUE"})
 ARG_FIELDS        = (("--fields",), {"metavar": "JSON|FILE|-"})
+ARG_DRAFT         = (("--draft",), {"action": "store_true"})
 
 COMMANDS = {
     ("users", "me"):                  (users_me, []),
@@ -1266,7 +1445,8 @@ COMMANDS = {
     ("issues", "get"):                (issues_get, [ARG_ISSUE]),
     ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100]),
     ("issues", "create"):             (issues_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
-                                                       ARG_DESCRIPTION]),
+                                                       ARG_DESCRIPTION, ARG_FIELD,
+                                                       ARG_FIELDS, ARG_DRAFT]),
     ("issues", "update"):             (issues_update, [ARG_ISSUE, ARG_FIELD, ARG_FIELDS,
                                                        ARG_SUMMARY_OPT, ARG_DESCRIPTION]),
     ("issues", "comments", "list"):   (issues_comments_list, [ARG_ISSUE, ARG_LIMIT50]),
