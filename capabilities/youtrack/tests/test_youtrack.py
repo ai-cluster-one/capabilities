@@ -133,6 +133,28 @@ def serve(handler_cls):
         thread.join()
 
 
+def _paging_handler(rows):
+    class PagingHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            top = int(query["$top"][0])
+            body = json.dumps(rows[:top]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    PagingHandler.requests = []
+    return PagingHandler
+
+
 def test_users_me_smoke(tmp_path):
     class UsersMeHandler(BaseHTTPRequestHandler):
         requests = []
@@ -156,6 +178,133 @@ def test_users_me_smoke(tmp_path):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["login"] == "agent"
     assert UsersMeHandler.requests[0].startswith("/api/users/me?")
+
+
+def test_users_find_sends_query_and_paging(tmp_path):
+    class UsersFindHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps([
+                {"id": "1-1", "login": "s.royz", "fullName": "Sergey Royz"},
+                {"id": "1-2", "login": "s.other", "fullName": "Other Person"},
+            ]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    UsersFindHandler.requests = []
+    with serve(UsersFindHandler) as base:
+        result = run_cli(tmp_path, base, "users", "find", "royz",
+                         "--limit", "2", "--offset", "5")
+    assert result.returncode == 0, result.stderr
+    path = UsersFindHandler.requests[0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["query"] == ["royz"]
+    assert query["$top"] == ["3"]          # limit + 1, so truncation is detectable
+    assert query["$skip"] == ["5"]
+    payload = json.loads(result.stdout)
+    assert payload["items"][0]["login"] == "s.royz"
+    assert payload["has_more"] is False    # 2 rows returned for limit 2
+
+
+def test_users_find_rejects_negative_offset(tmp_path):
+    with serve(Handler) as base:
+        result = run_cli(tmp_path, base, "users", "find", "x", "--offset", "-1")
+    assert result.returncode == 6
+    assert "offset" in result.stderr
+
+
+def test_search_reports_has_more_false_at_exactly_limit(tmp_path):
+    rows = [{"idReadable": f"DEMO-{n}", "summary": "s"} for n in range(2)]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--limit", "2")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 2
+    assert payload["has_more"] is False
+
+
+def test_search_reports_has_more_true_and_trims_to_limit(tmp_path):
+    rows = [{"idReadable": f"DEMO-{n}", "summary": "s"} for n in range(5)]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--limit", "2")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 2, "the extra probe row must not be emitted"
+    assert payload["has_more"] is True
+    assert [i["idReadable"] for i in payload["items"]] == ["DEMO-0", "DEMO-1"]
+
+
+def test_comments_list_sends_skip_and_envelopes(tmp_path):
+    rows = [{"id": "4-1", "text": "hi"}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "list", "DEMO-1",
+                         "--limit", "10", "--offset", "20")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert query["$skip"] == ["20"]
+    assert query["$top"] == ["11"]
+    assert json.loads(result.stdout)["has_more"] is False
+
+
+def test_offset_zero_is_omitted_from_the_request(tmp_path):
+    handler = _paging_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert "$skip" not in query
+
+
+def test_select_filters_core_and_nested_field_keys(tmp_path):
+    rows = [{"idReadable": "DEMO-1", "summary": "s", "description": "long text",
+             "customFields": [
+                 {"name": "State", "$type": "StateIssueCustomField",
+                  "value": {"name": "Open"}},
+                 {"name": "Points", "$type": "SimpleIssueCustomField",
+                  "value": 3},
+             ]}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--select", "idReadable,fields.State")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["items"] == [
+        {"idReadable": "DEMO-1", "fields": {"State": "Open"}}
+    ]
+
+
+def test_select_omits_a_field_absent_from_this_issue(tmp_path):
+    rows = [{"idReadable": "DEMO-1", "summary": "s", "customFields": []}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--select", "idReadable,fields.Points")
+    assert result.returncode == 0, result.stderr
+    # A field this issue does not carry is absent, not an error: custom fields
+    # differ per project and a cross-project search must survive it.
+    assert json.loads(result.stdout)["items"] == [{"idReadable": "DEMO-1"}]
+
+
+def test_select_rejects_an_unknown_key_shape(tmp_path):
+    handler = _paging_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--select", "idReadabel")
+    assert result.returncode == 6
+    assert "idReadable" in result.stderr, "must offer the near-miss"
 
 
 def test_projects_find_smoke(tmp_path):
@@ -382,10 +531,11 @@ def test_issues_comments_list_smoke(tmp_path):
         result = run_cli(tmp_path, base_url, "issues", "comments", "list", "DEMO-1", "--limit", "5")
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)[0]["text"] == "A note"
+    assert json.loads(result.stdout)["items"][0]["text"] == "A note"
     assert IssueCommentsHandler.requests[0].startswith("/api/issues/DEMO-1/comments?")
-    assert ("$top=5" in IssueCommentsHandler.requests[0]
-            or "%24top=5" in IssueCommentsHandler.requests[0])
+    # $top is limit + 1 (6), not limit (5): the extra row makes truncation detectable.
+    assert ("$top=6" in IssueCommentsHandler.requests[0]
+            or "%24top=6" in IssueCommentsHandler.requests[0])
 
 
 def test_create_and_comment_payloads(tmp_path):
@@ -511,7 +661,7 @@ def test_issues_http_request_and_parsing(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert default_result.returncode == 0, default_result.stderr
-    parsed = json.loads(result.stdout)
+    parsed = json.loads(result.stdout)["items"]
     assert len(parsed) == 2
     assert parsed[0]["idReadable"] == "DEMO-1"
     assert parsed[0]["fields"]["State"] == "Open"
@@ -519,9 +669,11 @@ def test_issues_http_request_and_parsing(tmp_path):
     assert parsed[1]["idReadable"] == "DEMO-2"
     assert parsed[1]["fields"]["State"] == "In Progress"
     assert "query=state%3AOpen" in IssuesHandler.requests[0][1]
-    assert "$top=10" in IssuesHandler.requests[0][1] or "%24top=10" in IssuesHandler.requests[0][1]
+    # $top is limit + 1 (11), not limit (10): the extra row makes truncation detectable.
+    assert "$top=11" in IssuesHandler.requests[0][1] or "%24top=11" in IssuesHandler.requests[0][1]
     assert "customFields=State" not in IssuesHandler.requests[0][1]
-    assert "$top=100" in IssuesHandler.requests[1][1] or "%24top=100" in IssuesHandler.requests[1][1]
+    # default --limit is 100, so $top is 101 for the same reason.
+    assert "$top=101" in IssuesHandler.requests[1][1] or "%24top=101" in IssuesHandler.requests[1][1]
 
 
 ISSUE_WITH_FIELDS = {
@@ -614,12 +766,377 @@ def test_issues_get_requests_custom_fields(tmp_path):
     assert "name" in path
 
 
+# Measured shape: GET /issues/{id}/links returns every possible slot, empty or
+# not — 7 on an instance with 4 link types. See the parity plan's "Link model".
+_ALL_LINK_SLOTS = [
+    {"direction": "BOTH", "linkType": {"name": "Relates",
+     "sourceToTarget": "relates to", "targetToSource": ""}, "issues": []},
+    {"direction": "OUTWARD", "linkType": {"name": "Depend",
+     "sourceToTarget": "is required for", "targetToSource": "depends on"},
+     "issues": []},
+    {"direction": "INWARD", "linkType": {"name": "Depend",
+     "sourceToTarget": "is required for", "targetToSource": "depends on"},
+     "issues": []},
+    {"direction": "OUTWARD", "linkType": {"name": "Duplicate",
+     "sourceToTarget": "is duplicated by", "targetToSource": "duplicates"},
+     "issues": []},
+    {"direction": "INWARD", "linkType": {"name": "Duplicate",
+     "sourceToTarget": "is duplicated by", "targetToSource": "duplicates"},
+     "issues": []},
+    {"direction": "OUTWARD", "linkType": {"name": "Subtask",
+     "sourceToTarget": "parent for", "targetToSource": "subtask of"},
+     "issues": []},
+    {"direction": "INWARD", "linkType": {"name": "Subtask",
+     "sourceToTarget": "parent for", "targetToSource": "subtask of"},
+     "issues": [{"idReadable": "DEMO-9"}]},
+]
+
+
+def test_issues_get_filters_empty_link_slots(tmp_path):
+    class LinkReadHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps({
+                "idReadable": "DEMO-1", "summary": "s",
+                "customFields": [],
+                "links": _ALL_LINK_SLOTS,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    LinkReadHandler.requests = []
+    with serve(LinkReadHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["links"] == [{"type": "subtask of", "issues": ["DEMO-9"]}]
+
+
+def test_issues_get_requests_the_links_projection(tmp_path):
+    class LinkFieldHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = json.dumps({"idReadable": "DEMO-1", "customFields": [],
+                               "links": []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    LinkFieldHandler.requests = []
+    with serve(LinkFieldHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(LinkFieldHandler.requests[0]).query)
+    assert "links(" in query["fields"][0]
+    # An issue with no links must emit no `links` key at all, not [].
+    assert "links" not in json.loads(result.stdout)
+
+
+def _link_slots_with_ids():
+    """`_ALL_LINK_SLOTS` plus the measured direction-encoded ids."""
+    ids = ["137-0", "137-1s", "137-1t", "137-2s", "137-2t", "137-3s", "137-3t"]
+    slots = []
+    for link_id, slot in zip(ids, _ALL_LINK_SLOTS):
+        entry = json.loads(json.dumps(slot))
+        entry["id"] = link_id
+        entry["issues"] = []
+        # Measured: Duplicate and Subtask report readOnly true, and both accept
+        # writes. The flag governs editing the type definition, not linking.
+        entry["linkType"]["readOnly"] = entry["linkType"]["name"] in (
+            "Duplicate", "Subtask")
+        slots.append(entry)
+    return slots
+
+
+class _LinkHandler(BaseHTTPRequestHandler):
+    """Serves the link slots for GET, records POST/DELETE."""
+    requests = []
+    slots = None
+
+    def log_message(self, *_args):
+        pass
+
+    def _reply(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.__class__.requests.append(("GET", self.path, None))
+        # Match on the path only. A substring test would also hit the `links(...)`
+        # projection inside the ?fields= query that issues_get sends.
+        route = urllib.parse.urlparse(self.path).path
+        if route.endswith("/links"):
+            self._reply(self.__class__.slots)
+        elif route.startswith("/api/issues/"):
+            self._reply({"id": "2-99", "idReadable": "DEMO-9"})
+        else:
+            self._reply({"error": "missing"}, 404)
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+        self._reply({"idReadable": "DEMO-9"})
+
+    def do_DELETE(self):
+        self.__class__.requests.append(("DELETE", self.path, None))
+        self._reply({})
+
+
+@pytest.fixture
+def link_handler():
+    _LinkHandler.requests = []
+    _LinkHandler.slots = _link_slots_with_ids()
+    return _LinkHandler
+
+
+@pytest.mark.parametrize("phrase,link_id", [
+    ("relates to", "137-0"),
+    ("is required for", "137-1s"),
+    ("depends on", "137-1t"),
+    ("is duplicated by", "137-2s"),
+    ("duplicates", "137-2t"),
+    ("parent for", "137-3s"),
+    ("subtask of", "137-3t"),
+])
+def test_every_direction_phrase_resolves(tmp_path, link_handler, phrase, link_id):
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", phrase)
+    assert result.returncode == 0, result.stderr
+    posts = [r for r in link_handler.requests if r[0] == "POST"]
+    assert len(posts) == 1
+    assert f"/links/{link_id}/issues" in posts[0][1]
+
+
+def test_readonly_link_type_is_still_writable(tmp_path, link_handler):
+    # Regression guard. `Subtask` reports readOnly true and accepts writes; a
+    # later tidy-up that treats the flag as a gate would disable the one verb
+    # M3 exists to deliver, and every other test would still pass.
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 0, result.stderr
+    assert any(r[0] == "POST" for r in link_handler.requests)
+
+
+def test_phrase_matching_is_case_insensitive(tmp_path, link_handler):
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "SubTask Of")
+    assert result.returncode == 0, result.stderr
+
+
+def test_unknown_phrase_exits_6_with_near_miss(tmp_path, link_handler):
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask off")
+    assert result.returncode == 6
+    assert "subtask of" in result.stderr
+    assert not any(r[0] == "POST" for r in link_handler.requests)
+
+
+def test_ambiguous_phrase_fails_rather_than_picking(tmp_path, link_handler):
+    # Phrase uniqueness is measured on one instance only; a custom link type
+    # could collide. Picking one silently would create the wrong link.
+    slots = _link_slots_with_ids()
+    slots.append({"id": "137-4s", "direction": "OUTWARD",
+                  "linkType": {"name": "Custom", "sourceToTarget": "subtask of",
+                               "targetToSource": "parent of",
+                               "readOnly": False},
+                  "issues": []})
+    _LinkHandler.slots = slots
+    with serve(_LinkHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 6
+    assert "ambiguous" in result.stderr.lower()
+    assert not any(r[0] == "POST" for r in _LinkHandler.requests)
+
+
+def test_self_link_is_refused_without_any_request(tmp_path, link_handler):
+    # Measured: the server returns 200 for a self-link and silently creates
+    # nothing. Asserting the exit code alone would pass for a client that sent
+    # it, so assert that no write left the process. The refusal happens
+    # before the direction phrase is even resolved, so no request of any
+    # kind — not just no POST — should be issued; asserting only "no POST"
+    # would still pass a refactor that issued a GET first.
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-1", "--type", "relates to")
+    assert result.returncode == 6
+    assert "itself" in result.stderr.lower()
+    assert link_handler.requests == []
+
+
+def test_links_add_sends_the_readable_key(tmp_path, link_handler):
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in link_handler.requests if r[0] == "POST"][0]
+    assert post[2] == {"idReadable": "DEMO-9"}
+
+
+def test_links_add_translates_a_bad_target(tmp_path):
+    class BadTargetHandler(_LinkHandler):
+        requests = []
+        slots = None
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, None))
+            self._reply({"error": "Bad Request", "error_description":
+                         "YouTrack is unable to locate an Issue-type entity "
+                         "unless its ID is also provided"}, 400)
+
+    BadTargetHandler.requests = []
+    BadTargetHandler.slots = _link_slots_with_ids()
+    with serve(BadTargetHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-404", "--type", "relates to")
+    # The raw message describes an id-format problem, which is not what
+    # happened. Exit 3 naming the target is the honest translation.
+    assert result.returncode == 3
+    assert "DEMO-404" in result.stderr
+
+
+def test_links_add_is_a_write_verb():
+    assert "issues links add" in _write_verbs()
+
+
+def test_links_remove_is_a_write_verb():
+    # Mirrors test_links_add_is_a_write_verb. WRITE_VERBS <= COMMANDS only
+    # catches a stray/typo'd entry; it cannot catch an omission, which would
+    # silently disable the allow_write gate for this verb.
+    assert "issues links remove" in _write_verbs()
+
+
+def test_links_remove_resolves_the_internal_target_id(tmp_path, link_handler):
+    # Measured asymmetry: POST accepts a readable key, DELETE demands the
+    # internal id and 404s on a readable one. So remove pays a resolution GET.
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "remove", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 0, result.stderr
+    deletes = [r for r in link_handler.requests if r[0] == "DELETE"]
+    assert len(deletes) == 1
+    assert deletes[0][1].endswith("/links/137-3t/issues/2-99")
+
+
+def test_links_remove_retranslates_the_missing_link_404(tmp_path):
+    class NoSuchLinkHandler(_LinkHandler):
+        requests = []
+        slots = None
+
+        def do_DELETE(self):
+            self.__class__.requests.append(("DELETE", self.path, None))
+            # Measured: the message names the *target issue*, which exists.
+            self._reply({"error": "Not Found", "error_description":
+                         "Entity with id 2-99 not found"}, 404)
+
+    NoSuchLinkHandler.requests = []
+    NoSuchLinkHandler.slots = _link_slots_with_ids()
+    with serve(NoSuchLinkHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "remove", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "subtask of")
+    assert result.returncode == 3
+    # Must blame the link, not the issue: the issue in YouTrack's message exists.
+    assert "subtask of" in result.stderr
+    assert "link" in result.stderr.lower()
+
+
+def test_links_remove_translates_a_bad_target(tmp_path):
+    # Mirrors test_links_add_translates_a_bad_target. Add's nonexistent-target
+    # failure surfaces as a 400 on the write POST; remove's surfaces as a 404
+    # on the target-resolution GET instead (measured asymmetry) — both must
+    # produce the same specific "no issue named" message, not the generic
+    # "resource not found".
+    class BadTargetHandler(_LinkHandler):
+        requests = []
+        slots = None
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route.endswith("/links"):
+                self._reply(self.__class__.slots)
+            else:
+                self._reply({"error": "Not Found", "error_description":
+                             "Entity with id DEMO-404 not found"}, 404)
+
+    BadTargetHandler.requests = []
+    BadTargetHandler.slots = _link_slots_with_ids()
+    with serve(BadTargetHandler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "remove", "DEMO-1",
+                         "--to", "DEMO-404", "--type", "relates to")
+    assert result.returncode == 3
+    assert "DEMO-404" in result.stderr
+
+
+def test_links_remove_self_link_is_refused_without_any_request(tmp_path, link_handler):
+    # Mirrors test_self_link_is_refused_without_any_request. `add` refuses a
+    # self-link before any request; `remove` had no such guard and would spend
+    # three HTTP calls (resolve direction, resolve target, DELETE) before
+    # failing on the third. Assert it now fails before the first.
+    with serve(link_handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "remove", "DEMO-1",
+                         "--to", "DEMO-1", "--type", "relates to")
+    assert result.returncode == 6
+    assert "itself" in result.stderr.lower()
+    assert link_handler.requests == []
+
+
+def test_bare_404_at_a_write_still_exits_3_via_the_generic_mapping(tmp_path):
+    # Pins the property the `on_error`-before-hardcoded-404 reorder in
+    # `_request` relies on: a verb that passes `on_error` must still exit 3 on
+    # a plain 404 whose body matches none of that callback's conditions. Here
+    # `issues links add`'s POST returns a 404 with a body `_link_target_error`
+    # does not recognise (no "not found" text), so `on_error` returns without
+    # dying and the hardcoded `if response.status_code == 404` a few lines
+    # below must be the thing that produces exit 3.
+    class Bare404Handler(_LinkHandler):
+        requests = []
+        slots = None
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, None))
+            self._reply({"error": "Oops"}, 404)
+
+    Bare404Handler.requests = []
+    Bare404Handler.slots = _link_slots_with_ids()
+    with serve(Bare404Handler) as base:
+        result = run_cli(tmp_path, base, "issues", "links", "add", "DEMO-1",
+                         "--to", "DEMO-9", "--type", "relates to")
+    assert result.returncode == 3
+
+
 def test_issues_search_emits_same_fields_shape(tmp_path):
     CustomFieldsHandler.requests = []
     with serve(CustomFieldsHandler) as base:
         result = run_cli(tmp_path, base, "issues", "search", "project: DEMO")
     assert result.returncode == 0, result.stderr
-    row = json.loads(result.stdout)[0]
+    row = json.loads(result.stdout)["items"][0]
     assert row["fields"]["State"] == "Done"
     assert "customFields" not in row
 
@@ -1714,9 +2231,10 @@ def test_articles_list_all_and_by_project(tmp_path):
 
     assert all_res.returncode == 0, all_res.stderr
     assert proj_res.returncode == 0, proj_res.stderr
-    assert json.loads(all_res.stdout)[0]["idReadable"] == "KB-A-1"
+    assert json.loads(all_res.stdout)["items"][0]["idReadable"] == "KB-A-1"
     assert requests[0].startswith("/api/articles?")
-    assert "$top=10" in requests[0] or "%24top=10" in requests[0]
+    # $top is limit + 1 (11), not limit (10): the extra row makes truncation detectable.
+    assert "$top=11" in requests[0] or "%24top=11" in requests[0]
     assert requests[1].startswith("/api/admin/projects/0-6/articles?")
 
 
@@ -1762,7 +2280,7 @@ def test_article_read_and_comments(tmp_path):
     assert json.loads(art.stdout)["content"] == "# Body"
     assert art_url.returncode == 0, art_url.stderr
     assert coms.returncode == 0, coms.stderr
-    assert json.loads(coms.stdout)[0]["text"] == "First note"
+    assert json.loads(coms.stdout)["items"][0]["text"] == "First note"
     assert requests[0].startswith("/api/articles/KB-A-1?")
     assert requests[1].startswith("/api/articles/KB-A-1?")
     assert requests[2].startswith("/api/articles/KB-A-1/comments?")

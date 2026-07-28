@@ -42,6 +42,12 @@ Contract commands:
 
 Read:
   youtrack users me                          Current YouTrack user.
+  youtrack users find SUBSTRING [--limit N] [--offset N]
+                                             Find users by substring across
+                                             login, name and email. The visible
+                                             set is token-scoped, so absence
+                                             here does not prove a login is
+                                             invalid.
   youtrack projects find [SUBSTRING]         Projects visible to the token;
                                              optional substring match on name.
   youtrack projects fields list ID           Custom-field schema for a project:
@@ -57,17 +63,25 @@ Read:
   youtrack projects fields get ID NAME       One field's schema; NAME matches
                                              case-insensitively.
   youtrack issues get ISSUE                  Read one issue (ID or URL).
-  youtrack issues search QUERY [--limit N]   Search issues server-side using
+  youtrack issues search QUERY [--limit N] [--offset N] [--select KEY,KEY]
+                                             Search issues server-side using
                                              YouTrack query language.
-  youtrack issues comments list ISSUE [--limit N]
+                                             --select trims the output to the
+                                             named keys: core attributes
+                                             (idReadable, summary, …) or
+                                             fields.<name> for one custom
+                                             field. A named custom field the
+                                             issue does not carry is omitted,
+                                             not an error.
+  youtrack issues comments list ISSUE [--limit N] [--offset N]
                                              Read recent comments on an issue.
-  youtrack articles list [--project ID] [--limit N]
+  youtrack articles list [--project ID] [--limit N] [--offset N]
                                              List knowledge-base articles (paged;
                                              --project scopes to one project). This
                                              is a listing, not a full-text search.
   youtrack articles get ID                   Read one article (ID or URL): summary,
                                              content, project, parent/child refs.
-  youtrack articles comments list ID [--limit N]
+  youtrack articles comments list ID [--limit N] [--offset N]
                                              Read recent comments on an article.
 
 Write:
@@ -114,6 +128,19 @@ Write:
                                              Respects allow_write connection policy.
   youtrack issues comments add ISSUE [--text TEXT|-]
                                              Add a comment; omitted text reads stdin.
+  youtrack issues links add ISSUE --to ISSUE --type PHRASE
+                                             Link two issues. --type takes the
+                                             direction phrase, not a type name:
+                                             "subtask of", "parent for",
+                                             "relates to", "depends on", "is
+                                             required for", "duplicates", "is
+                                             duplicated by". One write fills in
+                                             both sides. Linking an issue to
+                                             itself is refused.
+  youtrack issues links remove ISSUE --to ISSUE --type PHRASE
+                                             Remove a link. Not idempotent:
+                                             removing a link that is not there
+                                             exits 3.
   youtrack articles create --project ID      Create an article in a project
         --summary S [--content TEXT|-]        (database entity id); optionally give
         [--parent ID|URL]                    a parent article to create a sub-article.
@@ -127,6 +154,10 @@ Global options accepted anywhere:
   --token-env KEY                            Select the env key holding the token.
 
 Text arguments accept inline text, a readable file path, or `-` for stdin.
+Every verb that takes --limit returns {"items": [...], "has_more": bool}
+rather than a bare array. has_more is true when the server had more rows
+than --limit; page on with --offset. This is how a sprint rollup detects
+that it was cut short instead of quietly reporting a partial total.
 Success is JSON on stdout. Errors are JSON on stderr. Exit codes: 0 success,
 2 auth/config, 3 not found, 4 policy refusal (this connection is read-only),
 5 network/server, 6 input, 7 a YouTrack workflow rule rejected the change.
@@ -148,7 +179,7 @@ from typing import NoReturn
 import httpx
 
 NAME = "youtrack"
-SUMMARY = "YouTrack CLI for issues (read, search, comment, create — as a numbered issue or a draft, with any custom field set in the create call — and update of summary, description, and any custom field), project custom-field schemas, and the knowledge base (read, create, and update articles and article comments)."
+SUMMARY = "YouTrack CLI for issues (read with links, paged search with field projection, comment, create — as a numbered issue or a draft, with any custom field set in the create call — update of summary, description, and any custom field, and add/remove issue links by direction phrase), user lookup, project custom-field schemas, and the knowledge base (read, create, and update articles and article comments)."
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,
@@ -157,6 +188,7 @@ CRED_KEYS = [
      "note": "permanent token (perm:…); alternates via --token-env"},
 ]
 WRITE_VERBS = {"issues create", "issues update", "issues comments add",
+               "issues links add", "issues links remove",
                "articles create", "articles update", "articles comments add"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
@@ -771,11 +803,15 @@ def _client(base_url: str, token: str) -> httpx.Client:
                                  "Content-Type": "application/json"})
 
 def _request(client: httpx.Client, method: str, path: str, on_error=None, **kwargs):
-    """`on_error` sees any >=400 response before the generic mapping.
+    """`on_error` sees every >=400 response except 401/403, before the
+    generic mapping.
 
-    It exists so a write can translate YouTrack's own error text — which names
-    no field, leaks `{1}` placeholders, and returns 500 for a mere typo — into
-    something an agent can act on. It either _die()s or returns to fall through.
+    401 and 403 die a few lines above as auth failures and never reach the
+    hook. For every other status >= 400 — including 404 — `on_error` runs
+    first; it exists so a write can translate YouTrack's own error text —
+    which names no field, leaks `{1}` placeholders, and returns 500 for a
+    mere typo — into something an agent can act on. It either _die()s or
+    returns to fall through to the generic mapping below.
     """
     for attempt in range(3):
         try:
@@ -791,10 +827,10 @@ def _request(client: httpx.Client, method: str, path: str, on_error=None, **kwar
         break
     if response.status_code in (401, 403):
         _die(2, "auth", "YouTrack rejected the credentials or permission", status=response.status_code)
-    if response.status_code == 404:
-        _die(3, "not_found", "YouTrack resource not found", status=404)
     if on_error is not None and response.status_code >= 400:
         on_error(response)
+    if response.status_code == 404:
+        _die(3, "not_found", "YouTrack resource not found", status=404)
     if response.status_code >= 500 or response.status_code == 429:
         _die(5, "server_error", response.text[:500] or "YouTrack server error", status=response.status_code)
     if response.status_code >= 400:
@@ -810,9 +846,11 @@ USER_FIELDS = "id,login,name,fullName,email"
 PROJECT_FIELDS = "id,name,shortName"
 _CF_PROJECTION = ("customFields(id,name,$type,"
                   "value(id,name,login,text,minutes,presentation))")
+LINK_PROJECTION = ("links(direction,linkType(name,sourceToTarget,targetToSource),"
+                   "issues(idReadable))")
 ISSUE_FIELDS = ("id,idReadable,summary,description,created,updated,resolved,"
                 "project(id,name,shortName),reporter(id,login,fullName),"
-                + _CF_PROJECTION)
+                + _CF_PROJECTION + "," + LINK_PROJECTION)
 ISSUE_SEARCH_FIELDS = ("id,idReadable,summary,description," + _CF_PROJECTION)
 COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 ARTICLE_FIELDS = ("id,idReadable,summary,content,created,updated,"
@@ -826,6 +864,75 @@ ARTICLE_COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
 def _positive_limit(value: int) -> None:
     if value < 1:
         _die(6, "input", "--limit must be positive")
+
+
+def _nonnegative_offset(value: int) -> None:
+    if value < 0:
+        _die(6, "input", "--offset cannot be negative")
+
+
+def _page_params(a, fields: str) -> dict:
+    """Paging params that fetch one extra row so truncation is detectable.
+
+    `$top = limit + 1` is deliberate: YouTrack has no total-count field on these
+    endpoints, so the only way to know the caller's page was cut short is to ask
+    for one more row than we intend to return. `_paged` discards it.
+    """
+    _positive_limit(a.limit)
+    _nonnegative_offset(a.offset)
+    params = {"fields": fields, "$top": a.limit + 1}
+    if a.offset:
+        params["$skip"] = a.offset
+    return params
+
+
+def _paged(rows, limit: int) -> dict:
+    """The list envelope: `limit` items, plus whether the server had more."""
+    rows = rows if isinstance(rows, list) else []
+    return {"items": rows[:limit], "has_more": len(rows) > limit}
+
+
+# The top-level keys `issues search` can emit, after flattening. `fields.<name>`
+# addresses one entry inside the flattened custom-field map.
+_SEARCH_SELECT_KEYS = {"id", "idReadable", "summary", "description", "fields"}
+
+
+def _select_keys(raw: str) -> list[str]:
+    """Validate the key *shape* only.
+
+    A bare key must be one this verb emits — a typo there would otherwise
+    silently yield empty output. A `fields.X` key is accepted without checking
+    X, because custom fields differ per project and a cross-project search must
+    not fail on the first issue that lacks one (D7).
+    """
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys:
+        _die(6, "input", "--select needs at least one key")
+    for key in keys:
+        if key.startswith("fields.") and len(key) > len("fields."):
+            continue
+        if key in _SEARCH_SELECT_KEYS:
+            continue
+        near = difflib.get_close_matches(key, sorted(_SEARCH_SELECT_KEYS), n=3,
+                                         cutoff=0.6)
+        hint = (f"did you mean: {', '.join(near)}?" if near else
+                f"selectable: {', '.join(sorted(_SEARCH_SELECT_KEYS))}, "
+                "or fields.<custom field name>")
+        _die(6, "unknown_select_key", f"cannot select {key!r}", hint)
+    return keys
+
+
+def _apply_select(issue: dict, keys: list[str]) -> dict:
+    picked: dict = {}
+    for key in keys:
+        if key.startswith("fields."):
+            name = key[len("fields."):]
+            fields = issue.get("fields") or {}
+            if name in fields:
+                picked.setdefault("fields", {})[name] = fields[name]
+        elif key in issue:
+            picked[key] = issue[key]
+    return picked
 
 
 # Read order matters: a User value carries both `login` and `name`, and the
@@ -862,6 +969,42 @@ def _flatten_custom_fields(issue):
     fields = issue.pop("customFields") or []
     issue["fields"] = {f["name"]: _flatten_field(f)
                        for f in fields if isinstance(f, dict) and f.get("name")}
+    return issue
+
+
+def _link_phrase(link: dict) -> str | None:
+    """The phrase naming this link from the read issue's side.
+
+    INWARD reads as targetToSource ("subtask of"), OUTWARD and BOTH as
+    sourceToTarget. An undirected type reports targetToSource as "" — measured —
+    so BOTH must not consult it.
+    """
+    link_type = link.get("linkType") or {}
+    key = "targetToSource" if link.get("direction") == "INWARD" else "sourceToTarget"
+    return (link_type.get(key) or "").strip() or None
+
+
+def _flatten_links(issue):
+    """Drop the empty slots and reduce each link to phrase + issue keys.
+
+    The endpoint returns every possible slot on every issue — 7 where there are
+    4 link types — so passing them through would put 7 near-empty entries on
+    every single issue read (measured).
+    """
+    if not isinstance(issue, dict) or "links" not in issue:
+        return issue
+    links = issue.pop("links") or []
+    shaped = []
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        targets = [i.get("idReadable") for i in (link.get("issues") or [])
+                   if isinstance(i, dict) and i.get("idReadable")]
+        phrase = _link_phrase(link)
+        if targets and phrase:
+            shaped.append({"type": phrase, "issues": targets})
+    if shaped:
+        issue["links"] = shaped
     return issue
 
 
@@ -1201,6 +1344,12 @@ def users_me(c, a):
     return _request(c, "GET", "/users/me", params={"fields": USER_FIELDS})
 
 
+def users_find(c, a):
+    params = _page_params(a, USER_FIELDS)
+    params["query"] = a.substring
+    return _paged(_request(c, "GET", "/users", params=params), a.limit)
+
+
 def projects_find(c, a):
     params = {"fields": PROJECT_FIELDS, "$top": 100}
     if a.substring:
@@ -1260,9 +1409,9 @@ def projects_fields_get(c, a):
 
 
 def issues_get(c, a):
-    return _flatten_custom_fields(
+    return _flatten_links(_flatten_custom_fields(
         _request(c, "GET", f"/issues/{_issue_ref(a.issue)}",
-                 params={"fields": ISSUE_FIELDS}))
+                 params={"fields": ISSUE_FIELDS})))
 
 
 def issues_create(c, a):
@@ -1325,17 +1474,20 @@ def issues_update(c, a):
 
 
 def issues_search(c, a):
-    _positive_limit(a.limit)
-    result = _request(c, "GET", "/issues",
-                      params={"fields": ISSUE_SEARCH_FIELDS, "query": a.query,
-                              "$top": a.limit})
-    return [_flatten_custom_fields(i) for i in result]
+    keys = _select_keys(a.select) if a.select else None
+    rows = _request(c, "GET", "/issues",
+                    params={**_page_params(a, ISSUE_SEARCH_FIELDS),
+                            "query": a.query})
+    rows = rows if isinstance(rows, list) else []
+    shaped = [_flatten_custom_fields(i) for i in rows]
+    if keys:
+        shaped = [_apply_select(i, keys) for i in shaped]
+    return _paged(shaped, a.limit)
 
 
 def issues_comments_list(c, a):
-    _positive_limit(a.limit)
-    return _request(c, "GET", f"/issues/{_issue_ref(a.issue)}/comments",
-                    params={"fields": COMMENT_FIELDS, "$top": a.limit})
+    return _paged(_request(c, "GET", f"/issues/{_issue_ref(a.issue)}/comments",
+                           params=_page_params(a, COMMENT_FIELDS)), a.limit)
 
 
 def issues_comments_add(c, a):
@@ -1346,6 +1498,132 @@ def issues_comments_add(c, a):
                     params={"fields": COMMENT_FIELDS}, json={"text": text})
 
 
+# ── issues: links ────────────────────────────────────────────────────────
+#
+# Measured 2026-07-28, see .claude/plans/2026-07-27-youtrack-mcp-parity.md.
+#
+# GET /issues/{id}/links returns every possible slot — 7 where the instance has
+# 4 link types — each with a direction-encoded id (`137-3s` OUTWARD, `137-3t`
+# INWARD, bare `137-0` undirected). That suffix convention is an observed
+# pattern, not a documented contract, so ids are read from this call rather
+# than built. The same payload carries the phrase, so one GET resolves both.
+#
+# `linkType.readOnly` is NOT a write gate: Duplicate and Subtask both report it
+# and both accept links. It governs editing the type definition. Do not branch
+# on it.
+
+def _link_slots(c, ref: str) -> list:
+    slots = _request(c, "GET", f"/issues/{ref}/links",
+                     params={"fields": "id,direction,"
+                                       "linkType(name,sourceToTarget,targetToSource)"})
+    return slots if isinstance(slots, list) else []
+
+
+def _resolve_link(c, ref: str, phrase: str) -> str:
+    """The direction-encoded link id for a direction phrase.
+
+    Fails on an ambiguous phrase rather than picking: uniqueness is measured on
+    one instance, and a custom link type could collide.
+    """
+    wanted = phrase.strip().casefold()
+    slots = _link_slots(c, ref)
+    matches, phrases = [], []
+    for slot in slots:
+        text = _link_phrase(slot)
+        if not text or not slot.get("id"):
+            continue
+        phrases.append(text)
+        if text.casefold() == wanted:
+            matches.append(slot["id"])
+    if len(matches) > 1:
+        _die(6, "ambiguous_link_type",
+             f"{phrase!r} is ambiguous on this instance: it names "
+             f"{len(matches)} link directions",
+             "rename the colliding custom link type, or file the link in the "
+             "YouTrack UI")
+    if not matches:
+        near = difflib.get_close_matches(phrase, phrases, n=3, cutoff=0.6)
+        hint = (f"did you mean: {', '.join(near)}?" if near
+                else f"link directions: {', '.join(sorted(set(phrases)))}")
+        _die(6, "unknown_link_type", f"no link direction named {phrase!r}", hint)
+    return matches[0]
+
+
+def _link_target_error(target: str):
+    """Translate the measured add-path failures, and remove's analogous 404.
+
+    A nonexistent target returns 400 "YouTrack is unable to locate an
+    Issue-type entity unless its ID is also provided" on add's POST — a
+    message about id format, which is not what went wrong. On remove's
+    target-resolution GET, the identical mistake surfaces as a plain 404
+    naming the missing entity instead of that 400.
+
+    Both call sites reach this hook only after `ref` and the link direction
+    are already confirmed to exist — add resolves the direction phrase
+    against `ref` first, and remove's GET addresses `target` directly with
+    nothing else in play — so a 404 here can only be about `target`. The 404
+    branch still requires "not found" in the body rather than firing on bare
+    status alone, so an unrelated 404 shape (see the reorder-safety test)
+    keeps falling through to the generic mapping.
+    """
+    def on_error(response):
+        text = response.text
+        if (response.status_code == 400 and "unable to locate" in text) or (
+                response.status_code == 404 and "not found" in text.lower()):
+            _die(3, "not_found", f"no issue named {target!r}",
+                 "check the target key; links accept a readable key like "
+                 "PROJ-123", status=response.status_code)
+    return on_error
+
+
+def issues_links_add(c, a):
+    ref, target = _issue_ref(a.issue), _issue_ref(a.to)
+    if ref.casefold() == target.casefold():
+        _die(6, "input", f"{ref} cannot be linked to itself",
+             "YouTrack accepts a self-link with 200 and silently creates "
+             "nothing, so this is refused here rather than reported as done")
+    link_id = _resolve_link(c, ref, a.type)
+    _request(c, "POST", f"/issues/{ref}/links/{link_id}/issues",
+             params={"fields": "idReadable"}, json={"idReadable": target},
+             on_error=_link_target_error(target))
+    # Report by reading the issue back: one write populates both sides, and the
+    # POST response echoes only the target.
+    return issues_get(c, argparse.Namespace(issue=ref))
+
+
+def _missing_link_error(ref: str, target: str, phrase: str):
+    """Retranslate remove's 404.
+
+    Measured: deleting a link that does not exist returns 404 whose message
+    names the *target issue* — which exists. Passing it through would tell the
+    caller the issue is missing when the link is.
+    """
+    def on_error(response):
+        if response.status_code == 404:
+            _die(3, "not_found",
+                 f"{ref} has no {phrase!r} link to {target}",
+                 "read the issue to see the links it does have", status=404)
+    return on_error
+
+
+def issues_links_remove(c, a):
+    ref, target = _issue_ref(a.issue), _issue_ref(a.to)
+    if ref.casefold() == target.casefold():
+        _die(6, "input", f"{ref} cannot be unlinked from itself",
+             "YouTrack never creates a self-link — add refuses it — so "
+             "there is nothing here for remove to delete")
+    link_id = _resolve_link(c, ref, a.type)
+    # DELETE needs the internal id; a readable key 404s (measured).
+    resolved = _request(c, "GET", f"/issues/{target}", params={"fields": "id"},
+                        on_error=_link_target_error(target))
+    internal = (resolved or {}).get("id")
+    if not internal:
+        _die(3, "not_found", f"no issue named {target!r}")
+    _request(c, "DELETE", f"/issues/{ref}/links/{link_id}/issues/{internal}",
+             on_error=_missing_link_error(ref, target, a.type))
+    return issues_get(c, argparse.Namespace(issue=ref))
+
+
 def _article_ref(value):
     value = value.strip()
     match = re.search(r"/articles/([^/?#]+)", value)
@@ -1353,10 +1631,9 @@ def _article_ref(value):
 
 
 def articles_list(c, a):
-    _positive_limit(a.limit)
     path = f"/admin/projects/{a.project}/articles" if a.project else "/articles"
-    return _request(c, "GET", path,
-                    params={"fields": ARTICLE_LIST_FIELDS, "$top": a.limit})
+    return _paged(_request(c, "GET", path,
+                           params=_page_params(a, ARTICLE_LIST_FIELDS)), a.limit)
 
 
 def articles_get(c, a):
@@ -1365,9 +1642,8 @@ def articles_get(c, a):
 
 
 def articles_comments_list(c, a):
-    _positive_limit(a.limit)
-    return _request(c, "GET", f"/articles/{_article_ref(a.article)}/comments",
-                    params={"fields": ARTICLE_COMMENT_FIELDS, "$top": a.limit})
+    return _paged(_request(c, "GET", f"/articles/{_article_ref(a.article)}/comments",
+                           params=_page_params(a, ARTICLE_COMMENT_FIELDS)), a.limit)
 
 
 def articles_comments_add(c, a):
@@ -1420,8 +1696,11 @@ ARG_ISSUE         = (("issue",), {})
 ARG_ARTICLE       = (("article",), {})
 ARG_QUERY         = (("query",), {})
 ARG_SUBSTRING_OPT = (("substring",), {"nargs": "?", "default": None})
+ARG_SUBSTRING_REQ = (("substring",), {})
+ARG_OFFSET        = (("--offset",), {"type": int, "default": 0})
 ARG_LIMIT50       = (("--limit",), {"type": int, "default": 50})
 ARG_LIMIT100      = (("--limit",), {"type": int, "default": 100})
+ARG_SELECT        = (("--select",), {"metavar": "KEY,KEY"})
 ARG_PROJECT_REQ   = (("--project",), {"required": True})
 ARG_PROJECT_OPT   = (("--project",), {})
 ARG_PROJECT_POS   = (("project",), {})
@@ -1436,28 +1715,33 @@ ARG_FIELD         = (("--field",), {"action": "append", "default": [],
                                     "metavar": "NAME=VALUE"})
 ARG_FIELDS        = (("--fields",), {"metavar": "JSON|FILE|-"})
 ARG_DRAFT         = (("--draft",), {"action": "store_true"})
+ARG_LINK_TO       = (("--to",), {"required": True})
+ARG_LINK_TYPE     = (("--type",), {"required": True, "metavar": "PHRASE"})
 
 COMMANDS = {
     ("users", "me"):                  (users_me, []),
+    ("users", "find"):                (users_find, [ARG_SUBSTRING_REQ, ARG_LIMIT50, ARG_OFFSET]),
     ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT]),
     ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
     ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
     ("issues", "get"):                (issues_get, [ARG_ISSUE]),
-    ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100]),
+    ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100, ARG_OFFSET, ARG_SELECT]),
     ("issues", "create"):             (issues_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
                                                        ARG_DESCRIPTION, ARG_FIELD,
                                                        ARG_FIELDS, ARG_DRAFT]),
     ("issues", "update"):             (issues_update, [ARG_ISSUE, ARG_FIELD, ARG_FIELDS,
                                                        ARG_SUMMARY_OPT, ARG_DESCRIPTION]),
-    ("issues", "comments", "list"):   (issues_comments_list, [ARG_ISSUE, ARG_LIMIT50]),
+    ("issues", "comments", "list"):   (issues_comments_list, [ARG_ISSUE, ARG_LIMIT50, ARG_OFFSET]),
     ("issues", "comments", "add"):    (issues_comments_add, [ARG_ISSUE, ARG_TEXT]),
-    ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100]),
+    ("issues", "links", "add"):        (issues_links_add, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
+    ("issues", "links", "remove"):     (issues_links_remove, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
+    ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("articles", "get"):              (articles_get, [ARG_ARTICLE]),
     ("articles", "create"):           (articles_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
                                                          ARG_CONTENT, ARG_PARENT]),
     ("articles", "update"):           (articles_update, [ARG_ARTICLE, ARG_SUMMARY_OPT,
                                                          ARG_CONTENT]),
-    ("articles", "comments", "list"): (articles_comments_list, [ARG_ARTICLE, ARG_LIMIT50]),
+    ("articles", "comments", "list"): (articles_comments_list, [ARG_ARTICLE, ARG_LIMIT50, ARG_OFFSET]),
     ("articles", "comments", "add"):  (articles_comments_add, [ARG_ARTICLE, ARG_TEXT]),
 }
 
