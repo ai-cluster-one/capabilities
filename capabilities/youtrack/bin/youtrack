@@ -1398,6 +1398,12 @@ def searches_list(c, a):
                            params=_page_params(a, SAVED_QUERY_FIELDS)), a.limit)
 
 
+# Measured 2026-07-28: GET /groups honours `query=` server-side — a nonsense
+# substring (`query=zzznomatch`) returned 0 rows, a real one (`query=Incidents`)
+# returned exactly "Incidents Team", and no query never silently returned an
+# unfiltered list instead. `_resolve_group_ids` below deliberately does NOT
+# pass `query`: it needs the complete set to resolve a name (and to notice a
+# duplicate), not a filtered subset.
 def groups_find(c, a):
     params = _page_params(a, GROUP_FIELDS)
     if a.substring:
@@ -1550,22 +1556,39 @@ def _resolve_group_ids(c, names: list) -> list:
     bogus name returns the same 400 as a name-instead-of-id — so the server
     cannot tell the caller which mistake they made. Resolving here is the only
     way to say "no such group" precisely.
+
+    Fetches `/groups` once with a fixed `$top: 1000` and no continuation — an
+    instance with more than 1000 groups can have a *valid* group past that page
+    reported as unknown here; this deliberately does not paginate to find it.
+
+    Group names are not guaranteed unique. Mirroring `_resolve_link`'s refusal
+    of an ambiguous link phrase rather than picking one, a name shared by more
+    than one group here is refused (exit 6) instead of silently resolving to
+    whichever row a dict comprehension happened to keep last — guessing here
+    could grant or restrict comment visibility to the wrong group.
     """
     rows = _request(c, "GET", "/groups",
                     params={"fields": GROUP_FIELDS, "$top": 1000})
-    by_name = {(r.get("name") or "").casefold(): r
-               for r in (rows if isinstance(rows, list) else [])
-               if isinstance(r, dict)}
+    by_name: dict = {}
+    for r in (rows if isinstance(rows, list) else []):
+        if isinstance(r, dict) and r.get("name"):
+            by_name.setdefault(r["name"].casefold(), []).append(r)
     resolved = []
     for name in names:
-        entry = by_name.get(name.strip().casefold())
-        if entry is None or not entry.get("id"):
-            known = sorted(r["name"] for r in by_name.values() if r.get("name"))
+        matches = by_name.get(name.strip().casefold(), [])
+        if len(matches) > 1:
+            _die(6, "ambiguous_group_name",
+                 f"{name!r} is ambiguous on this instance: it names "
+                 f"{len(matches)} groups",
+                 "rename one of the colliding groups so the name is unique, "
+                 "or resolve it to an id with `groups find` first")
+        if not matches or not matches[0].get("id"):
+            known = sorted({r["name"] for lst in by_name.values() for r in lst})
             near = difflib.get_close_matches(name, known, n=3, cutoff=0.6)
             hint = (f"did you mean: {', '.join(near)}?" if near
                     else f"groups visible to this token: {', '.join(known)}")
             _die(6, "unknown_group", f"no group named {name!r}", hint)
-        resolved.append({"id": entry["id"]})
+        resolved.append({"id": matches[0]["id"]})
     return resolved
 
 
@@ -1577,6 +1600,12 @@ def _comment_visibility(c, users: list, groups: list):
     """
     if not users and not groups:
         return None
+    for login in users:
+        if not login.strip():
+            _die(6, "input", "--permitted-users cannot be empty")
+    for group_name in groups:
+        if not group_name.strip():
+            _die(6, "input", "--permitted-groups cannot be empty")
     visibility = {"$type": "LimitedVisibility"}
     if users:
         visibility["permittedUsers"] = [{"login": u.strip()} for u in users]

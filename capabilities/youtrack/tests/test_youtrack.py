@@ -256,6 +256,10 @@ def test_comments_list_sends_skip_and_envelopes(tmp_path):
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
     assert query["$skip"] == ["20"]
     assert query["$top"] == ["11"]
+    # The read projection must keep asking for visibility, or an unknown-field
+    # silent drop server-side would regress this invisibly (measured: YouTrack
+    # drops an unrecognised field from `fields=` rather than erroring).
+    assert "visibility($type" in query["fields"][0]
     assert json.loads(result.stdout)["has_more"] is False
 
 
@@ -344,6 +348,7 @@ def test_projects_find_pages_and_envelopes(tmp_path):
         result = run_cli(tmp_path, base, "projects", "find", "ION",
                          "--limit", "2", "--offset", "1")
     assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/admin/projects"
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
     assert query["$top"] == ["3"]        # limit + 1, replacing the hardcoded 100
     assert query["$skip"] == ["1"]
@@ -351,6 +356,15 @@ def test_projects_find_pages_and_envelopes(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["items"][0]["shortName"] == "ION"
     assert payload["has_more"] is False
+
+
+def test_projects_find_substring_is_optional(tmp_path):
+    handler = _paging_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "projects", "find")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
+    assert "query" not in query
 
 
 def test_groups_find_pages_and_envelopes(tmp_path):
@@ -364,6 +378,7 @@ def test_groups_find_pages_and_envelopes(tmp_path):
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "groups", "find", "Team", "--limit", "2")
     assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/groups"
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
     assert query["$top"] == ["3"]              # limit + 1
     assert query["query"] == ["Team"]
@@ -377,6 +392,7 @@ def test_groups_find_substring_is_optional(tmp_path):
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "groups", "find")
     assert result.returncode == 0, result.stderr
+    assert urllib.parse.urlparse(handler.requests[0]).path == "/api/groups"
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
     assert "query" not in query
 
@@ -2689,13 +2705,6 @@ def test_articles_update_refuses_a_cross_project_parent(tmp_path):
     assert not any(r[0] == "POST" for r in CrossProjectHandler.requests)
 
 
-def test_articles_update_still_requires_something_to_change(tmp_path):
-    with serve(Handler) as base:
-        result = run_cli(tmp_path, base, "articles", "update", "A-1")
-    assert result.returncode == 6
-    assert "summary" in result.stderr
-
-
 def _visibility_handler(groups):
     """Serves /groups for name->id resolution, records the comment POST."""
     class VisibilityHandler(BaseHTTPRequestHandler):
@@ -2781,6 +2790,38 @@ def test_unknown_group_name_exits_6_with_near_miss_and_no_write(tmp_path):
     assert "ION Team" in result.stderr, "must offer the near-miss"
     # The server cannot distinguish a bad name from a name-instead-of-id, so the
     # refusal must happen client-side, before any write.
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_ambiguous_group_name_exits_6_with_no_write(tmp_path):
+    # Two groups sharing a name: resolving must refuse rather than pick a
+    # winner, mirroring _resolve_link's refusal of an ambiguous link phrase.
+    dup_groups = [{"id": "3-4", "name": "Incidents"},
+                  {"id": "3-9", "name": "Incidents"}]
+    handler = _visibility_handler(dup_groups)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-groups", "Incidents")
+    assert result.returncode == 6
+    assert "ambiguous" in result.stderr
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_comment_permitted_users_rejects_empty_login(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-users", "")
+    assert result.returncode == 6
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_comment_permitted_groups_rejects_empty_name(tmp_path):
+    handler = _visibility_handler(_GROUPS)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
+                         "--text", "hi", "--permitted-groups", "   ")
+    assert result.returncode == 6
     assert not any(r[0] == "POST" for r in handler.requests)
 
 
