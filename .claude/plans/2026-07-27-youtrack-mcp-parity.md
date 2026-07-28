@@ -1,6 +1,6 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status — 2026-07-28: ✅ M1 and ✅ M2 are both shipped and merged to `upstream/main`. M3 is next; M4 outstanding.**
+**Status — 2026-07-28: ✅ M1, ✅ M2 and ✅ M3 are shipped. M1 and M2 are merged to `upstream/main`; M3 is on `feat/youtrack-m3-work-the-board`, unpushed. M4 outstanding.**
 
 - ✅ **M1** — PR #14, catalog repair in #15.
 - ✅ **M2 step 0** — write-direction probe closed, then extended the same day to the *create* path (see "Create path — measured"), which settled step 2's and step 5's central premises.
@@ -8,7 +8,7 @@
 - ✅ **M2 steps 2–5** (`issues create` with `--field`/`--fields`, type-aware marshalling, schema-backed error translation, `--draft`) — PR #20, whose commit declares "Completes M2". 42 new tests; 105 tests total in `capabilities/youtrack/tests/test_youtrack.py`.
 - ✅ **Decision D1** — the misnamed `required` key is gone; `projects fields *` now emit `canBeEmpty` faithfully (breaking change, landed in PR #20).
 - ⬜ **M2 "Done when" is code-complete but not live-demonstrated** — the one-call sprint-ready IONDEV create over `text` fields is still unproven against the live server; see the note under M2's "Done when".
-- 🔨 **M3** — design approved and step 0 (link probe) closed 2026-07-28; steps 1–3 outstanding. ⬜ **M4** — outstanding.
+- ✅ **M3** — shipped 2026-07-28: `users find`, `issues links add`/`remove`, links on `issues get`, `--offset` on every `--limit` verb, `--select` on `issues search`. 147 tests pass; verified live against ION. ⬜ **M4** — outstanding.
 - **Standing constraint (owner, 2026-07-28): all experiments run against the ION project; IONDEV is not to be touched.** What ION cannot prove stays recorded as unproven — which permanently blocks M2's Group 1 gap, since ION carries no `text` field.
 
 This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
@@ -39,15 +39,15 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `create_article` | `articles create` (also `--parent`) | ✅ parity+ |
 | `update_article` | `articles update` | ⬜ near — cannot re-parent (M4) |
 | `add_issue_comment` | `issues comments add` | ⬜ near — no `permittedUsers`/`permittedGroups` (M4) |
-| `get_issue_comments` | `issues comments list --limit` | ⬜ partial — no offset (M3) |
+| `get_issue_comments` | `issues comments list --limit --offset` | ✅ **parity** (M3) |
 | `get_issue` | `issues get` | ✅ **parity** (M1 — custom fields now returned) |
-| `search_issues` | `issues search QUERY --limit` | ⬜ partial — no offset, no `--select`, no sort (M3) |
+| `search_issues` | `issues search QUERY --limit --offset --select` | ✅ **parity** (M3 — sort still absent, deliberately) |
 | `create_issue` | `issues create --project/--summary/--description/--field/--fields` | ✅ **parity** (M2 step 2) |
 | `update_issue` | `issues update --field/--fields/--summary/--description` | ✅ **parity** (M2 step 1) |
 | `search_articles` | `articles list` | ⬜ partial — a listing, not a query (M4) |
 | `get_issue_fields_schema` | `projects fields list` · `projects fields get` | ✅ **parity** (M1) |
-| `find_user` | — | ⬜ absent (M3) |
-| `link_issues` | — | ⬜ absent (M3) |
+| `find_user` | `users find` | ✅ **parity** (M3) |
+| `link_issues` | `issues links add` · `issues links remove` | ✅ **parity** (M3) |
 | `change_issue_assignee` | `issues update --field Assignee=…` | ✅ covered — deliberate drop, no own verb |
 | `manage_issue_tags` | — | ⬜ absent (M4) |
 | `log_work` | — | ⬜ absent (M4) |
@@ -58,7 +58,7 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `create_draft_issue` | `issues create --draft` | ✅ **parity** (M2 step 5) |
 | — | `articles comments list`, `articles comments add` | CLI-only; MCP has no article-comment tools |
 
-**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1 and M2 shipped: 9 at parity, 5 near/partial, 8 absent, plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** M3 closes 4 of the 13 remaining — `find_user`, `link_issues`, and the paging gaps on `search_issues` and `get_issue_comments` — leaving M4 the long tail.
+**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1, M2 and M3 all shipped: 13 at parity, 1 near/partial (`search_articles`), 8 absent, plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** Everything still open is M4's long tail. `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
 
 Attachments are in **neither** surface — they belong to the 44-tool community server, not JetBrains'. Not a parity item.
 
@@ -512,14 +512,14 @@ The milestone that makes the capability usable, and the only one with real desig
 
 **And it is now blocked indefinitely, by decision rather than by effort (2026-07-28).** Closing it needs one real `issues create` carrying both `text` fields, but the owner has scoped all experiments to **ION** and ruled IONDEV untouchable — and ION's live schema carries no `text` field (11 fields, 8 types, none of them `text`). Unblocking requires either IONDEV write authorization or a `text` field added to ION. Until then this criterion stays open on purpose; do not let a later reader mistake it for an oversight.
 
-## M3 — Work the board — 🔨 IN PROGRESS
+## M3 — Work the board — ✅ SHIPPED
 
 Design approved 2026-07-28. **All experiments are confined to the ION project; IONDEV is not to be touched** — anything ION cannot prove stays recorded as unproven.
 
-0. **✅ Probe the link model first — done 2026-07-28**, see "Link model — measured" above. Scoped to links only: `users find` and paging needed no probe. Seven questions closed; it changed three things in the approved design (noted inline below) and produced one finding that would have broken the milestone silently — `readOnly: true` on `Subtask` is not a write gate.
-1. **`users find`** — a hard prerequisite for Assignee/Requestor/Approver. M2 can marshal `{"login": …}` blind, but nothing can confirm the login exists. `GET /api/users?query=…`, reusing the existing `USER_FIELDS` projection. **Decision: it stays a standalone lookup verb and is not wired into create/update pre-flight**, continuous with M2's deliberate exclusion of user-typed fields from the allowed-value pre-check — the visible user set is token-scoped, so a client-side refusal would invent a rejection the server would not make.
-2. **`issues links add` / `remove`**, plus links on `issues get`. The consumer's guide requires `parentIssue` for Sub-Tasks; today parentage is prose in descriptions ("Part of IONDEV-867") and invisible to any query. Grammar: `issues links add ISSUE --to ISSUE --type "subtask of"` — **the direction phrase is the type**, which the probe confirms is unambiguous. Bad phrases reuse the `difflib` near-miss plus `_die_bad_value` machinery M2 already shipped, so link errors need no new translation code. No `issues links list`; `issues get` covers reads. Three probe-driven changes from the approved design: **link ids are read off `GET /issues/{id}/links`, not built by suffix arithmetic**; **empty link slots are filtered out** of `issues get` (the endpoint returns all 7 regardless); and **self-links are refused client-side at exit 6**, because the server returns 200 and silently creates nothing.
-3. **`--offset`** on `issues search` and `issues comments list`; **`--select`** on `issues search`. The current limit silently truncates, so a sprint rollup is quietly wrong rather than obviously wrong. Paging matters more than projection. **`--select` filters the CLI's own flattened output on dotted paths** (`idReadable,summary,fields.State`), applied after shaping, so it cannot emit a wire shape a consumer has not seen. Truncation is signalled by fetching `$top = limit + 1`, returning `limit`, and emitting `has_more` — which requires an **envelope** (`{"items": […], "has_more": bool}`) and is therefore a **breaking output change**, the second in this series after M2's `canBeEmpty` rename.
+0. **✅ Probe the link model — done 2026-07-28**, see "Link model — measured" above. Scoped to links only: `users find` and paging needed no probe. Seven questions closed; it changed three things in the approved design (noted inline below) and produced one finding that would have broken the milestone silently — `readOnly: true` on `Subtask` is not a write gate.
+1. **✅ `users find`** — a hard prerequisite for Assignee/Requestor/Approver. M2 can marshal `{"login": …}` blind, but nothing can confirm the login exists. `GET /api/users?query=…`, reusing the existing `USER_FIELDS` projection. **Decision: it stays a standalone lookup verb and is not wired into create/update pre-flight**, continuous with M2's deliberate exclusion of user-typed fields from the allowed-value pre-check — the visible user set is token-scoped, so a client-side refusal would invent a rejection the server would not make.
+2. **✅ `issues links add` / `remove`**, plus links on `issues get`. The consumer's guide requires `parentIssue` for Sub-Tasks; today parentage is prose in descriptions ("Part of IONDEV-867") and invisible to any query. Grammar: `issues links add ISSUE --to ISSUE --type "subtask of"` — **the direction phrase is the type**, which the probe confirms is unambiguous. Bad phrases reuse the `difflib` near-miss plus `_die_bad_value` machinery M2 already shipped, so link errors need no new translation code. No `issues links list`; `issues get` covers reads. Three probe-driven changes from the approved design: **link ids are read off `GET /issues/{id}/links`, not built by suffix arithmetic**; **empty link slots are filtered out** of `issues get` (the endpoint returns all 7 regardless); and **self-links are refused client-side at exit 6**, because the server returns 200 and silently creates nothing.
+3. **✅ `--offset`** on every `--limit` verb (widened from the two named here) and **`--select`** on `issues search`. The current limit silently truncates, so a sprint rollup is quietly wrong rather than obviously wrong. Paging matters more than projection. **`--select` filters the CLI's own flattened output on dotted paths** (`idReadable,summary,fields.State`), applied after shaping, so it cannot emit a wire shape a consumer has not seen. Truncation is signalled by fetching `$top = limit + 1`, returning `limit`, and emitting `has_more` — which requires an **envelope** (`{"items": […], "has_more": bool}`) and is therefore a **breaking output change**, the second in this series after M2's `canBeEmpty` rename.
 
 **Done when:** an agent can assign to a person it looked up, file a Sub-Task linked to its parent, and page a full sprint without truncation. **All three are demonstrable on ION** — link types are instance-global and paging is project-independent, so unlike M2's acceptance criterion this one is not blocked by the ION-only constraint.
 
