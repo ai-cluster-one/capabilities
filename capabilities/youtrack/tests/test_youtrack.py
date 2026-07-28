@@ -268,6 +268,45 @@ def test_offset_zero_is_omitted_from_the_request(tmp_path):
     assert "$skip" not in query
 
 
+def test_select_filters_core_and_nested_field_keys(tmp_path):
+    rows = [{"idReadable": "DEMO-1", "summary": "s", "description": "long text",
+             "customFields": [
+                 {"name": "State", "$type": "StateIssueCustomField",
+                  "value": {"name": "Open"}},
+                 {"name": "Points", "$type": "SimpleIssueCustomField",
+                  "value": 3},
+             ]}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--select", "idReadable,fields.State")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["items"] == [
+        {"idReadable": "DEMO-1", "fields": {"State": "Open"}}
+    ]
+
+
+def test_select_omits_a_field_absent_from_this_issue(tmp_path):
+    rows = [{"idReadable": "DEMO-1", "summary": "s", "customFields": []}]
+    handler = _paging_handler(rows)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--select", "idReadable,fields.Points")
+    assert result.returncode == 0, result.stderr
+    # A field this issue does not carry is absent, not an error: custom fields
+    # differ per project and a cross-project search must survive it.
+    assert json.loads(result.stdout)["items"] == [{"idReadable": "DEMO-1"}]
+
+
+def test_select_rejects_an_unknown_key_shape(tmp_path):
+    handler = _paging_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "search", "project: DEMO",
+                         "--select", "idReadabel")
+    assert result.returncode == 6
+    assert "idReadable" in result.stderr, "must offer the near-miss"
+
+
 def test_projects_find_smoke(tmp_path):
     class ProjectsHandler(BaseHTTPRequestHandler):
         requests = []

@@ -63,9 +63,16 @@ Read:
   youtrack projects fields get ID NAME       One field's schema; NAME matches
                                              case-insensitively.
   youtrack issues get ISSUE                  Read one issue (ID or URL).
-  youtrack issues search QUERY [--limit N] [--offset N]
+  youtrack issues search QUERY [--limit N] [--offset N] [--select KEY,KEY]
                                              Search issues server-side using
                                              YouTrack query language.
+                                             --select trims the output to the
+                                             named keys: core attributes
+                                             (idReadable, summary, …) or
+                                             fields.<name> for one custom
+                                             field. A named custom field the
+                                             issue does not carry is omitted,
+                                             not an error.
   youtrack issues comments list ISSUE [--limit N] [--offset N]
                                              Read recent comments on an issue.
   youtrack articles list [--project ID] [--limit N] [--offset N]
@@ -865,6 +872,49 @@ def _paged(rows, limit: int) -> dict:
     return {"items": rows[:limit], "has_more": len(rows) > limit}
 
 
+# The top-level keys `issues search` can emit, after flattening. `fields.<name>`
+# addresses one entry inside the flattened custom-field map.
+_SEARCH_SELECT_KEYS = {"id", "idReadable", "summary", "description", "fields"}
+
+
+def _select_keys(raw: str) -> list[str]:
+    """Validate the key *shape* only.
+
+    A bare key must be one this verb emits — a typo there would otherwise
+    silently yield empty output. A `fields.X` key is accepted without checking
+    X, because custom fields differ per project and a cross-project search must
+    not fail on the first issue that lacks one (D7).
+    """
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys:
+        _die(6, "input", "--select needs at least one key")
+    for key in keys:
+        if key.startswith("fields.") and len(key) > len("fields."):
+            continue
+        if key in _SEARCH_SELECT_KEYS:
+            continue
+        near = difflib.get_close_matches(key, sorted(_SEARCH_SELECT_KEYS), n=3,
+                                         cutoff=0.6)
+        hint = (f"did you mean: {', '.join(near)}?" if near else
+                f"selectable: {', '.join(sorted(_SEARCH_SELECT_KEYS))}, "
+                "or fields.<custom field name>")
+        _die(6, "unknown_select_key", f"cannot select {key!r}", hint)
+    return keys
+
+
+def _apply_select(issue: dict, keys: list[str]) -> dict:
+    picked: dict = {}
+    for key in keys:
+        if key.startswith("fields."):
+            name = key[len("fields."):]
+            fields = issue.get("fields") or {}
+            if name in fields:
+                picked.setdefault("fields", {})[name] = fields[name]
+        elif key in issue:
+            picked[key] = issue[key]
+    return picked
+
+
 # Read order matters: a User value carries both `login` and `name`, and the
 # login is what writes need. Bundle elements (Enum/State/Owned/Version/Build)
 # carry `name`; text fields `text`; periods `presentation`.
@@ -1368,10 +1418,14 @@ def issues_update(c, a):
 
 
 def issues_search(c, a):
+    keys = _select_keys(a.select) if a.select else None
     rows = _request(c, "GET", "/issues",
                     params={**_page_params(a, ISSUE_SEARCH_FIELDS),
                             "query": a.query})
-    return _paged([_flatten_custom_fields(i) for i in rows], a.limit)
+    shaped = [_flatten_custom_fields(i) for i in rows]
+    if keys:
+        shaped = [_apply_select(i, keys) for i in shaped]
+    return _paged(shaped, a.limit)
 
 
 def issues_comments_list(c, a):
@@ -1463,6 +1517,7 @@ ARG_SUBSTRING_REQ = (("substring",), {})
 ARG_OFFSET        = (("--offset",), {"type": int, "default": 0})
 ARG_LIMIT50       = (("--limit",), {"type": int, "default": 50})
 ARG_LIMIT100      = (("--limit",), {"type": int, "default": 100})
+ARG_SELECT        = (("--select",), {"metavar": "KEY,KEY"})
 ARG_PROJECT_REQ   = (("--project",), {"required": True})
 ARG_PROJECT_OPT   = (("--project",), {})
 ARG_PROJECT_POS   = (("project",), {})
@@ -1485,7 +1540,7 @@ COMMANDS = {
     ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
     ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
     ("issues", "get"):                (issues_get, [ARG_ISSUE]),
-    ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100, ARG_OFFSET]),
+    ("issues", "search"):             (issues_search, [ARG_QUERY, ARG_LIMIT100, ARG_OFFSET, ARG_SELECT]),
     ("issues", "create"):             (issues_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
                                                        ARG_DESCRIPTION, ARG_FIELD,
                                                        ARG_FIELDS, ARG_DRAFT]),
