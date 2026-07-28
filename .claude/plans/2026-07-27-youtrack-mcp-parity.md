@@ -551,7 +551,11 @@ Fill on demand, not speculatively. Full enumeration and cost in "What remains" b
 
 # What remains — as of 2026-07-28, M1–M3 merged
 
-**10 items close the last 9 MCP gaps** (`update_article` re-parent and `search_articles` both live in articles). Nothing here is blocked on a measurement: every gap is a known endpoint on a surface the CLI already models. Grouped by what a caller can do afterwards, cheapest first.
+**9 items close the last 9 MCP gaps, one-to-one** — Group A 3, Group B 4, Group C 2. A tenth work item, `projects find` paging, closes no parity gap and is tracked separately below.
+
+**All of Groups A and B are unblocked; Group C is not.** Every A and B gap is a known endpoint on a surface the CLI already models, with no unmeasured behaviour. Group C's two items both touch bundle-backed or unit-parsed values and need a step-0 probe first — see Group C for what specifically is unknown.
+
+Grouped by what a caller can do afterwards, cheapest first. **All three groups are substructure inside M4** — they are not new milestones.
 
 ## Group A — three near-misses on verbs that already exist
 
