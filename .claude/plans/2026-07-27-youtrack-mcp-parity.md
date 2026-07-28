@@ -552,7 +552,7 @@ The reliable way to regenerate it — the hash covers `capabilities/<name>/` rec
 
 ## Tests
 
-`tests/test_youtrack.py` covers the existing verbs; extend per milestone. Four tests are load-bearing:
+`tests/test_youtrack.py` covers the existing verbs (105 as of M2); extend per milestone. These are the load-bearing ones for M1–M2:
 
 - **One per field type** in the marshalling table — the one place a wrong constant produces a plausible-looking request that YouTrack rejects. Assert the exact request body per type; the measured shapes above are the fixtures.
 - **`date` normalization**: writing `2026-08-15` must send noon UTC (`1786795200000`), and reading noon UTC back must render `2026-08-15`. Assert the *calendar date*, never epoch equality across a round trip — and cover `date and time` separately, where epoch equality *does* hold.
@@ -562,6 +562,21 @@ The reliable way to regenerate it — the hash covers `capabilities/<name>/` rec
 - **Workflow rejection**: a 400 with `error_type: workflow` must surface `error_rule_name` and must *not* be reported as an input error.
 
 Dropped from this list: the original client-side atomicity test. The server rolls a mixed-validity batch back on its own (measured), so there is nothing client-side to assert — and under option (C) the request is deliberately sent.
+
+### M3 tests
+
+The measured link model above supplies the fixtures. Load-bearing, in rough order of what would hurt most if it regressed:
+
+- **`readOnly` is not a gate.** A fixture link type with `readOnly: true` must still resolve and write. This is the regression guard for the finding that would have silently broken the milestone; without it, a later "tidy-up" that respects the flag disables `subtask of` and every other test still passes.
+- **Self-link is refused before any HTTP call.** `--to` equal to the issue must exit `6` **and issue no request** — asserting the exit code alone is not enough, because the server returns `200` for a self-link, so a client that sent it would look correct to a naive test.
+- **All 7 phrases resolve** to the right link id and direction, case-insensitively. An unknown phrase exits `6` with a near-miss over the legal phrases. **An ambiguous phrase — two types sharing one — must fail loudly, not pick.** Phrase uniqueness is measured on one instance only; a custom link type could collide, and this test is what keeps that from becoming a silent mis-link.
+- **Empty link slots are filtered.** An issue payload carrying all 7 slots with one populated must emit exactly one `links` entry.
+- **`remove` resolves the internal id.** It must perform the resolution GET and send DELETE with the internal id; a readable key in the DELETE path is the measured 404.
+- **`remove`'s 404 is retranslated.** A 404 whose message names the *target issue* must surface as exit `3` naming the **link**, since the issue in that message demonstrably exists.
+- **`has_more` boundary.** Server returns exactly `limit` → `has_more: false`; server returns `limit + 1` → `has_more: true` **and exactly `limit` items emitted**. The off-by-one here is the whole point of the flag.
+- **`--offset N` sends `$skip=N`** on both `issues search` and `issues comments list`.
+- **`--select` dotted paths.** `fields.State` selects into the nested map. **Decision: a key that is neither a known core attribute nor `fields.<anything>` exits `6` with a near-miss; a `fields.X` naming a field absent from a given issue is simply omitted for that issue, not an error** — custom fields legitimately differ per project, so a search spanning projects must not fail on the first issue lacking one. Without this split, either a typo silently yields empty output or a valid cross-project search dies.
+- **`issues links add` / `remove` ∈ `WRITE_VERBS`** — covered transitively by the existing `WRITE_VERBS ⊆ COMMANDS` test, but assert membership directly too: that test catches a typo in a path, not an omission.
 
 ## Consumer refresh
 
