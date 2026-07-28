@@ -3034,3 +3034,255 @@ def test_comment_without_visibility_flags_sends_no_visibility_key(tmp_path):
     assert result.returncode == 0, result.stderr
     post = [r for r in handler.requests if r[0] == "POST"][0]
     assert "visibility" not in post[2]
+
+
+_WORK_ITEM = {"id": "162-1", "date": 1784505600000,
+              "duration": {"minutes": 90, "presentation": "1h 30m",
+                           "$type": "DurationValue"},
+              "text": None, "type": None,
+              "author": {"login": "s.royz"}, "created": 1785273759478}
+
+_PROJECT_WORK_TYPES = [{"id": "139-0", "name": "Development"},
+                       {"id": "139-1", "name": "Testing"}]
+
+
+def _work_handler(items=None, types=None, *, post_status=200, post_body=None):
+    """Serves the issue read (for its project), the project's work-item types,
+    the work-item POST, and the work-item list."""
+    items = [_WORK_ITEM] if items is None else items
+    types = _PROJECT_WORK_TYPES if types is None else types
+
+    class WorkHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = b"" if payload is None else json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route.endswith("/timeTrackingSettings/workItemTypes"):
+                self._reply(types)
+            elif route.endswith("/timeTracking/workItems"):
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                top = int(query.get("$top", ["100"])[0])
+                self._reply(items[:top])
+            else:                                   # the issue, for its project
+                self._reply({"id": "2-1", "idReadable": "DEMO-1",
+                             "project": {"id": "0-1", "shortName": "DEMO"}})
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+            self._reply(post_body if post_body is not None else _WORK_ITEM,
+                        post_status)
+
+    WorkHandler.requests = []
+    return WorkHandler
+
+
+def test_work_log_sends_duration_as_presentation(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1h 30m")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert urllib.parse.urlparse(post[1]).path == \
+        "/api/issues/DEMO-1/timeTracking/workItems"
+    # Measured: minutes and presentation together return "Conflict in period
+    # value", and the server owns the grammar (and the workday length).
+    assert post[2]["duration"] == {"presentation": "1h 30m"}
+    assert "minutes" not in post[2]["duration"]
+
+
+def test_work_log_without_a_type_makes_exactly_one_request(tmp_path):
+    """No --type means no project lookup, so no issue read either."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "45m")
+    assert result.returncode == 0, result.stderr
+    assert len(handler.requests) == 1
+    assert handler.requests[0][0] == "POST"
+
+
+def test_work_log_refuses_a_unit_less_duration_before_any_request(tmp_path):
+    """Measured: YouTrack reads a bare number as HOURS, so --duration 90
+    intending minutes logs 90 hours. Refused rather than passed through."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "90")
+    assert result.returncode == 6
+    assert "90m" in result.stderr or "unit" in result.stderr.lower()
+    assert not handler.requests, "must not reach the server"
+
+
+def test_work_log_accepts_unit_forms_the_server_parses(tmp_path):
+    for raw in ["90m", "1h30m", "1h 30m", "2d", "1w", "1H30M"]:
+        handler = _work_handler()
+        with serve(handler) as base:
+            result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                             "--duration", raw)
+        assert result.returncode == 0, f"{raw}: {result.stderr}"
+
+
+def test_work_log_resolves_the_type_against_the_projects_set(tmp_path):
+    """Measured: a type valid instance-wide can be rejected by the project
+    (Review), so resolution must read the project's list, which costs one read
+    of the issue to learn its project."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--type", "testing")
+    assert result.returncode == 0, result.stderr
+    gets = [urllib.parse.urlparse(r[1]).path for r in handler.requests
+            if r[0] == "GET"]
+    assert "/api/admin/projects/0-1/timeTrackingSettings/workItemTypes" in gets
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    # Measured: the type write takes an id and rejects a name.
+    assert post[2]["type"] == {"id": "139-1"}
+
+
+def test_work_log_unknown_type_exits_6_with_near_miss_and_no_write(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--type", "Developmnt")
+    assert result.returncode == 6
+    assert "Development" in result.stderr
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_work_log_type_absent_from_the_project_is_refused_here(tmp_path):
+    """Review exists instance-wide but not on this project — the near-miss must
+    be over the PROJECT's set, so an instance-only name is simply unknown."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--type", "Review")
+    assert result.returncode == 6
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_work_log_sends_the_date_as_noon_utc_epoch_ms(tmp_path):
+    """The server snaps to 00:00 of the day and whether that snap is UTC or
+    profile-timezone is unmeasurable on ION, so noon is sent for its ~12h of
+    margin. Assert the request, never epoch equality on the round trip."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--date", "2026-07-20")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2]["date"] == 1784548800000        # 2026-07-20T12:00:00Z
+
+
+def test_work_log_rejects_a_malformed_date(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--date", "20/07/2026")
+    assert result.returncode == 6
+    assert not handler.requests
+
+
+def test_work_log_renders_the_read_back_date_as_a_calendar_day(tmp_path):
+    """The server stores 00:00 of the day; epoch ms is a hostile interface for
+    a calendar date, exactly as for `date` custom fields."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1h 30m")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["date"] == "2026-07-20"
+
+
+def test_work_log_emits_both_duration_representations_without_type(tmp_path):
+    """presentation is re-rendered by the server and minutes reflects the
+    project's workday length, so each carries what the other loses. $type never
+    reaches output."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1h 30m")
+    assert result.returncode == 0, result.stderr
+    duration = json.loads(result.stdout)["duration"]
+    assert duration == {"minutes": 90, "presentation": "1h 30m"}
+    assert "$type" not in duration
+
+
+def test_work_log_passes_text_through(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "5m", "--text", "line one\nline two")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2]["text"] == "line one\nline two"
+
+
+def test_work_log_translates_an_unparseable_duration(tmp_path):
+    handler = _work_handler(
+        post_status=400,
+        post_body={"error": "bad_request",
+                   "error_description": "Value 1.5h cannot be parsed"})
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1.5h")
+    assert result.returncode == 6
+    assert "1.5h" in result.stderr
+
+
+def test_work_log_translates_a_non_positive_duration(tmp_path):
+    handler = _work_handler(
+        post_status=400,
+        post_body={"error": "invalid_properties",
+                   "error_description": "Work duration can not be negative or empty"})
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "0m")
+    assert result.returncode == 6
+
+
+def test_work_list_pages_and_envelopes(tmp_path):
+    items = [dict(_WORK_ITEM, id=f"162-{n}") for n in range(5)]
+    handler = _work_handler(items)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "list", "DEMO-1",
+                         "--limit", "2", "--offset", "1")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(handler.requests[0][1]).query)
+    assert query["$top"] == ["3"]           # limit + 1
+    assert query["$skip"] == ["1"]
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 2
+    assert payload["has_more"] is True
+    assert payload["items"][0]["date"] == "2026-07-20"
+    assert "$type" not in payload["items"][0]["duration"]
+
+
+def test_work_list_of_an_issue_with_no_items(tmp_path):
+    handler = _work_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "list", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"items": [], "has_more": False}
+
+
+def test_work_log_is_gated_and_list_is_not(tmp_path):
+    verbs = _write_verbs()
+    assert "issues work log" in verbs
+    assert "issues work list" not in verbs

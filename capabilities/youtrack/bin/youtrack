@@ -89,6 +89,9 @@ Read:
                                              not an error.
   youtrack issues comments list ISSUE [--limit N] [--offset N]
                                              Read recent comments on an issue.
+  youtrack issues work list ISSUE [--limit N] [--offset N]
+                                             Work items logged on an issue:
+                                             date, duration, type, author, text.
   youtrack articles list [--project ID] [--limit N] [--offset N]
                                              List knowledge-base articles (paged;
                                              --project scopes to one project). This
@@ -173,6 +176,24 @@ Write:
                                              write. add is idempotent; removing
                                              a tag the issue does not carry
                                              exits 3.
+  youtrack issues work log ISSUE             Log time against an issue. Adds an
+        --duration D [--date YYYY-MM-DD]      entry; it never rewrites a field.
+        [--type NAME] [--text TEXT|-]         --duration needs a unit — 45m,
+                                             1h 30m, 2d — because YouTrack reads
+                                             a bare number as HOURS, so a
+                                             unit-less value is refused here. 1d
+                                             is the project's workday, not 24h,
+                                             and the server re-renders the
+                                             duration it stores, so the reply
+                                             carries both minutes and its own
+                                             presentation. --type is optional
+                                             and is validated against this
+                                             project's work item types, which
+                                             can differ from the instance's.
+                                             --date is a calendar day and
+                                             defaults to today. The Spent time
+                                             field is calculated from these
+                                             entries and cannot be set directly.
   youtrack articles create --project ID      Create an article in a project
         --summary S [--content TEXT|-]        (database entity id); optionally give
         [--parent ID|URL]                    a parent article to create a sub-article.
@@ -226,7 +247,7 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {"issues create", "issues update", "issues comments add",
                "issues links add", "issues links remove",
-               "issues tags add", "issues tags remove",
+               "issues tags add", "issues tags remove", "issues work log",
                "articles create", "articles update", "articles comments add"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
@@ -904,6 +925,8 @@ ARTICLE_FIELDS = ("id,idReadable,summary,content,created,updated,"
 ARTICLE_LIST_FIELDS = ("id,idReadable,summary,updated,"
                        "project(id,name,shortName),parentArticle(idReadable)")
 ARTICLE_COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
+WORK_ITEM_FIELDS = ("id,date,duration(minutes,presentation),text,"
+                    "type(id,name),author(login),created")
 
 def _positive_limit(value: int) -> None:
     if value < 1:
@@ -996,14 +1019,24 @@ def _flatten_value(value):
     return value
 
 
+def _utc_date(ms: int) -> str:
+    """Epoch ms -> YYYY-MM-DD in UTC.
+
+    Both a `date` custom field (snapped by the server to noon UTC) and a work
+    item's date (snapped to 00:00) are calendar days, and epoch ms is a hostile
+    interface for one.
+    """
+    return datetime.datetime.fromtimestamp(
+        ms / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
 def _flatten_field(entry):
     value = _flatten_value(entry.get("value"))
     # A `date` field carries no time of day — the server snaps it to noon UTC —
     # so epoch ms both misleads and does not survive a round trip. `date and
     # time` is SimpleIssueCustomField and keeps its precision.
     if entry.get("$type") == "DateIssueCustomField" and isinstance(value, int):
-        return datetime.datetime.fromtimestamp(
-            value / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
+        return _utc_date(value)
     return value
 
 
@@ -1863,6 +1896,150 @@ def issues_tags_remove(c, a):
     return issues_get(c, argparse.Namespace(issue=ref))
 
 
+# ── issues: work items ───────────────────────────────────────────────────
+#
+# Measured 2026-07-28, see .claude/plans/2026-07-27-youtrack-mcp-parity.md.
+#
+# Three traps, all measured:
+#   1. A unit-less duration is read as HOURS — "90" logs 90h, not 90m.
+#   2. `type` takes an id and rejects a name, and work-item types are
+#      PROJECT-scoped: `Review` exists instance-wide and project 0-1 refuses
+#      it. Resolution must read the project's set, never the instance's.
+#   3. The date is snapped to 00:00 of the day — the opposite corner from a
+#      `date` custom field's noon — and an ISO string is rejected outright.
+#
+# `Spent time` is derived from these entries and is not writable directly
+# ("automatically calculated based on time tracking settings"), so there is
+# deliberately no verb that sets it.
+
+_UNIT_LESS_DURATION_RE = re.compile(r"^\d+$")
+
+
+def _duration_value(raw: str) -> dict:
+    """The `duration` object, as a presentation string the server parses.
+
+    Only one of minutes/presentation may be sent — both returns "Conflict in
+    period value" — and presentation is chosen because YouTrack owns the period
+    grammar and the workday length (1d = 8h on ION, from project settings).
+
+    A unit-less number is refused. This is deliberately stricter than the
+    server, which accepts it and reads it as HOURS: `--duration 90` meaning 90
+    minutes would silently log 90 hours, and the client can detect that with
+    certainty.
+    """
+    value = raw.strip()
+    if not value:
+        _die(6, "input", "--duration cannot be empty")
+    if _UNIT_LESS_DURATION_RE.match(value):
+        _die(6, "input",
+             f"--duration {value!r} has no unit, and YouTrack reads a bare "
+             f"number as HOURS — {value} would log {value} hours",
+             f"write {value}m for minutes, or 1h 30m / 2h / 2d (1d is the "
+             "project's workday, not 24h)")
+    return {"presentation": value}
+
+
+def _resolve_work_item_type(c, ref: str, name: str) -> str:
+    """A work-item type name -> its id, scoped to the issue's project.
+
+    Measured: the type write rejects a name, and a type that exists
+    instance-wide can still be refused by the project ("The selected work type
+    is not supported for issues in this YouTrack project"). So the project's own
+    list is the authority, and reaching it costs one read of the issue.
+    """
+    issue = _request(c, "GET", f"/issues/{ref}", params={"fields": "project(id)"})
+    project = ((issue or {}).get("project") or {}).get("id")
+    if not project:
+        _die(5, "bad_response", "YouTrack returned an issue without a project")
+    rows = _request(c, "GET",
+                    f"/admin/projects/{project}/timeTrackingSettings/workItemTypes",
+                    params={"fields": "id,name", "$top": 200})
+    wanted = name.strip().casefold()
+    known = []
+    for row in (rows if isinstance(rows, list) else []):
+        if not isinstance(row, dict) or not row.get("name"):
+            continue
+        known.append(row["name"])
+        if row["name"].casefold() == wanted and row.get("id"):
+            return row["id"]
+    near = difflib.get_close_matches(name, sorted(known), n=3, cutoff=0.6)
+    hint = (f"did you mean: {', '.join(near)}?" if near
+            else f"work item types on this project: {', '.join(sorted(known))}")
+    _die(6, "unknown_work_item_type",
+         f"no work item type named {name!r} on this issue's project", hint)
+
+
+def _work_item_error():
+    """Translate the two duration rejections; let everything else fall through."""
+    def on_error(response):
+        try:
+            body = response.json()
+        except ValueError:
+            return
+        if not isinstance(body, dict):
+            return
+        detail = str(body.get("error_description") or body.get("error") or "")
+        if "cannot be parsed" in detail:
+            _die(6, "invalid_duration", detail,
+                 "durations are whole numbers with units: 45m, 1h 30m, 2d. "
+                 "Fractions, negatives and seconds are rejected",
+                 status=response.status_code)
+        if "negative or empty" in detail:
+            _die(6, "invalid_duration", detail,
+                 "log a positive duration", status=response.status_code)
+    return on_error
+
+
+def _shape_work_item(item):
+    """One work item, with the date as a calendar day and no $type anywhere.
+
+    `duration` keeps BOTH representations: the server re-renders presentation
+    (1d 4h reads back as 12h, and output never uses day units), while minutes
+    reflects the project's workday length — so each carries what the other
+    loses.
+    """
+    if not isinstance(item, dict):
+        return item
+    duration = item.get("duration") or {}
+    shaped = {"id": item.get("id"),
+              "duration": {"minutes": duration.get("minutes"),
+                           "presentation": duration.get("presentation")},
+              "text": item.get("text")}
+    date = item.get("date")
+    shaped["date"] = _utc_date(date) if isinstance(date, int) else None
+    work_type = item.get("type") or {}
+    shaped["type"] = work_type.get("name")
+    shaped["author"] = (item.get("author") or {}).get("login")
+    if isinstance(item.get("created"), int):
+        shaped["created"] = item["created"]
+    return shaped
+
+
+def issues_work_log(c, a):
+    ref = _issue_ref(a.issue)
+    body = {"duration": _duration_value(a.duration)}
+    if a.date is not None:
+        # Noon, not midnight: the server snaps to 00:00 of the day, and whether
+        # that snap uses UTC or the profile timezone is unmeasured — noon keeps
+        # ~12h of margin either way, so the calendar date survives.
+        body["date"] = _epoch_ms_noon_utc(a.date, "--date")
+    if a.text is not None:
+        body["text"] = _read_text(a.text)
+    if a.type is not None:
+        body["type"] = {"id": _resolve_work_item_type(c, ref, a.type)}
+    return _shape_work_item(
+        _request(c, "POST", f"/issues/{ref}/timeTracking/workItems",
+                 params={"fields": WORK_ITEM_FIELDS}, json=body,
+                 on_error=_work_item_error()))
+
+
+def issues_work_list(c, a):
+    rows = _request(c, "GET", f"/issues/{_issue_ref(a.issue)}/timeTracking/workItems",
+                    params=_page_params(a, WORK_ITEM_FIELDS))
+    rows = rows if isinstance(rows, list) else []
+    return _paged([_shape_work_item(r) for r in rows], a.limit)
+
+
 def _article_ref(value):
     value = value.strip()
     match = re.search(r"/articles/([^/?#]+)", value)
@@ -1987,6 +2164,9 @@ ARG_PERMITTED_USERS  = (("--permitted-users",), {"action": "append", "default": 
                                                  "metavar": "LOGIN"})
 ARG_PERMITTED_GROUPS = (("--permitted-groups",), {"action": "append", "default": [],
                                                   "metavar": "NAME"})
+ARG_DURATION      = (("--duration",), {"required": True, "metavar": "D"})
+ARG_DATE          = (("--date",), {"metavar": "YYYY-MM-DD"})
+ARG_WORK_TYPE     = (("--type",), {"metavar": "NAME"})
 
 COMMANDS = {
     ("users", "me"):                  (users_me, []),
@@ -2013,6 +2193,11 @@ COMMANDS = {
     ("issues", "links", "remove"):     (issues_links_remove, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
     ("issues", "tags", "add"):         (issues_tags_add, [ARG_ISSUE, ARG_TAG_POS]),
     ("issues", "tags", "remove"):      (issues_tags_remove, [ARG_ISSUE, ARG_TAG_POS]),
+    ("issues", "work", "log"):         (issues_work_log, [ARG_ISSUE, ARG_DURATION,
+                                                          ARG_DATE, ARG_WORK_TYPE,
+                                                          ARG_TEXT]),
+    ("issues", "work", "list"):        (issues_work_list, [ARG_ISSUE, ARG_LIMIT50,
+                                                           ARG_OFFSET]),
     ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("articles", "get"):              (articles_get, [ARG_ARTICLE]),
     ("articles", "create"):           (articles_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,
