@@ -1271,6 +1271,9 @@ def test_tags_add_resolves_the_name_to_an_id(tmp_path):
     assert urllib.parse.urlparse(post[1]).path == "/api/issues/DEMO-1/tags"
     # Measured: the tag write rejects a name and takes only an id.
     assert post[2] == {"id": "6-31"}
+    # F7: report by reading the issue back, not the raw POST echo — otherwise
+    # add/remove is unobservable to the caller.
+    assert json.loads(result.stdout)["idReadable"] == "DEMO-1"
 
 
 def test_tags_add_matches_the_name_case_insensitively(tmp_path):
@@ -1352,6 +1355,8 @@ def test_tags_remove_deletes_by_resolved_id(tmp_path):
     assert result.returncode == 0, result.stderr
     delete = [r for r in handler.requests if r[0] == "DELETE"][0]
     assert urllib.parse.urlparse(delete[1]).path == "/api/issues/DEMO-1/tags/6-31"
+    # F7: report by reading the issue back, not the empty DELETE reply.
+    assert json.loads(result.stdout)["idReadable"] == "DEMO-1"
 
 
 def test_tags_remove_of_a_tag_the_issue_lacks_blames_the_tag(tmp_path):
@@ -1903,7 +1908,12 @@ class UpdateErrorHandler(UpdateFieldsHandler):
     def do_GET(self):
         self.__class__.requests.append(("GET", self.path, None))
         if "/admin/projects/" in self.path and "/customFields" in self.path:
-            self._reply(UPDATE_PROJECT_SCHEMA)
+            # Honors $top/$skip like a real backend would, so a mutation that
+            # pages this error-translation re-read is observable.
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            top = int(query["$top"][0]) if "$top" in query else len(UPDATE_PROJECT_SCHEMA)
+            skip = int(query.get("$skip", ["0"])[0])
+            self._reply(UPDATE_PROJECT_SCHEMA[skip:skip + top])
         elif self.path.startswith("/api/issues/DEMO-1"):
             self._reply({
                 "idReadable": "DEMO-1",
@@ -1972,6 +1982,24 @@ def test_update_server_500_for_unknown_field_maps_to_exit_6(tmp_path):
               "error_description": "incompatible-issue-custom-field-name-Priority"})
 
     assert result.returncode == 6, result.stderr
+
+
+def test_update_error_schema_read_is_not_paged(tmp_path):
+    """F14: the error-translation re-read needs the COMPLETE field set for the
+    same reason create's does — a truncated schema would falsely say a real
+    field is unknown."""
+    result, _ = run_update(
+        tmp_path, "DEMO-1", "--field", "Priority=Sideways",
+        handler=UpdateErrorHandler, status=400,
+        body={"error": "Bad Request",
+              "error_description": "An Sideways-type entity with the specified "
+                                   "name ({1}) was not found"})
+
+    assert result.returncode == 6, result.stderr
+    path = schema_reads(UpdateErrorHandler)[0][1]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["$top"] == ["200"]
+    assert "$skip" not in query
 
 
 def test_update_happy_path_never_fetches_the_schema(tmp_path):
@@ -2113,7 +2141,14 @@ class CreateFieldsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.__class__.requests.append(("GET", self.path, None))
         if "/admin/projects/" in self.path and "/customFields" in self.path:
-            self._reply(self.schema())
+            # Honors $top/$skip like a real backend would, so a mutation that
+            # pages this internal read is observable rather than silently
+            # served the complete fixture regardless of the query.
+            schema = self.schema()
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            top = int(query["$top"][0]) if "$top" in query else len(schema)
+            skip = int(query.get("$skip", ["0"])[0])
+            self._reply(schema[skip:skip + top])
         else:
             self._reply({"error": "missing"}, 404)
 
@@ -2233,6 +2268,20 @@ def test_create_happy_path_fetches_the_schema_exactly_once(tmp_path):
     assert result.returncode == 0, result.stderr
     assert len(create_schema_reads()) == 1, create_schema_reads()
     assert len(writes) == 1
+
+
+def test_create_schema_read_is_not_paged(tmp_path):
+    """F14: create's schema read is the internal-caller path, which needs the
+    COMPLETE field set — a truncated schema turns a legal field name into a
+    false 'unknown field'. Only `projects fields list` may page."""
+    result, _writes = run_create(tmp_path, "--summary", "s",
+                                 "--field", "Priority=Normal")
+
+    assert result.returncode == 0, result.stderr
+    path = create_schema_reads()[0][1]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["$top"] == ["200"]
+    assert "$skip" not in query
 
 
 def test_create_without_fields_never_fetches_the_schema(tmp_path):
@@ -3117,14 +3166,26 @@ _WORK_ITEM = {"id": "162-1", "date": 1784505600000,
               "author": {"login": "s.royz"}, "created": 1785273759478}
 
 _PROJECT_WORK_TYPES = [{"id": "139-0", "name": "Development"},
-                       {"id": "139-1", "name": "Testing"}]
+                       {"id": "139-1", "name": "Testing"},
+                       {"id": "139-2", "name": "Documentation"},
+                       {"id": "139-3", "name": "Meeting"},
+                       {"id": "139-4", "name": "Support"}]
+
+# Measured 2026-07-28: the instance-wide endpoint lists 6 work-item types on
+# ION, project 0-1 lists 5 — `Review` exists instance-wide and is refused by
+# the project. The fixture keeps that asymmetry so a test can tell "resolved
+# against the project's set" apart from "resolved against the instance's".
+_INSTANCE_WORK_TYPES = _PROJECT_WORK_TYPES + [{"id": "139-5", "name": "Review"}]
 
 
-def _work_handler(items=None, types=None, *, post_status=200, post_body=None):
-    """Serves the issue read (for its project), the project's work-item types,
+def _work_handler(items=None, types=None, *, post_status=200, post_body=None,
+                  instance_types=None):
+    """Serves the issue read (for its project), the project's work-item types
+    (project-scoped) and the instance-wide types (distinct set, see above),
     the work-item POST, and the work-item list."""
     items = [_WORK_ITEM] if items is None else items
     types = _PROJECT_WORK_TYPES if types is None else types
+    instance_types = _INSTANCE_WORK_TYPES if instance_types is None else instance_types
 
     class WorkHandler(BaseHTTPRequestHandler):
         requests = []
@@ -3143,7 +3204,9 @@ def _work_handler(items=None, types=None, *, post_status=200, post_body=None):
         def do_GET(self):
             self.__class__.requests.append(("GET", self.path, None))
             route = urllib.parse.urlparse(self.path).path
-            if route.endswith("/timeTrackingSettings/workItemTypes"):
+            if route == "/api/admin/timeTrackingSettings/workItemTypes":
+                self._reply(instance_types)
+            elif route.endswith("/timeTrackingSettings/workItemTypes"):
                 self._reply(types)
             elif route.endswith("/timeTracking/workItems"):
                 query = urllib.parse.parse_qs(
@@ -3202,6 +3265,15 @@ def test_work_log_refuses_a_unit_less_duration_before_any_request(tmp_path):
     assert not handler.requests, "must not reach the server"
 
 
+def test_work_log_refuses_an_empty_duration_before_any_request(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "")
+    assert result.returncode == 6
+    assert not handler.requests, "must not reach the server"
+
+
 def test_work_log_accepts_unit_forms_the_server_parses(tmp_path):
     for raw in ["90m", "1h30m", "1h 30m", "2d", "1w", "1H30M"]:
         handler = _work_handler()
@@ -3235,6 +3307,21 @@ def test_work_log_unknown_type_exits_6_with_near_miss_and_no_write(tmp_path):
                          "--duration", "30m", "--type", "Developmnt")
     assert result.returncode == 6
     assert "Development" in result.stderr
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_work_log_ambiguous_type_is_refused_not_guessed(tmp_path):
+    """I-5: nothing in the measured record says work-item-type names are
+    unique on a project, so a collision must be refused (exit 6), mirroring
+    _resolve_tag_id / _resolve_group_ids / _resolve_link, not resolved to
+    whichever row happened to match first."""
+    collide = [{"id": "139-1", "name": "Testing"}, {"id": "139-9", "name": "Testing"}]
+    handler = _work_handler(types=collide)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--type", "Testing")
+    assert result.returncode == 6
+    assert "ambiguous" in result.stderr.lower()
     assert not any(r[0] == "POST" for r in handler.requests)
 
 
@@ -3281,6 +3368,23 @@ def test_work_log_renders_the_read_back_date_as_a_calendar_day(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["date"] == "2026-07-20"
+
+
+def test_work_log_flattens_type_and_author(tmp_path):
+    """_shape_work_item must flatten `type` to its name and `author` to its
+    login, never emit the whole object (which would leak $type)."""
+    item = dict(_WORK_ITEM,
+               type={"id": "139-1", "name": "Testing", "$type": "WorkItemType"},
+               author={"login": "s.royz", "$type": "User"})
+    handler = _work_handler(post_body=item)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1h 30m")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["type"] == "Testing"
+    assert payload["author"] == "s.royz"
+    assert "$type" not in json.dumps(payload)
 
 
 def test_work_log_emits_both_duration_representations_without_type(tmp_path):
