@@ -1,6 +1,6 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status — 2026-07-28: ✅ M1, ✅ M2 and ✅ M3 are shipped. M1 and M2 are merged to `upstream/main`; M3 is on `feat/youtrack-m3-work-the-board`, unpushed. M4 outstanding.**
+**Status — 2026-07-28: ✅ M1, ✅ M2 and ✅ M3 are shipped and all merged to `upstream/main`. M4 outstanding.**
 
 - ✅ **M1** — PR #14, catalog repair in #15.
 - ✅ **M2 step 0** — write-direction probe closed, then extended the same day to the *create* path (see "Create path — measured"), which settled step 2's and step 5's central premises.
@@ -8,7 +8,7 @@
 - ✅ **M2 steps 2–5** (`issues create` with `--field`/`--fields`, type-aware marshalling, schema-backed error translation, `--draft`) — PR #20, whose commit declares "Completes M2". 42 new tests; 105 tests total in `capabilities/youtrack/tests/test_youtrack.py`.
 - ✅ **Decision D1** — the misnamed `required` key is gone; `projects fields *` now emit `canBeEmpty` faithfully (breaking change, landed in PR #20).
 - ⬜ **M2 "Done when" is code-complete but not live-demonstrated** — the one-call sprint-ready IONDEV create over `text` fields is still unproven against the live server; see the note under M2's "Done when".
-- ✅ **M3** — shipped 2026-07-28: `users find`, `issues links add`/`remove`, links on `issues get`, `--offset` on every `--limit` verb, `--select` on `issues search`. 147 tests pass; verified live against ION. ⬜ **M4** — outstanding.
+- ✅ **M3** — PR #21, merged 2026-07-28: `users find`, `issues links add`/`remove`, links on `issues get`, `--offset` on every `--limit` verb, `--select` on `issues search`. 151 tests pass; verified live against ION. Surface is now **19 domain verbs**. ⬜ **M4** — outstanding, see "What remains" below.
 - **Standing constraint (owner, 2026-07-28): all experiments run against the ION project; IONDEV is not to be touched.** What ION cannot prove stays recorded as unproven — which permanently blocks M2's Group 1 gap, since ION carries no `text` field.
 
 This doc is both the surface contract and the milestone plan; keep them together so they cannot drift.
@@ -58,7 +58,7 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `create_draft_issue` | `issues create --draft` | ✅ **parity** (M2 step 5) |
 | — | `articles comments list`, `articles comments add` | CLI-only; MCP has no article-comment tools |
 
-**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1, M2 and M3 all shipped: 13 at parity, 1 near/partial (`search_articles`), 8 absent, plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** Everything still open is M4's long tail. `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
+**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1, M2 and M3 all merged: 13 at parity, 3 near/partial (`update_article`, `add_issue_comment`, `search_articles`), 6 absent, plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** 13 + 3 + 6 + 1 = 23. (An earlier revision of this line said "1 near/partial, 8 absent" — a miscount that did not sum to 23; corrected against the table above.) Everything still open is M4's long tail. `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
 
 Attachments are in **neither** surface — they belong to the 44-tool community server, not JetBrains'. Not a parity item.
 
@@ -545,7 +545,66 @@ Exercised through the installed CLI on two throwaway ION issues (ION-1437, ION-1
 
 ## M4 — Long tail — ⬜ OUTSTANDING
 
-Fill on demand, not speculatively: `articles search` · `articles update --parent` · `projects get` · `projects find` paging (`--limit`/`--offset`/`has_more`; it still hardcodes `$top: 100` and truncates silently) · `issues tags` · `issues work` · `searches list` · `groups find` + `groups members` · `permittedUsers`/`permittedGroups` visibility on comments and articles.
+Fill on demand, not speculatively. Full enumeration and cost in "What remains" below.
+
+---
+
+# What remains — as of 2026-07-28, M1–M3 merged
+
+**10 items close the last 9 MCP gaps** (`update_article` re-parent and `search_articles` both live in articles). Nothing here is blocked on a measurement: every gap is a known endpoint on a surface the CLI already models. Grouped by what a caller can do afterwards, cheapest first.
+
+## Group A — three near-misses on verbs that already exist
+
+Smallest change per unit of parity: each is a flag or a query swap on shipped code, not a new verb.
+
+| Gap | Change | MCP tool closed |
+|---|---|---|
+| `articles update --parent` | add the flag; the create path already accepts `--parent`, so the marshalling exists | `update_article` → parity |
+| `articles search QUERY` | new verb, but `articles list`'s projection and paging are reusable; it is a query swap | `search_articles` → parity |
+| `issues comments add --permitted-users/--permitted-groups` | comment visibility; needs `groups find` first if group names are to be validated | `add_issue_comment` → parity |
+
+## Group B — three read verbs, no write risk
+
+| Gap | Notes | MCP tool closed |
+|---|---|---|
+| `projects get ID` | one GET, projection only | `get_project` |
+| `searches list` | saved searches; a plain listing | `get_saved_issue_searches` |
+| `groups find` + `groups members ID` | two verbs, one MCP tool each; `groups members` is the "exactly one op → the sub-resource is the verb" case from the grammar rules | `find_user_groups`, `get_user_group_members` |
+
+## Group C — two write verbs that need a probe first
+
+These are the only remaining items with unmeasured behaviour, and both touch bundle-backed or unit-parsed values — the class that cost M2 its step-0 probe.
+
+| Gap | Why it needs measuring | MCP tool closed |
+|---|---|---|
+| `issues tags add` / `remove` | tags are bundle-backed and instance-scoped; whether adding an unknown tag creates it or 400s is unmeasured, and that decides whether a pre-flight or an error translation is right | `manage_issue_tags` |
+| `issues work log` / `list` | duration parsing is the risk. M2 measured that `period` fields round-trip as `presentation` (`1d 4h`) while reading back as **minutes**, with the workday length coming from server-side project settings — so a work-item duration almost certainly has the same dual representation, and asserting minutes would test a server config value rather than CLI behaviour | `log_work` |
+
+**Probe before building Group C**, on ION, in the shape M2 and M3 used: write one of each, read it back, record measured-versus-inferred. Group C is also where `--project` scoping matters, since tag and work-item types are project-configured.
+
+## Not MCP parity, but tracked here
+
+- **`projects find` paging.** It hardcodes `$top: 100` with no `--limit`/`--offset`/`has_more`, so it is the one list verb that still truncates silently — the exact bug M3 removed everywhere else. Cheap, and it closes the inconsistency M3's D6 deliberately widened to avoid.
+- **Attachments.** In neither surface. They belong to the 44-tool community server, not JetBrains'. Only a parity item if the target changes (see below).
+
+## Gaps that are closed by decision, not by work
+
+Do not schedule these; they are answered.
+
+- **`change_issue_assignee`** — covered by `issues update --field Assignee=…`. A dedicated verb for one field invites one per field.
+- **`issues links list`** — deliberately absent; `issues get` returns links.
+- **Sort on `issues search`** — expressible as `sort by:` inside the YouTrack query; a flag would duplicate the query language.
+
+## Two open gaps that are *not* parity gaps
+
+Both are evidence gaps, and both are blocked by the ION-only constraint rather than by effort:
+
+- **Exit 7 for a workflow-rule rejection of a link** — UNTESTED. No link rule fired on ION.
+- **M2's `text`-on-create criterion** — open. ION carries no `text` field. Needs IONDEV write authorization or a `text` field added to ION.
+
+## If the parity target changes
+
+This document measures against JetBrains' **23 predefined MCP tools**. The **44-tool community MCP server** is a strictly larger surface — it adds attachments, and a wider spread of admin and bundle operations. Adopting it as the target would roughly double the remaining work and reopen items this plan closed by decision. That is a scope decision for the owner, not a milestone; nothing below assumes it.
 
 ## Sequencing rationale
 
