@@ -1523,6 +1523,48 @@ def _codex_meta(stdout, model):
             "cost_usd": None, "duration_ms": None, "session_id": thread_id}
 
 
+def discover_codex_images(thread_id):
+    """Discover Codex-generated images for a thread, returning valid local paths.
+    
+    Codex saves images to ~/.codex/generated_images/<thread-id>/. Return only
+    regular files with supported extensions inside that exact directory, capped
+    at Telegram's album limit (10).
+    """
+    if not thread_id:
+        return []
+    codex_home = Path.home() / ".codex" / "generated_images"
+    thread_dir = codex_home / str(thread_id)
+    if not thread_dir.is_dir():
+        return []
+    try:
+        resolved_thread = thread_dir.resolve()
+        resolved_codex = codex_home.resolve()
+    except OSError:
+        return []
+    if resolved_codex not in resolved_thread.parents and resolved_thread != resolved_codex:
+        return []
+    
+    supported_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+    images = []
+    try:
+        for item in sorted(thread_dir.iterdir()):
+            if not item.is_file():
+                continue
+            if item.suffix.lower() not in supported_exts:
+                continue
+            try:
+                if item.stat().st_size == 0:
+                    continue
+            except OSError:
+                continue
+            images.append(item)
+            if len(images) >= 10:
+                break
+    except OSError:
+        pass
+    return images
+
+
 def worker_codex(chat, tail, state=None, procs=None):
     """Headless `codex exec`. Full access (bypass
     approvals+sandbox) mirrors the claude worker's; --skip-git-repo-check because /app is not
@@ -1932,8 +1974,31 @@ async def run_session(client):
                 retry_job(key, job, "session closed before worker reply was delivered")
                 return
             reply, meta = result["reply"], result["meta"]
-            sent = await send_channel_message(
-                ent_id, reply, is_direct, reply_to=None if is_direct else job.get("message_id"))
+            
+            # Discover and send Codex-generated images
+            images = []
+            if meta.get("harness") == "codex" and meta.get("session_id"):
+                images = discover_codex_images(meta["session_id"])
+            
+            reply_msg_id = None if is_direct else job.get("message_id")
+            if images:
+                try:
+                    if len(reply) <= 1024:
+                        sent = await client.send_file(
+                            ent_id, images, caption=reply,
+                            reply_to=reply_msg_id)
+                    else:
+                        sent = await client.send_file(
+                            ent_id, images, reply_to=reply_msg_id)
+                        await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
+                    image_count = len(images) if isinstance(images, list) else 1
+                    log(f"{key}: sent {image_count} image(s) with reply job msg={job.get('message_id')}")
+                except Exception as send_err:
+                    log(f"{key}: image send failed, delivering text only: {send_err}")
+                    sent = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
+            else:
+                sent = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
+            
             tok = meta.get("tokens", {})
             cost = f" ${meta['cost_usd']:.4f}" if meta.get("cost_usd") else ""
             log(f"{key}: replied job msg={job.get('message_id')} «{reply[:80]}» · "

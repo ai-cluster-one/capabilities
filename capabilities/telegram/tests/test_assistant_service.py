@@ -574,5 +574,99 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("21", register["123"]["jobs"])
 
 
+class TestCodexImageDiscovery(unittest.IsolatedAsyncioTestCase):
+    """Test Codex image artifact discovery and path validation."""
+
+    async def test_discover_codex_images_finds_valid_images_in_thread_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            
+            # Create fake Codex image directory structure
+            codex_home = Path(td) / "fake-home" / ".codex" / "generated_images"
+            thread_id = "019ed6d8-test-thread-id"
+            thread_dir = codex_home / thread_id
+            thread_dir.mkdir(parents=True)
+            
+            # Create test images
+            (thread_dir / "image1.png").write_bytes(b"fake-png-data")
+            (thread_dir / "image2.jpg").write_bytes(b"fake-jpg-data")
+            (thread_dir / "image3.gif").write_bytes(b"fake-gif-data")
+            (thread_dir / "ignored.txt").write_text("not an image")
+            (thread_dir / "empty.png").write_bytes(b"")  # Should be skipped
+            
+            # Monkey-patch Path.home() for this test
+            original_home = Path.home
+            Path.home = lambda: Path(td) / "fake-home"
+            try:
+                images = daemon.discover_codex_images(thread_id)
+                self.assertEqual(len(images), 3)
+                names = {img.name for img in images}
+                self.assertEqual(names, {"image1.png", "image2.jpg", "image3.gif"})
+            finally:
+                Path.home = original_home
+
+    async def test_discover_codex_images_rejects_path_traversal(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            
+            # Create structure outside the valid generated_images tree
+            codex_home = Path(td) / "fake-home" / ".codex" / "generated_images"
+            codex_home.mkdir(parents=True)
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "malicious.png").write_bytes(b"data")
+            
+            original_home = Path.home
+            Path.home = lambda: Path(td) / "fake-home"
+            try:
+                # Thread ID that would escape the safe directory
+                images = daemon.discover_codex_images("../../outside")
+                self.assertEqual(images, [])
+            finally:
+                Path.home = original_home
+
+    async def test_discover_codex_images_caps_at_telegram_album_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            
+            codex_home = Path(td) / "fake-home" / ".codex" / "generated_images"
+            thread_id = "test-many-images"
+            thread_dir = codex_home / thread_id
+            thread_dir.mkdir(parents=True)
+            
+            # Create 15 images
+            for i in range(15):
+                (thread_dir / f"img{i:02d}.png").write_bytes(b"data")
+            
+            original_home = Path.home
+            Path.home = lambda: Path(td) / "fake-home"
+            try:
+                images = daemon.discover_codex_images(thread_id)
+                self.assertEqual(len(images), 10)  # Telegram album limit
+            finally:
+                Path.home = original_home
+
+    async def test_discover_codex_images_returns_empty_for_missing_thread(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            
+            codex_home = Path(td) / "fake-home" / ".codex" / "generated_images"
+            codex_home.mkdir(parents=True)
+            
+            original_home = Path.home
+            Path.home = lambda: Path(td) / "fake-home"
+            try:
+                images = daemon.discover_codex_images("nonexistent-thread")
+                self.assertEqual(images, [])
+                
+                images = daemon.discover_codex_images(None)
+                self.assertEqual(images, [])
+                
+                images = daemon.discover_codex_images("")
+                self.assertEqual(images, [])
+            finally:
+                Path.home = original_home
+
+
 if __name__ == "__main__":
     unittest.main()
