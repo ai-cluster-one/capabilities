@@ -66,6 +66,11 @@ one SigNoz deployment:
       "api_key_env": "SIGNOZ_PROD_API_KEY",
       "otlp_endpoint": "https://collector.example.com:4318",
       "deployment": "self_hosted",
+      "dimensions": {
+        "agent": "agent_id",
+        "call": "call_id",
+        "room": "room_id"
+      },
       "allow_write": false
     },
     "cloud-reference": {
@@ -83,6 +88,30 @@ one SigNoz deployment:
 Connection files hold endpoint wiring and names of secret environment
 variables, never secret values. Writes through `signoz api POST|PUT|PATCH|DELETE`
 also require `allow_write: true`.
+
+### Project-specific dimensions
+
+The `agent`, `call`, and `room` dimensions power `--agent-id`, `--call-id`,
+`--room-id`, `signoz agent`, and `signoz call`. Their defaults are `agent_id`,
+`call_id`, and `room_id` for both logs and traces. Override a dimension with
+one shared field name, as above, or use different fields per signal:
+
+```json
+{
+  "dimensions": {
+    "agent": "voice.agent_id",
+    "call": {
+      "logs": "voice.call_id",
+      "traces": "conversation_id"
+    },
+    "room": "room_id"
+  }
+}
+```
+
+Mapped names must be simple attribute paths such as `call_id` or
+`voice.call_id`. For more complex Query Builder expressions, keep the mapping
+simple and add the expression with `--filter`.
 
 For a reverse proxy that needs extra authentication, set
 `SIGNOZ_CUSTOM_HEADERS` to a JSON object or use `custom_headers_env` in the

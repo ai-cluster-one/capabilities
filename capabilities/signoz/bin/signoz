@@ -36,6 +36,11 @@ CONNECTIONS
           "api_key_env": "SIGNOZ_PROD_API_KEY",
           "otlp_endpoint": "https://collector.example.com:4318",
           "deployment": "self_hosted",
+          "dimensions": {
+            "agent": "agent_id",
+            "call": "call_id",
+            "room": "room_id"
+          },
           "allow_write": false
         },
         "cloud": {
@@ -70,13 +75,20 @@ COMMANDS
                     [--context resource|attribute|scope] [--metric NAME]
   signoz fields values --signal ... --name FIELD [same options]
       Discover queryable field names and observed values.
-  signoz logs search [--service NAME] [--severity LEVEL] [--search TEXT]
+  signoz logs search [--service NAME] [--agent-id ID] [--call-id ID]
+                     [--room-id ID] [--severity LEVEL] [--search TEXT]
                      [--filter EXPR] [--limit N] [--offset N] [time options]
-  signoz traces search [--service NAME] [--operation NAME] [--error yes|no]
+  signoz traces search [--service NAME] [--agent-id ID] [--call-id ID]
+                       [--room-id ID] [--operation NAME] [--error yes|no]
                        [--filter EXPR] [--limit N] [--offset N] [time options]
   signoz trace <trace-id> [--since 6h|--start MS --end MS]
       Query raw logs/spans through Query Builder v5. Shortcut filters combine
       with --filter using AND.
+  signoz call <call-id> [--signal logs|traces|both] [--service NAME]
+                        [--filter EXPR] [--limit N] [time options]
+  signoz agent <agent-id> [same options]
+      Fetch correlated logs and traces for one domain identifier. Connection
+      dimensions map logical agent/call/room names to project-specific fields.
   signoz query <file|->
       Execute a complete Query Builder v5 JSON request from a file or stdin.
 
@@ -688,6 +700,12 @@ _ALIASES = {
     "SIGNOZ_CUSTOM_HEADERS": ("SIGNOZ_CUSTOM_HEADERS",),
 }
 
+_DEFAULT_DIMENSIONS = {
+    "agent": {"logs": "agent_id", "traces": "agent_id"},
+    "call": {"logs": "call_id", "traces": "call_id"},
+    "room": {"logs": "room_id", "traces": "room_id"},
+}
+
 
 def _resolve_first(keys: tuple[str, ...]) -> tuple[str | None, str | None,
                                                     Path | None, str | None]:
@@ -740,6 +758,47 @@ def _entry_value(entry: dict, literal_key: str, canonical_key: str,
     return _resolve_first(_ALIASES[canonical_key])
 
 
+def _dimension_fields(entry: dict) -> dict[str, dict[str, str]]:
+    import re
+
+    configured = entry.get("dimensions", {})
+    if not isinstance(configured, dict):
+        _die(6, "bad_config", "dimensions must be an object")
+    unknown = sorted(set(configured) - set(_DEFAULT_DIMENSIONS))
+    if unknown:
+        _die(6, "bad_config",
+             f"unknown dimensions: {', '.join(unknown)}",
+             "supported dimensions: agent, call, room")
+
+    result = {
+        name: dict(fields) for name, fields in _DEFAULT_DIMENSIONS.items()
+    }
+    for name, value in configured.items():
+        if isinstance(value, str):
+            result[name] = {"logs": value, "traces": value}
+        elif isinstance(value, dict):
+            invalid_signals = sorted(set(value) - {"logs", "traces"})
+            if invalid_signals:
+                _die(6, "bad_config",
+                     f"dimension {name!r} has unknown signals: "
+                     f"{', '.join(invalid_signals)}")
+            for signal, field in value.items():
+                result[name][signal] = field
+        else:
+            _die(6, "bad_config",
+                 f"dimension {name!r} must be a field name or signal map")
+
+    for name, signals in result.items():
+        for signal, field in signals.items():
+            if not isinstance(field, str) or not re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_.]*", field):
+                _die(6, "bad_config",
+                     f"dimension {name!r} for {signal} has invalid field "
+                     f"name {field!r}",
+                     "use a simple attribute name such as call_id or voice.call_id")
+    return result
+
+
 def _resolve_connection(wanted: str | None) -> dict:
     reg, reg_file = _connections_registry()
     cid, raw = _select_connection(reg, wanted)
@@ -786,6 +845,7 @@ def _resolve_connection(wanted: str | None) -> dict:
         "custom_headers": custom_headers,
         "headers_resolution": (headers_tier, headers_source, headers_env),
         "deployment": _deployment(url, otlp, entry.get("deployment")),
+        "dimensions": _dimension_fields(entry),
         "verify_tls": bool(entry.get("verify_tls", True)),
         "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
     }
@@ -800,6 +860,7 @@ def _connection_report(conn: dict) -> dict:
     return {
         "allow_write": conn["allow_write"],
         "deployment": conn["deployment"],
+        "dimensions": conn["dimensions"],
         "verify_tls": conn["verify_tls"],
         "keys": [
             row("SIGNOZ_URL", conn["url"], conn["url_resolution"],
@@ -1040,6 +1101,25 @@ def _qb_quote(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
+def _identifier(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise argparse.ArgumentTypeError("identifier cannot be empty")
+    return value
+
+
+def _add_dimension_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--agent-id", type=_identifier)
+    parser.add_argument("--call-id", type=_identifier)
+    parser.add_argument("--room-id", type=_identifier)
+
+
+def _dimension_filter(conn: dict, signal: str, dimension: str,
+                      value: str) -> str:
+    field = conn["dimensions"][dimension][signal]
+    return f"{field} = '{_qb_quote(value)}'"
+
+
 def _query_payload(signal: str, start: int, end: int, expression: str,
                    limit: int, offset: int) -> dict:
     spec: dict = {
@@ -1236,6 +1316,7 @@ def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
     parser.add_argument("--filter", default="")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--offset", type=int, default=0)
+    _add_dimension_args(parser)
     if signal == "logs":
         parser.add_argument("--severity", default="")
         parser.add_argument("--search", default="")
@@ -1249,6 +1330,10 @@ def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
     parts = [args.filter] if args.filter else []
     if args.service:
         parts.append(f"service.name = '{_qb_quote(args.service)}'")
+    for dimension in ("agent", "call", "room"):
+        value = getattr(args, f"{dimension}_id")
+        if value:
+            parts.append(_dimension_filter(conn, signal, dimension, value))
     if signal == "logs":
         if args.severity:
             parts.append(f"severity_text = '{_qb_quote(args.severity)}'")
@@ -1264,6 +1349,45 @@ def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
         signal, start, end, " AND ".join(parts),
         _bounded_limit(args.limit), args.offset)
     return _request(conn, "POST", "/api/v5/query_range", json_body=payload)
+
+
+def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
+    parser = _parser(dimension)
+    parser.add_argument(f"{dimension}_id", type=_identifier)
+    parser.add_argument("--signal", choices=["logs", "traces", "both"],
+                        default="both")
+    parser.add_argument("--service", default="")
+    parser.add_argument("--filter", default="")
+    parser.add_argument("--limit", type=int, default=100)
+    _add_time_args(parser, "24h")
+    args = parser.parse_args(argv)
+    limit = _bounded_limit(args.limit)
+    start, end = _window(args)
+    identifier = getattr(args, f"{dimension}_id")
+    signals = ["logs", "traces"] if args.signal == "both" else [args.signal]
+
+    filters = {}
+    data = {}
+    for signal in signals:
+        parts = [args.filter] if args.filter else []
+        if args.service:
+            parts.append(f"service.name = '{_qb_quote(args.service)}'")
+        parts.append(_dimension_filter(
+            conn, signal, dimension, identifier))
+        expression = " AND ".join(parts)
+        filters[signal] = expression
+        data[signal] = _request(
+            conn, "POST", "/api/v5/query_range",
+            json_body=_query_payload(
+                signal, start, end, expression, limit, 0))
+
+    return {
+        "entity": dimension,
+        "id": identifier,
+        "window": {"start": start, "end": end},
+        "filters": filters,
+        "data": data,
+    }
 
 
 def _cmd_trace(conn: dict, argv: list[str]):
@@ -1357,6 +1481,8 @@ def main() -> None:
         result = _cmd_signal_search(conn, "logs", rest)
     elif command == "traces":
         result = _cmd_signal_search(conn, "traces", rest)
+    elif command in {"call", "agent"}:
+        result = _cmd_correlated(conn, command, rest)
     elif command == "trace":
         result = _cmd_trace(conn, rest)
     elif command == "query":

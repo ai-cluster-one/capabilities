@@ -21,6 +21,11 @@ def connection(**overrides):
         "ingestion_key": None,
         "custom_headers": None,
         "deployment": "self_hosted",
+        "dimensions": {
+            "agent": {"logs": "agent_id", "traces": "agent_id"},
+            "call": {"logs": "call_id", "traces": "call_id"},
+            "room": {"logs": "room_id", "traces": "room_id"},
+        },
         "verify_tls": True,
         "allow_write": False,
     }
@@ -33,7 +38,8 @@ def test_help_documents_every_domain_command():
     for command in [
         "doctor", "connections", "version", "ingestion", "services", "metrics",
         "fields keys", "fields values", "logs search", "traces search", "trace",
-        "query", "dashboards", "alerts", "rules", "views", "channels", "api",
+        "call", "agent", "query", "dashboards", "alerts", "rules", "views",
+        "channels", "api",
     ]:
         assert f"signoz {command}" in help_text
     assert "SIGNOZ_API_KEY" in help_text
@@ -174,3 +180,112 @@ def test_custom_headers_cannot_override_management_key():
     with pytest.raises(SystemExit) as exc:
         module._parse_custom_headers('{"SIGNOZ-API-KEY":"wrong"}')
     assert exc.value.code == 6
+
+
+def test_dimension_mapping_supports_shared_and_per_signal_fields():
+    dimensions = module._dimension_fields({
+        "dimensions": {
+            "agent": "voice.agent_id",
+            "call": {
+                "logs": "voice.call_id",
+                "traces": "conversation_id",
+            },
+        },
+    })
+    assert dimensions["agent"] == {
+        "logs": "voice.agent_id", "traces": "voice.agent_id"}
+    assert dimensions["call"] == {
+        "logs": "voice.call_id", "traces": "conversation_id"}
+    assert dimensions["room"] == {
+        "logs": "room_id", "traces": "room_id"}
+
+
+def test_dimension_mapping_rejects_query_expression_injection():
+    with pytest.raises(SystemExit) as exc:
+        module._dimension_fields({
+            "dimensions": {"call": "call_id OR true"},
+        })
+    assert exc.value.code == 6
+
+
+def test_signal_shortcuts_combine_with_existing_filters():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(dimensions={
+        "agent": {"logs": "voice.agent_id", "traces": "span.agent_id"},
+        "call": {"logs": "voice.call_id", "traces": "span.call_id"},
+        "room": {"logs": "voice.room_id", "traces": "span.room_id"},
+    })
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "logs", [
+            "search",
+            "--service", "worker",
+            "--agent-id", "agent-'one",
+            "--call-id", "call-1",
+            "--room-id", "room-1",
+            "--filter", "environment = 'production'",
+            "--start", "1",
+            "--end", "2",
+        ])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    assert spec["filter"]["expression"] == (
+        "environment = 'production' AND service.name = 'worker' AND "
+        "voice.agent_id = 'agent-\\'one' AND voice.call_id = 'call-1' AND "
+        "voice.room_id = 'room-1'")
+
+
+def test_correlated_call_queries_logs_and_traces_with_mapped_fields():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(dimensions={
+        "agent": {"logs": "agent_id", "traces": "agent_id"},
+        "call": {"logs": "log.call_id", "traces": "span.call_id"},
+        "room": {"logs": "room_id", "traces": "room_id"},
+    })
+    with patch.object(module, "_request", side_effect=request):
+        result = module._cmd_correlated(conn, "call", [
+            "call-123",
+            "--service", "worker",
+            "--limit", "5",
+            "--start", "1",
+            "--end", "2",
+        ])
+
+    assert result["entity"] == "call"
+    assert result["id"] == "call-123"
+    assert set(result["data"]) == {"logs", "traces"}
+    assert len(calls) == 2
+    log_spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    trace_spec = calls[1][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    assert log_spec["signal"] == "logs"
+    assert log_spec["limit"] == 5
+    assert log_spec["filter"]["expression"] == (
+        "service.name = 'worker' AND log.call_id = 'call-123'")
+    assert trace_spec["signal"] == "traces"
+    assert trace_spec["filter"]["expression"] == (
+        "service.name = 'worker' AND span.call_id = 'call-123'")
+
+
+def test_correlated_agent_can_select_one_signal():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    with patch.object(module, "_request", side_effect=request):
+        result = module._cmd_correlated(connection(), "agent", [
+            "agent-1", "--signal", "traces", "--start", "1", "--end", "2"])
+
+    assert set(result["data"]) == {"traces"}
+    assert set(result["filters"]) == {"traces"}
+    assert len(calls) == 1

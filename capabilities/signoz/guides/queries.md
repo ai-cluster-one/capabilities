@@ -9,8 +9,9 @@ signoz fields keys --signal logs --context resource --search service
 signoz fields values --signal logs --name service.name --context resource
 ```
 
-All convenience query commands default to the last hour. Use `--since 30m`,
-`--since 7d`, or an explicit millisecond window:
+Log and trace searches default to the last hour; correlated `call` and `agent`
+lookups default to 24 hours. Use `--since 30m`, `--since 7d`, or an explicit
+millisecond window:
 
 ```sh
 signoz logs search --start 1785300000000 --end 1785303600000
@@ -21,22 +22,41 @@ signoz logs search --start 1785300000000 --end 1785303600000
 ```sh
 signoz logs search --service checkout --severity ERROR --search timeout
 signoz logs search --filter "deployment.environment = 'production'" --limit 200
+signoz logs search --agent-id agent-42 --call-id call-123 --since 24h
 ```
 
-`--service`, `--severity`, `--search`, and `--filter` combine with `AND`.
-`--search` emits a Query Builder `body CONTAINS` predicate. Paginate with
-`--limit` and `--offset`.
+`--service`, `--agent-id`, `--call-id`, `--room-id`, `--severity`, `--search`,
+and `--filter` combine with `AND`. `--search` emits a Query Builder
+`body CONTAINS` predicate. Paginate with `--limit` and `--offset`.
 
 ## Traces
 
 ```sh
 signoz traces search --service checkout --error yes
 signoz traces search --operation "POST /orders" --since 6h
+signoz traces search --call-id call-123 --room-id room-7
 signoz trace 0123456789abcdef0123456789abcdef --since 24h
 ```
 
 Use `trace` after a search has produced a trace ID. Its default window is six
 hours; widen it when inspecting an older trace.
+
+## Correlated calls and agents
+
+Fetch logs and traces together when the domain identifier is more useful than
+a telemetry trace ID:
+
+```sh
+signoz call call-123 --since 7d
+signoz agent agent-42 --service voice-worker --since 24h
+signoz call call-123 --signal traces --limit 50
+```
+
+The result includes the resolved time window, the exact filter used for each
+signal, and a `data` object containing `logs`, `traces`, or both. Use
+`--signal logs|traces|both` to control the round trips. Project connections can
+map logical dimensions to different workspace-specific fields; see
+`signoz guide connections`.
 
 ## Raw Query Builder v5
 
