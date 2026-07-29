@@ -66,6 +66,7 @@ one SigNoz deployment:
       "api_key_env": "SIGNOZ_PROD_API_KEY",
       "otlp_endpoint": "https://collector.example.com:4318",
       "deployment": "self_hosted",
+      "environment": "production",
       "dimensions": {
         "agent": "agent_id",
         "call": "call_id",
@@ -88,6 +89,43 @@ one SigNoz deployment:
 Connection files hold endpoint wiring and names of secret environment
 variables, never secret values. Writes through `signoz api POST|PUT|PATCH|DELETE`
 also require `allow_write: true`.
+
+### Environment scope
+
+The optional `environment` property scopes telemetry queries to a logical
+deployment environment. When set, the CLI automatically filters logs and traces
+by `deployment.environment` or `deployment.environment.name` (both are checked
+for compatibility with SigNoz 0.97.1 and current OpenTelemetry semantic
+conventions).
+
+```json
+{
+  "production": {
+    "url": "https://signoz.example.com",
+    "api_key_env": "SIGNOZ_PROD_API_KEY",
+    "environment": "production"
+  }
+}
+```
+
+Commands that support environment scoping:
+- `signoz logs search`
+- `signoz traces search`
+- `signoz call`
+- `signoz agent`
+
+Override behavior per query:
+- `--environment dev` — query a specific environment
+- `--all-environments` — query all environments (ignore connection scope)
+- `--legacy-unscoped` — query historical data without deployment.environment
+
+Workspace catalog commands (`services`, `metrics`, `fields`, `dashboards`,
+`alerts`, `rules`, `views`, `channels`) and raw API escape hatches (`query`,
+`api`) are never environment-scoped; they operate across the entire workspace.
+
+The `signoz ingestion` command renders both `deployment.environment` and
+`deployment.environment.name` in `OTEL_RESOURCE_ATTRIBUTES` when the connection
+has an environment, compatible with current and legacy SigNoz versions.
 
 ### Project-specific dimensions
 

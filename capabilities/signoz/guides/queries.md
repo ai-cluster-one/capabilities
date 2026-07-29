@@ -21,13 +21,23 @@ signoz logs search --start 1785300000000 --end 1785303600000
 
 ```sh
 signoz logs search --service checkout --severity ERROR --search timeout
-signoz logs search --filter "deployment.environment = 'production'" --limit 200
+signoz logs search --filter "status = 'failed'" --limit 200
 signoz logs search --agent-id agent-42 --call-id call-123 --since 24h
+signoz logs search --environment staging --service api
+signoz logs search --all-environments --service api
+signoz logs search --legacy-unscoped --service checkout
 ```
 
 `--service`, `--agent-id`, `--call-id`, `--room-id`, `--severity`, `--search`,
-and `--filter` combine with `AND`. `--search` emits a Query Builder
-`body CONTAINS` predicate. Paginate with `--limit` and `--offset`.
+`--filter`, and the connection's environment (if set) combine with `AND`.
+`--search` emits a Query Builder `body CONTAINS` predicate. Paginate with
+`--limit` and `--offset`.
+
+When the connection has `environment: "production"`, queries automatically scope
+to that environment. Override with `--environment dev` to query a different
+environment, `--all-environments` to query across all environments, or
+`--legacy-unscoped` to access historical data recorded before
+`deployment.environment` attributes were added.
 
 ## Traces
 
@@ -50,13 +60,15 @@ a telemetry trace ID:
 signoz call call-123 --since 7d
 signoz agent agent-42 --service voice-worker --since 24h
 signoz call call-123 --signal traces --limit 50
+signoz call call-123 --environment production
+signoz agent agent-42 --all-environments
 ```
 
-The result includes the resolved time window, the exact filter used for each
-signal, and a `data` object containing `logs`, `traces`, or both. Use
-`--signal logs|traces|both` to control the round trips. Project connections can
-map logical dimensions to different workspace-specific fields; see
-`signoz guide connections`.
+The result includes the resolved time window, environment scope, the exact
+filter used for each signal, and a `data` object containing `logs`, `traces`,
+or both. Use `--signal logs|traces|both` to control the round trips. Project
+connections can map logical dimensions to different workspace-specific fields
+and set a default environment scope; see `signoz guide connections`.
 
 ## Raw Query Builder v5
 

@@ -36,6 +36,7 @@ CONNECTIONS
           "api_key_env": "SIGNOZ_PROD_API_KEY",
           "otlp_endpoint": "https://collector.example.com:4318",
           "deployment": "self_hosted",
+          "environment": "production",
           "dimensions": {
             "agent": "agent_id",
             "call": "call_id",
@@ -55,6 +56,10 @@ CONNECTIONS
     }
   Secrets are names of env vars, never literal values. Selection is
   --connection <id>, then the registry default, then the sole entry.
+  
+  Optional "environment" scopes data queries to deployment.environment or
+  deployment.environment.name. Queries inherit the connection's environment
+  unless overridden with --environment, --all-environments, or --legacy-unscoped.
 
 COMMANDS
   signoz doctor [--connection ID]
@@ -77,18 +82,24 @@ COMMANDS
       Discover queryable field names and observed values.
   signoz logs search [--service NAME] [--agent-id ID] [--call-id ID]
                      [--room-id ID] [--severity LEVEL] [--search TEXT]
-                     [--filter EXPR] [--limit N] [--offset N] [time options]
+                     [--filter EXPR] [--environment ENV] [--all-environments]
+                     [--legacy-unscoped] [--limit N] [--offset N] [time options]
   signoz traces search [--service NAME] [--agent-id ID] [--call-id ID]
                        [--room-id ID] [--operation NAME] [--error yes|no]
-                       [--filter EXPR] [--limit N] [--offset N] [time options]
+                       [--filter EXPR] [--environment ENV] [--all-environments]
+                       [--legacy-unscoped] [--limit N] [--offset N] [time options]
   signoz trace <trace-id> [--since 6h|--start MS --end MS]
       Query raw logs/spans through Query Builder v5. Shortcut filters combine
-      with --filter using AND.
+      with --filter using AND. --environment overrides the connection's scope;
+      --all-environments queries all environments; --legacy-unscoped queries
+      historical data without deployment.environment attributes.
   signoz call <call-id> [--signal logs|traces|both] [--service NAME]
-                        [--filter EXPR] [--limit N] [time options]
+                        [--filter EXPR] [--environment ENV] [--all-environments]
+                        [--legacy-unscoped] [--limit N] [time options]
   signoz agent <agent-id> [same options]
       Fetch correlated logs and traces for one domain identifier. Connection
       dimensions map logical agent/call/room names to project-specific fields.
+      Environment scope applies unless overridden.
   signoz query <file|->
       Execute a complete Query Builder v5 JSON request from a file or stdin.
 
@@ -706,6 +717,8 @@ _DEFAULT_DIMENSIONS = {
     "room": {"logs": "room_id", "traces": "room_id"},
 }
 
+_ENVIRONMENT_FIELDS = ("deployment.environment", "deployment.environment.name")
+
 
 def _resolve_first(keys: tuple[str, ...]) -> tuple[str | None, str | None,
                                                     Path | None, str | None]:
@@ -756,6 +769,18 @@ def _entry_value(entry: dict, literal_key: str, canonical_key: str,
         value, tier, source = _resolve_env_key(pointer.strip())
         return value, tier, source, pointer.strip()
     return _resolve_first(_ALIASES[canonical_key])
+
+
+def _validate_environment(value: str) -> str:
+    import re
+    value = value.strip()
+    if not value:
+        _die(6, "bad_config", "environment cannot be empty")
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value):
+        _die(6, "bad_config",
+             f"environment {value!r} has invalid characters",
+             "use alphanumerics, underscores, dots, and hyphens")
+    return value
 
 
 def _dimension_fields(entry: dict) -> dict[str, dict[str, str]]:
@@ -831,6 +856,13 @@ def _resolve_connection(wanted: str | None) -> dict:
             _die(6, "bad_config",
                  f"connection {cid!r} URL must be the instance root, got {url!r}")
 
+    environment_raw = entry.get("environment")
+    environment = None
+    if environment_raw is not None:
+        if not isinstance(environment_raw, str):
+            _die(6, "bad_config", "environment must be a string")
+        environment = _validate_environment(environment_raw)
+
     return {
         "id": cid,
         "registry": str(reg_file) if reg_file else None,
@@ -845,6 +877,7 @@ def _resolve_connection(wanted: str | None) -> dict:
         "custom_headers": custom_headers,
         "headers_resolution": (headers_tier, headers_source, headers_env),
         "deployment": _deployment(url, otlp, entry.get("deployment")),
+        "environment": environment,
         "dimensions": _dimension_fields(entry),
         "verify_tls": bool(entry.get("verify_tls", True)),
         "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
@@ -857,7 +890,7 @@ def _connection_report(conn: dict) -> dict:
         return _resolved_key_report(
             key, secret, required, value, tier, source, env_key)
 
-    return {
+    report = {
         "allow_write": conn["allow_write"],
         "deployment": conn["deployment"],
         "dimensions": conn["dimensions"],
@@ -875,6 +908,9 @@ def _connection_report(conn: dict) -> dict:
                 conn["headers_resolution"], secret=True, required=False),
         ],
     }
+    if conn.get("environment") is not None:
+        report["environment"] = conn["environment"]
+    return report
 
 
 def _connections_report() -> dict:
@@ -1114,10 +1150,48 @@ def _add_dimension_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--room-id", type=_identifier)
 
 
+def _add_environment_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--environment", type=_identifier,
+                        help="override connection environment or query a specific environment")
+    parser.add_argument("--all-environments", action="store_true",
+                        help="query all environments (ignore connection environment)")
+    parser.add_argument("--legacy-unscoped", action="store_true",
+                        help="query legacy data without deployment.environment attributes")
+
+
 def _dimension_filter(conn: dict, signal: str, dimension: str,
                       value: str) -> str:
     field = conn["dimensions"][dimension][signal]
     return f"{field} = '{_qb_quote(value)}'"
+
+
+def _environment_filter(environment: str | None) -> list[str]:
+    if environment is None:
+        return []
+    quoted = _qb_quote(environment)
+    return [
+        f"({_ENVIRONMENT_FIELDS[0]} = '{quoted}' OR "
+        f"{_ENVIRONMENT_FIELDS[1]} = '{quoted}')"
+    ]
+
+
+def _resolve_environment_scope(conn: dict, args) -> str | None:
+    if getattr(args, "all_environments", False):
+        if getattr(args, "environment", None):
+            _die(6, "input",
+                 "--all-environments and --environment are mutually exclusive")
+        if getattr(args, "legacy_unscoped", False):
+            _die(6, "input",
+                 "--all-environments and --legacy-unscoped are mutually exclusive")
+        return None
+    if getattr(args, "legacy_unscoped", False):
+        if getattr(args, "environment", None):
+            _die(6, "input",
+                 "--legacy-unscoped and --environment are mutually exclusive")
+        return None
+    if getattr(args, "environment", None):
+        return args.environment
+    return conn.get("environment")
 
 
 def _query_payload(signal: str, start: int, end: int, expression: str,
@@ -1194,7 +1268,16 @@ def _ingestion_plan(conn: dict) -> dict:
         env["OTEL_EXPORTER_OTLP_HEADERS"] = (
             "signoz-ingestion-key=${SIGNOZ_INGESTION_KEY}"
             if conn.get("ingestion_key") else None)
-    return {
+    
+    resource_attributes = None
+    if conn.get("environment"):
+        resource_attributes = (
+            f"{_ENVIRONMENT_FIELDS[0]}={conn['environment']},"
+            f"{_ENVIRONMENT_FIELDS[1]}={conn['environment']}"
+        )
+        env["OTEL_RESOURCE_ATTRIBUTES"] = resource_attributes
+    
+    plan = {
         "connection": conn["id"],
         "deployment": conn["deployment"],
         "configured": bool(endpoint),
@@ -1207,6 +1290,14 @@ def _ingestion_plan(conn: dict) -> dict:
             if conn["deployment"] == "cloud"
             else "Self-hosted Community normally accepts OTLP without an ingestion key."),
     }
+    if conn.get("environment"):
+        plan["environment"] = conn["environment"]
+        plan["environment_note"] = (
+            f"Connection specifies environment={conn['environment']!r}. "
+            "Both deployment.environment and deployment.environment.name will be set. "
+            "Merge with existing OTEL_RESOURCE_ATTRIBUTES if needed, separated by commas."
+        )
+    return plan
 
 
 def cmd_doctor(wanted: str | None) -> None:
@@ -1317,6 +1408,7 @@ def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--offset", type=int, default=0)
     _add_dimension_args(parser)
+    _add_environment_args(parser)
     if signal == "logs":
         parser.add_argument("--severity", default="")
         parser.add_argument("--search", default="")
@@ -1328,6 +1420,9 @@ def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
     if args.offset < 0:
         _die(6, "input", "--offset cannot be negative")
     parts = [args.filter] if args.filter else []
+    environment_scope = _resolve_environment_scope(conn, args)
+    if environment_scope and not args.legacy_unscoped:
+        parts.extend(_environment_filter(environment_scope))
     if args.service:
         parts.append(f"service.name = '{_qb_quote(args.service)}'")
     for dimension in ("agent", "call", "room"):
@@ -1359,6 +1454,7 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
     parser.add_argument("--service", default="")
     parser.add_argument("--filter", default="")
     parser.add_argument("--limit", type=int, default=100)
+    _add_environment_args(parser)
     _add_time_args(parser, "24h")
     args = parser.parse_args(argv)
     limit = _bounded_limit(args.limit)
@@ -1366,10 +1462,14 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
     identifier = getattr(args, f"{dimension}_id")
     signals = ["logs", "traces"] if args.signal == "both" else [args.signal]
 
+    environment_scope = _resolve_environment_scope(conn, args)
+
     filters = {}
     data = {}
     for signal in signals:
         parts = [args.filter] if args.filter else []
+        if environment_scope and not args.legacy_unscoped:
+            parts.extend(_environment_filter(environment_scope))
         if args.service:
             parts.append(f"service.name = '{_qb_quote(args.service)}'")
         parts.append(_dimension_filter(
@@ -1385,6 +1485,7 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
         "entity": dimension,
         "id": identifier,
         "window": {"start": start, "end": end},
+        "environment_scope": environment_scope,
         "filters": filters,
         "data": data,
     }

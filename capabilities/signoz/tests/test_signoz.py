@@ -289,3 +289,230 @@ def test_correlated_agent_can_select_one_signal():
     assert set(result["data"]) == {"traces"}
     assert set(result["filters"]) == {"traces"}
     assert len(calls) == 1
+
+
+def test_environment_validation_rejects_empty_and_invalid_chars():
+    with pytest.raises(SystemExit) as exc:
+        module._validate_environment("")
+    assert exc.value.code == 6
+    with pytest.raises(SystemExit) as exc:
+        module._validate_environment("prod space")
+    assert exc.value.code == 6
+    with pytest.raises(SystemExit) as exc:
+        module._validate_environment("prod'OR'1")
+    assert exc.value.code == 6
+    assert module._validate_environment("production") == "production"
+    assert module._validate_environment("staging-v2") == "staging-v2"
+    assert module._validate_environment("dev.local") == "dev.local"
+
+
+def test_connection_with_environment_includes_it_in_report(tmp_path, monkeypatch):
+    (tmp_path / "capabilities").mkdir()
+    (tmp_path / "capabilities" / "settings.json").write_text("{}")
+    (tmp_path / "capabilities" / "signoz").mkdir()
+    (tmp_path / "capabilities" / "signoz" / "connections.json").write_text(
+        json.dumps({
+            "connections": {
+                "prod": {
+                    "url": "https://signoz.example",
+                    "api_key_env": "SIGNOZ_KEY",
+                    "environment": "production",
+                }
+            }
+        })
+    )
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("SIGNOZ_KEY", "secret")
+    resolved = module._resolve_connection("prod")
+    assert resolved["environment"] == "production"
+    report = module._connection_report(resolved)
+    assert report["environment"] == "production"
+
+
+def test_connection_without_environment_omits_from_report(tmp_path, monkeypatch):
+    (tmp_path / "capabilities").mkdir()
+    (tmp_path / "capabilities" / "settings.json").write_text("{}")
+    (tmp_path / "capabilities" / "signoz").mkdir()
+    (tmp_path / "capabilities" / "signoz" / "connections.json").write_text(
+        json.dumps({
+            "connections": {
+                "prod": {
+                    "url": "https://signoz.example",
+                    "api_key_env": "SIGNOZ_KEY",
+                }
+            }
+        })
+    )
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("SIGNOZ_KEY", "secret")
+    resolved = module._resolve_connection("prod")
+    assert resolved.get("environment") is None
+    report = module._connection_report(resolved)
+    assert "environment" not in report
+
+
+def test_environment_filter_checks_both_field_variants():
+    filters = module._environment_filter("production")
+    assert len(filters) == 1
+    assert "deployment.environment = 'production'" in filters[0]
+    assert "deployment.environment.name = 'production'" in filters[0]
+    assert " OR " in filters[0]
+
+
+def test_environment_filter_escapes_special_chars():
+    filters = module._environment_filter("prod'test")
+    assert "\\'test" in filters[0]
+
+
+def test_log_search_with_connection_environment_adds_automatic_filter():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(environment="production")
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "logs", [
+            "search", "--service", "api", "--start", "1", "--end", "2"])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert "deployment.environment = 'production'" in expr
+    assert "deployment.environment.name = 'production'" in expr
+    assert "service.name = 'api'" in expr
+
+
+def test_log_search_environment_override_replaces_connection_scope():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(environment="production")
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "logs", [
+            "search", "--environment", "staging", "--start", "1", "--end", "2"])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert "staging" in expr
+    assert "production" not in expr
+
+
+def test_log_search_all_environments_removes_scope():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(environment="production")
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "logs", [
+            "search", "--all-environments", "--start", "1", "--end", "2"])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert "deployment.environment" not in expr
+    assert expr == ""
+
+
+def test_log_search_legacy_unscoped_removes_environment_filter():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(environment="production")
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "logs", [
+            "search", "--legacy-unscoped", "--service", "api",
+            "--start", "1", "--end", "2"])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert "deployment.environment" not in expr
+    assert "service.name = 'api'" in expr
+
+
+def test_all_environments_and_environment_are_mutually_exclusive():
+    with pytest.raises(SystemExit) as exc:
+        module._cmd_signal_search(connection(), "logs", [
+            "search", "--all-environments", "--environment", "dev",
+            "--start", "1", "--end", "2"])
+    assert exc.value.code == 6
+
+
+def test_legacy_unscoped_and_environment_are_mutually_exclusive():
+    with pytest.raises(SystemExit) as exc:
+        module._cmd_signal_search(connection(), "logs", [
+            "search", "--legacy-unscoped", "--environment", "dev",
+            "--start", "1", "--end", "2"])
+    assert exc.value.code == 6
+
+
+def test_correlated_call_applies_environment_to_both_signals():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(environment="production")
+    with patch.object(module, "_request", side_effect=request):
+        result = module._cmd_correlated(conn, "call", [
+            "call-1", "--start", "1", "--end", "2"])
+
+    assert result["environment_scope"] == "production"
+    assert len(calls) == 2
+    for call in calls:
+        spec = call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+        expr = spec["filter"]["expression"]
+        assert "deployment.environment = 'production'" in expr
+        assert "call_id = 'call-1'" in expr
+
+
+def test_correlated_call_respects_all_environments_flag():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(environment="production")
+    with patch.object(module, "_request", side_effect=request):
+        result = module._cmd_correlated(conn, "call", [
+            "call-1", "--all-environments", "--start", "1", "--end", "2"])
+
+    assert result["environment_scope"] is None
+    for call in calls:
+        spec = call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+        expr = spec["filter"]["expression"]
+        assert "deployment.environment" not in expr
+
+
+def test_ingestion_plan_without_environment_has_no_resource_attributes():
+    plan = module._ingestion_plan(connection())
+    assert "OTEL_RESOURCE_ATTRIBUTES" not in plan["env"]
+    assert "environment" not in plan
+
+
+def test_ingestion_plan_with_environment_sets_both_fields():
+    plan = module._ingestion_plan(connection(
+        environment="production",
+        otlp_endpoint="https://collector:4318"))
+    assert plan["environment"] == "production"
+    attrs = plan["env"]["OTEL_RESOURCE_ATTRIBUTES"]
+    assert "deployment.environment=production" in attrs
+    assert "deployment.environment.name=production" in attrs
+    assert "environment_note" in plan
+
+
+def test_ingestion_plan_does_not_leak_environment_value():
+    plan = module._ingestion_plan(connection(environment="secret-env"))
+    plan_json = json.dumps(plan)
+    assert "secret-env" in plan_json
+    assert plan["environment"] == "secret-env"
