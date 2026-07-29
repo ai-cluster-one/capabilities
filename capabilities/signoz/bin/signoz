@@ -1,0 +1,1399 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""signoz — agent-first CLI for SigNoz telemetry and configuration APIs.
+
+It supports SigNoz Cloud and self-hosted Community/Enterprise installations.
+The management/query API and OTLP ingestion are deliberately separate:
+SIGNOZ_API_KEY reads or manages SigNoz, while SIGNOZ_INGESTION_KEY only
+authenticates Cloud telemetry ingestion. Self-hosted ingestion normally has no
+key. Run `signoz guide connections` for the exact deployment matrix.
+
+CONNECTIONS
+  With no registry, the implicit `default` connection resolves:
+    SIGNOZ_URL                 Management/query base URL (required).
+    SIGNOZ_API_KEY             Service-account/PAT API key (required, secret).
+    SIGNOZ_OTLP_ENDPOINT       OTLP endpoint (optional).
+    SIGNOZ_INGESTION_KEY       Cloud ingestion key (optional, secret).
+    SIGNOZ_CUSTOM_HEADERS      Extra proxy headers as JSON or K:V,K2:V2 (secret).
+
+  Compatibility aliases are accepted for existing setups:
+    SIGNOZ_API_URL -> SIGNOZ_URL
+    SIGNOZ_SERVICE_KEY -> SIGNOZ_API_KEY
+    SIGNOZ_ENDPOINT -> SIGNOZ_OTLP_ENDPOINT
+
+  More than one deployment is declared in
+  <project>/capabilities/signoz/connections.json:
+    {
+      "default": "production",
+      "connections": {
+        "production": {
+          "url": "https://signoz.example.com",
+          "api_key_env": "SIGNOZ_PROD_API_KEY",
+          "otlp_endpoint": "https://collector.example.com:4318",
+          "deployment": "self_hosted",
+          "allow_write": false
+        },
+        "cloud": {
+          "url": "https://workspace.eu.signoz.cloud",
+          "api_key_env": "SIGNOZ_CLOUD_API_KEY",
+          "otlp_endpoint": "https://ingest.eu.signoz.cloud:443",
+          "ingestion_key_env": "SIGNOZ_CLOUD_INGESTION_KEY",
+          "deployment": "cloud",
+          "allow_write": false
+        }
+      }
+    }
+  Secrets are names of env vars, never literal values. Selection is
+  --connection <id>, then the registry default, then the sole entry.
+
+COMMANDS
+  signoz doctor [--connection ID]
+      Verify version, management API authentication, and OTLP configuration.
+      Without a connection flag checks every configured deployment.
+  signoz connections
+      Local resolution report; secrets are masked and no network is touched.
+  signoz version
+      Server version and edition metadata (the endpoint is intentionally public).
+  signoz ingestion
+      Render a secret-free OTLP environment plan for the selected deployment.
+
+  signoz services [--since 1h|--start MS --end MS]
+      Services observed in the time window.
+  signoz metrics [--search TEXT] [--limit N] [time options]
+      Metric catalog with type/unit/last-seen metadata.
+  signoz fields keys --signal logs|traces|metrics [--search TEXT]
+                    [--context resource|attribute|scope] [--metric NAME]
+  signoz fields values --signal ... --name FIELD [same options]
+      Discover queryable field names and observed values.
+  signoz logs search [--service NAME] [--severity LEVEL] [--search TEXT]
+                     [--filter EXPR] [--limit N] [--offset N] [time options]
+  signoz traces search [--service NAME] [--operation NAME] [--error yes|no]
+                       [--filter EXPR] [--limit N] [--offset N] [time options]
+  signoz trace <trace-id> [--since 6h|--start MS --end MS]
+      Query raw logs/spans through Query Builder v5. Shortcut filters combine
+      with --filter using AND.
+  signoz query <file|->
+      Execute a complete Query Builder v5 JSON request from a file or stdin.
+
+  signoz dashboards [<id>]      List dashboards or fetch one.
+  signoz alerts                 Current Alertmanager instances.
+  signoz rules [<id>]           Alert-rule definitions (v1/v2 by server version).
+  signoz views [<id>] [--source-page traces|logs|metrics]
+  signoz channels [<id>]        Saved Explorer views and notification channels.
+
+  signoz api <GET|POST|PUT|PATCH|DELETE> </api/...> [--data <file|->]
+      Authenticated escape hatch for a documented API not covered above.
+      Non-GET calls require the connection's allow_write=true policy.
+
+Contract commands:
+  signoz stub · signoz manifest --json · signoz guide [connections|queries]
+  signoz ids list|get|set|rm · signoz refs
+
+EXIT CODES
+  0 success · 2 missing/rejected API credentials · 3 not found ·
+  4 project/write policy refusal (ask the user; never lift it yourself) ·
+  5 network/server/protocol failure · 6 invalid input.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import NoReturn
+from urllib.parse import urlparse
+
+import httpx
+
+NAME = 'signoz'
+SUMMARY = ("SigNoz CLI over the management and Query Builder APIs — discover "
+           "services/metrics/fields, search logs and traces, inspect dashboards/"
+           "alerts/views/channels, and execute raw API queries on Cloud or "
+           "self-hosted instances.")
+SCOPE = "project"
+CRED_KEYS = [
+    {"key": "SIGNOZ_URL", "secret": False, "required": True,
+     "note": "management/query base URL; SIGNOZ_API_URL is accepted as an alias"},
+    {"key": "SIGNOZ_API_KEY", "secret": True, "required": True,
+     "note": "service-account/PAT key; SIGNOZ_SERVICE_KEY is accepted as an alias"},
+    {"key": "SIGNOZ_OTLP_ENDPOINT", "secret": False, "required": False,
+     "note": "OTLP gRPC/HTTP endpoint; SIGNOZ_ENDPOINT is accepted as an alias"},
+    {"key": "SIGNOZ_INGESTION_KEY", "secret": True, "required": False,
+     "note": "Cloud-only telemetry ingestion key; omit for self-hosted"},
+    {"key": "SIGNOZ_CUSTOM_HEADERS", "secret": True, "required": False,
+     "note": "optional reverse-proxy headers as JSON object or K:V,K2:V2"},
+]
+WRITE_VERBS = {"api"}
+WRITE_DEFAULT = False
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/signoz/guides/")
+TOPICS = ["connections", "queries"]
+STATE = False
+POST_INSTALL: list[dict] = []
+
+TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+MAX_RETRIES = 3
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding capabilities/, legacy .capabilities/,
+    .env(.local), or .git.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    `capabilities/` is canonical. A legacy `.capabilities/` remains readable
+    until `capabilities init` migrates it. If both exist, the canonical tree
+    wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _auth_context() -> dict | None:
+    """Optional runtime authority envelope passed by an ingress/service.
+
+    Absence means the ordinary project gate is the whole policy. Presence means
+    a request-scoped authority layer exists and must fail closed before any
+    credential or network work happens.
+    """
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return None
+    try:
+        if raw.lstrip().startswith("{"):
+            data = json.loads(raw)
+        else:
+            data = json.loads(Path(raw).read_text())
+    except (OSError, ValueError) as e:
+        _die(4, "auth_context_unreadable",
+             "runtime authority context could not be read",
+             f"{raw}: {e}")
+    if not isinstance(data, dict):
+        _die(4, "auth_context_invalid",
+             "runtime authority context is not an object")
+    return data
+
+
+def _auth_capability_allowed(rule) -> bool:
+    if rule is True or rule == "*":
+        return True
+    if rule in (False, None):
+        return False
+    if isinstance(rule, dict):
+        if rule.get("deny") is True:
+            return False
+        if rule.get("enabled") is False or rule.get("allow") is False:
+            return False
+        return True
+    return False
+
+
+def _auth_gate() -> None:
+    ctx = _auth_context()
+    if ctx is None:
+        return
+    allowed = ctx.get("allowed_capabilities")
+    if allowed is None:
+        return
+    if allowed is True or allowed == "*":
+        return
+    if isinstance(allowed, list):
+        if NAME in allowed or "*" in allowed:
+            return
+    elif isinstance(allowed, dict):
+        if _auth_capability_allowed(allowed.get(NAME, allowed.get("*"))):
+            return
+    else:
+        _die(4, "auth_context_invalid",
+             "runtime authority context has invalid allowed_capabilities")
+    source = ctx.get("source") or "runtime"
+    role = ctx.get("sender_role") or ctx.get("role") or "unknown"
+    chat = ctx.get("chat_id") or "unknown"
+    _die(4, "capability_not_authorized",
+         f"{NAME} is not authorized for this {source} request",
+         f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
+
+
+def _gate() -> None:
+    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks.
+
+    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
+    is stricter and also runs here, before credentials or network calls.
+    """
+    _auth_gate()
+    root = _project_root()
+    if root is None:
+        return
+    gate_file = _project_capabilities_dir(root) / "settings.json"
+    try:
+        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
+    except (OSError, ValueError):
+        return
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({gate_file})",
+             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project's active capabilities/."""
+    root = _project_root()
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract — the declaration surface --------------------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import urllib.error as _ue
+    import urllib.request as _ur
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10.0) as resp:
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(text); return
+    except _ue.HTTPError as e:
+        if e.code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if e.code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        err = f"upstream returned {e.code}"
+    except _ue.URLError as e:
+        err = str(e.reason)
+    except OSError as e:
+        err = str(e)
+    if cache.exists():
+        sys.stderr.write(json.dumps(
+            {"warning": f"upstream unreachable; serving cached copy ({err})"},
+            ensure_ascii=False) + "\n")
+        _emit(cache.read_text()); return
+    _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _render_ids_markdown(data: dict) -> str:
+    """Render the {label: {value, note}} envelope as the labelled markdown
+    list the manager's `capabilities ids <NAME>` also produces — one shared
+    format across the ids surface and the identifiers section of `help`."""
+    lines: list[str] = []
+    for label, entry in sorted(data.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        v = entry.get("value")
+        vs = f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+        line = f"- **{label}**: {vs}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _identifiers_section() -> str:
+    """The Identifiers block appended to the bare top-level help — deterministic
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
+    agent following the `<NAME> help` startup protocol loads the discovered
+    labels/values/notes into context at once. Empty when no project envelope
+    or nothing recorded (do not bloat help with an empty section)."""
+    envdir = _env_dir()
+    if envdir is None:
+        return ""
+    ids_file = envdir / "identifiers.json"
+    if not ids_file.exists():
+        return ""
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    header = (
+        "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
+        f"Structural lookups discovered for `{NAME}` in this project. Fetch a single\n"
+        f"raw value with `{NAME} ids get <label>`; the full envelope is also at\n"
+        f"`capabilities ids {NAME}`.\n\n"
+    )
+    return header + _render_ids_markdown(data) + "\n"
+
+
+def _cmd_help() -> None:
+    """Bare top-level help: the CLI's HELP body (module-level `HELP` if
+    defined, else the module docstring), then the project's Identifiers
+    section. Only fires when no extra args follow — per-verb help stays
+    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    g = globals()
+    text = g.get("HELP") or g.get("__doc__") or ""
+    if text.startswith("\n"):
+        text = text.lstrip("\n")
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    section = _identifiers_section()
+    if section:
+        sys.stdout.write(section)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved.
+
+    `help` is a contract verb only when bare (no extra args) — the top-level
+    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
+    through to the CLI so per-verb help stays clean."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    elif cmd == "help" and len(argv) == 1:
+        _cmd_help()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged; (None, None) when neither
+    declares one (the implicit default connection applies)."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    return None, None
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. No registry → the implicit
+    default. A connection's own `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        if wanted and wanted != "default":
+            _die(6, "unknown_connection",
+                 "no connections registry; the sole connection is 'default'",
+                 "the implicit default resolves from the credential cascade")
+        return "default", None
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+# <<< contract: connections <<<
+
+_ALIASES = {
+    "SIGNOZ_URL": ("SIGNOZ_URL", "SIGNOZ_API_URL"),
+    "SIGNOZ_API_KEY": ("SIGNOZ_API_KEY", "SIGNOZ_SERVICE_KEY"),
+    "SIGNOZ_OTLP_ENDPOINT": ("SIGNOZ_OTLP_ENDPOINT", "SIGNOZ_ENDPOINT"),
+    "SIGNOZ_INGESTION_KEY": ("SIGNOZ_INGESTION_KEY",),
+    "SIGNOZ_CUSTOM_HEADERS": ("SIGNOZ_CUSTOM_HEADERS",),
+}
+
+
+def _resolve_first(keys: tuple[str, ...]) -> tuple[str | None, str | None,
+                                                    Path | None, str | None]:
+    for key in keys:
+        value, tier, source = _resolve_env_key(key)
+        if value:
+            return value, tier, source, key
+    return None, None, None, None
+
+
+def _resolved_key_report(key: str, secret: bool, required: bool,
+                         value: str | None, tier: str | None, source,
+                         env_key: str | None = None) -> dict:
+    row = _key_report(key, secret, required, value, tier, source)
+    if env_key and env_key != key:
+        row["resolved_from_key"] = env_key
+    return row
+
+
+def _deployment(url: str | None, otlp: str | None, explicit: str | None) -> str:
+    if explicit:
+        normalized = explicit.lower().replace("-", "_")
+        if normalized not in {"cloud", "self_hosted"}:
+            _die(6, "bad_config",
+                 f"deployment must be 'cloud' or 'self_hosted', got {explicit!r}")
+        return normalized
+    hosts = " ".join(filter(None, [
+        urlparse(url or "").hostname, urlparse(otlp or "").hostname,
+    ]))
+    return "cloud" if ".signoz.cloud" in hosts else "self_hosted"
+
+
+def _entry_value(entry: dict, literal_key: str, canonical_key: str,
+                 env_pointer: str | None = None,
+                 legacy_pointer: str | None = None
+                 ) -> tuple[str | None, str | None, object, str | None]:
+    literal = entry.get(literal_key)
+    if literal is not None:
+        if not isinstance(literal, str) or not literal.strip():
+            _die(6, "bad_config", f"{literal_key} must be a non-empty string")
+        return literal.strip(), "registry", None, literal_key
+    pointer = entry.get(env_pointer) if env_pointer else None
+    if pointer is None and legacy_pointer:
+        pointer = entry.get(legacy_pointer)
+    if pointer is not None:
+        if not isinstance(pointer, str) or not pointer.strip():
+            _die(6, "bad_config", f"{env_pointer} must name an environment key")
+        value, tier, source = _resolve_env_key(pointer.strip())
+        return value, tier, source, pointer.strip()
+    return _resolve_first(_ALIASES[canonical_key])
+
+
+def _resolve_connection(wanted: str | None) -> dict:
+    reg, reg_file = _connections_registry()
+    cid, raw = _select_connection(reg, wanted)
+    entry = raw if isinstance(raw, dict) else {}
+    if raw is not None and not isinstance(raw, dict):
+        _die(6, "bad_config", f"connection {cid!r} must be an object")
+
+    url, url_tier, url_source, url_key = _entry_value(
+        entry, "url", "SIGNOZ_URL")
+    api_key, api_tier, api_source, api_env = _entry_value(
+        entry, "_never_literal_api_key", "SIGNOZ_API_KEY",
+        "api_key_env", "secret_env")
+    otlp, otlp_tier, otlp_source, otlp_key = _entry_value(
+        entry, "otlp_endpoint", "SIGNOZ_OTLP_ENDPOINT")
+    ingestion_key, ingestion_tier, ingestion_source, ingestion_env = _entry_value(
+        entry, "_never_literal_ingestion_key", "SIGNOZ_INGESTION_KEY",
+        "ingestion_key_env")
+    custom_headers, headers_tier, headers_source, headers_env = _entry_value(
+        entry, "_never_literal_custom_headers", "SIGNOZ_CUSTOM_HEADERS",
+        "custom_headers_env")
+
+    if url:
+        url = url.rstrip("/")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            _die(6, "bad_config",
+                 f"connection {cid!r} has invalid management URL {url!r}",
+                 "use an absolute http(s) URL without an /api suffix")
+        if parsed.path not in {"", "/"}:
+            _die(6, "bad_config",
+                 f"connection {cid!r} URL must be the instance root, got {url!r}")
+
+    return {
+        "id": cid,
+        "registry": str(reg_file) if reg_file else None,
+        "url": url,
+        "url_resolution": (url_tier, url_source, url_key),
+        "api_key": api_key,
+        "api_resolution": (api_tier, api_source, api_env),
+        "otlp_endpoint": otlp.rstrip("/") if otlp else None,
+        "otlp_resolution": (otlp_tier, otlp_source, otlp_key),
+        "ingestion_key": ingestion_key,
+        "ingestion_resolution": (ingestion_tier, ingestion_source, ingestion_env),
+        "custom_headers": custom_headers,
+        "headers_resolution": (headers_tier, headers_source, headers_env),
+        "deployment": _deployment(url, otlp, entry.get("deployment")),
+        "verify_tls": bool(entry.get("verify_tls", True)),
+        "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+    }
+
+
+def _connection_report(conn: dict) -> dict:
+    def row(key: str, value, resolution, *, secret: bool, required: bool) -> dict:
+        tier, source, env_key = resolution
+        return _resolved_key_report(
+            key, secret, required, value, tier, source, env_key)
+
+    return {
+        "allow_write": conn["allow_write"],
+        "deployment": conn["deployment"],
+        "verify_tls": conn["verify_tls"],
+        "keys": [
+            row("SIGNOZ_URL", conn["url"], conn["url_resolution"],
+                secret=False, required=True),
+            row("SIGNOZ_API_KEY", conn["api_key"], conn["api_resolution"],
+                secret=True, required=True),
+            row("SIGNOZ_OTLP_ENDPOINT", conn["otlp_endpoint"],
+                conn["otlp_resolution"], secret=False, required=False),
+            row("SIGNOZ_INGESTION_KEY", conn["ingestion_key"],
+                conn["ingestion_resolution"], secret=True, required=False),
+            row("SIGNOZ_CUSTOM_HEADERS", conn["custom_headers"],
+                conn["headers_resolution"], secret=True, required=False),
+        ],
+    }
+
+
+def _connections_report() -> dict:
+    reg, _ = _connections_registry()
+    if reg is None:
+        conn = _resolve_connection("default")
+        return {"default": "default",
+                "connections": {"default": _connection_report(conn)}}
+    conns = reg["connections"]
+    default = reg.get("default") or (next(iter(conns)) if len(conns) == 1 else None)
+    return {
+        "default": default,
+        "connections": {
+            cid: _connection_report(_resolve_connection(cid))
+            for cid in conns
+        },
+    }
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+def _require_url(conn: dict) -> None:
+    if not conn.get("url"):
+        _die(2, "credentials_missing",
+             f"connection {conn['id']!r} has no SIGNOZ_URL",
+             "`signoz connections` shows the resolution cascade")
+
+
+def _require_api(conn: dict) -> None:
+    _require_url(conn)
+    if not conn.get("api_key"):
+        _die(2, "credentials_missing",
+             f"connection {conn['id']!r} has no SIGNOZ_API_KEY",
+             "create a SigNoz API key/PAT; an ingestion key cannot query data")
+
+
+def _parse_custom_headers(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        if raw.lstrip().startswith("{"):
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("JSON must be an object")
+            headers = {str(k).strip(): str(v) for k, v in parsed.items()}
+        else:
+            headers = {}
+            for item in raw.split(","):
+                if ":" not in item:
+                    raise ValueError("expected K:V,K2:V2")
+                key, value = item.split(":", 1)
+                headers[key.strip()] = value.strip()
+    except (ValueError, json.JSONDecodeError) as exc:
+        _die(6, "bad_config", f"SIGNOZ_CUSTOM_HEADERS is invalid: {exc}")
+    forbidden = {"host", "content-length", "signoz-api-key"}
+    if any(key.lower() in forbidden for key in headers):
+        _die(6, "bad_config",
+             "SIGNOZ_CUSTOM_HEADERS cannot override Host, Content-Length, or SIGNOZ-API-KEY")
+    return headers
+
+
+def _error_message(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                return str(error.get("message") or error.get("code") or error)[:1000]
+            return str(payload.get("message") or payload.get("error") or payload)[:1000]
+    except ValueError:
+        pass
+    text = response.text.strip()
+    return text[:1000] if text else response.reason_phrase
+
+
+def _request(conn: dict, method: str, path: str, *,
+             params: dict | None = None, json_body=None,
+             require_auth: bool = True, expect_json: bool = True):
+    if require_auth:
+        _require_api(conn)
+    else:
+        _require_url(conn)
+    if not path.startswith("/api/"):
+        _die(6, "input", f"SigNoz API path must start with /api/, got {path!r}")
+    headers = {"Accept": "application/json"}
+    if conn.get("api_key"):
+        headers["SIGNOZ-API-KEY"] = conn["api_key"]
+    headers.update(_parse_custom_headers(conn.get("custom_headers")))
+
+    replay_safe = method in {"GET", "PUT", "DELETE"} or path.endswith("/query_range")
+    response = None
+    try:
+        with httpx.Client(timeout=TIMEOUT, verify=conn["verify_tls"],
+                          follow_redirects=True) as client:
+            for attempt in range(MAX_RETRIES):
+                response = client.request(
+                    method, conn["url"] + path, params=params,
+                    json=json_body, headers=headers)
+                if response.status_code not in {429, 502, 503, 504} \
+                        or not replay_safe or attempt == MAX_RETRIES - 1:
+                    break
+                time.sleep(0.25 * (2 ** attempt))
+    except (httpx.TimeoutException, httpx.NetworkError, httpx.InvalidURL) as exc:
+        _die(5, "network_error",
+             f"{method} {path} failed for connection {conn['id']!r}: {exc}")
+    if response is None:
+        _die(5, "protocol_error",
+             f"{method} {path} completed without a response")
+
+    if response.status_code in {401, 403}:
+        _die(2, "authentication_failed",
+             f"SigNoz rejected SIGNOZ_API_KEY for connection {conn['id']!r}",
+             "use a management API key/PAT, not SIGNOZ_INGESTION_KEY",
+             response.status_code)
+    if response.status_code == 404:
+        _die(3, "not_found", f"SigNoz endpoint/resource not found: {path}",
+             "the endpoint may require a newer SigNoz version", 404)
+    if response.status_code == 429 or response.status_code >= 500:
+        _die(5, "server_error",
+             f"SigNoz returned {response.status_code}: {_error_message(response)}",
+             status=response.status_code)
+    if response.status_code >= 400:
+        _die(6, "api_error",
+             f"SigNoz returned {response.status_code}: {_error_message(response)}",
+             status=response.status_code)
+    if response.status_code == 204 or not response.content:
+        return {"ok": True, "status": response.status_code}
+    try:
+        return response.json()
+    except ValueError:
+        if expect_json:
+            _die(5, "protocol_error",
+                 f"SigNoz returned non-JSON content for {path}",
+                 f"content-type: {response.headers.get('content-type', 'unknown')}")
+        return {
+            "status": response.status_code,
+            "content_type": response.headers.get("content-type"),
+            "body": response.text[:1_000_000],
+            "truncated": len(response.text) > 1_000_000,
+        }
+
+
+def _server_info(conn: dict) -> dict:
+    payload = _request(conn, "GET", "/api/v1/version", require_auth=False)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    source = data if isinstance(data, dict) else payload
+    if not isinstance(source, dict):
+        _die(5, "protocol_error", "SigNoz version response is not an object")
+    version = source.get("version") or payload.get("version")
+    if not version:
+        _die(5, "protocol_error", "SigNoz version response has no version")
+    return {
+        "version": str(version).lstrip("v"),
+        "edition": "enterprise" if bool(source.get("ee", payload.get("ee"))) else "community",
+        "setup_completed": source.get("setupCompleted", payload.get("setupCompleted")),
+    }
+
+
+def _version_at_least(version: str, wanted: tuple[int, int, int]) -> bool:
+    import re
+    numbers = [int(x) for x in re.findall(r"\d+", version)[:3]]
+    numbers += [0] * (3 - len(numbers))
+    return tuple(numbers) >= wanted
+
+
+def _dashboard_path(info: dict, ident: str | None = None) -> str:
+    base = "/api/v2/dashboards" if _version_at_least(
+        info["version"], (0, 135, 0)) else "/api/v1/dashboards"
+    return base + (f"/{ident}" if ident else "")
+
+
+def _rules_path(info: dict, ident: str | None = None) -> str:
+    base = "/api/v2/rules" if _version_at_least(
+        info["version"], (0, 120, 0)) else "/api/v1/rules"
+    return base + (f"/{ident}" if ident else "")
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        _die(6, "input", message, self.format_usage().strip())
+
+
+def _parser(prog: str) -> _Parser:
+    return _Parser(prog=f"signoz {prog}", add_help=False)
+
+
+def _add_time_args(parser: argparse.ArgumentParser, default: str = "1h") -> None:
+    parser.add_argument("--since", default=default)
+    parser.add_argument("--start", type=int)
+    parser.add_argument("--end", type=int)
+
+
+def _duration_ms(raw: str) -> int:
+    import re
+    match = re.fullmatch(r"(\d+)([smhdw])", raw.strip().lower())
+    if not match:
+        _die(6, "input", f"invalid duration {raw!r}",
+             "use an integer plus s/m/h/d/w, for example 30m or 7d")
+    units = {"s": 1_000, "m": 60_000, "h": 3_600_000,
+             "d": 86_400_000, "w": 604_800_000}
+    return int(match.group(1)) * units[match.group(2)]
+
+
+def _window(args) -> tuple[int, int]:
+    if (args.start is None) != (args.end is None):
+        _die(6, "input", "--start and --end must be supplied together")
+    if args.start is not None:
+        if args.start >= args.end:
+            _die(6, "input", "--start must be less than --end")
+        return args.start, args.end
+    end = int(time.time() * 1000)
+    return end - _duration_ms(args.since), end
+
+
+def _bounded_limit(value: int, maximum: int = 10_000) -> int:
+    if value < 1 or value > maximum:
+        _die(6, "input", f"--limit must be between 1 and {maximum}")
+    return value
+
+
+def _qb_quote(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _query_payload(signal: str, start: int, end: int, expression: str,
+                   limit: int, offset: int) -> dict:
+    spec: dict = {
+        "name": "A",
+        "signal": signal,
+        "disabled": False,
+        "filter": {"expression": expression},
+        "limit": limit,
+        "offset": offset,
+        "order": [{"key": {"name": "timestamp"}, "direction": "desc"}],
+        "having": {"expression": ""},
+    }
+    if signal == "logs":
+        spec["order"].append(
+            {"key": {"name": "id"}, "direction": "desc"})
+    else:
+        spec["selectFields"] = [
+            {"name": "trace_id", "fieldDataType": "string",
+             "signal": "traces", "fieldContext": "span"},
+            {"name": "span_id", "fieldDataType": "string",
+             "signal": "traces", "fieldContext": "span"},
+            {"name": "parent_span_id", "fieldDataType": "string",
+             "signal": "traces", "fieldContext": "span"},
+            {"name": "name", "fieldDataType": "string",
+             "signal": "traces", "fieldContext": "span"},
+            {"name": "duration_nano", "fieldDataType": "number",
+             "signal": "traces", "fieldContext": "span"},
+            {"name": "timestamp", "fieldDataType": "number",
+             "signal": "traces", "fieldContext": "span"},
+            {"name": "has_error", "fieldDataType": "bool",
+             "signal": "traces", "fieldContext": "span"},
+            {"name": "status_code_string", "fieldDataType": "string",
+             "signal": "traces", "fieldContext": "span"},
+            {"name": "service.name", "fieldDataType": "string",
+             "signal": "traces", "fieldContext": "resource"},
+        ]
+    return {
+        "schemaVersion": "v1",
+        "start": start,
+        "end": end,
+        "requestType": "raw",
+        "compositeQuery": {
+            "queries": [{"type": "builder_query", "spec": spec}]},
+        "formatOptions": {
+            "formatTableResultForUI": False, "fillGaps": False},
+        "variables": {},
+    }
+
+
+def _read_json_input(source: str):
+    try:
+        text = sys.stdin.read() if source == "-" else Path(source).read_text()
+    except OSError as exc:
+        _die(6, "input", f"cannot read {source!r}: {exc}")
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        _die(6, "input", f"{source!r} is not valid JSON: {exc}")
+
+
+def _ingestion_plan(conn: dict) -> dict:
+    endpoint = conn.get("otlp_endpoint")
+    protocol = None
+    if endpoint:
+        parsed = urlparse(endpoint)
+        protocol = "http/protobuf" if parsed.port == 4318 else "grpc"
+    env = {
+        "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint,
+        "OTEL_EXPORTER_OTLP_PROTOCOL": protocol,
+    }
+    if conn["deployment"] == "cloud":
+        env["OTEL_EXPORTER_OTLP_HEADERS"] = (
+            "signoz-ingestion-key=${SIGNOZ_INGESTION_KEY}"
+            if conn.get("ingestion_key") else None)
+    return {
+        "connection": conn["id"],
+        "deployment": conn["deployment"],
+        "configured": bool(endpoint),
+        "ingestion_auth": (
+            "signoz-ingestion-key" if conn["deployment"] == "cloud" else "none"),
+        "ingestion_key_set": bool(conn.get("ingestion_key")),
+        "env": env,
+        "note": (
+            "Cloud requires an ingestion key."
+            if conn["deployment"] == "cloud"
+            else "Self-hosted Community normally accepts OTLP without an ingestion key."),
+    }
+
+
+def cmd_doctor(wanted: str | None) -> None:
+    report = _connections_report()
+    _doctor_gate(report, wanted)
+    targets = [wanted] if wanted else list(report["connections"])
+    results = {}
+    for cid in targets:
+        conn = _resolve_connection(cid)
+        info = _server_info(conn)
+        # A protected endpoint proves that the management key, not merely the
+        # public health/version route, is accepted.
+        _request(conn, "GET", "/api/v1/dashboards")
+        results[cid] = {
+            "ok": True,
+            "url": conn["url"],
+            **info,
+            "deployment": conn["deployment"],
+            "allow_write": conn["allow_write"],
+            "ingestion": _ingestion_plan(conn),
+        }
+    _emit({"ok": True, "connections": results})
+
+
+def _cmd_services(conn: dict, argv: list[str]):
+    parser = _parser("services")
+    _add_time_args(parser)
+    args = parser.parse_args(argv)
+    start, end = _window(args)
+    info = _server_info(conn)
+    # v0.97's legacy service parser feeds the values to time.Unix(0, value)
+    # and therefore expects nanoseconds. Newer service APIs use milliseconds,
+    # matching Query Builder v5 and the official MCP client.
+    if not _version_at_least(info["version"], (0, 100, 0)):
+        start, end = start * 1_000_000, end * 1_000_000
+    return _request(conn, "POST", "/api/v1/services",
+                    json_body={"start": str(start), "end": str(end)})
+
+
+def _cmd_metrics(conn: dict, argv: list[str]):
+    parser = _parser("metrics")
+    parser.add_argument("--search", default="")
+    parser.add_argument("--limit", type=int, default=50)
+    _add_time_args(parser)
+    args = parser.parse_args(argv)
+    limit = _bounded_limit(args.limit, 1_000)
+    start, end = _window(args)
+    info = _server_info(conn)
+    if _version_at_least(info["version"], (0, 120, 0)):
+        return _request(conn, "GET", "/api/v2/metrics", params={
+            "start": start, "end": end, "limit": limit,
+            "searchText": args.search or None,
+        })
+    payload = {
+        "offset": 0,
+        "limit": limit,
+        "start": start,
+        "end": end,
+        "orderBy": {"columnName": "timeseries", "order": "desc"},
+        "filters": {"op": "AND", "items": []},
+    }
+    result = _request(conn, "POST", "/api/v1/metrics", json_body=payload)
+    if args.search and isinstance(result, dict):
+        data = result.get("data")
+        target = data if isinstance(data, dict) else result
+        metrics = target.get("metrics") if isinstance(target, dict) else None
+        if isinstance(metrics, list):
+            needle = args.search.lower()
+            target["metrics"] = [
+                item for item in metrics
+                if needle in str((item or {}).get("metric_name")
+                                 or (item or {}).get("name") or "").lower()
+            ]
+            target["client_side_search"] = args.search
+    return result
+
+
+def _cmd_fields(conn: dict, argv: list[str]):
+    if not argv or argv[0] not in {"keys", "values"}:
+        _die(6, "input", "usage: signoz fields keys|values [options]")
+    verb = argv[0]
+    parser = _parser(f"fields {verb}")
+    parser.add_argument("--signal", required=True,
+                        choices=["logs", "traces", "metrics"])
+    parser.add_argument("--search", default="")
+    parser.add_argument("--context", dest="field_context", default="")
+    parser.add_argument("--metric", default="")
+    if verb == "values":
+        parser.add_argument("--name", required=True)
+    args = parser.parse_args(argv[1:])
+    params = {
+        "signal": args.signal,
+        "searchText": args.search or None,
+        "fieldContext": args.field_context or None,
+        "metricName": args.metric or None,
+    }
+    if verb == "values":
+        params["name"] = args.name
+    return _request(conn, "GET", f"/api/v1/fields/{verb}", params=params)
+
+
+def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
+    if not argv or argv[0] != "search":
+        _die(6, "input", f"usage: signoz {signal} search [options]")
+    parser = _parser(f"{signal} search")
+    parser.add_argument("--service", default="")
+    parser.add_argument("--filter", default="")
+    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--offset", type=int, default=0)
+    if signal == "logs":
+        parser.add_argument("--severity", default="")
+        parser.add_argument("--search", default="")
+    else:
+        parser.add_argument("--operation", default="")
+        parser.add_argument("--error", choices=["yes", "no"])
+    _add_time_args(parser)
+    args = parser.parse_args(argv[1:])
+    if args.offset < 0:
+        _die(6, "input", "--offset cannot be negative")
+    parts = [args.filter] if args.filter else []
+    if args.service:
+        parts.append(f"service.name = '{_qb_quote(args.service)}'")
+    if signal == "logs":
+        if args.severity:
+            parts.append(f"severity_text = '{_qb_quote(args.severity)}'")
+        if args.search:
+            parts.append(f"body CONTAINS '{_qb_quote(args.search)}'")
+    else:
+        if args.operation:
+            parts.append(f"name = '{_qb_quote(args.operation)}'")
+        if args.error:
+            parts.append(f"has_error = {'true' if args.error == 'yes' else 'false'}")
+    start, end = _window(args)
+    payload = _query_payload(
+        signal, start, end, " AND ".join(parts),
+        _bounded_limit(args.limit), args.offset)
+    return _request(conn, "POST", "/api/v5/query_range", json_body=payload)
+
+
+def _cmd_trace(conn: dict, argv: list[str]):
+    parser = _parser("trace")
+    parser.add_argument("trace_id")
+    _add_time_args(parser, "6h")
+    args = parser.parse_args(argv)
+    start, end = _window(args)
+    payload = _query_payload(
+        "traces", start, end,
+        f"trace_id = '{_qb_quote(args.trace_id)}'", 1_000, 0)
+    return _request(conn, "POST", "/api/v5/query_range", json_body=payload)
+
+
+def _cmd_views(conn: dict, argv: list[str]):
+    parser = _parser("views")
+    parser.add_argument("id", nargs="?")
+    parser.add_argument("--source-page",
+                        choices=["traces", "logs", "metrics"])
+    args = parser.parse_args(argv)
+    path = "/api/v1/explorer/views" + (f"/{args.id}" if args.id else "")
+    params = {"sourcePage": args.source_page} if args.source_page else None
+    return _request(conn, "GET", path, params=params)
+
+
+def _cmd_api(conn: dict, argv: list[str]):
+    parser = _parser("api")
+    parser.add_argument("method", choices=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    parser.add_argument("path")
+    parser.add_argument("--data")
+    args = parser.parse_args(argv)
+    if not args.path.startswith("/api/") or "://" in args.path:
+        _die(6, "input", "api path must be a relative /api/... path")
+    if args.method != "GET":
+        _write_gate(conn["id"], conn["allow_write"], "api")
+    elif args.data:
+        _die(6, "input", "--data is not accepted with GET")
+    body = _read_json_input(args.data) if args.data else None
+    return _request(conn, args.method, args.path, json_body=body,
+                    expect_json=False)
+
+
+def _extract_connection(argv: list[str]) -> tuple[str | None, list[str]]:
+    wanted = None
+    cleaned = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--connection":
+            if i + 1 >= len(argv):
+                _die(6, "input", "--connection needs an id")
+            wanted = argv[i + 1]
+            i += 2
+            continue
+        if argv[i].startswith("--connection="):
+            wanted = argv[i].split("=", 1)[1]
+            i += 1
+            continue
+        cleaned.append(argv[i])
+        i += 1
+    return wanted, cleaned
+
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    _contract(argv)
+    wanted, args = _extract_connection(argv)
+    if args == ["doctor"]:
+        cmd_doctor(wanted)
+        return
+    if not args:
+        _die(6, "input", "missing command", f"run `{NAME} help`")
+    conn = _resolve_connection(wanted)
+    command, rest = args[0], args[1:]
+
+    if command == "version":
+        if rest:
+            _die(6, "input", "version takes no arguments")
+        result = {"connection": conn["id"], **_server_info(conn)}
+    elif command == "ingestion":
+        if rest:
+            _die(6, "input", "ingestion takes no arguments")
+        result = _ingestion_plan(conn)
+    elif command == "services":
+        result = _cmd_services(conn, rest)
+    elif command == "metrics":
+        result = _cmd_metrics(conn, rest)
+    elif command == "fields":
+        result = _cmd_fields(conn, rest)
+    elif command == "logs":
+        result = _cmd_signal_search(conn, "logs", rest)
+    elif command == "traces":
+        result = _cmd_signal_search(conn, "traces", rest)
+    elif command == "trace":
+        result = _cmd_trace(conn, rest)
+    elif command == "query":
+        if len(rest) != 1:
+            _die(6, "input", "usage: signoz query <file|->")
+        result = _request(conn, "POST", "/api/v5/query_range",
+                          json_body=_read_json_input(rest[0]))
+    elif command == "dashboards":
+        parser = _parser("dashboards")
+        parser.add_argument("id", nargs="?")
+        parsed = parser.parse_args(rest)
+        info = _server_info(conn)
+        result = _request(conn, "GET", _dashboard_path(info, parsed.id))
+    elif command == "alerts":
+        if rest:
+            _die(6, "input", "alerts takes no arguments")
+        result = _request(conn, "GET", "/api/v1/alerts")
+    elif command == "rules":
+        parser = _parser("rules")
+        parser.add_argument("id", nargs="?")
+        parsed = parser.parse_args(rest)
+        info = _server_info(conn)
+        result = _request(conn, "GET", _rules_path(info, parsed.id))
+    elif command == "views":
+        result = _cmd_views(conn, rest)
+    elif command == "channels":
+        parser = _parser("channels")
+        parser.add_argument("id", nargs="?")
+        parsed = parser.parse_args(rest)
+        path = "/api/v1/channels" + (f"/{parsed.id}" if parsed.id else "")
+        result = _request(conn, "GET", path)
+    elif command == "api":
+        result = _cmd_api(conn, rest)
+    else:
+        _die(6, "input", f"unknown command {command!r}", f"run `{NAME} help`")
+    _emit(result)
+
+
+if __name__ == "__main__":
+    main()

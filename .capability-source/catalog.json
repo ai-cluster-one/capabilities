@@ -85,6 +85,11 @@
       "payload_sha256": "c046a651af51b6aeec6b1a7e0096a7992aac361b8cdae9fe59c998ea528c810e",
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes."
     },
+    "signoz": {
+      "path": "capabilities/signoz",
+      "payload_sha256": "36b426d76923f92449b062465cc5588a9138fbb73dadf010e0c4fec3d149f151",
+      "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances."
+    },
     "simplbooks": {
       "path": "capabilities/simplbooks",
       "payload_sha256": "317c699373efe9e20a2ab4b27345f912e9ec84b405a66d267c07019c05c52e6b",
