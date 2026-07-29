@@ -1,6 +1,6 @@
 # Design + plan — `youtrack` MCP parity and noun-verb CLI
 
-**Status — 2026-07-28: ✅ M1, ✅ M2, ✅ M3 and ✅ M4a are shipped. M1–M3 are merged to `upstream/main`; M4a is on `feat/youtrack-m4a-unblocked-tail`. ⬜ M4b outstanding — the last two gaps.**
+**Status — 2026-07-29: ✅ M1, ✅ M2, ✅ M3, ✅ M4a and ✅ M4b are all shipped. M1–M4a are merged to `upstream/main`; M4b is on `feat/youtrack-m4b-tags-and-work`. Every JetBrains predefined MCP tool is now accounted for — the parity ladder is complete.**
 
 - ✅ **M1** — PR #14, catalog repair in #15.
 - ✅ **M2 step 0** — write-direction probe closed, then extended the same day to the *create* path (see "Create path — measured"), which settled step 2's and step 5's central premises.
@@ -49,8 +49,8 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `find_user` | `users find` | ✅ **parity** (M3) |
 | `link_issues` | `issues links add` · `issues links remove` | ✅ **parity** (M3) |
 | `change_issue_assignee` | `issues update --field Assignee=…` | ✅ covered — deliberate drop, no own verb |
-| `manage_issue_tags` | — | ⬜ absent (M4b) |
-| `log_work` | — | ⬜ absent (M4b) |
+| `manage_issue_tags` | `issues tags add` · `issues tags remove` | ✅ **parity** (M4b) |
+| `log_work` | `issues work log` · `issues work list` | ✅ **parity** (M4b) |
 | `get_project` | `projects get` | ✅ **parity** (M4a) |
 | `get_saved_issue_searches` | `searches list` | ✅ **parity** (M4a) |
 | `find_user_groups` | `groups find` | ✅ **parity** (M4a) |
@@ -58,9 +58,9 @@ Against the **23** predefined MCP tools listed on [Predefined MCP Tools](https:/
 | `create_draft_issue` | `issues create --draft` | ✅ **parity** (M2 step 5) |
 | — | `articles comments list`, `articles comments add` | CLI-only; MCP has no article-comment tools |
 
-**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-28, with M1, M2, M3 and M4a all shipped: 20 at parity, 0 near/partial, 2 absent (`manage_issue_tags`, `log_work` — both M4b), plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** 20 + 0 + 2 + 1 = 23, counted over the table's 23 MCP rows (the CLI-only row is not a parity item). **Only M4b remains.**
+**The `status` column above is kept current; the 6/6/11 sentence is the frozen baseline at authoring time. As of 2026-07-29, with M1, M2, M3, M4a and M4b all shipped: 22 at parity, 0 near/partial, 0 absent, plus 1 (`change_issue_assignee`) deliberately covered by `issues update --field` instead of its own verb.** 22 + 0 + 0 + 1 = 23, counted over the table's 23 MCP rows (the CLI-only row is not a parity item). **The ladder is complete — every JetBrains predefined MCP tool is accounted for.**
 
-This one line has now been miscounted three times — "1 near/partial, 8 absent" (didn't sum to 23), "31 at parity … = 34" (a row heuristic that swept in other tables), and a revision that left the previous milestone's `13 + 3 + 6 + 1 = 23` standing beside the new figure so the sentence asserted both. **Recount it against the table programmatically rather than editing the numbers in place.** `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
+This one line has now been miscounted four times — "1 near/partial, 8 absent" (didn't sum to 23), "31 at parity … = 34" (a row heuristic that swept in other tables), a revision that left the previous milestone's `13 + 3 + 6 + 1 = 23` standing beside the new figure so the sentence asserted both, and M4b shipping with it still reading `20 … 2 absent` after `manage_issue_tags` and `log_work` had moved to parity in the table above. **Recount it against the table programmatically rather than editing the numbers in place** — and note that counting it mechanically is itself easy to get wrong: classify each row on its status glyph, because `search_issues`'s status cell contains the phrase "sort still absent, deliberately" and a substring match reads that row as absent. `search_issues` is counted at parity without sort support: sorting is expressible inside the YouTrack query itself (`sort by:`), so a dedicated flag would duplicate the query language.
 
 Attachments are in **neither** surface — they belong to the 44-tool community server, not JetBrains'. Not a parity item.
 
@@ -390,6 +390,78 @@ An **undirected** type contributes exactly one phrase: `Relates` reports `target
 
 **Not proven on ION: workflow-rule rejection of a link (exit 7).** No link rule fired on ION, and whether one exists on IONDEV is unknown and now unaskable under the ION-only constraint. Tag: **UNTESTED** — do not claim exit 7 coverage for links.
 
+---
+
+# Tags and work items — measured 2026-07-28 (M4b step 0, closed)
+
+Probed live against **ION** with raw HTTP, one write per request so failures stay attributable, **every write read back**. Four throwaway issues (ION-1441, ION-1442, ION-1443 and the empty-state issue) and two throwaway articles (ION-A-240, ION-A-241) were created and **all six deleted, each deletion verified by a follow-up 404** on both the internal id and the readable key. Closing sweeps: `summary: PROBE` → `[]`, `project: ION created: Today` → `[]`, `GET /users/me/drafts` → `[]`, instance tag count unchanged at **17**, instance work-item-type count unchanged at **6**. No write of any kind touched IONDEV.
+
+Every row below is measured unless tagged otherwise. **Three of the plan's own expectations were falsified here** — the duration round-trip, the `Spent time` scope-boundary claim, and the self-parent premise — and are corrected in place rather than left standing.
+
+## Tags — the write path takes an id, and a name is not merely unsupported but indistinguishable from a typo
+
+| Case | Server response | Consequence |
+|---|---|---|
+| add by id — `POST /issues/{id}/tags` `{"id": "6-3"}` | **200**, echoes `{"id","name"}` | the write path |
+| **add by name** — `{"name": "Grooming"}` | **400** `YouTrack is unable to locate an Tag-type entity unless its ID is also provided` | a caller-facing `TAG` naming a tag **requires a client-side name→id lookup** |
+| **add an unknown name** | **400, byte-identical to the line above**, and `GET /issueTags?query=ProbeM4b` → `[]` | writing an unknown name **does not create a tag**, and the server cannot tell the caller which mistake they made — resolution must happen client-side. This is the `permittedGroups` situation exactly |
+| add an unknown id — `{"id": "6-9999"}` | **400** `An Tag-type entity with the specified ID (6-9999) was not found` | distinct message; only reachable if a resolved id goes stale mid-call |
+| id and name **disagreeing** — `{"id":"6-3","name":"DevOps"}` | **200**, and the **id wins** (`Question` was applied) | never send both; a name alongside an id is silently ignored |
+| **add twice** | **200**, no duplicate entry | **add is idempotent**, as link-add was. No client-side pre-check needed |
+| add a tag owned by **another user** (`Data Team`, owner `k.shmidt`) | **200**, applied | ownership does not gate application |
+| remove — `DELETE /issues/{id}/tags/{tagId}` | **200**, empty body, removes only that tag | the removal path |
+| **remove the same tag again** | **404** `Entity with id 6-3 not found` | **remove is NOT idempotent**, and the message names the **tag** — which exists as a tag. Passing it through would claim the tag does not exist when the *issue* merely does not carry it. Same trap as link-remove; must be translated |
+| remove by **name** in the path | **404** `Entity with id Grooming not found` | the DELETE path takes an id too |
+| **`POST /issues/{id}` with a `tags` array** | **200** — and it **replaced the whole tag set**: an issue holding `Question` + `Data Team` came back holding only `DevOps` | ⚠️ **REPLACE semantics, not append.** This is the plausible-looking alternative implementation and it silently destroys tags the caller never named. The additive `/tags` sub-resource is the only correct path for add/remove |
+| unknown issue, on add / remove / read | **404** `Entity with id ION-999999 not found` | names the issue, so it is separable from the missing-tag 404 above by message content |
+
+**Inventory, measured:** tags are **instance-scoped**; `GET /issueTags` returned **17** visible, 12 owned by `s.royz` and 5 by others (`k.shmidt` ×2, `amand.amichelini` ×2, `dmytro.safonov`). All 17 names are **distinct on this instance**. `GET /issueTags?query=…` is honoured server-side. Reads: `GET /issues/{id}?fields=tags(id,name)` works and yields `[]` when the issue has none; `GET /issues/{id}/tags` also exists.
+
+**Name uniqueness is not guaranteed by the server** — nothing prevents two users owning same-named tags, and only this instance's 17 were observed. Resolution must therefore **refuse an ambiguous name rather than pick one**, exactly as `_resolve_group_ids` and `_resolve_link` already do. Tag: **measured (uniqueness on ION) + design decision (the refusal)**.
+
+**A tag this token cannot see is indistinguishable from a typo — and cannot be tested here.** The only tag with `visibleFor: None` (`Documentation`, `6-29`) is owned by this very token, and all five foreign-owned tags are group-visible, so no invisible tag exists to name. Consequence for the design, not a defect: an unresolvable name may be someone else's private tag rather than a misspelling, so the exit-6 message should not assert the tag does not exist — only that it is not visible here. Tag: **UNPROVABLE-HERE on ION.**
+
+## Work items — three measured traps, one of which reverses a plan expectation
+
+`POST /issues/{id}/timeTracking/workItems`, `GET` the same path to list.
+
+| Case | Server response | Consequence |
+|---|---|---|
+| `{"duration": {"minutes": 90}}` | **200**; reads back **both** `minutes: 90` **and** `presentation: "1h 30m"` | the minimal write: `type`, `date`, `text` and `author` are all optional |
+| **`{"duration": {"presentation": "1d 4h"}}`** | **200** → reads back **`presentation: "12h"`, `minutes: 720`** | ⚠️ **`presentation` does NOT round-trip byte-exact.** This **falsifies the expectation carried over from `period` custom fields**, where `1d 4h` did round-trip verbatim. A work item's presentation is re-rendered |
+| `"90m"`, `"1h30m"`, `"3h 15m"`, `" 45m "`, `"1H30M"` | all **200** | the grammar is whitespace-tolerant and **case-insensitive**; `h`/`m` inputs round-trip stably |
+| `"2d"` → `16h`/960 · `"1w"` → `40h`/2400 · `5000` minutes → `"83h 20m"` | 200 | **the output presentation is rendered in hours and minutes only** — never days or weeks. So day/week *inputs* can never round-trip, and `1d = 8h` / `1w = 5d` on ION comes from **project settings**, not from YouTrack. Tests must use `h`/`m` inputs or they assert a server config value |
+| **`{"presentation": "90"}`** (no unit) | **200** → **`minutes: 5400`, `presentation: "90h"`** | ⚠️ **a unit-less number is read as HOURS.** `--duration 90` meaning 90 minutes would log **90 hours** — a silent 60× error |
+| `"1.5h"` · `"-5m"` · `"1h 2m 3s"` | **400** `Value … cannot be parsed` | no fractional units, no negatives, no seconds |
+| duration omitted · `{"minutes": 0}` · `{"minutes": -30}` · `"0m"` | **400** `invalid_properties` / `Work duration can not be negative or empty` | **duration is required and must be positive** |
+| `{"duration": 90}` (bare int) | **400** type mismatch, `DurationValue`-type value required | duration is always an object |
+| `{"minutes": 60, "presentation": "5m"}` | **400** `Conflict in period value` | send exactly one of the two |
+| **`type` by name** — `{"type": {"name": "Development"}}` | **400** `YouTrack is unable to locate an WorkItemType-type entity unless its ID is also provided`; an **unknown** name returns the identical 400 | same shape as tags: **`--type` needs a client-side name→id lookup**, and the server cannot distinguish a typo from a name-instead-of-id |
+| `type` by id — `{"type": {"id": "139-1"}}` | **200**, reads back `{"id","name"}` | the write shape |
+| unknown type id | **400** `An WorkItemType-type entity with the specified ID (139-999) was not found` | distinct message |
+| **a type valid instance-wide but not in the project** (`Review`, `139-5`) | **400** `invalid_properties` — *"The selected work type is not supported for issues in this YouTrack project"* | ⚠️ **work-item types are project-scoped.** The instance endpoint lists **6**, project `0-1` lists **5**. Resolving against the instance set would send a legal-looking id the project rejects |
+| `text` with a newline | **200**, round-trips **exactly** | plain passthrough |
+| `author` omitted → the token's user; explicit `{"login": "s.royz"}` accepted | 200 | no need to send it |
+| list — `GET …/workItems` with `$top` / `$skip` | **200**, both honoured; `[]` when none | pages like every other list endpoint |
+| `DELETE …/workItems/{id}` | **200** | work items are deletable (used for probe cleanup) |
+| unknown issue, on log and list | **404** `Entity with id ION-999999 not found` | standard |
+
+**The date is snapped to 00:00 of the UTC day — the *opposite* corner from the `date` custom field's noon.** Measured across four inputs: `12:00Z` → `00:00Z` same day, `23:00Z` → `00:00Z` same day, `01:00Z` → `00:00Z` same day, and `00:00Z` unchanged. **No day shift in any case.** An omitted date defaults to **today at 00:00Z**. An **ISO date string is rejected** — `400`, *"the date property … only accepts kotlin.Long-type value"* — so the CLI must accept `YYYY-MM-DD` and convert, as it already does for `date` fields.
+
+**Whether that snap is to UTC midnight or to the profile's timezone midnight cannot be decided here:** this token's profile timezone is `Etc/UTC`, offset 0, so the two are indistinguishable. Tag: **UNPROVABLE-HERE.** It matters because midnight is a day boundary — under a negative-offset profile, sending midnight UTC could land on the previous calendar day, where sending **noon** UTC has ~12 hours of margin in either direction. The safer convention is therefore noon, at the cost of a round trip that is not byte-exact (the server stores 00:00 of that day); the calendar date, which is the only thing a caller means by a work-item date, survives either way. Tag on the timezone-sensitivity reasoning: **INFERRED**.
+
+**⚠️ Retracted — the scope-boundary claim about `Spent time` was wrong.** This plan previously stated that "ION's `estimate` and `timeSpent` are `PeriodProjectCustomField`s, which means the `Estimation` and `Spent time` *fields* are already writable through `issues update --field`". **Measured: `Spent time` is not writable at all.** A direct custom-field write returns **400** *"You cannot edit the value for this field, as it is automatically calculated based on time tracking settings."* It is **derived from the work-item log** — verified numerically: the field read `985` minutes as the exact sum of eight logged items, then `898` after one 90-minute item was deleted and three 1-minute items added. `Estimation` remains writable (measured in M2). **The scope boundary itself is unchanged and now rests on a stronger reason:** M4b adds only the additive work-item log, and a verb that "rewrites Spent time" is not merely redundant — it is impossible.
+
+## Article self-parent — the server already refuses it, so the guard is quality, not correctness
+
+| Case | Server response | Consequence |
+|---|---|---|
+| **self-parent** — `POST /articles/{a}` `{"parentArticle": {"id": a}}`, by internal id **and** by readable key | **400** `invalid_properties` — *"There is a recursive chain in the table of contents that causes an article to be a sub-article of itself"*; read back unchanged | ⚠️ **premise corrected.** M4b's item was written on the assumption that self-parenting "is currently sent to the server, whose behaviour there is unmeasured". It is refused, correctly, and 400 already maps to exit **6**. So a client-side guard buys a canonical message and one saved round trip — **not** a correctness fix. This is materially unlike `issues links add`, where the server returned **200** and silently created nothing, making the guard the only thing preventing a lie |
+| a **2-cycle** (`b` under `a`, then `a` under `b`) | **HTTP 500, empty body**; nothing applied | maps to exit **5**. Guarding cycles of depth > 1 needs an ancestor walk and is **out of M4b scope**; recorded so the 500 is not mistaken for a CLI defect |
+| a **nonexistent parent id** | **200 — and it silently CLEARED the article's existing parent** (verified by an independent read: parent `null`, and the former parent's `childArticles` empty) | data loss with no error. **The CLI is already protected**: `_parent_article_id` resolves the ref with a `GET` first, so an unresolvable `--parent` dies at exit 3 before the write. **Do not "optimize away" that resolution read** |
+
+**Design consequence for the guard:** compare the **resolved internal ids**, not the raw refs. `--parent 138-277` against an article addressed as `ION-A-240` is the same article in two notations, which a string comparison of the arguments would miss — and both ids are already in hand from the two resolution reads the verb performs anyway.
+
 # Output shape
 
 Custom fields nest under their own key rather than merging top-level, so a field named `Summary` or `ID` cannot collide with core attributes:
@@ -603,24 +675,72 @@ Exercised through the installed CLI. The one throwaway issue (ION-1440) was dele
 
 **The group name→id resolution is the load-bearing result here.** `permittedGroups` rejects a name, so without it the flag could not accept the group name a caller actually knows.
 
-## M4b — Tags and work items — ⬜ NEXT
+## M4b — Tags and work items — ✅ SHIPPED
 
 Group C. The last two MCP gaps, and the only ones with unmeasured behaviour. **Both are probeable on ION — confirmed 2026-07-28 by reading the live instance**, so unlike M2's Group 1 this milestone is not blocked by the ION-only constraint.
 
-**Step 0 — probe first, on ION.** This is the class that has already burned the project twice: M2's step 0 falsified four documented-looking claims, and M3's probe found `readOnly: true` is not a write gate — which would have shipped `subtask of` as unavailable with every test passing. Do not build either verb from the REST docs.
+**Step 0 — probe first, on ION. ✅ Done 2026-07-28** — see "Tags and work items — measured" above. It earned its keep for the third time running: **three of this milestone's own stated premises were falsified**, and one plausible implementation path turned out to be silently destructive.
 
-*Tags — measured so far:* instance-scoped, not project-scoped (`GET /issueTags` returned 17 visible), each with an `owner` and a `visibleFor` group; one tag has `visibleFor: None`, i.e. private to its owner. **Unknown, and each changes the design:** whether writing an unknown tag name creates it or returns 400 (decides pre-flight versus error translation); whether a tag owned by another user can be applied; what happens with a tag the token cannot see; whether add is idempotent as link-add was; and the removal path's shape.
+The four findings that change the design rather than the tests:
 
-*Work items — measured so far:* time tracking is **enabled** on ION, with five `workItemTypes` (`Development`, `Testing`, `Documentation`, `Investigation`, `Implementation`). **Unknown:** the duration write shape — `{"minutes": N}` versus `{"presentation": "1d 4h"}` — and its round-trip fidelity. M2 measured that a `period` custom field round-trips byte-exact as `presentation` while reading back as **minutes**, with workday length coming from server-side project settings, so a work item very likely carries the same dual representation. Also unknown: whether `type` is required, and how the work item's date behaves relative to the `date` normalization M2 measured.
+1. **Both write paths take an id and reject a name** — tags *and* work-item types — and in both cases an unknown name returns the **byte-identical 400** to a name-instead-of-id. So `issues tags add ISSUE TAG` and `issues work log --type T` both need client-side name→id resolution, on the `permittedGroups` pattern, or they cannot accept the name a caller actually knows.
+2. **Work-item types are project-scoped**, not instance-scoped: `Review` exists instance-wide and is rejected by project `0-1`. Resolution must read the project's set, which means reading the issue's project first.
+3. **`POST /issues/{id}` with a `tags` array replaces the whole tag set** — measured, it wiped two tags the caller never named. The additive `/tags` sub-resource is the only correct path.
+4. **A unit-less `--duration 90` is read as 90 *hours*** — a silent 60× error, and the strongest argument in this milestone for a client-side refusal.
 
-**Scope boundary, so M4b does not duplicate what already ships.** ION's `estimate` and `timeSpent` are `PeriodProjectCustomField`s, which means the `Estimation` and `Spent time` *fields* are already writable through `issues update --field` on the M2 marshalling path. M4b is about the additive **work-item log** — `POST` a new entry, list the entries — which is what `log_work` actually covers. Do not add a verb that re-writes those two fields.
+Corrections to what this section previously asserted, now that it is measured:
+
+- *Duration round-trip:* the expectation that a work item "very likely carries the same dual representation" as a `period` custom field is **half right and half wrong**. It does read back both `minutes` and `presentation` — but unlike a `period` field, **`presentation` is re-rendered and does not round-trip byte-exact** (`1d 4h` → `12h`), and output never uses day or week units. Asserting *either* representation for a day-unit input tests a project setting.
+- *`type` requiredness:* **optional**, not required. Omitting it yields `type: null`.
+- *Date behaviour:* snapped to **00:00 of the UTC day** — the opposite corner from the `date` custom field's noon, not the same rule.
+
+**Scope boundary, so M4b does not duplicate what already ships. Its stated reason was wrong; the boundary is right.** This section previously claimed `Estimation` and `Spent time` are both "already writable through `issues update --field`". **Measured: `Spent time` is not writable at all** — 400, *"automatically calculated based on time tracking settings"* — and is derived from the work-item log. `Estimation` is writable. So M4b covers only the additive **work-item log** (POST an entry, list the entries), and a verb rewriting `Spent time` is not redundant but impossible.
 
 Also fold in, since neither is a parity gap but both are the last of their kind:
 
-- **`projects fields list` paging** — hardcodes `$top: 200`, bare array, no `--limit`. The last silent truncation in the surface, per M4a's final review.
-- **A self-parent guard on `articles update --parent`** — `issues links add`/`remove` refuse a self-reference client-side; re-parenting an article to itself is currently sent to the server, whose behaviour there is unmeasured.
+- **`projects fields list` paging** — hardcodes `$top: 200`, bare array, no `--limit`. The last silent truncation in the surface, per M4a's final review. Note that `_project_fields` is also the internal lookup behind `projects fields get` and both write verbs' validation, and **those callers need the complete set** — the paging belongs to the verb, not to the shared helper.
+- **A self-parent guard on `articles update --parent`** — **the premise here was wrong.** The server does **not** silently accept a self-parent: it returns 400 *"recursive chain … sub-article of itself"* and applies nothing, which already maps to exit 6. The guard is therefore a message and round-trip improvement, **not** the correctness fix the self-link guard was. It is still worth shipping, and it must compare **resolved internal ids** so that `--parent 138-277` against `ION-A-240` is caught.
 
 **Done when:** parity is **22 of 23** at parity plus 1 (`change_issue_assignee`) covered by design — every JetBrains predefined tool accounted for.
+
+### ✅ M4b verified live against ION — 2026-07-29
+
+Exercised through the installed CLI on one throwaway issue (ION-1444) and one throwaway article (ION-A-242), both deleted afterwards and confirmed gone (`GET` → 404 on the internal id *and* the readable key). Closing sweeps: `summary: PROBE` → `[]`, `project: ION created: Today` → `[]`, drafts → `[]`, instance tag count still **17**, work-item types still **6**.
+
+| Check | Result |
+|---|---|
+| `issues tags add "Question"` | ✅ exit 0 |
+| the same add repeated | ✅ exit 0, **no duplicate** — idempotent through the CLI, as measured |
+| `issues tags add "Data Team"` (owned by `k.shmidt`) | ✅ applied — a foreign-owned tag is usable |
+| `issues tags add "devops"` | ✅ resolved case-insensitively to `DevOps` |
+| **tags accumulate rather than replace** | ✅ `['Question', 'DevOps', 'Data Team']` after four adds — the measured replace-semantics footgun is absent |
+| `issues get` | ✅ returns `tags` flattened to names |
+| `issues tags remove "Question"` | ✅ exit 0, only that tag removed |
+| removing a tag the issue no longer carries | ✅ exit **3**, `ION-1444 has no 'Question' tag` — blames the tag, not the issue |
+| `issues tags add "Questin"` | ✅ exit **6**, `no tag named 'Questin' is visible to this token`, hint `did you mean: Question, Design?`, **nothing written** |
+| `issues work log --duration "1h 30m"` | ✅ `{"minutes": 90, "presentation": "1h 30m"}`, date defaulted, `type: null`, `author: s.royz` |
+| `--duration 45m --type Development --date 2026-07-20 --text …` | ✅ type resolved by name; **`date` read back as `2026-07-20`** — noon-out/midnight-stored round-trips to the right calendar day |
+| **`--duration "1d 4h"`** | ✅ reads back **`12h` / 720** — the falsified round-trip, confirmed through the CLI |
+| `issues work list --limit 2` / `--offset 2` | ✅ `has_more: true` then `false`, pages differ |
+| **`--duration 90`** | ✅ exit **6** before any request: *"has no unit, and YouTrack reads a bare number as HOURS — 90 would log 90 hours"* |
+| `--duration 1.5h` | ✅ exit **6**, server message translated with the grammar hint |
+| `--duration ""` | ✅ exit **6** |
+| **`--type Review`** (instance-legal, absent from ION) | ✅ exit **6**, hint lists ION's five project types — the project-scoping decision, proven live |
+| `--type Developmnt` | ✅ exit **6**, `did you mean: Development?` |
+| `--date 20/07/2026` | ✅ exit **6** |
+| nothing logged by any refusal | ✅ the work list still held exactly the three legitimate entries |
+| `Spent time` after logging | ✅ `1d 6h 15m` = 855 min = 90 + 45 + 720 — derived from the log |
+| `issues update --field "Spent time=1h"` | ✅ exit **6**, server: *"automatically calculated based on time tracking settings"* — confirms the field cannot be written directly |
+| `projects fields list 0-1 --limit 3` / `--offset 3` | ✅ envelope with `has_more`, pages differ — the last silent truncation is gone |
+| `projects fields get 0-1 Estimation` | ✅ resolves a field **past page 1** — internal callers still read the complete schema |
+| `issues create --field "Estimation=1h" --field "NoSuchField=x"` | ✅ exit **6**, `no field named 'NoSuchField' on project 0-1`, while `Estimation` (also past page 1) validated — the F14 guarantee, live |
+| `articles update --parent` with the article's own key | ✅ exit **6**, `ION-A-242 cannot be its own parent` |
+| the same **across notations** (readable key vs internal id `138-280`) | ✅ exit **6** — the resolved-id comparison catches what an argument comparison would miss |
+| `articles update --summary` | ✅ still works — the guard does not block the legitimate path |
+
+**Not covered live, and why:** a tag invisible to this token (none exists to name — the only private tag is owned by this very token), and a work-item log against a project with time tracking disabled (writes are confined to ION). Both remain **UNPROVABLE-HERE**.
+
+One rough edge, recorded rather than fixed: the direct `Spent time` write surfaces YouTrack's raw JSON body as the error message rather than a translated one. The exit code is correct (6) and the server's wording is self-explanatory, so this is message polish, not a defect.
 
 ---
 
@@ -654,12 +774,12 @@ Smallest change per unit of parity: each is a flag or a query swap on shipped co
 
 These are the only remaining items with unmeasured behaviour, and both touch bundle-backed or unit-parsed values — the class that cost M2 its step-0 probe.
 
-| Gap | Why it needs measuring | MCP tool closed |
+| Gap | Why it needed measuring | MCP tool closed |
 |---|---|---|
-| `issues tags add` / `remove` | tags are bundle-backed and instance-scoped; whether adding an unknown tag creates it or 400s is unmeasured, and that decides whether a pre-flight or an error translation is right | `manage_issue_tags` |
-| `issues work log` / `list` | duration parsing is the risk. M2 measured that `period` fields round-trip as `presentation` (`1d 4h`) while reading back as **minutes**, with the workday length coming from server-side project settings — so a work-item duration almost certainly has the same dual representation, and asserting minutes would test a server config value rather than CLI behaviour | `log_work` |
+| `issues tags add` / `remove` | tags are instance-scoped, and whether adding an unknown tag creates it or 400s decided pre-flight versus error translation. **✅ Measured 2026-07-28:** it 400s with the same message as a name-instead-of-id, so **client-side name→id resolution is mandatory**; add is idempotent, remove is not | `manage_issue_tags` |
+| `issues work log` / `list` | duration parsing was the risk. **✅ Measured 2026-07-28:** the dual representation exists but `presentation` is **re-rendered, not byte-exact** (`1d 4h` → `12h`, never day units on output), a **unit-less number means hours**, and `type` needs an id resolved against the **project's** type set, not the instance's | `log_work` |
 
-**Probe before building Group C**, on ION, in the shape M2 and M3 used: write one of each, read it back, record measured-versus-inferred. Group C is also where `--project` scoping matters, since tag and work-item types are project-configured.
+**✅ Probe done, on ION** — see "Tags and work items — measured 2026-07-28" above. Project scoping did prove load-bearing, but not where this line expected it: **tags are instance-scoped** (no project argument needed), while **work-item types are project-scoped** (so the issue's project must be read first).
 
 ## Not MCP parity, but tracked here
 

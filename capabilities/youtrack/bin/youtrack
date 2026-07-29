@@ -53,7 +53,8 @@ Read:
                                              optional substring match on name.
   youtrack projects get ID                   One project: name, shortName,
                                              description, archived, leader.
-  youtrack projects fields list ID           Custom-field schema for a project:
+  youtrack projects fields list ID [--limit N] [--offset N]
+                                             Custom-field schema for a project:
                                              name, type, multiValue, canBeEmpty,
                                              and allowed values where bundled.
                                              canBeEmpty is YouTrack's own flag and
@@ -76,7 +77,8 @@ Read:
   youtrack searches list [--limit N] [--offset N]
                                              Saved issue searches visible to
                                              the token, with their queries.
-  youtrack issues get ISSUE                  Read one issue (ID or URL).
+  youtrack issues get ISSUE                  Read one issue (ID or URL),
+                                             including its tags.
   youtrack issues search QUERY [--limit N] [--offset N] [--select KEY,KEY]
                                              Search issues server-side using
                                              YouTrack query language.
@@ -89,6 +91,9 @@ Read:
                                              not an error.
   youtrack issues comments list ISSUE [--limit N] [--offset N]
                                              Read recent comments on an issue.
+  youtrack issues work list ISSUE [--limit N] [--offset N]
+                                             Work items logged on an issue:
+                                             date, duration, type, author, text.
   youtrack articles list [--project ID] [--limit N] [--offset N]
                                              List knowledge-base articles (paged;
                                              --project scopes to one project). This
@@ -162,6 +167,35 @@ Write:
                                              Remove a link. Not idempotent:
                                              removing a link that is not there
                                              exits 3.
+  youtrack issues tags add ISSUE TAG         Tag an issue. TAG is the tag name;
+  youtrack issues tags remove ISSUE TAG      it is resolved to an id here
+                                             because YouTrack's tag endpoint
+                                             rejects a name. Tags are
+                                             instance-wide, not per project, and
+                                             a tag owned by someone else can be
+                                             applied. A name that is not visible
+                                             to this token exits 6 before any
+                                             write. add is idempotent; removing
+                                             a tag the issue does not carry
+                                             exits 3.
+  youtrack issues work log ISSUE             Log time against an issue. Adds an
+        --duration D [--date YYYY-MM-DD]      entry; it never rewrites a field.
+        [--type NAME] [--text TEXT|-]         --duration needs a unit — 45m,
+                                             1h 30m, 2d — because YouTrack reads
+                                             a bare number as HOURS, so a
+                                             unit-less value is refused here. 1d
+                                             is the project's workday, not 24h,
+                                             and the server re-renders the
+                                             duration it stores, so the reply
+                                             carries both minutes and its own
+                                             presentation. --type is optional
+                                             and is validated against this
+                                             project's work item types, which
+                                             can differ from the instance's.
+                                             --date is a calendar day and
+                                             defaults to today. The Spent time
+                                             field is calculated from these
+                                             entries and cannot be set directly.
   youtrack articles create --project ID      Create an article in a project
         --summary S [--content TEXT|-]        (database entity id); optionally give
         [--parent ID|URL]                    a parent article to create a sub-article.
@@ -171,7 +205,9 @@ Write:
                                              `articles list`, with a query.
   youtrack articles update ID                Update an article's summary and/or
         [--summary S] [--content TEXT|-]     content and/or parent (ID|URL).
-        [--parent ID|URL]                    Respects allow_write policy.
+        [--parent ID|URL]                    Respects allow_write policy. An
+                                             article cannot be given itself as
+                                             --parent (refused before the write).
   youtrack articles comments add ID [--text TEXT|-]
                                              Add a comment to an article.
 
@@ -205,7 +241,7 @@ from typing import NoReturn
 import httpx
 
 NAME = "youtrack"
-SUMMARY = "YouTrack CLI for issues (read with links, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, and add/remove issue links by direction phrase), user and group lookup, project reads and custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments)."
+SUMMARY = "YouTrack CLI for issues (read with links and tags, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, add/remove issue links by direction phrase, tag and untag by tag name, and log and list work items), user and group lookup, project reads and paged custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments)."
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,
@@ -215,6 +251,7 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {"issues create", "issues update", "issues comments add",
                "issues links add", "issues links remove",
+               "issues tags add", "issues tags remove", "issues work log",
                "articles create", "articles update", "articles comments add"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
@@ -878,9 +915,10 @@ _CF_PROJECTION = ("customFields(id,name,$type,"
                   "value(id,name,login,text,minutes,presentation))")
 LINK_PROJECTION = ("links(direction,linkType(name,sourceToTarget,targetToSource),"
                    "issues(idReadable))")
+TAG_FIELDS = "id,name,owner(login)"
 ISSUE_FIELDS = ("id,idReadable,summary,description,created,updated,resolved,"
                 "project(id,name,shortName),reporter(id,login,fullName),"
-                + _CF_PROJECTION + "," + LINK_PROJECTION)
+                + _CF_PROJECTION + "," + LINK_PROJECTION + ",tags(id,name)")
 ISSUE_SEARCH_FIELDS = ("id,idReadable,summary,description," + _CF_PROJECTION)
 COMMENT_FIELDS = ("id,text,created,updated,author(id,login,fullName),"
                   "visibility($type,permittedUsers(login),permittedGroups(id,name))")
@@ -891,6 +929,8 @@ ARTICLE_FIELDS = ("id,idReadable,summary,content,created,updated,"
 ARTICLE_LIST_FIELDS = ("id,idReadable,summary,updated,"
                        "project(id,name,shortName),parentArticle(idReadable)")
 ARTICLE_COMMENT_FIELDS = "id,text,created,updated,author(id,login,fullName)"
+WORK_ITEM_FIELDS = ("id,date,duration(minutes,presentation),text,"
+                    "type(id,name),author(login),created")
 
 def _positive_limit(value: int) -> None:
     if value < 1:
@@ -983,14 +1023,24 @@ def _flatten_value(value):
     return value
 
 
+def _utc_date(ms: int) -> str:
+    """Epoch ms -> YYYY-MM-DD in UTC.
+
+    Both a `date` custom field (snapped by the server to noon UTC) and a work
+    item's date (snapped to 00:00) are calendar days, and epoch ms is a hostile
+    interface for one.
+    """
+    return datetime.datetime.fromtimestamp(
+        ms / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
 def _flatten_field(entry):
     value = _flatten_value(entry.get("value"))
     # A `date` field carries no time of day — the server snaps it to noon UTC —
     # so epoch ms both misleads and does not survive a round trip. `date and
     # time` is SimpleIssueCustomField and keeps its precision.
     if entry.get("$type") == "DateIssueCustomField" and isinstance(value, int):
-        return datetime.datetime.fromtimestamp(
-            value / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
+        return _utc_date(value)
     return value
 
 
@@ -1036,6 +1086,21 @@ def _flatten_links(issue):
             shaped.append({"type": phrase, "issues": targets})
     if shaped:
         issue["links"] = shaped
+    return issue
+
+
+def _flatten_tags(issue):
+    """Reduce tags to their names, dropping the key when there are none.
+
+    Matches _flatten_links: an absent key rather than an empty list, so a
+    consumer handles "no tags" the same way it already handles "no links".
+    """
+    if not isinstance(issue, dict) or "tags" not in issue:
+        return issue
+    names = [t.get("name") for t in (issue.pop("tags") or [])
+             if isinstance(t, dict) and t.get("name")]
+    if names:
+        issue["tags"] = names
     return issue
 
 
@@ -1443,16 +1508,21 @@ def _shape_project_field(entry):
             "values": values or None}
 
 
-def _project_fields(c, project):
-    # $top=200 is deliberate headroom, not a default left in place: the
-    # largest real project seen has 45 custom fields.
+def _project_fields(c, project, params=None):
+    # $top=200 is deliberate headroom for the internal callers — `projects
+    # fields get` and both write verbs' validation need the COMPLETE set, since
+    # a truncated schema turns a legal field name into a false "unknown field".
+    # The largest real project seen has 45 custom fields, so 200 is headroom,
+    # not a default left in place. Only the `projects fields list` verb passes
+    # paging params.
     raw = _request(c, "GET", f"/admin/projects/{project}/customFields",
-                   params={"fields": PROJECT_FIELD_FIELDS, "$top": 200})
+                   params=params or {"fields": PROJECT_FIELD_FIELDS, "$top": 200})
     return [_shape_project_field(e) for e in raw if isinstance(e, dict)]
 
 
 def projects_fields_list(c, a):
-    return _project_fields(c, a.project)
+    return _paged(_project_fields(c, a.project,
+                                  _page_params(a, PROJECT_FIELD_FIELDS)), a.limit)
 
 
 def projects_fields_get(c, a):
@@ -1468,9 +1538,9 @@ def projects_fields_get(c, a):
 
 
 def issues_get(c, a):
-    return _flatten_links(_flatten_custom_fields(
+    return _flatten_tags(_flatten_links(_flatten_custom_fields(
         _request(c, "GET", f"/issues/{_issue_ref(a.issue)}",
-                 params={"fields": ISSUE_FIELDS})))
+                 params={"fields": ISSUE_FIELDS}))))
 
 
 def issues_create(c, a):
@@ -1752,6 +1822,246 @@ def issues_links_remove(c, a):
     return issues_get(c, argparse.Namespace(issue=ref))
 
 
+# ── issues: tags ─────────────────────────────────────────────────────────
+#
+# Measured 2026-07-28, see .claude/plans/2026-07-27-youtrack-mcp-parity.md.
+#
+# The write path takes an id and REJECTS a name — and an unknown name returns
+# the byte-identical 400 — so the name a caller knows has to be resolved here
+# or it cannot be accepted at all. Same shape as permittedGroups.
+#
+# Do NOT implement add/remove as POST /issues/{id} with a `tags` array. That
+# endpoint works, but it REPLACES the whole tag set: measured, it wiped two
+# tags the caller never named. Only the additive sub-resource below is safe.
+
+def _resolve_tag_id(c, name: str) -> str:
+    """A tag name -> its id.
+
+    Fetches /issueTags once with a fixed `$top: 1000` and no `query`: the
+    complete visible set is needed both to resolve a name and to notice a
+    duplicate, and a filtered subset cannot show a collision. An instance with
+    more than 1000 tags can have a *valid* tag past that page reported as
+    unknown here; this deliberately does not paginate to find it.
+
+    Tag names are not guaranteed unique — 17 distinct on ION, but nothing
+    server-side enforces it — so a collision is refused rather than resolved to
+    whichever row a comprehension kept last, mirroring _resolve_link and
+    _resolve_group_ids.
+    """
+    rows = _request(c, "GET", "/issueTags",
+                    params={"fields": TAG_FIELDS, "$top": 1000})
+    by_name: dict = {}
+    for row in (rows if isinstance(rows, list) else []):
+        if isinstance(row, dict) and row.get("name"):
+            by_name.setdefault(row["name"].casefold(), []).append(row)
+    matches = by_name.get(name.strip().casefold(), [])
+    if len(matches) > 1:
+        _die(6, "ambiguous_tag_name",
+             f"{name!r} is ambiguous on this instance: it names "
+             f"{len(matches)} tags",
+             "rename one of the colliding tags so the name is unique")
+    if not matches or not matches[0].get("id"):
+        known = sorted({r["name"] for lst in by_name.values() for r in lst})
+        near = difflib.get_close_matches(name, known, n=3, cutoff=0.6)
+        hint = (f"did you mean: {', '.join(near)}?" if near
+                else f"tags visible to this token: {', '.join(known)}")
+        # Deliberately "not visible" rather than "does not exist": a tag
+        # private to another user is invisible here and indistinguishable from
+        # a typo, so non-existence is not something this CLI can assert.
+        _die(6, "unknown_tag", f"no tag named {name!r} is visible to this token",
+             hint)
+    return matches[0]["id"]
+
+
+def issues_tags_add(c, a):
+    ref = _issue_ref(a.issue)
+    tag_id = _resolve_tag_id(c, a.tag)
+    # Idempotent server-side (measured), so no pre-check: a second identical
+    # add returns 200 and creates no duplicate.
+    _request(c, "POST", f"/issues/{ref}/tags",
+             params={"fields": "id,name"}, json={"id": tag_id})
+    return issues_get(c, argparse.Namespace(issue=ref))
+
+
+def _missing_tag_error(ref: str, tag: str, tag_id: str):
+    """Retranslate remove's 404 — but only the one that names the tag.
+
+    Measured: removing a tag the issue does not carry returns 404 whose message
+    names the *tag id*, which exists as a tag; an unknown *issue* returns 404
+    naming the issue instead. They are separable only by message content, so
+    this fires on the tag id alone and lets the issue case fall through to the
+    generic not-found mapping.
+    """
+    def on_error(response):
+        if response.status_code == 404 and tag_id in response.text:
+            _die(3, "not_found", f"{ref} has no {tag!r} tag",
+                 "read the issue to see the tags it does have", status=404)
+    return on_error
+
+
+def issues_tags_remove(c, a):
+    ref = _issue_ref(a.issue)
+    tag_id = _resolve_tag_id(c, a.tag)
+    _request(c, "DELETE", f"/issues/{ref}/tags/{tag_id}",
+             on_error=_missing_tag_error(ref, a.tag, tag_id))
+    return issues_get(c, argparse.Namespace(issue=ref))
+
+
+# ── issues: work items ───────────────────────────────────────────────────
+#
+# Measured 2026-07-28, see .claude/plans/2026-07-27-youtrack-mcp-parity.md.
+#
+# Three traps, all measured:
+#   1. A unit-less duration is read as HOURS — "90" logs 90h, not 90m.
+#   2. `type` takes an id and rejects a name, and work-item types are
+#      PROJECT-scoped: `Review` exists instance-wide and project 0-1 refuses
+#      it. Resolution must read the project's set, never the instance's.
+#   3. The date is snapped to 00:00 of the day — the opposite corner from a
+#      `date` custom field's noon — and an ISO string is rejected outright.
+#
+# `Spent time` is derived from these entries and is not writable directly
+# ("automatically calculated based on time tracking settings"), so there is
+# deliberately no verb that sets it.
+
+_UNIT_LESS_DURATION_RE = re.compile(r"^\d+$")
+
+
+def _duration_value(raw: str) -> dict:
+    """The `duration` object, as a presentation string the server parses.
+
+    Only one of minutes/presentation may be sent — both returns "Conflict in
+    period value" — and presentation is chosen because YouTrack owns the period
+    grammar and the workday length (1d = 8h on ION, from project settings).
+
+    A unit-less number is refused. This is deliberately stricter than the
+    server, which accepts it and reads it as HOURS: `--duration 90` meaning 90
+    minutes would silently log 90 hours, and the client can detect that with
+    certainty.
+    """
+    value = raw.strip()
+    if not value:
+        _die(6, "input", "--duration cannot be empty")
+    if _UNIT_LESS_DURATION_RE.match(value):
+        _die(6, "input",
+             f"--duration {value!r} has no unit, and YouTrack reads a bare "
+             f"number as HOURS — {value} would log {value} hours",
+             f"write {value}m for minutes, or 1h 30m / 2h / 2d (1d is the "
+             "project's workday, not 24h)")
+    return {"presentation": value}
+
+
+def _resolve_work_item_type(c, ref: str, name: str) -> str:
+    """A work-item type name -> its id, scoped to the issue's project.
+
+    Measured: the type write rejects a name, and a type that exists
+    instance-wide can still be refused by the project ("The selected work type
+    is not supported for issues in this YouTrack project"). So the project's own
+    list is the authority, and reaching it costs one read of the issue.
+
+    Nothing in the measured record says work-item-type names are unique on a
+    project, so a collision is refused (exit 6) rather than resolved to
+    whichever row happened to match first — mirroring _resolve_tag_id,
+    _resolve_group_ids and _resolve_link.
+    """
+    issue = _request(c, "GET", f"/issues/{ref}", params={"fields": "project(id)"})
+    project = ((issue or {}).get("project") or {}).get("id")
+    if not project:
+        _die(5, "bad_response", "YouTrack returned an issue without a project")
+    rows = _request(c, "GET",
+                    f"/admin/projects/{project}/timeTrackingSettings/workItemTypes",
+                    params={"fields": "id,name", "$top": 200})
+    wanted = name.strip().casefold()
+    by_name: dict = {}
+    for row in (rows if isinstance(rows, list) else []):
+        if isinstance(row, dict) and row.get("name"):
+            by_name.setdefault(row["name"].casefold(), []).append(row)
+    matches = by_name.get(wanted, [])
+    if len(matches) > 1:
+        _die(6, "ambiguous_work_item_type",
+             f"{name!r} is ambiguous on this project: it names "
+             f"{len(matches)} work item types",
+             "rename one of the colliding work item types so the name is unique")
+    if not matches or not matches[0].get("id"):
+        known = sorted({r["name"] for lst in by_name.values() for r in lst})
+        near = difflib.get_close_matches(name, known, n=3, cutoff=0.6)
+        hint = (f"did you mean: {', '.join(near)}?" if near
+                else f"work item types on this project: {', '.join(known)}")
+        _die(6, "unknown_work_item_type",
+             f"no work item type named {name!r} on this issue's project", hint)
+    return matches[0]["id"]
+
+
+def _work_item_error():
+    """Translate the two duration rejections; let everything else fall through."""
+    def on_error(response):
+        try:
+            body = response.json()
+        except ValueError:
+            return
+        if not isinstance(body, dict):
+            return
+        detail = str(body.get("error_description") or body.get("error") or "")
+        if "cannot be parsed" in detail:
+            _die(6, "invalid_duration", detail,
+                 "durations are whole numbers with units: 45m, 1h 30m, 2d. "
+                 "Fractions, negatives and seconds are rejected",
+                 status=response.status_code)
+        if "negative or empty" in detail:
+            _die(6, "invalid_duration", detail,
+                 "log a positive duration", status=response.status_code)
+    return on_error
+
+
+def _shape_work_item(item):
+    """One work item, with the date as a calendar day and no $type anywhere.
+
+    `duration` keeps BOTH representations: the server re-renders presentation
+    (1d 4h reads back as 12h, and output never uses day units), while minutes
+    reflects the project's workday length — so each carries what the other
+    loses.
+    """
+    if not isinstance(item, dict):
+        return item
+    duration = item.get("duration") or {}
+    shaped = {"id": item.get("id"),
+              "duration": {"minutes": duration.get("minutes"),
+                           "presentation": duration.get("presentation")},
+              "text": item.get("text")}
+    date = item.get("date")
+    shaped["date"] = _utc_date(date) if isinstance(date, int) else None
+    work_type = item.get("type") or {}
+    shaped["type"] = work_type.get("name")
+    shaped["author"] = (item.get("author") or {}).get("login")
+    if isinstance(item.get("created"), int):
+        shaped["created"] = item["created"]
+    return shaped
+
+
+def issues_work_log(c, a):
+    ref = _issue_ref(a.issue)
+    body = {"duration": _duration_value(a.duration)}
+    if a.date is not None:
+        # Noon, not midnight: the server snaps to 00:00 of the day, and whether
+        # that snap uses UTC or the profile timezone is unmeasured — noon keeps
+        # ~12h of margin either way, so the calendar date survives.
+        body["date"] = _epoch_ms_noon_utc(a.date, "--date")
+    if a.text is not None:
+        body["text"] = _read_text(a.text)
+    if a.type is not None:
+        body["type"] = {"id": _resolve_work_item_type(c, ref, a.type)}
+    return _shape_work_item(
+        _request(c, "POST", f"/issues/{ref}/timeTracking/workItems",
+                 params={"fields": WORK_ITEM_FIELDS}, json=body,
+                 on_error=_work_item_error()))
+
+
+def issues_work_list(c, a):
+    rows = _request(c, "GET", f"/issues/{_issue_ref(a.issue)}/timeTracking/workItems",
+                    params=_page_params(a, WORK_ITEM_FIELDS))
+    rows = rows if isinstance(rows, list) else []
+    return _paged([_shape_work_item(r) for r in rows], a.limit)
+
+
 def _article_ref(value):
     value = value.strip()
     match = re.search(r"/articles/([^/?#]+)", value)
@@ -1840,7 +2150,18 @@ def articles_update(c, a):
                       if isinstance(target, dict) else None)
         if not project_id:
             _die(5, "bad_response", "YouTrack returned an article without a project")
-        body["parentArticle"] = {"id": _parent_article_id(c, a.parent, project_id)}
+        parent_id = _parent_article_id(c, a.parent, project_id)
+        # Compare resolved internal ids, not the arguments: `--parent 5-1`
+        # against `A-1` is one article in two notations. YouTrack does refuse a
+        # self-parent (400, "recursive chain … sub-article of itself"), so this
+        # is a clearer message and one saved round trip rather than a
+        # correctness fix — unlike the self-link guard, where the server
+        # returned 200 and silently created nothing.
+        if isinstance(target, dict) and parent_id == target.get("id"):
+            _die(6, "input", f"{a.article} cannot be its own parent",
+                 "an article cannot be a sub-article of itself; YouTrack "
+                 "refuses this too")
+        body["parentArticle"] = {"id": parent_id}
     return _request(c, "POST", f"/articles/{_article_ref(a.article)}",
                     params={"fields": ARTICLE_FIELDS}, json=body)
 
@@ -1869,19 +2190,25 @@ ARG_FIELD         = (("--field",), {"action": "append", "default": [],
                                     "metavar": "NAME=VALUE"})
 ARG_FIELDS        = (("--fields",), {"metavar": "JSON|FILE|-"})
 ARG_DRAFT         = (("--draft",), {"action": "store_true"})
+ARG_TAG_POS       = (("tag",), {"metavar": "TAG"})
 ARG_LINK_TO       = (("--to",), {"required": True})
 ARG_LINK_TYPE     = (("--type",), {"required": True, "metavar": "PHRASE"})
 ARG_PERMITTED_USERS  = (("--permitted-users",), {"action": "append", "default": [],
                                                  "metavar": "LOGIN"})
 ARG_PERMITTED_GROUPS = (("--permitted-groups",), {"action": "append", "default": [],
                                                   "metavar": "NAME"})
+ARG_DURATION      = (("--duration",), {"required": True, "metavar": "D"})
+ARG_DATE          = (("--date",), {"metavar": "YYYY-MM-DD"})
+ARG_WORK_TYPE     = (("--type",), {"metavar": "NAME"})
 
 COMMANDS = {
     ("users", "me"):                  (users_me, []),
     ("users", "find"):                (users_find, [ARG_SUBSTRING_REQ, ARG_LIMIT50, ARG_OFFSET]),
     ("projects", "find"):             (projects_find, [ARG_SUBSTRING_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("projects", "get"):              (projects_get, [ARG_PROJECT_POS]),
-    ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS]),
+    ("projects", "fields", "list"):   (projects_fields_list, [ARG_PROJECT_POS,
+                                                              ARG_LIMIT100,
+                                                              ARG_OFFSET]),
     ("projects", "fields", "get"):    (projects_fields_get, [ARG_PROJECT_POS, ARG_FIELD_NAME]),
     ("searches", "list"):             (searches_list, [ARG_LIMIT100, ARG_OFFSET]),
     ("groups", "find"):               (groups_find, [ARG_SUBSTRING_OPT, ARG_LIMIT100, ARG_OFFSET]),
@@ -1899,6 +2226,13 @@ COMMANDS = {
                                                              ARG_PERMITTED_GROUPS]),
     ("issues", "links", "add"):        (issues_links_add, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
     ("issues", "links", "remove"):     (issues_links_remove, [ARG_ISSUE, ARG_LINK_TO, ARG_LINK_TYPE]),
+    ("issues", "tags", "add"):         (issues_tags_add, [ARG_ISSUE, ARG_TAG_POS]),
+    ("issues", "tags", "remove"):      (issues_tags_remove, [ARG_ISSUE, ARG_TAG_POS]),
+    ("issues", "work", "log"):         (issues_work_log, [ARG_ISSUE, ARG_DURATION,
+                                                          ARG_DATE, ARG_WORK_TYPE,
+                                                          ARG_TEXT]),
+    ("issues", "work", "list"):        (issues_work_list, [ARG_ISSUE, ARG_LIMIT50,
+                                                           ARG_OFFSET]),
     ("articles", "list"):             (articles_list, [ARG_PROJECT_OPT, ARG_LIMIT100, ARG_OFFSET]),
     ("articles", "get"):              (articles_get, [ARG_ARTICLE]),
     ("articles", "create"):           (articles_create, [ARG_PROJECT_REQ, ARG_SUMMARY_REQ,

@@ -428,7 +428,13 @@ class ProjectFieldsHandler(Handler):
     def do_GET(self):
         self.__class__.requests.append(("GET", self.path, self.headers, None))
         if "/customFields" in self.path:
-            self._reply(PROJECT_FIELDS_PAYLOAD)
+            # Honors $top/$skip like a real backend would, so paging tests
+            # against this fixture exercise genuine truncation/has_more
+            # behaviour rather than always returning the fixed payload.
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            top = int(query["$top"][0])
+            skip = int(query.get("$skip", ["0"])[0])
+            self._reply(PROJECT_FIELDS_PAYLOAD[skip:skip + top])
         else:
             self._reply({"error": "missing"}, 404)
 
@@ -438,7 +444,7 @@ def test_projects_fields_list_shapes_schema(tmp_path):
     with serve(ProjectFieldsHandler) as base:
         result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == [
+    assert json.loads(result.stdout)["items"] == [
         {"name": "Priority", "type": "enum[1]", "multiValue": False,
          "canBeEmpty": False, "values": ["Critical", "Normal"]},
         {"name": "Assignee", "type": "user[1]", "multiValue": False,
@@ -458,7 +464,7 @@ def test_projects_fields_report_can_be_empty_not_required(tmp_path):
         got = run_cli(tmp_path, base, "projects", "fields", "get", "0-6", "Priority")
     assert listed.returncode == 0, listed.stderr
     assert got.returncode == 0, got.stderr
-    for row in json.loads(listed.stdout):
+    for row in json.loads(listed.stdout)["items"]:
         assert "required" not in row, "the misnamed `required` key must be gone"
         assert isinstance(row["canBeEmpty"], bool)
     one = json.loads(got.stdout)
@@ -519,7 +525,7 @@ def test_projects_fields_list_drops_nameless_bundle_entries(tmp_path):
     with serve(NamelessBundleHandler) as base:
         result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
     assert result.returncode == 0, result.stderr
-    parsed = json.loads(result.stdout)
+    parsed = json.loads(result.stdout)["items"]
     assert parsed[0]["values"] == ["Critical"]
     assert None not in parsed[0]["values"]
     assert parsed[1]["values"] == ["s.royz"]
@@ -549,11 +555,41 @@ def test_projects_fields_list_skips_non_dict_entries(tmp_path):
     with serve(MalformedProjectFieldsHandler) as base:
         result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6")
     assert result.returncode == 0, result.stderr
-    parsed = json.loads(result.stdout)
+    parsed = json.loads(result.stdout)["items"]
     assert parsed == [
         {"name": "Priority", "type": "enum[1]", "multiValue": False,
          "canBeEmpty": False, "values": ["Critical"]},
     ]
+
+
+def test_projects_fields_list_pages_and_envelopes(tmp_path):
+    ProjectFieldsHandler.requests = []
+    with serve(ProjectFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "fields", "list", "0-6",
+                         "--limit", "2", "--offset", "1")
+    assert result.returncode == 0, result.stderr
+    path = [r[1] for r in ProjectFieldsHandler.requests if r[0] == "GET"][0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["$top"] == ["3"]        # limit + 1, replacing the hardcoded 200
+    assert query["$skip"] == ["1"]
+    payload = json.loads(result.stdout)
+    assert "items" in payload and isinstance(payload["items"], list)
+    assert payload["has_more"] is False
+
+
+def test_project_field_validation_still_reads_the_complete_set(tmp_path):
+    """The paging belongs to the verb, not to _project_fields: `fields get` and
+    both write verbs validate against the schema, and a paged helper would
+    narrow validation into false 'unknown field' errors."""
+    ProjectFieldsHandler.requests = []
+    with serve(ProjectFieldsHandler) as base:
+        result = run_cli(tmp_path, base, "projects", "fields", "get", "0-6",
+                         "Points")
+    assert result.returncode == 0, result.stderr
+    path = [r[1] for r in ProjectFieldsHandler.requests if r[0] == "GET"][0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["$top"] == ["200"]
+    assert "$skip" not in query
 
 
 def test_issues_get_smoke(tmp_path):
@@ -1178,6 +1214,212 @@ def test_links_remove_self_link_is_refused_without_any_request(tmp_path, link_ha
     assert link_handler.requests == []
 
 
+_TAGS = [{"id": "6-3", "name": "Question", "owner": {"login": "s.royz"}},
+         {"id": "6-11", "name": "DevOps", "owner": {"login": "s.royz"}},
+         {"id": "6-31", "name": "Data Team", "owner": {"login": "k.shmidt"}}]
+
+
+def _tag_handler(tags=None, *, delete_status=200, delete_body=None,
+                 issue_tags=None):
+    """Serves /issueTags for name->id resolution, the tag write, and issues get."""
+    tags = _TAGS if tags is None else tags
+
+    class TagHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = b"" if payload is None else json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route == "/api/issueTags":
+                self._reply(tags)
+            else:                                   # the issues get read-back
+                self._reply({"idReadable": "DEMO-1", "summary": "s",
+                             "tags": issue_tags if issue_tags is not None
+                                     else [{"id": "6-3", "name": "Question"}]})
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+            self._reply({"id": "6-3", "name": "Question"})
+
+        def do_DELETE(self):
+            self.__class__.requests.append(("DELETE", self.path, None))
+            self._reply(delete_body, delete_status)
+
+    TagHandler.requests = []
+    return TagHandler
+
+
+def test_tags_add_resolves_the_name_to_an_id(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Data Team")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert urllib.parse.urlparse(post[1]).path == "/api/issues/DEMO-1/tags"
+    # Measured: the tag write rejects a name and takes only an id.
+    assert post[2] == {"id": "6-31"}
+    # F7: report by reading the issue back, not the raw POST echo — otherwise
+    # add/remove is unobservable to the caller.
+    assert json.loads(result.stdout)["idReadable"] == "DEMO-1"
+
+
+def test_tags_add_matches_the_name_case_insensitively(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "devops")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2] == {"id": "6-11"}
+
+
+def test_tags_add_never_sends_a_name_alongside_the_id(tmp_path):
+    """Measured: with both, the id wins and the name is silently ignored."""
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Question")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert "name" not in post[2]
+
+
+def test_tags_add_never_writes_the_issue_level_tags_array(tmp_path):
+    """Measured: POST /issues/{id} with a tags array REPLACES the tag set and
+    wiped two tags the caller never named. Only the additive sub-resource is
+    acceptable, so no POST may target the issue itself."""
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Question")
+    assert result.returncode == 0, result.stderr
+    for method, path, body in handler.requests:
+        if method == "POST":
+            assert urllib.parse.urlparse(path).path.endswith("/tags")
+            assert "tags" not in (body or {})
+
+
+def test_tags_unknown_name_exits_6_with_near_miss_and_no_write(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Questin")
+    assert result.returncode == 6
+    assert "Question" in result.stderr, "must offer the near-miss"
+    # The server returns the same 400 for a typo as for a name-instead-of-id,
+    # so the refusal has to happen here, before any write.
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_tags_unknown_name_does_not_claim_the_tag_does_not_exist(tmp_path):
+    """A tag private to another user is invisible to this token and
+    indistinguishable from a typo, so the message must not overclaim."""
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Secret")
+    assert result.returncode == 6
+    assert "visible" in result.stderr.lower()
+
+
+def test_tags_ambiguous_name_is_refused_not_guessed(tmp_path):
+    collide = [{"id": "6-3", "name": "Shared", "owner": {"login": "s.royz"}},
+               {"id": "6-9", "name": "Shared", "owner": {"login": "k.shmidt"}}]
+    handler = _tag_handler(collide)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
+                         "Shared")
+    assert result.returncode == 6
+    assert "ambiguous" in result.stderr.lower()
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_tags_remove_deletes_by_resolved_id(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "remove", "DEMO-1",
+                         "Data Team")
+    assert result.returncode == 0, result.stderr
+    delete = [r for r in handler.requests if r[0] == "DELETE"][0]
+    assert urllib.parse.urlparse(delete[1]).path == "/api/issues/DEMO-1/tags/6-31"
+    # F7: report by reading the issue back, not the empty DELETE reply.
+    assert json.loads(result.stdout)["idReadable"] == "DEMO-1"
+
+
+def test_tags_remove_of_a_tag_the_issue_lacks_blames_the_tag(tmp_path):
+    """Measured: that 404's message names the TAG, which exists — passing it
+    through would say the tag is missing when the issue merely lacks it."""
+    handler = _tag_handler(delete_status=404,
+                           delete_body={"error": "Not Found",
+                                        "error_description":
+                                            "Entity with id 6-31 not found"})
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "remove", "DEMO-1",
+                         "Data Team")
+    assert result.returncode == 3
+    assert "Data Team" in result.stderr
+    assert "DEMO-1" in result.stderr
+
+
+def test_tags_remove_of_an_unknown_issue_is_not_reported_as_a_missing_tag(tmp_path):
+    """The same status, a different message: this 404 names the ISSUE."""
+    handler = _tag_handler(delete_status=404,
+                           delete_body={"error": "Not Found",
+                                        "error_description":
+                                            "Entity with id DEMO-1 not found"})
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "tags", "remove", "DEMO-1",
+                         "Data Team")
+    assert result.returncode == 3
+    assert "has no" not in result.stderr, \
+        "must not blame the tag when the issue is what is missing"
+
+
+def test_issues_get_flattens_tags_to_names(tmp_path):
+    handler = _tag_handler(issue_tags=[{"id": "6-3", "name": "Question"},
+                                       {"id": "6-11", "name": "DevOps"}])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["tags"] == ["Question", "DevOps"]
+
+
+def test_issues_get_omits_the_tags_key_when_there_are_none(tmp_path):
+    """Matches _flatten_links, which omits `links` rather than emitting []."""
+    handler = _tag_handler(issue_tags=[])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    assert "tags" not in json.loads(result.stdout)
+
+
+def test_issue_fields_projection_requests_tags(tmp_path):
+    handler = _tag_handler()
+    with serve(handler) as base:
+        run_cli(tmp_path, base, "issues", "get", "DEMO-1")
+    path = [r[1] for r in handler.requests if r[0] == "GET"][0]
+    assert "tags(" in urllib.parse.unquote(path)
+
+
+def test_tag_write_verbs_are_gated(tmp_path):
+    verbs = _write_verbs()
+    assert "issues tags add" in verbs
+    assert "issues tags remove" in verbs
+
+
 def test_bare_404_at_a_write_still_exits_3_via_the_generic_mapping(tmp_path):
     # Pins the property the `on_error`-before-hardcoded-404 reorder in
     # `_request` relies on: a verb that passes `on_error` must still exit 3 on
@@ -1666,7 +1908,12 @@ class UpdateErrorHandler(UpdateFieldsHandler):
     def do_GET(self):
         self.__class__.requests.append(("GET", self.path, None))
         if "/admin/projects/" in self.path and "/customFields" in self.path:
-            self._reply(UPDATE_PROJECT_SCHEMA)
+            # Honors $top/$skip like a real backend would, so a mutation that
+            # pages this error-translation re-read is observable.
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            top = int(query["$top"][0]) if "$top" in query else len(UPDATE_PROJECT_SCHEMA)
+            skip = int(query.get("$skip", ["0"])[0])
+            self._reply(UPDATE_PROJECT_SCHEMA[skip:skip + top])
         elif self.path.startswith("/api/issues/DEMO-1"):
             self._reply({
                 "idReadable": "DEMO-1",
@@ -1735,6 +1982,24 @@ def test_update_server_500_for_unknown_field_maps_to_exit_6(tmp_path):
               "error_description": "incompatible-issue-custom-field-name-Priority"})
 
     assert result.returncode == 6, result.stderr
+
+
+def test_update_error_schema_read_is_not_paged(tmp_path):
+    """F14: the error-translation re-read needs the COMPLETE field set for the
+    same reason create's does — a truncated schema would falsely say a real
+    field is unknown."""
+    result, _ = run_update(
+        tmp_path, "DEMO-1", "--field", "Priority=Sideways",
+        handler=UpdateErrorHandler, status=400,
+        body={"error": "Bad Request",
+              "error_description": "An Sideways-type entity with the specified "
+                                   "name ({1}) was not found"})
+
+    assert result.returncode == 6, result.stderr
+    path = schema_reads(UpdateErrorHandler)[0][1]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["$top"] == ["200"]
+    assert "$skip" not in query
 
 
 def test_update_happy_path_never_fetches_the_schema(tmp_path):
@@ -1876,7 +2141,14 @@ class CreateFieldsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.__class__.requests.append(("GET", self.path, None))
         if "/admin/projects/" in self.path and "/customFields" in self.path:
-            self._reply(self.schema())
+            # Honors $top/$skip like a real backend would, so a mutation that
+            # pages this internal read is observable rather than silently
+            # served the complete fixture regardless of the query.
+            schema = self.schema()
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            top = int(query["$top"][0]) if "$top" in query else len(schema)
+            skip = int(query.get("$skip", ["0"])[0])
+            self._reply(schema[skip:skip + top])
         else:
             self._reply({"error": "missing"}, 404)
 
@@ -1996,6 +2268,20 @@ def test_create_happy_path_fetches_the_schema_exactly_once(tmp_path):
     assert result.returncode == 0, result.stderr
     assert len(create_schema_reads()) == 1, create_schema_reads()
     assert len(writes) == 1
+
+
+def test_create_schema_read_is_not_paged(tmp_path):
+    """F14: create's schema read is the internal-caller path, which needs the
+    COMPLETE field set — a truncated schema turns a legal field name into a
+    false 'unknown field'. Only `projects fields list` may page."""
+    result, _writes = run_create(tmp_path, "--summary", "s",
+                                 "--field", "Priority=Normal")
+
+    assert result.returncode == 0, result.stderr
+    path = create_schema_reads()[0][1]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    assert query["$top"] == ["200"]
+    assert "$skip" not in query
 
 
 def test_create_without_fields_never_fetches_the_schema(tmp_path):
@@ -2627,7 +2913,8 @@ def test_articles_search_sends_the_query_to_the_articles_endpoint(tmp_path):
     assert payload["has_more"] is False
 
 
-def test_articles_update_reparents(tmp_path):
+def _reparent_handler():
+    """Serves A-1/5-1 and A-2/5-2 in the same project; records the parent POST."""
     class ReparentHandler(BaseHTTPRequestHandler):
         requests = []
 
@@ -2658,11 +2945,16 @@ def test_articles_update_reparents(tmp_path):
             self._reply({"id": "5-1", "idReadable": "A-1"})
 
     ReparentHandler.requests = []
-    with serve(ReparentHandler) as base:
+    return ReparentHandler
+
+
+def test_articles_update_reparents(tmp_path):
+    handler = _reparent_handler()
+    with serve(handler) as base:
         result = run_cli(tmp_path, base, "articles", "update", "A-1",
                          "--parent", "A-2")
     assert result.returncode == 0, result.stderr
-    post = [r for r in ReparentHandler.requests if r[0] == "POST"][0]
+    post = [r for r in handler.requests if r[0] == "POST"][0]
     assert post[2] == {"parentArticle": {"id": "5-2"}}
 
 
@@ -2703,6 +2995,38 @@ def test_articles_update_refuses_a_cross_project_parent(tmp_path):
     assert result.returncode == 6
     # Same pre-check articles create already performs — must not reach the write.
     assert not any(r[0] == "POST" for r in CrossProjectHandler.requests)
+
+
+def test_articles_update_refuses_self_parent_by_the_same_ref(tmp_path):
+    handler = _reparent_handler()          # reuse the Task-3 M4a handler shape
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "A-1")
+    assert result.returncode == 6
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_articles_update_refuses_self_parent_across_notations(tmp_path):
+    """The measured reason this compares resolved internal ids: --parent 5-1
+    against A-1 is one article in two notations, which comparing the raw
+    arguments would miss."""
+    handler = _reparent_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "5-1")
+    assert result.returncode == 6
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_articles_update_still_reparents_to_a_different_article(tmp_path):
+    """The guard must not break the legitimate case."""
+    handler = _reparent_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "articles", "update", "A-1",
+                         "--parent", "A-2")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2] == {"parentArticle": {"id": "5-2"}}
 
 
 def _visibility_handler(groups):
@@ -2833,3 +3157,310 @@ def test_comment_without_visibility_flags_sends_no_visibility_key(tmp_path):
     assert result.returncode == 0, result.stderr
     post = [r for r in handler.requests if r[0] == "POST"][0]
     assert "visibility" not in post[2]
+
+
+_WORK_ITEM = {"id": "162-1", "date": 1784505600000,
+              "duration": {"minutes": 90, "presentation": "1h 30m",
+                           "$type": "DurationValue"},
+              "text": None, "type": None,
+              "author": {"login": "s.royz"}, "created": 1785273759478}
+
+_PROJECT_WORK_TYPES = [{"id": "139-0", "name": "Development"},
+                       {"id": "139-1", "name": "Testing"},
+                       {"id": "139-2", "name": "Documentation"},
+                       {"id": "139-3", "name": "Meeting"},
+                       {"id": "139-4", "name": "Support"}]
+
+# Measured 2026-07-28: the instance-wide endpoint lists 6 work-item types on
+# ION, project 0-1 lists 5 — `Review` exists instance-wide and is refused by
+# the project. The fixture keeps that asymmetry so a test can tell "resolved
+# against the project's set" apart from "resolved against the instance's".
+_INSTANCE_WORK_TYPES = _PROJECT_WORK_TYPES + [{"id": "139-5", "name": "Review"}]
+
+
+def _work_handler(items=None, types=None, *, post_status=200, post_body=None,
+                  instance_types=None):
+    """Serves the issue read (for its project), the project's work-item types
+    (project-scoped) and the instance-wide types (distinct set, see above),
+    the work-item POST, and the work-item list."""
+    items = [_WORK_ITEM] if items is None else items
+    types = _PROJECT_WORK_TYPES if types is None else types
+    instance_types = _INSTANCE_WORK_TYPES if instance_types is None else instance_types
+
+    class WorkHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def log_message(self, *_args):
+            pass
+
+        def _reply(self, payload, status=200):
+            body = b"" if payload is None else json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.__class__.requests.append(("GET", self.path, None))
+            route = urllib.parse.urlparse(self.path).path
+            if route == "/api/admin/timeTrackingSettings/workItemTypes":
+                self._reply(instance_types)
+            elif route.endswith("/timeTrackingSettings/workItemTypes"):
+                self._reply(types)
+            elif route.endswith("/timeTracking/workItems"):
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                top = int(query.get("$top", ["100"])[0])
+                self._reply(items[:top])
+            else:                                   # the issue, for its project
+                self._reply({"id": "2-1", "idReadable": "DEMO-1",
+                             "project": {"id": "0-1", "shortName": "DEMO"}})
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.__class__.requests.append(("POST", self.path, json.loads(raw)))
+            self._reply(post_body if post_body is not None else _WORK_ITEM,
+                        post_status)
+
+    WorkHandler.requests = []
+    return WorkHandler
+
+
+def test_work_log_sends_duration_as_presentation(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1h 30m")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert urllib.parse.urlparse(post[1]).path == \
+        "/api/issues/DEMO-1/timeTracking/workItems"
+    # Measured: minutes and presentation together return "Conflict in period
+    # value", and the server owns the grammar (and the workday length).
+    assert post[2]["duration"] == {"presentation": "1h 30m"}
+    assert "minutes" not in post[2]["duration"]
+
+
+def test_work_log_without_a_type_makes_exactly_one_request(tmp_path):
+    """No --type means no project lookup, so no issue read either."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "45m")
+    assert result.returncode == 0, result.stderr
+    assert len(handler.requests) == 1
+    assert handler.requests[0][0] == "POST"
+
+
+def test_work_log_refuses_a_unit_less_duration_before_any_request(tmp_path):
+    """Measured: YouTrack reads a bare number as HOURS, so --duration 90
+    intending minutes logs 90 hours. Refused rather than passed through."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "90")
+    assert result.returncode == 6
+    assert "90m" in result.stderr or "unit" in result.stderr.lower()
+    assert not handler.requests, "must not reach the server"
+
+
+def test_work_log_refuses_an_empty_duration_before_any_request(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "")
+    assert result.returncode == 6
+    assert not handler.requests, "must not reach the server"
+
+
+def test_work_log_accepts_unit_forms_the_server_parses(tmp_path):
+    for raw in ["90m", "1h30m", "1h 30m", "2d", "1w", "1H30M"]:
+        handler = _work_handler()
+        with serve(handler) as base:
+            result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                             "--duration", raw)
+        assert result.returncode == 0, f"{raw}: {result.stderr}"
+
+
+def test_work_log_resolves_the_type_against_the_projects_set(tmp_path):
+    """Measured: a type valid instance-wide can be rejected by the project
+    (Review), so resolution must read the project's list, which costs one read
+    of the issue to learn its project."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--type", "testing")
+    assert result.returncode == 0, result.stderr
+    gets = [urllib.parse.urlparse(r[1]).path for r in handler.requests
+            if r[0] == "GET"]
+    assert "/api/admin/projects/0-1/timeTrackingSettings/workItemTypes" in gets
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    # Measured: the type write takes an id and rejects a name.
+    assert post[2]["type"] == {"id": "139-1"}
+
+
+def test_work_log_unknown_type_exits_6_with_near_miss_and_no_write(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--type", "Developmnt")
+    assert result.returncode == 6
+    assert "Development" in result.stderr
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_work_log_ambiguous_type_is_refused_not_guessed(tmp_path):
+    """I-5: nothing in the measured record says work-item-type names are
+    unique on a project, so a collision must be refused (exit 6), mirroring
+    _resolve_tag_id / _resolve_group_ids / _resolve_link, not resolved to
+    whichever row happened to match first."""
+    collide = [{"id": "139-1", "name": "Testing"}, {"id": "139-9", "name": "Testing"}]
+    handler = _work_handler(types=collide)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--type", "Testing")
+    assert result.returncode == 6
+    assert "ambiguous" in result.stderr.lower()
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_work_log_type_absent_from_the_project_is_refused_here(tmp_path):
+    """Review exists instance-wide but not on this project — the near-miss must
+    be over the PROJECT's set, so an instance-only name is simply unknown."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--type", "Review")
+    assert result.returncode == 6
+    assert not any(r[0] == "POST" for r in handler.requests)
+
+
+def test_work_log_sends_the_date_as_noon_utc_epoch_ms(tmp_path):
+    """The server snaps to 00:00 of the day and whether that snap is UTC or
+    profile-timezone is unmeasurable on ION, so noon is sent for its ~12h of
+    margin. Assert the request, never epoch equality on the round trip."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--date", "2026-07-20")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2]["date"] == 1784548800000        # 2026-07-20T12:00:00Z
+
+
+def test_work_log_rejects_a_malformed_date(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "30m", "--date", "20/07/2026")
+    assert result.returncode == 6
+    assert not handler.requests
+
+
+def test_work_log_renders_the_read_back_date_as_a_calendar_day(tmp_path):
+    """The server stores 00:00 of the day; epoch ms is a hostile interface for
+    a calendar date, exactly as for `date` custom fields."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1h 30m")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["date"] == "2026-07-20"
+
+
+def test_work_log_flattens_type_and_author(tmp_path):
+    """_shape_work_item must flatten `type` to its name and `author` to its
+    login, never emit the whole object (which would leak $type)."""
+    item = dict(_WORK_ITEM,
+               type={"id": "139-1", "name": "Testing", "$type": "WorkItemType"},
+               author={"login": "s.royz", "$type": "User"})
+    handler = _work_handler(post_body=item)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1h 30m")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["type"] == "Testing"
+    assert payload["author"] == "s.royz"
+    assert "$type" not in json.dumps(payload)
+
+
+def test_work_log_emits_both_duration_representations_without_type(tmp_path):
+    """presentation is re-rendered by the server and minutes reflects the
+    project's workday length, so each carries what the other loses. $type never
+    reaches output."""
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1h 30m")
+    assert result.returncode == 0, result.stderr
+    duration = json.loads(result.stdout)["duration"]
+    assert duration == {"minutes": 90, "presentation": "1h 30m"}
+    assert "$type" not in duration
+
+
+def test_work_log_passes_text_through(tmp_path):
+    handler = _work_handler()
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "5m", "--text", "line one\nline two")
+    assert result.returncode == 0, result.stderr
+    post = [r for r in handler.requests if r[0] == "POST"][0]
+    assert post[2]["text"] == "line one\nline two"
+
+
+def test_work_log_translates_an_unparseable_duration(tmp_path):
+    handler = _work_handler(
+        post_status=400,
+        post_body={"error": "bad_request",
+                   "error_description": "Value 1.5h cannot be parsed"})
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "1.5h")
+    assert result.returncode == 6
+    assert "1.5h" in result.stderr
+
+
+def test_work_log_translates_a_non_positive_duration(tmp_path):
+    handler = _work_handler(
+        post_status=400,
+        post_body={"error": "invalid_properties",
+                   "error_description": "Work duration can not be negative or empty"})
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
+                         "--duration", "0m")
+    assert result.returncode == 6
+
+
+def test_work_list_pages_and_envelopes(tmp_path):
+    items = [dict(_WORK_ITEM, id=f"162-{n}") for n in range(5)]
+    handler = _work_handler(items)
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "list", "DEMO-1",
+                         "--limit", "2", "--offset", "1")
+    assert result.returncode == 0, result.stderr
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(handler.requests[0][1]).query)
+    assert query["$top"] == ["3"]           # limit + 1
+    assert query["$skip"] == ["1"]
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 2
+    assert payload["has_more"] is True
+    assert payload["items"][0]["date"] == "2026-07-20"
+    assert "$type" not in payload["items"][0]["duration"]
+
+
+def test_work_list_of_an_issue_with_no_items(tmp_path):
+    handler = _work_handler([])
+    with serve(handler) as base:
+        result = run_cli(tmp_path, base, "issues", "work", "list", "DEMO-1")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"items": [], "has_more": False}
+
+
+def test_work_log_is_gated_and_list_is_not(tmp_path):
+    verbs = _write_verbs()
+    assert "issues work log" in verbs
+    assert "issues work list" not in verbs
