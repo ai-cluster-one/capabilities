@@ -1413,7 +1413,7 @@ Expected diff: one or two changed lines, no reformatting noise.
 
 - [ ] **Step 6: Update the parity plan's status markers and recount**
 
-Mark M4b ✅ in the status block and the milestone heading. In the parity table, `manage_issue_tags` and `log_work` both move to parity. Then **run `python3 .claude/plans/recount-parity.py`** and make the count line say what it prints — **22 at parity, 0 near/partial, 0 absent, plus 1 covered by design**. Do not edit the numbers by hand; the script fails if the prose and the table disagree.
+Mark M4b ✅ in the status block and the milestone heading. In the parity table, `manage_issue_tags` and `log_work` both move to parity. Then **recount the table's statuses and make the count line say what the count says** — **22 at parity, 0 near/partial, 0 absent, plus 1 covered by design**, summing to 23 over the 23 MCP rows. Do not edit the numbers by hand. Classify each row on its leading status glyph: a substring match on "absent" reads `search_issues` as absent, because its status cell says "sort still absent, deliberately".
 
 - [ ] **Step 7: Audit and reinstall**
 
@@ -1447,7 +1447,7 @@ cd capabilities/youtrack && python3 -m pytest tests/test_youtrack.py -q
 
 Expected: 169 pre-existing plus ~35 new, all passing. `test_every_command_is_documented` and `test_every_documented_command_exists` cover the four new verbs; `test_write_verbs_match_commands` covers the three new write verbs.
 
-Then, from the repo root: `python3 .claude/plans/recount-parity.py` must print `OK`.
+Then the parity table's statuses must recount to 22 at parity, 0 absent and 1 covered by design, and the count line in the parity plan must say exactly that.
 
 ## Rollback
 
