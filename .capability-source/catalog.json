@@ -62,7 +62,7 @@
     },
     "macmail": {
       "path": "capabilities/macmail",
-      "payload_sha256": "8b4ca63d8ff4526565029c3c48eb84bc8a256f17708381a96e02620982a5be4a",
+      "payload_sha256": "eab5797c76e26b253a33c008cd3d27a4565f8b937b58a40dcd5ecf9b4620fac0",
       "summary": "Mail.app CLI over macOS Automation — read/search mail across configured accounts, show a message, save attachments, draft (never send), and export a mailbox to JSON."
     },
     "mailbox": {
@@ -87,7 +87,7 @@
     },
     "signoz": {
       "path": "capabilities/signoz",
-      "payload_sha256": "36b426d76923f92449b062465cc5588a9138fbb73dadf010e0c4fec3d149f151",
+      "payload_sha256": "bdc1ae38cfabbd4c2c7a12dd86a0ebfffb58abd0c05bfa5107340e9f1e9b7c89",
       "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances."
     },
     "simplbooks": {
