@@ -6,73 +6,73 @@
 # ]
 # ///
 """
-mail — personal Mail.app CLI (JXA-backed; read + draft only; no send).
+macmail — personal Mail.app CLI (JXA-backed; read + draft only; no send).
 
 No credentials on disk. Uses Mail.app's already-configured accounts. First
 invocation requires a one-time macOS Automation grant:
   System Settings → Privacy & Security → Automation → your terminal → Mail
 
 Commands:
-  mail help
+  macmail help
       Print this document.
 
-  mail doctor
+  macmail doctor
       Readiness — proves the macOS Automation grant by listing accounts.
 
-  mail accounts [--json]
+  macmail accounts [--json]
       List accounts Mail.app knows about.
 
-  mail mailboxes <account> [--json]
+  macmail mailboxes <account> [--json]
       List mailboxes (folders) for an account.
 
-  mail read <account> [--mailbox NAME] [--limit N] [--since ISO] [--json]
+  macmail read <account> [--mailbox NAME] [--limit N] [--since ISO] [--json]
       Read recent messages from a mailbox (newest first).
 
-  mail search <account> <query> [--mailbox NAME]
+  macmail search <account> <query> [--mailbox NAME]
        [--field subject|sender|content|any] [--limit N] [--json]
       Search within an account. Default field is 'any' (subject OR sender).
       Content search is supported but slow.
 
-  mail show <account> <message-id> [--json] [--html] [--raw]
+  macmail show <account> <message-id> [--json] [--html] [--raw]
       Show one message by RFC-822 Message-ID, including headers + body.
       --html prints the HTML body (link URLs intact); --raw prints the
       full RFC-822 source.
 
-  mail links <account> <message-id> [--match TEXT] [--json]
+  macmail links <account> <message-id> [--match TEXT] [--json]
       List hyperlinks (anchor text + URL) from a message's HTML body.
       --match filters to links whose text or URL contains TEXT.
 
-  mail attachments <account> <message-id> [--save DIR] [--index N] [--json]
+  macmail attachments <account> <message-id> [--save DIR] [--index N] [--json]
       List a message's attachments, or save them to DIR. --index N saves
       only the attachment at that index.
 
-  mail fetch <url> --out PATH [--header 'Name: value' ...] [--timeout SEC]
+  macmail fetch <url> --out PATH [--header 'Name: value' ...] [--timeout SEC]
       Download a URL to disk (follows redirects). Use to pull a PDF behind
       a 'Download receipt' link surfaced by `mail links`.
 
-  mail draft <account> --to ADDR [--to ADDR ...] [--cc ADDR] [--bcc ADDR]
+  macmail draft <account> --to ADDR [--to ADDR ...] [--cc ADDR] [--bcc ADDR]
        --subject TEXT [--in-reply-to MESSAGE-ID] [--body TEXT | --body -]
       Compose a draft and save it to the account's Drafts folder.
       NO SEND. Use '--body -' to read body from stdin.
 
-  mail export <account> --mailbox NAME --out PATH [--limit N] [--since ISO]
+  macmail export <account> --mailbox NAME --out PATH [--limit N] [--since ISO]
       Dump a mailbox to JSON (for .assets/messages/email/<conv>/messages.json).
 
 <account> matches case-insensitively against the account's Mail.app name or
 any of its configured email addresses.
 
 Contract commands (the same on every capability):
-  mail stub                                 One-line awareness text.
-  mail manifest --json                      Machine-readable declaration.
-  mail connections                          Connection resolution report. mail
+  macmail stub                                 One-line awareness text.
+  macmail manifest --json                      Machine-readable declaration.
+  macmail connections                          Connection resolution report. macmail
                                             holds no credential (auth is the
                                             macOS Automation grant), so each
                                             connection reports an empty key set.
-  mail guide [<topic>]                      Guide topics / one guide body,
+  macmail guide [<topic>]                      Guide topics / one guide body,
                                             fetched live from the docs base.
-  mail ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-       [--note <text>]                      (capabilities/mail/identifiers.json).
-  mail refs                                 Menu of the project's reference
+  macmail ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
+       [--note <text>]                      (capabilities/macmail/identifiers.json).
+  macmail refs                                 Menu of the project's reference
                                             files for this capability.
 
 Exit codes:
@@ -192,7 +192,7 @@ function accountSenderString(acct) {
 
 # --- Capability declaration — one home for every contract fact ---------------
 
-NAME = "mail"
+NAME = "macmail"
 SUMMARY = ("Mail.app CLI over macOS Automation — read/search mail across "
            "configured accounts, show a message, save attachments, draft "
            "(never send), and export a mailbox to JSON.")
@@ -206,7 +206,7 @@ STATE = False       # True when the capability writes session/cache state
 POST_INSTALL: list = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
-CREDENTIALS_ENV = _CONFIG_HOME / "mail" / "credentials.env"
+CREDENTIALS_ENV = _CONFIG_HOME / "macmail" / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
 
@@ -1360,7 +1360,7 @@ def main():
     _gate()                      # every verb passes the project gate first
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
     p = argparse.ArgumentParser(
-        prog="mail",
+        prog="macmail",
         description="Personal Mail.app CLI (JXA; read + draft, no send).",
     )
     sub = p.add_subparsers(dest="cmd", required=True)

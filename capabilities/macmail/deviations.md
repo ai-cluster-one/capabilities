@@ -1,4 +1,4 @@
-# mail — recorded deviations
+# macmail — recorded deviations
 
 Deliberate departures from the executable standard (SHEBANG.md), kept in this
 dedicated file so an audit reads them as choices, not drift.

@@ -1,5 +1,5 @@
 """
-mail JXA reliability regression tests.
+macmail JXA reliability regression tests.
 
 Tests verify fail-closed behavior, timeout handling, and structured error
 propagation through code inspection and behavioral contracts.
@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-MAIL_BIN = Path(__file__).parent.parent / "bin" / "mail"
+MAIL_BIN = Path(__file__).parent.parent / "bin" / "macmail"
 
 
 def test_run_jxa_has_timeout_handler():

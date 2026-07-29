@@ -27,7 +27,7 @@
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "62f4ea04d57cfa290ccd53c586dc007321e9fe18590717b594a8bcb3cea77fe5",
+      "payload_sha256": "a4145fe98d6b4833df864a37364ee362e12bd187c750125a05f5b4b05d9ce8bd",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
@@ -57,12 +57,12 @@
     },
     "ical": {
       "path": "capabilities/ical",
-      "payload_sha256": "d53706627c61d6b456d95cdf861d06501e05190926fe661f6ec600e3667dc125",
-      "summary": "Calendar.app CLI over macOS Automation — read and write events across Calendar.app's configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); auth is the one-time macOS Automation grant, no credential on disk."
+      "payload_sha256": "0459d7622834305c9412e3a689e981914cf6891b10dc12667602f1c6fb979fd7",
+      "summary": "macOS Calendar CLI with indexed EventKit reads and Calendar.app automation writes across configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); no credential is stored on disk."
     },
-    "mail": {
-      "path": "capabilities/mail",
-      "payload_sha256": "4311706a9af2e14cb5ddc693a65028ba4e5ec41f4cc329d9c84c7e68327808a0",
+    "macmail": {
+      "path": "capabilities/macmail",
+      "payload_sha256": "8b4ca63d8ff4526565029c3c48eb84bc8a256f17708381a96e02620982a5be4a",
       "summary": "Mail.app CLI over macOS Automation — read/search mail across configured accounts, show a message, save attachments, draft (never send), and export a mailbox to JSON."
     },
     "mailbox": {
@@ -122,7 +122,7 @@
     },
     "youtrack": {
       "path": "capabilities/youtrack",
-      "payload_sha256": "53ac24242c6123e625e26ff0dfe23a0cd1c2991fb95d71eec012a4842d3dc728",
+      "payload_sha256": "f7d0e3c3ece95813a1af8cd2e5f065b2ae5b0187220ba9933f44c8b4592d9e7c",
       "summary": "YouTrack CLI for issues (read with links and tags, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, add/remove issue links by direction phrase, tag and untag by tag name, and log and list work items), user and group lookup, project reads and paged custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments)."
     }
   }
