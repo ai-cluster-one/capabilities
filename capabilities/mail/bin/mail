@@ -837,9 +837,12 @@ for (const mb of acct.mailboxes()) {
     errors.push({mailbox: mb.name(), error: String(e)});
   }
 }
+if (errors.length > 0) {
+  const names = errors.map(e => e.mailbox).join(', ');
+  die(`Mailbox search failed (${errors.length} errors): ${names}. Cannot determine if message exists.`);
+}
 if (!found) {
-  const detail = errors.length > 0 ? ` (${errors.length} mailbox errors encountered)` : '';
-  die(`Message not found: ${target}${detail}`);
+  die(`Message not found: ${target}`);
 }
 JSON.stringify({source: found.source()});
 """
@@ -1079,16 +1082,20 @@ def cmd_search(args):
         result = {"messages": result if isinstance(result, list) else [], "errors": []}
     msgs = result.get("messages", [])
     errors = result.get("errors", [])
+    
     if errors:
-        sys.stderr.write(json.dumps(
-            {"warning": f"{len(errors)} mailbox(es) failed during search",
-             "failed_mailboxes": errors}, ensure_ascii=False) + "\n")
+        failed_mailboxes = [e.get("mailbox", "unknown") for e in errors]
+        _die(1, "incomplete_search",
+             f"search failed on {len(errors)} mailbox(es): {', '.join(failed_mailboxes[:3])}{'...' if len(failed_mailboxes) > 3 else ''}",
+             f"Cannot distinguish missing messages from search failures. "
+             f"Narrow scope with --mailbox, check mailbox access, or contact support. "
+             f"Failed: {', '.join(failed_mailboxes)}")
+    
     if args.json:
-        print(json.dumps({"messages": msgs, "errors": errors}, ensure_ascii=False, indent=2))
+        print(json.dumps(msgs, ensure_ascii=False, indent=2))
         return
     scope = args.mailbox or "all mailboxes"
-    err_note = f" ({len(errors)} mailbox errors)" if errors else ""
-    print(f"# search {args.query!r} in {args.account}:{scope}  ({len(msgs)} hits){err_note}")
+    print(f"# search {args.query!r} in {args.account}:{scope}  ({len(msgs)} hits)")
     for m in msgs:
         ts = (m.get("dateReceived") or "")[:16].replace("T", " ")
         subj = (m.get("subject") or "(no subject)").replace("\n", " ")
@@ -1123,9 +1130,12 @@ def cmd_show(args):
         errors.push({mailbox: mb.name(), error: String(e)});
       }
     }
+    if (errors.length > 0) {
+      const names = errors.map(e => e.mailbox).join(', ');
+      die(`Mailbox search failed (${errors.length} errors): ${names}. Cannot determine if message exists.`);
+    }
     if (!found) {
-      const detail = errors.length > 0 ? ` (${errors.length} mailbox errors encountered)` : '';
-      die(`Message not found: ${target}${detail}`);
+      die(`Message not found: ${target}`);
     }
     JSON.stringify(messageFull(found));
     """
