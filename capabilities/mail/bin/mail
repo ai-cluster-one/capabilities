@@ -781,8 +781,13 @@ def _cmd_connections() -> None:
     _emit(_connections_report())
 
 
-def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 600):
-    """Execute a JXA script via osascript; return parsed JSON or None."""
+def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 120):
+    """Execute a JXA script via osascript; return parsed JSON or None.
+
+    Reduced default timeout from 600s to 120s. Mailbox operations that hit this
+    limit should be broken into smaller scopes or filtered queries rather than
+    waiting indefinitely.
+    """
     full_script = JXA_PRELUDE + "\n" + script_body
     env = os.environ.copy()
     if env_extras:
@@ -794,18 +799,22 @@ def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 600
             capture_output=True, text=True, timeout=timeout, env=env,
         )
     except FileNotFoundError:
-        sys.exit("osascript not found — this CLI only works on macOS.")
+        _die(2, "osascript_missing", "osascript not found",
+             "this CLI only works on macOS")
+    except subprocess.TimeoutExpired:
+        _die(1, "jxa_timeout",
+             f"Mail.app automation timed out after {timeout}s",
+             "The request was not completed; do not interpret this as an empty result. "
+             "Reduce the mailbox scope, limit, or date range to avoid scanning large mailboxes.")
     if result.returncode != 0:
         err = result.stderr.strip()
         if "-1743" in err or "Not authorized to send Apple events" in err:
-            sys.exit(
-                "Mail.app automation is not authorized for this terminal.\n"
-                "  Grant: System Settings → Privacy & Security → Automation\n"
-                "         → [your terminal app] → enable Mail\n"
-                "  Then run the command again.\n"
-                f"  ({err})"
-            )
-        sys.exit(f"osascript failed: {err}")
+            _die(2, "automation_denied",
+                 "Mail.app automation is not authorized for this terminal",
+                 "Grant: System Settings → Privacy & Security → Automation → "
+                 "[your terminal app] → enable Mail. Then run the command again. "
+                 f"Detail: {err}")
+        _die(1, "jxa_failed", f"osascript failed: {err}")
     out = result.stdout.strip()
     if not out:
         return None
@@ -819,13 +828,19 @@ SOURCE_FETCH = r"""
 const acct = findAccount(env('ACCOUNT'));
 const target = env('MSG_ID');
 let found = null;
+const errors = [];
 for (const mb of acct.mailboxes()) {
   try {
     const hits = mb.messages.whose({messageId: target})();
     if (hits.length > 0) { found = hits[0]; break; }
-  } catch (e) {}
+  } catch (e) {
+    errors.push({mailbox: mb.name(), error: String(e)});
+  }
 }
-if (!found) die(`Message not found: ${target}`);
+if (!found) {
+  const detail = errors.length > 0 ? ` (${errors.length} mailbox errors encountered)` : '';
+  die(`Message not found: ${target}${detail}`);
+}
 JSON.stringify({source: found.source()});
 """
 
@@ -1027,11 +1042,15 @@ def cmd_search(args):
       {sender:  {_contains: query}}
     ]};
 
+    const errors = [];
     function searchMailbox(mb) {
       try {
         const hits = mb.messages.whose(clause)();
         return hits.slice(0, limit);
-      } catch (e) { return []; }
+      } catch (e) {
+        errors.push({mailbox: mb.name(), error: String(e)});
+        return [];
+      }
     }
 
     let messages = [];
@@ -1047,20 +1066,29 @@ def cmd_search(args):
         if (messages.length >= limit) break;
       }
     }
-    JSON.stringify(messages.map(messageSummary));
+    JSON.stringify({messages: messages.map(messageSummary), errors: errors});
     """
-    msgs = run_jxa(script, {
+    result = run_jxa(script, {
         "ACCOUNT": args.account,
         "MAILBOX": args.mailbox or "",
         "QUERY": args.query,
         "FIELD": args.field,
         "LIMIT": str(args.limit),
-    }) or []
+    }) or {"messages": [], "errors": []}
+    if not isinstance(result, dict):
+        result = {"messages": result if isinstance(result, list) else [], "errors": []}
+    msgs = result.get("messages", [])
+    errors = result.get("errors", [])
+    if errors:
+        sys.stderr.write(json.dumps(
+            {"warning": f"{len(errors)} mailbox(es) failed during search",
+             "failed_mailboxes": errors}, ensure_ascii=False) + "\n")
     if args.json:
-        print(json.dumps(msgs, ensure_ascii=False, indent=2))
+        print(json.dumps({"messages": msgs, "errors": errors}, ensure_ascii=False, indent=2))
         return
     scope = args.mailbox or "all mailboxes"
-    print(f"# search {args.query!r} in {args.account}:{scope}  ({len(msgs)} hits)")
+    err_note = f" ({len(errors)} mailbox errors)" if errors else ""
+    print(f"# search {args.query!r} in {args.account}:{scope}  ({len(msgs)} hits){err_note}")
     for m in msgs:
         ts = (m.get("dateReceived") or "")[:16].replace("T", " ")
         subj = (m.get("subject") or "(no subject)").replace("\n", " ")
@@ -1086,13 +1114,19 @@ def cmd_show(args):
     const acct = findAccount(env('ACCOUNT'));
     const target = env('MSG_ID');
     let found = null;
+    const errors = [];
     for (const mb of acct.mailboxes()) {
       try {
         const hits = mb.messages.whose({messageId: target})();
         if (hits.length > 0) { found = hits[0]; break; }
-      } catch (e) {}
+      } catch (e) {
+        errors.push({mailbox: mb.name(), error: String(e)});
+      }
     }
-    if (!found) die(`Message not found: ${target}`);
+    if (!found) {
+      const detail = errors.length > 0 ? ` (${errors.length} mailbox errors encountered)` : '';
+      die(`Message not found: ${target}${detail}`);
+    }
     JSON.stringify(messageFull(found));
     """
     m = run_jxa(script, {"ACCOUNT": args.account, "MSG_ID": args.message_id})

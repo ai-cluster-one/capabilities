@@ -3,12 +3,17 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
+#     "pyobjc-framework-EventKit>=12.1",
 # ]
 # ///
 """
-ical — personal Calendar.app CLI (JXA-backed; read + write, policy-gated).
+ical — personal macOS Calendar CLI (EventKit reads + policy-gated writes).
 
-No secret on disk. Auth is the one-time macOS Automation grant:
+No secret on disk. Reliable reads use the indexed local EventKit store and
+require Full Calendar Access:
+  System Settings → Privacy & Security → Calendars
+
+Writes currently use Calendar.app automation and require:
   System Settings → Privacy & Security → Automation → your terminal → Calendar
 
 Writes are gated through the standard connections model — the same exit-4
@@ -89,7 +94,10 @@ else exit 4):
   ical delete <event-id> [--connection ID]
       Delete an event by uid.
 
-Calendar.app / JXA caveats — recorded honestly:
+Calendar integration caveats — recorded honestly:
+  • Reads use EventKit date predicates rather than Calendar.app `whose`
+    queries. The latter can scan or hydrate every event in every calendar and
+    take minutes when many remote calendars are configured.
   • Whether attendee invitations are actually *sent* depends on the
     underlying account (iCloud/Exchange/CalDAV send; local calendars just
     record the attendee). ical adds the attendee via JXA and reports
@@ -137,6 +145,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NoReturn
@@ -233,11 +242,11 @@ function eventFull(e, calName) {
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "ical"
-SUMMARY = ("Calendar.app CLI over macOS Automation — read and write events "
-           "across Calendar.app's configured calendars (calendars, events, "
-           "show, search, freebusy, create, update, delete). Writes are "
-           "gated by the connection's policy (scope + allow_write); auth is "
-           "the one-time macOS Automation grant, no credential on disk.")
+SUMMARY = ("macOS Calendar CLI with indexed EventKit reads and Calendar.app "
+           "automation writes across configured calendars (calendars, events, "
+           "show, search, freebusy, create, update, delete). Writes are gated "
+           "by the connection's policy (scope + allow_write); no credential "
+           "is stored on disk.")
 SCOPE = "user"      # credential scope: "project" | "user"
 CRED_KEYS: list = []   # no credentials — auth is the one-time macOS Automation grant
 WRITE_VERBS: list = ["create", "update", "delete"]  # gated per-connection
@@ -885,7 +894,7 @@ def _extract_connection(argv: list[str]) -> tuple[list[str], str | None]:
 
 # --- JXA runner -------------------------------------------------------------
 
-def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 600):
+def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 60):
     """Execute a JXA script via osascript; return parsed JSON or None."""
     full_script = JXA_PRELUDE + "\n" + script_body
     env = os.environ.copy()
@@ -898,18 +907,22 @@ def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 600
             capture_output=True, text=True, timeout=timeout, env=env,
         )
     except FileNotFoundError:
-        sys.exit("osascript not found — this CLI only works on macOS.")
+        _die(2, "osascript_missing", "osascript not found",
+             "this CLI only works on macOS")
+    except subprocess.TimeoutExpired:
+        _die(1, "jxa_timeout",
+             f"Calendar.app automation timed out after {timeout}s",
+             "The request was not completed; do not interpret this as an empty result. "
+             "Reduce the date range or calendar scope, or check for slow remote calendars.")
     if result.returncode != 0:
         err = result.stderr.strip()
         if "-1743" in err or "Not authorized to send Apple events" in err:
-            sys.exit(
-                "Calendar.app automation is not authorized for this terminal.\n"
-                "  Grant: System Settings → Privacy & Security → Automation\n"
-                "         → [your terminal app] → enable Calendar\n"
-                "  Then run the command again.\n"
-                f"  ({err})"
-            )
-        sys.exit(f"osascript failed: {err}")
+            _die(2, "automation_denied",
+                 "Calendar.app automation is not authorized for this terminal",
+                 "Grant: System Settings → Privacy & Security → Automation → "
+                 "[your terminal app] → enable Calendar. Then run the command again. "
+                 f"Detail: {err}")
+        _die(1, "jxa_failed", f"osascript failed: {err}")
     out = result.stdout.strip()
     if not out:
         return None
@@ -917,6 +930,182 @@ def run_jxa(script_body: str, env_extras: dict | None = None, timeout: int = 600
         return json.loads(out)
     except json.JSONDecodeError:
         return out
+
+
+# --- Native EventKit reads --------------------------------------------------
+
+def _eventkit_modules():
+    try:
+        import EventKit  # type: ignore[import-not-found]
+        import Foundation  # type: ignore[import-not-found]
+    except ImportError as exc:
+        _die(2, "eventkit_unavailable",
+             "EventKit Python bridge is unavailable",
+             f"reinstall the ical capability ({exc})")
+    return EventKit, Foundation
+
+
+def _eventkit_store():
+    """Return an EKEventStore with full read access.
+
+    Calendar.app scripting is intentionally not used here: date predicates sent
+    through Apple Events can make Calendar.app scan or hydrate every event in
+    every calendar. EventKit executes the same range query against the indexed
+    local event store.
+
+    The requesting identity for TCC is the parent process (the terminal or IDE
+    that launched this script), not osascript. The user must grant Full Calendar
+    Access to that parent in System Settings > Privacy & Security > Calendars.
+    """
+    EventKit, Foundation = _eventkit_modules()
+    store = EventKit.EKEventStore.alloc().init()
+    result = {"granted": None, "error": None}
+
+    def callback(granted, error):
+        result["granted"] = bool(granted)
+        result["error"] = error
+
+    if hasattr(store, "requestFullAccessToEventsWithCompletion_"):
+        store.requestFullAccessToEventsWithCompletion_(callback)
+    else:
+        store.requestAccessToEntityType_completion_(
+            EventKit.EKEntityTypeEvent, callback)
+
+    deadline = time.monotonic() + 60
+    while result["granted"] is None and time.monotonic() < deadline:
+        Foundation.NSRunLoop.currentRunLoop().runMode_beforeDate_(
+            Foundation.NSDefaultRunLoopMode,
+            Foundation.NSDate.dateWithTimeIntervalSinceNow_(0.1),
+        )
+
+    if not result["granted"]:
+        detail = str(result["error"]) if result["error"] else "permission denied"
+        _die(2, "calendar_access_denied",
+             "full Calendar access is required for reliable EventKit reads",
+             "The requesting identity is your terminal or IDE (the parent process that "
+             "launched this script). Grant Full Calendar Access to it in: "
+             "System Settings > Privacy & Security > Calendars. "
+             f"Current permissions may show Visual Studio Code with Add Only; change to Full Calendar. "
+             f"Detail: {detail}")
+    return store
+
+
+def _eventkit_calendars(store):
+    EventKit, _ = _eventkit_modules()
+    return list(store.calendarsForEntityType_(EventKit.EKEntityTypeEvent) or [])
+
+
+def _eventkit_selected_calendars(store, wanted: list[str]):
+    if not wanted:
+        return None
+    wanted_keys = {name.strip().lower() for name in wanted}
+    selected = [
+        calendar for calendar in _eventkit_calendars(store)
+        if str(calendar.title() or "").strip().lower() in wanted_keys
+    ]
+    if not selected:
+        _die(3, "not_found",
+             f"no calendar matches: {', '.join(wanted)}")
+    return selected
+
+
+def _ns_date(value: datetime):
+    _, Foundation = _eventkit_modules()
+    return Foundation.NSDate.dateWithTimeIntervalSince1970_(value.timestamp())
+
+
+def _datetime_from_ns(value) -> datetime | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(
+        float(value.timeIntervalSince1970()), tz=timezone.utc).astimezone()
+
+
+def _eventkit_event_id(event) -> str | None:
+    """Prefer Calendar's external UID so existing JXA write verbs remain compatible."""
+    for getter in ("calendarItemExternalIdentifier", "eventIdentifier",
+                   "calendarItemIdentifier"):
+        try:
+            value = getattr(event, getter)()
+        except Exception:
+            value = None
+        if value:
+            return str(value)
+    return None
+
+
+def _eventkit_event_summary(event) -> dict:
+    calendar = event.calendar()
+    start = _datetime_from_ns(event.startDate())
+    end = _datetime_from_ns(event.endDate())
+    return {
+        "id": _eventkit_event_id(event),
+        "title": str(event.title() or ""),
+        "startDate": _iso(start) if start else None,
+        "endDate": _iso(end) if end else None,
+        "allDay": bool(event.isAllDay()),
+        "calendar": str(calendar.title() or "") if calendar else None,
+        "location": str(event.location() or "") or None,
+    }
+
+
+def _eventkit_event_full(event) -> dict:
+    payload = _eventkit_event_summary(event)
+    payload["notes"] = str(event.notes() or "") or None
+    url = event.URL()
+    payload["url"] = str(url.absoluteString()) if url else None
+    attendees = []
+    for attendee in list(event.attendees() or []):
+        attendee_url = attendee.URL()
+        attendees.append({
+            "name": str(attendee.name() or "") or None,
+            "email": str(attendee_url.resourceSpecifier())
+            if attendee_url else None,
+        })
+    payload["attendees"] = attendees
+    return payload
+
+
+def _eventkit_events(frm: datetime, to: datetime, wanted: list[str]):
+    store = _eventkit_store()
+    calendars = _eventkit_selected_calendars(store, wanted)
+    predicate = store.predicateForEventsWithStartDate_endDate_calendars_(
+        _ns_date(frm), _ns_date(to), calendars)
+    events = list(store.eventsMatchingPredicate_(predicate) or [])
+    events.sort(key=lambda event: float(event.startDate().timeIntervalSince1970()))
+    return store, events
+
+
+def _eventkit_find_event(store, event_id: str, wanted: list[str]):
+    candidates = []
+    for finder in ("eventWithIdentifier_", "calendarItemWithIdentifier_"):
+        try:
+            item = getattr(store, finder)(event_id)
+        except Exception:
+            item = None
+        if item is not None:
+            candidates.append(item)
+    try:
+        candidates.extend(
+            list(store.calendarItemsWithExternalIdentifier_(event_id) or []))
+    except Exception:
+        pass
+
+    wanted_keys = {name.strip().lower() for name in wanted}
+    seen = set()
+    for item in candidates:
+        marker = str(item.calendarItemIdentifier() or id(item))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if not hasattr(item, "startDate"):
+            continue
+        calendar = item.calendar()
+        name = str(calendar.title() or "").strip().lower() if calendar else ""
+        if wanted_keys and name not in wanted_keys:
+            continue
+        return item
+    _die(3, "not_found", f"event not found in scope: {event_id}")
 
 
 # --- Date helpers -----------------------------------------------------------
@@ -976,32 +1165,25 @@ def _resolve_read_calendars(args) -> list[str]:
 # --- Domain commands --------------------------------------------------------
 
 def cmd_doctor():
-    """Cheapest authenticated round-trip: the Automation grant + calendar list."""
+    """Prove full EventKit access and list the indexed local calendars."""
     _doctor_gate(_connections_report(), None)
-    script = r"""
-    const Cal = Application('Calendar');
-    const cals = Cal.calendars();
-    JSON.stringify({calendars: cals.map(c => c.name())});
-    """
-    info = run_jxa(script) or {}
-    if "calendars" not in info:
-        _die(2, "automation_denied",
-             "Calendar.app did not answer — the macOS Automation grant is missing",
-             "System Settings → Privacy & Security → Automation → your terminal → Calendar")
-    _emit({"ok": True, "count": len(info["calendars"]), "calendars": info["calendars"]})
+    store = _eventkit_store()
+    names = [str(calendar.title() or "")
+             for calendar in _eventkit_calendars(store)]
+    _emit({"ok": True, "backend": "EventKit",
+           "count": len(names), "calendars": names})
 
 
 def cmd_calendars(args):
-    script = r"""
-    const Cal = Application('Calendar');
-    const out = Cal.calendars().map(c => {
-      let writable = null;
-      try { writable = c.writable(); } catch (e) {}
-      return { name: c.name(), writable: writable };
-    });
-    JSON.stringify(out);
-    """
-    cals = run_jxa(script) or []
+    store = _eventkit_store()
+    cals = []
+    for calendar in _eventkit_calendars(store):
+        try:
+            writable = bool(calendar.allowsContentModifications())
+        except Exception:
+            writable = None
+        cals.append({"name": str(calendar.title() or ""),
+                     "writable": writable})
     scope = args._scope
     if scope:
         keep = {s.strip().lower() for s in scope}
@@ -1021,32 +1203,10 @@ def cmd_calendars(args):
 def cmd_events(args):
     frm, to = _default_window(args.frm, args.to, days_default=7)
     wanted = _resolve_read_calendars(args)
-    script = r"""
-    const raw = env('CALENDARS') || '';
-    const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
-    const cals = calendarsForNames(wanted);
-    const fromDate = new Date(env('FROM'));
-    const toDate = new Date(env('TO'));
-    const limit = parseInt(env('LIMIT') || '0');
-    const out = [];
-    for (const c of cals) {
-      const evs = eventsInWindow(c, fromDate, toDate);
-      const calName = c.name();
-      for (const e of evs) out.push(eventSummary(e, calName));
-    }
-    out.sort(function(a, b) {
-      const as = a.startDate || '', bs = b.startDate || '';
-      return as < bs ? -1 : (as > bs ? 1 : 0);
-    });
-    const trimmed = limit > 0 ? out.slice(0, limit) : out;
-    JSON.stringify(trimmed);
-    """
-    events = run_jxa(script, {
-        "CALENDARS": "|".join(wanted),
-        "FROM": _iso(frm),
-        "TO": _iso(to),
-        "LIMIT": str(args.limit or 0),
-    }) or []
+    _, raw_events = _eventkit_events(frm, to, wanted)
+    events = [_eventkit_event_summary(event) for event in raw_events]
+    if args.limit and args.limit > 0:
+        events = events[:args.limit]
     if args.json:
         print(json.dumps(events, ensure_ascii=False, indent=2))
         return
@@ -1067,27 +1227,9 @@ def cmd_events(args):
 
 def cmd_show(args):
     scope = args._scope
-    script = r"""
-    const Cal = Application('Calendar');
-    const target = env('UID');
-    const raw = env('CALENDARS') || '';
-    const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
-    const cals = calendarsForNames(wanted);
-    let found = null;
-    let calName = null;
-    for (const c of cals) {
-      try {
-        const hits = c.events.whose({uid: target})();
-        if (hits.length > 0) { found = hits[0]; calName = c.name(); break; }
-      } catch (e) {}
-    }
-    if (!found) die('Event not found: ' + target);
-    JSON.stringify(eventFull(found, calName));
-    """
-    ev = run_jxa(script, {
-        "UID": args.event_id,
-        "CALENDARS": "|".join(scope),
-    })
+    store = _eventkit_store()
+    ev = _eventkit_event_full(
+        _eventkit_find_event(store, args.event_id, scope))
     if args.json:
         print(json.dumps(ev, ensure_ascii=False, indent=2))
         return
@@ -1117,71 +1259,24 @@ def cmd_show(args):
 def cmd_search(args):
     frm, to = _default_window(args.frm, args.to, days_default=30)
     wanted = _resolve_read_calendars(args)
-    script = r"""
-    const raw = env('CALENDARS') || '';
-    const wanted = raw ? raw.split('|').map(s => s.trim()).filter(Boolean) : [];
-    const cals = calendarsForNames(wanted);
-    const fromDate = new Date(env('FROM'));
-    const toDate = new Date(env('TO'));
-    const query = env('QUERY') || '';
-    const field = env('FIELD') || 'any';
-    const limit = parseInt(env('LIMIT') || '0');
-
-    function matchClauses() {
-      if (field === 'title') return [{summary: {_contains: query}}];
-      if (field === 'notes') return [{description: {_contains: query}}];
-      return null;   // 'any' → run two whose() calls and union
-    }
-
-    function windowClause() {
-      return [
-        {startDate: {'>=': fromDate}},
-        {startDate: {'<': toDate}}
-      ];
-    }
-
-    function runWhere(cal, extra) {
-      try {
-        return cal.events.whose({_and: windowClause().concat(extra)})();
-      } catch (e) { return []; }
-    }
-
-    const out = [];
-    const seen = {};
-    for (const c of cals) {
-      const calName = c.name();
-      let hits = [];
-      const clauses = matchClauses();
-      if (clauses) {
-        hits = runWhere(c, clauses);
-      } else {
-        // 'any' — union title-match and notes-match
-        const a = runWhere(c, [{summary: {_contains: query}}]);
-        const b = runWhere(c, [{description: {_contains: query}}]);
-        hits = a.concat(b);
-      }
-      for (const e of hits) {
-        const uid = (function(){try{return e.uid();}catch(x){return null;}})();
-        if (uid && seen[uid]) continue;
-        if (uid) seen[uid] = true;
-        out.push(eventSummary(e, calName));
-      }
-    }
-    out.sort(function(a, b) {
-      const as = a.startDate || '', bs = b.startDate || '';
-      return as < bs ? -1 : (as > bs ? 1 : 0);
-    });
-    const trimmed = limit > 0 ? out.slice(0, limit) : out;
-    JSON.stringify(trimmed);
-    """
-    events = run_jxa(script, {
-        "CALENDARS": "|".join(wanted),
-        "FROM": _iso(frm),
-        "TO": _iso(to),
-        "QUERY": args.query,
-        "FIELD": args.field,
-        "LIMIT": str(args.limit or 0),
-    }) or []
+    _, raw_events = _eventkit_events(frm, to, wanted)
+    query = args.query.casefold()
+    events = []
+    for event in raw_events:
+        title = str(event.title() or "")
+        notes = str(event.notes() or "")
+        location = str(event.location() or "")
+        if args.field == "title":
+            matched = query in title.casefold()
+        elif args.field == "notes":
+            matched = query in notes.casefold()
+        else:
+            matched = any(query in value.casefold()
+                          for value in (title, notes, location))
+        if matched:
+            events.append(_eventkit_event_summary(event))
+            if args.limit and len(events) >= args.limit:
+                break
     if args.json:
         print(json.dumps(events, ensure_ascii=False, indent=2))
         return
@@ -1222,54 +1317,38 @@ def cmd_freebusy(args):
         wanted = requested
     else:
         wanted = list(scope)
-    script = r"""
-    const wantedRaw = env('CALENDARS') || '';
-    const wanted = wantedRaw ? wantedRaw.split('|').map(s => s.trim()).filter(Boolean) : [];
-    const includeNoise = env('INCLUDE_NOISE') === '1';
-    const noiseTokens = (env('NOISE_TOKENS') || '').split('|').filter(Boolean);
-    const Cal = Application('Calendar');
-    const all = Cal.calendars();
-    let cals;
-    if (wanted.length > 0) {
-      cals = calendarsForNames(wanted);
-    } else {
-      cals = all;
-      if (!includeNoise && noiseTokens.length > 0) {
-        cals = cals.filter(function(c) {
-          const n = (c.name() || '').toLowerCase();
-          for (const t of noiseTokens) { if (n.indexOf(t) >= 0) return false; }
-          return true;
-        });
-      }
+    store = _eventkit_store()
+    calendars = _eventkit_selected_calendars(store, wanted)
+    if calendars is None:
+        calendars = _eventkit_calendars(store)
+        if not args.include_noise:
+            calendars = [
+                calendar for calendar in calendars
+                if not any(token in str(calendar.title() or "").casefold()
+                           for token in _NOISE_TOKENS)
+            ]
+    predicate = store.predicateForEventsWithStartDate_endDate_calendars_(
+        _ns_date(frm), _ns_date(to), calendars)
+    raw_events = list(store.eventsMatchingPredicate_(predicate) or [])
+    busy = []
+    for event in raw_events:
+        start = _datetime_from_ns(event.startDate())
+        end = _datetime_from_ns(event.endDate())
+        if not start or not end:
+            continue
+        start = max(start, frm)
+        end = min(end, to)
+        if end <= start:
+            continue
+        busy.append({
+            "start": _iso(start),
+            "end": _iso(end),
+            "allDay": bool(event.isAllDay()),
+        })
+    data = {
+        "calendars": [str(calendar.title() or "") for calendar in calendars],
+        "busy": busy,
     }
-    const fromDate = new Date(env('FROM'));
-    const toDate = new Date(env('TO'));
-    const busy = [];
-    for (const c of cals) {
-      const evs = eventsInWindow(c, fromDate, toDate);
-      for (const e of evs) {
-        let s = null, en = null, allDay = false;
-        try { s = e.startDate(); } catch (x) {}
-        try { en = e.endDate(); } catch (x) {}
-        try { allDay = e.alldayEvent(); } catch (x) {}
-        if (!s || !en) continue;
-        // Trim to window
-        if (s < fromDate) s = fromDate;
-        if (en > toDate) en = toDate;
-        if (en <= s) continue;
-        busy.push({start: localISO(s), end: localISO(en), allDay: allDay});
-      }
-    }
-    busy.sort(function(a, b) { return a.start < b.start ? -1 : (a.start > b.start ? 1 : 0); });
-    JSON.stringify({calendars: cals.map(c => c.name()), busy: busy});
-    """
-    data = run_jxa(script, {
-        "CALENDARS": "|".join(wanted),
-        "INCLUDE_NOISE": "1" if args.include_noise else "0",
-        "NOISE_TOKENS": "|".join(_NOISE_TOKENS),
-        "FROM": _iso(frm),
-        "TO": _iso(to),
-    }) or {"busy": [], "calendars": []}
 
     merged = _merge_intervals(data.get("busy") or [])
     payload = {
