@@ -3,6 +3,7 @@ credentials.env
 .env
 .env.local
 .env.*.local
+.env.signoz.*
 *.local
 
 # Private working notes — grounded scratch (backlog, plans, session recaps).

@@ -27,7 +27,7 @@
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "62f4ea04d57cfa290ccd53c586dc007321e9fe18590717b594a8bcb3cea77fe5",
+      "payload_sha256": "a4145fe98d6b4833df864a37364ee362e12bd187c750125a05f5b4b05d9ce8bd",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
@@ -85,6 +85,11 @@
       "payload_sha256": "c046a651af51b6aeec6b1a7e0096a7992aac361b8cdae9fe59c998ea528c810e",
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes."
     },
+    "signoz": {
+      "path": "capabilities/signoz",
+      "payload_sha256": "36b426d76923f92449b062465cc5588a9138fbb73dadf010e0c4fec3d149f151",
+      "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances."
+    },
     "simplbooks": {
       "path": "capabilities/simplbooks",
       "payload_sha256": "317c699373efe9e20a2ab4b27345f912e9ec84b405a66d267c07019c05c52e6b",
@@ -122,7 +127,7 @@
     },
     "youtrack": {
       "path": "capabilities/youtrack",
-      "payload_sha256": "68bc42f35897517cd13edf16efc83ceb674b4aa6d4551dddb174127360e5e1e2",
+      "payload_sha256": "9d49d625988ae2905226d822e37dbb7462128521dbbc4f370ba1bd5c8c12b546",
       "summary": "YouTrack CLI for issues (read with links, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, and add/remove issue links by direction phrase), user and group lookup, project reads and custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments)."
     }
   }
