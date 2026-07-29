@@ -487,7 +487,8 @@ def test_correlated_call_respects_all_environments_flag():
         result = module._cmd_correlated(conn, "call", [
             "call-1", "--all-environments", "--start", "1", "--end", "2"])
 
-    assert result["environment_scope"] is None
+    assert "environment_scope" not in result
+    assert "scope_filter" not in result
     for call in calls:
         spec = call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
         expr = spec["filter"]["expression"]
@@ -516,3 +517,291 @@ def test_ingestion_plan_does_not_leak_environment_value():
     plan_json = json.dumps(plan)
     assert "secret-env" in plan_json
     assert plan["environment"] == "secret-env"
+
+
+def test_scope_filter_validation_rejects_empty_and_whitespace():
+    with pytest.raises(SystemExit) as exc:
+        module._validate_scope_filter("")
+    assert exc.value.code == 6
+    with pytest.raises(SystemExit) as exc:
+        module._validate_scope_filter("   ")
+    assert exc.value.code == 6
+    assert module._validate_scope_filter("service.name = 'prod'") == "service.name = 'prod'"
+    assert module._validate_scope_filter("  filter  ") == "filter"
+
+
+def test_scope_filter_validation_rejects_excessive_length():
+    long_filter = "x" * 10_001
+    with pytest.raises(SystemExit) as exc:
+        module._validate_scope_filter(long_filter)
+    assert exc.value.code == 6
+    reasonable_filter = "x" * 10_000
+    assert module._validate_scope_filter(reasonable_filter) == reasonable_filter
+
+
+def test_connection_with_scope_filter_includes_in_report(tmp_path, monkeypatch):
+    (tmp_path / "capabilities").mkdir()
+    (tmp_path / "capabilities" / "settings.json").write_text("{}")
+    (tmp_path / "capabilities" / "signoz").mkdir()
+    (tmp_path / "capabilities" / "signoz" / "connections.json").write_text(
+        json.dumps({
+            "connections": {
+                "prod": {
+                    "url": "https://signoz.example",
+                    "api_key_env": "SIGNOZ_KEY",
+                    "scope_filter": "service.name = 'production'",
+                }
+            }
+        })
+    )
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("SIGNOZ_KEY", "secret")
+    resolved = module._resolve_connection("prod")
+    assert resolved["scope_filter"] == "service.name = 'production'"
+    report = module._connection_report(resolved)
+    assert report["scope_filter"] == "service.name = 'production'"
+
+
+def test_connection_without_scope_filter_omits_from_report(tmp_path, monkeypatch):
+    (tmp_path / "capabilities").mkdir()
+    (tmp_path / "capabilities" / "settings.json").write_text("{}")
+    (tmp_path / "capabilities" / "signoz").mkdir()
+    (tmp_path / "capabilities" / "signoz" / "connections.json").write_text(
+        json.dumps({
+            "connections": {
+                "prod": {
+                    "url": "https://signoz.example",
+                    "api_key_env": "SIGNOZ_KEY",
+                }
+            }
+        })
+    )
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("SIGNOZ_KEY", "secret")
+    resolved = module._resolve_connection("prod")
+    assert resolved.get("scope_filter") is None
+    report = module._connection_report(resolved)
+    assert "scope_filter" not in report
+
+
+def test_cli_environment_overrides_scope_filter():
+    conn = connection(
+        environment="production",
+        scope_filter="service.name = 'production'"
+    )
+    
+    class Args:
+        environment = "staging"
+        all_environments = False
+        legacy_unscoped = False
+    
+    scope_type, scope_value = module._resolve_effective_scope(conn, Args())
+    assert scope_type == "environment"
+    assert scope_value == "staging"
+
+
+def test_scope_filter_replaces_environment_when_both_present():
+    conn = connection(
+        environment="production",
+        scope_filter="(deployment.environment = 'production' OR service.name = 'production')"
+    )
+    
+    class Args:
+        environment = None
+        all_environments = False
+        legacy_unscoped = False
+    
+    scope_type, scope_value = module._resolve_effective_scope(conn, Args())
+    assert scope_type == "filter"
+    assert scope_value == "(deployment.environment = 'production' OR service.name = 'production')"
+
+
+def test_scope_filter_used_when_no_environment():
+    conn = connection(scope_filter="custom.field = 'value'")
+    
+    class Args:
+        environment = None
+        all_environments = False
+        legacy_unscoped = False
+    
+    scope_type, scope_value = module._resolve_effective_scope(conn, Args())
+    assert scope_type == "filter"
+    assert scope_value == "custom.field = 'value'"
+
+
+def test_all_environments_overrides_scope_filter():
+    conn = connection(scope_filter="service.name = 'production'")
+    
+    class Args:
+        environment = None
+        all_environments = True
+        legacy_unscoped = False
+    
+    scope_type, scope_value = module._resolve_effective_scope(conn, Args())
+    assert scope_type is None
+    assert scope_value is None
+
+
+def test_legacy_unscoped_overrides_scope_filter():
+    conn = connection(scope_filter="service.name = 'production'")
+    
+    class Args:
+        environment = None
+        all_environments = False
+        legacy_unscoped = True
+    
+    scope_type, scope_value = module._resolve_effective_scope(conn, Args())
+    assert scope_type is None
+    assert scope_value is None
+
+
+def test_build_scope_filter_for_environment_type():
+    filters = module._build_scope_filter("environment", "production")
+    assert len(filters) == 1
+    assert "deployment.environment = 'production'" in filters[0]
+    assert "deployment.environment.name = 'production'" in filters[0]
+    assert " OR " in filters[0]
+
+
+def test_build_scope_filter_for_filter_type():
+    custom_filter = "service.name = 'prod' AND region = 'us-west'"
+    filters = module._build_scope_filter("filter", custom_filter)
+    assert len(filters) == 1
+    assert filters[0] == custom_filter
+
+
+def test_build_scope_filter_for_none_type():
+    filters = module._build_scope_filter(None, None)
+    assert filters == []
+
+
+def test_log_search_uses_scope_filter():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(scope_filter="(service.name = 'production' OR env = 'prod')")
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "logs", [
+            "search", "--service", "api", "--start", "1", "--end", "2"])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert "(service.name = 'production' OR env = 'prod')" in expr
+    assert "service.name = 'api'" in expr
+
+
+def test_trace_search_uses_scope_filter():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(scope_filter="custom_field = 'value'")
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "traces", [
+            "search", "--operation", "POST /api", "--start", "1", "--end", "2"])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert "custom_field = 'value'" in expr
+    assert "name = 'POST /api'" in expr
+
+
+def test_scope_filter_ands_with_user_filter():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(scope_filter="env = 'prod'")
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "logs", [
+            "search", "--filter", "status = 'error'", "--start", "1", "--end", "2"])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert "status = 'error'" in expr
+    assert "env = 'prod'" in expr
+    assert " AND " in expr
+
+
+def test_correlated_call_with_scope_filter():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(
+        scope_filter="(deployment.environment = 'prod' OR service.name = 'production')"
+    )
+    with patch.object(module, "_request", side_effect=request):
+        result = module._cmd_correlated(conn, "call", [
+            "call-1", "--start", "1", "--end", "2"])
+
+    assert result.get("scope_filter") == "(deployment.environment = 'prod' OR service.name = 'production')"
+    assert "environment_scope" not in result
+    assert len(calls) == 2
+    for call in calls:
+        spec = call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+        expr = spec["filter"]["expression"]
+        assert "(deployment.environment = 'prod' OR service.name = 'production')" in expr
+
+
+def test_correlated_call_with_environment_not_scope_filter():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(environment="production")
+    with patch.object(module, "_request", side_effect=request):
+        result = module._cmd_correlated(conn, "call", [
+            "call-1", "--start", "1", "--end", "2"])
+
+    assert result.get("environment_scope") == "production"
+    assert "scope_filter" not in result
+
+
+def test_precedence_cli_environment_beats_both():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(
+        environment="production",
+        scope_filter="service.name = 'production'"
+    )
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "logs", [
+            "search", "--environment", "staging", "--start", "1", "--end", "2"])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert "deployment.environment = 'staging'" in expr
+    assert "service.name = 'production'" not in expr
+
+
+def test_scope_filter_with_legacy_unscoped_no_scope():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "success", "data": {}}
+
+    conn = connection(scope_filter="env = 'prod'")
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(conn, "logs", [
+            "search", "--legacy-unscoped", "--start", "1", "--end", "2"])
+
+    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert expr == ""

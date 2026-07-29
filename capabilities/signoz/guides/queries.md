@@ -70,6 +70,70 @@ or both. Use `--signal logs|traces|both` to control the round trips. Project
 connections can map logical dimensions to different workspace-specific fields
 and set a default environment scope; see `signoz guide connections`.
 
+## Migrating from legacy telemetry
+
+When migrating from legacy `service.name`-based environments to standard
+`deployment.environment` attributes, use `scope_filter` to bridge the transition:
+
+**Step 1: Add both environment and scope_filter**
+
+```json
+{
+  "connections": {
+    "production": {
+      "url": "https://signoz.example.com",
+      "api_key_env": "SIGNOZ_PROD_API_KEY",
+      "environment": "production",
+      "scope_filter": "(deployment.environment = 'production' OR deployment.environment.name = 'production' OR service.name = 'production')"
+    }
+  }
+}
+```
+
+**Step 2: Start sending new telemetry with deployment.environment**
+
+```bash
+signoz ingestion
+# Outputs OTEL_RESOURCE_ATTRIBUTES with both deployment.environment fields
+# Configure your application to include these in telemetry
+```
+
+**Step 3: Query both old and new data seamlessly**
+
+```bash
+# Uses scope_filter, matches both legacy service.name=production and new deployment.environment=production
+signoz logs search --service myapp
+
+# Query specific environment (overrides scope_filter and environment)
+signoz logs search --environment staging
+
+# Query legacy data only
+signoz logs search --legacy-unscoped --filter "service.name = 'production'"
+
+# Query all environments
+signoz logs search --all-environments
+```
+
+**Step 4: Remove scope_filter after retention window**
+
+After legacy data ages out (typically 30-90 days):
+
+```json
+{
+  "connections": {
+    "production": {
+      "url": "https://signoz.example.com",
+      "api_key_env": "SIGNOZ_PROD_API_KEY",
+      "environment": "production"
+    }
+  }
+}
+```
+
+Now queries use standard `deployment.environment` scope only. The `environment`
+property continues to work for connection declaration and `signoz ingestion`
+output even when `scope_filter` controlled read queries during transition.
+
 ## Raw Query Builder v5
 
 When the convenience commands cannot express an aggregation, formula, PromQL,

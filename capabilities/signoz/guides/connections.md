@@ -127,6 +127,75 @@ The `signoz ingestion` command renders both `deployment.environment` and
 `deployment.environment.name` in `OTEL_RESOURCE_ATTRIBUTES` when the connection
 has an environment, compatible with current and legacy SigNoz versions.
 
+### Custom scope filter
+
+The optional `scope_filter` property provides a custom Query Builder v5 filter
+expression for legacy or non-standard telemetry that cannot be cleanly
+represented by environment alone. It is narrowly defined for migration scenarios.
+
+```json
+{
+  "production": {
+    "url": "https://signoz.example.com",
+    "api_key_env": "SIGNOZ_PROD_API_KEY",
+    "environment": "production",
+    "scope_filter": "(deployment.environment = 'production' OR deployment.environment.name = 'production' OR service.name = 'production')"
+  }
+}
+```
+
+**Precedence (deterministic):**
+1. CLI `--all-environments` or `--legacy-unscoped` → disables connection base scope
+2. CLI `--environment <value>` → overrides both `scope_filter` and `environment`
+3. Connection `scope_filter` → **replaces** environment-derived scope (not AND)
+4. Connection `environment` → generates dual-field deployment.environment scope
+5. Command `--filter` → always ANDs with the effective base scope
+
+**When to use scope_filter:**
+- Bridging legacy telemetry: match both new `deployment.environment` and legacy
+  `service.name` attributes during migration
+- Temporary workaround for non-standard telemetry until it can be fixed upstream
+- Custom logical scoping that cannot be expressed by environment alone
+
+**When NOT to use scope_filter:**
+- If `environment` alone suffices (prefer the standard field)
+- Permanent filtering (fix upstream telemetry instead)
+- Complex multi-condition logic unrelated to deployment scope
+
+The `scope_filter` is validated for schema type (string), non-empty/whitespace,
+and reasonable size (max 10000 chars). It is not parsed or security-validated;
+use trusted filter expressions only.
+
+Like `environment`, `scope_filter` applies only to telemetry query commands
+(`logs search`, `traces search`, `call`, `agent`). Workspace catalog commands
+and raw API escape hatches are never scoped.
+
+**Migration example:**
+Set both `environment` and `scope_filter` during transition, then remove
+`scope_filter` after legacy data ages out:
+
+```json
+{
+  "production": {
+    "environment": "production",
+    "scope_filter": "(deployment.environment = 'production' OR service.name = 'production')"
+  }
+}
+```
+
+After retention window expires (typically 30-90 days), remove `scope_filter`:
+
+```json
+{
+  "production": {
+    "environment": "production"
+  }
+}
+```
+
+The `environment` property remains useful for connection declaration and
+`signoz ingestion` output even when `scope_filter` controls read queries.
+
 ### Project-specific dimensions
 
 The `agent`, `call`, and `room` dimensions power `--agent-id`, `--call-id`,

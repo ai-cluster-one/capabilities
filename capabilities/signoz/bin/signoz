@@ -58,7 +58,10 @@ CONNECTIONS
   --connection <id>, then the registry default, then the sole entry.
   
   Optional "environment" scopes data queries to deployment.environment or
-  deployment.environment.name. Queries inherit the connection's environment
+  deployment.environment.name. Optional "scope_filter" provides a custom
+  Query Builder v5 filter expression for legacy or non-standard telemetry.
+  When both exist, scope_filter replaces environment-derived scope; CLI
+  --environment overrides both. Queries apply the connection's base scope
   unless overridden with --environment, --all-environments, or --legacy-unscoped.
 
 COMMANDS
@@ -783,6 +786,17 @@ def _validate_environment(value: str) -> str:
     return value
 
 
+def _validate_scope_filter(value: str) -> str:
+    value = value.strip()
+    if not value:
+        _die(6, "bad_config", "scope_filter cannot be empty or whitespace-only")
+    if len(value) > 10_000:
+        _die(6, "bad_config",
+             f"scope_filter is too long ({len(value)} characters)",
+             "maximum length is 10000 characters")
+    return value
+
+
 def _dimension_fields(entry: dict) -> dict[str, dict[str, str]]:
     import re
 
@@ -863,6 +877,13 @@ def _resolve_connection(wanted: str | None) -> dict:
             _die(6, "bad_config", "environment must be a string")
         environment = _validate_environment(environment_raw)
 
+    scope_filter_raw = entry.get("scope_filter")
+    scope_filter = None
+    if scope_filter_raw is not None:
+        if not isinstance(scope_filter_raw, str):
+            _die(6, "bad_config", "scope_filter must be a string")
+        scope_filter = _validate_scope_filter(scope_filter_raw)
+
     return {
         "id": cid,
         "registry": str(reg_file) if reg_file else None,
@@ -878,6 +899,7 @@ def _resolve_connection(wanted: str | None) -> dict:
         "headers_resolution": (headers_tier, headers_source, headers_env),
         "deployment": _deployment(url, otlp, entry.get("deployment")),
         "environment": environment,
+        "scope_filter": scope_filter,
         "dimensions": _dimension_fields(entry),
         "verify_tls": bool(entry.get("verify_tls", True)),
         "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
@@ -910,6 +932,8 @@ def _connection_report(conn: dict) -> dict:
     }
     if conn.get("environment") is not None:
         report["environment"] = conn["environment"]
+    if conn.get("scope_filter") is not None:
+        report["scope_filter"] = conn["scope_filter"]
     return report
 
 
@@ -1175,7 +1199,20 @@ def _environment_filter(environment: str | None) -> list[str]:
     ]
 
 
-def _resolve_environment_scope(conn: dict, args) -> str | None:
+def _resolve_effective_scope(conn: dict, args) -> tuple[str | None, str | None]:
+    """Resolve the effective base scope filter with exact precedence.
+    
+    Returns (scope_type, scope_value) where:
+    - scope_type: "environment", "filter", or None
+    - scope_value: the environment name or filter expression, or None
+    
+    Precedence:
+    1. --all-environments or --legacy-unscoped → (None, None)
+    2. CLI --environment → ("environment", value)
+    3. connection scope_filter → ("filter", expression)
+    4. connection environment → ("environment", value)
+    5. no scope → (None, None)
+    """
     if getattr(args, "all_environments", False):
         if getattr(args, "environment", None):
             _die(6, "input",
@@ -1183,15 +1220,36 @@ def _resolve_environment_scope(conn: dict, args) -> str | None:
         if getattr(args, "legacy_unscoped", False):
             _die(6, "input",
                  "--all-environments and --legacy-unscoped are mutually exclusive")
-        return None
+        return None, None
     if getattr(args, "legacy_unscoped", False):
         if getattr(args, "environment", None):
             _die(6, "input",
                  "--legacy-unscoped and --environment are mutually exclusive")
-        return None
+        return None, None
     if getattr(args, "environment", None):
-        return args.environment
-    return conn.get("environment")
+        return "environment", args.environment
+    if conn.get("scope_filter"):
+        return "filter", conn["scope_filter"]
+    if conn.get("environment"):
+        return "environment", conn["environment"]
+    return None, None
+
+
+def _build_scope_filter(scope_type: str | None, scope_value: str | None) -> list[str]:
+    """Build the base scope filter from resolved scope type and value.
+    
+    Returns:
+    - For scope_type="environment": dual-field OR filter
+    - For scope_type="filter": raw filter expression as-is
+    - For scope_type=None: empty list (no scope)
+    """
+    if scope_type is None or scope_value is None:
+        return []
+    if scope_type == "environment":
+        return _environment_filter(scope_value)
+    if scope_type == "filter":
+        return [scope_value]
+    return []
 
 
 def _query_payload(signal: str, start: int, end: int, expression: str,
@@ -1420,9 +1478,8 @@ def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
     if args.offset < 0:
         _die(6, "input", "--offset cannot be negative")
     parts = [args.filter] if args.filter else []
-    environment_scope = _resolve_environment_scope(conn, args)
-    if environment_scope and not args.legacy_unscoped:
-        parts.extend(_environment_filter(environment_scope))
+    scope_type, scope_value = _resolve_effective_scope(conn, args)
+    parts.extend(_build_scope_filter(scope_type, scope_value))
     if args.service:
         parts.append(f"service.name = '{_qb_quote(args.service)}'")
     for dimension in ("agent", "call", "room"):
@@ -1462,14 +1519,13 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
     identifier = getattr(args, f"{dimension}_id")
     signals = ["logs", "traces"] if args.signal == "both" else [args.signal]
 
-    environment_scope = _resolve_environment_scope(conn, args)
+    scope_type, scope_value = _resolve_effective_scope(conn, args)
 
     filters = {}
     data = {}
     for signal in signals:
         parts = [args.filter] if args.filter else []
-        if environment_scope and not args.legacy_unscoped:
-            parts.extend(_environment_filter(environment_scope))
+        parts.extend(_build_scope_filter(scope_type, scope_value))
         if args.service:
             parts.append(f"service.name = '{_qb_quote(args.service)}'")
         parts.append(_dimension_filter(
@@ -1481,14 +1537,18 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
             json_body=_query_payload(
                 signal, start, end, expression, limit, 0))
 
-    return {
+    result = {
         "entity": dimension,
         "id": identifier,
         "window": {"start": start, "end": end},
-        "environment_scope": environment_scope,
         "filters": filters,
         "data": data,
     }
+    if scope_type == "environment":
+        result["environment_scope"] = scope_value
+    elif scope_type == "filter":
+        result["scope_filter"] = scope_value
+    return result
 
 
 def _cmd_trace(conn: dict, argv: list[str]):
