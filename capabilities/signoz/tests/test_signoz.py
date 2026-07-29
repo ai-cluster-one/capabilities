@@ -352,7 +352,16 @@ def test_connection_without_environment_omits_from_report(tmp_path, monkeypatch)
 
 
 def test_environment_filter_checks_both_field_variants():
-    filters = module._environment_filter("production")
+    def request(_conn, method, path, **kwargs):
+        return {"data": {"keys": [
+            {"name": "deployment.environment"},
+            {"name": "deployment.environment.name"},
+        ]}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        filters = module._environment_filter(conn, "logs", "production")
+    
     assert len(filters) == 1
     assert "deployment.environment = 'production'" in filters[0]
     assert "deployment.environment.name = 'production'" in filters[0]
@@ -360,7 +369,13 @@ def test_environment_filter_checks_both_field_variants():
 
 
 def test_environment_filter_escapes_special_chars():
-    filters = module._environment_filter("prod'test")
+    def request(_conn, method, path, **kwargs):
+        return {"data": {"keys": [{"name": "deployment.environment"}]}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        filters = module._environment_filter(conn, "logs", "prod'test")
+    
     assert "\\'test" in filters[0]
 
 
@@ -369,6 +384,11 @@ def test_log_search_with_connection_environment_adds_automatic_filter():
 
     def request(_conn, method, path, **kwargs):
         calls.append((method, path, kwargs))
+        if path == "/api/v1/fields/keys":
+            return {"data": {"keys": [
+                {"name": "deployment.environment"},
+                {"name": "deployment.environment.name"},
+            ]}}
         return {"status": "success", "data": {}}
 
     conn = connection(environment="production")
@@ -376,7 +396,8 @@ def test_log_search_with_connection_environment_adds_automatic_filter():
         module._cmd_signal_search(conn, "logs", [
             "search", "--service", "api", "--start", "1", "--end", "2"])
 
-    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    query_call = [c for c in calls if c[1] == "/api/v5/query_range"][0]
+    spec = query_call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
     expr = spec["filter"]["expression"]
     assert "deployment.environment = 'production'" in expr
     assert "deployment.environment.name = 'production'" in expr
@@ -388,6 +409,8 @@ def test_log_search_environment_override_replaces_connection_scope():
 
     def request(_conn, method, path, **kwargs):
         calls.append((method, path, kwargs))
+        if path == "/api/v1/fields/keys":
+            return {"data": {"keys": [{"name": "deployment.environment"}]}}
         return {"status": "success", "data": {}}
 
     conn = connection(environment="production")
@@ -395,7 +418,8 @@ def test_log_search_environment_override_replaces_connection_scope():
         module._cmd_signal_search(conn, "logs", [
             "search", "--environment", "staging", "--start", "1", "--end", "2"])
 
-    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    query_call = [c for c in calls if c[1] == "/api/v5/query_range"][0]
+    spec = query_call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
     expr = spec["filter"]["expression"]
     assert "staging" in expr
     assert "production" not in expr
@@ -459,6 +483,8 @@ def test_correlated_call_applies_environment_to_both_signals():
 
     def request(_conn, method, path, **kwargs):
         calls.append((method, path, kwargs))
+        if path == "/api/v1/fields/keys":
+            return {"data": {"keys": [{"name": "deployment.environment"}]}}
         return {"status": "success", "data": {}}
 
     conn = connection(environment="production")
@@ -467,8 +493,9 @@ def test_correlated_call_applies_environment_to_both_signals():
             "call-1", "--start", "1", "--end", "2"])
 
     assert result["environment_scope"] == "production"
-    assert len(calls) == 2
-    for call in calls:
+    query_calls = [c for c in calls if c[1] == "/api/v5/query_range"]
+    assert len(query_calls) == 2
+    for call in query_calls:
         spec = call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
         expr = spec["filter"]["expression"]
         assert "deployment.environment = 'production'" in expr
@@ -655,23 +682,126 @@ def test_legacy_unscoped_overrides_scope_filter():
     assert scope_value is None
 
 
-def test_build_scope_filter_for_environment_type():
-    filters = module._build_scope_filter("environment", "production")
+def test_discover_environment_fields_both_exist():
+    def request(_conn, method, path, **kwargs):
+        return {"data": {"keys": [
+            {"name": "deployment.environment"},
+            {"name": "deployment.environment.name"},
+            {"name": "other.field"},
+        ]}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        fields = module._discover_environment_fields(conn, "logs")
+    
+    assert set(fields) == {"deployment.environment", "deployment.environment.name"}
+    assert "_discovered_env_fields_logs" in conn
+
+
+def test_discover_environment_fields_only_old():
+    def request(_conn, method, path, **kwargs):
+        return {"data": {"keys": [
+            {"name": "deployment.environment"},
+        ]}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        fields = module._discover_environment_fields(conn, "logs")
+    
+    assert fields == ["deployment.environment"]
+
+
+def test_discover_environment_fields_only_new():
+    def request(_conn, method, path, **kwargs):
+        return {"data": {"keys": [
+            {"name": "deployment.environment.name"},
+        ]}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        fields = module._discover_environment_fields(conn, "logs")
+    
+    assert fields == ["deployment.environment.name"]
+
+
+def test_discover_environment_fields_none_exist():
+    def request(_conn, method, path, **kwargs):
+        return {"data": {"keys": [{"name": "other.field"}]}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        fields = module._discover_environment_fields(conn, "logs")
+    
+    assert fields == []
+
+
+def test_discover_environment_fields_cached():
+    call_count = [0]
+    
+    def request(_conn, method, path, **kwargs):
+        call_count[0] += 1
+        return {"data": {"keys": [{"name": "deployment.environment"}]}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        fields1 = module._discover_environment_fields(conn, "logs")
+        fields2 = module._discover_environment_fields(conn, "logs")
+    
+    assert fields1 == fields2 == ["deployment.environment"]
+    assert call_count[0] == 1
+
+
+def test_build_scope_filter_for_environment_both_fields():
+    def request(_conn, method, path, **kwargs):
+        return {"data": {"keys": [
+            {"name": "deployment.environment"},
+            {"name": "deployment.environment.name"},
+        ]}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        filters = module._build_scope_filter(conn, "logs", "environment", "production")
+    
     assert len(filters) == 1
     assert "deployment.environment = 'production'" in filters[0]
     assert "deployment.environment.name = 'production'" in filters[0]
     assert " OR " in filters[0]
 
 
+def test_build_scope_filter_for_environment_one_field():
+    def request(_conn, method, path, **kwargs):
+        return {"data": {"keys": [{"name": "deployment.environment"}]}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        filters = module._build_scope_filter(conn, "logs", "environment", "production")
+    
+    assert len(filters) == 1
+    assert filters[0] == "deployment.environment = 'production'"
+    assert " OR " not in filters[0]
+
+
+def test_build_scope_filter_for_environment_no_fields_fails():
+    def request(_conn, method, path, **kwargs):
+        return {"data": {"keys": []}}
+    
+    conn = connection()
+    with patch.object(module, "_request", side_effect=request):
+        with pytest.raises(SystemExit) as exc:
+            module._build_scope_filter(conn, "logs", "environment", "production")
+    
+    assert exc.value.code == 6
+
+
 def test_build_scope_filter_for_filter_type():
     custom_filter = "service.name = 'prod' AND region = 'us-west'"
-    filters = module._build_scope_filter("filter", custom_filter)
+    filters = module._build_scope_filter(connection(), "logs", "filter", custom_filter)
     assert len(filters) == 1
     assert filters[0] == custom_filter
 
 
 def test_build_scope_filter_for_none_type():
-    filters = module._build_scope_filter(None, None)
+    filters = module._build_scope_filter(connection(), "logs", None, None)
     assert filters == []
 
 
@@ -758,6 +888,8 @@ def test_correlated_call_with_environment_not_scope_filter():
 
     def request(_conn, method, path, **kwargs):
         calls.append((method, path, kwargs))
+        if path == "/api/v1/fields/keys":
+            return {"data": {"keys": [{"name": "deployment.environment"}]}}
         return {"status": "success", "data": {}}
 
     conn = connection(environment="production")
@@ -774,6 +906,8 @@ def test_precedence_cli_environment_beats_both():
 
     def request(_conn, method, path, **kwargs):
         calls.append((method, path, kwargs))
+        if path == "/api/v1/fields/keys":
+            return {"data": {"keys": [{"name": "deployment.environment"}]}}
         return {"status": "success", "data": {}}
 
     conn = connection(
@@ -784,7 +918,8 @@ def test_precedence_cli_environment_beats_both():
         module._cmd_signal_search(conn, "logs", [
             "search", "--environment", "staging", "--start", "1", "--end", "2"])
 
-    spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    query_call = [c for c in calls if c[1] == "/api/v5/query_range"][0]
+    spec = query_call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
     expr = spec["filter"]["expression"]
     assert "deployment.environment = 'staging'" in expr
     assert "service.name = 'production'" not in expr
@@ -805,3 +940,56 @@ def test_scope_filter_with_legacy_unscoped_no_scope():
     spec = calls[0][2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
     expr = spec["filter"]["expression"]
     assert expr == ""
+
+
+def test_correlated_call_per_signal_field_discovery():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if path == "/api/v1/fields/keys":
+            signal = kwargs["params"]["signal"]
+            if signal == "logs":
+                return {"data": {"keys": [{"name": "deployment.environment"}]}}
+            else:
+                return {"data": {"keys": [
+                    {"name": "deployment.environment"},
+                    {"name": "deployment.environment.name"},
+                ]}}
+        return {"status": "success", "data": {}}
+
+    conn = connection(environment="production")
+    with patch.object(module, "_request", side_effect=request):
+        result = module._cmd_correlated(conn, "call", [
+            "call-1", "--start", "1", "--end", "2"])
+
+    query_calls = [c for c in calls if c[1] == "/api/v5/query_range"]
+    assert len(query_calls) == 2
+    
+    log_call = query_calls[0]
+    log_spec = log_call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    log_expr = log_spec["filter"]["expression"]
+    assert "deployment.environment = 'production'" in log_expr
+    assert " OR " not in log_expr
+    
+    trace_call = query_calls[1]
+    trace_spec = trace_call[2]["json_body"]["compositeQuery"]["queries"][0]["spec"]
+    trace_expr = trace_spec["filter"]["expression"]
+    assert "deployment.environment = 'production'" in trace_expr
+    assert "deployment.environment.name = 'production'" in trace_expr
+    assert " OR " in trace_expr
+
+
+def test_environment_scope_fails_when_no_fields_exist():
+    def request(_conn, method, path, **kwargs):
+        if path == "/api/v1/fields/keys":
+            return {"data": {"keys": []}}
+        return {"status": "success", "data": {}}
+
+    conn = connection(environment="production")
+    with patch.object(module, "_request", side_effect=request):
+        with pytest.raises(SystemExit) as exc:
+            module._cmd_signal_search(conn, "logs", [
+                "search", "--start", "1", "--end", "2"])
+    
+    assert exc.value.code == 6

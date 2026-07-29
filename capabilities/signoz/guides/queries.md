@@ -73,9 +73,32 @@ and set a default environment scope; see `signoz guide connections`.
 ## Migrating from legacy telemetry
 
 When migrating from legacy `service.name`-based environments to standard
-`deployment.environment` attributes, use `scope_filter` to bridge the transition:
+`deployment.environment` attributes, use `scope_filter` to bridge the transition.
 
-**Step 1: Add both environment and scope_filter**
+### Stage A: Before environment fields exist (SigNoz 0.97.1 with no deployment.environment)
+
+Use pure legacy scope_filter:
+
+```json
+{
+  "connections": {
+    "production": {
+      "url": "https://signoz.example.com",
+      "api_key_env": "SIGNOZ_PROD_API_KEY",
+      "scope_filter": "service.name = 'production'"
+    }
+  }
+}
+```
+
+Queries work with legacy data. No `environment` property yet because the fields
+don't exist in SigNoz.
+
+### Stage B: Transition period (after deployment.environment fields exist)
+
+Once new telemetry includes `deployment.environment` attributes (verified via
+`signoz fields keys --signal logs --search deployment`), add `environment` and
+update `scope_filter` to match both:
 
 ```json
 {
@@ -90,7 +113,7 @@ When migrating from legacy `service.name`-based environments to standard
 }
 ```
 
-**Step 2: Start sending new telemetry with deployment.environment**
+**Start sending new telemetry:**
 
 ```bash
 signoz ingestion
@@ -98,13 +121,13 @@ signoz ingestion
 # Configure your application to include these in telemetry
 ```
 
-**Step 3: Query both old and new data seamlessly**
+**Query seamlessly matches both old and new records:**
 
 ```bash
-# Uses scope_filter, matches both legacy service.name=production and new deployment.environment=production
+# Uses scope_filter, matches legacy service.name=production AND new deployment.environment=production
 signoz logs search --service myapp
 
-# Query specific environment (overrides scope_filter and environment)
+# Query specific environment (overrides scope_filter)
 signoz logs search --environment staging
 
 # Query legacy data only
@@ -114,9 +137,9 @@ signoz logs search --legacy-unscoped --filter "service.name = 'production'"
 signoz logs search --all-environments
 ```
 
-**Step 4: Remove scope_filter after retention window**
+### Stage C: After legacy retention expires
 
-After legacy data ages out (typically 30-90 days):
+Remove `scope_filter` after legacy `service.name` data ages out (typically 30-90 days):
 
 ```json
 {
@@ -130,9 +153,9 @@ After legacy data ages out (typically 30-90 days):
 }
 ```
 
-Now queries use standard `deployment.environment` scope only. The `environment`
-property continues to work for connection declaration and `signoz ingestion`
-output even when `scope_filter` controlled read queries during transition.
+Now queries use standard discovered `deployment.environment` fields only. The
+CLI discovers which environment fields exist per signal and builds the
+appropriate filter automatically.
 
 ## Raw Query Builder v5
 

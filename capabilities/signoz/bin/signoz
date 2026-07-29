@@ -1189,14 +1189,66 @@ def _dimension_filter(conn: dict, signal: str, dimension: str,
     return f"{field} = '{_qb_quote(value)}'"
 
 
-def _environment_filter(environment: str | None) -> list[str]:
-    if environment is None:
+def _discover_environment_fields(conn: dict, signal: str) -> list[str]:
+    """Discover which deployment.environment fields exist for this signal.
+    
+    Returns list of existing field names from _ENVIRONMENT_FIELDS.
+    Caches result in conn dict to avoid repeated discovery within one process.
+    """
+    cache_key = f"_discovered_env_fields_{signal}"
+    if cache_key in conn:
+        return conn[cache_key]
+    
+    try:
+        result = _request(conn, "GET", "/api/v1/fields/keys", params={
+            "signal": signal,
+            "searchText": "deployment.environment",
+        })
+        data = result.get("data") if isinstance(result, dict) else None
+        keys = data.get("keys") if isinstance(data, dict) else None
+        if not isinstance(keys, list):
+            conn[cache_key] = []
+            return []
+        
+        found_fields = []
+        for key_entry in keys:
+            if isinstance(key_entry, dict):
+                name = key_entry.get("name")
+                if name in _ENVIRONMENT_FIELDS:
+                    found_fields.append(name)
+        
+        conn[cache_key] = found_fields
+        return found_fields
+    except SystemExit:
+        conn[cache_key] = []
         return []
+
+
+def _environment_filter(conn: dict, signal: str, environment: str) -> list[str]:
+    """Build environment filter using only fields that exist for this signal.
+    
+    Discovers which of deployment.environment and deployment.environment.name
+    exist, then generates a filter using only existing fields.
+    
+    Fails closed with clear error if neither field exists.
+    """
+    existing_fields = _discover_environment_fields(conn, signal)
+    
+    if not existing_fields:
+        _die(6, "no_environment_field",
+             f"signal {signal!r} has no deployment.environment fields",
+             "This SigNoz installation does not yet have deployment.environment "
+             "or deployment.environment.name for this signal. Use connection "
+             "scope_filter for legacy telemetry, or --all-environments / "
+             "--legacy-unscoped to query without environment scope.")
+    
     quoted = _qb_quote(environment)
-    return [
-        f"({_ENVIRONMENT_FIELDS[0]} = '{quoted}' OR "
-        f"{_ENVIRONMENT_FIELDS[1]} = '{quoted}')"
-    ]
+    if len(existing_fields) == 1:
+        return [f"{existing_fields[0]} = '{quoted}'"]
+    
+    parts = [f"{field} = '{quoted}'" for field in existing_fields]
+    return ["(" + " OR ".join(parts) + ")"]
+
 
 
 def _resolve_effective_scope(conn: dict, args) -> tuple[str | None, str | None]:
@@ -1235,18 +1287,21 @@ def _resolve_effective_scope(conn: dict, args) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _build_scope_filter(scope_type: str | None, scope_value: str | None) -> list[str]:
+def _build_scope_filter(conn: dict, signal: str, scope_type: str | None,
+                       scope_value: str | None) -> list[str]:
     """Build the base scope filter from resolved scope type and value.
     
+    For environment type, discovers which fields exist for this signal.
+    
     Returns:
-    - For scope_type="environment": dual-field OR filter
+    - For scope_type="environment": field-discovered filter (one field or OR)
     - For scope_type="filter": raw filter expression as-is
     - For scope_type=None: empty list (no scope)
     """
     if scope_type is None or scope_value is None:
         return []
     if scope_type == "environment":
-        return _environment_filter(scope_value)
+        return _environment_filter(conn, signal, scope_value)
     if scope_type == "filter":
         return [scope_value]
     return []
@@ -1479,7 +1534,7 @@ def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
         _die(6, "input", "--offset cannot be negative")
     parts = [args.filter] if args.filter else []
     scope_type, scope_value = _resolve_effective_scope(conn, args)
-    parts.extend(_build_scope_filter(scope_type, scope_value))
+    parts.extend(_build_scope_filter(conn, signal, scope_type, scope_value))
     if args.service:
         parts.append(f"service.name = '{_qb_quote(args.service)}'")
     for dimension in ("agent", "call", "room"):
@@ -1525,7 +1580,7 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
     data = {}
     for signal in signals:
         parts = [args.filter] if args.filter else []
-        parts.extend(_build_scope_filter(scope_type, scope_value))
+        parts.extend(_build_scope_filter(conn, signal, scope_type, scope_value))
         if args.service:
             parts.append(f"service.name = '{_qb_quote(args.service)}'")
         parts.append(_dimension_filter(
