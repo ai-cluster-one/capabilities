@@ -195,9 +195,14 @@ and groups. Groups may additionally enable ambient voice transcription:
 ```
 
 - `auto`: All Telegram voice notes from participants are transcribed and echoed to
-  the chat with sender attribution (`<sender name> сказал: <transcript>`). Unaddressed
-  voices are echoed but do not create assistant worker jobs or produce AI replies.
-  Addressed voices (mention, reply, or alias) still dispatch to the worker as normal.
+  the chat with sender attribution (`<sender name> сказал: <transcript>`). After
+  transcription, the transcript is checked against the same configured assistant
+  name/username/group-alias matching semantics used for text messages. If the spoken
+  transcript names the assistant (e.g., "Marvin" or "Assistant"), the voice note is
+  treated as an addressed assistant request and dispatches a worker. If the transcript
+  does not name the assistant, it is echoed without creating a worker job. Voices
+  already addressed via Telegram-level mention/reply dispatch as normal regardless of
+  transcript content.
 - `disabled`: Only voice notes addressed to the assistant are transcribed. This is
   the default.
 

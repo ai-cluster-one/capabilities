@@ -875,6 +875,359 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             help_text = daemon._set_help(reg, "123", "voice-transcription")
             self.assertIn("only available in groups", help_text)
 
+    async def test_ambient_voice_transcript_without_alias_echo_only(self):
+        """Ambient voice with transcript that doesn't name assistant => echo only, no worker."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "auto"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(501, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Speaker", last_name="One", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+            transcriptions = []
+            daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append((audio, mime)) or "just some regular speech without addressing anyone"
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 501)
+
+            self.assertEqual(len(transcriptions), 1)
+            self.assertEqual(message.downloads, 1)
+            self.assertEqual(client.send_attempts, 1, "Should send exactly one echo")
+            sent_text = client.sent[0]["text"]
+            self.assertIn("Speaker One сказал:", sent_text)
+            self.assertIn("just some regular speech", sent_text)
+            reg = daemon.load_register()
+            self.assertEqual(reg["-200"]["jobs"], {}, "Should not create worker job")
+            await self.stop_session(client, task)
+
+    async def test_ambient_voice_transcript_with_english_alias_dispatches_worker(self):
+        """Ambient voice with transcript naming 'Assistant' => echo + worker dispatch."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "auto"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(502, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Speaker", last_name="Two", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+            transcriptions = []
+            daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append((audio, mime)) or "Hey Assistant, what's the weather like?"
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 502)
+
+            self.assertEqual(len(transcriptions), 1)
+            self.assertEqual(message.downloads, 1)
+            self.assertEqual(client.send_attempts, 2, "Should send echo + worker response")
+            echo = client.sent[0]["text"]
+            self.assertIn("Speaker Two сказал:", echo)
+            self.assertIn("Hey Assistant", echo)
+            reg = daemon.load_register()
+            self.assertEqual(len(reg["-200"]["jobs"]), 0, "Worker job should complete")
+            await self.stop_session(client, task)
+
+    async def test_ambient_voice_transcript_with_russian_alias_dispatches_worker(self):
+        """Ambient voice with transcript naming 'Марвин' => echo + worker dispatch."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "voice_transcription": {"mode": "auto"},
+                    "aliases": ["Марвин"]
+                }
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(503, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Speaker", last_name="Three", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+            transcriptions = []
+            daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append((audio, mime)) or "Марвин, покажи мне погоду"
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 503)
+
+            self.assertEqual(len(transcriptions), 1)
+            self.assertEqual(message.downloads, 1)
+            self.assertEqual(client.send_attempts, 2, "Should send echo + worker response")
+            echo = client.sent[0]["text"]
+            self.assertIn("Speaker Three сказал:", echo)
+            self.assertIn("Марвин, покажи мне погоду", echo)
+            reg = daemon.load_register()
+            self.assertEqual(len(reg["-200"]["jobs"]), 0, "Worker job should complete")
+            await self.stop_session(client, task)
+
+    async def test_ambient_voice_custom_group_alias_honored(self):
+        """Custom per-group alias is checked in transcript."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "voice_transcription": {"mode": "auto"},
+                    "aliases": ["CustomBot"]
+                }
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(504, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Speaker", last_name="Four", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+            transcriptions = []
+            daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append((audio, mime)) or "CustomBot, help me with this task"
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 504)
+
+            self.assertEqual(len(transcriptions), 1)
+            self.assertEqual(client.send_attempts, 2, "Should send echo + worker response")
+            reg = daemon.load_register()
+            self.assertEqual(len(reg["-200"]["jobs"]), 0, "Worker job should complete")
+            await self.stop_session(client, task)
+
+    async def test_ambient_voice_concurrent_duplicates_with_alias_dispatch_once(self):
+        """Concurrent delivery of ambient voice with spoken alias => one download/echo/worker."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "auto"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(505, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Speaker", last_name="Five", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+            transcriptions = []
+            daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append((audio, mime)) or "Assistant, run the tests"
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+
+            await asyncio.gather(client.handler(event), client.handler(event))
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 505)
+
+            self.assertEqual(len(transcriptions), 1, "Should transcribe exactly once")
+            self.assertEqual(message.downloads, 1, "Should download exactly once")
+            self.assertEqual(client.send_attempts, 2, "Should send echo + worker response exactly once")
+            reg = daemon.load_register()
+            self.assertEqual(len(reg["-200"]["jobs"]), 0, "Worker job should complete")
+            await self.stop_session(client, task)
+
+    async def test_ambient_voice_catchup_with_alias_dispatches_once(self):
+        """Catch-up with ambient voice containing spoken alias dispatches worker exactly once."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "auto"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(506, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Speaker", last_name="Six", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+            transcriptions = []
+            daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append(message.id) or "Assistant, tell me a joke"
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await asyncio.sleep(0.05)
+
+            self.assertEqual(len(transcriptions), 1)
+            self.assertEqual(transcriptions, [506])
+            self.assertEqual(message.downloads, 1)
+            self.assertEqual(client.send_attempts, 2, "Should send echo + worker response")
+            reg = daemon.load_register()
+            self.assertEqual(len(reg["-200"]["jobs"]), 0, "Worker job should complete")
+            await self.stop_session(client, task)
+
+    async def test_ambient_voice_failed_transcription_never_dispatches(self):
+        """Failed transcription produces fallback marker and does not dispatch worker."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "auto"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(507, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Speaker", last_name="Seven", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+
+            def failing_transcribe(audio, mime):
+                raise RuntimeError("Deepgram failure")
+            daemon.deepgram_transcribe = failing_transcribe
+
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 507)
+
+            self.assertEqual(client.send_attempts, 1, "Should send only echo with fallback")
+            sent_text = client.sent[0]["text"]
+            self.assertIn("[голосовое — не удалось расшифровать]", sent_text)
+            reg = daemon.load_register()
+            self.assertEqual(reg["-200"]["jobs"], {}, "Failed transcription should not dispatch worker")
+            await self.stop_session(client, task)
+
+    async def test_ambient_voice_disabled_group_no_transcription(self):
+        """Group with disabled transcription does not transcribe or check for spoken alias."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "disabled"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(508, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Speaker", last_name="Eight", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+            transcriptions = []
+            daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append((audio, mime)) or "Assistant, this should be ignored"
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await asyncio.sleep(0.05)  # Let handler complete
+
+            self.assertEqual(len(transcriptions), 0, "Should not transcribe when disabled")
+            self.assertEqual(message.downloads, 0, "Should not download when disabled")
+            self.assertEqual(client.send_attempts, 0, "Should not send anything")
+            reg = daemon.load_register()
+            self.assertEqual(reg["-200"].get("last_processed_message_id", 0), 0, "Should not process")
+            await self.stop_session(client, task)
+
+    async def test_direct_voice_and_addressed_voice_unchanged(self):
+        """Direct message voice and already-addressed group voice keep existing behavior."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {"-200": {}}
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            # Direct message voice
+            dm_message = Message(509, voice=True)
+            dm_client = FakeClient([dm_message])
+            daemon.deepgram_transcribe = lambda audio, mime: "direct voice message"
+            dm_task = asyncio.create_task(daemon.run_session(dm_client))
+            await dm_client.started.wait()
+
+            await dm_client.handler(Event(dm_message))
+            await wait_until(lambda: daemon.load_register()["123"]["last_processed_message_id"] == 509)
+
+            self.assertEqual(dm_client.send_attempts, 2, "Direct voice: echo + worker")
+            echo = dm_client.sent[0]["text"]
+            self.assertIn("Твоё сообщение:", echo)
+            self.assertIn("direct voice message", echo)
+            await self.stop_session(dm_client, dm_task)
+
+            # Addressed group voice (mentioned=True)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            addressed_message = Message(510, voice=True)
+            addressed_message.sender_id = 888
+            addressed_message.mentioned = True
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Addressed", last_name="Speaker", username=None)
+            addressed_message.get_sender = fake_get_sender
+
+            group_client = FakeClient([addressed_message])
+            daemon.deepgram_transcribe = lambda audio, mime: "addressed group voice"
+            group_task = asyncio.create_task(daemon.run_session(group_client))
+            await group_client.started.wait()
+
+            event = Event(addressed_message, chat_id=-200)
+            event.is_private = False
+            await group_client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 510)
+
+            self.assertEqual(group_client.send_attempts, 2, "Addressed group voice: echo + worker")
+            echo = group_client.sent[0]["text"]
+            self.assertIn("Addressed Speaker сказал:", echo)
+            self.assertIn("addressed group voice", echo)
+            await self.stop_session(group_client, group_task)
+
 
 class TestCodexImageDiscovery(unittest.IsolatedAsyncioTestCase):
     """Test Codex image artifact discovery and path validation."""

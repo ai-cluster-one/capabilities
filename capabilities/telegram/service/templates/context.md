@@ -40,8 +40,11 @@ have recorded, remembered, or saved a fact for later.
   when you actually need the file.
 - Voice notes addressed to you are transcribed and echoed as ordinary conversation
   text. In groups with `voice_transcription` mode set to `auto`, unaddressed voice
-  notes from other participants are also transcribed and visible in the chat (but
-  do not create assistant requests).
+  notes from other participants are also transcribed and visible in the chat. If the
+  transcript of such an ambient voice names the assistant using a configured alias
+  (e.g., "Marvin", "Assistant"), it becomes an addressed assistant request exactly
+  as if that text had been typed. Otherwise, it is echoed without creating an
+  assistant request.
 
 ## Progress Messages
 

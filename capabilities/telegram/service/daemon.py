@@ -2349,7 +2349,15 @@ async def run_session(client):
                     if job is None:
                         continue
                     profile = await _sender_profile(m, group_policy, direct=is_direct)
-                    await echo_voice_message(m, ent, key, is_direct, sender_name=profile["name"])
+                    spoken = await echo_voice_message(m, ent, key, is_direct, sender_name=profile["name"])
+                    # If transcript names the assistant, finalize and dispatch
+                    if spoken and spoken != "[голосовое — не удалось расшифровать]" and _text_names_me(spoken, me, group_policy):
+                        if await finalize_job(
+                                key, m, group_policy, is_direct, f"catch-up/{reason}/ambient-addressed", job,
+                                text_override=spoken):
+                            enqueued += 1
+                        continue
+                    # Otherwise echo-only, no worker
                     mark_job_finished(key, job, "done")
                     continue
                 job = reserve_job(key, m, group_policy, is_direct, f"catch-up/{reason}")
@@ -2418,13 +2426,27 @@ async def run_session(client):
                     chat_ref, reply, access["kind"] == "private",
                     reply_to=None if access["kind"] == "private" else event.message.id)
             return
-        if access.get("ambient_voice"):                   # unaddressed voice in auto mode — echo only, no worker
+        if access.get("ambient_voice"):                   # unaddressed voice in auto mode — check transcript
             job = reserve_job(key, event.message, group_policy, is_direct, "live/ambient")
             if job is None:
                 log(f"{key}: already queued/done msg={event.message.id}")
                 return
             profile = await _sender_profile(event.message, group_policy, direct=is_direct)
-            await echo_voice_message(event.message, chat_ref, key, is_direct, sender_name=profile["name"])
+            spoken = await echo_voice_message(event.message, chat_ref, key, is_direct, sender_name=profile["name"])
+            # If transcript names the assistant, dispatch as an addressed request
+            if spoken and spoken != "[голосовое — не удалось расшифровать]" and _text_names_me(spoken, me, group_policy):
+                enqueued = await finalize_job(
+                    key, event.message, group_policy, is_direct, "live/ambient-addressed", job, text_override=spoken)
+                if not enqueued:
+                    log(f"{key}: already queued/done msg={event.message.id}")
+                    return
+                if key in busy:
+                    log(f"{key}: ambient voice msg={event.message.id} transcript addressed; worker busy")
+                else:
+                    log(f"{key}: ambient voice msg={event.message.id} transcript addressed; arming worker")
+                    arm(key, chat_ref)
+                return
+            # Otherwise echo-only, no worker
             mark_job_finished(key, job, "done")
             log(f"{key}: ambient voice msg={event.message.id} transcribed; no worker dispatch")
             return
