@@ -832,6 +832,36 @@ def _job_map(reg, key):
     return _channel_row(reg, key).setdefault("jobs", {})
 
 
+def _voice_echo_senders(reg, key):
+    """Mapping of echo message ID → sender name for voice transcription echoes.
+    Used to attribute outgoing echo messages to the original speaker in conversation history."""
+    return _channel_row(reg, key).setdefault("voice_echo_senders", {})
+
+
+def _record_voice_echo_sender(reg, key, echo_ids, sender_name):
+    """Record that the given echo message ID(s) should be attributed to sender_name."""
+    if not echo_ids or not sender_name:
+        return
+    mapping = _voice_echo_senders(reg, key)
+    for echo_id in echo_ids:
+        mapping[str(echo_id)] = sender_name
+    _prune_voice_echo_senders(reg, key)
+
+
+def _prune_voice_echo_senders(reg, key):
+    """Keep only the most recent entries. Limit = 2 × tail_size to ensure all messages
+    in a worker's conversation history can be attributed, even if the tail is full of echoes."""
+    s = channel_settings(reg, key)
+    limit = 2 * s.get("tail_size", 50)
+    mapping = _voice_echo_senders(reg, key)
+    if len(mapping) > limit:
+        # Remove oldest entries (lowest message IDs)
+        sorted_ids = sorted(mapping.keys(), key=lambda x: int(x) if x.isdigit() else 0)
+        to_remove = sorted_ids[:len(mapping) - limit]
+        for msg_id in to_remove:
+            mapping.pop(msg_id, None)
+
+
 def _job_id(message_id):
     return str(message_id)
 
@@ -1766,13 +1796,14 @@ async def run_session(client):
         return chunks
 
     async def send_channel_message(ent_id, text, is_direct, reply_to=None, **kwargs):
-        sent = None
+        sent_ids = []
         for chunk in message_chunks(text):
             if is_direct or reply_to is None:
                 sent = await client.send_message(ent_id, chunk, **kwargs)
             else:
                 sent = await client.send_message(ent_id, chunk, reply_to=reply_to, **kwargs)
-        return sent
+            sent_ids.append(sent.id)
+        return sent_ids[-1] if sent_ids else None, sent_ids
 
     async def handle_call_recording_request(key, message, group_policy, chat_ref):
         text = _message_text(message)
@@ -1796,7 +1827,7 @@ async def run_session(client):
         row["last_processed_message_id"] = max(
             message.id, row.get("last_processed_message_id", 0))
         save_register(reg)
-        await send_channel_message(chat_ref, reply, False, reply_to=message.id)
+        _, _ = await send_channel_message(chat_ref, reply, False, reply_to=message.id)
         return True
 
     async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset):
@@ -1818,7 +1849,7 @@ async def run_session(client):
             text = str(item.get("text") or "").strip()
             if not text or text in ("-", ".", "..."):
                 continue
-            await send_channel_message(ent_id, text, is_direct, reply_to=None if is_direct else reply_to)
+            _, _ = await send_channel_message(ent_id, text, is_direct, reply_to=None if is_direct else reply_to)
             log(f"{key}: progress job msg={reply_to or 'direct'} «{text[:80]}»")
         return offset
 
@@ -1920,6 +1951,7 @@ async def run_session(client):
     async def build_tail_and_participants(key, ent_id, s, group_policy, is_direct, job):
         raw = await client.get_messages(ent_id, limit=s["tail_size"])
         tail = []
+        echo_senders = _voice_echo_senders(reg, key)
         for m in reversed(raw or []):
             if not _tail_in_scope(m, group_policy):
                 continue
@@ -1927,17 +1959,8 @@ async def run_session(client):
             if t is None:
                 continue
             if m.out:
-                # For outgoing messages, check if it's a voice echo (reply with blockquote).
-                # Voice echoes in groups are attributed to the original sender, not the assistant.
-                sender = ASSISTANT_NAME
-                if not is_direct and getattr(m, "is_reply", False) and t and "<blockquote>" in t:
-                    try:
-                        replied = await m.get_reply_message()
-                        if replied and _is_spoken_media(replied):
-                            profile = await _sender_profile(replied, group_policy, direct=is_direct)
-                            sender = profile["name"]
-                    except Exception:
-                        pass
+                # Check if this outgoing message is a recorded voice echo
+                sender = echo_senders.get(str(m.id), ASSISTANT_NAME)
             else:
                 sender = (await _sender_profile(m, group_policy, direct=is_direct))["name"]
             tail.append({"id": m.id, "sender": sender, "text": t})
@@ -2070,14 +2093,14 @@ async def run_session(client):
                     else:
                         sent = await client.send_file(
                             ent_id, images, reply_to=reply_msg_id)
-                        await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
+                        _, _ = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
                     image_count = len(images) if isinstance(images, list) else 1
                     log(f"{key}: sent {image_count} image(s) with reply job msg={job.get('message_id')}")
                 except Exception as send_err:
                     log(f"{key}: image send failed, delivering text only: {send_err}")
-                    sent = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
+                    sent, _ = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
             else:
-                sent = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
+                sent, _ = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
             
             tok = meta.get("tokens", {})
             cost = f" ${meta['cost_usd']:.4f}" if meta.get("cost_usd") else ""
@@ -2139,7 +2162,7 @@ async def run_session(client):
         notice = (f"Worker error:\n{error}" if is_supervisor
                   else "Something went wrong while processing this. Please tell an administrator.")
         try:
-            await send_channel_message(
+            _, _ = await send_channel_message(
                 ent_id, notice, is_direct, reply_to=None if is_direct else job.get("message_id"))
         except Exception as se:
             log(f"{key}: failed to send error notice: {se}")
@@ -2274,12 +2297,16 @@ async def run_session(client):
                 text = f"Твоё сообщение:\n<blockquote>{html.escape(spoken)}</blockquote>"
             else:
                 text = f"<blockquote>{html.escape(spoken)}</blockquote>"
-            await send_channel_message(
+            _, echo_ids = await send_channel_message(
                 chat_id,
                 text,
                 is_direct,
                 parse_mode="html",
                 reply_to=None if is_direct else message.id)
+            # Record echo attribution so conversation history shows the sender, not the assistant
+            if not is_direct and sender_name and echo_ids:
+                _record_voice_echo_sender(reg, key, echo_ids, sender_name)
+                save_register(reg)
             log(f"{key}: voice echo «{spoken[:50]}»")
         except Exception as e:
             # The job reservation remains the idempotency record. Retrying the echo on a
@@ -2433,7 +2460,7 @@ async def run_session(client):
             row["last_processed_message_id"] = max(event.message.id, row.get("last_processed_message_id", 0))
             save_register(reg)
             if reply:
-                await send_channel_message(
+                _, _ = await send_channel_message(
                     chat_ref, reply, access["kind"] == "private",
                     reply_to=None if access["kind"] == "private" else event.message.id)
             return

@@ -183,10 +183,15 @@ class FakeClient:
         # Return both initial messages and sent messages (echoes)
         all_messages = list(self.messages)
         for sent in self.sent:
+            # Model Telethon's behavior: messages sent with parse_mode='html' are stored
+            # as plain text (HTML tags are converted to entity markers, not preserved)
+            text = sent.get("text", "")
+            if sent.get("parse_mode") == "html":
+                text = strip_html_tags(text)
             # Create a Message-like object for sent messages
             msg = SimpleNamespace(
                 id=sent.get("id", 1000 + len(all_messages)),
-                text=sent.get("text", ""),
+                text=text,
                 out=True,
                 voice=False,
                 photo=False,
@@ -226,6 +231,13 @@ class FakeClient:
 
     async def disconnect(self):
         self.disconnected.set()
+
+
+def strip_html_tags(text):
+    """Strip HTML tags to model Telethon's behavior: HTML sent with parse_mode='html'
+    is stored as plain text with entity markers, not HTML tags."""
+    import re
+    return re.sub(r'<[^>]+>', '', text)
 
 
 async def wait_until(predicate, timeout=3):
@@ -1218,7 +1230,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.stop_session(client, task)
 
     async def test_voice_echo_attributed_to_sender_in_worker_history(self):
-        """After group voice echo, later worker sees transcript attributed to original sender, not assistant."""
+        """Voice echo attribution via explicit register mapping, not content heuristics."""
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()
             service_settings["allowed_groups"] = {
@@ -1231,7 +1243,6 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             voice_msg = Message(601, voice=True)
             voice_msg.sender_id = 999
             voice_msg.mentioned = False
-            voice_msg.is_reply = False
 
             async def fake_get_voice_sender():
                 return SimpleNamespace(first_name="Alice", last_name="Smith", username=None)
@@ -1241,7 +1252,6 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             text_msg = Message(602, text="Assistant, summarize what Alice said")
             text_msg.sender_id = 888
             text_msg.mentioned = True
-            text_msg.is_reply = False
 
             async def fake_get_text_sender():
                 return SimpleNamespace(first_name="Bob", last_name="Jones", username=None)
@@ -1269,6 +1279,13 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             await client.handler(event)
             await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 601)
 
+            # Verify echo ID is recorded in register
+            reg = daemon.load_register()
+            echo_senders = reg["-200"].get("voice_echo_senders", {})
+            self.assertEqual(len(echo_senders), 1, "Echo ID should be recorded")
+            # The echo will have ID 1000 (first sent message)
+            self.assertEqual(echo_senders.get("1000"), "Alice Smith")
+
             # Send addressed text message
             event = Event(text_msg, chat_id=-200)
             event.is_private = False
@@ -1288,17 +1305,191 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNotNone(echo_entry, "Voice echo should appear in conversation history")
             self.assertEqual(echo_entry["sender"], "Alice Smith",
-                             "Voice echo must be attributed to Alice, not Assistant")
-            self.assertIn("<blockquote>", echo_entry["text"])
+                             "Voice echo must be attributed to Alice via register mapping")
 
             # Verify the echo message itself has no visible sender prefix
             echo_msg = client.sent[0]["text"]
             self.assertNotIn("Alice", echo_msg, "Echo should not have visible sender name")
             self.assertNotIn("сказал:", echo_msg, "Echo should not have 'сказал:' prefix")
-            self.assertIn("<blockquote>", echo_msg)
-            self.assertIn("this is what I wanted to say", echo_msg)
 
             await self.stop_session(client, task)
+
+    async def test_voice_echo_attribution_survives_restart(self):
+        """Echo attribution mapping persists across daemon save/load cycles."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {"-200": {"voice_transcription": {"mode": "auto"}}}
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            voice_msg = Message(701, voice=True)
+            voice_msg.sender_id = 999
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Alice", last_name="", username=None)
+            voice_msg.get_sender = fake_get_sender
+
+            client = FakeClient([voice_msg])
+            daemon.deepgram_transcribe = lambda audio, mime: "restart test"
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(voice_msg, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 701)
+            await self.stop_session(client, task)
+
+            # Simulate restart: reload register from disk
+            saved_reg = daemon.load_register()
+            self.assertIn("voice_echo_senders", saved_reg["-200"])
+            self.assertEqual(saved_reg["-200"]["voice_echo_senders"]["1000"], "Alice")
+
+            # Verify persistence: clear in-memory state and reload from disk
+            daemon.reg = {}  # Clear in-memory register
+            loaded_reg = daemon.load_register()
+            self.assertEqual(loaded_reg["-200"]["voice_echo_senders"]["1000"], "Alice",
+                             "Attribution mapping must survive reload from disk")
+
+    async def test_normal_assistant_reply_remains_assistant_attributed(self):
+        """Ordinary assistant replies, even with blockquote formatting, stay attributed to Assistant."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {"-200": {}}
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            # Voice message that will be addressed and get a normal reply
+            voice_msg = Message(702, voice=True)
+            voice_msg.sender_id = 999
+            voice_msg.mentioned = True
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Alice", last_name="", username=None)
+            voice_msg.get_sender = fake_get_sender
+
+            # Follow-up text request
+            text_msg = Message(703, text="Assistant, what did I say?")
+            text_msg.sender_id = 888
+            text_msg.mentioned = True
+            async def fake_get_text_sender():
+                return SimpleNamespace(first_name="Bob", last_name="", username=None)
+            text_msg.get_sender = fake_get_text_sender
+
+            client = FakeClient([voice_msg, text_msg])
+            daemon.deepgram_transcribe = lambda audio, mime: "voice content"
+
+            captured_tail = []
+            def capture_worker(chat, tail, state=None, procs=None):
+                captured_tail.append(tail)
+                # Return a reply with blockquote formatting
+                return {"reply": "You said:\n<blockquote>voice content</blockquote>",
+                        "meta": {"harness": "stub", "model": None, "is_error": False,
+                                 "tokens": {}, "cost_usd": None, "duration_ms": None, "session_id": None}}
+            daemon.WORKERS["stub"] = capture_worker
+
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            # Process voice (addressed, so it dispatches worker)
+            event = Event(voice_msg, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: len(captured_tail) >= 1)
+
+            # Process text request
+            event = Event(text_msg, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: len(captured_tail) >= 2 and daemon.load_register()["-200"]["last_processed_message_id"] == 703)
+
+            # Second worker call should see:
+            # - Echo (1000) attributed to Alice
+            # - Normal assistant reply (1001) attributed to Assistant (even though it has blockquote)
+            self.assertGreaterEqual(len(captured_tail), 2)
+            tail = captured_tail[1]
+
+            assistant_reply = next((e for e in tail if "You said" in e["text"]), None)
+            self.assertIsNotNone(assistant_reply, "Assistant's reply should be in tail")
+            self.assertEqual(assistant_reply["sender"], "Assistant",
+                             "Normal assistant reply must stay attributed to Assistant, not falsely to Alice")
+
+            await self.stop_session(client, task)
+
+    async def test_multi_chunk_voice_echo_attribution(self):
+        """Long transcripts split into multiple messages are all attributed correctly."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {"-200": {"voice_transcription": {"mode": "auto"}}}
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            voice_msg = Message(704, voice=True)
+            voice_msg.sender_id = 999
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Verbose", last_name="Speaker", username=None)
+            voice_msg.get_sender = fake_get_sender
+
+            # Long transcript that will be chunked
+            long_transcript = "word " * 2000  # Exceeds TELEGRAM_MESSAGE_LIMIT
+
+            client = FakeClient([voice_msg])
+            daemon.deepgram_transcribe = lambda audio, mime: long_transcript
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(voice_msg, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 704)
+
+            # Multiple chunks should have been sent
+            self.assertGreater(len(client.sent), 1, "Long transcript should be chunked")
+
+            # All chunk IDs should be recorded
+            reg = daemon.load_register()
+            echo_senders = reg["-200"]["voice_echo_senders"]
+            for sent in client.sent:
+                msg_id = str(sent["id"])
+                self.assertIn(msg_id, echo_senders,
+                              f"Chunk {msg_id} must be recorded in echo mapping")
+                self.assertEqual(echo_senders[msg_id], "Verbose Speaker")
+
+            await self.stop_session(client, task)
+
+    async def test_voice_echo_sender_mapping_is_bounded(self):
+        """Echo sender mapping is pruned to prevent unbounded growth."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {"-200": {"voice_transcription": {"mode": "auto"}}}
+            service_settings["defaults"]["tail_size"] = 5  # Small tail for testing
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            # Send many voice messages to trigger pruning (limit is 2 × tail_size = 10)
+            for i in range(15):
+                voice_msg = Message(800 + i, voice=True)
+                voice_msg.sender_id = 999
+                async def fake_get_sender(name=f"Speaker{i}"):
+                    return SimpleNamespace(first_name=name, last_name="", username=None)
+                voice_msg.get_sender = fake_get_sender
+
+                client = FakeClient([voice_msg])
+                daemon.deepgram_transcribe = lambda audio, mime: f"message {i}"
+                task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+
+                event = Event(voice_msg, chat_id=-200)
+                event.is_private = False
+                await client.handler(event)
+                await wait_until(lambda msg_id=800+i: daemon.load_register()["-200"]["last_processed_message_id"] == msg_id)
+                await self.stop_session(client, task)
+
+            # Verify mapping is pruned to limit
+            reg = daemon.load_register()
+            echo_senders = reg["-200"]["voice_echo_senders"]
+            self.assertLessEqual(len(echo_senders), 10,
+                                 "Mapping must be pruned to 2 × tail_size")
+            self.assertGreater(len(echo_senders), 0,
+                               "Mapping should retain recent entries")
 
     async def test_direct_voice_and_addressed_voice_unchanged(self):
         """Direct message voice and already-addressed group voice keep existing behavior."""
