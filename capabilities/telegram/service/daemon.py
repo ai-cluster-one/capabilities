@@ -1796,6 +1796,7 @@ async def run_session(client):
         return chunks
 
     async def send_channel_message(ent_id, text, is_direct, reply_to=None, **kwargs):
+        sent = None
         sent_ids = []
         for chunk in message_chunks(text):
             if is_direct or reply_to is None:
@@ -1803,7 +1804,7 @@ async def run_session(client):
             else:
                 sent = await client.send_message(ent_id, chunk, reply_to=reply_to, **kwargs)
             sent_ids.append(sent.id)
-        return sent_ids[-1] if sent_ids else None, sent_ids
+        return sent, sent_ids
 
     async def handle_call_recording_request(key, message, group_policy, chat_ref):
         text = _message_text(message)

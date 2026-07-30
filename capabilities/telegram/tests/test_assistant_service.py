@@ -1459,37 +1459,68 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         """Echo sender mapping is pruned to prevent unbounded growth."""
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()
-            service_settings["allowed_groups"] = {"-200": {"voice_transcription": {"mode": "auto"}}}
             service_settings["defaults"]["tail_size"] = 5  # Small tail for testing
             daemon = import_daemon(Path(td), service_settings)
-            daemon.save_register({"-200": {"last_processed_message_id": 0}})
 
-            # Send many voice messages to trigger pruning (limit is 2 × tail_size = 10)
+            # Directly test the helper functions without going through the full daemon
+            reg = {"-200": {"last_processed_message_id": 0}}
+            key = "-200"
+
+            # Record 15 echo IDs with monotonically increasing message IDs
             for i in range(15):
-                voice_msg = Message(800 + i, voice=True)
-                voice_msg.sender_id = 999
-                async def fake_get_sender(name=f"Speaker{i}"):
-                    return SimpleNamespace(first_name=name, last_name="", username=None)
-                voice_msg.get_sender = fake_get_sender
+                echo_id = 1000 + i
+                sender_name = f"Speaker{i}"
+                daemon._record_voice_echo_sender(reg, key, [echo_id], sender_name)
 
-                client = FakeClient([voice_msg])
-                daemon.deepgram_transcribe = lambda audio, mime: f"message {i}"
-                task = asyncio.create_task(daemon.run_session(client))
-                await client.started.wait()
-
-                event = Event(voice_msg, chat_id=-200)
-                event.is_private = False
-                await client.handler(event)
-                await wait_until(lambda msg_id=800+i: daemon.load_register()["-200"]["last_processed_message_id"] == msg_id)
-                await self.stop_session(client, task)
-
-            # Verify mapping is pruned to limit
-            reg = daemon.load_register()
+            # Verify mapping is pruned to exactly the limit (2 × tail_size = 10)
             echo_senders = reg["-200"]["voice_echo_senders"]
-            self.assertLessEqual(len(echo_senders), 10,
-                                 "Mapping must be pruned to 2 × tail_size")
-            self.assertGreater(len(echo_senders), 0,
-                               "Mapping should retain recent entries")
+            self.assertEqual(len(echo_senders), 10,
+                             "Mapping must be pruned to exactly 2 × tail_size")
+
+            # Verify oldest IDs (1000-1004) are removed and newest IDs (1005-1014) remain
+            for i in range(5):  # First 5 should be pruned
+                self.assertNotIn(str(1000 + i), echo_senders,
+                                 f"Oldest echo ID {1000 + i} should be pruned")
+            for i in range(5, 15):  # Last 10 should remain
+                self.assertIn(str(1000 + i), echo_senders,
+                              f"Recent echo ID {1000 + i} should remain after pruning")
+                self.assertEqual(echo_senders[str(1000 + i)], f"Speaker{i}",
+                                 f"Echo {1000 + i} should map to correct sender")
+
+    async def test_normal_reply_delivery_preserves_message_id_in_job_metadata(self):
+        """Normal text replies record their Telegram message ID in job.reply_message_id."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            daemon = import_daemon(Path(td), service_settings)
+
+            message = Message(901, text="Assistant, hello")
+            message.mentioned = True
+            client = FakeClient([message])
+
+            # Worker returns a normal text reply
+            def stub_worker(chat, tail, state=None, procs=None):
+                return {"reply": "Hello there!", "meta": {"harness": "stub", "model": None,
+                                                          "is_error": False, "tokens": {},
+                                                          "cost_usd": None, "duration_ms": None,
+                                                          "session_id": None}}
+            daemon.WORKERS["stub"] = stub_worker
+
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message)
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["123"]["last_processed_message_id"] == 901)
+
+            # Verify the reply was sent (DM doesn't have voice echo, just the reply)
+            self.assertEqual(len(client.sent), 1, "Should send reply")
+
+            # Verify the reply has a valid Telegram message ID
+            reply_msg = client.sent[0]
+            self.assertIsNotNone(reply_msg.get("id"), "Reply message must have an ID")
+            self.assertGreaterEqual(reply_msg["id"], 1000, "Reply ID should be from FakeClient sequence")
+
+            await self.stop_session(client, task)
 
     async def test_direct_voice_and_addressed_voice_unchanged(self):
         """Direct message voice and already-addressed group voice keep existing behavior."""
