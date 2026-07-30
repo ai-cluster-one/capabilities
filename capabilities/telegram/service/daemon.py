@@ -1926,8 +1926,20 @@ async def run_session(client):
             t = message_tail_text(m)
             if t is None:
                 continue
-            sender = (ASSISTANT_NAME if m.out
-                      else (await _sender_profile(m, group_policy, direct=is_direct))["name"])
+            if m.out:
+                # For outgoing messages, check if it's a voice echo (reply with blockquote).
+                # Voice echoes in groups are attributed to the original sender, not the assistant.
+                sender = ASSISTANT_NAME
+                if not is_direct and getattr(m, "is_reply", False) and t and "<blockquote>" in t:
+                    try:
+                        replied = await m.get_reply_message()
+                        if replied and _is_spoken_media(replied):
+                            profile = await _sender_profile(replied, group_policy, direct=is_direct)
+                            sender = profile["name"]
+                    except Exception:
+                        pass
+            else:
+                sender = (await _sender_profile(m, group_policy, direct=is_direct))["name"]
             tail.append({"id": m.id, "sender": sender, "text": t})
 
         profiles = {}
@@ -2242,8 +2254,9 @@ async def run_session(client):
         events and startup catch-up use this helper so a voice that arrived while the daemon was
         down cannot be silently skipped by the text-only tail renderer.
 
-        In groups, sender_name should be provided for sender-attributed format.
-        In DMs, sender_name is ignored (always uses "Твоё сообщение:").
+        In groups, the echo is a reply to the original voice message (Telegram's reply preview
+        shows sender attribution), so no visible prefix is added.
+        In DMs, "Твоё сообщение:" is prefixed because DM echoes are plain messages.
         """
         log(f"{key}: <- voice {message.id}, transcribing")
         transcript = None
@@ -2258,14 +2271,12 @@ async def run_session(client):
         spoken = transcript or "[голосовое — не удалось расшифровать]"
         try:
             if is_direct:
-                prefix = "Твоё сообщение:"
-            elif sender_name:
-                prefix = f"{html.escape(sender_name)} сказал:"
+                text = f"Твоё сообщение:\n<blockquote>{html.escape(spoken)}</blockquote>"
             else:
-                prefix = "Твоё сообщение:"
+                text = f"<blockquote>{html.escape(spoken)}</blockquote>"
             await send_channel_message(
                 chat_id,
-                f"{prefix}\n<blockquote>{html.escape(spoken)}</blockquote>",
+                text,
                 is_direct,
                 parse_mode="html",
                 reply_to=None if is_direct else message.id)

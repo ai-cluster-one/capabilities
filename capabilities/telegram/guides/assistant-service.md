@@ -195,20 +195,22 @@ and groups. Groups may additionally enable ambient voice transcription:
 ```
 
 - `auto`: All Telegram voice notes from participants are transcribed and echoed to
-  the chat with sender attribution (`<sender name> сказал: <transcript>`). After
-  transcription, the transcript is checked against the same configured assistant
-  name/username/group-alias matching semantics used for text messages. If the spoken
-  transcript names the assistant (e.g., "Marvin" or "Assistant"), the voice note is
-  treated as an addressed assistant request and dispatches a worker. If the transcript
-  does not name the assistant, it is echoed without creating a worker job. Voices
-  already addressed via Telegram-level mention/reply dispatch as normal regardless of
-  transcript content.
+  the chat. In groups, the echo is sent as a Telegram reply to the original voice
+  message (Telegram's reply preview shows sender attribution), and the echo content
+  itself contains only the blockquoted transcript. In direct messages, the echo uses
+  the "Твоё сообщение:" prefix. After transcription, the transcript is checked against
+  the same configured assistant name/username/group-alias matching semantics used for
+  text messages. If the spoken transcript names the assistant (e.g., "Marvin" or
+  "Assistant"), the voice note is treated as an addressed assistant request and
+  dispatches a worker. If the transcript does not name the assistant, it is echoed
+  without creating a worker job. Voices already addressed via Telegram-level
+  mention/reply dispatch as normal regardless of transcript content. In conversation
+  history provided to workers, voice echoes are attributed to the original sender
+  via the reply relationship, not to the assistant.
 - `disabled`: Only voice notes addressed to the assistant are transcribed. This is
   the default.
 
 Runtime overrides are available per channel via `/set voice-transcription auto|disabled`.
-Direct messages always transcribe voice notes and use the "Твоё сообщение:" prefix
-regardless of this setting.
 
 Transcription failures produce a fallback message. The daemon reserves ownership before
 transcription so duplicate deliveries and restart catch-up cannot transcribe the same

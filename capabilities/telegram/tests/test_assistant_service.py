@@ -123,6 +123,8 @@ class Message:
         self.file = SimpleNamespace(mime_type="audio/ogg", name=None) if voice else None
         self.out = False
         self.downloads = 0
+        self.is_reply = False
+        self._reply_message = None
 
     async def get_sender(self):
         return SimpleNamespace(first_name="Test", last_name="User", username=None)
@@ -131,6 +133,9 @@ class Message:
         self.downloads += 1
         await asyncio.sleep(0)
         return b"voice"
+
+    async def get_reply_message(self):
+        return self._reply_message
 
 
 class Event:
@@ -175,7 +180,27 @@ class FakeClient:
 
     async def get_messages(self, _chat, limit=None):
         self.get_messages_calls += 1
-        return self.messages[-limit:] if limit else list(self.messages)
+        # Return both initial messages and sent messages (echoes)
+        all_messages = list(self.messages)
+        for sent in self.sent:
+            # Create a Message-like object for sent messages
+            msg = SimpleNamespace(
+                id=sent.get("id", 1000 + len(all_messages)),
+                text=sent.get("text", ""),
+                out=True,
+                voice=False,
+                photo=False,
+                file=None,
+                is_reply=sent.get("reply_to") is not None,
+            )
+            # If this is a reply, link it to the original message
+            if sent.get("reply_to"):
+                original = next((m for m in all_messages if m.id == sent["reply_to"]), None)
+                async def get_reply(orig=original):
+                    return orig
+                msg.get_reply_message = get_reply
+            all_messages.append(msg)
+        return all_messages[-limit:] if limit else all_messages
 
     async def catch_up(self):
         self.catch_up_calls += 1
@@ -190,9 +215,10 @@ class FakeClient:
         if self.fail_sends:
             self.fail_sends -= 1
             raise RuntimeError("simulated outbound failure")
-        item = {"chat": chat, "text": text, **kwargs}
+        msg_id = 1000 + len(self.sent)
+        item = {"id": msg_id, "chat": chat, "text": text, **kwargs}
         self.sent.append(item)
-        return SimpleNamespace(id=1000 + len(self.sent))
+        return SimpleNamespace(id=msg_id)
 
     async def run_until_disconnected(self):
         self.started.set()
@@ -631,7 +657,8 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.send_attempts, 1)
             self.assertEqual(len(client.sent), 1)
             sent_text = client.sent[0]["text"]
-            self.assertIn("Ambient User сказал:", sent_text)
+            self.assertNotIn("сказал:", sent_text)
+            self.assertNotIn("Ambient User", sent_text)
             self.assertIn("ambient speech", sent_text)
             self.assertIn("<blockquote>", sent_text)
             reg = daemon.load_register()
@@ -667,8 +694,10 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(transcriptions), 1)
             self.assertEqual(client.send_attempts, 2)
             echo = client.sent[0]["text"]
-            self.assertIn("Addressed User сказал:", echo)
+            self.assertNotIn("сказал:", echo)
+            self.assertNotIn("Addressed User", echo)
             self.assertIn("addressed speech", echo)
+            self.assertIn("<blockquote>", echo)
             reg = daemon.load_register()
             self.assertEqual(len(reg["-200"]["jobs"]), 0)
             await self.stop_session(client, task)
@@ -729,8 +758,10 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.send_attempts, 1, "Should echo exactly once")
             self.assertEqual(len(client.sent), 1, "Should send exactly one message")
             sent_text = client.sent[0]["text"]
-            self.assertIn("Concurrent Test сказал:", sent_text)
+            self.assertNotIn("сказал:", sent_text)
+            self.assertNotIn("Concurrent Test", sent_text)
             self.assertIn("concurrent speech", sent_text)
+            self.assertIn("<blockquote>", sent_text)
             reg = daemon.load_register()
             self.assertEqual(reg["-200"]["jobs"], {}, "Ambient voice should not leave jobs")
             await self.stop_session(client, task)
@@ -769,8 +800,10 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.send_attempts, 1)
             self.assertEqual(len(client.sent), 1)
             sent_text = client.sent[0]["text"]
-            self.assertIn("Failed Transcription сказал:", sent_text)
+            self.assertNotIn("сказал:", sent_text)
+            self.assertNotIn("Failed Transcription", sent_text)
             self.assertIn("[голосовое — не удалось расшифровать]", sent_text)
+            self.assertIn("<blockquote>", sent_text)
             reg = daemon.load_register()
             self.assertEqual(reg["-200"]["jobs"], {})
             await self.stop_session(client, task)
@@ -908,8 +941,10 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.downloads, 1)
             self.assertEqual(client.send_attempts, 1, "Should send exactly one echo")
             sent_text = client.sent[0]["text"]
-            self.assertIn("Speaker One сказал:", sent_text)
+            self.assertNotIn("сказал:", sent_text)
+            self.assertNotIn("Speaker One", sent_text)
             self.assertIn("just some regular speech", sent_text)
+            self.assertIn("<blockquote>", sent_text)
             reg = daemon.load_register()
             self.assertEqual(reg["-200"]["jobs"], {}, "Should not create worker job")
             await self.stop_session(client, task)
@@ -947,8 +982,10 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.downloads, 1)
             self.assertEqual(client.send_attempts, 2, "Should send echo + worker response")
             echo = client.sent[0]["text"]
-            self.assertIn("Speaker Two сказал:", echo)
+            self.assertNotIn("сказал:", echo)
+            self.assertNotIn("Speaker Two", echo)
             self.assertIn("Hey Assistant", echo)
+            self.assertIn("<blockquote>", echo)
             reg = daemon.load_register()
             self.assertEqual(len(reg["-200"]["jobs"]), 0, "Worker job should complete")
             await self.stop_session(client, task)
@@ -989,8 +1026,10 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.downloads, 1)
             self.assertEqual(client.send_attempts, 2, "Should send echo + worker response")
             echo = client.sent[0]["text"]
-            self.assertIn("Speaker Three сказал:", echo)
+            self.assertNotIn("сказал:", echo)
+            self.assertNotIn("Speaker Three", echo)
             self.assertIn("Марвин, покажи мне погоду", echo)
+            self.assertIn("<blockquote>", echo)
             reg = daemon.load_register()
             self.assertEqual(len(reg["-200"]["jobs"]), 0, "Worker job should complete")
             await self.stop_session(client, task)
@@ -1178,6 +1217,89 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reg["-200"].get("last_processed_message_id", 0), 0, "Should not process")
             await self.stop_session(client, task)
 
+    async def test_voice_echo_attributed_to_sender_in_worker_history(self):
+        """After group voice echo, later worker sees transcript attributed to original sender, not assistant."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "auto"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            # Voice message from Alice
+            voice_msg = Message(601, voice=True)
+            voice_msg.sender_id = 999
+            voice_msg.mentioned = False
+            voice_msg.is_reply = False
+
+            async def fake_get_voice_sender():
+                return SimpleNamespace(first_name="Alice", last_name="Smith", username=None)
+            voice_msg.get_sender = fake_get_voice_sender
+
+            # Later text message from Bob, addressed to assistant
+            text_msg = Message(602, text="Assistant, summarize what Alice said")
+            text_msg.sender_id = 888
+            text_msg.mentioned = True
+            text_msg.is_reply = False
+
+            async def fake_get_text_sender():
+                return SimpleNamespace(first_name="Bob", last_name="Jones", username=None)
+            text_msg.get_sender = fake_get_text_sender
+
+            client = FakeClient([voice_msg, text_msg])
+            daemon.deepgram_transcribe = lambda audio, mime: "this is what I wanted to say"
+
+            # Capture the tail passed to the worker
+            captured_tail = []
+            def capture_worker(chat, tail, state=None, procs=None):
+                captured_tail.append(tail)
+                return {"reply": "summary here", "meta": {"harness": "stub", "model": None,
+                                                          "is_error": False, "tokens": {},
+                                                          "cost_usd": None, "duration_ms": None,
+                                                          "session_id": None}}
+            daemon.WORKERS["stub"] = capture_worker
+
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            # Send voice message
+            event = Event(voice_msg, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 601)
+
+            # Send addressed text message
+            event = Event(text_msg, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 602)
+
+            # Verify worker was called and captured the tail
+            self.assertEqual(len(captured_tail), 1, "Worker should be called for addressed message")
+            tail = captured_tail[0]
+
+            # Find the voice echo in the tail
+            echo_entry = None
+            for entry in tail:
+                if "this is what I wanted to say" in entry["text"]:
+                    echo_entry = entry
+                    break
+
+            self.assertIsNotNone(echo_entry, "Voice echo should appear in conversation history")
+            self.assertEqual(echo_entry["sender"], "Alice Smith",
+                             "Voice echo must be attributed to Alice, not Assistant")
+            self.assertIn("<blockquote>", echo_entry["text"])
+
+            # Verify the echo message itself has no visible sender prefix
+            echo_msg = client.sent[0]["text"]
+            self.assertNotIn("Alice", echo_msg, "Echo should not have visible sender name")
+            self.assertNotIn("сказал:", echo_msg, "Echo should not have 'сказал:' prefix")
+            self.assertIn("<blockquote>", echo_msg)
+            self.assertIn("this is what I wanted to say", echo_msg)
+
+            await self.stop_session(client, task)
+
     async def test_direct_voice_and_addressed_voice_unchanged(self):
         """Direct message voice and already-addressed group voice keep existing behavior."""
         with tempfile.TemporaryDirectory() as td:
@@ -1224,8 +1346,10 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(group_client.send_attempts, 2, "Addressed group voice: echo + worker")
             echo = group_client.sent[0]["text"]
-            self.assertIn("Addressed Speaker сказал:", echo)
+            self.assertNotIn("сказал:", echo)
+            self.assertNotIn("Addressed Speaker", echo)
             self.assertIn("addressed group voice", echo)
+            self.assertIn("<blockquote>", echo)
             await self.stop_session(group_client, group_task)
 
 
