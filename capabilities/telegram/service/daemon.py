@@ -636,6 +636,34 @@ def _is_spoken_media(message):
     )
 
 
+def _is_telegram_voice_note(message):
+    """True for Telegram voice notes specifically (not arbitrary audio files)."""
+    return bool(getattr(message, "voice", False))
+
+
+def _voice_transcription_mode(policy, reg, key):
+    """Resolve the effective voice transcription mode for a group channel.
+
+    Returns "auto", "disabled", or None (disabled). The static group policy is the
+    default; a runtime /set override in the register takes precedence.
+    """
+    if policy is None:
+        return None
+    runtime = (reg.get(key, {}).get("settings", {}) or {}).get("voice_transcription")
+    if runtime is not None:
+        normalized = str(runtime).strip().lower()
+        if normalized in ("auto", "on", "enabled", "true"):
+            return "auto"
+        return "disabled"
+    static = (policy.get("voice_transcription") or {}).get("mode")
+    if static is not None:
+        normalized = str(static).strip().lower()
+        if normalized in ("auto", "on", "enabled"):
+            return "auto"
+        return "disabled"
+    return "disabled"
+
+
 def _message_kind(message):
     if _is_spoken_media(message):
         return "voice"
@@ -694,7 +722,13 @@ async def _message_addresses_me(message, me, policy):
     return await _reply_is_to_me(message, me)
 
 
-async def _event_access(event, me):
+async def _event_access(event, me, reg):
+    """Gate 1: the door. Determines if a message should be processed.
+
+    Returns access dict with kind/policy, or None to ignore. For groups with
+    voice_transcription auto, unaddressed Telegram voice notes are admitted as
+    ambient (transcribe + echo, no worker dispatch).
+    """
     sender_id = str(event.sender_id) if event.sender_id is not None else None
     if getattr(event, "is_private", False):
         if sender_id in ALLOWED or ALLOW_ANY_DIRECT:
@@ -703,9 +737,14 @@ async def _event_access(event, me):
     group_key, policy = _group_policy(event.chat_id)
     if policy is None:
         return None
-    if not await _message_addresses_me(event.message, me, policy):
-        return None
-    return {"kind": "group", "group_key": group_key, "policy": policy}
+    key = str(event.chat_id)
+    addressed = await _message_addresses_me(event.message, me, policy)
+    if addressed:
+        return {"kind": "group", "group_key": group_key, "policy": policy, "addressed": True}
+    if (_is_telegram_voice_note(event.message)
+            and _voice_transcription_mode(policy, reg, key) == "auto"):
+        return {"kind": "group", "group_key": group_key, "policy": policy, "addressed": False, "ambient_voice": True}
+    return None
 
 
 async def _event_chat_ref(event, is_direct=False):
@@ -974,6 +1013,10 @@ def _status(reg, key):
     elif worker == "codex":
         lines.append(f"  codex.reasoning = {s.get('reasoning_effort') or 'default'}")
         lines.append(f"  codex.service_tier = {s.get('service_tier') or 'default'}")
+    _, group_policy = _group_policy(key)
+    if group_policy is not None:
+        mode = s.get("voice_transcription") or _voice_transcription_mode(group_policy, reg, key)
+        lines.append(f"  voice-transcription = {mode}")
     lines.append(f"  watermark = {wm}")
     if counts:
         lines.append("  jobs = " + ", ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
@@ -1011,6 +1054,12 @@ def _set_help(reg, key, topic=None):
         return f"usage: /set tail <1..500>\ncurrent: {s['tail_size']}"
     if topic == "debounce":
         return f"usage: /set debounce <0..300>\ncurrent: {s['debounce']}s"
+    if topic in ("voice-transcription", "voice_transcription", "voice"):
+        _, group_policy = _group_policy(key)
+        if group_policy is None:
+            return "voice-transcription setting is only available in groups (direct messages always transcribe voice)"
+        current = s.get("voice_transcription") or _voice_transcription_mode(group_policy, reg, key)
+        return f"usage: /set voice-transcription <auto|disabled>\ncurrent: {current}\naliases: on=auto, off=disabled"
     if field == "model" and worker in WORKER_NAMES:
         current = channel_settings(reg, key).get("model") if worker == active else \
             _worker_settings(reg.get(key, {}), worker).get("model")
@@ -1039,7 +1088,7 @@ def _set_help(reg, key, topic=None):
     if field in ("speed", "service-tier", "service_tier"):
         return "speed/service-tier is only available for codex\nusage: /set codex.speed <default|fast|priority>"
 
-    return ("\n".join([
+    lines = [
         "usage: /set <setting> <value>",
         f"active worker: {active}",
         "settings:",
@@ -1050,10 +1099,16 @@ def _set_help(reg, key, topic=None):
         "  reasoning <default|low|medium|high|xhigh>  (codex active)",
         "  effort <default|low|medium|high|xhigh|max>  (claude active)",
         "  speed <default|fast|priority>  (codex active)",
+    ]
+    _, group_policy = _group_policy(key)
+    if group_policy is not None:
+        lines.append("  voice-transcription <auto|disabled>  (groups only)")
+    lines.extend([
         "worker-specific:",
         "  codex.model / codex.reasoning / codex.speed",
         "  claude.model / claude.effort",
-    ]))
+    ])
+    return "\n".join(lines)
 
 
 def set_channel_setting(reg, key, k, v):
@@ -1077,6 +1132,19 @@ def set_channel_setting(reg, key, k, v):
             raise ValueError(f"worker must be one of {_values(WORKER_CHOICES)}")
         s["worker"] = worker
         return f"worker = {worker}"
+    if k in ("voice-transcription", "voice_transcription", "voice"):
+        _, group_policy = _group_policy(key)
+        if group_policy is None:
+            raise ValueError("voice-transcription setting is only available in groups (direct messages always transcribe voice)")
+        mode = v.strip().lower()
+        if mode in ("auto", "on", "enabled", "true"):
+            s["voice_transcription"] = "auto"
+            return "voice-transcription = auto (unaddressed voice notes will be transcribed)"
+        elif mode in ("disabled", "off", "false"):
+            s["voice_transcription"] = "disabled"
+            return "voice-transcription = disabled (only addressed voice notes will be transcribed)"
+        else:
+            raise ValueError("voice-transcription must be auto or disabled (aliases: on=auto, off=disabled)")
     target_worker, field = None, k
     if "." in k:
         maybe_worker, field = k.split(".", 1)
@@ -2167,12 +2235,15 @@ async def run_session(client):
                 stopped = True
         return "Stopped." if stopped else "Nothing is running right now."
 
-    async def echo_voice_message(message, chat_id, key, is_direct):
+    async def echo_voice_message(message, chat_id, key, is_direct, sender_name=None):
         """Transcribe a Telegram voice note and echo the text into the chat.
 
         The echo is the durable, worker-visible representation of the voice note. Both live
         events and startup catch-up use this helper so a voice that arrived while the daemon was
         down cannot be silently skipped by the text-only tail renderer.
+
+        In groups, sender_name should be provided for sender-attributed format.
+        In DMs, sender_name is ignored (always uses "Твоё сообщение:").
         """
         log(f"{key}: <- voice {message.id}, transcribing")
         transcript = None
@@ -2186,9 +2257,15 @@ async def run_session(client):
             log(f"{key}: voice download error: {e}")
         spoken = transcript or "[голосовое — не удалось расшифровать]"
         try:
+            if is_direct:
+                prefix = "Твоё сообщение:"
+            elif sender_name:
+                prefix = f"{html.escape(sender_name)} сказал:"
+            else:
+                prefix = "Твоё сообщение:"
             await send_channel_message(
                 chat_id,
-                f"Твоё сообщение:\n<blockquote>{html.escape(spoken)}</blockquote>",
+                f"{prefix}\n<blockquote>{html.escape(spoken)}</blockquote>",
                 is_direct,
                 parse_mode="html",
                 reply_to=None if is_direct else message.id)
@@ -2252,20 +2329,36 @@ async def run_session(client):
                 if _message_is_known(reg, key, m.id):
                     continue
                 is_direct = group_policy is None
+                addressed = False
                 if group_policy is not None:
-                    if not await _message_addresses_me(m, me, group_policy):
+                    addressed = await _message_addresses_me(m, me, group_policy)
+                    is_ambient_voice = (not addressed
+                                        and _is_telegram_voice_note(m)
+                                        and _voice_transcription_mode(group_policy, reg, key) == "auto")
+                    if not addressed and not is_ambient_voice:
                         continue
                 elif not _incoming_in_scope(m, group_policy):
                     continue
+                else:
+                    is_ambient_voice = False
                 if group_policy is not None and await handle_call_recording_request(
                         key, m, group_policy, ent):
+                    continue
+                if is_ambient_voice:
+                    profile = await _sender_profile(m, group_policy, direct=is_direct)
+                    await echo_voice_message(m, ent, key, is_direct, sender_name=profile["name"])
+                    row = reg.setdefault(key, {})
+                    row["last_processed_message_id"] = max(m.id, row.get("last_processed_message_id", 0))
+                    save_register(reg)
                     continue
                 job = reserve_job(key, m, group_policy, is_direct, f"catch-up/{reason}")
                 if job is None:
                     continue
                 spoken = None
                 if _is_spoken_media(m):
-                    spoken = await echo_voice_message(m, ent, key, is_direct)
+                    profile = await _sender_profile(m, group_policy, direct=is_direct)
+                    sender_name = None if is_direct else profile["name"]
+                    spoken = await echo_voice_message(m, ent, key, is_direct, sender_name=sender_name)
                 if await finalize_job(
                         key, m, group_policy, is_direct, f"catch-up/{reason}", job,
                         text_override=spoken):
@@ -2290,7 +2383,7 @@ async def run_session(client):
         write_health(
             last_live_update_at=now(),
         )
-        access = await _event_access(event, me)          # gate 1: the door
+        access = await _event_access(event, me, reg)          # gate 1: the door
         if not access:
             log(f"{event.chat_id}: ignored {_message_kind(event.message)} from {event.sender_id}")
             return
@@ -2324,13 +2417,23 @@ async def run_session(client):
                     chat_ref, reply, access["kind"] == "private",
                     reply_to=None if access["kind"] == "private" else event.message.id)
             return
+        if access.get("ambient_voice"):                   # unaddressed voice in auto mode — echo only, no job
+            profile = await _sender_profile(event.message, group_policy, direct=is_direct)
+            await echo_voice_message(event.message, chat_ref, key, is_direct, sender_name=profile["name"])
+            row = reg.setdefault(key, {})
+            row["last_processed_message_id"] = max(event.message.id, row.get("last_processed_message_id", 0))
+            save_register(reg)
+            log(f"{key}: ambient voice msg={event.message.id} transcribed; no worker dispatch")
+            return
         job = reserve_job(key, event.message, group_policy, is_direct, "live")
         if job is None:
             log(f"{key}: already queued/done msg={event.message.id}")
             return
         spoken = None
         if _is_spoken_media(event.message):               # transcribe → echo (visible + attributed by reply)
-            spoken = await echo_voice_message(event.message, chat_ref, key, is_direct)
+            profile = await _sender_profile(event.message, group_policy, direct=is_direct)
+            sender_name = None if is_direct else profile["name"]
+            spoken = await echo_voice_message(event.message, chat_ref, key, is_direct, sender_name=sender_name)
         else:
             log(f"{key}: <- {_message_kind(event.message)} «{text[:60]}» "
                 f"(debounce {channel_settings(reg, key)['debounce']}s)")

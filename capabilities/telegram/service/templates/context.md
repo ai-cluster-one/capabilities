@@ -38,7 +38,10 @@ have recorded, remembered, or saved a fact for later.
 - Non-voice media may appear as `[attachment: <name> | msg <id>]`. Treat it as
   a lazy handle, not the file. Use `telegram download <chat_id> <msgid>` only
   when you actually need the file.
-- Voice notes are transcribed and echoed as ordinary conversation text.
+- Voice notes addressed to you are transcribed and echoed as ordinary conversation
+  text. In groups with `voice_transcription` mode set to `auto`, unaddressed voice
+  notes from other participants are also transcribed and visible in the chat (but
+  do not create assistant requests).
 
 ## Progress Messages
 
