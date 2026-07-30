@@ -2345,11 +2345,12 @@ async def run_session(client):
                         key, m, group_policy, ent):
                     continue
                 if is_ambient_voice:
+                    job = reserve_job(key, m, group_policy, is_direct, f"catch-up/{reason}/ambient")
+                    if job is None:
+                        continue
                     profile = await _sender_profile(m, group_policy, direct=is_direct)
                     await echo_voice_message(m, ent, key, is_direct, sender_name=profile["name"])
-                    row = reg.setdefault(key, {})
-                    row["last_processed_message_id"] = max(m.id, row.get("last_processed_message_id", 0))
-                    save_register(reg)
+                    mark_job_finished(key, job, "done")
                     continue
                 job = reserve_job(key, m, group_policy, is_direct, f"catch-up/{reason}")
                 if job is None:
@@ -2417,12 +2418,14 @@ async def run_session(client):
                     chat_ref, reply, access["kind"] == "private",
                     reply_to=None if access["kind"] == "private" else event.message.id)
             return
-        if access.get("ambient_voice"):                   # unaddressed voice in auto mode — echo only, no job
+        if access.get("ambient_voice"):                   # unaddressed voice in auto mode — echo only, no worker
+            job = reserve_job(key, event.message, group_policy, is_direct, "live/ambient")
+            if job is None:
+                log(f"{key}: already queued/done msg={event.message.id}")
+                return
             profile = await _sender_profile(event.message, group_policy, direct=is_direct)
             await echo_voice_message(event.message, chat_ref, key, is_direct, sender_name=profile["name"])
-            row = reg.setdefault(key, {})
-            row["last_processed_message_id"] = max(event.message.id, row.get("last_processed_message_id", 0))
-            save_register(reg)
+            mark_job_finished(key, job, "done")
             log(f"{key}: ambient voice msg={event.message.id} transcribed; no worker dispatch")
             return
         job = reserve_job(key, event.message, group_policy, is_direct, "live")

@@ -695,6 +695,86 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(reg["123"]["jobs"]), 0)
             await self.stop_session(client, task)
 
+    async def test_ambient_voice_concurrent_duplicates_transcribe_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "auto"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(405, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Concurrent", last_name="Test", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+            transcriptions = []
+            daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append((audio, mime)) or "concurrent speech"
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+
+            await asyncio.gather(client.handler(event), client.handler(event))
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 405)
+
+            self.assertEqual(len(transcriptions), 1, "Should transcribe exactly once")
+            self.assertEqual(message.downloads, 1, "Should download exactly once")
+            self.assertEqual(client.send_attempts, 1, "Should echo exactly once")
+            self.assertEqual(len(client.sent), 1, "Should send exactly one message")
+            sent_text = client.sent[0]["text"]
+            self.assertIn("Concurrent Test сказал:", sent_text)
+            self.assertIn("concurrent speech", sent_text)
+            reg = daemon.load_register()
+            self.assertEqual(reg["-200"]["jobs"], {}, "Ambient voice should not leave jobs")
+            await self.stop_session(client, task)
+
+    async def test_ambient_voice_transcription_failure_uses_sender_attributed_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "auto"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(406, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Failed", last_name="Transcription", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+
+            def failing_transcribe(audio, mime):
+                raise RuntimeError("Deepgram API failure")
+            daemon.deepgram_transcribe = failing_transcribe
+
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 406)
+
+            self.assertEqual(client.send_attempts, 1)
+            self.assertEqual(len(client.sent), 1)
+            sent_text = client.sent[0]["text"]
+            self.assertIn("Failed Transcription сказал:", sent_text)
+            self.assertIn("[голосовое — не удалось расшифровать]", sent_text)
+            reg = daemon.load_register()
+            self.assertEqual(reg["-200"]["jobs"], {})
+            await self.stop_session(client, task)
+
     async def test_ambient_voice_catch_up_does_not_duplicate(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()

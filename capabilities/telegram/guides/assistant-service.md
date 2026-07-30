@@ -33,6 +33,9 @@ capability bundle.
    - Set group `aliases` / `address_aliases` if the assistant should react to names other than the default.
    - Set a group's `call_recording.mode` to `auto`, `on_request`, or `disabled`.
      Recording is opt-in per group and defaults to `disabled`.
+   - Set a group's `voice_transcription.mode` to `auto` to transcribe all
+     voice notes from participants (unaddressed voices are echoed without
+     creating worker jobs). Defaults to `disabled`.
    - Choose `defaults.worker`: `codex`, `claude`, or `stub`.
 
 4. Ensure the selected connection can send replies:
@@ -170,6 +173,41 @@ captured in participant snapshots, but the OGG does not contain separate
 per-participant tracks.
 The service never starts a group call itself. It posts the completed recording only
 when `send_to_chat` is enabled; participant notice remains the operator's responsibility.
+
+## Voice Transcription
+
+Voice notes addressed to the assistant are always transcribed in both direct messages
+and groups. Groups may additionally enable ambient voice transcription:
+
+```json
+{
+  "allowed_groups": {
+    "-100789": {
+      "name": "Ambient voice enabled",
+      "voice_transcription": {"mode": "auto"}
+    },
+    "-100999": {
+      "name": "Addressed only",
+      "voice_transcription": {"mode": "disabled"}
+    }
+  }
+}
+```
+
+- `auto`: All Telegram voice notes from participants are transcribed and echoed to
+  the chat with sender attribution (`<sender name> сказал: <transcript>`). Unaddressed
+  voices are echoed but do not create assistant worker jobs or produce AI replies.
+  Addressed voices (mention, reply, or alias) still dispatch to the worker as normal.
+- `disabled`: Only voice notes addressed to the assistant are transcribed. This is
+  the default.
+
+Runtime overrides are available per channel via `/set voice-transcription auto|disabled`.
+Direct messages always transcribe voice notes and use the "Твоё сообщение:" prefix
+regardless of this setting.
+
+Transcription failures produce a fallback message. The daemon reserves ownership before
+transcription so duplicate deliveries and restart catch-up cannot transcribe the same
+voice note twice.
 
 ## Channel Context
 
