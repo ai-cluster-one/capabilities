@@ -48,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -498,9 +499,8 @@ def configured_call_recording_users():
 
 
 def call_recorder_command():
-    # Group watching is now disabled — it must run on the daemon's client to avoid
-    # multiple update-consuming connections per account (which suppresses p2p call
-    # delivery). Integration onto the daemon client is pending.
+    # Group watching runs on the daemon's own PyTgCalls instance (not as a subprocess).
+    # A second update-consuming connection suppresses p2p INCOMING_CALL delivery.
     return None
 
 
@@ -2595,15 +2595,20 @@ async def run_session(client):
             arm(key, ent)
 
     # --- call listener (PyTgCalls on daemon's client) -----------------------------
-    # P2P call recording for allowed direct-message callers. Group call recording
-    # was previously run as a separate subprocess (call_recorder.py --watch-groups),
-    # but that created a second update-consuming Telethon connection which suppressed
-    # p2p call delivery. Group watching is now disabled until re-implemented on this
-    # same client/PyTgCalls instance.
+    # P2P and group call recording on the daemon's own client. Exactly one
+    # update-consuming Telethon connection per account — a second subprocess breaks
+    # p2p INCOMING_CALL delivery.
     calls = None
     users = configured_call_recording_users()
-    if users["allowed_callers"]:
+    groups = configured_call_recording_groups()
+    has_p2p_recording = bool(users["allowed_callers"])
+    has_group_recording = bool(groups["auto"] or groups["on_request"])
+
+    if has_p2p_recording or has_group_recording:
         calls = PyTgCalls(client)
+
+    # P2P call recording (incoming calls from allowed direct-message callers)
+    if has_p2p_recording:
         allowed_callers = set(users["allowed_callers"])
         active_recording = {
             "task": None,
@@ -2850,9 +2855,364 @@ async def run_session(client):
                     return
                 await start_call_recording(caller_id, "conference", call_config)
 
+    # Group call recording (voice chats in configured groups)
+    group_watcher_task = None
+    if has_group_recording:
+        auto_groups = set(groups["auto"])
+        on_request_groups = set(groups["on_request"])
+        send_to_chat_groups = set(groups["send_to_chat"])
+        all_groups = auto_groups | on_request_groups
+        recorded_call_ids = {}
+        active_group_recording = None
+        group_call_closed_event = asyncio.Event()
+        schema_fallback_groups = set()
+        schema_retry_after = {}
+        join_retry_after = {}
+
+        # Helpers for group call inspection
+        bridge = getattr(getattr(calls, "_app", None), "_bind_client", None)
+
+        async def active_group_call(chat_id: int):
+            """Check if a group has an active voice chat."""
+            get_call = getattr(bridge, "get_call", None)
+            if get_call is None:
+                return None
+            try:
+                from telethon.errors.common import TypeNotFoundError
+                call_ref = await get_call(chat_id)
+                schema_fallback_groups.discard(chat_id)
+                cache = getattr(bridge, "_cache", None)
+                if call_ref is not None and cache is not None:
+                    cache.set_cache(chat_id, call_ref)
+                return call_ref
+            except TypeNotFoundError:
+                # Telegram schema updated before Telethon — skip probing for now
+                if chat_id not in schema_fallback_groups:
+                    log(f"group-call-probe: schema fallback for {chat_id}")
+                    schema_fallback_groups.add(chat_id)
+                return None
+            except Exception as exc:
+                log(f"group-call-probe: failed for {chat_id}: {exc}")
+                return None
+
+        async def start_group_recording(chat_id: int, trigger: str, request: dict | None = None) -> bool:
+            """Join and record an active group voice chat."""
+            nonlocal active_group_recording
+            call_ref = await active_group_call(chat_id)
+            if call_ref is None:
+                recorded_call_ids.pop(chat_id, None)
+                return False
+            call_id = int(call_ref.id)
+            if recorded_call_ids.get(chat_id) == call_id:
+                return False
+
+            retry_key = (chat_id, call_id)
+            if time.time() < join_retry_after.get(retry_key, 0):
+                return False
+
+            try:
+                entity = await client.get_entity(chat_id)
+                title = getattr(entity, "title", None) or str(chat_id)
+            except Exception:
+                title = str(chat_id)
+
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            output = (CONNECTION_STATE_DIR / "calls" / "recordings"
+                      / f"{timestamp}-{_safe_file_part(str(chat_id))}-call-{call_id}.ogg")
+            capture = output.with_suffix(".mp3")
+            metadata_path = output.with_suffix(".json")
+            output.parent.mkdir(parents=True, exist_ok=True)
+
+            metadata = {
+                "schema_version": 3,
+                "status": "joining",
+                "connection": CONNECTION,
+                "account_id": str((await client.get_me()).id),
+                "chat_id": str(chat_id),
+                "chat_title": title,
+                "telegram_call_id": str(call_id),
+                "detected_at": iso_utc(),
+                "recording_started_at": None,
+                "recording_ended_at": None,
+                "duration_seconds": None,
+                "trigger": trigger,
+                "request": request,
+                "stop_reason": None,
+                "join": {
+                    "attempts": 0,
+                    "status": "joining",
+                    "errors": [],
+                },
+                "audio": {
+                    "path": str(output),
+                    "format": output.suffix.lstrip("."),
+                    "codec": "opus",
+                    "bytes": 0,
+                    "settled": False,
+                    "capture_method": "pytgcalls_mp3_then_ffmpeg_ogg",
+                    "source": {
+                        "path": str(capture),
+                        "format": "mp3",
+                        "bytes": 0,
+                        "retained": False,
+                    },
+                    "conversion": {
+                        "status": "pending",
+                        "error": None,
+                    },
+                },
+                "delivery": {
+                    "enabled": chat_id in send_to_chat_groups,
+                    "status": "pending" if chat_id in send_to_chat_groups else "disabled",
+                    "attempts": 0,
+                    "message_id": None,
+                    "sent_at": None,
+                    "error": None,
+                },
+            }
+            write_metadata(metadata_path, metadata)
+
+            # Attempt to join (with retries)
+            from pytgcalls.types import GroupCallConfig
+            from pytgcalls.exceptions import NoActiveGroupCall
+            joined = False
+            JOIN_ATTEMPTS = 3
+            for attempt in range(1, JOIN_ATTEMPTS + 1):
+                metadata["join"].update({"attempts": attempt, "status": "joining"})
+                write_metadata(metadata_path, metadata)
+                cache = getattr(bridge, "_cache", None)
+                if cache is not None:
+                    cache.set_cache(chat_id, call_ref)
+                try:
+                    await asyncio.wait_for(
+                        calls.record(
+                            chat_id,
+                            RecordStream(capture),
+                            config=GroupCallConfig(auto_start=False),
+                        ),
+                        timeout=20,
+                    )
+                    await calls.mute(chat_id)
+                except NoActiveGroupCall:
+                    with contextlib.suppress(OSError):
+                        capture.unlink()
+                    metadata.update({
+                        "status": "not_started",
+                        "stop_reason": "no_active_voice_chat",
+                    })
+                    metadata["join"]["status"] = "no_active_voice_chat"
+                    metadata["delivery"].update({
+                        "status": "skipped",
+                        "error": "no_active_voice_chat",
+                    })
+                    write_metadata(metadata_path, metadata)
+                    return False
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"[:500]
+                    metadata["join"]["errors"].append({
+                        "attempt": attempt,
+                        "error": error,
+                        "at": iso_utc(),
+                    })
+                    metadata["join"]["status"] = "retrying"
+                    write_metadata(metadata_path, metadata)
+                    log(f"group-call: join failed for {chat_id} call {call_id} attempt {attempt}: {error}")
+                    with contextlib.suppress(Exception):
+                        await calls.leave_call(chat_id)
+                    with contextlib.suppress(OSError):
+                        capture.unlink()
+                    if attempt < JOIN_ATTEMPTS:
+                        current_call = await active_group_call(chat_id)
+                        if current_call is None or int(current_call.id) != call_id:
+                            metadata.update({
+                                "status": "not_started",
+                                "stop_reason": "voice_chat_closed_during_join",
+                            })
+                            metadata["join"]["status"] = "call_closed"
+                            metadata["delivery"].update({
+                                "status": "skipped",
+                                "error": "voice_chat_closed_during_join",
+                            })
+                            write_metadata(metadata_path, metadata)
+                            return False
+                        call_ref = current_call
+                        await asyncio.sleep(2 * attempt)
+                        continue
+                    break
+                else:
+                    joined = True
+                    metadata["join"]["status"] = "joined"
+                    join_retry_after.pop(retry_key, None)
+                    break
+
+            if not joined:
+                metadata.update({"status": "join_failed", "stop_reason": "join_failed"})
+                metadata["join"]["status"] = "failed"
+                metadata["delivery"].update({
+                    "status": "skipped",
+                    "error": "join_failed",
+                })
+                join_retry_after[retry_key] = time.time() + 15
+                write_metadata(metadata_path, metadata)
+                return False
+
+            # Recording started
+            started_at = datetime.now(timezone.utc)
+            recorded_call_ids[chat_id] = call_id
+            active_group_recording = {
+                "chat_id": chat_id,
+                "call_id": call_id,
+                "output": output,
+                "capture": capture,
+                "metadata_path": metadata_path,
+                "metadata": metadata,
+                "started_at": started_at,
+                "trigger": trigger,
+                "request": request,
+            }
+            group_call_closed_event.clear()
+            metadata.update({
+                "status": "recording",
+                "recording_started_at": iso_utc(started_at),
+            })
+            write_metadata(metadata_path, metadata)
+            log(f"group-call: started recording {chat_id} call {call_id} ({trigger})")
+            return True
+
+        async def finish_group_recording(reason: str):
+            """Finalize an active group recording."""
+            nonlocal active_group_recording
+            if active_group_recording is None:
+                return
+            current = active_group_recording
+            chat_id = current["chat_id"]
+            metadata = current["metadata"]
+            recording_ended_at = iso_utc()
+            wall_duration = (datetime.now(timezone.utc) - current["started_at"]).total_seconds()
+
+            with contextlib.suppress(Exception):
+                await calls.leave_call(chat_id)
+
+            output = current["output"]
+            capture = current["capture"]
+            finalized = await finalize_mp3_capture(capture, output)
+            status = "complete" if finalized["status"] == "complete" else "conversion_failed"
+            media_duration = finalized.get("duration_seconds") or wall_duration
+
+            metadata.update({
+                "status": status,
+                "recording_ended_at": recording_ended_at,
+                "duration_seconds": media_duration,
+                "wall_duration_seconds": round(wall_duration, 3),
+                "stop_reason": reason,
+            })
+            metadata["audio"]["bytes"] = finalized["output_bytes"]
+            metadata["audio"]["settled"] = finalized["status"] == "complete"
+            metadata["audio"]["source"].update({
+                "bytes": finalized["source_bytes"],
+                "retained": finalized["source_retained"],
+            })
+            metadata["audio"]["conversion"].update({
+                "status": finalized["status"],
+                "error": finalized["error"],
+            })
+            if finalized.get("cleanup_error"):
+                metadata["audio"]["source"]["cleanup_error"] = finalized["cleanup_error"]
+            write_metadata(current["metadata_path"], metadata)
+
+            log(f"group-call: finished {chat_id} call {current['call_id']} "
+                f"({media_duration:.1f}s, {finalized['output_bytes']} bytes) — {reason}")
+
+            if metadata["delivery"]["enabled"] and finalized["status"] == "complete":
+                await send_recording_to_chat(
+                    client,
+                    chat_id,
+                    output,
+                    current["metadata_path"],
+                    metadata,
+                    emit_event_fn=lambda event, **fields: log(f"group-call-delivery: {event} {fields}"),
+                )
+
+            active_group_recording = None
+            group_call_closed_event.clear()
+
+        @calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))
+        async def group_call_closed(_call_client: PyTgCalls, update: ChatUpdate):
+            if active_group_recording is not None and update.chat_id == active_group_recording["chat_id"]:
+                group_call_closed_event.set()
+
+        async def watch_groups_loop():
+            """Background task: poll for active group calls and process requests."""
+            POLL_SECONDS = 2.0
+            while not closing:
+                # Finish active recording if call ended
+                if active_group_recording is not None:
+                    try:
+                        await asyncio.wait_for(group_call_closed_event.wait(), timeout=POLL_SECONDS)
+                    except asyncio.TimeoutError:
+                        pass
+                    if group_call_closed_event.is_set():
+                        await finish_group_recording("voice_chat_closed")
+                        continue
+
+                    # Verify call still active
+                    chat_id = active_group_recording["chat_id"]
+                    call_ref = await active_group_call(chat_id)
+                    if call_ref is None or int(call_ref.id) != active_group_recording["call_id"]:
+                        group_call_closed_event.set()
+                        await finish_group_recording("voice_chat_closed")
+                        continue
+                    continue
+
+                # Process on-request recording files
+                for path in sorted(CALL_RECORDING_REQUEST_DIR.glob("*.json")):
+                    request = None
+                    try:
+                        request = json.loads(path.read_text())
+                    except Exception:
+                        pass
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                    if not isinstance(request, dict):
+                        continue
+                    try:
+                        req_chat_id = int(request.get("chat_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    if req_chat_id not in on_request_groups and req_chat_id not in auto_groups:
+                        continue
+                    if await start_group_recording(req_chat_id, "on_request", request):
+                        break
+
+                # Auto groups: poll for active calls
+                if active_group_recording is None:
+                    for chat_id in sorted(auto_groups):
+                        call_ref = await active_group_call(chat_id)
+                        if call_ref is None:
+                            recorded_call_ids.pop(chat_id, None)
+                            continue
+                        if recorded_call_ids.get(chat_id) == int(call_ref.id):
+                            continue
+                        if await start_group_recording(chat_id, "automatic"):
+                            break
+
+                # Wait for next poll
+                if active_group_recording is None:
+                    await asyncio.sleep(POLL_SECONDS)
+
+        group_watcher_task = asyncio.create_task(watch_groups_loop())
+        log(f"group-call watcher: started; auto={sorted(auto_groups)}; on_request={sorted(on_request_groups)}")
+
+    # Start PyTgCalls (shared by p2p and group recording)
+    if calls is not None:
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
-        log(f"call listener: started on daemon client; allowed_callers={sorted(allowed_callers)}")
+        features = []
+        if has_p2p_recording:
+            features.append(f"p2p(allowed_callers={sorted(allowed_callers)})")
+        if has_group_recording:
+            features.append(f"groups(auto={len(auto_groups)}, on_request={len(on_request_groups)})")
+        log(f"call listener: started on daemon client; {', '.join(features)}")
 
     log("live — reacting in real time. Ctrl-C to stop.")
     sync_task = asyncio.create_task(periodic_sync())
@@ -2868,10 +3228,13 @@ async def run_session(client):
         await disconnected_task
     finally:
         closing = True
-        for task in (sync_task, disconnected_task):
+        cleanup_tasks = [sync_task, disconnected_task]
+        if group_watcher_task is not None:
+            cleanup_tasks.append(group_watcher_task)
+        for task in cleanup_tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(sync_task, disconnected_task, return_exceptions=True)
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
         pending_timers = list(timers.values())
         for task in pending_timers:
             task.cancel()
