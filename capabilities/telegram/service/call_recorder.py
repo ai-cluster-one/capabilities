@@ -2,10 +2,13 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "py-tgcalls==3.0.0.dev4",
-#     "ntgcalls==3.0.0b14",
+#     "py-tgcalls==2.3.3",
 #     "telethon==1.43.2",
 # ]
+# Reverted from 3.0.0.dev4: the pre-release captures no inbound audio (237-byte
+# ID3 header only, 0 samples). Conference call support (CallConfig, join flags,
+# metadata sidecar, empty-capture guard) remains — flip to 3.x once upstream
+# fixes audio capture to re-enable it.
 # ///
 """Record an existing Telegram group voice chat through a full MTProto account.
 

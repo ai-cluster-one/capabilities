@@ -1,7 +1,10 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["telethon==1.43.2"]
+# dependencies = [
+#     "telethon==1.43.2",
+#     "py-tgcalls==2.3.3",
+# ]
 # ///
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
@@ -51,6 +54,10 @@ from pathlib import Path
 
 import telethon
 from telethon import TelegramClient, events
+from telethon.tl.types import MessageActionConferenceCall, MessageActionInviteToGroupCall, MessageService, UpdateNewMessage
+
+from pytgcalls import PyTgCalls, filters
+from pytgcalls.types import CallConfig, ChatUpdate, RecordStream
 
 logging.getLogger("telethon").setLevel(logging.CRITICAL)
 
@@ -496,21 +503,6 @@ def call_recorder_command():
         command.extend(("--request-group", str(chat_id)))
     for chat_id in groups["send_to_chat"]:
         command.extend(("--send-to-chat-group", str(chat_id)))
-    return command
-
-
-def call_listener_command():
-    users = configured_call_recording_users()
-    if not users["allowed_callers"]:
-        return None
-    command = [
-        str(CALL_RECORDER_BIN),
-        "--listen",
-        "--connection", CONNECTION,
-        "--project-root", str(PROJECT_ROOT),
-    ]
-    for user_id in users["allowed_callers"]:
-        command.extend(("--caller", str(user_id)))
     return command
 
 
@@ -2467,6 +2459,8 @@ async def run_session(client):
         if not access:
             log(f"{event.chat_id}: ignored {_message_kind(event.message)} from {event.sender_id}")
             return
+        if getattr(event.message, "action", None) is not None:
+            return
         key = str(event.chat_id)
         text = _message_text(event.message)
         group_policy = access.get("policy")
@@ -2600,6 +2594,101 @@ async def run_session(client):
         if ent is not None:
             arm(key, ent)
 
+    # --- call listener (PyTgCalls on daemon's client) -----------------------------
+    calls = None
+    users = configured_call_recording_users()
+    if users["allowed_callers"]:
+        calls = PyTgCalls(client)
+        allowed_callers = set(users["allowed_callers"])
+        active_recording = {"task": None, "caller_id": None}
+        seen_invite_ids = set()
+
+        def recording_output(caller_id: int, mode: str) -> Path:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            return (STATE_HOME / "telegram" / CONNECTION / "calls" / "recordings"
+                    / f"{timestamp}-{mode}-{caller_id}.ogg")
+
+        async def record_call(caller_id: int, mode: str, call_config: CallConfig):
+            output = recording_output(caller_id, mode)
+            capture = output.with_suffix(".mp3")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            metadata_path = output.with_suffix(".json")
+            started_at = datetime.now(timezone.utc)
+            metadata = {
+                "connection": CONNECTION,
+                "caller_id": str(caller_id),
+                "mode": mode,
+                "started_at": started_at.isoformat(),
+                "output": str(output),
+            }
+            try:
+                metadata_path.write_text(json.dumps(metadata, indent=2))
+            except Exception:
+                pass
+            try:
+                await calls.record(caller_id, RecordStream(capture), config=call_config)
+                log(f"call: recording {mode} from {caller_id} to {output}")
+            except Exception as exc:
+                log(f"call: failed to start {mode} recording from {caller_id}: {exc}")
+                active_recording["task"] = None
+                active_recording["caller_id"] = None
+                return
+            # Recording started; it will continue until call ends
+            # PyTgCalls handles the capture, LEFT_CALL event will clean up
+
+        async def start_call_recording(caller_id: int, mode: str, call_config: CallConfig):
+            if active_recording["task"] is not None:
+                log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
+                return
+            task = asyncio.create_task(record_call(caller_id, mode, call_config))
+            active_recording["task"] = task
+            active_recording["caller_id"] = caller_id
+
+        @calls.on_update(filters.chat_update(ChatUpdate.Status.INCOMING_CALL))
+        async def incoming_p2p_call(_call_client: PyTgCalls, update: ChatUpdate):
+            caller_id = update.chat_id
+            if caller_id not in allowed_callers:
+                log(f"call: ignoring p2p from {caller_id} — not in allowed_callers")
+                return
+            await start_call_recording(caller_id, "p2p", CallConfig(timeout=60))
+
+        @calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))
+        async def call_ended(_call_client: PyTgCalls, update: ChatUpdate):
+            if active_recording["caller_id"] == update.chat_id:
+                log(f"call: ended from {update.chat_id}")
+                active_recording["task"] = None
+                active_recording["caller_id"] = None
+
+        @client.on(events.Raw)
+        async def conference_invite(event):
+            if not isinstance(event, UpdateNewMessage):
+                return
+            message = event.message
+            if not isinstance(message, MessageService):
+                return
+            action = getattr(message, "action", None)
+            if action is None:
+                return
+            caller_id = getattr(message, "sender_id", None)
+            if caller_id is None:
+                peer_id = getattr(message, "peer_id", None)
+                if peer_id is not None and hasattr(peer_id, "user_id"):
+                    caller_id = peer_id.user_id
+            if caller_id is None or caller_id not in allowed_callers:
+                return
+            if message.id in seen_invite_ids:
+                return
+            if isinstance(action, MessageActionConferenceCall) and not action.missed:
+                seen_invite_ids.add(message.id)
+                await start_call_recording(caller_id, "conference", CallConfig(conference=message.id))
+            elif isinstance(action, MessageActionInviteToGroupCall):
+                seen_invite_ids.add(message.id)
+                await start_call_recording(caller_id, "conference", CallConfig(conference=message.id))
+
+        with contextlib.redirect_stdout(sys.stderr):
+            await calls.start()
+        log(f"call listener: started on daemon client; allowed_callers={sorted(allowed_callers)}")
+
     log("live — reacting in real time. Ctrl-C to stop.")
     sync_task = asyncio.create_task(periodic_sync())
     disconnected_task = asyncio.create_task(client.run_until_disconnected())
@@ -2680,36 +2769,6 @@ async def supervise_call_recorder():
         await stop_call_recorder_process(process, "telegram daemon shutdown")
 
 
-async def supervise_call_listener():
-    command = call_listener_command()
-    if command is None:
-        return
-    backoff = 2
-    process = None
-    try:
-        while True:
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except OSError as exc:
-                log(f"call listener: cannot start ({_short_error(exc)}); retrying in {backoff}s")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-                continue
-            users = configured_call_recording_users()
-            log(f"call listener: started pid={process.pid} allowed_callers={users['allowed_callers']}")
-            return_code = await process.wait()
-            process = None
-            log(f"call listener: exited code={return_code}; retrying in {backoff}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-    finally:
-        await stop_call_recorder_process(process, "telegram daemon shutdown")
-
-
 async def main():
     """Supervise the session so neither a transient crash nor a missing login kills the
     daemon. Telegram's rolling MTProto schema can diverge from Telethon's generated
@@ -2734,7 +2793,6 @@ async def main():
     lock_handle = None
     wrote_pid = False
     call_recorder_task = None
-    call_listener_task = None
     try:
         if not CHANNEL_ENABLED:
             log("telegram channel disabled (TELEGRAM_SERVICE_ENABLED not truthy) — idling; "
@@ -2750,8 +2808,6 @@ async def main():
         write_health("starting", last_error=None)
         if call_recorder_command() is not None:
             call_recorder_task = asyncio.create_task(supervise_call_recorder())
-        if call_listener_command() is not None:
-            call_listener_task = asyncio.create_task(supervise_call_listener())
         while True:
             client = TelegramClient(str(SESSION), api_id, api_hash)
             try:
@@ -2790,10 +2846,6 @@ async def main():
             call_recorder_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await call_recorder_task
-        if call_listener_task is not None:
-            call_listener_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await call_listener_task
         if wrote_pid:
             with contextlib.suppress(OSError):
                 if PID_FILE.read_text().strip() == str(os.getpid()):
