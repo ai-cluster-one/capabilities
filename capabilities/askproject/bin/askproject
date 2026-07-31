@@ -30,8 +30,9 @@ COMMANDS
   askproject <target> --act "<task>"      Let the peer modify its own project.
   askproject <target> -c "<follow-up>"    Continue the last conversation with
                                           that target (resumes its session).
-  askproject targets                       List targets you've talked to (this
-                                          project) + their last session.
+  askproject targets [--json]              List targets you've talked to (this
+                                          project) + their last session. Add
+                                          --json for machine-readable output.
   askproject help                          Print this document.
 
 <target> is a path to the other project: absolute, ~-expanded, or relative to
@@ -60,18 +61,19 @@ snapshot (below) are your safety net.
 
 ────────────────────────────────────────────────────────────────────────────
 SESSION CONTINUITY  (state is LOCAL to the project you call from)
-  The map of "which target → which session" is written to:
-      <your-project-root>/.claude/askproject/sessions.json
-  (your-project-root = nearest ancestor with .git or .claude; else cwd.)
-  This is a config of YOUR project, not of the tool — it travels with the repo
-  that initiates the calls. It is git-ignored automatically (session ids are
-  machine-local). `-c/--continue` resumes the last session for that target;
-  add --fork to branch instead of continue.
+  The map of "which target → which session" is stored in your project:
+    - If capabilities/ exists and is configured: capabilities/askproject/state/
+    - Otherwise: ~/.local/state/askproject/<project-key>/
+
+  This state is local to YOUR project, not the targets. `-c/--continue` resumes
+  the last session for that target; add --fork to branch instead of continue.
 
   Scope a session to ONE unit of work — resume with -c only while on that
   same item; start a fresh call for a new one; use --fork to branch off an
   existing thread without polluting it. Sessions that span unrelated tasks
   just carry dead context and grow costly — short, task-scoped is optimal.
+  Use `askproject targets` to see which sessions exist and when they were
+  last used.
 
 ────────────────────────────────────────────────────────────────────────────
 OUTPUT  (stdout = one JSON object; use --text to get just the answer)
@@ -155,7 +157,7 @@ CRED_KEYS: list = []   # no credentials — it drives the local `claude` CLI on 
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/askproject/guides/")
 TOPICS = ["capability-changes"]   # shipped guide topics
-STATE = False       # the session map lives in the CALLING project's .claude/askproject/
+STATE = True        # session map lives in capabilities/askproject/state/ (or fallback)
 POST_INSTALL: list = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -599,37 +601,76 @@ def die(msg: str, *, as_json: bool, code: int = 1):
     sys.exit(code)
 
 
-def find_project_root(start: Path) -> Path:
-    """Nearest ancestor (incl. start) containing .git or .claude; else start."""
-    start = start.resolve()
-    for d in [start, *start.parents]:
+def _state_path() -> Path:
+    """State home following the standard project envelope convention.
+
+    For projects with a capabilities/ envelope, state lives inside it.
+    Otherwise state goes under _STATE_HOME with a project-keyed path.
+    """
+    root = _project_root()
+    if root is not None:
+        envelope = _project_capabilities_dir(root)
+        # Only use the project envelope if settings.json exists (it's configured)
+        if (envelope / "settings.json").is_file():
+            state_dir = envelope / NAME / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            return state_dir / "sessions.json"
+
+    # Fallback: state lives outside any project, keyed by project root path
+    if root is not None:
+        # Hash the root path for a stable filename
+        import hashlib
+        key = hashlib.sha256(str(root).encode()).hexdigest()[:16]
+        state_dir = _STATE_HOME / NAME / key
+    else:
+        # No project root at all (bare cwd) - use a default bucket
+        state_dir = _STATE_HOME / NAME / "default"
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / "sessions.json"
+
+
+def _legacy_state_path() -> Path | None:
+    """The old .claude/askproject/sessions.json location.
+    Returns None if no .git or .claude root exists (matching old behavior)."""
+    cwd = Path.cwd().resolve()
+    for d in [cwd, *cwd.parents]:
         if (d / ".git").exists() or (d / ".claude").exists():
-            return d
-    return start
-
-
-def state_path() -> Path:
-    root = find_project_root(Path.cwd())
-    d = root / ".claude" / "askproject"
-    d.mkdir(parents=True, exist_ok=True)
-    gi = d / ".gitignore"
-    if not gi.exists():
-        gi.write_text("# session ids are machine-local\nsessions.json\n")
-    return d / "sessions.json"
+            legacy = d / ".claude" / "askproject" / "sessions.json"
+            return legacy if legacy.exists() else None
+    return None
 
 
 def load_state() -> dict:
-    p = state_path()
+    """Load session state, migrating from legacy .claude/ location if needed."""
+    p = _state_path()
+
+    # Try the new path first
     if p.exists():
         try:
             return json.loads(p.read_text())
         except json.JSONDecodeError:
             return {}
+
+    # One-time migration from legacy path
+    legacy = _legacy_state_path()
+    if legacy and legacy.exists():
+        try:
+            data = json.loads(legacy.read_text())
+            # Migrate to new location
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(data, indent=2) + "\n")
+            return data
+        except (json.JSONDecodeError, OSError):
+            pass
+
     return {}
 
 
 def save_state(state: dict):
-    state_path().write_text(json.dumps(state, indent=2) + "\n")
+    p = _state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(state, indent=2) + "\n")
 
 
 def git(target: Path, *args) -> str | None:
@@ -1139,7 +1180,8 @@ def run(args):
         die(f"target is not a directory: {target}", as_json=as_json)
 
     mode = "act" if args.act else "read"
-    caller = find_project_root(Path.cwd()).name
+    root = _project_root()
+    caller = root.name if root else Path.cwd().name
 
     state = load_state()
     key = str(target)
@@ -1197,6 +1239,7 @@ def run(args):
         entry["last_model"] = res.get("model")
         entry["engine"] = engine
         entry["interactions"] = entry.get("interactions", 0) + 1
+        entry["last_used_at"] = time.time()
         state[key] = entry
         save_state(state)
 
@@ -1233,14 +1276,52 @@ def run(args):
 
 
 def cmd_targets():
+    import datetime
+    as_json = "--json" in sys.argv
     state = load_state()
+
     if not state:
-        print("no targets recorded for this project")
+        if as_json:
+            _emit({"targets": []})
+        else:
+            print("no targets recorded for this project")
         return
-    for k, v in state.items():
-        print(f"{k}")
-        print(f"  last_session: {v.get('last_session_id')}  engine: {v.get('engine', 'claude')}")
-        print(f"  model: {v.get('last_model')}  interactions: {v.get('interactions')}")
+
+    if as_json:
+        targets = []
+        for k, v in state.items():
+            entry = {
+                "target": k,
+                "last_session_id": v.get("last_session_id"),
+                "engine": v.get("engine", "claude"),
+                "model": v.get("last_model"),
+                "interactions": v.get("interactions", 0),
+            }
+            last_used = v.get("last_used_at")
+            if last_used:
+                entry["last_used_at"] = last_used
+                entry["last_used_iso"] = datetime.datetime.fromtimestamp(
+                    last_used, tz=datetime.timezone.utc
+                ).isoformat()
+            targets.append(entry)
+        _emit({"targets": targets})
+    else:
+        for k, v in state.items():
+            print(f"{k}")
+            parts = [
+                f"last_session: {v.get('last_session_id')}",
+                f"engine: {v.get('engine', 'claude')}",
+            ]
+            last_used = v.get("last_used_at")
+            if last_used:
+                dt = datetime.datetime.fromtimestamp(last_used, tz=datetime.timezone.utc)
+                parts.append(f"last_used: {dt.strftime('%Y-%m-%d %H:%M UTC')}")
+            print(f"  {parts[0]}  {parts[1]}")
+            print(f"  model: {v.get('last_model')}  interactions: {v.get('interactions', 0)}", end="")
+            if last_used:
+                print(f"  {parts[2]}")
+            else:
+                print()
 
 
 def cmd_doctor():
