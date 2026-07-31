@@ -56,8 +56,19 @@ import telethon
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageActionConferenceCall, MessageActionInviteToGroupCall, MessageService, UpdateNewMessage
 
+import pytgcalls
 from pytgcalls import PyTgCalls, filters
 from pytgcalls.types import CallConfig, ChatUpdate, RecordStream
+
+# Import shared call recording helpers (same directory)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from call_recording_helpers import (
+    finalize_mp3_capture,
+    iso_utc,
+    send_recording_to_chat,
+    write_metadata,
+)
+sys.path.pop(0)
 
 logging.getLogger("telethon").setLevel(logging.CRITICAL)
 
@@ -487,23 +498,10 @@ def configured_call_recording_users():
 
 
 def call_recorder_command():
-    groups = configured_call_recording_groups()
-    if not groups["auto"] and not groups["on_request"]:
-        return None
-    command = [
-        str(CALL_RECORDER_BIN),
-        "--watch-groups",
-        "--connection", CONNECTION,
-        "--project-root", str(PROJECT_ROOT),
-        "--request-dir", str(CALL_RECORDING_REQUEST_DIR),
-    ]
-    for chat_id in groups["auto"]:
-        command.extend(("--auto-group", str(chat_id)))
-    for chat_id in groups["on_request"]:
-        command.extend(("--request-group", str(chat_id)))
-    for chat_id in groups["send_to_chat"]:
-        command.extend(("--send-to-chat-group", str(chat_id)))
-    return command
+    # Group watching is now disabled — it must run on the daemon's client to avoid
+    # multiple update-consuming connections per account (which suppresses p2p call
+    # delivery). Integration onto the daemon client is pending.
+    return None
 
 
 def _policy_allowed_capabilities(policy):
@@ -2389,6 +2387,8 @@ async def run_session(client):
             for m in reversed(raw):
                 if getattr(m, "out", False):
                     continue
+                if getattr(m, "action", None) is not None:
+                    continue
                 if _message_is_known(reg, key, m.id):
                     continue
                 is_direct = group_policy is None
@@ -2595,12 +2595,26 @@ async def run_session(client):
             arm(key, ent)
 
     # --- call listener (PyTgCalls on daemon's client) -----------------------------
+    # P2P call recording for allowed direct-message callers. Group call recording
+    # was previously run as a separate subprocess (call_recorder.py --watch-groups),
+    # but that created a second update-consuming Telethon connection which suppressed
+    # p2p call delivery. Group watching is now disabled until re-implemented on this
+    # same client/PyTgCalls instance.
     calls = None
     users = configured_call_recording_users()
     if users["allowed_callers"]:
         calls = PyTgCalls(client)
         allowed_callers = set(users["allowed_callers"])
-        active_recording = {"task": None, "caller_id": None}
+        active_recording = {
+            "task": None,
+            "caller_id": None,
+            "output": None,
+            "capture": None,
+            "metadata_path": None,
+            "metadata": None,
+            "started_at": None,
+            "mode": None,
+        }
         seen_invite_ids = set()
 
         def recording_output(caller_id: int, mode: str) -> Path:
@@ -2615,26 +2629,83 @@ async def run_session(client):
             metadata_path = output.with_suffix(".json")
             started_at = datetime.now(timezone.utc)
             metadata = {
+                "schema_version": 3,
+                "status": "joining",
                 "connection": CONNECTION,
                 "caller_id": str(caller_id),
                 "mode": mode,
-                "started_at": started_at.isoformat(),
-                "output": str(output),
+                "started_at": iso_utc(started_at),
+                "recording_started_at": None,
+                "recording_ended_at": None,
+                "duration_seconds": None,
+                "stop_reason": None,
+                "audio": {
+                    "path": str(output),
+                    "format": output.suffix.lstrip("."),
+                    "codec": "opus",
+                    "bytes": 0,
+                    "settled": False,
+                    "capture_method": "pytgcalls_mp3_then_ffmpeg_ogg",
+                    "source": {
+                        "path": str(capture),
+                        "format": "mp3",
+                        "bytes": 0,
+                        "retained": False,
+                    },
+                    "conversion": {
+                        "status": "pending",
+                        "error": None,
+                    },
+                },
+                "delivery": {
+                    "enabled": True,
+                    "status": "pending",
+                    "attempts": 0,
+                    "message_id": None,
+                    "sent_at": None,
+                    "error": None,
+                },
             }
-            try:
-                metadata_path.write_text(json.dumps(metadata, indent=2))
-            except Exception:
-                pass
+            write_metadata(metadata_path, metadata)
+
+            active_recording.update({
+                "caller_id": caller_id,
+                "output": output,
+                "capture": capture,
+                "metadata_path": metadata_path,
+                "metadata": metadata,
+                "started_at": started_at,
+                "mode": mode,
+            })
+
             try:
                 await calls.record(caller_id, RecordStream(capture), config=call_config)
+                metadata["status"] = "recording"
+                metadata["recording_started_at"] = iso_utc()
+                write_metadata(metadata_path, metadata)
                 log(f"call: recording {mode} from {caller_id} to {output}")
             except Exception as exc:
                 log(f"call: failed to start {mode} recording from {caller_id}: {exc}")
-                active_recording["task"] = None
-                active_recording["caller_id"] = None
+                metadata.update({
+                    "status": "join_failed",
+                    "stop_reason": "join_failed",
+                })
+                metadata["delivery"].update({
+                    "status": "skipped",
+                    "error": "join_failed",
+                })
+                write_metadata(metadata_path, metadata)
+                active_recording.update({
+                    "task": None,
+                    "caller_id": None,
+                    "output": None,
+                    "capture": None,
+                    "metadata_path": None,
+                    "metadata": None,
+                    "started_at": None,
+                    "mode": None,
+                })
                 return
-            # Recording started; it will continue until call ends
-            # PyTgCalls handles the capture, LEFT_CALL event will clean up
 
         async def start_call_recording(caller_id: int, mode: str, call_config: CallConfig):
             if active_recording["task"] is not None:
@@ -2642,7 +2713,6 @@ async def run_session(client):
                 return
             task = asyncio.create_task(record_call(caller_id, mode, call_config))
             active_recording["task"] = task
-            active_recording["caller_id"] = caller_id
 
         @calls.on_update(filters.chat_update(ChatUpdate.Status.INCOMING_CALL))
         async def incoming_p2p_call(_call_client: PyTgCalls, update: ChatUpdate):
@@ -2654,10 +2724,95 @@ async def run_session(client):
 
         @calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))
         async def call_ended(_call_client: PyTgCalls, update: ChatUpdate):
-            if active_recording["caller_id"] == update.chat_id:
-                log(f"call: ended from {update.chat_id}")
-                active_recording["task"] = None
-                active_recording["caller_id"] = None
+            if active_recording["caller_id"] != update.chat_id:
+                return
+
+            caller_id = update.chat_id
+            output = active_recording["output"]
+            capture = active_recording["capture"]
+            metadata_path = active_recording["metadata_path"]
+            metadata = active_recording["metadata"]
+            started_at = active_recording["started_at"]
+            mode = active_recording["mode"]
+
+            log(f"call: ended from {caller_id}")
+
+            # Clear active state immediately
+            active_recording.update({
+                "task": None,
+                "caller_id": None,
+                "output": None,
+                "capture": None,
+                "metadata_path": None,
+                "metadata": None,
+                "started_at": None,
+                "mode": None,
+            })
+
+            if output is None or capture is None or metadata is None:
+                log(f"call: cannot finalize — incomplete recording state")
+                return
+
+            # Finalize: convert MP3→OGG
+            recording_ended_at = iso_utc()
+            wall_duration = (datetime.now(timezone.utc) - started_at).total_seconds()
+
+            finalized = await finalize_mp3_capture(capture, output)
+            status = "complete" if finalized["status"] == "complete" else "conversion_failed"
+            media_duration = finalized.get("duration_seconds") or wall_duration
+
+            metadata.update({
+                "status": status,
+                "recording_ended_at": recording_ended_at,
+                "duration_seconds": media_duration,
+                "wall_duration_seconds": round(wall_duration, 3),
+                "stop_reason": "call_closed",
+            })
+            metadata["audio"]["bytes"] = finalized["output_bytes"]
+            metadata["audio"]["settled"] = finalized["status"] == "complete"
+            metadata["audio"]["source"].update({
+                "bytes": finalized["source_bytes"],
+                "retained": finalized["source_retained"],
+            })
+            metadata["audio"]["conversion"].update({
+                "status": finalized["status"],
+                "error": finalized["error"],
+            })
+            if finalized.get("cleanup_error"):
+                metadata["audio"]["source"]["cleanup_error"] = finalized["cleanup_error"]
+
+            # Empty-capture guard (same as conference path in call_recorder.py)
+            MIN_BYTES = 1024
+            MIN_DURATION = 1.0
+            is_empty = (
+                finalized["status"] == "complete"
+                and (finalized["output_bytes"] < MIN_BYTES or (media_duration or 0) < MIN_DURATION)
+            )
+
+            if is_empty:
+                metadata["delivery"].update({
+                    "status": "skipped",
+                    "error": "audio_not_received",
+                })
+                write_metadata(metadata_path, metadata)
+                log(f"call: recording empty (bytes={finalized['output_bytes']}, duration={media_duration:.1f}s) — not delivered")
+            else:
+                write_metadata(metadata_path, metadata)
+                # Deliver to caller's direct chat
+                if metadata["delivery"]["enabled"] and finalized["status"] == "complete":
+                    await send_recording_to_chat(
+                        client,
+                        caller_id,
+                        output,
+                        metadata_path,
+                        metadata,
+                        emit_event_fn=lambda event, **fields: log(f"call-delivery: {event} {fields}"),
+                    )
+                    log(f"call: recording delivered to {caller_id}")
+                elif finalized["status"] != "complete":
+                    log(f"call: recording conversion failed — {finalized['error']}")
+                else:
+                    log(f"call: recording complete, delivery disabled")
 
         @client.on(events.Raw)
         async def conference_invite(event):
@@ -2680,10 +2835,20 @@ async def run_session(client):
                 return
             if isinstance(action, MessageActionConferenceCall) and not action.missed:
                 seen_invite_ids.add(message.id)
-                await start_call_recording(caller_id, "conference", CallConfig(conference=message.id))
+                try:
+                    call_config = CallConfig(conference=message.id)
+                except TypeError:
+                    log(f"call: conference recording unavailable on py-tgcalls {getattr(pytgcalls, '__version__', 'unknown')} — upgrade to 3.x needed")
+                    return
+                await start_call_recording(caller_id, "conference", call_config)
             elif isinstance(action, MessageActionInviteToGroupCall):
                 seen_invite_ids.add(message.id)
-                await start_call_recording(caller_id, "conference", CallConfig(conference=message.id))
+                try:
+                    call_config = CallConfig(conference=message.id)
+                except TypeError:
+                    log(f"call: conference recording unavailable on py-tgcalls {getattr(pytgcalls, '__version__', 'unknown')} — upgrade to 3.x needed")
+                    return
+                await start_call_recording(caller_id, "conference", call_config)
 
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
