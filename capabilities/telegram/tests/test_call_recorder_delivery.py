@@ -89,6 +89,8 @@ def fake_runtime_modules():
         "MessageActionConferenceCall",
         "MessageActionGroupCall",
         "MessageActionInviteToGroupCall",
+        "MessageService",
+        "UpdateNewMessage",
     ):
         setattr(telethon_types, name, DummyType)
     modules["telethon.tl.types"] = telethon_types

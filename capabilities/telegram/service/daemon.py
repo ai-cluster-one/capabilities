@@ -462,6 +462,23 @@ def configured_call_recording_groups():
     return groups
 
 
+def configured_call_recording_users():
+    users = {"allowed_callers": []}
+    for key, raw_policy in ALLOWED.items():
+        policy = raw_policy if isinstance(raw_policy, dict) else {}
+        call_policy = _as_mapping(policy.get("call_recording"))
+        mode = str(call_policy.get("mode") or "disabled").strip().lower()
+        if mode in ("enabled", "auto", "on"):
+            try:
+                user_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            if user_id > 0:
+                users["allowed_callers"].append(user_id)
+    users["allowed_callers"].sort()
+    return users
+
+
 def call_recorder_command():
     groups = configured_call_recording_groups()
     if not groups["auto"] and not groups["on_request"]:
@@ -479,6 +496,21 @@ def call_recorder_command():
         command.extend(("--request-group", str(chat_id)))
     for chat_id in groups["send_to_chat"]:
         command.extend(("--send-to-chat-group", str(chat_id)))
+    return command
+
+
+def call_listener_command():
+    users = configured_call_recording_users()
+    if not users["allowed_callers"]:
+        return None
+    command = [
+        str(CALL_RECORDER_BIN),
+        "--listen",
+        "--connection", CONNECTION,
+        "--project-root", str(PROJECT_ROOT),
+    ]
+    for user_id in users["allowed_callers"]:
+        command.extend(("--caller", str(user_id)))
     return command
 
 
@@ -2648,6 +2680,36 @@ async def supervise_call_recorder():
         await stop_call_recorder_process(process, "telegram daemon shutdown")
 
 
+async def supervise_call_listener():
+    command = call_listener_command()
+    if command is None:
+        return
+    backoff = 2
+    process = None
+    try:
+        while True:
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                log(f"call listener: cannot start ({_short_error(exc)}); retrying in {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            users = configured_call_recording_users()
+            log(f"call listener: started pid={process.pid} allowed_callers={users['allowed_callers']}")
+            return_code = await process.wait()
+            process = None
+            log(f"call listener: exited code={return_code}; retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+    finally:
+        await stop_call_recorder_process(process, "telegram daemon shutdown")
+
+
 async def main():
     """Supervise the session so neither a transient crash nor a missing login kills the
     daemon. Telegram's rolling MTProto schema can diverge from Telethon's generated
@@ -2672,6 +2734,7 @@ async def main():
     lock_handle = None
     wrote_pid = False
     call_recorder_task = None
+    call_listener_task = None
     try:
         if not CHANNEL_ENABLED:
             log("telegram channel disabled (TELEGRAM_SERVICE_ENABLED not truthy) — idling; "
@@ -2687,6 +2750,8 @@ async def main():
         write_health("starting", last_error=None)
         if call_recorder_command() is not None:
             call_recorder_task = asyncio.create_task(supervise_call_recorder())
+        if call_listener_command() is not None:
+            call_listener_task = asyncio.create_task(supervise_call_listener())
         while True:
             client = TelegramClient(str(SESSION), api_id, api_hash)
             try:
@@ -2725,6 +2790,10 @@ async def main():
             call_recorder_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await call_recorder_task
+        if call_listener_task is not None:
+            call_listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call_listener_task
         if wrote_pid:
             with contextlib.suppress(OSError):
                 if PID_FILE.read_text().strip() == str(os.getpid()):

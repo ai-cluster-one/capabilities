@@ -2,7 +2,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "py-tgcalls==2.3.3",
+#     "py-tgcalls==3.0.0.dev4",
+#     "ntgcalls==3.0.0b14",
 #     "telethon==1.43.2",
 # ]
 # ///
@@ -58,6 +59,8 @@ from telethon.tl.types import (
     MessageActionConferenceCall,
     MessageActionGroupCall,
     MessageActionInviteToGroupCall,
+    MessageService,
+    UpdateNewMessage,
 )
 
 
@@ -1390,7 +1393,7 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
     active: dict | None = None
     failure: str | None = None
     stop_reason = "signal"
-    conference_poll_task: asyncio.Task | None = None
+    seen_invite_message_ids: set[int] = set()
 
     async def start_recording(
         call_client: PyTgCalls,
@@ -1409,26 +1412,64 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
         output = (Path(args.output).expanduser().resolve() if args.output
                   else default_output(config["id"], f"{mode}-{caller_id}"))
         capture = mp3_capture_path(output)
-        existing = next((path for path in (output, capture) if path.exists()), None)
+        metadata_path = output.with_suffix(".json")
+        existing = next((path for path in (output, capture, metadata_path) if path.exists()), None)
         if existing is not None:
             failure = f"recording already exists: {existing}"
             stop_event.set()
             return
         output.parent.mkdir(parents=True, exist_ok=True)
-        if call_ref is not None:
-            bridge = getattr(getattr(call_client, "_app", None), "_bind_client", None)
-            cache = getattr(bridge, "_cache", None)
-            if cache is None:
-                failure = "PyTgCalls conference-call cache is unavailable"
-                stop_event.set()
-                return
-            cache.set_cache(caller_id, call_ref)
+        detected_at = iso_utc()
+        metadata = {
+            "schema_version": 3,
+            "status": "joining",
+            "connection": config["id"],
+            "account_id": str((await client.get_me()).id),
+            "caller_id": str(caller_id),
+            "mode": mode,
+            "source_message_id": source_message_id,
+            "detected_at": detected_at,
+            "recording_started_at": None,
+            "recording_ended_at": None,
+            "duration_seconds": None,
+            "stop_reason": None,
+            "audio": {
+                "path": str(output),
+                "format": output.suffix.lstrip("."),
+                "codec": "opus",
+                "bytes": 0,
+                "settled": False,
+                "capture_method": "pytgcalls_mp3_then_ffmpeg_ogg",
+                "source": {
+                    "path": str(capture),
+                    "format": "mp3",
+                    "bytes": 0,
+                    "retained": False,
+                },
+                "conversion": {
+                    "status": "pending",
+                    "error": None,
+                },
+            },
+            "delivery": {
+                "enabled": True,
+                "status": "pending",
+                "attempts": 0,
+                "message_id": None,
+                "sent_at": None,
+                "error": None,
+            },
+        }
+        write_metadata(metadata_path, metadata)
+
         active = {
             "caller_id": caller_id,
             "mode": mode,
             "source_message_id": source_message_id,
             "output": output,
             "capture": capture,
+            "metadata_path": metadata_path,
+            "metadata": metadata,
             "started_at": time.time(),
         }
         emit_event(
@@ -1438,11 +1479,10 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             source_message_id=source_message_id,
         )
         try:
-            call_config = (
-                GroupCallConfig(auto_start=False)
-                if call_ref is not None
-                else CallConfig(timeout=60)
-            )
+            if mode == "conference":
+                call_config = CallConfig(conference=source_message_id)
+            else:
+                call_config = CallConfig(timeout=60)
             await call_client.record(
                 caller_id,
                 built_in_record_stream(capture),
@@ -1450,23 +1490,47 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             )
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"
+            metadata.update({
+                "status": "join_failed",
+                "stop_reason": "join_failed",
+            })
+            metadata["delivery"].update({
+                "status": "skipped",
+                "error": "join_failed",
+            })
+            write_metadata(metadata_path, metadata)
             emit_event("recording_failed", caller_id=caller_id, mode=mode, error=failure)
             stop_event.set()
             return
+
+        recording_started_at = iso_utc()
+        metadata.update({
+            "status": "recording",
+            "recording_started_at": recording_started_at,
+        })
+        write_metadata(metadata_path, metadata)
         emit_event(
             "recording_started",
             connection=config["id"],
             caller_id=caller_id,
             mode=mode,
             output=str(output),
+            metadata=str(metadata_path),
         )
 
     async def handle_conference_message(call_client: PyTgCalls, message) -> bool:
         action = getattr(message, "action", None)
         caller_id = getattr(message, "sender_id", None)
+        if caller_id is None:
+            peer_id = getattr(message, "peer_id", None)
+            if peer_id is not None and hasattr(peer_id, "user_id"):
+                caller_id = peer_id.user_id
         if caller_id is None or (allowed_callers and caller_id not in allowed_callers):
             return False
-        if isinstance(action, MessageActionConferenceCall) and action.active:
+        if message.id in seen_invite_message_ids:
+            return False
+        if isinstance(action, MessageActionConferenceCall) and not action.missed:
+            seen_invite_message_ids.add(message.id)
             await start_recording(
                 call_client,
                 caller_id,
@@ -1476,6 +1540,7 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             )
             return True
         if isinstance(action, MessageActionInviteToGroupCall):
+            seen_invite_message_ids.add(message.id)
             await start_recording(
                 call_client,
                 caller_id,
@@ -1486,9 +1551,27 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             return True
         return False
 
-    @client.on(events.NewMessage(incoming=True))
+    @client.on(events.Raw)
     async def conference_invite(event):
-        await handle_conference_message(calls, event.message)
+        if not isinstance(event, UpdateNewMessage):
+            return
+        message = event.message
+        if not isinstance(message, MessageService):
+            return
+        action = getattr(message, "action", None)
+        if action is not None:
+            emit_event(
+                "service_message_seen",
+                message_id=message.id,
+                sender_id=getattr(message, "sender_id", None),
+                peer_id=str(getattr(message, "peer_id", None)),
+                action=type(action).__name__,
+                active=getattr(action, "active", None),
+                missed=getattr(action, "missed", None),
+                video=getattr(action, "video", None),
+                duration=getattr(action, "duration", None),
+            )
+        await handle_conference_message(calls, message)
 
     @calls.on_update(filters.chat_update(ChatUpdate.Status.INCOMING_CALL))
     async def incoming_call(call_client: PyTgCalls, update: ChatUpdate):
@@ -1500,38 +1583,6 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
         if active is not None and update.chat_id == active["caller_id"]:
             stop_reason = "call_closed"
             stop_event.set()
-
-    async def poll_conference_cache() -> None:
-        bridge = getattr(getattr(calls, "_app", None), "_bind_client", None)
-        cache = getattr(bridge, "_cache", None)
-        if cache is None:
-            return
-        while not stop_event.is_set():
-            if active is None:
-                for caller_id in sorted(allowed_callers):
-                    call_ref = await cache.get_input_call(caller_id)
-                    if type(call_ref).__name__ not in {
-                        "InputGroupCall",
-                        "InputGroupCallInviteMessage",
-                        "InputGroupCallSlug",
-                    }:
-                        continue
-                    emit_event(
-                        "conference_call_cached",
-                        caller_id=caller_id,
-                        call_ref_type=type(call_ref).__name__,
-                    )
-                    await start_recording(
-                        calls,
-                        caller_id,
-                        "conference",
-                        call_ref=call_ref,
-                    )
-                    break
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=0.25)
-            except asyncio.TimeoutError:
-                pass
 
     try:
         await client.connect()
@@ -1547,7 +1598,6 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             account=getattr(me, "username", None) or str(me.id),
             callers=sorted(allowed_callers),
         )
-        conference_poll_task = asyncio.create_task(poll_conference_cache())
         if args.invite_link:
             if len(allowed_callers) != 1:
                 raise RecorderError(
@@ -1595,7 +1645,72 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
         with contextlib.suppress(NotInCallError, NoActiveGroupCall, RPCError):
             await calls.leave_call(caller_id)
         output = active["output"]
-        finalized = await finalize_mp3_capture(active["capture"], output)
+        metadata = active["metadata"]
+        metadata_path = active["metadata_path"]
+        capture = active["capture"]
+        mode = active["mode"]
+        wall_duration = round(time.time() - active["started_at"], 3)
+        recording_ended_at = iso_utc()
+
+        finalized = await finalize_mp3_capture(capture, output)
+        status = "complete" if finalized["status"] == "complete" else "conversion_failed"
+        media_duration = finalized.get("duration_seconds") or wall_duration
+
+        metadata.update({
+            "status": status,
+            "recording_ended_at": recording_ended_at,
+            "duration_seconds": media_duration,
+            "wall_duration_seconds": wall_duration,
+            "stop_reason": stop_reason,
+        })
+        metadata["audio"]["bytes"] = finalized["output_bytes"]
+        metadata["audio"]["settled"] = finalized["status"] == "complete"
+        metadata["audio"]["source"].update({
+            "bytes": finalized["source_bytes"],
+            "retained": finalized["source_retained"],
+        })
+        metadata["audio"]["conversion"].update({
+            "status": finalized["status"],
+            "error": finalized["error"],
+        })
+        if finalized.get("cleanup_error"):
+            metadata["audio"]["source"]["cleanup_error"] = finalized["cleanup_error"]
+
+        MIN_CONFERENCE_BYTES = 1024
+        MIN_CONFERENCE_DURATION = 1.0
+        is_conference = mode == "conference"
+        is_empty_conference = (
+            is_conference
+            and finalized["status"] == "complete"
+            and (finalized["output_bytes"] < MIN_CONFERENCE_BYTES
+                 or (media_duration or 0) < MIN_CONFERENCE_DURATION)
+        )
+
+        if is_empty_conference:
+            metadata["delivery"].update({
+                "status": "skipped",
+                "error": "conference_audio_not_received",
+            })
+            write_metadata(metadata_path, metadata)
+            emit_event(
+                "conference_recording_empty",
+                caller_id=caller_id,
+                output=str(output),
+                bytes=finalized["output_bytes"],
+                duration_seconds=media_duration,
+                wall_duration_seconds=wall_duration,
+            )
+        else:
+            write_metadata(metadata_path, metadata)
+            if metadata["delivery"]["enabled"]:
+                await send_recording_to_chat(
+                    client,
+                    caller_id,
+                    output,
+                    metadata_path,
+                    metadata,
+                )
+
         if finalized["status"] != "complete" and failure is None:
             failure = finalized["error"] or "recording conversion failed"
         result = {
@@ -1604,18 +1719,17 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             "connection": config["id"],
             "caller_id": caller_id,
             "output": str(output),
+            "metadata": str(metadata_path),
             "bytes": finalized["output_bytes"],
-            "duration_seconds": round(time.time() - active["started_at"], 3),
+            "duration_seconds": media_duration,
+            "wall_duration_seconds": wall_duration,
             "stopped": stop_reason,
+            "empty_conference": is_empty_conference,
         }
         if failure:
             result["error"] = failure
         return result
     finally:
-        if conference_poll_task is not None:
-            conference_poll_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await conference_poll_task
         if client.is_connected():
             await client.disconnect()
 
