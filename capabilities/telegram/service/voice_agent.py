@@ -100,39 +100,99 @@ def live_config(system_instruction, voice):
     }
 
 
-class _TrackWriter:
-    """One speaker's PCM track, padded with silence up to the shared origin."""
+def _sample_bytes(seconds, rate):
+    """Byte offset of a moment in a mono s16 track, on a sample boundary."""
+    return max(0, int(max(0.0, seconds) * rate)) * 2
 
-    def __init__(self, path, rate, origin):
+
+def _write_silence(handle, size):
+    while size > 0:
+        block = min(size, 1 << 20)
+        handle.write(b"\x00" * block)
+        size -= block
+
+
+class _TrackWriter:
+    """One speaker's PCM track, laid on the session's shared time origin.
+
+    Leading silence is resolved when the track is sealed, never when its first
+    payload lands. A live inbound stream can hand over audio that already covers
+    part of the interval since the origin — PyTgCalls dispatches no incoming
+    frame until the outbound slot is up, then flushes everything it buffered
+    meanwhile — so padding by the delay measured at the first write counts that
+    interval twice and drags the speaker later than they spoke. The audio's own
+    length places it instead: a track can have begun no later than its first
+    write, and no later than its last write minus everything it carries.
+    """
+
+    def __init__(self, path, rate, origin, clock=time.monotonic):
         self.path = path
         self.rate = rate
         self.origin = origin
         self.bytes = 0
+        self.payload_bytes = 0
+        self.lead_bytes = 0
+        self._clock = clock
+        self._first_write = None
+        self._last_write = None
         path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = path.open("wb")
-        self._started = False
 
     def write(self, payload):
         if self._handle is None:
             return
-        if not self._started:
-            self._started = True
-            lead = max(0.0, time.monotonic() - self.origin)
-            padding = int(lead * self.rate) * 2
-            if padding:
-                self._handle.write(b"\x00" * padding)
-                self.bytes += padding
+        self._last_write = self._clock() - self.origin
+        if self._first_write is None:
+            self._first_write = self._last_write
         self._handle.write(payload)
-        self.bytes += len(payload)
+        self.payload_bytes += len(payload)
 
     def close(self):
         if self._handle is not None:
             self._handle.close()
             self._handle = None
 
+    def seal(self, window_seconds):
+        """Close the track and place it in the call's window: leading silence up
+        to its first real sample, trailing silence to the end of the call. Both
+        tracks of a call seal to the same window, so joining them at t=0 aligns
+        the two speakers instead of shifting one against the other. A track that
+        never received audio stays empty, so the empty-track guard still sees it.
+        """
+        self.close()
+        if not self.payload_bytes:
+            self.bytes = 0
+            return
+        window = _sample_bytes(window_seconds, self.rate)
+        payload = min(self.payload_bytes, window)
+        lead = min(_sample_bytes(self._first_write, self.rate),
+                   _sample_bytes(self._last_write, self.rate) - payload)
+        lead = max(0, min(lead, window - payload))
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        with self.path.open("rb") as source, temporary.open("wb") as target:
+            _write_silence(target, lead)
+            # Audio beyond the window can only be over-delivery at the head; the
+            # stream's last sample is current, so the newest audio is the kept one.
+            source.seek(self.payload_bytes - payload)
+            remaining = payload
+            while remaining > 0:
+                chunk = source.read(min(remaining, 1 << 20))
+                if not chunk:
+                    break
+                target.write(chunk)
+                remaining -= len(chunk)
+            _write_silence(target, window - lead - payload)
+        os.replace(temporary, self.path)
+        self.lead_bytes = lead
+        self.bytes = self.path.stat().st_size
+
     @property
     def duration_seconds(self):
         return self.bytes / (self.rate * 2)
+
+    @property
+    def lead_seconds(self):
+        return self.lead_bytes / (self.rate * 2)
 
 
 class VoiceCallSession:
@@ -162,6 +222,7 @@ class VoiceCallSession:
         # One time origin for both tracks, fixed before the call is answered, so
         # caller audio arriving the instant record() lands is already on it.
         self.origin = time.monotonic()
+        self.window_seconds = None
         self._caller_writer = (
             _TrackWriter(caller_track, CALLER_RATE, self.origin)
             if caller_track is not None else None)
@@ -320,14 +381,17 @@ class VoiceCallSession:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        # The window closes once nothing can write any more, before the slower
+        # Gemini teardown, so both tracks are sealed to the call's own length.
+        self.window_seconds = time.monotonic() - self.origin
+        for writer in (self._caller_writer, self._agent_writer):
+            if writer is not None:
+                writer.seal(self.window_seconds)
         if self._stack is not None:
             with contextlib.suppress(Exception):
                 await self._stack.aclose()
             self._stack = None
         self._live = None
-        for writer in (self._caller_writer, self._agent_writer):
-            if writer is not None:
-                writer.close()
         return self.summary()
 
     def transcript(self):
@@ -366,6 +430,7 @@ class VoiceCallSession:
                 "path": str(writer.path),
                 "bytes": writer.bytes,
                 "duration_seconds": round(writer.duration_seconds, 3),
+                "lead_seconds": round(writer.lead_seconds, 3),
             })
         return rows
 

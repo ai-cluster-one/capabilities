@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+from array import array
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -114,6 +115,107 @@ def tone_pcm(rate, seconds, frequency, amplitude):
     )
 
 
+def marker_pcm(rate, seconds, marker_from, marker_to, frequency, amplitude):
+    """Silence for the whole span except one tone burst, so the burst is the
+    only energy in the track and its position is measurable after encoding."""
+    samples = array("h", bytes(2 * int(rate * seconds)))
+    for n in range(int(rate * marker_from), int(rate * marker_to)):
+        samples[n] = int(amplitude * math.sin(2 * math.pi * frequency * n / rate))
+    return samples.tobytes()
+
+
+class FakeClock:
+    """A monotonic clock the test drives, so track alignment is arithmetic
+    rather than a race with the scheduler."""
+
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+# One call replayed on the fake clock: the media slot opens half a second after
+# the session origin, both speakers carry a tone burst over exactly the same
+# real second, and the call runs to 3.5 s. The agent track is generated live —
+# a 10 ms frame per tick. The caller track is a real inbound stream: PyTgCalls
+# dispatches nothing until the outbound slot is up at 2.5 s, then flushes the
+# two seconds it buffered and continues live.
+WINDOW = 4.0
+SLOT_OPEN = 0.5
+MARKER_FROM = 1.5
+MARKER_TO = 2.5
+AUDIO_END = 3.5
+FRAME = 0.01
+
+
+def replay_agent_track(writer, clock, rate):
+    payload = marker_pcm(rate, AUDIO_END - SLOT_OPEN,
+                         MARKER_FROM - SLOT_OPEN, MARKER_TO - SLOT_OPEN, 900, 6000)
+    stride = int(rate * FRAME) * 2
+    clock.now = SLOT_OPEN
+    for start in range(0, len(payload), stride):
+        writer.write(payload[start:start + stride])
+        clock.advance(FRAME)
+
+
+def replay_caller_track(writer, clock, rate):
+    payload = marker_pcm(rate, AUDIO_END - SLOT_OPEN,
+                         MARKER_FROM - SLOT_OPEN, MARKER_TO - SLOT_OPEN, 300, 9000)
+    flush_at = MARKER_TO
+    backlog = int(rate * (flush_at - SLOT_OPEN)) * 2
+    stride = int(rate * FRAME) * 2
+    clock.now = flush_at
+    writer.write(payload[:backlog])
+    clock.advance(FRAME)
+    for start in range(backlog, len(payload), stride):
+        writer.write(payload[start:start + stride])
+        clock.advance(FRAME)
+
+
+def build_offset_tracks(va, caller_pcm, agent_pcm):
+    clock = FakeClock()
+    caller = va._TrackWriter(caller_pcm, va.CALLER_RATE, 0.0, clock=clock)
+    agent = va._TrackWriter(agent_pcm, va.AGENT_RATE, 0.0, clock=clock)
+    replay_agent_track(agent, clock, va.AGENT_RATE)
+    replay_caller_track(caller, clock, va.CALLER_RATE)
+    caller.seal(WINDOW)
+    agent.seal(WINDOW)
+    return caller, agent
+
+
+def first_sound_seconds(path, rate):
+    """Where the tone burst sits in a raw mono track that is otherwise silent."""
+    samples = array("h")
+    samples.frombytes(path.read_bytes())
+    return next(index for index, value in enumerate(samples) if value) / rate
+
+
+def channel_onsets(path, rate=16000, block=0.01):
+    """First moment each stereo channel carries real energy."""
+    decoded = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path),
+         "-f", "s16le", "-ar", str(rate), "-ac", "2", "-"],
+        capture_output=True, check=True).stdout
+    interleaved = array("h")
+    interleaved.frombytes(decoded)
+    span = int(rate * block)
+    onsets = []
+    for channel in (0, 1):
+        samples = interleaved[channel::2]
+        energies = [
+            max(abs(value) for value in samples[start:start + span])
+            for start in range(0, len(samples) - span, span)
+        ]
+        threshold = max(energies) * 0.25
+        onsets.append(next(index for index, value in enumerate(energies)
+                           if value >= threshold) * block)
+    return onsets
+
+
 class VoiceAgentMediaTests(unittest.IsolatedAsyncioTestCase):
     async def test_outbound_pump_sends_silence_when_nothing_is_buffered(self):
         with fake_runtime_modules():
@@ -192,17 +294,104 @@ class VoiceAgentMediaTests(unittest.IsolatedAsyncioTestCase):
                     caller_track=caller_pcm, log=lambda *_: None)
                 payload = b"\x33" * va.CALLER_FRAME_BYTES
                 session.on_incoming_frames([Frame(frame=payload) for _ in range(10)])
+                await asyncio.sleep(0.15)
                 await session.stop()
                 written = caller_pcm.read_bytes()
 
         self.assertEqual(session.caller_bytes, va.CALLER_FRAME_BYTES * 10)
         self.assertEqual(session._input_queue.qsize(), 1)
-        self.assertTrue(written.endswith(payload * 10))
+        self.assertTrue(written.startswith(payload * 10))
+
+    async def test_both_tracks_seal_to_the_same_call_window(self):
+        with fake_runtime_modules() as Frame:
+            va = import_voice_agent()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                session = va.VoiceCallSession(
+                    RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                    system_instruction="s", caller_name="Caller",
+                    caller_track=root / "caller.pcm", agent_track=root / "agent.pcm",
+                    log=lambda *_: None)
+                session.start_pump()
+                await asyncio.sleep(0.1)
+                session.on_incoming_frames(
+                    [Frame(frame=b"\x33" * va.CALLER_FRAME_BYTES) for _ in range(5)])
+                await asyncio.sleep(0.1)
+                await session.stop()
+                tracks = session.tracks
+
+        durations = {track["kind"]: track["duration_seconds"] for track in tracks}
+        self.assertAlmostEqual(durations["caller"], durations["agent"], delta=0.001)
+        for duration in durations.values():
+            self.assertLessEqual(duration, session.window_seconds + 0.001)
+
+
+class TrackAlignmentTests(unittest.TestCase):
+    def test_leading_silence_counts_the_delay_to_the_first_sample_once(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                caller, agent = build_offset_tracks(
+                    va, root / "caller.pcm", root / "agent.pcm")
+                marks = (first_sound_seconds(caller.path, va.CALLER_RATE),
+                         first_sound_seconds(agent.path, va.AGENT_RATE))
+
+        # The caller's stream was dispatched two seconds late but carried those
+        # two seconds with it: its silence is the real delay, not the delay plus
+        # the audio that already covered it.
+        self.assertAlmostEqual(caller.lead_seconds, SLOT_OPEN, delta=2 * FRAME)
+        self.assertAlmostEqual(agent.lead_seconds, SLOT_OPEN, delta=2 * FRAME)
+        for mark in marks:
+            self.assertAlmostEqual(mark, MARKER_FROM, delta=2 * FRAME)
+
+    def test_neither_track_outlives_the_call_window(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                caller, agent = build_offset_tracks(
+                    va, root / "caller.pcm", root / "agent.pcm")
+
+        for writer in (caller, agent):
+            self.assertLessEqual(writer.duration_seconds, WINDOW)
+        self.assertAlmostEqual(
+            caller.duration_seconds, agent.duration_seconds, delta=0.001)
+
+    def test_a_track_that_never_received_audio_stays_empty(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "caller.pcm"
+                writer = va._TrackWriter(path, va.CALLER_RATE, 0.0, clock=FakeClock())
+                writer.seal(WINDOW)
+                size = path.stat().st_size
+
+        self.assertEqual(size, 0)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
                      "ffmpeg/ffprobe not available")
 class StereoJoinTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tracks_that_start_at_different_offsets_stay_aligned(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                caller_pcm, agent_pcm = root / "caller.pcm", root / "agent.pcm"
+                build_offset_tracks(va, caller_pcm, agent_pcm)
+                output = root / "call.ogg"
+                result = await va.join_tracks_to_stereo(caller_pcm, agent_pcm, output)
+
+                self.assertEqual(result["status"], "complete", result["error"])
+                self.assertAlmostEqual(result["duration_seconds"], WINDOW, delta=0.1)
+                caller_onset, agent_onset = channel_onsets(output)
+
+        # Both speakers marked the same real second of the call, so the mix must
+        # put both markers in the same place.
+        self.assertAlmostEqual(caller_onset, agent_onset, delta=0.05)
+        self.assertAlmostEqual(caller_onset, MARKER_FROM, delta=0.1)
+
     async def test_two_tracks_join_into_a_separated_stereo_opus_file(self):
         with fake_runtime_modules():
             va = import_voice_agent()
