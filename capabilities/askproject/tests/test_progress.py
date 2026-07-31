@@ -1,11 +1,25 @@
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "askproject"
+
+
+def _load_cli():
+    """Load the CLI as a module so defaults are asserted from their one home."""
+    spec = importlib.util.spec_from_loader(
+        "askproject_cli", SourceFileLoader("askproject_cli", str(SCRIPT)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CLI = _load_cli()
 
 
 CODEX_FAKE = r'''#!/usr/bin/env python3
@@ -79,6 +93,16 @@ if streaming != ("--verbose" in args):
     print("expected streaming flags", file=sys.stderr)
     raise SystemExit(10)
 
+if "--effort" not in args:
+    print("claude was not given a reasoning effort", file=sys.stderr)
+    raise SystemExit(11)
+if args[args.index("--model") + 1] != os.environ.get("EXPECT_MODEL", ""):
+    print("unexpected model", file=sys.stderr)
+    raise SystemExit(12)
+if args[args.index("--effort") + 1] != os.environ.get("EXPECT_EFFORT", ""):
+    print("unexpected effort", file=sys.stderr)
+    raise SystemExit(13)
+
 def emit(value):
     print(json.dumps(value), flush=True)
 
@@ -115,7 +139,9 @@ def _write_executable(path: Path, body: str) -> None:
 
 
 def _invoke(tmp_path: Path, engine: str, fake: str, *extra: str,
-            open_stdin: bool = False):
+            open_stdin: bool = False,
+            expect_model: str | None = None,
+            expect_effort: str | None = None):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     _write_executable(fake_bin / engine, fake)
@@ -130,6 +156,8 @@ def _invoke(tmp_path: Path, engine: str, fake: str, *extra: str,
     env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
     env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
     env["XDG_STATE_HOME"] = str(tmp_path / "state")
+    env["EXPECT_MODEL"] = expect_model or CLI.DEFAULT_MODEL
+    env["EXPECT_EFFORT"] = expect_effort or CLI.DEFAULT_EFFORT
     read_fd = write_fd = None
     if open_stdin:
         read_fd, write_fd = os.pipe()
@@ -213,3 +241,44 @@ def test_claude_progress_uses_stream_events_without_echoing_answer(tmp_path):
     assert "askproject[claude] completed: Claude peer finished" in proc.stderr
     assert "CLAUDE FINAL MUST NOT BE PROGRESS" not in proc.stderr
     assert "/private/code.py" not in proc.stderr
+
+
+def test_claude_defaults_to_opus_at_default_effort_in_both_modes(tmp_path):
+    for name, extra in (("read", ()), ("act", ("--act",))):
+        case = tmp_path / name
+        case.mkdir()
+        proc = _invoke(case, "claude", CLAUDE_FAKE, "--quiet", *extra)
+
+        assert proc.returncode == 0, proc.stderr
+        result = json.loads(proc.stdout)
+        assert result["model"] == CLI.DEFAULT_MODEL
+        assert result["effort"] == CLI.DEFAULT_EFFORT
+
+
+def test_claude_effort_and_model_overrides_reach_the_peer(tmp_path):
+    proc = _invoke(tmp_path, "claude", CLAUDE_FAKE, "--quiet",
+                   "--effort", "low", "--model", "haiku",
+                   expect_model=CLI.MODEL_ALIASES["haiku"], expect_effort="low")
+
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["model"] == CLI.MODEL_ALIASES["haiku"]
+    assert result["effort"] == "low"
+
+
+def test_unknown_effort_fails_with_a_controlled_error(tmp_path):
+    proc = _invoke(tmp_path, "claude", CLAUDE_FAKE, "--quiet", "--effort", "turbo")
+
+    assert proc.returncode == 1
+    result = json.loads(proc.stdout)
+    assert result["ok"] is False
+    assert "turbo" in result["error"]
+    for level in CLI.EFFORT_LEVELS:
+        assert level in result["error"]
+
+
+def test_codex_reports_no_effort(tmp_path):
+    proc = _invoke(tmp_path, "codex", CODEX_FAKE, "--quiet")
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["effort"] is None

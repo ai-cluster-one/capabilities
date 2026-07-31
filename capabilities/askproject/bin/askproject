@@ -16,7 +16,8 @@ reads AGENTS.md) / settings / rights and answers as that project — then hands
 back the answer with cost, token, and files-changed data.
 
 Two engines drive the peer, selected with `--engine`:
-  claude (default)  headless `claude -p`; mode picks the model (haiku/sonnet).
+  claude (default)  headless `claude -p` on the newest Opus at xhigh reasoning
+                    effort; override either with --model / --effort.
   codex             headless `codex exec`; uses your ~/.codex/config.toml model
                     (the newest) unless you pass --model. No USD cost is
                     reported under ChatGPT auth, so cost_usd stays null.
@@ -43,16 +44,23 @@ directory (a git repo is strongly recommended — see snapshots below).
 MODES  (the fence; how each engine implements it differs)
   read  (default)   Pure research. claude: ONLY Read/Glob/Grep + plan mode.
                     codex: an OS read-only sandbox (sandbox_mode=read-only) —
-                    it may run read-only shell but cannot write. Model on
-                    claude: haiku (cheap). Use for "what does X do", reviews.
+                    it may run read-only shell but cannot write. Use for
+                    "what does X do", reviews.
   act   (--act)     Peer can edit, run tests, commit, and push from inside the
                     target project without prompts. claude: bypassPermissions +
                     target as --add-dir. codex: bypass approvals + sandbox.
-                    Model on claude: sonnet. Use for "fix X", "refactor".
+                    Use for "fix X", "refactor".
 
-MODELS: on claude the mode auto-picks the model (override with --model); on
+MODELS: the mode fences the peer's rights, not its brain — on claude both modes
+run the newest Opus, so a research answer is as considered as a build; pass
+`--model haiku|sonnet` to buy a cheaper peer where the question is small. On
 codex no model is forced — it uses your ~/.codex/config.toml default (the
 newest) unless --model is given.
+
+EFFORT: on claude the peer thinks at `xhigh` reasoning effort by default;
+--effort takes low|medium|high|xhigh|max. Effort is a claude-engine control —
+codex takes its reasoning settings from your ~/.codex/config.toml, so on codex
+the reported effort is null.
 
 FENCING REALITY: read mode is a hard fence (claude has no harmful tools; codex
 runs in an OS read-only sandbox). act mode intentionally drops the peer's
@@ -80,7 +88,8 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   {
     "ok": bool, "error": str|null,
     "target": "<abs path>", "engine": "claude|codex", "mode": "read|act",
-    "model": "<model id>|null", "session_id": "<uuid>", "resumed": bool,
+    "model": "<model id>|null", "effort": "<level>|null",
+    "session_id": "<uuid>", "resumed": bool,
     "answer": <string OR parsed object when --schema is used>,
     "cost_usd": float, "duration_ms": int, "num_turns": int,
     "tokens": {input, output, cache_read, cache_creation},
@@ -101,13 +110,16 @@ FLAGS
   --engine <claude|codex>  Which peer engine to spawn (default: claude, or
                         $ASKPROJECT_ENGINE). A -c resume adopts the session's
                         own engine — a codex thread can't be resumed by claude.
-  --act                 Modification mode (bypass prompts; sonnet on claude).
+  --act                 Modification mode (bypass prompts).
   -c, --continue        Resume the last session for this target.
   --fork                Reserved; neither headless CLI has a non-interactive
                         fork, so this exits with a controlled error.
-  --model <m>           Override the model. On claude the `haiku`/`sonnet`/
+  --model <m>           Override the model (default: the newest Opus on claude,
+                        or $ASKPROJECT_MODEL). On claude the `haiku`/`sonnet`/
                         `opus` aliases resolve to known-good full ids; on codex
                         the value is passed straight to `codex -m`.
+  --effort <level>      Reasoning effort on claude: low|medium|high|xhigh|max
+                        (default: xhigh, or $ASKPROJECT_EFFORT).
   --schema <file|json>  Pass a JSON Schema to constrain the peer's answer;
                         `answer` is then the parsed object.
   --timeout <seconds>   Kill the peer after N seconds (default 600).
@@ -167,15 +179,19 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 ENGINES = ("claude", "codex")
 DEFAULT_ENGINE = "claude"
 
-# claude: the mode auto-picks the model; these aliases resolve to full ids.
+# claude: one default model for both modes; these aliases resolve to full ids.
 # codex: no model is forced — it falls back to ~/.codex/config.toml (the newest).
-READ_MODEL = "claude-haiku-4-5-20251001"
-ACT_MODEL = "claude-sonnet-4-5-20250929"
+DEFAULT_MODEL = "claude-opus-5"
 MODEL_ALIASES = {
-    "haiku": READ_MODEL,
-    "sonnet": ACT_MODEL,
-    "opus": "claude-opus-4-5-20251101",
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-5-20250929",
+    "opus": DEFAULT_MODEL,
 }
+
+# claude: `--effort` levels. codex takes its reasoning settings from its own
+# config, so effort is a claude-engine control and stays null elsewhere.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_EFFORT = "xhigh"
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -722,13 +738,26 @@ def resolve_model(model: str) -> str:
     return MODEL_ALIASES.get(model, model)
 
 
+def _env_default(key: str, fallback: str) -> str:
+    """A default overridable by $ASKPROJECT_<KEY> (project .env or process env)."""
+    return (_project_env().get(key) or os.environ.get(key) or fallback).strip()
+
+
 def _default_engine() -> str:
-    """Engine when --engine is not passed: $ASKPROJECT_ENGINE (project .env or
-    process env), else the built-in default. An unknown value falls back."""
-    v = (_project_env().get("ASKPROJECT_ENGINE")
-         or os.environ.get("ASKPROJECT_ENGINE")
-         or DEFAULT_ENGINE).strip().lower()
+    """Engine when --engine is not passed. An unknown value falls back."""
+    v = _env_default("ASKPROJECT_ENGINE", DEFAULT_ENGINE).lower()
     return v if v in ENGINES else DEFAULT_ENGINE
+
+
+def _default_model() -> str:
+    """Model when --model is not passed (claude; codex falls back to its own)."""
+    return _env_default("ASKPROJECT_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL
+
+
+def _default_effort() -> str:
+    """Reasoning effort when --effort is not passed. An unknown value falls back."""
+    v = _env_default("ASKPROJECT_EFFORT", DEFAULT_EFFORT).lower()
+    return v if v in EFFORT_LEVELS else DEFAULT_EFFORT
 
 
 def build_preamble(mode: str, caller: str, extra: str | None,
@@ -976,18 +1005,18 @@ def _claude_progress(evt: dict, reporter: ProgressReporter) -> None:
 
 
 # --- engines -----------------------------------------------------------------
-# Each engine turns (target, prompt, mode, model, resume) into ONE normalized
-# dict so run() stays engine-blind:
-#   {answer, session_id, model, cost_usd, duration_ms, num_turns,
+# Each engine turns (target, prompt, mode, model, effort, resume) into ONE
+# normalized dict so run() stays engine-blind:
+#   {answer, session_id, model, effort, cost_usd, duration_ms, num_turns,
 #    tokens:{input,output,cache_read,cache_creation}, is_error, permission_denials}
 
-def run_claude(target, prompt, mode, model, caller, append,
+def run_claude(target, prompt, mode, model, effort, caller, append,
                schema_text, resume_id, timeout, as_json,
                reporter: ProgressReporter) -> dict:
     """Headless Claude. Progress uses stream-json; --quiet retains json mode."""
     output_format = "stream-json" if reporter.enabled else "json"
     cmd = ["claude", "-p", prompt, "--output-format", output_format,
-           "--model", model]
+           "--model", model, "--effort", effort]
     if reporter.enabled:
         cmd += ["--verbose"]
     if resume_id:
@@ -1048,6 +1077,7 @@ def run_claude(target, prompt, mode, model, caller, append,
         "answer": answer,
         "session_id": env.get("session_id"),
         "model": model,
+        "effort": effort,
         "cost_usd": env.get("total_cost_usd"),
         "duration_ms": env.get("duration_ms"),
         "num_turns": env.get("num_turns"),
@@ -1085,13 +1115,14 @@ def _parse_codex_events(stdout: str) -> tuple[dict, str | None, bool]:
     return usage, thread_id, is_error
 
 
-def run_codex(target, prompt, mode, model, caller, append,
+def run_codex(target, prompt, mode, model, effort, caller, append,
               schema_text, resume_id, timeout, as_json,
               reporter: ProgressReporter) -> dict:
     """Headless `codex exec`. codex has no system-prompt flag, so the peer
     preamble is folded into the prompt; the final message is read from -o and
     usage/thread id from the --json JSONL. Schema uses codex's native
-    --output-schema. No USD cost under ChatGPT auth → cost_usd stays null."""
+    --output-schema. Reasoning effort comes from ~/.codex/config.toml, so the
+    reported effort is null. No USD cost under ChatGPT auth → cost_usd null."""
     import tempfile
     prompt = build_preamble(mode, caller, append, None) + "\n\n" + prompt
     out_fd, outfile = tempfile.mkstemp(prefix="askproject-codex-", suffix=".txt")
@@ -1152,6 +1183,7 @@ def run_codex(target, prompt, mode, model, caller, append,
         "answer": answer,
         "session_id": thread_id,
         "model": model,
+        "effort": None,
         "cost_usd": None,
         "duration_ms": None,
         "num_turns": None,
@@ -1210,17 +1242,22 @@ def run(args):
         die(f"`{engine}` CLI not found on PATH", as_json=as_json)
 
     if engine == "claude":
-        model = resolve_model(args.model or (ACT_MODEL if mode == "act" else READ_MODEL))
+        model = resolve_model(args.model or _default_model())
     else:
         model = args.model or None   # codex: fall back to its config default (newest)
+
+    effort = (args.effort or _default_effort()).strip().lower()
+    if effort not in EFFORT_LEVELS:
+        die(f"unknown effort {args.effort!r}; expected one of "
+            f"{', '.join(EFFORT_LEVELS)}", as_json=as_json)
 
     schema_text = resolve_schema(args.schema) if args.schema else None
 
     reporter = ProgressReporter(engine, enabled=not args.quiet)
     reporter.emit("starting", f"Launching {engine} peer")
     before = snapshot(target)
-    res = ENGINE_RUNNERS[engine](target, args.prompt, mode, model, caller,
-                                 args.append, schema_text, resume_id,
+    res = ENGINE_RUNNERS[engine](target, args.prompt, mode, model, effort,
+                                 caller, args.append, schema_text, resume_id,
                                  args.timeout, as_json, reporter)
     after = snapshot(target)
     files_changed, dirty_before = diff_snapshots(before, after)
@@ -1237,6 +1274,7 @@ def run(args):
     if session_id:
         entry["last_session_id"] = session_id
         entry["last_model"] = res.get("model")
+        entry["last_effort"] = res.get("effort")
         entry["engine"] = engine
         entry["interactions"] = entry.get("interactions", 0) + 1
         entry["last_used_at"] = time.time()
@@ -1255,6 +1293,7 @@ def run(args):
         "engine": engine,
         "mode": mode,
         "model": res.get("model"),
+        "effort": res.get("effort"),
         "session_id": session_id,
         "resumed": resumed,
         "answer": answer,
@@ -1295,6 +1334,7 @@ def cmd_targets():
                 "last_session_id": v.get("last_session_id"),
                 "engine": v.get("engine", "claude"),
                 "model": v.get("last_model"),
+                "effort": v.get("last_effort"),
                 "interactions": v.get("interactions", 0),
             }
             last_used = v.get("last_used_at")
@@ -1317,7 +1357,8 @@ def cmd_targets():
                 dt = datetime.datetime.fromtimestamp(last_used, tz=datetime.timezone.utc)
                 parts.append(f"last_used: {dt.strftime('%Y-%m-%d %H:%M UTC')}")
             print(f"  {parts[0]}  {parts[1]}")
-            print(f"  model: {v.get('last_model')}  interactions: {v.get('interactions', 0)}", end="")
+            print(f"  model: {v.get('last_model')}  effort: {v.get('last_effort')}"
+                  f"  interactions: {v.get('interactions', 0)}", end="")
             if last_used:
                 print(f"  {parts[2]}")
             else:
@@ -1357,6 +1398,7 @@ def main():
     p.add_argument("-c", "--continue", dest="cont", action="store_true")
     p.add_argument("--fork", action="store_true")
     p.add_argument("--model")
+    p.add_argument("--effort")
     p.add_argument("--schema")
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--text", action="store_true")
