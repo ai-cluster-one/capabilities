@@ -16,8 +16,9 @@ reads AGENTS.md) / settings / rights and answers as that project — then hands
 back the answer with cost, token, and files-changed data.
 
 Two engines drive the peer, selected with `--engine`:
-  claude (default)  headless `claude -p` on the newest Opus at xhigh reasoning
-                    effort; override either with --model / --effort.
+  claude (default)  headless `claude -p` — the newest Sonnet in read mode, the
+                    newest Opus in act mode, at high reasoning effort; override
+                    either with --model / --effort.
   codex             headless `codex exec`; uses your ~/.codex/config.toml model
                     (the newest) unless you pass --model. No USD cost is
                     reported under ChatGPT auth, so cost_usd stays null.
@@ -51,13 +52,14 @@ MODES  (the fence; how each engine implements it differs)
                     target as --add-dir. codex: bypass approvals + sandbox.
                     Use for "fix X", "refactor".
 
-MODELS: the mode fences the peer's rights, not its brain — on claude both modes
-run the newest Opus, so a research answer is as considered as a build; pass
-`--model haiku|sonnet` to buy a cheaper peer where the question is small. On
-codex no model is forced — it uses your ~/.codex/config.toml default (the
-newest) unless --model is given.
+MODELS: on claude the mode auto-picks the model — reading and comparing code
+does not need the top tier, writing it does, so read mode runs the newest Sonnet
+and act mode the newest Opus. Pass `--model haiku` to buy a cheaper peer where
+the question is small, or name any model to force it. On codex no model is
+forced — it uses your ~/.codex/config.toml default (the newest) unless --model
+is given.
 
-EFFORT: on claude the peer thinks at `xhigh` reasoning effort by default;
+EFFORT: on claude the peer thinks at `high` reasoning effort by default;
 --effort takes low|medium|high|xhigh|max. Effort is a claude-engine control —
 codex takes its reasoning settings from your ~/.codex/config.toml, so on codex
 the reported effort is null.
@@ -114,12 +116,14 @@ FLAGS
   -c, --continue        Resume the last session for this target.
   --fork                Reserved; neither headless CLI has a non-interactive
                         fork, so this exits with a controlled error.
-  --model <m>           Override the model (default: the newest Opus on claude,
-                        or $ASKPROJECT_MODEL). On claude the `haiku`/`sonnet`/
-                        `opus` aliases resolve to known-good full ids; on codex
-                        the value is passed straight to `codex -m`.
+  --model <m>           Override the model, forcing it regardless of mode
+                        (default on claude: the newest Sonnet in read mode, the
+                        newest Opus in act mode, or $ASKPROJECT_MODEL). On claude
+                        the `haiku`/`sonnet`/`opus` aliases resolve to known-good
+                        full ids; on codex the value is passed straight to
+                        `codex -m`.
   --effort <level>      Reasoning effort on claude: low|medium|high|xhigh|max
-                        (default: xhigh, or $ASKPROJECT_EFFORT).
+                        (default: high, or $ASKPROJECT_EFFORT).
   --schema <file|json>  Pass a JSON Schema to constrain the peer's answer;
                         `answer` is then the parsed object.
   --timeout <seconds>   Kill the peer after N seconds (default 600).
@@ -179,19 +183,21 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 ENGINES = ("claude", "codex")
 DEFAULT_ENGINE = "claude"
 
-# claude: one default model for both modes; these aliases resolve to full ids.
-# codex: no model is forced — it falls back to ~/.codex/config.toml (the newest).
-DEFAULT_MODEL = "claude-opus-5"
+# claude: the mode picks the model — reading and comparing code does not need the
+# top tier, writing it does; these aliases resolve to full ids. codex: no model is
+# forced — it falls back to ~/.codex/config.toml (the newest).
+READ_MODEL = "claude-sonnet-5"
+ACT_MODEL = "claude-opus-5"
 MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5-20251001",
-    "sonnet": "claude-sonnet-4-5-20250929",
-    "opus": DEFAULT_MODEL,
+    "sonnet": READ_MODEL,
+    "opus": ACT_MODEL,
 }
 
 # claude: `--effort` levels. codex takes its reasoning settings from its own
 # config, so effort is a claude-engine control and stays null elsewhere.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-DEFAULT_EFFORT = "xhigh"
+DEFAULT_EFFORT = "high"
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -749,9 +755,11 @@ def _default_engine() -> str:
     return v if v in ENGINES else DEFAULT_ENGINE
 
 
-def _default_model() -> str:
-    """Model when --model is not passed (claude; codex falls back to its own)."""
-    return _env_default("ASKPROJECT_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL
+def _default_model(mode: str) -> str:
+    """Model when --model is not passed: the mode picks it (claude; codex falls
+    back to its own). $ASKPROJECT_MODEL outranks the mode's choice."""
+    fallback = ACT_MODEL if mode == "act" else READ_MODEL
+    return _env_default("ASKPROJECT_MODEL", fallback) or fallback
 
 
 def _default_effort() -> str:
@@ -1242,7 +1250,7 @@ def run(args):
         die(f"`{engine}` CLI not found on PATH", as_json=as_json)
 
     if engine == "claude":
-        model = resolve_model(args.model or _default_model())
+        model = resolve_model(args.model or _default_model(mode))
     else:
         model = args.model or None   # codex: fall back to its config default (newest)
 

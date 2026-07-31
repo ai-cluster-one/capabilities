@@ -156,7 +156,7 @@ def _invoke(tmp_path: Path, engine: str, fake: str, *extra: str,
     env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
     env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
     env["XDG_STATE_HOME"] = str(tmp_path / "state")
-    env["EXPECT_MODEL"] = expect_model or CLI.DEFAULT_MODEL
+    env["EXPECT_MODEL"] = expect_model or CLI.READ_MODEL
     env["EXPECT_EFFORT"] = expect_effort or CLI.DEFAULT_EFFORT
     read_fd = write_fd = None
     if open_stdin:
@@ -243,27 +243,32 @@ def test_claude_progress_uses_stream_events_without_echoing_answer(tmp_path):
     assert "/private/code.py" not in proc.stderr
 
 
-def test_claude_defaults_to_opus_at_default_effort_in_both_modes(tmp_path):
-    for name, extra in (("read", ()), ("act", ("--act",))):
+def test_claude_picks_sonnet_for_read_and_opus_for_act(tmp_path):
+    for name, extra, expected in (("read", (), CLI.READ_MODEL),
+                                  ("act", ("--act",), CLI.ACT_MODEL)):
         case = tmp_path / name
         case.mkdir()
-        proc = _invoke(case, "claude", CLAUDE_FAKE, "--quiet", *extra)
+        proc = _invoke(case, "claude", CLAUDE_FAKE, "--quiet", *extra,
+                       expect_model=expected)
 
         assert proc.returncode == 0, proc.stderr
         result = json.loads(proc.stdout)
-        assert result["model"] == CLI.DEFAULT_MODEL
+        assert result["model"] == expected
         assert result["effort"] == CLI.DEFAULT_EFFORT
 
 
 def test_claude_effort_and_model_overrides_reach_the_peer(tmp_path):
-    proc = _invoke(tmp_path, "claude", CLAUDE_FAKE, "--quiet",
-                   "--effort", "low", "--model", "haiku",
-                   expect_model=CLI.MODEL_ALIASES["haiku"], expect_effort="low")
+    for name, extra in (("read", ()), ("act", ("--act",))):
+        case = tmp_path / name
+        case.mkdir()
+        proc = _invoke(case, "claude", CLAUDE_FAKE, "--quiet", *extra,
+                       "--effort", "low", "--model", "haiku",
+                       expect_model=CLI.MODEL_ALIASES["haiku"], expect_effort="low")
 
-    assert proc.returncode == 0, proc.stderr
-    result = json.loads(proc.stdout)
-    assert result["model"] == CLI.MODEL_ALIASES["haiku"]
-    assert result["effort"] == "low"
+        assert proc.returncode == 0, proc.stderr
+        result = json.loads(proc.stdout)
+        assert result["model"] == CLI.MODEL_ALIASES["haiku"]
+        assert result["effort"] == "low"
 
 
 def test_unknown_effort_fails_with_a_controlled_error(tmp_path):
