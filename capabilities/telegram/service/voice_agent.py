@@ -14,7 +14,9 @@ stereo Opus file with real speaker separation.
 A caller can also have work done while they stay on the line: `agent_task` hands
 one task to the project's worker and returns at once, so speaking is never
 blocked on it. The result is spoken when it lands, or delivered to the caller's
-chat if the call ended first.
+chat if the call ended first. While it runs, a digest of the worker's own event
+stream is offered to the conversation, so the line is not silent. `send_to_chat`
+covers what speech carries badly — a link, a spelling, a number.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ import contextlib
 import json
 import os
 import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from pytgcalls.exceptions import NotInCallError
 from pytgcalls.types import Device, Frame
@@ -33,6 +37,20 @@ from call_recording_helpers import iso_utc, probe_audio_duration
 DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
 DEFAULT_VOICE = "Aoede"
 DEFAULT_HISTORY_MESSAGES = 30
+# One task per call, always. Several workers on one call race each other's
+# progress and their answers into the conversation, and the caller cannot tell
+# which reply belongs to which question. Not a setting: a project raising it
+# would only be re-creating that defect.
+TASKS_PER_CALL = 1
+# How long a finished task waits for a turn boundary before it is spoken anyway.
+ANNOUNCE_IDLE_TIMEOUT = 20.0
+# A pause longer than this starts a new transcript turn, even for one speaker.
+TURN_JOIN_GAP_SECONDS = 4.0
+# How often a long-running task may report in. Nothing about it reaches the
+# caller more often than this, however talkative the worker is, and never while
+# anyone is mid-sentence. A project may set its own pace.
+DEFAULT_PROGRESS_INTERVAL = 10.0
+PROGRESS_CALLER_QUIET = 3.0
 
 CALLER_RATE = 16000
 AGENT_RATE = 24000
@@ -47,9 +65,21 @@ INPUT_QUEUE_FRAMES = 50                                            # ~5 s of bac
 AGENT_TASK_TOOL = {
     "name": "agent_task",
     "description": (
-        "Hand one task to the project's worker while the call carries on — look "
-        "something up, check or file something, write something down. Returns "
+        "LAST RESORT, not first. Hand one task to the project's worker, which "
+        "can reach files, other systems and tools you cannot. Returns "
         "immediately; the result is announced in the conversation when it lands."
+        "\n\n"
+        "Before calling this, check whether you can already answer. The recent "
+        "chat messages in your instructions are YOURS — reading, summarising, "
+        "quoting or drawing conclusions from them needs no tool at all, and "
+        "delegating that will simply fail, because the worker cannot see this "
+        "conversation."
+        "\n\n"
+        "Call it only when the answer genuinely is not in front of you: current "
+        "state of a system, a file's contents, a check against something "
+        "external, or an action with an effect such as writing something down "
+        "or filing something. If you are unsure, answer from what you have and "
+        "say what you could not check."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -57,8 +87,10 @@ AGENT_TASK_TOOL = {
             "task": {
                 "type": "STRING",
                 "description": (
-                    "The task in a sentence or two, self-contained: the worker "
-                    "reads this text and not the conversation."
+                    "The task in a sentence or two, self-contained. The worker "
+                    "sees only this text — not the call, not the chat history "
+                    "in your instructions — so anything it needs must be "
+                    "written out here in full."
                 ),
             },
         },
@@ -67,8 +99,71 @@ AGENT_TASK_TOOL = {
 }
 
 
+SEND_TO_CHAT_TOOL = {
+    "name": "send_to_chat",
+    "description": (
+        "Write a message into this caller's Telegram chat, where they can read "
+        "it during or after the call. Use it for anything speech carries badly "
+        "— links, addresses, exact names and spellings, numbers, code, or a "
+        "list they will want to keep. Say aloud that you have sent it; do not "
+        "read the contents out."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "text": {
+                "type": "STRING",
+                "description": "The message exactly as it should appear in the chat.",
+            },
+        },
+        "required": ["text"],
+    },
+}
+
+
 class VoiceAgentError(RuntimeError):
     pass
+
+
+def summarize_progress(window):
+    """Turn a window of worker events into a few plain facts.
+
+    Deliberately not "the last thing that happened": a worker's last step is
+    often something that did not work, which it then routes around. Reporting
+    that would tell the caller a failure that is not one. So the whole window is
+    folded into counts plus where the work stands now, and nothing is inferred.
+    """
+    narrated = [text for kind, text in window if kind == "worker"]
+    if narrated:
+        # The worker's own words beat anything derived from its command stream.
+        return narrated[-1]
+    stages = [text for kind, text in window if kind == "stream"]
+    if not stages:
+        return None
+    counts = {}
+    for stage in stages:
+        counts[stage] = counts.get(stage, 0) + 1
+    current = stages[-1]
+    earlier = [f"{stage} ({count}x)" if count > 1 else stage
+               for stage, count in counts.items() if stage != current]
+    if not earlier:
+        return current
+    return f"{'; '.join(earlier[:3])}; now {current}"
+
+
+def progress_prompt(note):
+    return (
+        "Internal status note about the task you are running. The caller has "
+        "not said this and it is not a request.\n\n"
+        "It is a rough digest of the last few seconds of work, not a result and "
+        "not a verdict. Do not read it out, do not quote it, and do not treat "
+        "anything in it as finished or failed — the work is still going. Turn it "
+        "into at most one short clause in the language of the conversation, of "
+        "the kind a person drops while they are looking something up.\n\n"
+        "If the caller is in the middle of something else, or you have nothing "
+        "new to add, say nothing at all — silence is the right answer more often "
+        "than not.\n\n" + str(note)[:600]
+    )
 
 
 def completion_prompt(completion):
@@ -91,16 +186,19 @@ class VoiceTaskRunner:
     caller asked for is never dropped because they hung up first.
     """
 
-    def __init__(self, run_task, deliver, *, limit=2, log=print):
+    def __init__(self, run_task, deliver, *, log=print):
         self._run_task = run_task
         self._deliver = deliver
-        self.limit = max(1, int(limit or 1))
+        self.limit = TASKS_PER_CALL
         self.completions = asyncio.Queue()
         self._jobs = {}
         self._signatures = {}
         self._sequence = 0
         self._live = True
         self._log = log
+        # One record per task, so a call's own metadata says what was asked for
+        # and what came back — not only the log.
+        self.history = []
 
     @property
     def running(self):
@@ -118,13 +216,17 @@ class VoiceTaskRunner:
                     "running": self.running, "limit": self.limit,
                     "instruction": "This exact task is already running; do not start it twice."}
         if self.running >= self.limit:
-            return {"ok": False, "status": "capacity_reached",
+            return {"ok": False, "status": "busy",
                     "running": self.running, "limit": self.limit,
-                    "instruction": "Too many tasks are already running. Tell the caller "
-                                   "this one waits until the others finish."}
+                    "instruction": "A task is already running and only one runs at a "
+                                   "time. Do NOT start this one. Tell the caller you "
+                                   "will do it once the current one is done, and wait "
+                                   "for that result before calling this tool again."}
         self._sequence += 1
         job_id = f"task-{self._sequence}"
         self._signatures[signature] = job_id
+        self.history.append({"job_id": job_id, "task": text, "at": iso_utc(),
+                             "status": "running", "seconds": None, "result": None})
         self._jobs[job_id] = asyncio.create_task(self._run(job_id, signature, text))
         return {"ok": True, "status": "started", "job_id": job_id,
                 "running": self.running, "limit": self.limit,
@@ -133,26 +235,50 @@ class VoiceTaskRunner:
 
     async def _run(self, job_id, signature, text):
         completion = {"job_id": job_id, "task": text}
+        started = time.monotonic()
         try:
             completion.update({"ok": True, "result": await self._run_task(text)})
+            reply = str(completion.get("result") or "")
+            self._log(f"voice: task {job_id} finished ok in "
+                      f"{time.monotonic() - started:.1f}s, {len(reply)} chars")
         except asyncio.CancelledError:
+            self._log(f"voice: task {job_id} cancelled after "
+                      f"{time.monotonic() - started:.1f}s")
             raise
         except Exception as exc:
             completion.update({"ok": False,
                                "result": f"{type(exc).__name__}: {exc}"[:800]})
-            self._log(f"voice: task {job_id} failed — {completion['result']}")
+            self._log(f"voice: task {job_id} failed after "
+                      f"{time.monotonic() - started:.1f}s — {completion['result']}")
         self._jobs.pop(job_id, None)
         self._signatures.pop(signature, None)
+        self._close_record(job_id, completion, round(time.monotonic() - started, 1))
         # Decided without an await in between, so a call ending mid-decision
         # cannot route a result to a conversation that is already gone.
         if self._live:
             self.completions.put_nowait(completion)
+            self._log(f"voice: task {job_id} queued to be spoken "
+                      f"(queue depth {self.completions.qsize()})")
         else:
+            self._log(f"voice: task {job_id} finished after the call — "
+                      "delivering to the chat")
             await self.deliver(completion)
 
+    def _close_record(self, job_id, completion, seconds):
+        for row in self.history:
+            if row["job_id"] == job_id:
+                row.update({
+                    "status": "ok" if completion.get("ok") else "failed",
+                    "seconds": seconds,
+                    "result": str(completion.get("result") or "")[:2000],
+                })
+                return
+
     async def deliver(self, completion):
+        job_id = completion.get("job_id")
         try:
             await self._deliver(completion)
+            self._log(f"voice: task {job_id} result delivered to the chat")
         except Exception as exc:
             self._log("voice: cannot deliver task result to the chat — "
                       f"{type(exc).__name__}: {exc}")
@@ -161,6 +287,8 @@ class VoiceTaskRunner:
         """The call is over: what is already finished goes to the chat, and work
         still running follows it there when it lands."""
         self._live = False
+        self._log(f"voice: runner detached; {self.running} task(s) still running, "
+                  f"{self.completions.qsize()} finished result(s) to hand to the chat")
         while True:
             try:
                 completion = self.completions.get_nowait()
@@ -169,14 +297,43 @@ class VoiceTaskRunner:
             await self.deliver(completion)
 
 
-def build_system_prompt(voice_context, history):
-    """The project's own voice prompt, then the recent direct-chat tail. The
-    prompt text belongs to the project; nothing is added to it here."""
+def build_system_prompt(voice_context, history, now_line=None):
+    """The project's own voice prompt, when the call is happening, then the
+    recent direct-chat tail. The prompt text belongs to the project; nothing is
+    added to it here beyond those two runtime facts."""
     blocks = [(voice_context or "").strip()]
+    if now_line:
+        blocks.append("--- Right now ---\n\n" + now_line.strip())
     tail = (history or "").strip()
     if tail:
-        blocks.append("--- Recent messages in this direct chat ---\n\n" + tail)
+        blocks.append(
+            "--- Recent messages in this direct chat ---\n\n"
+            "Older first. Each line is timestamped in the same zone as the "
+            "current time above.\n\n" + tail)
     return "\n\n".join(block for block in blocks if block)
+
+
+def resolve_timezone(name):
+    """The zone a call states its times in, as (tzinfo, label).
+
+    An IANA name; UTC when unset or unknown, never the host's own zone — a
+    daemon moves between hosts and the caller's clock does not.
+    """
+    label = str(name or "").strip() or "UTC"
+    if label.upper() == "UTC":
+        return timezone.utc, "UTC"
+    try:
+        return ZoneInfo(label), label
+    except Exception:
+        return timezone.utc, "UTC"
+
+
+def current_time_line(zone, label):
+    """What the model is told about the present moment. Without it a call has no
+    'now' at all, so anything the caller says about time is unanchored."""
+    stamp = datetime.now(zone)
+    return (f"The call is happening now: {stamp:%Y-%m-%d %H:%M} "
+            f"({stamp:%A}), timezone {label}.")
 
 
 def greeting_prompt(caller_name):
@@ -301,7 +458,8 @@ class VoiceCallSession:
 
     def __init__(self, calls, chat_id, *, api_key, model, voice,
                  system_instruction, caller_name, caller_track=None,
-                 agent_track=None, task_runner=None, log=print):
+                 agent_track=None, task_runner=None, send_to_chat=None,
+                 progress_interval=DEFAULT_PROGRESS_INTERVAL, log=print):
         self._calls = calls
         self._chat_id = chat_id
         self._api_key = api_key
@@ -310,6 +468,7 @@ class VoiceCallSession:
         self._system_instruction = system_instruction
         self._caller_name = caller_name
         self._task_runner = task_runner
+        self._send_to_chat = send_to_chat
         self._log = log
 
         # A completion is injected only between turns: cutting into speech the
@@ -340,6 +499,16 @@ class VoiceCallSession:
         self.agent_voiced_frames = 0
         self.interruptions = 0
         self.dropped_input_chunks = 0
+        self.messages_sent = 0
+        # A finished result taken off the queue but not yet handed to the model.
+        self._announcing = None
+        self._last_fragment_at = 0.0
+        self._progress_window = []
+        self._progress_offered_at = 0.0
+        self._progress_last_offered = None
+        self._progress_interval = max(1.0, float(
+            progress_interval or DEFAULT_PROGRESS_INTERVAL))
+        self._caller_spoke_at = 0.0
 
     # --- media -------------------------------------------------------------
     def start_pump(self):
@@ -401,6 +570,25 @@ class VoiceCallSession:
                 return
 
     # --- Gemini ------------------------------------------------------------
+    def set_system_instruction(self, system_instruction):
+        """Set after the call is answered, not before.
+
+        Answering has a ring window: anything slow done before `record()` — and
+        reading a long chat tail is slow — lets the call expire, after which
+        pytgcalls tries to place a new call instead of accepting the offered one.
+        """
+        self._system_instruction = system_instruction
+
+    def _declared_tools(self):
+        """Only what this call can actually do is declared, so the model is never
+        holding a tool that would fail if it reached for it."""
+        tools = []
+        if self._task_runner is not None:
+            tools.append(AGENT_TASK_TOOL)
+        if self._send_to_chat is not None:
+            tools.append(SEND_TO_CHAT_TOOL)
+        return tools or None
+
     async def start_agent(self):
         from google import genai
 
@@ -412,8 +600,7 @@ class VoiceCallSession:
                     model=self._model,
                     config=live_config(
                         self._system_instruction, self._voice,
-                        tools=([AGENT_TASK_TOOL] if self._task_runner is not None
-                               else None)),
+                        tools=self._declared_tools()),
                 )
             )
         except Exception as exc:
@@ -424,6 +611,7 @@ class VoiceCallSession:
         self._tasks.append(asyncio.create_task(self._gemini_receiver()))
         if self._task_runner is not None:
             self._tasks.append(asyncio.create_task(self._announce_completions()))
+            self._tasks.append(asyncio.create_task(self._announce_progress()))
         await self._live.send_realtime_input(text=greeting_prompt(self._caller_name))
 
     async def _gemini_sender(self):
@@ -471,6 +659,8 @@ class VoiceCallSession:
             self._model_idle.clear()
         transcription = getattr(content, "input_transcription", None)
         if transcription is not None:
+            if getattr(transcription, "text", None):
+                self._caller_spoke_at = time.monotonic()
             self._record_fragment("caller", getattr(transcription, "text", None))
         transcription = getattr(content, "output_transcription", None)
         if transcription is not None:
@@ -494,11 +684,13 @@ class VoiceCallSession:
         answers = []
         for call in calls:
             name = getattr(call, "name", None)
+            args = getattr(call, "args", None) or {}
             if name == AGENT_TASK_TOOL["name"] and self._task_runner is not None:
-                args = getattr(call, "args", None) or {}
                 result = self._task_runner.start(args.get("task"))
                 self._log(f"voice: agent_task {result.get('status')} "
                           f"({result.get('job_id') or '-'})")
+            elif name == SEND_TO_CHAT_TOOL["name"] and self._send_to_chat is not None:
+                result = await self._write_to_chat(args.get("text"))
             else:
                 result = {"ok": False, "status": "unknown_tool",
                           "instruction": f"There is no tool named {name}."}
@@ -506,14 +698,106 @@ class VoiceCallSession:
                 name=name, id=getattr(call, "id", None), response={"result": result}))
         await self._live.send_tool_response(function_responses=answers)
 
+    async def _write_to_chat(self, text):
+        body = str(text or "").strip()
+        if not body:
+            return {"ok": False, "status": "empty_message",
+                    "instruction": "Nothing to send; write the message text and call again."}
+        try:
+            await self._send_to_chat(body)
+        except Exception as exc:
+            self._log(f"voice: cannot write to the chat — {type(exc).__name__}: {exc}")
+            return {"ok": False, "status": "send_failed",
+                    "instruction": "The message did not go through. Tell the caller "
+                                   "you will send it after the call."}
+        self.messages_sent += 1
+        self._log(f"voice: wrote {len(body)} chars to the chat")
+        return {"ok": True, "status": "sent",
+                "instruction": "Say in one short sentence that you have sent it. "
+                               "Do not read the contents out."}
+
+    def note_progress(self, note, source="stream"):
+        """Collect one event. What the caller eventually hears is a digest of the
+        whole window, decided at tick time — never a single raw line."""
+        text = str(note or "").strip()
+        if not text:
+            return
+        self._progress_window.append((source, text))
+        del self._progress_window[:-40]
+
+    async def _announce_progress(self):
+        """Offer the latest progress at most once per interval, and only into a
+        genuine lull: the model silent, the caller silent, something new to say."""
+        while True:
+            await asyncio.sleep(1.0)
+            if not self._task_runner.running:
+                # Nothing is running, so nothing in the window is still current.
+                self._progress_window.clear()
+                continue
+            note = self._due_progress()
+            if note is None:
+                continue
+            try:
+                await self._live.send_realtime_input(text=progress_prompt(note))
+                self._log(f"voice: progress offered to the model — {note[:80]!r}")
+            except Exception as exc:
+                self._log("voice: cannot offer progress — "
+                          f"{type(exc).__name__}: {exc}")
+                return
+
+    def _due_progress(self):
+        """The digest to offer now, or None while any of the conditions that keep
+        progress off the line still holds."""
+        if not self._progress_window:
+            return None
+        now = time.monotonic()
+        if now - self._progress_offered_at < self._progress_interval:
+            return None
+        if not self._model_idle.is_set():
+            return None
+        if now - self._caller_spoke_at < PROGRESS_CALLER_QUIET:
+            return None
+        note = summarize_progress(self._progress_window)
+        self._progress_window.clear()
+        if note is None or note == self._progress_last_offered:
+            # Nothing has changed since the last time; saying it again is noise.
+            return None
+        self._progress_last_offered = note
+        self._progress_offered_at = now
+        return note
+
     async def _announce_completions(self):
+        """Speak finished tasks between turns.
+
+        A result taken off the queue is held in `_announcing` until it has
+        actually been handed to the model, so that a call ending while we wait
+        for a pause cannot swallow it: `stop()` puts anything still in hand back
+        on the queue, and it reaches the caller's chat instead.
+        """
         while True:
             completion = await self._task_runner.completions.get()
-            await self._model_idle.wait()
+            self._announcing = completion
+            job_id = completion.get("job_id")
+            waited = time.monotonic()
+            if not self._model_idle.is_set():
+                self._log(f"voice: task {job_id} ready, waiting for the model "
+                          "to stop speaking")
+                try:
+                    await asyncio.wait_for(self._model_idle.wait(),
+                                           timeout=ANNOUNCE_IDLE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    # Never sit on a finished result because a turn boundary
+                    # failed to arrive; interrupting is better than losing it.
+                    self._log(f"voice: task {job_id} still waiting after "
+                              f"{ANNOUNCE_IDLE_TIMEOUT}s — speaking it anyway")
             try:
                 await self._live.send_realtime_input(
                     text=completion_prompt(completion))
+                self._announcing = None
+                self._log(f"voice: task {job_id} handed to the model to speak "
+                          f"(waited {time.monotonic() - waited:.1f}s)")
             except Exception as exc:
+                self._announcing = None
                 self._log("voice: cannot announce a finished task — "
                           f"{type(exc).__name__}: {exc}")
                 await self._task_runner.deliver(completion)
@@ -524,10 +808,16 @@ class VoiceCallSession:
         consecutive fragments from the same speaker into a turn."""
         if not text:
             return
-        if self._turns and self._turns[-1]["speaker"] == speaker:
+        now = time.monotonic()
+        # Same speaker is not enough: a task answered fifteen seconds later is a
+        # new turn, not a continuation, and joining them makes the timestamp lie.
+        if (self._turns and self._turns[-1]["speaker"] == speaker
+                and now - self._last_fragment_at <= TURN_JOIN_GAP_SECONDS):
             self._turns[-1]["text"] += text
+            self._last_fragment_at = now
             return
         self._turns.append({"speaker": speaker, "at": iso_utc(), "text": text})
+        self._last_fragment_at = now
 
     # --- teardown ----------------------------------------------------------
     async def stop(self):
@@ -539,6 +829,13 @@ class VoiceCallSession:
         # Tasks the caller started outlive the call; nothing can be spoken any
         # more, so their results are handed to the chat instead of dropped.
         if self._task_runner is not None:
+            if self._announcing is not None:
+                # Cancelled mid-announcement: this result was already off the
+                # queue, so put it back before draining or it is lost silently.
+                self._log(f"voice: task {self._announcing.get('job_id')} was "
+                          "waiting to be spoken when the call ended")
+                self._task_runner.completions.put_nowait(self._announcing)
+                self._announcing = None
             await self._task_runner.detach()
         # The window closes once nothing can write any more, before the slower
         # Gemini teardown, so both tracks are sealed to the call's own length.
@@ -570,6 +867,9 @@ class VoiceCallSession:
             "interruptions": self.interruptions,
             "dropped_input_chunks": self.dropped_input_chunks,
             "pump_error": self._pump_error,
+            "messages_sent": self.messages_sent,
+            "tasks": (self._task_runner.history
+                      if self._task_runner is not None else []),
             "transcript": self.transcript(),
         }
 

@@ -216,10 +216,13 @@ async def send_recording_to_chat(
     metadata_path: Path,
     metadata: dict,
     emit_event_fn=None,
+    caption: str | None = None,
 ) -> None:
     """Send finalized recording to a Telegram chat as a voice note.
 
     emit_event_fn: optional callable(event_name, **fields) for logging events.
+    caption: the line the recording is announced with; the built-in one when
+    the caller names none.
     """
     delivery = metadata["delivery"]
     if metadata.get("status") != "complete":
@@ -242,7 +245,7 @@ async def send_recording_to_chat(
             if not delivery.get("notice_message_id"):
                 notice = await client.send_message(
                     chat_id,
-                    recording_caption(metadata),
+                    caption or recording_caption(metadata),
                 )
                 delivery["notice_message_id"] = getattr(notice, "id", None)
                 write_metadata(metadata_path, metadata)

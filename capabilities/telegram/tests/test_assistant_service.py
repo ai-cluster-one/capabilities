@@ -506,21 +506,142 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inherited["model"], "text-model")
         self.assertEqual(inherited["effort"], "high")
         self.assertEqual(inherited["worker_timeout"], 2)
-        self.assertEqual(inherited["max_parallel_jobs"], 1)
+        # How many tasks a call may run is not part of the settings surface:
+        # the bound is fixed at one in code.
+        self.assertNotIn("max_parallel_jobs", inherited)
 
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(
                 worker="claude",
                 workers={"claude": {"model": "text-model", "effort": "high"}},
                 voice_agent={"worker": "claude",
-                             "workers": {"claude": {"model": "fast-model"}},
-                             "max_parallel_jobs": 3}))
+                             "workers": {"claude": {"model": "fast-model"}}}))
             tuned = daemon.voice_agent_settings()
 
         self.assertEqual(tuned["model"], "fast-model")
         self.assertEqual(tuned["effort"], "high")
-        self.assertEqual(tuned["max_parallel_jobs"], 3)
         self.assertEqual(tuned["worker_timeout"], 2)
+
+    async def test_voice_defaults_resolve_per_user_then_project_then_built_in(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(
+                voice_agent={"voice": "ProjectVoice", "history": 120})
+            service_settings["allowed_users"] = {
+                "1": {"voice_agent": {"mode": "auto", "voice": "UserVoice"}},
+                "2": {"voice_agent": {"mode": "auto"}},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            resolved = daemon.configured_voice_agent_users()
+
+        # The user's own choice wins; otherwise the project's; otherwise built in.
+        self.assertEqual(resolved[1]["voice"], "UserVoice")
+        self.assertEqual(resolved[2]["voice"], "ProjectVoice")
+        self.assertEqual(resolved[1]["history"], 120)
+        self.assertEqual(resolved[2]["history"], 120)
+
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_users"] = {"2": {"voice_agent": {"mode": "auto"}}}
+            daemon = import_daemon(Path(td), service_settings)
+            bare = daemon.configured_voice_agent_users()
+
+        self.assertEqual(bare[2]["voice"], daemon.voice_agent.DEFAULT_VOICE)
+        self.assertEqual(bare[2]["history"],
+                         daemon.voice_agent.DEFAULT_HISTORY_MESSAGES)
+
+    async def test_a_call_states_its_times_in_the_configured_zone(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(voice_agent={"timezone": "Asia/Tokyo"}))
+            self.assertEqual(daemon.VOICE_TIMEZONE_NAME, "Asia/Tokyo")
+
+        with tempfile.TemporaryDirectory() as td:
+            # Unset means UTC, never whatever zone the host happens to be in.
+            daemon = import_daemon(Path(td), settings())
+            self.assertEqual(daemon.VOICE_TIMEZONE_NAME, "UTC")
+            self.assertEqual(daemon.VOICE_RECORDING_CAPTION, "")
+            self.assertEqual(daemon.VOICE_PROGRESS_INTERVAL, 10.0)
+
+    async def test_a_worker_step_is_named_past_the_shell_wrapper(self):
+        """Codex wraps every command in `<shell> -lc "…"`, so the first word is
+        the shell and says nothing a waiting caller could use."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            def stage(command):
+                return daemon.codex_event_stage(json.dumps(
+                    {"type": "item.started",
+                     "item": {"type": "command_execution", "command": command}}))
+
+            self.assertEqual(stage(["/bin/zsh", "-lc", "rg needle ."]),
+                             "searching for it")
+            self.assertEqual(stage("/bin/bash -lc 'git status'"),
+                             "checking the repository")
+            # A capability the project happens to have is recognised without
+            # this file ever naming one.
+            self.assertEqual(stage("/bin/zsh -lc 'mailbox list --unread'"),
+                             "asking mailbox to list")
+            self.assertEqual(stage("/bin/zsh -lc 'someunknowntool'"),
+                             "running someunknowntool")
+            # The worker reporting its own progress is not progress.
+            self.assertIsNone(stage("/bin/zsh -lc 'telegram send 42 \"looking\"'"))
+
+            self.assertEqual(
+                daemon.codex_event_stage(json.dumps({"type": "thread.started"})),
+                "starting")
+            self.assertIsNone(daemon.codex_event_stage("not json"))
+            self.assertIsNone(daemon.codex_event_stage(json.dumps(
+                {"type": "item.started", "item": {"type": "agent_message"}})))
+
+    async def test_a_voice_task_reports_to_the_assistant_not_the_caller(self):
+        """Worker progress reaching the caller's chat leaves the agent guessing
+        about messages it cannot see, and it starts inventing."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            preamble = daemon.voice_task_preamble(4242, 10)
+
+        self.assertIn("telegram send 4242", preamble)
+        self.assertIn("every 10 seconds", preamble)
+        self.assertIn("go to the assistant on the call, not to the caller",
+                      preamble)
+        self.assertIn("do not address them", preamble)
+        self.assertIn("The answer you return at the end is the result",
+                      preamble)
+        # The delivery note the worker is given is about the spoken reply only;
+        # everything about progress lives in the preamble and nowhere else.
+        self.assertNotIn("progress", daemon.VOICE_TASK_DELIVERY)
+
+    async def test_the_call_is_answered_before_the_chat_tail_is_read(self):
+        """Reading the tail first expires the ring window, after which pytgcalls
+        tries to *place* a call instead of accepting the offered one. The handler
+        only runs on a real call, so the ordering itself is the guard."""
+        source = DAEMON_PATH.read_text()
+        body = source.split("async def start_voice_call", 1)[1]
+        body = body.split("def begin_voice_call", 1)[0]
+        order = [body.index(marker) for marker in (
+            "await calls.record(",
+            "await calls.play(",
+            "session.start_pump()",
+            "await voice_chat_history(",
+            "session.set_system_instruction(",
+            "await session.start_agent()",
+        )]
+        self.assertEqual(order, sorted(order))
+
+    async def test_the_call_summary_does_not_depend_on_a_recording(self):
+        """The summary is started before the recording is joined, so it is ready
+        to reply to it — and a call with no recording still gets one."""
+        source = DAEMON_PATH.read_text()
+        body = source.split("async def finish_voice_call", 1)[1]
+        body = body.split("@calls.on_update", 1)[0]
+        self.assertLess(body.index("generate_call_summary("),
+                        body.index("if not record:"))
+        self.assertLess(body.index("generate_call_summary("),
+                        body.index("join_tracks_to_stereo("))
+        # Posted after the recording is delivered, replying to that message.
+        flush = source.split("async def flush_call_summary", 1)[1].split("\n\n        async def", 1)[0]
+        self.assertIn("force_reply=True", flush)
+        self.assertIn('(metadata.get("delivery") or {}).get("message_id")', flush)
 
     async def test_voice_prompt_file_override_comes_from_settings(self):
         with tempfile.TemporaryDirectory() as td:

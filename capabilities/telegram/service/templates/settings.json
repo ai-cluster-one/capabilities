@@ -80,7 +80,11 @@
           "service_tier": null
         }
       },
-      "max_parallel_jobs": null,
+      "voice": null,
+      "history": null,
+      "timezone": null,
+      "progress_interval": null,
+      "recording_caption": null,
       "prompt_file": null
     }
   }

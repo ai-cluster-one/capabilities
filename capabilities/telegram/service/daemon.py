@@ -169,11 +169,23 @@ DIRECT_MESSAGE_MODE = str(DIRECT_MESSAGES.get("mode") or "allowed_users").strip(
 ALLOW_ANY_DIRECT = DIRECT_MESSAGE_MODE in ("anyone", "all", "open", "public")
 DIRECT_DEFAULT_ROLE = DIRECT_MESSAGES.get("default_role") or "direct_user"
 DEFAULTS = SETTINGS.get("defaults", {})
-# How the voice channel behaves — which worker its tasks run on, how many may run
-# at once, which prompt file it speaks from. Worker policy lives here beside the
-# text worker's, never in the connection entry, which carries identity only.
+# How the voice channel behaves — which worker its tasks run on, which model and
+# voice it speaks with, which zone it states times in, which prompt file it
+# speaks from. Worker policy lives here beside the text worker's, never in the
+# connection entry, which carries identity only.
 VOICE_AGENT_DEFAULTS = (DEFAULTS.get("voice_agent")
                         if isinstance(DEFAULTS.get("voice_agent"), dict) else {})
+# The zone a call's "now" and its history timestamps are stated in, resolved
+# once so both say the same thing.
+VOICE_TIMEZONE, VOICE_TIMEZONE_NAME = voice_agent.resolve_timezone(
+    VOICE_AGENT_DEFAULTS.get("timezone"))
+# The line a voice recording is announced with. The summary then replies to it,
+# so this one line introduces both and the reply needs no heading of its own.
+VOICE_RECORDING_CAPTION = str(VOICE_AGENT_DEFAULTS.get("recording_caption") or "").strip()
+# The cadence of progress on a call, in seconds: how often a running task is
+# asked to report in, and how often the call may pass one of those notes on.
+VOICE_PROGRESS_INTERVAL = float(VOICE_AGENT_DEFAULTS.get("progress_interval")
+                                or voice_agent.DEFAULT_PROGRESS_INTERVAL)
 _voice_prompt_file = (os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
                       or VOICE_AGENT_DEFAULTS.get("prompt_file")
                       or "voice-agent.md")
@@ -563,15 +575,20 @@ def configured_voice_agent_users():
             continue
         if user_id <= 0:
             continue
+        # Three levels, narrowest first: this caller, then the project's voice
+        # defaults, then the built-in — so a project can set them at all.
+        def resolved(field, fallback):
+            return (voice_policy.get(field)
+                    or VOICE_AGENT_DEFAULTS.get(field)
+                    or fallback)
         try:
-            history = int(voice_policy.get("history")
-                          or voice_agent.DEFAULT_HISTORY_MESSAGES)
+            history = int(resolved("history", voice_agent.DEFAULT_HISTORY_MESSAGES))
         except (TypeError, ValueError):
             history = voice_agent.DEFAULT_HISTORY_MESSAGES
         users[user_id] = {
             "name": policy.get("name") or str(user_id),
-            "model": voice_policy.get("model") or voice_agent.DEFAULT_MODEL,
-            "voice": voice_policy.get("voice") or voice_agent.DEFAULT_VOICE,
+            "model": resolved("model", voice_agent.DEFAULT_MODEL),
+            "voice": resolved("voice", voice_agent.DEFAULT_VOICE),
             "history": max(0, history),
         }
     return users
@@ -1109,17 +1126,11 @@ def voice_agent_settings():
     cfg = dict(_as_mapping(_as_mapping(DEFAULTS.get("workers")).get(worker)))
     cfg.update(_as_mapping(_as_mapping(VOICE_AGENT_DEFAULTS.get("workers")).get(worker)))
     cfg = {k: _default_as_none(v) for k, v in cfg.items()}
-    try:
-        parallel = int(VOICE_AGENT_DEFAULTS.get("max_parallel_jobs")
-                       or DEFAULTS.get("max_parallel_jobs", 2))
-    except (TypeError, ValueError):
-        parallel = 2
     return {
         "worker": worker,
         "worker_settings": cfg,
         "model": cfg.get("model"),
         "worker_timeout": DEFAULTS.get("worker_timeout", 90),
-        "max_parallel_jobs": max(1, parallel),
         **_worker_flags(worker, cfg),
     }
 
@@ -1143,6 +1154,123 @@ VOICE_TASK_DELIVERY = (
     "the caller is on a live phone call and your reply is read aloud to them — "
     "answer in one or two short spoken sentences, plain words only, no markdown, "
     "no lists, no URLs")
+
+VOICE_SUMMARY_DELIVERY = (
+    "your reply is posted into the chat as the record of a call that just "
+    "ended — write it as plain prose in the language of the call, no preamble, "
+    "no headings, no markdown")
+
+VOICE_SUMMARY_TASK = (
+    "A voice call has just ended. Write a short summary of it for the chat, so "
+    "that a later conversation knows what was discussed. Cover what was asked "
+    "for, what was decided, and anything left open. Do not invent anything that "
+    "is not in the transcript. Three or four sentences at most.\n\n"
+    "Transcript:\n")
+
+# Generic shell tools, described by what a caller waiting on the line would
+# understand. Anything not here is named by its own command instead, so a
+# capability the project happens to have is recognised without being listed.
+SHELL_STAGES = {
+    "rg": "searching for it", "grep": "searching for it",
+    "fd": "searching for it", "find": "searching for it", "ls": "searching for it",
+    "cat": "reading what it found", "head": "reading what it found",
+    "tail": "reading what it found", "sed": "reading what it found",
+    "awk": "reading what it found", "less": "reading what it found",
+    "jq": "reading what it found",
+    "git": "checking the repository",
+    "python": "working through the numbers", "python3": "working through the numbers",
+    "node": "working through the numbers",
+}
+
+
+def _shell_stage(command):
+    """Describe a shell step by what it actually does.
+
+    Codex wraps every command in `<shell> -lc "…"`, so the first word is the
+    shell and says nothing. Look past the wrapper at the real command, and name
+    the tool being used — that is what a caller waiting on the line cares about.
+    """
+    if isinstance(command, (list, tuple)):
+        parts = [str(part) for part in command]
+        text = parts[-1] if parts else ""
+    else:
+        text = str(command or "")
+    for marker in (" -lc ", " -c "):
+        if marker in text:
+            text = text.split(marker, 1)[1]
+    words = text.strip().strip("'\"").split()
+    if not words:
+        return "running a command"
+    head = words[0].rsplit("/", 1)[-1]
+    verb = words[1] if len(words) > 1 and not words[1].startswith("-") else ""
+    if head == "telegram" and verb == "send":
+        # The worker reporting its progress is not progress. Its words arrive
+        # through the outbox and outrank anything derived here anyway.
+        return None
+    if head in SHELL_STAGES:
+        return SHELL_STAGES[head]
+    return f"asking {head} to {verb}" if verb else f"running {head}"
+
+
+def codex_event_stage(line):
+    """Turn one codex `--json` event into a short, host-neutral phrase.
+
+    Structural rather than narrated: the worker does not have to remember to
+    report anything, because what it is doing is already in the event stream.
+    Returns None for events that say nothing a waiting caller would care about.
+    """
+    try:
+        event = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    kind = event.get("type")
+    if kind == "thread.started":
+        return "starting"
+    if kind == "turn.completed":
+        return "finishing up"
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    item_type = item.get("type") or item.get("item_type")
+    if item_type in ("command_execution", "local_shell_call", "shell_call"):
+        return _shell_stage(item.get("command"))
+    if item_type in ("file_change", "patch_apply", "apply_patch"):
+        return "changing files"
+    if item_type in ("mcp_tool_call", "tool_call", "function_call"):
+        return "using a tool"
+    if item_type == "web_search":
+        return "searching the web"
+    if item_type == "reasoning":
+        return "working it out"
+    return None
+
+
+def voice_task_preamble(chat_id, seconds):
+    """Prepended to a task asked for by voice.
+
+    A caller on the line hears silence, not a quiet chat, so the instruction
+    goes into the task text itself with the command and the chat spelled out.
+    Where those lines go is the part the worker cannot guess: to the assistant
+    holding the call, which decides what is worth saying aloud.
+    """
+    return (
+        "Someone is waiting on a live phone call for this, so silence costs "
+        "them directly.\n\n"
+        "Report what you are doing as you go, by running\n"
+        f'    telegram send {chat_id} "<one short line>"\n'
+        f"once before you start looking, and again every {seconds:.0f} seconds "
+        "or so while the work continues.\n\n"
+        "Say what you are actually doing and what you have found so far, not "
+        "that you are still working. \"Looking through yesterday's calls\" and "
+        "\"got the list, now counting the failed ones\" are useful; \"still "
+        "working\" and \"one moment\" are not. One plain line each time, in the "
+        "language of the task, no paths, no commands, no markdown.\n\n"
+        "These lines go to the assistant on the call, not to the caller. Do not "
+        "message the caller yourself and do not address them; the assistant "
+        "decides what to say aloud. The answer you return at the end is the "
+        "result — the progress lines are not.\n\n"
+        "The task:\n"
+    )
 
 
 def voice_task_authority(caller_id, caller_name, text, task_id="voice-task"):
@@ -1716,12 +1844,46 @@ def _kill_process_group(proc):
         return False
 
 
-def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None):
+def _stream_worker_proc(proc, on_line):
+    """Drain both pipes concurrently, handing stdout lines over as they arrive.
+
+    Reading one pipe to completion before the other deadlocks as soon as the
+    unread one fills, so each gets its own thread."""
+    collected = {"out": [], "err": []}
+
+    def pump(stream, key, callback):
+        try:
+            for line in stream:
+                collected[key].append(line)
+                if callback is not None:
+                    try:
+                        callback(line)
+                    except Exception:
+                        pass
+        finally:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+    threads = [
+        threading.Thread(target=pump, args=(proc.stdout, "out", on_line), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, "err", None), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    proc.wait()
+    for t in threads:
+        t.join(timeout=5)
+    return "".join(collected["out"]), "".join(collected["err"])
+
+
+def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None):
     """Run a worker subprocess in its own process group (start_new_session) and register it in
     the caller's `procs` map until the async job finalizes, so /stop can SIGKILL the whole group —
     claude/codex spawn children, so killing the group, not just the lone parent, is what stops
     the run. Returns (returncode, stdout, stderr); a killed run comes back with a negative
-    returncode, which the caller raises on like any nonzero exit."""
+    returncode, which the caller raises on like any nonzero exit. With `on_line`, stdout is
+    handed over line by line while the run is still going, for a caller that cannot wait for
+    the end of it."""
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("worker cancelled before process start")
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -1732,7 +1894,10 @@ def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None):
     # that arrived while the process was being created so no late process escapes.
     if cancel_event is not None and cancel_event.is_set():
         _kill_process_group(proc)
-    out, err = proc.communicate()
+    if on_line is not None:
+        out, err = _stream_worker_proc(proc, on_line)
+    else:
+        out, err = proc.communicate()
     return proc.returncode, out, err
 
 
@@ -1867,7 +2032,8 @@ def worker_codex(chat, tail, state=None, procs=None):
         proc_key = ((state or {}).get("proc_key") or chat)
         rc, stdout_txt, err = run_worker_proc(
             proc_key, cmd, procs, env=worker_env(state),
-            cancel_event=(state or {}).get("cancel_event"))
+            cancel_event=(state or {}).get("cancel_event"),
+            on_line=(state or {}).get("on_worker_line"))
         if rc != 0:
             raise RuntimeError(f"codex worker failed: {err.strip()[:200]}")
         reply = Path(out).read_text().strip()
@@ -1977,14 +2143,20 @@ async def run_session(client):
         chunks.append(text)
         return chunks
 
-    async def send_channel_message(ent_id, text, is_direct, reply_to=None, **kwargs):
+    async def send_channel_message(ent_id, text, is_direct, reply_to=None,
+                                   force_reply=False, **kwargs):
+        """One path for every message the service sends, so chunking at
+        Telegram's length limit happens once. A direct chat is a single thread,
+        so a `reply_to` meant for a group's addressed message is dropped there —
+        unless `force_reply` says the reply relationship is itself the point."""
         sent = None
         sent_ids = []
+        threaded = reply_to is not None and (force_reply or not is_direct)
         for chunk in message_chunks(text):
-            if is_direct or reply_to is None:
-                sent = await client.send_message(ent_id, chunk, **kwargs)
-            else:
+            if threaded:
                 sent = await client.send_message(ent_id, chunk, reply_to=reply_to, **kwargs)
+            else:
+                sent = await client.send_message(ent_id, chunk, **kwargs)
             sent_ids.append(sent.id)
         return sent, sent_ids
 
@@ -2903,7 +3075,33 @@ async def run_session(client):
         def voice_call_busy():
             return active_voice_call["starting"] or active_voice_call["session"] is not None
 
-        async def run_voice_task(caller_id, caller_name, text):
+        async def tail_voice_progress(path, on_progress):
+            """Follow one task's progress file. Every line the worker writes is
+            collected; what reaches the conversation is the call's decision, not
+            this reader's."""
+            offset = 0
+            while True:
+                await asyncio.sleep(1.0)
+                if not path.exists():
+                    continue
+                try:
+                    with path.open("r", encoding="utf-8") as fh:
+                        fh.seek(offset)
+                        lines = fh.readlines()
+                        offset = fh.tell()
+                except OSError:
+                    continue
+                for line in lines:
+                    try:
+                        item = json.loads(line)
+                    except ValueError:
+                        continue
+                    note = str(item.get("text") or "").strip()
+                    if note and note not in ("-", ".", "..."):
+                        on_progress(note, "worker")
+
+        async def run_voice_task(caller_id, caller_name, text,
+                                 delivery=VOICE_TASK_DELIVERY, on_progress=None):
             """One task the caller asked for mid-call, run by the project's own
             worker — the same machinery a message runs, under the authority the
             same user's messages resolve to."""
@@ -2911,12 +3109,28 @@ async def run_session(client):
             key = str(caller_id)
             voice_task_counter["n"] += 1
             task_id = f"voice-{int(time.time())}-{voice_task_counter['n']}"
-            job = voice_task_job(caller_id, caller_name, text, task_id)
+            worker_text = text
+            if on_progress is not None:
+                worker_text = voice_task_preamble(
+                    caller_id, VOICE_PROGRESS_INTERVAL) + text
+            job = voice_task_job(caller_id, caller_name, worker_text, task_id)
             authority = _authority_policy_for(job, None, True)
             proc_key = f"{key}#voice-{task_id}"
             authority_context = None
             worker_session = None
             cancel_event = threading.Event()
+            progress_task = None
+
+            def _offer_stage(line):
+                """Called from the worker's output pump, one JSONL event at a time."""
+                stage = codex_event_stage(line)
+                if stage:
+                    on_progress(stage, "stream")
+
+            PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+            progress_outbox = PROGRESS_DIR / f"{_safe_file_part(key)}-{task_id}.jsonl"
+            with contextlib.suppress(OSError):
+                progress_outbox.unlink()
             try:
                 worker_session = prepare_worker_session(key, task_id)
                 if authority is not None:
@@ -2937,17 +3151,23 @@ async def run_session(client):
                              "sender_name": job["sender_name"],
                              "sender_role": job["sender_role"],
                              "kind": job["kind"],
-                             "text": text,
+                             "text": worker_text,
                              "reply_to": None,
-                             "delivery": VOICE_TASK_DELIVERY,
+                             "delivery": delivery,
                          },
                          "authority": authority,
                          "authority_context": authority_context,
+                         "progress_outbox": str(progress_outbox),
+                         "on_worker_line": (_offer_stage if on_progress is not None
+                                            else None),
                          "worker_session": worker_session,
                          "cancel_event": cancel_event,
                          "proc_key": proc_key}
                 log(f"voice: task {task_id} dispatched worker={s['worker']} "
                     f"model={s['model'] or 'default'} authority={_authority_summary(authority)}")
+                if on_progress is not None:
+                    progress_task = asyncio.create_task(
+                        tail_voice_progress(progress_outbox, on_progress))
                 loop = asyncio.get_running_loop()
                 future = loop.run_in_executor(
                     None, WORKERS[s["worker"]], key, [], state, procs)
@@ -2960,11 +3180,85 @@ async def run_session(client):
                         f"{s['worker']} worker timed out after {s['worker_timeout']}s")
                 return (await future)["reply"]
             finally:
+                if progress_task is not None:
+                    progress_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await progress_task
+                with contextlib.suppress(OSError):
+                    progress_outbox.unlink()
                 cleanup_worker_session(worker_session)
                 if authority_context:
                     with contextlib.suppress(OSError):
                         Path(authority_context).unlink()
                 release_worker_proc(proc_key)
+
+        # The summary of the call that just ended, in flight while the recording
+        # is still being joined and uploaded — so it is ready to reply to it.
+        pending_summary = {}
+
+        async def generate_call_summary(caller_id, caller_name, transcript, metadata):
+            """Write the call up from its transcript, not its audio: audio is not
+            context, and a summary in the chat enters the next call's tail through
+            the ordinary path, timestamped by being a message."""
+            record = {"status": "skipped", "error": None, "message_id": None}
+            metadata["voice_agent"]["summary"] = record
+            if len(transcript) < 2:
+                record["error"] = "too_short"
+                return None
+            body = voice_agent.transcript_text(transcript, ASSISTANT_NAME, caller_name)
+            if not body.strip():
+                record["error"] = "empty_transcript"
+                return None
+            try:
+                text = await run_voice_task(
+                    caller_id, caller_name,
+                    VOICE_SUMMARY_TASK + body,
+                    delivery=VOICE_SUMMARY_DELIVERY)
+            except Exception as exc:
+                record.update({"status": "failed", "error": _short_error(exc)})
+                log(f"voice: call summary failed — {_short_error(exc)}")
+                return None
+            text = str(text or "").strip()
+            if not text:
+                record.update({"status": "failed", "error": "empty_reply"})
+                log("voice: call summary came back empty")
+                return None
+            return text
+
+        async def flush_call_summary():
+            """Post the summary as a reply to the recording it describes, so the
+            two read as one thing. A call with no recording still gets its
+            summary, standing alone; a summary that fails never costs the
+            recording, which was delivered before this is awaited."""
+            state = dict(pending_summary)
+            pending_summary.clear()
+            task = state.get("task")
+            if task is None:
+                return
+            try:
+                text = await task
+            except Exception as exc:
+                log(f"voice: call summary task failed — {_short_error(exc)}")
+                return
+            if not text:
+                return
+            metadata = state["metadata"]
+            record = metadata["voice_agent"].get("summary") or {}
+            reply_to = (metadata.get("delivery") or {}).get("message_id")
+            try:
+                sent, _ = await send_channel_message(
+                    state["caller_id"], text, True,
+                    reply_to=reply_to, force_reply=True)
+            except Exception as exc:
+                record.update({"status": "failed", "error": _short_error(exc)})
+                log(f"voice: cannot post call summary — {_short_error(exc)}")
+                write_metadata(state["metadata_path"], metadata)
+                return
+            record.update({"status": "sent", "message_id": getattr(sent, "id", None),
+                           "reply_to": reply_to})
+            write_metadata(state["metadata_path"], metadata)
+            log(f"voice: call summary posted to {state['caller_id']} "
+                f"({len(text)} chars, reply_to={reply_to})")
 
         async def deliver_voice_task_result(caller_id, completion):
             """The call ended before the task did: what the caller asked for
@@ -2994,7 +3288,14 @@ async def run_session(client):
                 if not text:
                     continue
                 who = ASSISTANT_NAME if getattr(m, "out", False) else caller_name
-                rows.append(f"{who}: {text}")
+                # Stamped in the same zone the prompt states as "now", so the
+                # model can tell minutes old from weeks old.
+                stamp = ""
+                when = getattr(m, "date", None)
+                if when is not None:
+                    with contextlib.suppress(Exception):
+                        stamp = f"[{when.astimezone(VOICE_TIMEZONE):%Y-%m-%d %H:%M}] "
+                rows.append(f"{stamp}{who}: {text}")
             return "\n".join(rows)
 
         async def start_voice_call(caller_id, policy, api_key, voice_context):
@@ -3051,11 +3352,15 @@ async def run_session(client):
             }
             write_metadata(metadata_path, metadata)
 
-            history = await voice_chat_history(caller_id, policy["history"], caller_name)
+            # `session` is bound just below; the closure reads it when a running
+            # task reports, which cannot happen before the session exists.
+            def note_task_progress(note, source="stream"):
+                session.note_progress(note, source)
+
             task_runner = voice_agent.VoiceTaskRunner(
-                lambda text: run_voice_task(caller_id, caller_name, text),
+                lambda text: run_voice_task(caller_id, caller_name, text,
+                                            on_progress=note_task_progress),
                 lambda completion: deliver_voice_task_result(caller_id, completion),
-                limit=voice_agent_settings()["max_parallel_jobs"],
                 log=log,
             )
             session = voice_agent.VoiceCallSession(
@@ -3064,12 +3369,15 @@ async def run_session(client):
                 api_key=api_key,
                 model=policy["model"],
                 voice=policy["voice"],
-                system_instruction=voice_agent.build_system_prompt(
-                    voice_context, history),
+                # The prompt is set once the call is answered: building it means
+                # reading the chat tail, and that must not delay the pickup.
+                system_instruction="",
                 caller_name=caller_name,
                 caller_track=caller_pcm,
                 agent_track=agent_pcm,
                 task_runner=task_runner,
+                send_to_chat=lambda body: send_channel_message(caller_id, body, True),
+                progress_interval=VOICE_PROGRESS_INTERVAL,
                 log=log,
             )
             active_voice_call.update({
@@ -3106,6 +3414,19 @@ async def run_session(client):
                     ),
                 )
                 session.start_pump()
+                # Answered, and both slots are already carrying audio. Reading
+                # the chat tail now costs a moment of dead air; reading it before
+                # the answer costs the ring window, after which pytgcalls tries
+                # to *place* a call instead of accepting one.
+                tail_started = time.monotonic()
+                history = await voice_chat_history(
+                    caller_id, policy["history"], caller_name)
+                log(f"voice: chat tail for {caller_id} — {len(history)} chars in "
+                    f"{time.monotonic() - tail_started:.1f}s")
+                session.set_system_instruction(voice_agent.build_system_prompt(
+                    voice_context, history,
+                    now_line=voice_agent.current_time_line(
+                        VOICE_TIMEZONE, VOICE_TIMEZONE_NAME)))
                 await session.start_agent()
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"[:500]
@@ -3188,6 +3509,8 @@ async def run_session(client):
                 "caller_seconds": summary["caller_seconds"],
                 "agent_seconds": summary["agent_seconds"],
                 "agent_voiced_seconds": summary["agent_voiced_seconds"],
+                "messages_sent": summary["messages_sent"],
+                "tasks": summary["tasks"],
                 "transcript": transcript,
                 "transcript_text": voice_agent.transcript_text(
                     transcript, ASSISTANT_NAME, caller_name),
@@ -3200,6 +3523,16 @@ async def run_session(client):
             metadata["audio"]["tracks"] = tracks
             log(f"voice: call with {caller_id} ended ({reason}); "
                 f"{len(transcript)} turns, {summary['interruptions']} interruption(s)")
+
+            # Started now so it runs while the recording is joined and uploaded;
+            # awaited afterwards, by which time it can reply to the recording.
+            pending_summary.update({
+                "task": asyncio.create_task(generate_call_summary(
+                    caller_id, caller_name, transcript, metadata)),
+                "caller_id": caller_id,
+                "metadata": metadata,
+                "metadata_path": metadata_path,
+            })
 
             if not record:
                 metadata.update({
@@ -3257,6 +3590,7 @@ async def run_session(client):
                 metadata_path,
                 metadata,
                 emit_event_fn=lambda event, **fields: log(f"voice-delivery: {event} {fields}"),
+                caption=VOICE_RECORDING_CAPTION or None,
             )
             log(f"voice: recording delivered to {caller_id}")
 
@@ -3289,6 +3623,7 @@ async def run_session(client):
         async def call_ended(_call_client: PyTgCalls, update: ChatUpdate):
             if active_voice_call["caller_id"] == update.chat_id:
                 await finish_voice_call("call_closed")
+                await flush_call_summary()
                 return
             if active_recording["caller_id"] != update.chat_id:
                 return

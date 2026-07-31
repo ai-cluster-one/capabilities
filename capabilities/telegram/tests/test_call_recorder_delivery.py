@@ -189,6 +189,40 @@ class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(persisted["delivery"]["notice_message_id"], 7000)
             self.assertEqual(persisted["delivery"]["message_id"], 7001)
 
+    async def test_the_announcement_line_is_the_callers_when_it_gives_one(self):
+        """The summary replies to this notice, so the project owns its wording;
+        without one, the built-in line still announces the recording."""
+        helpers = import_call_recording_helpers()
+        original_waveform = helpers.build_voice_waveform
+
+        async def fake_waveform(_path):
+            return b"waveform"
+
+        helpers.build_voice_waveform = fake_waveform
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                output = root / "recording.ogg"
+                output.write_bytes(b"ogg")
+                notices = []
+                for caption in ("Here is the call:", None):
+                    metadata = {
+                        "status": "complete",
+                        "duration_seconds": 61,
+                        "audio": {"settled": True},
+                        "delivery": {"enabled": True},
+                    }
+                    client = FakeClient()
+                    await helpers.send_recording_to_chat(
+                        client, -1001, output, root / "recording.json", metadata,
+                        caption=caption)
+                    notices.append(client.message_calls[0][1])
+        finally:
+            helpers.build_voice_waveform = original_waveform
+
+        self.assertEqual(notices[0], "Here is the call:")
+        self.assertEqual(notices[1], helpers.recording_caption({"duration_seconds": 61}))
+
     async def test_waveform_uses_telegram_five_bit_packing(self):
         helpers = import_call_recording_helpers()
         self.assertEqual(helpers.pack_voice_waveform([31, 31]), bytes([255, 3]))

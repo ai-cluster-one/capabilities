@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import math
 import shutil
@@ -11,10 +12,12 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from array import array
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -345,16 +348,19 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not a new user request", announced[0])
         self.assertIn("the answer is ready", announced[0])
 
-    async def test_tasks_beyond_the_bound_are_refused_not_queued(self):
+    async def test_a_second_task_is_refused_while_one_runs(self):
+        """One task per call, and the refusal tells the model to wait rather than
+        retry: several workers on one call race their answers into the call."""
         with fake_runtime_modules(), fake_genai_types():
             va = import_voice_agent()
+            self.assertEqual(va.TASKS_PER_CALL, 1)
             release = asyncio.Event()
 
             async def work(text):
                 await release.wait()
                 return text
 
-            runner = va.VoiceTaskRunner(work, self.fail_delivery, limit=2,
+            runner = va.VoiceTaskRunner(work, self.fail_delivery,
                                         log=lambda *_: None)
             session = task_session(va, runner)
             for task in ("first task", "second task", "third task"):
@@ -367,9 +373,19 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*jobs)
 
         self.assertEqual([answer["status"] for answer in answers],
-                         ["started", "started", "capacity_reached"])
-        self.assertEqual(running, 2)
-        self.assertEqual(answers[-1]["limit"], 2)
+                         ["started", "busy", "busy"])
+        self.assertEqual(running, 1)
+        self.assertEqual(answers[-1]["limit"], 1)
+        self.assertFalse(answers[-1]["ok"])
+        self.assertIn("Do NOT start this one", answers[-1]["instruction"])
+
+    async def test_the_task_bound_is_not_a_setting(self):
+        """A project raising the bound would only re-create the defect it fixes,
+        so the runner takes no limit at all."""
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            with self.assertRaises(TypeError):
+                va.VoiceTaskRunner(self.fail_delivery, self.fail_delivery, limit=4)
 
     async def test_the_same_task_is_never_started_twice(self):
         with fake_runtime_modules(), fake_genai_types():
@@ -440,6 +456,56 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(queued, 1)
         self.assertEqual([row["result"] for row in delivered], ["the answer is ready"])
+
+    async def test_a_result_in_hand_when_the_call_ends_still_reaches_the_chat(self):
+        """The announcer has taken the result off the queue and is waiting for the
+        model to stop speaking when the caller hangs up. Held in hand, it must be
+        put back before the queue is drained, or it is lost silently."""
+        delivered = []
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(
+                lambda text: self.answer("the answer is ready"),
+                lambda completion: self.collect(delivered, completion),
+                log=lambda *_: None)
+            session = task_session(va, runner)
+            session._model_idle.clear()          # the agent is mid-sentence
+            notifier = asyncio.create_task(session._announce_completions())
+            session._tasks.append(notifier)
+            await session._handle_tool_call(tool_call("look the thing up"))
+            await asyncio.sleep(0.05)
+            in_hand = session._announcing
+            spoken = list(session._live.texts)
+
+            await session.stop()                 # the caller hangs up
+
+        self.assertIsNotNone(in_hand)            # off the queue, not yet spoken
+        self.assertEqual(spoken, [])
+        self.assertEqual([row["result"] for row in delivered], ["the answer is ready"])
+
+    async def test_waiting_for_a_pause_is_bounded_rather_than_endless(self):
+        """A turn boundary that never arrives must not sit on a finished result:
+        interrupting the agent is better than losing what the caller asked for."""
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            self.assertEqual(va.ANNOUNCE_IDLE_TIMEOUT, 20.0)
+            va.ANNOUNCE_IDLE_TIMEOUT = 0.05
+            runner = va.VoiceTaskRunner(
+                lambda text: self.answer("the answer is ready"),
+                self.fail_delivery, log=lambda *_: None)
+            session = task_session(va, runner)
+            session._model_idle.clear()          # and it never becomes idle
+            notifier = asyncio.create_task(session._announce_completions())
+            await session._handle_tool_call(tool_call("look the thing up"))
+            await asyncio.sleep(0.2)
+            announced = list(session._live.texts)
+            notifier.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await notifier
+
+        self.assertEqual(len(announced), 1)
+        self.assertIn("the answer is ready", announced[0])
+        self.assertIsNone(session._announcing)
 
     async def test_a_failed_task_is_reported_rather_than_lost(self):
         delivered = []
@@ -710,6 +776,8 @@ class PromptTests(unittest.TestCase):
             prompt,
             "# Voice instructions\nSpeak briefly.\n\n"
             "--- Recent messages in this direct chat ---\n\n"
+            "Older first. Each line is timestamped in the same zone as the "
+            "current time above.\n\n"
             "Caller: hello\nAssistant: hi")
 
     def test_prompt_carries_no_built_in_text_of_its_own(self):
@@ -719,6 +787,147 @@ class PromptTests(unittest.TestCase):
                              "Project prompt.")
             self.assertEqual(va.build_system_prompt("", ""), "")
             self.assertFalse(hasattr(va, "VOICE_PREAMBLE"))
+
+    def test_the_prompt_can_be_set_after_the_call_is_answered(self):
+        """Building it means reading the chat tail, which must happen after the
+        call is picked up — so the session starts without one and is told later."""
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            session = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice="v",
+                system_instruction="", caller_name="Caller", log=lambda *_: None)
+            session.set_system_instruction("read from the chat")
+            config = va.live_config(session._system_instruction, "v")
+
+        self.assertEqual(config["system_instruction"],
+                         {"parts": [{"text": "read from the chat"}]})
+
+    def test_the_call_states_a_time_in_a_named_zone_never_the_hosts(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            zone, label = va.resolve_timezone("Europe/Berlin")
+            self.assertEqual(label, "Europe/Berlin")
+            line = va.current_time_line(zone, label)
+            self.assertIn("timezone Europe/Berlin", line)
+            self.assertIn(f"{datetime.now(zone):%Y-%m-%d}", line)
+            # Unset, unknown, or nonsense all mean UTC — never the host's zone,
+            # which would make a relocated daemon quietly report the wrong time.
+            for name in (None, "", "Mars/Olympus", "not a zone"):
+                self.assertEqual(va.resolve_timezone(name),
+                                 (timezone.utc, "UTC"))
+
+
+class ProgressTests(unittest.IsolatedAsyncioTestCase):
+    def test_the_digest_is_the_whole_window_not_its_last_step(self):
+        """A worker's last step is often something that did not work, which it
+        then routes around; reporting it tells the caller a failure that is not
+        one. So the window is folded into counts plus where the work stands."""
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            note = va.summarize_progress([
+                ("stream", "searching for it"),
+                ("stream", "searching for it"),
+                ("stream", "reading what it found"),
+                ("stream", "changing files"),
+            ])
+            single = va.summarize_progress([("stream", "starting")])
+            nothing = va.summarize_progress([])
+
+        self.assertIn("searching for it (2x)", note)
+        self.assertIn("reading what it found", note)
+        self.assertTrue(note.endswith("now changing files"))
+        self.assertEqual(single, "starting")
+        self.assertIsNone(nothing)
+
+    def test_a_line_the_worker_wrote_outranks_a_derived_one(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            note = va.summarize_progress([
+                ("stream", "searching for it"),
+                ("worker", "got the list, counting the failed ones"),
+                ("stream", "changing files"),
+            ])
+
+        self.assertEqual(note, "got the list, counting the failed ones")
+
+    async def test_the_same_note_is_never_offered_twice(self):
+        """What the caller hears is bounded independently of how talkative the
+        worker is: once per interval, only into a lull, and never a repeat."""
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(lambda text: self.never(),
+                                        self.never, log=lambda *_: None)
+            session = task_session(va, runner)
+            session._progress_interval = 0.0
+
+            session.note_progress("searching for it")
+            first = session._due_progress()
+            session.note_progress("searching for it")
+            repeated = session._due_progress()
+            session.note_progress("changing files")
+            changed = session._due_progress()
+
+        self.assertEqual(first, "searching for it")
+        self.assertIsNone(repeated)
+        self.assertEqual(changed, "changing files")
+
+    async def test_progress_stays_off_the_line_until_there_is_a_lull(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(lambda text: self.never(),
+                                        self.never, log=lambda *_: None)
+            session = task_session(va, runner)
+            session._progress_interval = 0.0
+            session.note_progress("searching for it")
+
+            session._model_idle.clear()               # the agent is speaking
+            while_speaking = session._due_progress()
+            session._model_idle.set()
+            session._caller_spoke_at = time.monotonic()   # the caller just spoke
+            while_caller_talks = session._due_progress()
+            session._caller_spoke_at = time.monotonic() - va.PROGRESS_CALLER_QUIET - 1
+            in_the_lull = session._due_progress()
+
+        self.assertIsNone(while_speaking)
+        self.assertIsNone(while_caller_talks)
+        self.assertEqual(in_the_lull, "searching for it")
+
+    async def test_progress_is_capped_to_one_note_per_interval(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(lambda text: self.never(),
+                                        self.never, log=lambda *_: None)
+            session = task_session(va, runner)
+            session.note_progress("searching for it")
+            first = session._due_progress()
+            session.note_progress("changing files")
+            too_soon = session._due_progress()
+
+        self.assertEqual(first, "searching for it")
+        self.assertIsNone(too_soon)
+
+    async def never(self, *_args):
+        raise AssertionError("nothing should run in a progress-only test")
+
+
+class TranscriptTurnTests(unittest.TestCase):
+    def test_a_pause_starts_a_new_turn_even_for_the_same_speaker(self):
+        """A task answered fifteen seconds later is a new turn, not a
+        continuation: joining them makes the turn's own timestamp lie."""
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            session = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                system_instruction="", caller_name="Caller", log=lambda *_: None)
+            session._record_fragment("agent", "one moment")
+            session._record_fragment("agent", ", looking")
+            joined = len(session._turns)
+            session._last_fragment_at -= va.TURN_JOIN_GAP_SECONDS + 1
+            session._record_fragment("agent", "here it is")
+
+        self.assertEqual(joined, 1)
+        self.assertEqual([turn["text"] for turn in session._turns],
+                         ["one moment, looking", "here it is"])
 
 
 if __name__ == "__main__":

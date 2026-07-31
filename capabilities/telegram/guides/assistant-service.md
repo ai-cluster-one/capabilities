@@ -152,7 +152,7 @@ An incoming one-to-one call is handled by two independent per-user switches unde
 | on | off | Conversation only; nothing is written and nothing is delivered. |
 | off | off | The call is not answered. |
 
-`voice_agent` accepts optional `model`, `voice`, and `history` overrides. `history` is how many messages of that direct chat are carried into the call prompt.
+`voice_agent` accepts optional `model`, `voice`, and `history` overrides for that one user. Each of the three resolves per-user first, then `defaults.voice_agent`, then the built-in. `history` is how many messages of that direct chat are carried into the call prompt.
 
 The voice agent runs on the daemon's own Telegram connection and its own PyTgCalls instance. An account may have exactly one connection consuming the update stream: a second one takes the incoming-call update and the first never sees it, so no part of call handling may open another client.
 
@@ -160,11 +160,25 @@ The two media slots of one direct call are independent, and both honour the requ
 
 Recording a voice-agent call therefore writes two raw tracks against one shared time origin, each padded with silence up to that origin, which FFmpeg joins into one stereo Opus file with real speaker separation. Both call paths refuse to deliver a recording that captured no audio.
 
-The system prompt is the project's own `capabilities/telegram/service/voice-agent.md`, then the recent tail of that direct chat. `telegram service init` scaffolds that file from the shipped template and never overwrites an existing one; the project owns it and edits it freely, including which language the assistant prefers on a call. Both speech directions are transcribed and the joined transcript is stored in the JSON sidecar next to the recording; it is not sent as a message.
+The system prompt is the project's own `capabilities/telegram/service/voice-agent.md`, the time the call is happening, then the recent tail of that direct chat, each message stamped with when it was sent. `telegram service init` scaffolds that file from the shipped template and never overwrites an existing one; the project owns it and edits it freely, including which language the assistant prefers on a call. Both speech directions are transcribed and the joined transcript is stored in the JSON sidecar next to the recording.
+
+The call is answered before the prompt is built. Reading a long chat tail first expires the ring window, after which the call layer tries to *place* a call instead of accepting one; so the daemon claims both media slots, then reads the tail, then sets the instruction and opens the speech session. The cost of that order is a second of dead air after pickup rather than a call that cannot be answered at all.
+
+A second tool, `send_to_chat`, writes into the caller's chat mid-call — for a link, an exact spelling, or a list that speech carries badly.
+
+### The record of a call
+
+When a call ends, its transcript is written up into a short summary and posted into the caller's chat as a reply to the recording, so the two read as one thing and the summary enters the next call's tail through the ordinary path. Audio is not context; the summary is what a later conversation reads. It is written from the transcript, not the audio, and generated while the recording is still being joined and uploaded. A call with no recording still gets its summary, standing alone, and a summary that fails never costs the recording.
+
+`recording_caption` is the line the recording is announced with; the summary reply carries no heading of its own. Left unset, the built-in caption is used.
 
 ### Doing work from a call
 
-The voice agent has one tool, `agent_task`: it hands a task to the project's worker — the same worker a message runs, launched the same way — and returns immediately, so the conversation is never blocked on it. Concurrent tasks are capped and an identical task already running is not started twice. When the result lands it is injected between turns, never into speech in progress, and the assistant tells the caller. If the call ended first, the result is delivered to the caller's direct chat as a message instead, so an answer the caller asked for always reaches them. Hanging up is the caller's own button; there is no tool for it, and no read-only inspection tools — the worker already sees the project.
+`agent_task` hands a task to the project's worker — the same worker a message runs, launched the same way — and returns immediately, so the conversation is never blocked on it. An identical task already running is not started twice, and **exactly one task runs per call**. That bound is fixed in code and is deliberately not a setting: several workers on one call race each other's progress and answers into the conversation, and the caller cannot tell which reply belongs to which question. A second request is refused with instructions to say it will be done after the current one.
+
+When the result lands it is injected between turns, never into speech in progress, and the assistant tells the caller. A result taken off the queue is held until it has actually been handed over, so a call ending while waiting for a pause cannot swallow it; and the wait for a pause is bounded, after which the assistant is interrupted rather than the result lost. If the call ended first, the result is delivered to the caller's direct chat as a message instead, so an answer the caller asked for always reaches them. Hanging up is the caller's own button; there is no tool for it, and no read-only inspection tools — the worker already sees the project.
+
+While a task runs, the caller hears roughly where it stands. Progress is read from the worker's own event stream rather than asked for — a fast worker works silently — and from any line the worker writes itself, which outranks a derived one. Events are accumulated over the interval and folded into where the work stands now, never reported as "the last thing that happened": a worker's last step is often something that failed and it then routed around, and reporting that tells the caller a failure that is not one. What reaches the caller is bounded independently of how talkative the worker is — at most one note per `progress_interval`, only into a genuine lull, and never the same note twice. Progress goes to the assistant only; the worker is told not to address the caller, and the answer it returns at the end is the result.
 
 A task runs under the authority the *same user's messages* resolve to: role and `authority.allowed_capabilities` come from the one resolution the direct-message path uses, given the caller id as sender. A call therefore reaches exactly what a message from that person reaches, and no more.
 
@@ -176,14 +190,20 @@ How the channel behaves is `defaults.voice_agent`, beside the text worker's poli
     "voice_agent": {
       "worker": "claude",
       "workers": {"claude": {"model": "<a fast model id>", "effort": null}},
-      "max_parallel_jobs": 2,
+      "voice": null,
+      "history": null,
+      "timezone": "<an IANA zone name>",
+      "progress_interval": 10,
+      "recording_caption": null,
       "prompt_file": null
     }
   }
 }
 ```
 
-Every field is optional and falls back to the project's existing worker settings (`defaults.worker`, `defaults.workers`, `defaults.max_parallel_jobs`); `prompt_file` overrides which file the call speaks from, relative to the service directory unless absolute. Pick a **fast, non-reasoning model** here: work asked for by voice is operational and quick — look something up, check or file a ticket, note something down — not coding, and the caller is waiting on the line. The timeout is the text worker's `defaults.worker_timeout`; task size is bounded by the model choice, not by cutting the clock short.
+Every field is optional. `worker` and `workers` fall back to the project's existing worker settings (`defaults.worker`, `defaults.workers`). `voice`, `history` and the worker's `model` are also settable per user, which wins over these. `timezone` is an IANA zone name and is what the call states as "now" and stamps the chat tail with; unset or unparseable, it is UTC — never the host's zone, so a call never quietly reports the wrong time. `progress_interval` is how often a running task may report in, in seconds. `prompt_file` overrides which file the call speaks from, relative to the service directory unless absolute.
+
+Pick a **fast, non-reasoning model** here: work asked for by voice is operational and quick — look something up, check or file a ticket, note something down — not coding, and the caller is waiting on the line. The timeout is the text worker's `defaults.worker_timeout`; task size is bounded by the model choice, not by cutting the clock short.
 
 An answered call needs a Gemini API key, in the environment variable the selected connection names as `gemini_secret_env` (`GOOGLE_API_KEY` when the entry omits it), resolved like every other credential. Without the key, or without `voice-agent.md`, the daemon logs which one is missing and a caller who also has `call_recording` on is recorded as usual instead.
 
