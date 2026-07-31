@@ -15,6 +15,7 @@ keeps only its policy/config under capabilities/telegram/service/:
   settings.json — connection, direct_messages, allowed_users, allowed_groups,
                   defaults
   context.md    — soft-gate prompt injected into every worker turn
+  voice-agent.md — system prompt for a direct call answered by voice
 
 Runtime state follows the selected Telegram connection:
   <connection-state>/session.session          auth session
@@ -140,6 +141,8 @@ SETTINGS_FILE = Path(os.environ.get("TELEGRAM_SERVICE_SETTINGS")
                      or SERVICE_DIR / "settings.json")
 CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_CONTEXT")
                     or SERVICE_DIR / "context.md")
+VOICE_CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
+                          or SERVICE_DIR / "voice-agent.md")
 
 # Per-instance channel toggle. Default on (opt-out) — set falsey on instances
 # that should not consume the Telegram channel.
@@ -429,6 +432,32 @@ def resolve_creds():
     if not api_hash:
         sys.exit(f"{secret_env} not resolved (project .env.local, credentials.env, or env)")
     return api_id, api_hash
+
+
+GEMINI_SECRET_ENV = ((CONNECTION_ENTRY or {}).get("gemini_secret_env")
+                     or "GOOGLE_API_KEY")
+
+
+def read_voice_context():
+    """The voice channel's own system prompt, owned by the project."""
+    try:
+        return VOICE_CONTEXT_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+def voice_call_readiness():
+    """What answering a call by voice needs, resolved when the phone rings: the
+    Gemini key the connection names, and the project's own voice prompt. Neither
+    is substituted — missing either, the call falls through to the recording
+    path, so a caller with call_recording on is still recorded."""
+    api_key = _env_value(GEMINI_SECRET_ENV)
+    if not api_key:
+        return None, None, f"{GEMINI_SECRET_ENV} not resolved"
+    voice_context = read_voice_context()
+    if not voice_context:
+        return None, None, f"no voice prompt at {VOICE_CONTEXT_FILE}"
+    return api_key, voice_context, None
 
 
 # --- access policy ------------------------------------------------------------
@@ -2804,7 +2833,7 @@ async def run_session(client):
                 rows.append(f"{who}: {text}")
             return "\n".join(rows)
 
-        async def start_voice_call(caller_id, policy, api_key):
+        async def start_voice_call(caller_id, policy, api_key, voice_context):
             record = caller_id in allowed_callers
             caller_name = policy["name"]
             output = recording_output(caller_id, "voice")
@@ -2859,7 +2888,6 @@ async def run_session(client):
             write_metadata(metadata_path, metadata)
 
             history = await voice_chat_history(caller_id, policy["history"], caller_name)
-            project_context = CONTEXT_FILE.read_text() if CONTEXT_FILE.exists() else ""
             session = voice_agent.VoiceCallSession(
                 calls,
                 caller_id,
@@ -2867,7 +2895,7 @@ async def run_session(client):
                 model=policy["model"],
                 voice=policy["voice"],
                 system_instruction=voice_agent.build_system_prompt(
-                    ASSISTANT_NAME, caller_name, project_context, history),
+                    voice_context, history),
                 caller_name=caller_name,
                 caller_track=caller_pcm,
                 agent_track=agent_pcm,
@@ -2939,7 +2967,7 @@ async def run_session(client):
             log(f"voice: answering {caller_name} ({caller_id}) with "
                 f"{policy['model']}/{policy['voice']}; record={record}")
 
-        def begin_voice_call(caller_id, policy, api_key):
+        def begin_voice_call(caller_id, policy, api_key, voice_context):
             """Claim the slot synchronously, then set the call up off the update
             handler: reading history and opening the Live socket must not hold up
             the PyTgCalls dispatcher."""
@@ -2947,7 +2975,7 @@ async def run_session(client):
 
             async def run():
                 try:
-                    await start_voice_call(caller_id, policy, api_key)
+                    await start_voice_call(caller_id, policy, api_key, voice_context)
                 finally:
                     active_voice_call["starting"] = False
 
@@ -3071,16 +3099,16 @@ async def run_session(client):
         async def incoming_p2p_call(_call_client: PyTgCalls, update: ChatUpdate):
             caller_id = update.chat_id
             if caller_id in voice_users:
-                api_key = _env_value("GOOGLE_API_KEY")
-                if api_key:
+                api_key, voice_context, blocked = voice_call_readiness()
+                if blocked:
+                    log(f"voice: {blocked} — cannot answer {caller_id} by voice")
+                else:
                     if voice_call_busy() or active_recording["task"] is not None:
                         log(f"call: ignoring voice call from {caller_id} — a call is already active")
                         return
-                    begin_voice_call(caller_id, voice_users[caller_id], api_key)
+                    begin_voice_call(caller_id, voice_users[caller_id], api_key,
+                                     voice_context)
                     return
-                # Without the key there is no conversation to have; fall through
-                # so a caller who also has call_recording on is still recorded.
-                log(f"voice: GOOGLE_API_KEY not resolved — cannot answer {caller_id} by voice")
             if caller_id not in allowed_callers:
                 log(f"call: ignoring p2p from {caller_id} — not in allowed_callers")
                 return
@@ -3573,8 +3601,12 @@ async def run_session(client):
         if has_p2p_recording:
             features.append(f"p2p(allowed_callers={sorted(allowed_callers)})")
         if has_voice_agent:
-            key_state = "key" if _env_value("GOOGLE_API_KEY") else "NO GOOGLE_API_KEY"
-            features.append(f"voice_agent(callers={sorted(voice_users)}, {key_state})")
+            key_state = (GEMINI_SECRET_ENV if _env_value(GEMINI_SECRET_ENV)
+                         else f"NO {GEMINI_SECRET_ENV}")
+            prompt_state = ("prompt" if read_voice_context()
+                            else f"NO {VOICE_CONTEXT_FILE}")
+            features.append(
+                f"voice_agent(callers={sorted(voice_users)}, {key_state}, {prompt_state})")
         if has_group_recording:
             features.append(f"groups(auto={len(auto_groups)}, on_request={len(on_request_groups)})")
         log(f"call listener: started on daemon client; {', '.join(features)}")

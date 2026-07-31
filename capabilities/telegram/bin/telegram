@@ -1760,6 +1760,10 @@ def _service_context_path(root: Path) -> Path:
     return _service_dir(root) / "context.md"
 
 
+def _service_voice_context_path(root: Path) -> Path:
+    return _service_dir(root) / "voice-agent.md"
+
+
 def _service_settings(root: Path) -> dict:
     data = _json_file(_service_settings_path(root))
     return data if isinstance(data, dict) else {}
@@ -1777,11 +1781,13 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     _require_service_envelope(root)
     settings_template = _service_template("settings.json")
     context_template = _service_template("context.md")
-    _require_service_bundle_files(settings_template, context_template)
+    voice_template = _service_template("voice-agent.md")
+    _require_service_bundle_files(settings_template, context_template, voice_template)
     target = _service_dir(root)
     target.mkdir(parents=True, exist_ok=True)
     settings_path = _service_settings_path(root)
     context_path = _service_context_path(root)
+    voice_path = _service_voice_context_path(root)
     written = []
     skipped = []
 
@@ -1799,6 +1805,12 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
         written.append(str(context_path))
     else:
         skipped.append(str(context_path))
+
+    if force or not voice_path.exists():
+        voice_path.write_text(voice_template.read_text())
+        written.append(str(voice_path))
+    else:
+        skipped.append(str(voice_path))
 
     return {"initialized": NAME, "project": str(root), "service_dir": str(target),
             "written": written, "skipped": skipped,
@@ -1919,6 +1931,7 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
         "daemon": str(_service_daemon()),
         "settings": str(_service_settings_path(root)),
         "context": str(_service_context_path(root)),
+        "voice_context": str(_service_voice_context_path(root)),
         "session": str(paths["session"]),
         "state_dir": str(paths["state"]),
         "pid_file": str(paths["pid"]),
@@ -1945,6 +1958,7 @@ def _service_env(root: Path, connection_id: str) -> dict:
     env["TELEGRAM_SERVICE_PROJECT_ROOT"] = str(root)
     env["TELEGRAM_SERVICE_SETTINGS"] = str(_service_settings_path(root))
     env["TELEGRAM_SERVICE_CONTEXT"] = str(_service_context_path(root))
+    env["TELEGRAM_SERVICE_VOICE_CONTEXT"] = str(_service_voice_context_path(root))
     env["TELEGRAM_SERVICE_CONNECTION"] = connection_id
     env["TELEGRAM_REAL_TELEGRAM"] = str(Path(__file__).resolve())
     return env

@@ -156,17 +156,27 @@ class AudioParameters:
     )
 
 
-def import_daemon(tmp: Path, service_settings: dict):
+def import_daemon(tmp: Path, service_settings: dict, *,
+                  connection_extra: dict | None = None,
+                  voice_context: str | None = None,
+                  project_env: dict | None = None):
     project = tmp / "project"
     service_dir = project / "capabilities" / "telegram" / "service"
     service_dir.mkdir(parents=True)
     settings_file = service_dir / "settings.json"
     context_file = service_dir / "context.md"
+    voice_context_file = service_dir / "voice-agent.md"
     settings_file.write_text(json.dumps(service_settings) + "\n")
     context_file.write_text("test context\n")
+    if voice_context is not None:
+        voice_context_file.write_text(voice_context)
+    if project_env:
+        (project / ".env.local").write_text(
+            "".join(f"{key}={value}\n" for key, value in project_env.items()))
     connections_file = tmp / "connections.json"
     connections_file.write_text(json.dumps({
-        "connections": {"test": {"api_id": 12345, "allow_write": True}},
+        "connections": {"test": {"api_id": 12345, "allow_write": True,
+                                 **(connection_extra or {})}},
     }) + "\n")
     fake_root = tmp / "fake"
     write_fake_telethon(fake_root)
@@ -189,6 +199,7 @@ def import_daemon(tmp: Path, service_settings: dict):
             "TELEGRAM_SERVICE_CONNECTION": "test",
             "TELEGRAM_SERVICE_CONNECTIONS_FILE": str(connections_file),
             "TELEGRAM_SERVICE_CONTEXT": str(context_file),
+            "TELEGRAM_SERVICE_VOICE_CONTEXT": str(voice_context_file),
             "TELEGRAM_SERVICE_PROJECT_ROOT": str(project),
             "TELEGRAM_SERVICE_SETTINGS": str(settings_file),
             "TELEGRAM_SERVICE_STATE_DIR": str(tmp / "service-state"),
@@ -436,6 +447,58 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(users[2]["history"], 5)
             self.assertEqual(
                 users[3]["history"], daemon.voice_agent.DEFAULT_HISTORY_MESSAGES)
+
+    async def test_gemini_key_env_name_comes_from_the_connection(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.assertEqual(daemon.GEMINI_SECRET_ENV, "GOOGLE_API_KEY")
+
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(),
+                connection_extra={"gemini_secret_env": "PROJECT_GEMINI_KEY"},
+                voice_context="Speak briefly.\n",
+                project_env={"PROJECT_GEMINI_KEY": "live-key",
+                             "GOOGLE_API_KEY": "wrong-key"})
+
+            self.assertEqual(daemon.GEMINI_SECRET_ENV, "PROJECT_GEMINI_KEY")
+            api_key, voice_context, blocked = daemon.voice_call_readiness()
+            self.assertEqual(api_key, "live-key")
+            self.assertEqual(voice_context, "Speak briefly.")
+            self.assertIsNone(blocked)
+
+    async def test_voice_call_is_blocked_when_the_named_key_is_unresolved(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(),
+                connection_extra={"gemini_secret_env": "PROJECT_GEMINI_KEY"},
+                voice_context="Speak briefly.\n")
+
+            api_key, voice_context, blocked = daemon.voice_call_readiness()
+            self.assertIsNone(api_key)
+            self.assertIsNone(voice_context)
+            self.assertIn("PROJECT_GEMINI_KEY", blocked)
+
+    async def test_missing_voice_prompt_blocks_the_call_by_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(),
+                project_env={"GOOGLE_API_KEY": "live-key"})
+
+            self.assertEqual(daemon.read_voice_context(), "")
+            api_key, voice_context, blocked = daemon.voice_call_readiness()
+            self.assertIsNone(api_key)
+            self.assertIsNone(voice_context)
+            self.assertIn(str(daemon.VOICE_CONTEXT_FILE), blocked)
+
+    async def test_empty_voice_prompt_is_not_a_prompt(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(), voice_context="   \n",
+                project_env={"GOOGLE_API_KEY": "live-key"})
+
+            _, _, blocked = daemon.voice_call_readiness()
+            self.assertIn(str(daemon.VOICE_CONTEXT_FILE), blocked)
 
     async def test_call_recording_request_is_explicit_and_persisted(self):
         with tempfile.TemporaryDirectory() as td:

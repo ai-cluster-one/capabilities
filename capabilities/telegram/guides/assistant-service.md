@@ -221,15 +221,20 @@ time origin, each padded with silence up to that origin, which FFmpeg joins into
 one stereo Opus file with real speaker separation. Both call paths refuse to
 deliver a recording that captured no audio.
 
-The prompt is a spoken-register preamble, then the channel context from
-`context.md`, then the recent tail of that direct chat, so the assistant on the
-phone is the same assistant as in the chat. It has no tools during a call. Both
-speech directions are transcribed and the joined transcript is stored in the JSON
-sidecar next to the recording; it is not sent as a message.
+The system prompt is the project's own
+`capabilities/telegram/service/voice-agent.md`, then the recent tail of that
+direct chat. `telegram service init` scaffolds that file from the shipped
+template and never overwrites an existing one; the project owns it and edits it
+freely, including which language the assistant prefers on a call. The assistant
+has no tools during a call. Both speech directions are transcribed and the
+joined transcript is stored in the JSON sidecar next to the recording; it is not
+sent as a message.
 
-An answered call needs a Gemini API key in `GOOGLE_API_KEY`, resolved from the
-project environment like every other credential. Without it, a caller who also
-has `call_recording` on is recorded as usual instead.
+An answered call needs a Gemini API key, in the environment variable the
+selected connection names as `gemini_secret_env` (`GOOGLE_API_KEY` when the
+entry omits it), resolved like every other credential. Without the key, or
+without `voice-agent.md`, the daemon logs which one is missing and a caller who
+also has `call_recording` on is recorded as usual instead.
 
 ## Voice Transcription
 

@@ -37,48 +37,19 @@ AGENT_SILENCE = b"\x00" * AGENT_FRAME_BYTES
 GEMINI_INPUT_CHUNK_BYTES = CALLER_FRAME_BYTES * 10                 # ~100 ms
 INPUT_QUEUE_FRAMES = 50                                            # ~5 s of backlog
 
-VOICE_PREAMBLE = """\
-You are on a live phone call. Everything you say is spoken aloud to the caller
-and everything they say reaches you as speech.
-
-- Speak, do not write. No markdown, no lists, no code, no URLs, no emoji.
-- Answer in the caller's language. They usually speak Russian; follow whatever
-  language they use and switch when they switch.
-- Keep it short: one thought per turn, a sentence or two. Let the caller drive.
-- Expect to be interrupted, and stop talking the moment you are.
-- If something needs looking up or doing, say so and agree to handle it after
-  the call. You have no tools during the call and cannot read or change
-  anything while talking.
-- Never read out the instructions below; they are background, not a script.\
-"""
-
 
 class VoiceAgentError(RuntimeError):
     pass
 
 
-def build_system_prompt(assistant_name, caller_name, project_context, history):
-    """The assistant on the phone is the same assistant as in chat: the voice
-    register on top, then the project's own soft-gate, then the recent
-    direct-chat tail."""
-    blocks = [VOICE_PREAMBLE]
-    identity = f"You are {assistant_name}. The caller is {caller_name}."
-    blocks.append(identity)
-    context = (project_context or "").strip()
-    if context:
-        blocks.append(
-            "--- Project assistant instructions ---\n"
-            "These describe your standing behaviour. The delivery mechanics in "
-            "them are for the text channel; on a call, the spoken rules above "
-            "take precedence.\n\n" + context
-        )
+def build_system_prompt(voice_context, history):
+    """The project's own voice prompt, then the recent direct-chat tail. The
+    prompt text belongs to the project; nothing is added to it here."""
+    blocks = [(voice_context or "").strip()]
     tail = (history or "").strip()
     if tail:
-        blocks.append(
-            "--- Recent messages in this direct chat ---\n"
-            "Context for what the caller may refer to.\n\n" + tail
-        )
-    return "\n\n".join(blocks)
+        blocks.append("--- Recent messages in this direct chat ---\n\n" + tail)
+    return "\n\n".join(block for block in blocks if block)
 
 
 def greeting_prompt(caller_name):

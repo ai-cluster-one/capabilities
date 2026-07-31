@@ -120,14 +120,21 @@ def _geminitalk_key_values(report: dict, cid: str = "default") -> dict:
 
 def _run_service_init(bin_dir: Path, env: dict[str, str], project: Path) -> None:
     _ensure_project_envelope(project)
-    proc = _run(
-        [str(bin_dir / "telegram"), "service", "init", "--connection", "marvin"],
-        {**env, "CLAUDE_PROJECT_DIR": str(project)},
-        cwd=project,
-    )
+    init_argv = [str(bin_dir / "telegram"), "service", "init",
+                 "--connection", "marvin"]
+    init_env = {**env, "CLAUDE_PROJECT_DIR": str(project)}
+    proc = _run(init_argv, init_env, cwd=project)
     if "FileNotFoundError" in proc.stderr:
         raise AssertionError(proc.stderr)
-    assert (project / "capabilities" / "telegram" / "service" / "settings.json").is_file()
+    service_dir = project / "capabilities" / "telegram" / "service"
+    assert (service_dir / "settings.json").is_file()
+    voice_prompt = service_dir / "voice-agent.md"
+    assert voice_prompt.is_file()
+
+    # The project owns its copy of both prompts: a second init leaves them alone.
+    voice_prompt.write_text("project-owned voice prompt\n")
+    _run(init_argv, init_env, cwd=project)
+    assert voice_prompt.read_text() == "project-owned voice prompt\n"
 
 
 def _write_fake_telethon(fake_telethon: Path) -> None:

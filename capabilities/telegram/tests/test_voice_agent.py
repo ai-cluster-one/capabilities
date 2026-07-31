@@ -442,26 +442,28 @@ class StereoJoinTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PromptTests(unittest.TestCase):
-    def test_prompt_layers_voice_rules_over_project_context_and_history(self):
+    def test_prompt_is_the_project_voice_file_then_the_history_tail(self):
         with fake_runtime_modules():
             va = import_voice_agent()
             prompt = va.build_system_prompt(
-                "Assistant", "Caller", "# Channel instructions\nReply naturally.",
-                "Caller: привет\nAssistant: привет")
+                "# Voice instructions\nSpeak briefly.\n",
+                "Caller: hello\nAssistant: hi")
 
-        self.assertTrue(prompt.startswith(va.VOICE_PREAMBLE))
-        self.assertIn("You are Assistant. The caller is Caller.", prompt)
-        self.assertLess(
-            prompt.index("Reply naturally."), prompt.index("Caller: привет"))
-        self.assertIn("the spoken rules above", prompt)
+        self.assertTrue(prompt.startswith("# Voice instructions\nSpeak briefly."))
+        self.assertLess(prompt.index("Speak briefly."), prompt.index("Caller: hello"))
+        self.assertEqual(
+            prompt,
+            "# Voice instructions\nSpeak briefly.\n\n"
+            "--- Recent messages in this direct chat ---\n\n"
+            "Caller: hello\nAssistant: hi")
 
-    def test_prompt_omits_absent_context_and_history_blocks(self):
+    def test_prompt_carries_no_built_in_text_of_its_own(self):
         with fake_runtime_modules():
             va = import_voice_agent()
-            prompt = va.build_system_prompt("Assistant", "Caller", "", "")
-
-        self.assertNotIn("--- Project assistant instructions ---", prompt)
-        self.assertNotIn("--- Recent messages in this direct chat ---", prompt)
+            self.assertEqual(va.build_system_prompt("Project prompt.", ""),
+                             "Project prompt.")
+            self.assertEqual(va.build_system_prompt("", ""), "")
+            self.assertFalse(hasattr(va, "VOICE_PREAMBLE"))
 
 
 if __name__ == "__main__":
