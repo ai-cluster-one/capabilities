@@ -66,6 +66,22 @@
       "stub": {
         "model": null
       }
+    },
+    "voice_agent": {
+      "worker": null,
+      "workers": {
+        "claude": {
+          "model": null,
+          "effort": null
+        },
+        "codex": {
+          "model": null,
+          "reasoning_effort": null,
+          "service_tier": null
+        }
+      },
+      "max_parallel_jobs": null,
+      "prompt_file": null
     }
   }
 }

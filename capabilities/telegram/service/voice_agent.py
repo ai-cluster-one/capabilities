@@ -10,12 +10,18 @@ and no resampling happens anywhere.
 Recording a voice-agent call therefore writes two separate PCM tracks on one
 shared time origin — caller left, agent right — which ffmpeg joins into a single
 stereo Opus file with real speaker separation.
+
+A caller can also have work done while they stay on the line: `agent_task` hands
+one task to the project's worker and returns at once, so speaking is never
+blocked on it. The result is spoken when it lands, or delivered to the caller's
+chat if the call ended first.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import time
 
@@ -38,8 +44,129 @@ GEMINI_INPUT_CHUNK_BYTES = CALLER_FRAME_BYTES * 10                 # ~100 ms
 INPUT_QUEUE_FRAMES = 50                                            # ~5 s of backlog
 
 
+AGENT_TASK_TOOL = {
+    "name": "agent_task",
+    "description": (
+        "Hand one task to the project's worker while the call carries on — look "
+        "something up, check or file something, write something down. Returns "
+        "immediately; the result is announced in the conversation when it lands."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "task": {
+                "type": "STRING",
+                "description": (
+                    "The task in a sentence or two, self-contained: the worker "
+                    "reads this text and not the conversation."
+                ),
+            },
+        },
+        "required": ["task"],
+    },
+}
+
+
 class VoiceAgentError(RuntimeError):
     pass
+
+
+def completion_prompt(completion):
+    return (
+        "Internal background event: a task you started has completed. This is "
+        "not a new user request. Briefly tell the caller the result in one or "
+        "two short spoken sentences, in the language of the conversation. Do "
+        "not start the same task again.\n"
+        + json.dumps(completion, ensure_ascii=False)[:8000]
+    )
+
+
+class VoiceTaskRunner:
+    """Work started from a call, bounded and deduplicated.
+
+    Starting a task never blocks the conversation: `start` returns a decision the
+    model can speak straight away, and the task runs on its own. Where the result
+    goes is decided when it lands, not when it was asked for — spoken while the
+    call is up, delivered to the caller's chat once it is not, so an answer the
+    caller asked for is never dropped because they hung up first.
+    """
+
+    def __init__(self, run_task, deliver, *, limit=2, log=print):
+        self._run_task = run_task
+        self._deliver = deliver
+        self.limit = max(1, int(limit or 1))
+        self.completions = asyncio.Queue()
+        self._jobs = {}
+        self._signatures = {}
+        self._sequence = 0
+        self._live = True
+        self._log = log
+
+    @property
+    def running(self):
+        return len(self._jobs)
+
+    def start(self, task):
+        text = " ".join(str(task or "").split())
+        if not text:
+            return {"ok": False, "status": "empty_task",
+                    "instruction": "Ask the caller what they want done, then call again."}
+        signature = text.lower()
+        running = self._signatures.get(signature)
+        if running is not None:
+            return {"ok": True, "status": "already_running", "job_id": running,
+                    "running": self.running, "limit": self.limit,
+                    "instruction": "This exact task is already running; do not start it twice."}
+        if self.running >= self.limit:
+            return {"ok": False, "status": "capacity_reached",
+                    "running": self.running, "limit": self.limit,
+                    "instruction": "Too many tasks are already running. Tell the caller "
+                                   "this one waits until the others finish."}
+        self._sequence += 1
+        job_id = f"task-{self._sequence}"
+        self._signatures[signature] = job_id
+        self._jobs[job_id] = asyncio.create_task(self._run(job_id, signature, text))
+        return {"ok": True, "status": "started", "job_id": job_id,
+                "running": self.running, "limit": self.limit,
+                "instruction": "Say in one short sentence that you are on it, then carry on "
+                               "talking. The result arrives by itself; do not wait for it."}
+
+    async def _run(self, job_id, signature, text):
+        completion = {"job_id": job_id, "task": text}
+        try:
+            completion.update({"ok": True, "result": await self._run_task(text)})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            completion.update({"ok": False,
+                               "result": f"{type(exc).__name__}: {exc}"[:800]})
+            self._log(f"voice: task {job_id} failed — {completion['result']}")
+        self._jobs.pop(job_id, None)
+        self._signatures.pop(signature, None)
+        # Decided without an await in between, so a call ending mid-decision
+        # cannot route a result to a conversation that is already gone.
+        if self._live:
+            self.completions.put_nowait(completion)
+        else:
+            await self.deliver(completion)
+
+    async def deliver(self, completion):
+        try:
+            await self._deliver(completion)
+        except Exception as exc:
+            self._log("voice: cannot deliver task result to the chat — "
+                      f"{type(exc).__name__}: {exc}")
+
+    async def detach(self):
+        """The call is over: what is already finished goes to the chat, and work
+        still running follows it there when it lands."""
+        self._live = False
+        while True:
+            try:
+                completion = self.completions.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            await self.deliver(completion)
 
 
 def build_system_prompt(voice_context, history):
@@ -59,8 +186,8 @@ def greeting_prompt(caller_name):
     )
 
 
-def live_config(system_instruction, voice):
-    return {
+def live_config(system_instruction, voice, tools=None):
+    config = {
         "response_modalities": ["AUDIO"],
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "speech_config": {
@@ -69,6 +196,9 @@ def live_config(system_instruction, voice):
         "input_audio_transcription": {},
         "output_audio_transcription": {},
     }
+    if tools:
+        config["tools"] = [{"function_declarations": list(tools)}]
+    return config
 
 
 def _sample_bytes(seconds, rate):
@@ -171,7 +301,7 @@ class VoiceCallSession:
 
     def __init__(self, calls, chat_id, *, api_key, model, voice,
                  system_instruction, caller_name, caller_track=None,
-                 agent_track=None, log=print):
+                 agent_track=None, task_runner=None, log=print):
         self._calls = calls
         self._chat_id = chat_id
         self._api_key = api_key
@@ -179,8 +309,13 @@ class VoiceCallSession:
         self._voice = voice or DEFAULT_VOICE
         self._system_instruction = system_instruction
         self._caller_name = caller_name
+        self._task_runner = task_runner
         self._log = log
 
+        # A completion is injected only between turns: cutting into speech the
+        # caller is listening to would be heard as the agent talking over itself.
+        self._model_idle = asyncio.Event()
+        self._model_idle.set()
         self._live = None
         self._stack = None
         self._tasks = []
@@ -275,7 +410,10 @@ class VoiceCallSession:
             self._live = await self._stack.enter_async_context(
                 client.aio.live.connect(
                     model=self._model,
-                    config=live_config(self._system_instruction, self._voice),
+                    config=live_config(
+                        self._system_instruction, self._voice,
+                        tools=([AGENT_TASK_TOOL] if self._task_runner is not None
+                               else None)),
                 )
             )
         except Exception as exc:
@@ -284,6 +422,8 @@ class VoiceCallSession:
             raise VoiceAgentError(f"{type(exc).__name__}: {exc}") from exc
         self._tasks.append(asyncio.create_task(self._gemini_sender()))
         self._tasks.append(asyncio.create_task(self._gemini_receiver()))
+        if self._task_runner is not None:
+            self._tasks.append(asyncio.create_task(self._announce_completions()))
         await self._live.send_realtime_input(text=greeting_prompt(self._caller_name))
 
     async def _gemini_sender(self):
@@ -309,6 +449,7 @@ class VoiceCallSession:
                 async for response in self._live.receive():
                     received = True
                     self._consume(response)
+                    await self._handle_tool_call(response)
             except Exception as exc:
                 self._log(f"voice: Gemini stream ended — {type(exc).__name__}: {exc}")
                 return
@@ -322,6 +463,12 @@ class VoiceCallSession:
         if getattr(content, "interrupted", False):
             self.interruptions += 1
             self._outbound.clear()
+            self._model_idle.set()
+        if getattr(content, "turn_complete", False) or getattr(
+                content, "generation_complete", False):
+            self._model_idle.set()
+        elif getattr(content, "model_turn", None) is not None:
+            self._model_idle.clear()
         transcription = getattr(content, "input_transcription", None)
         if transcription is not None:
             self._record_fragment("caller", getattr(transcription, "text", None))
@@ -334,6 +481,43 @@ class VoiceCallSession:
             data = getattr(inline, "data", None) if inline else None
             if data:
                 self._outbound.extend(data)
+
+    async def _handle_tool_call(self, response):
+        """Answer the tool call in the same turn it arrived in: the runner's
+        decision is what the model speaks, and it is already made."""
+        tool_call = getattr(response, "tool_call", None)
+        calls = getattr(tool_call, "function_calls", None) if tool_call else None
+        if not calls:
+            return
+        from google.genai import types
+
+        answers = []
+        for call in calls:
+            name = getattr(call, "name", None)
+            if name == AGENT_TASK_TOOL["name"] and self._task_runner is not None:
+                args = getattr(call, "args", None) or {}
+                result = self._task_runner.start(args.get("task"))
+                self._log(f"voice: agent_task {result.get('status')} "
+                          f"({result.get('job_id') or '-'})")
+            else:
+                result = {"ok": False, "status": "unknown_tool",
+                          "instruction": f"There is no tool named {name}."}
+            answers.append(types.FunctionResponse(
+                name=name, id=getattr(call, "id", None), response={"result": result}))
+        await self._live.send_tool_response(function_responses=answers)
+
+    async def _announce_completions(self):
+        while True:
+            completion = await self._task_runner.completions.get()
+            await self._model_idle.wait()
+            try:
+                await self._live.send_realtime_input(
+                    text=completion_prompt(completion))
+            except Exception as exc:
+                self._log("voice: cannot announce a finished task — "
+                          f"{type(exc).__name__}: {exc}")
+                await self._task_runner.deliver(completion)
+                return
 
     def _record_fragment(self, speaker, text):
         """Transcriptions arrive as one-to-three-word fragments; join
@@ -352,6 +536,10 @@ class VoiceCallSession:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        # Tasks the caller started outlive the call; nothing can be spoken any
+        # more, so their results are handed to the chat instead of dropped.
+        if self._task_runner is not None:
+            await self._task_runner.detach()
         # The window closes once nothing can write any more, before the slower
         # Gemini teardown, so both tracks are sealed to the call's own length.
         self.window_seconds = time.monotonic() - self.origin

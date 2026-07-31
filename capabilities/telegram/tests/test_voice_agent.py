@@ -216,6 +216,261 @@ def channel_onsets(path, rate=16000, block=0.01):
     return onsets
 
 
+@contextmanager
+def fake_genai_types():
+    """_handle_tool_call builds its reply with google.genai's FunctionResponse."""
+    names = ("google", "google.genai", "google.genai.types")
+    saved = {name: sys.modules.get(name) for name in names}
+
+    class FunctionResponse:
+        def __init__(self, name=None, id=None, response=None):
+            self.name = name
+            self.id = id
+            self.response = response
+
+    google = types.ModuleType("google")
+    google.__path__ = []
+    genai = types.ModuleType("google.genai")
+    genai.__path__ = []
+    genai_types = types.ModuleType("google.genai.types")
+    genai_types.FunctionResponse = FunctionResponse
+    genai.types = genai_types
+    google.genai = genai
+    sys.modules.update({"google": google, "google.genai": genai,
+                        "google.genai.types": genai_types})
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+class FakeLive:
+    """The Live socket: keeps what the session sent it."""
+
+    def __init__(self):
+        self.tool_responses = []
+        self.texts = []
+
+    async def send_tool_response(self, function_responses):
+        self.tool_responses.extend(function_responses)
+
+    async def send_realtime_input(self, text=None, audio=None):
+        self.texts.append(text)
+
+
+def tool_call(task, call_id="call-1", name="agent_task"):
+    return types.SimpleNamespace(
+        tool_call=types.SimpleNamespace(function_calls=[
+            types.SimpleNamespace(name=name, id=call_id, args={"task": task})]))
+
+
+def turn_complete():
+    return types.SimpleNamespace(server_content=types.SimpleNamespace(
+        interrupted=False, turn_complete=True, generation_complete=True,
+        input_transcription=None, output_transcription=None, model_turn=None))
+
+
+def task_session(va, runner):
+    session = va.VoiceCallSession(
+        RecordingCalls(), 42, api_key="k", model=None, voice=None,
+        system_instruction="s", caller_name="Caller", task_runner=runner,
+        log=lambda *_: None)
+    session._live = FakeLive()
+    return session
+
+
+class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
+    async def test_the_tool_answers_before_the_work_is_done(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            release = asyncio.Event()
+
+            async def work(text):
+                await release.wait()
+                return f"answer to {text}"
+
+            runner = va.VoiceTaskRunner(work, self.fail_delivery, log=lambda *_: None)
+            session = task_session(va, runner)
+            await session._handle_tool_call(tool_call("look the thing up"))
+            answered = session._live.tool_responses[0].response["result"]
+            still_running = runner.running
+
+            job = next(iter(runner._jobs.values()))
+            release.set()
+            await job
+            completion = runner.completions.get_nowait()
+
+        self.assertEqual(answered["status"], "started")
+        self.assertEqual(still_running, 1)
+        self.assertEqual(completion["result"], "answer to look the thing up")
+        self.assertEqual(runner.running, 0)
+
+    async def test_the_tool_is_declared_only_when_a_runner_is_present(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            with_tools = va.live_config("s", "v", tools=[va.AGENT_TASK_TOOL])
+            without = va.live_config("s", "v")
+
+        self.assertEqual(with_tools["tools"],
+                         [{"function_declarations": [va.AGENT_TASK_TOOL]}])
+        self.assertNotIn("tools", without)
+        self.assertEqual(va.AGENT_TASK_TOOL["name"], "agent_task")
+
+    async def test_a_finished_task_is_announced_only_between_turns(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(
+                lambda text: self.answer("the answer is ready"),
+                self.fail_delivery, log=lambda *_: None)
+            session = task_session(va, runner)
+            notifier = asyncio.create_task(session._announce_completions())
+
+            session._model_idle.clear()          # the agent is speaking
+            await session._handle_tool_call(tool_call("look the thing up"))
+            await asyncio.sleep(0.05)
+            spoken_over = list(session._live.texts)
+
+            session._consume(turn_complete())    # the turn ends
+            await asyncio.sleep(0.05)
+            announced = list(session._live.texts)
+            notifier.cancel()
+
+        self.assertEqual(spoken_over, [])
+        self.assertEqual(len(announced), 1)
+        self.assertIn("Internal background event", announced[0])
+        self.assertIn("not a new user request", announced[0])
+        self.assertIn("the answer is ready", announced[0])
+
+    async def test_tasks_beyond_the_bound_are_refused_not_queued(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            release = asyncio.Event()
+
+            async def work(text):
+                await release.wait()
+                return text
+
+            runner = va.VoiceTaskRunner(work, self.fail_delivery, limit=2,
+                                        log=lambda *_: None)
+            session = task_session(va, runner)
+            for task in ("first task", "second task", "third task"):
+                await session._handle_tool_call(tool_call(task))
+            answers = [row.response["result"] for row in session._live.tool_responses]
+            running = runner.running
+
+            jobs = list(runner._jobs.values())
+            release.set()
+            await asyncio.gather(*jobs)
+
+        self.assertEqual([answer["status"] for answer in answers],
+                         ["started", "started", "capacity_reached"])
+        self.assertEqual(running, 2)
+        self.assertEqual(answers[-1]["limit"], 2)
+
+    async def test_the_same_task_is_never_started_twice(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            release = asyncio.Event()
+
+            async def work(text):
+                await release.wait()
+                return text
+
+            runner = va.VoiceTaskRunner(work, self.fail_delivery, log=lambda *_: None)
+            session = task_session(va, runner)
+            await session._handle_tool_call(tool_call("Look   The Thing Up"))
+            await session._handle_tool_call(tool_call("look the thing up"))
+            answers = [row.response["result"] for row in session._live.tool_responses]
+            running = runner.running
+
+            jobs = list(runner._jobs.values())
+            release.set()
+            await asyncio.gather(*jobs)
+
+        self.assertEqual([answer["status"] for answer in answers],
+                         ["started", "already_running"])
+        self.assertEqual(answers[0]["job_id"], answers[1]["job_id"])
+        self.assertEqual(running, 1)
+
+    async def test_a_result_that_lands_after_the_call_goes_to_the_chat(self):
+        delivered = []
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            release = asyncio.Event()
+
+            async def work(text):
+                await release.wait()
+                return f"answer to {text}"
+
+            runner = va.VoiceTaskRunner(
+                work, lambda completion: self.collect(delivered, completion),
+                log=lambda *_: None)
+            session = task_session(va, runner)
+            await session._handle_tool_call(tool_call("look the thing up"))
+            job = next(iter(runner._jobs.values()))
+
+            await session.stop()                 # the caller hangs up
+            self.assertEqual(delivered, [])      # the work is still running
+            release.set()
+            await job
+
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["result"], "answer to look the thing up")
+        self.assertTrue(delivered[0]["ok"])
+
+    async def test_a_result_waiting_to_be_spoken_at_hangup_goes_to_the_chat(self):
+        delivered = []
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(
+                lambda text: self.answer("the answer is ready"),
+                lambda completion: self.collect(delivered, completion),
+                log=lambda *_: None)
+            session = task_session(va, runner)
+            session._model_idle.clear()          # nothing can be injected yet
+            await session._handle_tool_call(tool_call("look the thing up"))
+            await asyncio.sleep(0.05)
+            queued = runner.completions.qsize()
+
+            await session.stop()
+
+        self.assertEqual(queued, 1)
+        self.assertEqual([row["result"] for row in delivered], ["the answer is ready"])
+
+    async def test_a_failed_task_is_reported_rather_than_lost(self):
+        delivered = []
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+
+            async def work(text):
+                raise RuntimeError("worker timed out")
+
+            runner = va.VoiceTaskRunner(
+                work, lambda completion: self.collect(delivered, completion),
+                log=lambda *_: None)
+            session = task_session(va, runner)
+            await session._handle_tool_call(tool_call("look the thing up"))
+            job = next(iter(runner._jobs.values()))
+            await job
+            completion = runner.completions.get_nowait()
+
+        self.assertFalse(completion["ok"])
+        self.assertIn("worker timed out", completion["result"])
+
+    async def answer(self, text):
+        return text
+
+    async def collect(self, sink, completion):
+        sink.append(completion)
+
+    async def fail_delivery(self, completion):
+        raise AssertionError("the call was still up; nothing should reach the chat")
+
+
 class VoiceAgentMediaTests(unittest.IsolatedAsyncioTestCase):
     async def test_outbound_pump_sends_silence_when_nothing_is_buffered(self):
         with fake_runtime_modules():

@@ -199,11 +199,13 @@ def import_daemon(tmp: Path, service_settings: dict, *,
             "TELEGRAM_SERVICE_CONNECTION": "test",
             "TELEGRAM_SERVICE_CONNECTIONS_FILE": str(connections_file),
             "TELEGRAM_SERVICE_CONTEXT": str(context_file),
-            "TELEGRAM_SERVICE_VOICE_CONTEXT": str(voice_context_file),
             "TELEGRAM_SERVICE_PROJECT_ROOT": str(project),
             "TELEGRAM_SERVICE_SETTINGS": str(settings_file),
             "TELEGRAM_SERVICE_STATE_DIR": str(tmp / "service-state"),
         })
+        os.environ.pop("TELEGRAM_SERVICE_VOICE_CONTEXT", None)
+        if voice_context is not None:
+            os.environ["TELEGRAM_SERVICE_VOICE_CONTEXT"] = str(voice_context_file)
         sys.path.insert(0, str(fake_root))
         name = f"telegram_assistant_test_{time.time_ns()}"
         spec = importlib.util.spec_from_file_location(name, DAEMON_PATH)
@@ -447,6 +449,85 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(users[2]["history"], 5)
             self.assertEqual(
                 users[3]["history"], daemon.voice_agent.DEFAULT_HISTORY_MESSAGES)
+
+    async def test_a_call_runs_under_the_authority_the_callers_messages_resolve(self):
+        """The one thing a voice channel must not do: widen what a caller can
+        reach. The authority handed to a worker launched from a call is compared
+        against the authority the same user's message pipeline actually handed
+        its worker — captured from the live path, not restated here."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_users"] = {
+                "777": {"name": "Caller", "role": "direct_user"}}
+            service_settings["authority"] = {
+                "roles": {
+                    "supervisor": {"allowed_capabilities": {"*": True}},
+                    "direct_user": {"allowed_capabilities": {"routine": True}},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            seen = {}
+
+            def capture(chat, tail, state, procs):
+                seen["authority"] = state["authority"]
+                return successful_result("done")
+
+            daemon.WORKERS["stub"] = capture
+            message = Message(401)
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 401)
+            await self.stop_session(client, task)
+
+            from_call = daemon.voice_task_authority(777, "Caller", "check the invoice")
+            stranger = daemon.voice_task_authority(999, "Stranger", "check the invoice")
+
+        from_message = seen["authority"]
+        self.assertEqual(from_message["sender_role"], "direct_user")
+        self.assertEqual(from_call["sender_role"], from_message["sender_role"])
+        self.assertEqual(from_call["allowed_capabilities"],
+                         from_message["allowed_capabilities"])
+        self.assertEqual(from_call["allowed_capabilities"], {"routine": True})
+        # No role is assumed for a caller the settings never named.
+        self.assertEqual(stranger["sender_role"], "direct_user")
+        self.assertEqual(stranger["allowed_capabilities"], {"routine": True})
+
+    async def test_voice_task_worker_policy_falls_back_to_the_projects_own(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(
+                worker="claude", workers={"claude": {"model": "text-model",
+                                                     "effort": "high"}}))
+            inherited = daemon.voice_agent_settings()
+
+        self.assertEqual(inherited["worker"], "claude")
+        self.assertEqual(inherited["model"], "text-model")
+        self.assertEqual(inherited["effort"], "high")
+        self.assertEqual(inherited["worker_timeout"], 2)
+        self.assertEqual(inherited["max_parallel_jobs"], 1)
+
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(
+                worker="claude",
+                workers={"claude": {"model": "text-model", "effort": "high"}},
+                voice_agent={"worker": "claude",
+                             "workers": {"claude": {"model": "fast-model"}},
+                             "max_parallel_jobs": 3}))
+            tuned = daemon.voice_agent_settings()
+
+        self.assertEqual(tuned["model"], "fast-model")
+        self.assertEqual(tuned["effort"], "high")
+        self.assertEqual(tuned["max_parallel_jobs"], 3)
+        self.assertEqual(tuned["worker_timeout"], 2)
+
+    async def test_voice_prompt_file_override_comes_from_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(voice_agent={"prompt_file": "call.md"}))
+            self.assertEqual(daemon.VOICE_CONTEXT_FILE.name, "call.md")
+            self.assertEqual(daemon.VOICE_CONTEXT_FILE.parent.name, "service")
 
     async def test_gemini_key_env_name_comes_from_the_connection(self):
         with tempfile.TemporaryDirectory() as td:

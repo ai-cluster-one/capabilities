@@ -141,8 +141,6 @@ SETTINGS_FILE = Path(os.environ.get("TELEGRAM_SERVICE_SETTINGS")
                      or SERVICE_DIR / "settings.json")
 CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_CONTEXT")
                     or SERVICE_DIR / "context.md")
-VOICE_CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
-                          or SERVICE_DIR / "voice-agent.md")
 
 # Per-instance channel toggle. Default on (opt-out) — set falsey on instances
 # that should not consume the Telegram channel.
@@ -171,6 +169,17 @@ DIRECT_MESSAGE_MODE = str(DIRECT_MESSAGES.get("mode") or "allowed_users").strip(
 ALLOW_ANY_DIRECT = DIRECT_MESSAGE_MODE in ("anyone", "all", "open", "public")
 DIRECT_DEFAULT_ROLE = DIRECT_MESSAGES.get("default_role") or "direct_user"
 DEFAULTS = SETTINGS.get("defaults", {})
+# How the voice channel behaves — which worker its tasks run on, how many may run
+# at once, which prompt file it speaks from. Worker policy lives here beside the
+# text worker's, never in the connection entry, which carries identity only.
+VOICE_AGENT_DEFAULTS = (DEFAULTS.get("voice_agent")
+                        if isinstance(DEFAULTS.get("voice_agent"), dict) else {})
+_voice_prompt_file = (os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
+                      or VOICE_AGENT_DEFAULTS.get("prompt_file")
+                      or "voice-agent.md")
+VOICE_CONTEXT_FILE = Path(_voice_prompt_file)
+if not VOICE_CONTEXT_FILE.is_absolute():
+    VOICE_CONTEXT_FILE = SERVICE_DIR / VOICE_CONTEXT_FILE
 ASSISTANT_NAME = SETTINGS.get("assistant_name") or DEFAULTS.get("assistant_name") or "Assistant"
 DEFAULT_GROUP_ALIASES = tuple(DEFAULTS.get("group_aliases") or (ASSISTANT_NAME,))
 CONTROL_DEFAULTS = {
@@ -572,6 +581,21 @@ def call_recorder_command():
     # Group watching runs on the daemon's own PyTgCalls instance (not as a subprocess).
     # A second update-consuming connection suppresses p2p INCOMING_CALL delivery.
     return None
+
+
+def sender_role_for(sender_id, group_policy, is_direct):
+    """The role a sender carries, resolved once for every path that starts a
+    worker. A voice caller is authenticated by caller id alone, exactly like a
+    direct-message sender, so both paths must land on the same role — role is
+    what `_authority_policy_for` turns into tool authority, and a second
+    resolution here would let a phone call widen what a message may reach."""
+    sid = str(sender_id)
+    allowed = _as_mapping(ALLOWED.get(sid))
+    member = _as_mapping(_as_mapping(_as_mapping(group_policy).get("members")).get(sid))
+    default_role = (DIRECT_DEFAULT_ROLE if is_direct else
+                    _as_mapping(group_policy).get("member_role")
+                    or _as_mapping(group_policy).get("role") or "group_member")
+    return allowed.get("role") or member.get("role") or default_role
 
 
 def _policy_allowed_capabilities(policy):
@@ -1060,6 +1084,74 @@ def _worker_settings(row, worker):
     return {k: _default_as_none(v) for k, v in cfg.items()}
 
 
+def _worker_flags(worker, cfg):
+    out = {}
+    if worker == "claude":
+        out["effort"] = cfg.get("effort")
+    elif worker == "codex":
+        out["reasoning_effort"] = cfg.get("reasoning_effort")
+        out["service_tier"] = cfg.get("service_tier")
+    return out
+
+
+def voice_agent_settings():
+    """Worker policy for a task started from a call: the project's own worker
+    settings, overlaid by whatever `defaults.voice_agent` names.
+
+    Work asked for by voice is operational and quick — look something up, file
+    something, write something down — so a project points this at a fast model
+    rather than the deep-reasoning mode it codes with. The timeout is the text
+    worker's: the tool returns at once, so nothing waits on the clock, and task
+    size is bounded by the model choice instead."""
+    worker = str(VOICE_AGENT_DEFAULTS.get("worker") or DEFAULT_WORKER).strip().lower()
+    if worker not in WORKER_NAMES:
+        worker = DEFAULT_WORKER
+    cfg = dict(_as_mapping(_as_mapping(DEFAULTS.get("workers")).get(worker)))
+    cfg.update(_as_mapping(_as_mapping(VOICE_AGENT_DEFAULTS.get("workers")).get(worker)))
+    cfg = {k: _default_as_none(v) for k, v in cfg.items()}
+    try:
+        parallel = int(VOICE_AGENT_DEFAULTS.get("max_parallel_jobs")
+                       or DEFAULTS.get("max_parallel_jobs", 2))
+    except (TypeError, ValueError):
+        parallel = 2
+    return {
+        "worker": worker,
+        "worker_settings": cfg,
+        "model": cfg.get("model"),
+        "worker_timeout": DEFAULTS.get("worker_timeout", 90),
+        "max_parallel_jobs": max(1, parallel),
+        **_worker_flags(worker, cfg),
+    }
+
+
+def voice_task_job(caller_id, caller_name, text, task_id):
+    """A call's task shaped exactly like a direct message's job, so the one
+    authority resolution applies to it unchanged."""
+    key = str(caller_id)
+    return {
+        "message_id": task_id,
+        "chat_id": key,
+        "sender_id": key,
+        "sender_name": caller_name or key,
+        "sender_role": sender_role_for(key, None, True),
+        "kind": "voice_call_task",
+        "text": text,
+    }
+
+
+VOICE_TASK_DELIVERY = (
+    "the caller is on a live phone call and your reply is read aloud to them — "
+    "answer in one or two short spoken sentences, plain words only, no markdown, "
+    "no lists, no URLs")
+
+
+def voice_task_authority(caller_id, caller_name, text, task_id="voice-task"):
+    """Tool authority for a task started from a call — the direct-message path's
+    own resolution, given the caller as its sender and nothing widened."""
+    return _authority_policy_for(
+        voice_task_job(caller_id, caller_name, text, task_id), None, True)
+
+
 def channel_settings(reg, key):
     """Defaults (settings.json) overlaid by this channel's /set overrides."""
     row = reg.get(key, {})
@@ -1077,11 +1169,7 @@ def channel_settings(reg, key):
         "worker_settings": cfg,
         "model": cfg.get("model"),
     }
-    if worker == "claude":
-        out["effort"] = cfg.get("effort")
-    elif worker == "codex":
-        out["reasoning_effort"] = cfg.get("reasoning_effort")
-        out["service_tier"] = cfg.get("service_tier")
+    out.update(_worker_flags(worker, cfg))
     return out
 
 
@@ -1498,9 +1586,11 @@ def build_prompt(tail, state=None):
         lines.append(ctx)
     req = st.get("current_request") or {}
     if req:
-        lines.append("Delivery: final reply is sent by the daemon "
-                     + ("as a reply to the request message"
-                        if req.get("reply_to") else "as a plain direct message"))
+        lines.append("Delivery: " + (
+            req.get("delivery")
+            or ("final reply is sent by the daemon "
+                + ("as a reply to the request message"
+                   if req.get("reply_to") else "as a plain direct message"))))
     pu = st.get("prev_usage")
     if pu:
         lines.append(f"Previous turn (rough context scale): input ~{pu.get('input')} tok., "
@@ -1970,10 +2060,7 @@ async def run_session(client):
         member = (group_policy or {}).get("members", {}).get(sender_id, {})
         allowed = ALLOWED.get(sender_id, {})
         sender_name = allowed.get("name") or member.get("name") or sender_id
-        default_role = (DIRECT_DEFAULT_ROLE if is_direct else
-                        (group_policy or {}).get("member_role")
-                        or (group_policy or {}).get("role") or "group_member")
-        sender_role = allowed.get("role") or member.get("role") or default_role
+        sender_role = sender_role_for(sender_id, group_policy, is_direct)
         job = {
             "message_id": message.id,
             "chat_id": key,
@@ -2811,8 +2898,85 @@ async def run_session(client):
             "finishing": False,
         }
 
+        voice_task_counter = {"n": 0}
+
         def voice_call_busy():
             return active_voice_call["starting"] or active_voice_call["session"] is not None
+
+        async def run_voice_task(caller_id, caller_name, text):
+            """One task the caller asked for mid-call, run by the project's own
+            worker — the same machinery a message runs, under the authority the
+            same user's messages resolve to."""
+            s = voice_agent_settings()
+            key = str(caller_id)
+            voice_task_counter["n"] += 1
+            task_id = f"voice-{int(time.time())}-{voice_task_counter['n']}"
+            job = voice_task_job(caller_id, caller_name, text, task_id)
+            authority = _authority_policy_for(job, None, True)
+            proc_key = f"{key}#voice-{task_id}"
+            authority_context = None
+            worker_session = None
+            cancel_event = threading.Event()
+            try:
+                worker_session = prepare_worker_session(key, task_id)
+                if authority is not None:
+                    AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
+                    auth_path = AUTHORITY_DIR / f"{_safe_file_part(key)}-{task_id}.json"
+                    auth_path.write_text(
+                        json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+                    authority_context = str(auth_path)
+                state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
+                         "chat_type": "private", "chat_name": None,
+                         "harness": s["worker"],
+                         "participants": [{"name": job["sender_name"],
+                                           "role": job["sender_role"]}],
+                         "settings": s, "messages": 0, "history_chars": 0,
+                         "current_request": {
+                             "message_id": task_id,
+                             "sender_id": key,
+                             "sender_name": job["sender_name"],
+                             "sender_role": job["sender_role"],
+                             "kind": job["kind"],
+                             "text": text,
+                             "reply_to": None,
+                             "delivery": VOICE_TASK_DELIVERY,
+                         },
+                         "authority": authority,
+                         "authority_context": authority_context,
+                         "worker_session": worker_session,
+                         "cancel_event": cancel_event,
+                         "proc_key": proc_key}
+                log(f"voice: task {task_id} dispatched worker={s['worker']} "
+                    f"model={s['model'] or 'default'} authority={_authority_summary(authority)}")
+                loop = asyncio.get_running_loop()
+                future = loop.run_in_executor(
+                    None, WORKERS[s["worker"]], key, [], state, procs)
+                done, _ = await asyncio.wait({future}, timeout=float(s["worker_timeout"]))
+                if not done:
+                    await terminate_worker(
+                        proc_key, future, cancel_event,
+                        f"voice task timeout after {s['worker_timeout']}s")
+                    raise RuntimeError(
+                        f"{s['worker']} worker timed out after {s['worker_timeout']}s")
+                return (await future)["reply"]
+            finally:
+                cleanup_worker_session(worker_session)
+                if authority_context:
+                    with contextlib.suppress(OSError):
+                        Path(authority_context).unlink()
+                release_worker_proc(proc_key)
+
+        async def deliver_voice_task_result(caller_id, completion):
+            """The call ended before the task did: what the caller asked for
+            reaches them as a direct message instead of being spoken."""
+            text = str(completion.get("result") or "").strip()
+            if not completion.get("ok"):
+                text = f"Worker error:\n{text}" if text else "Worker error."
+            if not text:
+                return
+            await send_channel_message(caller_id, text, True)
+            log(f"voice: task {completion.get('job_id')} result delivered to "
+                f"{caller_id} after the call ended")
 
         async def voice_chat_history(caller_id, limit, caller_name):
             if limit <= 0:
@@ -2888,6 +3052,12 @@ async def run_session(client):
             write_metadata(metadata_path, metadata)
 
             history = await voice_chat_history(caller_id, policy["history"], caller_name)
+            task_runner = voice_agent.VoiceTaskRunner(
+                lambda text: run_voice_task(caller_id, caller_name, text),
+                lambda completion: deliver_voice_task_result(caller_id, completion),
+                limit=voice_agent_settings()["max_parallel_jobs"],
+                log=log,
+            )
             session = voice_agent.VoiceCallSession(
                 calls,
                 caller_id,
@@ -2899,6 +3069,7 @@ async def run_session(client):
                 caller_name=caller_name,
                 caller_track=caller_pcm,
                 agent_track=agent_pcm,
+                task_runner=task_runner,
                 log=log,
             )
             active_voice_call.update({

@@ -225,10 +225,52 @@ The system prompt is the project's own
 `capabilities/telegram/service/voice-agent.md`, then the recent tail of that
 direct chat. `telegram service init` scaffolds that file from the shipped
 template and never overwrites an existing one; the project owns it and edits it
-freely, including which language the assistant prefers on a call. The assistant
-has no tools during a call. Both speech directions are transcribed and the
-joined transcript is stored in the JSON sidecar next to the recording; it is not
-sent as a message.
+freely, including which language the assistant prefers on a call. Both speech
+directions are transcribed and the joined transcript is stored in the JSON
+sidecar next to the recording; it is not sent as a message.
+
+### Doing work from a call
+
+The voice agent has one tool, `agent_task`: it hands a task to the project's
+worker — the same worker a message runs, launched the same way — and returns
+immediately, so the conversation is never blocked on it. Concurrent tasks are
+capped and an identical task already running is not started twice. When the
+result lands it is injected between turns, never into speech in progress, and
+the assistant tells the caller. If the call ended first, the result is delivered
+to the caller's direct chat as a message instead, so an answer the caller asked
+for always reaches them. Hanging up is the caller's own button; there is no tool
+for it, and no read-only inspection tools — the worker already sees the project.
+
+A task runs under the authority the *same user's messages* resolve to: role and
+`authority.allowed_capabilities` come from the one resolution the direct-message
+path uses, given the caller id as sender. A call therefore reaches exactly what
+a message from that person reaches, and no more.
+
+How the channel behaves is `defaults.voice_agent`, beside the text worker's
+policy in the same file — worker policy never lives in the connection entry,
+which carries identity and secret references only:
+
+```json
+{
+  "defaults": {
+    "voice_agent": {
+      "worker": "claude",
+      "workers": {"claude": {"model": "<a fast model id>", "effort": null}},
+      "max_parallel_jobs": 2,
+      "prompt_file": null
+    }
+  }
+}
+```
+
+Every field is optional and falls back to the project's existing worker settings
+(`defaults.worker`, `defaults.workers`, `defaults.max_parallel_jobs`);
+`prompt_file` overrides which file the call speaks from, relative to the service
+directory unless absolute. Pick a **fast, non-reasoning model** here: work asked
+for by voice is operational and quick — look something up, check or file a
+ticket, note something down — not coding, and the caller is waiting on the line.
+The timeout is the text worker's `defaults.worker_timeout`; task size is bounded
+by the model choice, not by cutting the clock short.
 
 An answered call needs a Gemini API key, in the environment variable the
 selected connection names as `gemini_secret_env` (`GOOGLE_API_KEY` when the
