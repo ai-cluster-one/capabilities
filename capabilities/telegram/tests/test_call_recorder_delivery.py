@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
-CALL_RECORDER_PATH = TELEGRAM_DIR / "service" / "call_recorder.py"
+HELPERS_PATH = TELEGRAM_DIR / "service" / "call_recording_helpers.py"
 
 
 class DummyType:
@@ -107,12 +107,12 @@ def fake_runtime_modules():
                 sys.modules[name] = value
 
 
-def import_call_recorder():
+def import_call_recording_helpers():
     with fake_runtime_modules():
-        name = f"telegram_call_recorder_test_{time.time_ns()}"
-        spec = importlib.util.spec_from_file_location(name, CALL_RECORDER_PATH)
+        name = f"telegram_call_helpers_test_{time.time_ns()}"
+        spec = importlib.util.spec_from_file_location(name, HELPERS_PATH)
         if spec is None or spec.loader is None:
-            raise AssertionError("cannot import Telegram call recorder")
+            raise AssertionError("cannot import Telegram call recording helpers")
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
@@ -135,7 +135,7 @@ class FakeClient:
 
 class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_uses_voice_note_with_separate_notice(self):
-        recorder = import_call_recorder()
+        helpers = import_call_recording_helpers()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             output = root / "recording.ogg"
@@ -148,14 +148,14 @@ class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "delivery": {"enabled": True},
             }
             client = FakeClient()
-            original_waveform = recorder.build_voice_waveform
+            original_waveform = helpers.build_voice_waveform
 
             async def fake_waveform(_path):
                 return b"waveform"
 
-            recorder.build_voice_waveform = fake_waveform
+            helpers.build_voice_waveform = fake_waveform
             try:
-                await recorder.send_recording_to_chat(
+                await helpers.send_recording_to_chat(
                     client,
                     -1001,
                     output,
@@ -163,7 +163,7 @@ class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     metadata,
                 )
             finally:
-                recorder.build_voice_waveform = original_waveform
+                helpers.build_voice_waveform = original_waveform
 
             self.assertEqual(
                 client.message_calls,
@@ -190,19 +190,19 @@ class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(persisted["delivery"]["message_id"], 7001)
 
     async def test_waveform_uses_telegram_five_bit_packing(self):
-        recorder = import_call_recorder()
-        self.assertEqual(recorder.pack_voice_waveform([31, 31]), bytes([255, 3]))
+        helpers = import_call_recording_helpers()
+        self.assertEqual(helpers.pack_voice_waveform([31, 31]), bytes([255, 3]))
 
         pcm = (
             int(1000).to_bytes(2, "little", signed=True) * 100
             + int(10000).to_bytes(2, "little", signed=True) * 100
         )
-        waveform = recorder.voice_waveform_from_pcm(pcm, bars=2)
+        waveform = helpers.voice_waveform_from_pcm(pcm, bars=2)
         self.assertIsNotNone(waveform)
         self.assertEqual(len(waveform), 2)
 
     async def test_probe_audio_duration_reads_ffprobe_value(self):
-        recorder = import_call_recorder()
+        helpers = import_call_recording_helpers()
 
         class Process:
             returncode = 0
@@ -210,16 +210,16 @@ class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
             async def communicate(self):
                 return b"638.299479\n", b""
 
-        original = recorder.asyncio.create_subprocess_exec
+        original = helpers.asyncio.create_subprocess_exec
 
         async def fake_exec(*_args, **_kwargs):
             return Process()
 
-        recorder.asyncio.create_subprocess_exec = fake_exec
+        helpers.asyncio.create_subprocess_exec = fake_exec
         try:
-            duration = await recorder.probe_audio_duration(Path("recording.ogg"))
+            duration = await helpers.probe_audio_duration(Path("recording.ogg"))
         finally:
-            recorder.asyncio.create_subprocess_exec = original
+            helpers.asyncio.create_subprocess_exec = original
 
         self.assertAlmostEqual(duration, 638.299479)
 

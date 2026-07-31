@@ -45,15 +45,113 @@ def write_fake_telethon(root: Path) -> None:
     package.mkdir(parents=True)
     (package / "__init__.py").write_text(
         """
-class _NewMessage:
+class _Handler:
     def __init__(self, *args, **kwargs):
         pass
 
 class events:
-    NewMessage = _NewMessage
+    NewMessage = _Handler
+    Raw = _Handler
 
 class TelegramClient:
     pass
+
+__version__ = "1.43.2-test"
+""".lstrip()
+    )
+    tl = package / "tl"
+    tl.mkdir()
+    (tl / "__init__.py").write_text("")
+    (tl / "types.py").write_text(
+        """
+class _Placeholder:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.__dict__.update(kwargs)
+
+class DocumentAttributeAudio(_Placeholder): pass
+class DocumentAttributeFilename(_Placeholder): pass
+class MessageActionConferenceCall(_Placeholder): pass
+class MessageActionInviteToGroupCall(_Placeholder): pass
+class MessageService(_Placeholder): pass
+class UpdateNewMessage(_Placeholder): pass
+""".lstrip()
+    )
+    errors = package / "errors"
+    errors.mkdir()
+    (errors / "__init__.py").write_text(
+        "from .common import TypeNotFoundError\n"
+        "class RPCError(Exception): pass\n"
+        "class AuthKeyError(Exception): pass\n"
+    )
+    (errors / "common.py").write_text("class TypeNotFoundError(Exception): pass\n")
+
+
+def write_fake_pytgcalls(root: Path) -> None:
+    """The daemon imports the media stack at module scope; these stand-ins let the
+    non-media behaviour be exercised without the compiled ntgcalls binding."""
+    package = root / "pytgcalls"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        """
+from . import filters
+
+class PyTgCalls:
+    def __init__(self, *args, **kwargs):
+        pass
+
+__version__ = "2.3.3-test"
+""".lstrip()
+    )
+    (package / "filters.py").write_text(
+        """
+def chat_update(*args, **kwargs):
+    return lambda *a, **k: False
+
+def stream_frame(*args, **kwargs):
+    return lambda *a, **k: False
+""".lstrip()
+    )
+    (package / "exceptions.py").write_text(
+        "class NoActiveGroupCall(Exception): pass\n"
+        "class NotInCallError(Exception): pass\n"
+    )
+    types_pkg = package / "types"
+    types_pkg.mkdir()
+    (types_pkg / "__init__.py").write_text(
+        """
+class _Placeholder:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.__dict__.update(kwargs)
+
+class CallConfig(_Placeholder): pass
+class ChatUpdate(_Placeholder):
+    class Status:
+        INCOMING_CALL = "incoming_call"
+        LEFT_CALL = "left_call"
+class Device:
+    MICROPHONE = "microphone"
+class Direction:
+    INCOMING = "incoming"
+class ExternalMedia:
+    AUDIO = "audio"
+class Frame(_Placeholder):
+    class Info(_Placeholder): pass
+class GroupCallConfig(_Placeholder): pass
+class MediaStream(_Placeholder):
+    class Flags:
+        REQUIRED = 1
+        IGNORE = 2
+class RecordStream(_Placeholder): pass
+""".lstrip()
+    )
+    (types_pkg / "raw.py").write_text(
+        """
+class AudioParameters:
+    def __init__(self, bitrate=48000, channels=1):
+        self.bitrate = bitrate
+        self.channels = channels
 """.lstrip()
     )
 
@@ -72,10 +170,16 @@ def import_daemon(tmp: Path, service_settings: dict):
     }) + "\n")
     fake_root = tmp / "fake"
     write_fake_telethon(fake_root)
+    write_fake_pytgcalls(fake_root)
+
+    stubbed = ("telethon", "telethon.tl", "telethon.tl.types", "telethon.errors",
+               "telethon.errors.common", "pytgcalls", "pytgcalls.filters",
+               "pytgcalls.exceptions", "pytgcalls.types", "pytgcalls.types.raw",
+               "call_recording_helpers", "voice_agent")
 
     old_env = dict(os.environ)
     old_path = list(sys.path)
-    old_telethon = sys.modules.pop("telethon", None)
+    old_modules = {name: sys.modules.pop(name, None) for name in stubbed}
     try:
         os.environ.update({
             "HOME": str(tmp / "home"),
@@ -104,9 +208,10 @@ def import_daemon(tmp: Path, service_settings: dict):
         os.environ.clear()
         os.environ.update(old_env)
         sys.path[:] = old_path
-        sys.modules.pop("telethon", None)
-        if old_telethon is not None:
-            sys.modules["telethon"] = old_telethon
+        for name, module in old_modules.items():
+            sys.modules.pop(name, None)
+            if module is not None:
+                sys.modules[name] = module
 
 
 class Message:
@@ -268,7 +373,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)
 
-    async def test_call_recording_modes_build_supervised_media_command(self):
+    async def test_call_recording_modes_are_read_from_group_policy(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()
             service_settings["allowed_groups"] = {
@@ -284,12 +389,53 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 daemon.configured_call_recording_groups(),
                 {"auto": [-1001], "on_request": [-1002], "send_to_chat": [-1001]},
             )
-            command = daemon.call_recorder_command()
-            self.assertEqual(command[0], str(daemon.CALL_RECORDER_BIN))
-            self.assertIn("--watch-groups", command)
-            self.assertEqual(command[command.index("--auto-group") + 1], "-1001")
-            self.assertEqual(command[command.index("--request-group") + 1], "-1002")
-            self.assertEqual(command[command.index("--send-to-chat-group") + 1], "-1001")
+            # Group watching runs on the daemon's own client: a second
+            # update-consuming connection would swallow p2p INCOMING_CALL.
+            self.assertIsNone(daemon.call_recorder_command())
+
+    async def test_voice_agent_and_call_recording_are_independent_switches(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_users"] = {
+                "1": {"name": "Both",
+                      "call_recording": {"mode": "auto"},
+                      "voice_agent": {"mode": "auto"}},
+                "2": {"name": "Record only", "call_recording": {"mode": "auto"}},
+                "3": {"name": "Voice only", "voice_agent": {"mode": "enabled"}},
+                "4": {"name": "Neither"},
+                "5": {"name": "Voice disabled", "voice_agent": {"mode": "disabled"}},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+
+            self.assertEqual(
+                daemon.configured_call_recording_users()["allowed_callers"], [1, 2])
+            self.assertEqual(sorted(daemon.configured_voice_agent_users()), [1, 3])
+
+    async def test_voice_agent_policy_defaults_and_overrides(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_users"] = {
+                "1": {"name": "Default", "voice_agent": {"mode": "auto"}},
+                "2": {"name": "Tuned", "voice_agent": {
+                    "mode": "auto", "model": "other-live", "voice": "Puck",
+                    "history": 5}},
+                "3": {"name": "Bad history", "voice_agent": {
+                    "mode": "auto", "history": "not-a-number"}},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            users = daemon.configured_voice_agent_users()
+
+            self.assertEqual(users[1], {
+                "name": "Default",
+                "model": daemon.voice_agent.DEFAULT_MODEL,
+                "voice": daemon.voice_agent.DEFAULT_VOICE,
+                "history": daemon.voice_agent.DEFAULT_HISTORY_MESSAGES,
+            })
+            self.assertEqual(users[2]["model"], "other-live")
+            self.assertEqual(users[2]["voice"], "Puck")
+            self.assertEqual(users[2]["history"], 5)
+            self.assertEqual(
+                users[3]["history"], daemon.voice_agent.DEFAULT_HISTORY_MESSAGES)
 
     async def test_call_recording_request_is_explicit_and_persisted(self):
         with tempfile.TemporaryDirectory() as td:

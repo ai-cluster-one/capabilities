@@ -4,6 +4,7 @@
 # dependencies = [
 #     "telethon==1.43.2",
 #     "py-tgcalls==2.3.3",
+#     "google-genai>=1.36.0",
 # ]
 # ///
 """
@@ -59,7 +60,16 @@ from telethon.tl.types import MessageActionConferenceCall, MessageActionInviteTo
 
 import pytgcalls
 from pytgcalls import PyTgCalls, filters
-from pytgcalls.types import CallConfig, ChatUpdate, RecordStream
+from pytgcalls.types import (
+    CallConfig,
+    ChatUpdate,
+    Device,
+    Direction,
+    ExternalMedia,
+    MediaStream,
+    RecordStream,
+)
+from pytgcalls.types.raw import AudioParameters
 
 # Import shared call recording helpers (same directory)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -69,6 +79,7 @@ from call_recording_helpers import (
     send_recording_to_chat,
     write_metadata,
 )
+import voice_agent
 sys.path.pop(0)
 
 logging.getLogger("telethon").setLevel(logging.CRITICAL)
@@ -495,6 +506,36 @@ def configured_call_recording_users():
             if user_id > 0:
                 users["allowed_callers"].append(user_id)
     users["allowed_callers"].sort()
+    return users
+
+
+def configured_voice_agent_users():
+    """Direct callers the assistant answers by talking. Independent of call_recording:
+    either switch alone answers the call, and both together record it."""
+    users = {}
+    for key, raw_policy in ALLOWED.items():
+        policy = _as_mapping(raw_policy)
+        voice_policy = _as_mapping(policy.get("voice_agent"))
+        mode = str(voice_policy.get("mode") or "disabled").strip().lower()
+        if mode not in ("enabled", "auto", "on"):
+            continue
+        try:
+            user_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0:
+            continue
+        try:
+            history = int(voice_policy.get("history")
+                          or voice_agent.DEFAULT_HISTORY_MESSAGES)
+        except (TypeError, ValueError):
+            history = voice_agent.DEFAULT_HISTORY_MESSAGES
+        users[user_id] = {
+            "name": policy.get("name") or str(user_id),
+            "model": voice_policy.get("model") or voice_agent.DEFAULT_MODEL,
+            "voice": voice_policy.get("voice") or voice_agent.DEFAULT_VOICE,
+            "history": max(0, history),
+        }
     return users
 
 
@@ -2601,14 +2642,17 @@ async def run_session(client):
     calls = None
     users = configured_call_recording_users()
     groups = configured_call_recording_groups()
+    voice_users = configured_voice_agent_users()
     has_p2p_recording = bool(users["allowed_callers"])
+    has_voice_agent = bool(voice_users)
+    has_p2p_calls = has_p2p_recording or has_voice_agent
     has_group_recording = bool(groups["auto"] or groups["on_request"])
 
-    if has_p2p_recording or has_group_recording:
+    if has_p2p_calls or has_group_recording:
         calls = PyTgCalls(client)
 
-    # P2P call recording (incoming calls from allowed direct-message callers)
-    if has_p2p_recording:
+    # P2P direct calls: recorded, answered by the voice agent, or both
+    if has_p2p_calls:
         allowed_callers = set(users["allowed_callers"])
         active_recording = {
             "task": None,
@@ -2713,15 +2757,330 @@ async def run_session(client):
                 return
 
         async def start_call_recording(caller_id: int, mode: str, call_config: CallConfig):
-            if active_recording["task"] is not None:
+            if active_recording["task"] is not None or voice_call_busy():
                 log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
                 return
             task = asyncio.create_task(record_call(caller_id, mode, call_config))
             active_recording["task"] = task
 
+        # --- Gemini Live voice agent (answers a direct call by talking) -------
+        # The two media slots of one p2p call are independent: record() takes the
+        # inbound PCM, play() feeds the outbound PCM. Both honour AudioParameters
+        # exactly, so the Live API's own 16 kHz in / 24 kHz out need no resampling.
+        active_voice_call = {
+            "session": None,
+            "caller_id": None,
+            "caller_name": None,
+            "record": False,
+            "output": None,
+            "caller_pcm": None,
+            "agent_pcm": None,
+            "metadata_path": None,
+            "metadata": None,
+            "started_at": None,
+            "starting": False,
+            "finishing": False,
+        }
+
+        def voice_call_busy():
+            return active_voice_call["starting"] or active_voice_call["session"] is not None
+
+        async def voice_chat_history(caller_id, limit, caller_name):
+            if limit <= 0:
+                return ""
+            try:
+                messages = await client.get_messages(caller_id, limit=limit)
+            except Exception as exc:
+                log(f"voice: cannot read history for {caller_id}: {_short_error(exc)}")
+                return ""
+            rows = []
+            for m in reversed(messages):
+                if getattr(m, "action", None) is not None:
+                    continue
+                text = message_tail_text(m)
+                if not text:
+                    continue
+                who = ASSISTANT_NAME if getattr(m, "out", False) else caller_name
+                rows.append(f"{who}: {text}")
+            return "\n".join(rows)
+
+        async def start_voice_call(caller_id, policy, api_key):
+            record = caller_id in allowed_callers
+            caller_name = policy["name"]
+            output = recording_output(caller_id, "voice")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            metadata_path = output.with_suffix(".json")
+            caller_pcm = output.with_name(f"{output.stem}-caller.pcm") if record else None
+            agent_pcm = output.with_name(f"{output.stem}-agent.pcm") if record else None
+            started_at = datetime.now(timezone.utc)
+            metadata = {
+                "schema_version": 3,
+                "status": "joining",
+                "connection": CONNECTION,
+                "caller_id": str(caller_id),
+                "mode": "voice_agent",
+                "started_at": iso_utc(started_at),
+                "recording_started_at": None,
+                "recording_ended_at": None,
+                "duration_seconds": None,
+                "stop_reason": None,
+                "voice_agent": {
+                    "enabled": True,
+                    "status": "starting",
+                    "model": policy["model"],
+                    "voice": policy["voice"],
+                    "history_messages": policy["history"],
+                    "error": None,
+                    "transcript": [],
+                    "transcript_text": "",
+                },
+                "audio": {
+                    "path": str(output) if record else None,
+                    "format": "ogg" if record else None,
+                    "codec": "opus" if record else None,
+                    "bytes": 0,
+                    "settled": False,
+                    "capture_method": "external_pcm_two_track_then_ffmpeg_stereo_ogg",
+                    "tracks": [],
+                    "conversion": {
+                        "status": "pending" if record else "disabled",
+                        "error": None,
+                    },
+                },
+                "delivery": {
+                    "enabled": record,
+                    "status": "pending" if record else "disabled",
+                    "attempts": 0,
+                    "message_id": None,
+                    "sent_at": None,
+                    "error": None,
+                },
+            }
+            write_metadata(metadata_path, metadata)
+
+            history = await voice_chat_history(caller_id, policy["history"], caller_name)
+            project_context = CONTEXT_FILE.read_text() if CONTEXT_FILE.exists() else ""
+            session = voice_agent.VoiceCallSession(
+                calls,
+                caller_id,
+                api_key=api_key,
+                model=policy["model"],
+                voice=policy["voice"],
+                system_instruction=voice_agent.build_system_prompt(
+                    ASSISTANT_NAME, caller_name, project_context, history),
+                caller_name=caller_name,
+                caller_track=caller_pcm,
+                agent_track=agent_pcm,
+                log=log,
+            )
+            active_voice_call.update({
+                "session": session,
+                "caller_id": caller_id,
+                "caller_name": caller_name,
+                "record": record,
+                "output": output,
+                "caller_pcm": caller_pcm,
+                "agent_pcm": agent_pcm,
+                "metadata_path": metadata_path,
+                "metadata": metadata,
+                "started_at": started_at,
+                "finishing": False,
+            })
+            try:
+                # record() answers the call and claims the inbound slot; play()
+                # then claims the outbound one on the same connection.
+                await calls.record(
+                    caller_id,
+                    RecordStream(
+                        audio=True,
+                        audio_parameters=AudioParameters(voice_agent.CALLER_RATE, 1),
+                    ),
+                    config=CallConfig(timeout=60),
+                )
+                await calls.play(
+                    caller_id,
+                    MediaStream(
+                        ExternalMedia.AUDIO,
+                        audio_parameters=AudioParameters(voice_agent.AGENT_RATE, 1),
+                        audio_flags=MediaStream.Flags.REQUIRED,
+                        video_flags=MediaStream.Flags.IGNORE,
+                    ),
+                )
+                session.start_pump()
+                await session.start_agent()
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"[:500]
+                log(f"voice: cannot answer call from {caller_id}: {error}")
+                with contextlib.suppress(Exception):
+                    await session.stop()
+                with contextlib.suppress(Exception):
+                    await calls.leave_call(caller_id)
+                metadata.update({"status": "join_failed", "stop_reason": "join_failed"})
+                metadata["voice_agent"].update({"status": "failed", "error": error})
+                metadata["delivery"].update({"status": "skipped", "error": "join_failed"})
+                write_metadata(metadata_path, metadata)
+                for path in (caller_pcm, agent_pcm):
+                    if path is not None:
+                        with contextlib.suppress(OSError):
+                            path.unlink()
+                active_voice_call.update({
+                    "session": None, "caller_id": None, "caller_name": None,
+                    "record": False, "output": None, "caller_pcm": None,
+                    "agent_pcm": None, "metadata_path": None, "metadata": None,
+                    "started_at": None, "finishing": False,
+                })
+                return
+            metadata.update({
+                "status": "in_call",
+                "recording_started_at": iso_utc(),
+            })
+            metadata["voice_agent"]["status"] = "talking"
+            write_metadata(metadata_path, metadata)
+            log(f"voice: answering {caller_name} ({caller_id}) with "
+                f"{policy['model']}/{policy['voice']}; record={record}")
+
+        def begin_voice_call(caller_id, policy, api_key):
+            """Claim the slot synchronously, then set the call up off the update
+            handler: reading history and opening the Live socket must not hold up
+            the PyTgCalls dispatcher."""
+            active_voice_call["starting"] = True
+
+            async def run():
+                try:
+                    await start_voice_call(caller_id, policy, api_key)
+                finally:
+                    active_voice_call["starting"] = False
+
+            asyncio.create_task(run())
+
+        async def finish_voice_call(reason):
+            if active_voice_call["session"] is None or active_voice_call["finishing"]:
+                return
+            active_voice_call["finishing"] = True
+            session = active_voice_call["session"]
+            caller_id = active_voice_call["caller_id"]
+            caller_name = active_voice_call["caller_name"]
+            record = active_voice_call["record"]
+            output = active_voice_call["output"]
+            caller_pcm = active_voice_call["caller_pcm"]
+            agent_pcm = active_voice_call["agent_pcm"]
+            metadata = active_voice_call["metadata"]
+            metadata_path = active_voice_call["metadata_path"]
+            started_at = active_voice_call["started_at"]
+
+            summary = await session.stop()
+            tracks = session.tracks
+            with contextlib.suppress(Exception):
+                await calls.leave_call(caller_id)
+            active_voice_call.update({
+                "session": None, "caller_id": None, "caller_name": None,
+                "record": False, "output": None, "caller_pcm": None,
+                "agent_pcm": None, "metadata_path": None, "metadata": None,
+                "started_at": None, "finishing": False,
+            })
+
+            wall_duration = (datetime.now(timezone.utc) - started_at).total_seconds()
+            transcript = summary["transcript"]
+            metadata["voice_agent"].update({
+                "status": "complete",
+                "error": summary["pump_error"],
+                "interruptions": summary["interruptions"],
+                "dropped_input_chunks": summary["dropped_input_chunks"],
+                "caller_seconds": summary["caller_seconds"],
+                "agent_seconds": summary["agent_seconds"],
+                "agent_voiced_seconds": summary["agent_voiced_seconds"],
+                "transcript": transcript,
+                "transcript_text": voice_agent.transcript_text(
+                    transcript, ASSISTANT_NAME, caller_name),
+            })
+            metadata.update({
+                "recording_ended_at": iso_utc(),
+                "wall_duration_seconds": round(wall_duration, 3),
+                "stop_reason": reason,
+            })
+            metadata["audio"]["tracks"] = tracks
+            log(f"voice: call with {caller_id} ended ({reason}); "
+                f"{len(transcript)} turns, {summary['interruptions']} interruption(s)")
+
+            if not record:
+                metadata.update({
+                    "status": "conversation_only",
+                    "duration_seconds": round(wall_duration, 3),
+                })
+                write_metadata(metadata_path, metadata)
+                return
+
+            finalized = await voice_agent.join_tracks_to_stereo(
+                caller_pcm, agent_pcm, output)
+            status = "complete" if finalized["status"] == "complete" else "conversion_failed"
+            media_duration = finalized.get("duration_seconds") or wall_duration
+            metadata.update({
+                "status": status,
+                "duration_seconds": media_duration,
+            })
+            metadata["audio"]["bytes"] = finalized["output_bytes"]
+            metadata["audio"]["settled"] = finalized["status"] == "complete"
+            metadata["audio"]["conversion"].update({
+                "status": finalized["status"],
+                "error": finalized["error"],
+            })
+            metadata["audio"]["sources_retained"] = finalized["sources_retained"]
+
+            MIN_BYTES = 1024
+            MIN_DURATION = 1.0
+            is_empty = (
+                finalized["status"] == "complete"
+                and (finalized["output_bytes"] < MIN_BYTES
+                     or (media_duration or 0) < MIN_DURATION)
+            )
+            if finalized["status"] != "complete":
+                metadata["delivery"].update({
+                    "status": "skipped",
+                    "error": finalized["error"],
+                })
+                write_metadata(metadata_path, metadata)
+                log(f"voice: recording join failed — {finalized['error']}")
+                return
+            if is_empty:
+                metadata["delivery"].update({
+                    "status": "skipped",
+                    "error": "audio_not_received",
+                })
+                write_metadata(metadata_path, metadata)
+                log(f"voice: recording empty (bytes={finalized['output_bytes']}, "
+                    f"duration={media_duration:.1f}s) — not delivered")
+                return
+            write_metadata(metadata_path, metadata)
+            await send_recording_to_chat(
+                client,
+                caller_id,
+                output,
+                metadata_path,
+                metadata,
+                emit_event_fn=lambda event, **fields: log(f"voice-delivery: {event} {fields}"),
+            )
+            log(f"voice: recording delivered to {caller_id}")
+
+        @calls.on_update(filters.stream_frame(Direction.INCOMING, Device.MICROPHONE))
+        async def inbound_call_audio(_call_client: PyTgCalls, update):
+            session = active_voice_call["session"]
+            if session is not None and update.chat_id == active_voice_call["caller_id"]:
+                session.on_incoming_frames(update.frames)
+
         @calls.on_update(filters.chat_update(ChatUpdate.Status.INCOMING_CALL))
         async def incoming_p2p_call(_call_client: PyTgCalls, update: ChatUpdate):
             caller_id = update.chat_id
+            if caller_id in voice_users:
+                api_key = _env_value("GOOGLE_API_KEY")
+                if api_key:
+                    if voice_call_busy() or active_recording["task"] is not None:
+                        log(f"call: ignoring voice call from {caller_id} — a call is already active")
+                        return
+                    begin_voice_call(caller_id, voice_users[caller_id], api_key)
+                    return
+                # Without the key there is no conversation to have; fall through
+                # so a caller who also has call_recording on is still recorded.
+                log(f"voice: GOOGLE_API_KEY not resolved — cannot answer {caller_id} by voice")
             if caller_id not in allowed_callers:
                 log(f"call: ignoring p2p from {caller_id} — not in allowed_callers")
                 return
@@ -2729,6 +3088,9 @@ async def run_session(client):
 
         @calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))
         async def call_ended(_call_client: PyTgCalls, update: ChatUpdate):
+            if active_voice_call["caller_id"] == update.chat_id:
+                await finish_voice_call("call_closed")
+                return
             if active_recording["caller_id"] != update.chat_id:
                 return
 
@@ -3210,6 +3572,9 @@ async def run_session(client):
         features = []
         if has_p2p_recording:
             features.append(f"p2p(allowed_callers={sorted(allowed_callers)})")
+        if has_voice_agent:
+            key_state = "key" if _env_value("GOOGLE_API_KEY") else "NO GOOGLE_API_KEY"
+            features.append(f"voice_agent(callers={sorted(voice_users)}, {key_state})")
         if has_group_recording:
             features.append(f"groups(auto={len(auto_groups)}, on_request={len(on_request_groups)})")
         log(f"call listener: started on daemon client; {', '.join(features)}")

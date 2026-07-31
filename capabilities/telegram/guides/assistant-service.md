@@ -174,6 +174,63 @@ per-participant tracks.
 The service never starts a group call itself. It posts the completed recording only
 when `send_to_chat` is enabled; participant notice remains the operator's responsibility.
 
+## Direct Calls
+
+An incoming one-to-one call is handled by two independent per-user switches under
+`allowed_users`. Both default to off, and the daemon answers only when at least
+one is on:
+
+```json
+{
+  "allowed_users": {
+    "1000000001": {
+      "name": "Supervisor",
+      "role": "supervisor",
+      "call_recording": {"mode": "auto"},
+      "voice_agent": {"mode": "auto"}
+    }
+  }
+}
+```
+
+| `voice_agent` | `call_recording` | Behaviour |
+|---|---|---|
+| off | on | The call is answered and recorded to a single mixed track: MP3 capture, converted to OGG/Opus, delivered to the caller's direct chat. |
+| on | on | The assistant holds a spoken conversation and the call is recorded as a stereo OGG — caller left, assistant right — delivered to the caller's direct chat. |
+| on | off | Conversation only; nothing is written and nothing is delivered. |
+| off | off | The call is not answered. |
+
+`voice_agent` accepts optional `model`, `voice`, and `history` overrides. `history`
+is how many messages of that direct chat are carried into the call prompt.
+
+The voice agent runs on the daemon's own Telegram connection and its own PyTgCalls
+instance. An account may have exactly one connection consuming the update stream:
+a second one takes the incoming-call update and the first never sees it, so no part
+of call handling may open another client.
+
+The two media slots of one direct call are independent, and both honour the
+requested audio parameters exactly. The inbound slot delivers 16 kHz mono PCM —
+the format the speech model consumes — and the outbound slot accepts 24 kHz mono
+PCM, the format it emits, so no resampling happens in either direction. Inbound
+frames are batched to about 100 ms before being sent upstream; the outbound slot
+is fed on a 10 ms tick and sends silence when nothing is buffered, so the stream
+never stalls. When the caller interrupts, queued speech is dropped.
+
+Recording a voice-agent call therefore writes two raw tracks against one shared
+time origin, each padded with silence up to that origin, which FFmpeg joins into
+one stereo Opus file with real speaker separation. Both call paths refuse to
+deliver a recording that captured no audio.
+
+The prompt is a spoken-register preamble, then the channel context from
+`context.md`, then the recent tail of that direct chat, so the assistant on the
+phone is the same assistant as in the chat. It has no tools during a call. Both
+speech directions are transcribed and the joined transcript is stored in the JSON
+sidecar next to the recording; it is not sent as a message.
+
+An answered call needs a Gemini API key in `GOOGLE_API_KEY`, resolved from the
+project environment like every other credential. Without it, a caller who also
+has `call_recording` on is recorded as usual instead.
+
 ## Voice Transcription
 
 Voice notes addressed to the assistant are always transcribed in both direct messages
