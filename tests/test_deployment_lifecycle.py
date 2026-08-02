@@ -23,6 +23,11 @@ def _project(tmp_path: Path, has_contextkit: bool = False) -> Path:
 
 def _run(tmp_path: Path, project: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Run deployment command with isolated environment."""
+    policy = tmp_path / "config" / "capabilities" / "settings.json"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(json.dumps({
+        "capabilities": {"deployment": {"enabled": True}},
+    }) + "\n")
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),

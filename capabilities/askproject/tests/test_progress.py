@@ -151,6 +151,11 @@ def _invoke(tmp_path: Path, engine: str, fake: str, *extra: str,
     caller.mkdir()
     target.mkdir()
     (caller / ".git").mkdir()
+    capdir = caller / "capabilities"
+    capdir.mkdir()
+    (capdir / "settings.json").write_text(json.dumps({
+        "capabilities": {"askproject": {"enabled": True}},
+    }) + "\n")
 
     env = os.environ.copy()
     env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")

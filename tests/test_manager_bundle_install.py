@@ -83,6 +83,13 @@ def _loaded_geminitalk(tmp: Path, project: Path):
     module_name = f"geminitalk_test_{time.time_ns()}"
     try:
         _ensure_project_envelope(project)
+        registry = project / "capabilities" / "geminitalk" / "connections.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        if not registry.exists():
+            registry.write_text(json.dumps({
+                "default": "default",
+                "connections": {"default": {}},
+            }) + "\n")
         os.environ.update({
             "HOME": str(tmp / "home"),
             "XDG_CONFIG_HOME": str(tmp / "config"),
@@ -119,7 +126,10 @@ def _geminitalk_key_values(report: dict, cid: str = "default") -> dict:
 
 
 def _run_service_init(bin_dir: Path, env: dict[str, str], project: Path) -> None:
-    _ensure_project_envelope(project)
+    capdir = _ensure_project_envelope(project)
+    (capdir / "settings.json").write_text(json.dumps({
+        "capabilities": {"telegram": {"enabled": True}},
+    }) + "\n")
     init_argv = [str(bin_dir / "telegram"), "service", "init",
                  "--connection", "marvin"]
     init_env = {**env, "CLAUDE_PROJECT_DIR": str(project)}
@@ -448,39 +458,39 @@ def test_telegram_worker_wrapper_limits_current_chat_scope() -> None:
 
 
 def test_telegram_service_authority_pins_connection_and_session() -> None:
-    env = dict(os.environ)
-    env["CAPABILITIES_AUTH_CONTEXT"] = json.dumps({
-        "source": "telegram",
-        "connection": "marvin",
-        "chat_id": "-1001",
-        "sender_role": "group_member",
-        "allowed_capabilities": {
-            "telegram": {"scope": "current_chat"},
-        },
-    })
-    wrong_connection = subprocess.run(
-        [str(TELEGRAM_SCRIPT), "chats", "--connection", "personal"],
-        cwd=str(REPO),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert wrong_connection.returncode == 4
-    payload = json.loads(wrong_connection.stderr)
-    assert payload["error"]["code"] == "connection_scope_denied"
+    with tempfile.TemporaryDirectory() as td:
+        config = Path(td) / "config"
+        policy = config / "capabilities" / "settings.json"
+        policy.parent.mkdir(parents=True)
+        policy.write_text(json.dumps({
+            "capabilities": {"telegram": {"enabled": True}},
+        }) + "\n")
+        env = dict(os.environ)
+        env["XDG_CONFIG_HOME"] = str(config)
+        env["CAPABILITIES_AUTH_CONTEXT"] = json.dumps({
+            "source": "telegram",
+            "connection": "marvin",
+            "chat_id": "-1001",
+            "sender_role": "group_member",
+            "allowed_capabilities": {
+                "telegram": {"scope": "current_chat"},
+            },
+        })
+        wrong_connection = subprocess.run(
+            [str(TELEGRAM_SCRIPT), "chats", "--connection", "personal"],
+            cwd=str(REPO), env=env, capture_output=True, text=True, timeout=30,
+        )
+        assert wrong_connection.returncode == 4
+        payload = json.loads(wrong_connection.stderr)
+        assert payload["error"]["code"] == "connection_scope_denied"
 
-    wrong_session = subprocess.run(
-        [str(TELEGRAM_SCRIPT), "chats", "--session", "/tmp/personal"],
-        cwd=str(REPO),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert wrong_session.returncode == 4
-    payload = json.loads(wrong_session.stderr)
-    assert payload["error"]["code"] == "session_scope_denied"
+        wrong_session = subprocess.run(
+            [str(TELEGRAM_SCRIPT), "chats", "--session", "/tmp/personal"],
+            cwd=str(REPO), env=env, capture_output=True, text=True, timeout=30,
+        )
+        assert wrong_session.returncode == 4
+        payload = json.loads(wrong_session.stderr)
+        assert payload["error"]["code"] == "session_scope_denied"
 
 
 def test_telegram_control_authority_limits_settings_commands() -> None:
@@ -627,7 +637,8 @@ def test_geminitalk_effective_defaults_match_marvin_baseline() -> None:
             assert geminitalk.DEFAULT_MAX_AGENT_SESSIONS == 3
             assert geminitalk.WRITE_DEFAULT is True
 
-            cid, cfg = geminitalk._selected_cfg(None, None, require_key=False)
+            reg, _ = geminitalk._connections_registry()
+            cid, cfg = geminitalk._selected_cfg(reg, None, require_key=False)
             assert cid == "default"
             assert cfg["voice"] == "Aoede"
             assert cfg["agent_name"] == "Tessa"
@@ -637,19 +648,19 @@ def test_geminitalk_effective_defaults_match_marvin_baseline() -> None:
             assert cfg["allow_codex_tasks"] is True
             assert cfg["prompt_files"] == ["capabilities/geminitalk/base.md"]
 
-            implicit = geminitalk._connections_report()
-            assert implicit["connections"]["default"]["allow_write"] is True
-            implicit_values = _geminitalk_key_values(implicit)
-            assert implicit_values["voice"] == "Aoede"
-            assert implicit_values["agent_name"] == "Tessa"
-            assert implicit_values["language"] == "auto"
-            assert implicit_values["max_agent_sessions"] == 3
-            assert implicit_values["allow_capability_domain_commands"] is False
-            assert implicit_values["allow_codex_tasks"] is True
-            assert implicit_values["prompt_files"] == ["capabilities/geminitalk/base.md"]
+            declared = geminitalk._connections_report()
+            assert declared["connections"]["default"]["allow_write"] is True
+            declared_values = _geminitalk_key_values(declared)
+            assert declared_values["voice"] == "Aoede"
+            assert declared_values["agent_name"] == "Tessa"
+            assert declared_values["language"] == "auto"
+            assert declared_values["max_agent_sessions"] == 3
+            assert declared_values["allow_capability_domain_commands"] is False
+            assert declared_values["allow_codex_tasks"] is True
+            assert declared_values["prompt_files"] == ["capabilities/geminitalk/base.md"]
 
             capdir = project / "capabilities" / "geminitalk"
-            capdir.mkdir(parents=True)
+            capdir.mkdir(parents=True, exist_ok=True)
             (capdir / "connections.json").write_text(json.dumps({
                 "default": "marvin-like",
                 "connections": {"marvin-like": {"secret_env": "GOOGLE_API_KEY"}},
@@ -685,13 +696,15 @@ def test_geminitalk_default_prompt_adds_codex_context_when_present() -> None:
         (project / "capabilities").mkdir(parents=True)
         with _loaded_geminitalk(tmp, project) as geminitalk:
             geminitalk.cmd_init()
-            _cid, cfg = geminitalk._selected_cfg(None, None, require_key=False)
+            reg, _ = geminitalk._connections_registry()
+            _cid, cfg = geminitalk._selected_cfg(reg, None, require_key=False)
             assert cfg["prompt_files"] == ["capabilities/geminitalk/base.md"]
 
             codex_context = project / ".codex" / "generated" / "context.md"
             codex_context.parent.mkdir(parents=True)
             codex_context.write_text("Codex generated context marker.\n")
-            _cid, cfg = geminitalk._selected_cfg(None, None, require_key=False)
+            reg, _ = geminitalk._connections_registry()
+            _cid, cfg = geminitalk._selected_cfg(reg, None, require_key=False)
             assert cfg["prompt_files"] == [
                 "capabilities/geminitalk/base.md",
                 ".codex/generated/context.md",
@@ -749,7 +762,8 @@ def test_geminitalk_legacy_prompt_file_migrates_after_project_base() -> None:
         (project / "legacy-connection.md").write_text("LEGACY CONNECTION PROMPT MARKER\n")
         with _loaded_geminitalk(tmp, project) as geminitalk:
             os.environ["GEMINITALK_SYSTEM_PROMPT_FILE"] = "legacy-env.md"
-            _cid, cfg = geminitalk._selected_cfg(None, None, require_key=False)
+            reg, _ = geminitalk._connections_registry()
+            _cid, cfg = geminitalk._selected_cfg(reg, None, require_key=False)
             assert cfg["prompt_files"] == [
                 "capabilities/geminitalk/base.md",
                 "legacy-env.md",

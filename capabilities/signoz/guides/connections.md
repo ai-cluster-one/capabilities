@@ -52,10 +52,13 @@ SIGNOZ_ENDPOINT     -> SIGNOZ_OTLP_ENDPOINT
 New configuration should use the canonical names. `signoz connections` shows
 which name and cascade tier resolved without exposing either secret.
 
-## Multiple deployments
+## Connection registry
 
-Use `capabilities/signoz/connections.json` when a project talks to more than
-one SigNoz deployment:
+Every setup declares at least one connection in
+`capabilities/signoz/connections.json` (or the user-level registry). Values may
+remain in the environment cascade; an empty declared entry is enough to use the
+canonical variables and compatibility aliases. A multi-deployment registry
+looks like this:
 
 ```json
 {

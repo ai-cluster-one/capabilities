@@ -107,6 +107,15 @@ def _env(tmp: Path, bin_dir: Path, log: Path, **extra: str) -> tuple[dict[str, s
     home = tmp / "home"
     project = tmp / "project"
     (project / ".git").mkdir(parents=True)
+    capdir = project / "capabilities" / "vapic"
+    capdir.mkdir(parents=True)
+    (project / "capabilities" / "settings.json").write_text(json.dumps({
+        "capabilities": {"vapic": {"enabled": True}},
+    }) + "\n")
+    (capdir / "connections.json").write_text(json.dumps({
+        "default": "default",
+        "connections": {"default": {"secret_env": "VAPI_API_KEY"}},
+    }) + "\n")
     env = dict(os.environ)
     env.update({
         "HOME": str(home),

@@ -9,8 +9,8 @@ Directo exposes no public API. Auth is a three-step browser ceremony
 (`keeks.asp` → credential POST → location POST) minting a cookie pair bound
 to a location (koht). The primaries resolve per connection: a registry entry
 names `db`/`koht` literally and `username`/`password` by env-key indirection
-(`username_env`/`password_env`, resolved through the cascade), while the
-implicit default rides the bare `DIRECTO_*` cascade. The minted session
+(`username_env`/`password_env`, resolved through the cascade). A declared
+connection may leave those values to the bare `DIRECTO_*` cascade. The minted session
 resolves from the per-connection session file in the state home first, with
 the cascade as the one-shot override path. Every authed call self-heals: an
 expired session triggers a re-login from the primaries and one retry.

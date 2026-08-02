@@ -108,10 +108,26 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_cli(tmp_path, base_url, *args):
+    config = tmp_path / "config"
+    policy = config / "capabilities" / "settings.json"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(json.dumps({
+        "capabilities": {"youtrack": {"enabled": True}},
+    }))
+    registry = config / "youtrack" / "connections.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({
+        "default": "test",
+        "connections": {"test": {
+            "base_url": base_url,
+            "secret_env": "YOUTRACK_TOKEN",
+            "allow_write": True,
+        }},
+    }))
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),
-        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_CONFIG_HOME": str(config),
         "YOUTRACK_URL": base_url,
         "YOUTRACK_TOKEN": "perm:test",
     })

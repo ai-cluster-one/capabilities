@@ -3,7 +3,8 @@
 `geminitalk` uses a Google AI Studio API key and a small amount of per-project
 voice policy.
 
-For the implicit default connection, set one of:
+Declare a connection even when there is only one. The connection can inherit
+its secret from one of the standard environment keys:
 
 ```sh
 GEMINITALK_API_KEY=...
@@ -23,7 +24,7 @@ GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS=false
 GEMINITALK_ALLOW_CODEX_TASKS=true
 ```
 
-For named connections, use `capabilities/geminitalk/connections.json`:
+Use `capabilities/geminitalk/connections.json` (or the user-level registry):
 
 ```json
 {

@@ -13,9 +13,8 @@ fetch and export message history to JSON, download media, transcribe voice notes
 and render a readable log. Run `whatsapp doctor` first to confirm the chain.
 
 Connections
-  Configuration resolves as named connections. A connection is one WhatsApp
-  identity = a (WAHA instance + session). With no registry the sole connection is
-  `default`, resolved from the credential cascade (flat keys below). A project
+  Configuration requires explicit named connections. A connection is one
+  WhatsApp identity = a WAHA instance plus session. A project
   with several WhatsApp identities declares them in
   <project>/capabilities/whatsapp/connections.json:
         {
@@ -48,7 +47,7 @@ Connections
   WRITES ARE OFF BY DEFAULT: a WhatsApp send leaves the system (a message reaches
   a real person), so `send` exits 4 unless the connection carries an explicit
   "allow_write": true. No flag lifts the gate; granting it is a deliberate registry
-  edit, made after asking the user. The implicit default connection can never write.
+  edit, made after asking the user.
 
   Selection: --connection <id> (-c) on every command. Unflagged, the registry's
   "default" pointer applies, else the sole entry; several entries without a pointer
@@ -57,8 +56,7 @@ Connections
 Credentials (4-tier cascade; first non-empty wins)
   flags > project .env(.local) > ~/.config/whatsapp/credentials.env > process env.
   The secret is named indirectly by the connection's secret_env and never travels
-  on argv. With no connections.json anywhere, the implicit `default` connection
-  resolves from single-instance env:
+  on argv. A connection may resolve these values from the cascade:
         WAHA_BASE_URL                            instance URL (required)
         WAHA_WHATSAPP_API_KEY                    X-Api-Key
         WAHA_DASHBOARD_USERNAME / WAHA_DASHBOARD_PASSWORD   dashboard basic auth
@@ -187,7 +185,7 @@ SUMMARY = ("WhatsApp CLI over a self-hosted WAHA bridge — list chats, "
            "and transcribe voice notes. Run `whatsapp doctor` first to "
            "confirm the instance is reachable and the session is linked.")
 SCOPE = "project"   # credential scope: "project" | "user"
-CRED_KEYS = [       # the implicit default connection; a registry entry supplies these per id
+CRED_KEYS = [       # an override-free registry entry resolves these flat keys
     {"key": "WAHA_BASE_URL", "secret": False, "required": True,
      "note": "WAHA instance URL"},
     {"key": "WAHA_WHATSAPP_API_KEY", "secret": True, "required": False,
@@ -366,25 +364,86 @@ def _auth_gate() -> None:
          f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
 
 
-def _gate() -> None:
-    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks.
+def _policy_entry(path: Path):
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        _die(6, "bad_policy", f"cannot read capability policy {path}: {e}")
+    capabilities = data.get("capabilities") if isinstance(data, dict) else None
+    if not isinstance(capabilities, dict):
+        _die(6, "bad_policy", f"{path} is not a capability policy",
+             'expected {"capabilities": {"<name>": {"enabled": true}}}')
+    entry = capabilities.get(NAME)
+    if entry is not None and (not isinstance(entry, dict)
+                              or set(entry) != {"enabled"}
+                              or not isinstance(entry.get("enabled"), bool)):
+        _die(6, "bad_policy", f"invalid {NAME} policy entry in {path}",
+             'expected {"enabled": true|false}')
+    return entry
 
-    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
-    is stricter and also runs here, before credentials or network calls.
-    """
-    _auth_gate()
+
+def _project_enabled_explicitly() -> bool:
+    """True only for an explicit project enabled entry; global inheritance is
+    deliberately insufficient for project-owned service activation."""
     root = _project_root()
     if root is None:
+        return False
+    entry = _policy_entry(_project_capabilities_dir(root) / "settings.json")
+    return isinstance(entry, dict) and entry.get("enabled") is True
+
+
+def _require_project_enabled_for_service() -> Path:
+    root = _project_root()
+    if root is None or not _project_enabled_explicitly():
+        _die(4, "project_enable_required",
+             f"{NAME} service activation requires an explicit project enable",
+             f"ask the user, then run `capabilities enable {NAME} --project` "
+             "before service init/start/run")
+    return root
+
+
+def _gate() -> None:
+    """Project policy overrides global policy; absence inherits, and absence at
+    both scopes is default deny. Safe local discovery verbs remain available so
+    a disabled capability can be understood and configured before use.
+
+    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
+    is stricter and runs first, before credentials or network calls.
+    """
+    _auth_gate()
+    verb = sys.argv[1] if len(sys.argv) > 1 else "help"
+    service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    service_contract = globals().get("SERVICE")
+    if isinstance(service_contract, dict) and verb == "service" \
+            and service_action in {"init", "start", "run"}:
+        _require_project_enabled_for_service()
+    if verb in {"help", "stub", "manifest", "connections"}:
         return
-    gate_file = _project_capabilities_dir(root) / "settings.json"
-    try:
-        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
-    except (OSError, ValueError):
+    root = _project_root()
+    project_file = (_project_capabilities_dir(root) / "settings.json") \
+        if root is not None else None
+    project_entry = _policy_entry(project_file) if project_file else None
+    global_file = _CONFIG_HOME / "capabilities" / "settings.json"
+    global_entry = _policy_entry(global_file)
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is True:
         return
-    if isinstance(entry, dict) and entry.get("enabled") is False:
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is False:
         _die(4, "disabled",
-             f"{NAME} is disabled in this project ({gate_file})",
-             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+             f"{NAME} is disabled in this project ({project_file})",
+             f"ask the user whether to enable {NAME} for this project; if yes, "
+             f"run `capabilities enable {NAME} --project`")
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is True:
+        return
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is False:
+        message = f"{NAME} is disabled globally ({global_file})"
+    else:
+        message = f"{NAME} is not enabled by project or global policy"
+    _die(4, "not_enabled", message,
+         f"ask the user whether to enable {NAME} only for this project or "
+         f"globally for every project; then run `capabilities enable {NAME} "
+         "--project` or `--global` exactly as requested")
 
 
 def _env_dir() -> Path | None:
@@ -648,8 +707,8 @@ def _mask(value: str) -> str:
 
 def _connections_registry() -> tuple[dict | None, Path | None]:
     """The connections envelope and its path: project envelope first, else the
-    user config home. First found wins, never merged; (None, None) when neither
-    declares one (the implicit default connection applies)."""
+    user config home. First found wins, never merged. Every connection-bearing
+    capability requires a registry, even when it declares only one connection."""
     envdir = _env_dir()
     candidates = ([envdir / "connections.json"] if envdir else []) + \
                  [_CONFIG_HOME / NAME / "connections.json"]
@@ -665,19 +724,22 @@ def _connections_registry() -> tuple[dict | None, Path | None]:
             _die(6, "bad_config", f"{reg_file} is not a connections envelope",
                  'expected {"default": "<id>", "connections": { ... }}')
         return raw, reg_file
-    return None, None
+    project_path = (envdir / "connections.json") if envdir else None
+    homes = ([str(project_path)] if project_path else []) + \
+            [str(_CONFIG_HOME / NAME / "connections.json")]
+    _die(6, "connections_required",
+         f"{NAME} requires an explicit connections registry",
+         "create one of: " + ", ".join(homes) +
+         '; expected {"default": "<id>", "connections": {"<id>": { ... }}}')
 
 
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
-    """flag → default pointer → sole entry → die 6. No registry → the implicit
-    default. A connection's own `address` field selects it too (used where a
+    """flag → default pointer → sole entry → die 6. A connection's own
+    `address` field selects it too (used where a
     connection carries a human-recognizable address; absent fields never match)."""
     if reg is None:
-        if wanted and wanted != "default":
-            _die(6, "unknown_connection",
-                 "no connections registry; the sole connection is 'default'",
-                 "the implicit default resolves from the credential cascade")
-        return "default", None
+        _die(6, "connections_required",
+             f"{NAME} requires an explicit connections registry")
     conns = reg["connections"]
     if wanted:
         if wanted in conns:
@@ -763,11 +825,11 @@ def _build_cfg(cid: str, entry: dict | None,
     """Materialize one connection into the config dict every cmd_* consumes.
     Returns (cfg, problem) — problem is an error dict ({"exit", "code",
     "message", "hint"?}) instead of a die, so doctor can report every
-    connection rather than stopping at the first. The implicit default (no
+    connection rather than stopping at the first. An override-free entry (no
     registry entry) reads the flat WAHA_* keys through the cascade; a named
     connection reads base_url/session/etc. literally and resolves its X-Api-Key
     and dashboard pair through secret_env / *_env indirection."""
-    if entry is None:   # the implicit default — flat keys through the cascade
+    if entry is None:   # declared entry without overrides — use the flat-key cascade
         base_url = _resolve_env_key("WAHA_BASE_URL")[0]
         api_key = _resolve_env_key("WAHA_WHATSAPP_API_KEY")[0]
         username = _resolve_env_key("WAHA_DASHBOARD_USERNAME")[0]
@@ -854,8 +916,8 @@ def _build_cfg(cid: str, entry: dict | None,
 def get_config(args=None):
     """Resolve the active connection into the config dict cmd_* code consumes.
     Selects through the standard registry (capabilities/whatsapp/connections.json,
-    else the user config home); with no registry the implicit `default` connection
-    resolves from single-instance env (WAHA_BASE_URL / WAHA_WHATSAPP_API_KEY)."""
+    else the user config home); the selected entry's values may resolve from
+    WAHA_BASE_URL / WAHA_WHATSAPP_API_KEY through the cascade."""
     requested_session = getattr(args, "session", None)
     requested_conn = getattr(args, "connection", None)
     reg, _ = _connections_registry()
@@ -2192,7 +2254,7 @@ def cmd_pair(args):
 
 
 def main():
-    _gate()                      # every verb passes the project gate first
+    _gate()                      # every verb passes the effective policy gate first
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
     parser = argparse.ArgumentParser(
         prog="whatsapp",
@@ -2201,7 +2263,7 @@ def main():
     parser.add_argument(
         "--connection", "-c", dest="connection", default=None,
         help="connection id (default: the registry's \"default\" pointer, "
-             "the sole connection, else the implicit `default`)",
+             "else the sole declared connection)",
     )
     parser.add_argument(
         "--session", default=None,
@@ -2289,7 +2351,7 @@ def main():
     # The standard write gate: a write verb refuses on a read-only connection,
     # after selection, before any credential resolves. Resolving the selected
     # connection's allow_write costs no network and no secret — it reads the
-    # committed registry alone (the implicit default falls to WRITE_DEFAULT).
+    # committed registry alone (an override-free entry falls to WRITE_DEFAULT).
     if args.command in WRITE_VERBS:
         reg, _ = _connections_registry()
         cid, entry = _select_connection(reg, args.connection)

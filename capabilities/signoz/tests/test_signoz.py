@@ -46,12 +46,18 @@ def test_help_documents_every_domain_command():
     assert "SIGNOZ_INGESTION_KEY" in help_text
 
 
-def test_implicit_connection_accepts_existing_aliases(tmp_path, monkeypatch):
+def test_declared_connection_accepts_existing_aliases(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text(
         "SIGNOZ_API_URL=https://legacy.example\n"
         "SIGNOZ_SERVICE_KEY=management-secret\n"
         "SIGNOZ_ENDPOINT=https://collector.example:4318\n"
     )
+    connection_dir = tmp_path / "capabilities" / "signoz"
+    connection_dir.mkdir(parents=True)
+    (connection_dir / "connections.json").write_text(json.dumps({
+        "default": "default",
+        "connections": {"default": {}},
+    }))
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
     resolved = module._resolve_connection("default")
     assert resolved["url"] == "https://legacy.example"

@@ -187,9 +187,14 @@ The `ids` verbs manage the identifiers envelope:
 
 `ids set` creates `capabilities/<name>/` on demand **inside an existing `capabilities/`**; in a project with no `capabilities/` envelope it exits 6, naming `capabilities init` as the remediation.
 
-## The project gate
+## The capability policy gate
 
-Every verb — `help` and `doctor` included — passes the project gate before dispatch. The gate reads one file, the manager-owned `capabilities/settings.json` at the project root, resolved by the same walk everything project-scoped shares:
+Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns both policy files:
+
+1. Project: `capabilities/settings.json`.
+2. Global machine default: `$XDG_CONFIG_HOME/capabilities/settings.json`.
+
+An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
 
 ```python
 def _project_root() -> Path | None:
@@ -217,32 +222,30 @@ def _project_capabilities_dir(root: Path) -> Path:
     return legacy
 
 def _gate() -> None:
-    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks."""
-    root = _project_root()
-    if root is None:
+    _auth_gate()
+    if sys.argv[1] in {"help", "stub", "manifest", "connections"}:
         return
-    gate_file = _project_capabilities_dir(root) / "settings.json"
-    try:
-        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
-    except (OSError, ValueError):
+    project_entry = _policy_entry(project_policy) if project_root else None
+    global_entry = _policy_entry(_CONFIG_HOME / "capabilities" / "settings.json")
+    effective = project_entry if project_entry is not None else global_entry
+    if isinstance(effective, dict) and effective.get("enabled") is True:
         return
-    if isinstance(entry, dict) and entry.get("enabled") is False:
-        _die(4, "disabled",
-             f"{NAME} is disabled in this project ({gate_file})",
-             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+    _die(4, "not_enabled", f"{NAME} is not enabled by effective policy",
+         "ask whether to enable it --project or --global")
 ```
 
-| State | Execution |
-|---|---|
-| absent — no project, no gate file, or no entry for this capability | runs; the gate has no opinion |
-| `"enabled": true` | runs |
-| `"enabled": false` | every verb exits 4 |
+| Project entry | Global entry | Operational result |
+|---|---|---|
+| `true` | any | enabled by project |
+| `false` | any | disabled by project |
+| absent | `true` | enabled by inheritance |
+| absent | `false` or absent | disabled |
 
-The gate is a **guardrail, not a security boundary** — it is cwd-based and fails open (an unreadable gate file never blocks). Its job is to stop a stray reference from becoming use: the exit-4 envelope is written for the model and routes the decision to the human. Absence keeps ad-hoc use working — a home directory, a server, cron — so disable is a deliberate user statement, recorded in the file.
+The gate is a **guardrail, not a security boundary** — project resolution remains cwd-based. A malformed policy is a configuration error and operational absence is closed. The exit-4 envelope routes the scope decision to the human. Bundled service `init`, `start`, and `run` additionally require explicit project enable: inherited global availability grants CLI use, not ownership of a project daemon. This rule lives once in the preamble: `_gate()` applies it only when the executable declares a `SERVICE` manifest surface, so each service implements its lifecycle without repeating policy logic and domain commands merely named `service` remain ordinary CLI verbs.
 
 ## The credential cascade
 
-Every executable resolves its credentials the same way — a deterministic **four-tier cascade**, first non-empty wins — so config follows the developer from a laptop (project and user config present) to a deployed box (global env only) with no change in code and no model or agent lookup:
+Every executable resolves the values named by an explicit connection through the same deterministic cascade, first non-empty wins, so secrets can move from laptop files to deployment environment without changing the declared identity:
 
 1. **Flags** — explicit `--…` overrides, per invocation, for non-secret values only. **A secret never has a flag**: `argv` leaks (process lists, shell history), so a secret resolves from the tiers below, and a one-shot secret override is an env-prefix invocation — `ASANA_TOKEN=… asana …` — which is tier 4 working as designed.
 2. **Project env** — `.env.local` then `.env` at the project root (`_project_root()` above). The project you're working in wins.
@@ -310,14 +313,14 @@ A capability whose secret is not a flat token resolves it in its own shape — k
 
 ## Connections
 
-Every capability resolves its configuration as **connections** — named, complete resolutions of its credential keys. The model is universal; cardinality is a runtime fact of the consuming project, never a declared trait. A project with no registry has exactly **one implicit connection, `default`**, resolved by the bare cascade above — which is what keeps a deployed box, where only injected env exists, resolving with zero files.
+Every connection-bearing capability resolves its configuration as **explicit named connections**. A registry is required even when there is only one connection; environment variables resolve values for that declared connection but never create an identity implicitly. Core-only capabilities omit the connections tier and report an empty connections map.
 
-More than one endpoint or identity is declared in the **connections registry** — a standard envelope, written at configuration time by whoever configures, read by the script. The registry resolves through two homes, **first found wins, never merged**:
+Endpoints and identities are declared in the **connections registry** — a standard envelope, written at configuration time by whoever configures, read by the script. The registry resolves through two homes, **first found wins, never merged**:
 
 1. **Project** — `capabilities/<name>/connections.json`: the project's own endpoints and identities.
 2. **User** — `$XDG_CONFIG_HOME/<name>/connections.json` (default `~/.config/<name>/`): machine-level identities, the shape for personal-account tools whose connections are a fact of the machine, not of any one project.
 
-Whichever registry is found is **authoritative**: it fully defines the connection set, the implicit default does not exist beside it, and the other home is not consulted.
+Whichever registry is found is **authoritative**: it fully defines the connection set and the other home is not consulted.
 
 ```json
 {
@@ -343,9 +346,9 @@ Non-secret values sit literally in the entry: chosen, committed, per-connection 
 One flag selects, accepted by every domain verb: `--connection <id>`. A capability may accept a native alias beside it (`--mailbox <id|address>`); the standard flag always works. Resolution is deterministic, refusing ambiguity rather than guessing:
 
 ```python
-def _connections_registry() -> dict | None:
+def _connections_registry() -> dict:
     """The connections envelope: project envelope first, else the user config
-    home. First found wins; None when neither declares one."""
+    home. First found wins; a registry is required."""
     envdir = _env_dir()
     candidates = ([envdir / "connections.json"] if envdir else []) + \
                  [_CONFIG_HOME / NAME / "connections.json"]
@@ -360,16 +363,12 @@ def _connections_registry() -> dict | None:
             _die(6, "bad_config", f"{path} is not a connections envelope",
                  'expected {"default": "<id>", "connections": { ... }}')
         return reg
-    return None
+    _die(6, "connections_required", f"{NAME} requires an explicit registry")
 
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
-    """flag → default pointer → sole entry → die 6. No registry → the implicit default."""
+    """flag → default pointer → sole entry → die 6."""
     if reg is None:
-        if wanted and wanted != "default":
-            _die(6, "unknown_connection",
-                 f"no connections registry; the sole connection is 'default'",
-                 "the implicit default resolves from the credential cascade")
-        return "default", None
+        _die(6, "connections_required", f"{NAME} requires an explicit registry")
     conns = reg["connections"]
     if wanted:
         if wanted in conns:
@@ -406,13 +405,13 @@ def _write_gate(conn_id: str, conn: dict | None, verb: str) -> None:
              "`allow_write: true` on this connection in connections.json.")
 ```
 
-`WRITE_DEFAULT` is the capability's word on what silence means, declared once in the script: `True` for tools whose writes stay inside a system the consumer owns (a task tracker, an automation instance); **`False` when a write leaves the system** — messages a human, sends mail, moves money. Under `WRITE_DEFAULT = False`, writing is granted per connection, deliberately, in a committed registry entry — the implicit default connection cannot write at all, so a deployed box that must send carries a registry naming its writing identity. The refused write is the ceremony: exit 4 at the moment of intent routes the grant decision to the human with the exact remediation in hand.
+`WRITE_DEFAULT` is the capability's word on what silence means, declared once in the script: `True` for tools whose writes stay inside a system the consumer owns; **`False` when a write leaves the system**. Under `WRITE_DEFAULT = False`, writing is granted per connection, deliberately, in a registry entry. The refused write is the ceremony: exit 4 at the moment of intent routes the grant decision to the human with the exact remediation in hand.
 
 The principle: **the cascade resolves values; a gate is not a value.** No flag, no env var, no tier overrides the gate — it reads from the two declarations alone, and the exit-4 envelope routes the decision to the human, exactly as the project gate does. Exit 4 is the policy-refusal code in both.
 
 ### `connections` — the resolution report
 
-`<name> connections` prints where every value of every connection resolves from — the programmatic answer to *"which credentials is this using, and from where?"*. It is **purely local**: resolution only, no network, no authentication attempt (readiness stays `doctor`'s question). The report always carries the same shape, the implicit default included, so a consumer never branches on cardinality:
+`<name> connections` prints where every value of every declared connection resolves from — the programmatic answer to *"which credentials is this using, and from where?"*. It is **purely local**: resolution only, no network, no authentication attempt (readiness stays `doctor`'s question). The report always carries the same shape, so a consumer never branches on cardinality:
 
 ```json
 {
@@ -441,7 +440,7 @@ def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 ```
 
-A **core-only** capability — one carrying the `capability core` fence and no `connections` fence, because it has nothing to resolve (it drives a local tool or the host, with no credentials or endpoint) — still answers `connections`, reporting an empty map: `{ "connections": {}, "default": null }`. That absence is the contract, not a gap: `audit` accepts the empty report in place of the implicit-default-plus-registry checks, and never writes a registry against such a capability.
+A **core-only** capability — one carrying the `capability core` fence and no `connections` fence, because it has nothing to resolve (it drives a local tool or the host, with no credentials or endpoint) — still answers `connections`, reporting an empty map: `{ "connections": {}, "default": null }`. That absence is the contract, not a gap: `audit` accepts the empty report in place of the explicit-registry checks, and never writes a registry against such a capability.
 
 ## Identity-free
 
@@ -464,7 +463,7 @@ def _state_dir() -> Path:
     return _STATE_HOME / NAME
 ```
 
-- **Project scope** → `<root>/capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, session maps, each project isolated to its own account session. The manager-owned `capabilities/.gitignore` is what guarantees `*/state/` never commits — a session cookie is a secret, so the guard is a precondition: project state lands inside the envelope only where `capabilities/` already exists. Anywhere else — a home directory, a server, cron, an unwired repo — state falls back to the user state home and ad-hoc use keeps working.
+- **Project scope** → `<root>/capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, session maps, each project isolated to its own account session. The manager-owned `capabilities/.gitignore` guarantees `*/state/` never commits. Outside an initialized envelope state falls back to the user state home; operational use there still requires global policy enable and an explicit global connections registry where the capability bears connections.
 - **User scope** → `$XDG_STATE_HOME/<name>/` (default `~/.local/state/<name>/`).
 
 A stateful capability keys its state **per connection** — `<state-dir>/<connection-id>/…` — so two connections of one capability never share a session. The guides cache is the exception: guide content is capability-scoped and connection-independent, so it stays unkeyed at the user state home.
@@ -506,7 +505,7 @@ The code tells the caller *which kind* of failure without parsing the message:
 | `0` | success |
 | `2` | auth — missing/rejected credentials, 401/403 |
 | `3` | not found — the addressed resource does not exist, 404 |
-| `4` | policy refusal — the project gate (every verb), or a write verb on a read-only connection |
+| `4` | policy refusal — effective project/global capability policy, explicit project requirement for service activation, or a write verb on a read-only connection |
 | `5` | server / network — timeout, connection error, 429 after retries, 5xx |
 | `6` | input / validation — a malformed argument, a bad date, a conflicting flag |
 
@@ -561,7 +560,7 @@ def _missing_required(keys: list[dict]) -> list[str]:
 
 Only a connection that clears this gate proceeds to the live round-trip (the per-capability authenticated probe, conventionally `_check_connection`). A capability with nothing to resolve — core-only, empty `CRED_KEYS`, carrying no `connections` fence — has no gate to clear: `doctor` proves whatever local readiness it can (a host grant, a tool on `PATH`) and stops there.
 
-`doctor` is the **readiness oracle**. The stub only announces that a tool exists, so "is it wired up *here*?" is `doctor`'s question to answer — at use-time, per context, never inferred from the stub's presence. A failing `doctor` does not just report "not configured"; it names the exact remediation, including *where* the missing config goes — derived from the declared credential scope and `CRED_KEYS`: the project `.env`, or `~/.config/<name>/credentials.env` — so an agent learns how to wire the tool up from the tool itself. A capability whose required config is global (or nil) is usable from any project the moment it is installed; one that needs project-side config is globally *aware* but only *ready* where that config exists, and `doctor` makes the difference explicit.
+`doctor` is the **readiness oracle**. The stub only announces that a tool exists, so "is it wired up *here*?" is `doctor`'s question to answer at use-time, never inferred from stub presence. A failing `doctor` names the exact remediation. A connection-bearing capability is ready only after effective policy enables it and an explicit project or global registry declares its identity; the registry's named values then resolve through the credential cascade. A core-only capability still has no registry requirement.
 
 ## Conformance and deviation
 

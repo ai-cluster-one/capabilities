@@ -224,25 +224,86 @@ def _auth_gate() -> None:
          f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
 
 
-def _gate() -> None:
-    """absent → run; enabled → run; disabled → exit 4. Unreadable never blocks.
+def _policy_entry(path: Path):
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        _die(6, "bad_policy", f"cannot read capability policy {path}: {e}")
+    capabilities = data.get("capabilities") if isinstance(data, dict) else None
+    if not isinstance(capabilities, dict):
+        _die(6, "bad_policy", f"{path} is not a capability policy",
+             'expected {"capabilities": {"<name>": {"enabled": true}}}')
+    entry = capabilities.get(NAME)
+    if entry is not None and (not isinstance(entry, dict)
+                              or set(entry) != {"enabled"}
+                              or not isinstance(entry.get("enabled"), bool)):
+        _die(6, "bad_policy", f"invalid {NAME} policy entry in {path}",
+             'expected {"enabled": true|false}')
+    return entry
 
-    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
-    is stricter and also runs here, before credentials or network calls.
-    """
-    _auth_gate()
+
+def _project_enabled_explicitly() -> bool:
+    """True only for an explicit project enabled entry; global inheritance is
+    deliberately insufficient for project-owned service activation."""
     root = _project_root()
     if root is None:
+        return False
+    entry = _policy_entry(_project_capabilities_dir(root) / "settings.json")
+    return isinstance(entry, dict) and entry.get("enabled") is True
+
+
+def _require_project_enabled_for_service() -> Path:
+    root = _project_root()
+    if root is None or not _project_enabled_explicitly():
+        _die(4, "project_enable_required",
+             f"{NAME} service activation requires an explicit project enable",
+             f"ask the user, then run `capabilities enable {NAME} --project` "
+             "before service init/start/run")
+    return root
+
+
+def _gate() -> None:
+    """Project policy overrides global policy; absence inherits, and absence at
+    both scopes is default deny. Safe local discovery verbs remain available so
+    a disabled capability can be understood and configured before use.
+
+    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
+    is stricter and runs first, before credentials or network calls.
+    """
+    _auth_gate()
+    verb = sys.argv[1] if len(sys.argv) > 1 else "help"
+    service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    service_contract = globals().get("SERVICE")
+    if isinstance(service_contract, dict) and verb == "service" \
+            and service_action in {"init", "start", "run"}:
+        _require_project_enabled_for_service()
+    if verb in {"help", "stub", "manifest", "connections"}:
         return
-    gate_file = _project_capabilities_dir(root) / "settings.json"
-    try:
-        entry = json.loads(gate_file.read_text()).get("capabilities", {}).get(NAME)
-    except (OSError, ValueError):
+    root = _project_root()
+    project_file = (_project_capabilities_dir(root) / "settings.json") \
+        if root is not None else None
+    project_entry = _policy_entry(project_file) if project_file else None
+    global_file = _CONFIG_HOME / "capabilities" / "settings.json"
+    global_entry = _policy_entry(global_file)
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is True:
         return
-    if isinstance(entry, dict) and entry.get("enabled") is False:
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is False:
         _die(4, "disabled",
-             f"{NAME} is disabled in this project ({gate_file})",
-             "Do not enable it yourself — ask the user whether to enable it, then stop.")
+             f"{NAME} is disabled in this project ({project_file})",
+             f"ask the user whether to enable {NAME} for this project; if yes, "
+             f"run `capabilities enable {NAME} --project`")
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is True:
+        return
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is False:
+        message = f"{NAME} is disabled globally ({global_file})"
+    else:
+        message = f"{NAME} is not enabled by project or global policy"
+    _die(4, "not_enabled", message,
+         f"ask the user whether to enable {NAME} only for this project or "
+         f"globally for every project; then run `capabilities enable {NAME} "
+         "--project` or `--global` exactly as requested")
 
 
 def _env_dir() -> Path | None:
@@ -506,8 +567,8 @@ def _mask(value: str) -> str:
 
 def _connections_registry() -> tuple[dict | None, Path | None]:
     """The connections envelope and its path: project envelope first, else the
-    user config home. First found wins, never merged; (None, None) when neither
-    declares one (the implicit default connection applies)."""
+    user config home. First found wins, never merged. Every connection-bearing
+    capability requires a registry, even when it declares only one connection."""
     envdir = _env_dir()
     candidates = ([envdir / "connections.json"] if envdir else []) + \
                  [_CONFIG_HOME / NAME / "connections.json"]
@@ -523,19 +584,22 @@ def _connections_registry() -> tuple[dict | None, Path | None]:
             _die(6, "bad_config", f"{reg_file} is not a connections envelope",
                  'expected {"default": "<id>", "connections": { ... }}')
         return raw, reg_file
-    return None, None
+    project_path = (envdir / "connections.json") if envdir else None
+    homes = ([str(project_path)] if project_path else []) + \
+            [str(_CONFIG_HOME / NAME / "connections.json")]
+    _die(6, "connections_required",
+         f"{NAME} requires an explicit connections registry",
+         "create one of: " + ", ".join(homes) +
+         '; expected {"default": "<id>", "connections": {"<id>": { ... }}}')
 
 
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
-    """flag → default pointer → sole entry → die 6. No registry → the implicit
-    default. A connection's own `address` field selects it too (used where a
+    """flag → default pointer → sole entry → die 6. A connection's own
+    `address` field selects it too (used where a
     connection carries a human-recognizable address; absent fields never match)."""
     if reg is None:
-        if wanted and wanted != "default":
-            _die(6, "unknown_connection",
-                 "no connections registry; the sole connection is 'default'",
-                 "the implicit default resolves from the credential cascade")
-        return "default", None
+        _die(6, "connections_required",
+             f"{NAME} requires an explicit connections registry")
     conns = reg["connections"]
     if wanted:
         if wanted in conns:
@@ -612,10 +676,9 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
 
 def _connections_report() -> dict:
     """The resolution report — every connection, every value, its winning tier
-    and source, secrets masked. Local only: no network, no login attempt. With
-    no registry, one implicit `default` resolved from CRED_KEYS via the cascade;
-    with a registry, each named connection (its email + password-by-secret_env +
-    allow_write). Never dies on missing credentials — readiness is doctor's. The
+    and source, secrets masked. Local only: no network, no login attempt. Each
+    registry connection carries its email plus password-by-secret_env and
+    allow_write. Never dies on missing credentials — readiness is doctor's. The
     one resolver doctor's gate and the `connections` verb both read."""
     reg, reg_path = _connections_registry()
     report: dict = {"default": None, "connections": {}}
@@ -656,7 +719,7 @@ def _cmd_connections() -> None:
 
 # The connection resolved for this invocation, set once in main() before the
 # click CLI runs. None until then (and for the contract verbs, which never
-# resolve a connection). The implicit default carries entry=None.
+# resolve a connection). A declared override-free entry carries entry=None.
 _CONN: dict | None = None
 
 
@@ -1142,7 +1205,7 @@ def load_credentials() -> dict[str, str]:
     out: dict[str, str] = {}
     if _CONN and _CONN.get("entry") is not None:
         # A named registry connection supplies the identity: email literally,
-        # password through its secret_env. The implicit default (entry=None)
+        # password through its secret_env. An override-free entry (entry=None)
         # keeps the flat cascade below.
         if _CONN.get("email"):
             out["SIMPLBOOKS_EMAIL"] = _CONN["email"]
@@ -1171,7 +1234,7 @@ def load_credentials() -> dict[str, str]:
 
 def _resolve_connection(wanted: str | None) -> dict:
     """Select the connection for this invocation and fold in its identity. The
-    implicit default (no registry) carries entry=None and resolves email/password
+    declared override-free connection carries entry=None and resolves email/password
     from the flat cascade exactly as before; a named registry connection supplies
     the email literally and the password through secret_env (cascade tiers 2-4).
     Returns {id, entry, email, password, allow_write}. Stored in _CONN so the
@@ -7282,7 +7345,7 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
 
 def main() -> None:
     global _CONN
-    _gate()                      # every verb passes the project gate first
+    _gate()                      # every verb passes the effective policy gate first
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
 
     # `--connection`/`-c <id>` is a global selector accepted anywhere on the
