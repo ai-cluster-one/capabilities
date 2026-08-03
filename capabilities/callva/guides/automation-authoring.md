@@ -126,6 +126,14 @@ nested `call` object parameter — that is the argument shape the prepared
 per-call run view matches (`callva help`), so its runs stay discoverable under
 the call they belong to.
 
+Ask before adding it: does one run of this automation belong to exactly one
+conversation? Only then does the parameter mean anything. For a scheduler that
+creates hundreds of calls in one run, a sweep or batch over a queue, a
+maintenance pass that re-queues stuck records, or a helper that touches no call
+at all, the honest answer is "several" or "none" — there is nothing to
+correlate, so no `call` parameter. Leaving it out there is the correct and
+common outcome, not an omission to fix later.
+
 That parameter is only half the contract; the other half lives in the agent
 config, and correlation needs both. The runtime reaches the automation through
 an `http_request` tool the agent declares, and a run carries exactly what that
