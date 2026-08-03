@@ -44,6 +44,7 @@ def test_help_documents_every_domain_command():
         assert f"signoz {command}" in help_text
     assert "SIGNOZ_API_KEY" in help_text
     assert "SIGNOZ_INGESTION_KEY" in help_text
+    assert help_text.count("[--select FIELD]") == 2
 
 
 def test_declared_connection_accepts_existing_aliases(tmp_path, monkeypatch):
@@ -999,3 +1000,163 @@ def test_environment_scope_fails_when_no_fields_exist():
                 "search", "--start", "1", "--end", "2"])
     
     assert exc.value.code == 6
+
+
+def _fields_keys(entries):
+    """The catalogue arrives keyed by field name, each name carrying one entry
+    per context — the shape a live server returns."""
+    def request(_conn, method, path, **kwargs):
+        if path == "/api/v1/fields/keys":
+            search = kwargs["params"]["searchText"]
+            matched = [e for e in entries if e["name"] == search]
+            return {"data": {"keys": {search: matched} if matched else {}}}
+        return {"status": "success", "data": {}}
+    return request
+
+
+def test_select_appends_resolved_fields_to_trace_defaults():
+    calls = []
+    entries = [{"name": "http.route", "fieldContext": "span",
+                "fieldDataType": "string"}]
+    inner = _fields_keys(entries)
+
+    def request(conn, method, path, **kwargs):
+        calls.append((path, kwargs))
+        return inner(conn, method, path, **kwargs)
+
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(connection(), "traces", [
+            "search", "--select", "http.route", "--start", "1", "--end", "2"])
+
+    body = [c for c in calls if c[0] == "/api/v5/query_range"][0][1]["json_body"]
+    fields = body["compositeQuery"]["queries"][0]["spec"]["selectFields"]
+    assert fields[0]["name"] == "trace_id"
+    assert fields[-1] == {"name": "http.route", "fieldDataType": "string",
+                          "signal": "traces", "fieldContext": "span"}
+
+
+def test_select_accepts_comma_separated_names():
+    calls = []
+    entries = [
+        {"name": "http.route", "fieldContext": "span",
+         "fieldDataType": "string"},
+        {"name": "http.status_code", "fieldContext": "span",
+         "fieldDataType": "int64"},
+    ]
+    inner = _fields_keys(entries)
+
+    def request(conn, method, path, **kwargs):
+        calls.append((path, kwargs))
+        return inner(conn, method, path, **kwargs)
+
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_signal_search(connection(), "traces", [
+            "search", "--select", "http.route,http.status_code",
+            "--start", "1", "--end", "2"])
+
+    body = [c for c in calls if c[0] == "/api/v5/query_range"][0][1]["json_body"]
+    fields = body["compositeQuery"]["queries"][0]["spec"]["selectFields"]
+    assert [f["name"] for f in fields[-2:]] == ["http.route", "http.status_code"]
+    assert fields[-1]["fieldDataType"] == "int64"
+
+
+def test_logs_search_has_no_select_because_rows_carry_every_attribute():
+    """Naming selectFields on a logs query replaces the whole record rather
+    than adding to it, and a log row already carries every attribute."""
+    with pytest.raises(SystemExit) as exc:
+        module._cmd_signal_search(connection(), "logs", [
+            "search", "--select", "http.route", "--start", "1", "--end", "2"])
+    assert exc.value.code == 6
+
+
+def test_select_rejects_an_unknown_field():
+    with patch.object(module, "_request", side_effect=_fields_keys([])):
+        with pytest.raises(SystemExit) as exc:
+            module._cmd_signal_search(connection(), "traces", [
+                "search", "--select", "nope", "--start", "1", "--end", "2"])
+    assert exc.value.code == 3
+
+
+def test_select_rejects_an_ambiguous_name_until_qualified():
+    entries = [
+        {"name": "host.name", "fieldContext": "resource",
+         "fieldDataType": "string"},
+        {"name": "host.name", "fieldContext": "span",
+         "fieldDataType": "string"},
+    ]
+    with patch.object(module, "_request", side_effect=_fields_keys(entries)):
+        with pytest.raises(SystemExit) as exc:
+            module._cmd_signal_search(connection(), "traces", [
+                "search", "--select", "host.name", "--start", "1", "--end", "2"])
+        assert exc.value.code == 6
+        assert module._select_field(
+            connection(), "traces", "resource:host.name")["fieldContext"] == "resource"
+
+
+def test_trace_id_query_collapses_to_one_bucket_on_replaying_servers():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((path, kwargs))
+        return {"status": "success", "data": {}}
+
+    with (
+        patch.object(module, "_server_info", return_value={"version": "0.97.1"}),
+        patch.object(module, "_request", side_effect=request),
+    ):
+        module._cmd_trace(connection(), ["abc123", "--since", "12h"])
+
+    body = calls[0][1]["json_body"]
+    assert body["end"] - body["start"] == module._BUCKET_MS
+
+
+def test_trace_id_query_keeps_its_window_on_fixed_servers():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((path, kwargs))
+        return {"status": "success", "data": {}}
+
+    with (
+        patch.object(module, "_server_info", return_value={"version": "0.117.0"}),
+        patch.object(module, "_request", side_effect=request),
+    ):
+        module._cmd_trace(connection(), ["abc123", "--since", "12h"])
+
+    body = calls[0][1]["json_body"]
+    assert body["end"] - body["start"] == 12 * module._BUCKET_MS
+
+
+def test_raw_query_without_a_trace_id_filter_is_sent_unchanged():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((path, kwargs))
+        return {"status": "success", "data": {}}
+
+    payload = module._query_payload(
+        "traces", 1_000, 1_000 + 12 * module._BUCKET_MS,
+        "name = 'checkout'", 100, 0)
+    with patch.object(module, "_request", side_effect=request):
+        module._query_range(connection(), payload)
+
+    assert calls[0][1]["json_body"] is payload
+
+
+def test_a_negated_trace_id_filter_keeps_its_window():
+    calls = []
+
+    def request(_conn, method, path, **kwargs):
+        calls.append((path, kwargs))
+        return {"status": "success", "data": {}}
+
+    payload = module._query_payload(
+        "traces", 1_000, 1_000 + 12 * module._BUCKET_MS,
+        "trace_id != 'abc123'", 100, 0)
+    with (
+        patch.object(module, "_server_info", return_value={"version": "0.97.1"}),
+        patch.object(module, "_request", side_effect=request),
+    ):
+        module._query_range(connection(), payload)
+
+    assert calls[0][1]["json_body"] is payload

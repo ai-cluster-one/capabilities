@@ -33,6 +33,10 @@ signoz logs search --legacy-unscoped --service checkout
 `--search` emits a Query Builder `body CONTAINS` predicate. Paginate with
 `--limit` and `--offset`.
 
+A log row carries every attribute and resource of the record, in its
+`attributes_string`, `attributes_number`, `attributes_bool` and
+`resources_string` maps, so reading one attribute needs nothing extra.
+
 When the connection has `environment: "production"`, queries automatically scope
 to that environment. Override with `--environment dev` to query a different
 environment, `--all-environments` to query across all environments, or
@@ -50,6 +54,38 @@ signoz trace 0123456789abcdef0123456789abcdef --since 24h
 
 Use `trace` after a search has produced a trace ID. Its default window is six
 hours; widen it when inspecting an older trace.
+
+A span row carries a fixed set of fields rather than the whole record, so an
+attribute is read with `--select`:
+
+```sh
+signoz traces search --operation checkout --select http.route
+signoz traces search --call-id call-123 --select http.route,http.status_code
+signoz trace 0123456789abcdef0123456789abcdef --select http.route
+```
+
+The flag is repeatable and accepts a comma-separated list, and its names are
+added to the default fields. Names resolve against the catalogue
+`signoz fields keys` reports, which supplies each field's context and data
+type. A name that exists in more than one context is rejected with the choices;
+qualify it as `context:name`:
+
+```sh
+signoz fields keys --signal traces --search host.name
+signoz traces search --service checkout --select resource:host.name
+```
+
+SigNoz before 0.117.0 splits a raw query's window into exponentially growing
+time buckets and runs the statement once per bucket, while a `trace_id` filter
+makes the traces statement builder replace each bucket's bounds with the
+trace's own range. Every bucket then runs identical SQL and the rows are
+concatenated, so each span is returned once per bucket — a duplication factor
+that grows with the window (SigNoz issue 10449, fixed by pull request 10637).
+Against such a server the capability narrows to a single bucket any raw traces
+request pinned to one trace with `trace_id = '…'` — on `trace`,
+`traces search --filter`, and `query` alike. That equality is what makes the
+server derive the real range from the trace, so the span set is unaffected;
+any other predicate keeps its window.
 
 ## Correlated calls and agents
 
@@ -167,8 +203,9 @@ signoz query query.json
 generate-query | signoz query -
 ```
 
-The body is sent unchanged to `POST /api/v5/query_range`. A minimal raw log
-request has this shape:
+The body is sent to `POST /api/v5/query_range` unchanged, apart from the
+`trace_id` window narrowing described under Traces. A minimal raw log request
+has this shape:
 
 ```json
 {

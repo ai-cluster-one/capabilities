@@ -86,16 +86,26 @@ COMMANDS
   signoz logs search [--service NAME] [--agent-id ID] [--call-id ID]
                      [--room-id ID] [--severity LEVEL] [--search TEXT]
                      [--filter EXPR] [--environment ENV] [--all-environments]
-                     [--legacy-unscoped] [--limit N] [--offset N] [time options]
+                     [--legacy-unscoped] [--limit N] [--offset N]
+                     [time options]
   signoz traces search [--service NAME] [--agent-id ID] [--call-id ID]
                        [--room-id ID] [--operation NAME] [--error yes|no]
-                       [--filter EXPR] [--environment ENV] [--all-environments]
-                       [--legacy-unscoped] [--limit N] [--offset N] [time options]
-  signoz trace <trace-id> [--since 6h|--start MS --end MS]
+                       [--filter EXPR] [--select FIELD] [--environment ENV]
+                       [--all-environments] [--legacy-unscoped]
+                       [--limit N] [--offset N] [time options]
+  signoz trace <trace-id> [--select FIELD] [--since 6h|--start MS --end MS]
       Query raw logs/spans through Query Builder v5. Shortcut filters combine
       with --filter using AND. --environment overrides the connection's scope;
       --all-environments queries all environments; --legacy-unscoped queries
       historical data without deployment.environment attributes.
+      --select returns a span or resource attribute alongside a span's default
+      fields, so reading one needs no hand-written raw query. It is repeatable
+      and accepts a comma-separated list; names resolve against the same
+      catalogue `signoz fields keys` reports, and a name carried in several
+      contexts is qualified as context:name, for example
+      --select http.route,resource:host.name. Log rows already carry every
+      attribute in attributes_string and resources_string, so logs need no
+      --select.
   signoz call <call-id> [--signal logs|traces|both] [--service NAME]
                         [--filter EXPR] [--environment ENV] [--all-environments]
                         [--legacy-unscoped] [--limit N] [time options]
@@ -105,6 +115,10 @@ COMMANDS
       Environment scope applies unless overridden.
   signoz query <file|->
       Execute a complete Query Builder v5 JSON request from a file or stdin.
+      On servers before 0.117.0 a raw traces request pinned to one trace with
+      trace_id = '...' has its window narrowed to one hour, because those
+      servers repeat every row once per time bucket; the server derives the real
+      range from the trace, so the span set is unaffected.
 
   signoz dashboards [<id>]      List dashboards or fetch one.
   signoz alerts                 Current Alertmanager instances.
@@ -1289,6 +1303,13 @@ def _identifier(value: str) -> str:
     return value
 
 
+def _add_select_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--select", action="append", default=[], metavar="FIELD",
+        help="return an extra field alongside the defaults; repeatable or "
+             "comma-separated, optionally qualified as context:name")
+
+
 def _add_dimension_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--agent-id", type=_identifier)
     parser.add_argument("--call-id", type=_identifier)
@@ -1310,6 +1331,16 @@ def _dimension_filter(conn: dict, signal: str, dimension: str,
     return f"{field} = '{_qb_quote(value)}'"
 
 
+def _catalogue_entries(result) -> list[dict]:
+    """Flatten a /api/v1/fields/keys response. The catalogue arrives keyed by
+    field name, each name carrying one entry per context it appears in."""
+    data = result.get("data") if isinstance(result, dict) else None
+    keys = data.get("keys") if isinstance(data, dict) else None
+    if isinstance(keys, dict):
+        keys = [entry for group in keys.values() for entry in (group or [])]
+    return [entry for entry in keys or [] if isinstance(entry, dict)]
+
+
 def _discover_environment_fields(conn: dict, signal: str) -> list[str]:
     """Discover which deployment.environment fields exist for this signal.
     
@@ -1325,19 +1356,12 @@ def _discover_environment_fields(conn: dict, signal: str) -> list[str]:
             "signal": signal,
             "searchText": "deployment.environment",
         })
-        data = result.get("data") if isinstance(result, dict) else None
-        keys = data.get("keys") if isinstance(data, dict) else None
-        if not isinstance(keys, list):
-            conn[cache_key] = []
-            return []
-        
         found_fields = []
-        for key_entry in keys:
-            if isinstance(key_entry, dict):
-                name = key_entry.get("name")
-                if name in _ENVIRONMENT_FIELDS:
-                    found_fields.append(name)
-        
+        for key_entry in _catalogue_entries(result):
+            name = key_entry.get("name")
+            if name in _ENVIRONMENT_FIELDS and name not in found_fields:
+                found_fields.append(name)
+
         conn[cache_key] = found_fields
         return found_fields
     except SystemExit:
@@ -1428,8 +1452,66 @@ def _build_scope_filter(conn: dict, signal: str, scope_type: str | None,
     return []
 
 
+_FIELD_CONTEXTS = ("resource", "scope", "attribute", "span", "log", "metric")
+
+
+def _split_selection(values: list[str]) -> list[str]:
+    names: list[str] = []
+    for value in values:
+        for part in value.split(","):
+            part = part.strip()
+            if part and part not in names:
+                names.append(part)
+    return names
+
+
+def _select_field(conn: dict, signal: str, request: str) -> dict:
+    """Resolve one --select name to a Query Builder selectField, using the same
+    /api/v1/fields/keys catalogue `signoz fields keys` reports. An optional
+    `context:` prefix disambiguates a name carried in more than one context."""
+    cache = conn.setdefault("_select_field_cache", {})
+    if (signal, request) in cache:
+        return cache[(signal, request)]
+    wanted_context, _, tail = request.partition(":")
+    if tail and wanted_context in _FIELD_CONTEXTS:
+        name = tail
+    else:
+        wanted_context, name = None, request
+    result = _request(conn, "GET", "/api/v1/fields/keys",
+                      params={"signal": signal, "searchText": name})
+    matches = [
+        entry for entry in _catalogue_entries(result)
+        if entry.get("name") == name
+        and (wanted_context is None
+             or entry.get("fieldContext") == wanted_context)
+    ]
+    contexts = sorted({str(entry.get("fieldContext")) for entry in matches})
+    if not matches:
+        _die(3, "unknown_field",
+             f"--select {request!r} is not a known {signal} field",
+             f"run `{NAME} fields keys --signal {signal} --search {name}`")
+    if len(contexts) > 1:
+        _die(6, "ambiguous_field",
+             f"--select {name!r} exists in {signal} contexts {', '.join(contexts)}",
+             f"qualify it, for example --select {contexts[0]}:{name}")
+    entry = matches[0]
+    field = {
+        "name": name,
+        "fieldDataType": entry.get("fieldDataType") or "string",
+        "signal": signal,
+        "fieldContext": entry.get("fieldContext") or "attribute",
+    }
+    cache[(signal, request)] = field
+    return field
+
+
+def _select_fields(conn: dict, signal: str, requests: list[str]) -> list[dict]:
+    return [_select_field(conn, signal, request) for request in requests]
+
+
 def _query_payload(signal: str, start: int, end: int, expression: str,
-                   limit: int, offset: int) -> dict:
+                   limit: int, offset: int,
+                   select: list[dict] | None = None) -> dict:
     spec: dict = {
         "name": "A",
         "signal": signal,
@@ -1464,6 +1546,9 @@ def _query_payload(signal: str, start: int, end: int, expression: str,
             {"name": "service.name", "fieldDataType": "string",
              "signal": "traces", "fieldContext": "resource"},
         ]
+        for field in select or []:
+            if field not in spec["selectFields"]:
+                spec["selectFields"].append(field)
     return {
         "schemaVersion": "v1",
         "start": start,
@@ -1475,6 +1560,60 @@ def _query_payload(signal: str, start: int, end: int, expression: str,
             "formatTableResultForUI": False, "fillGaps": False},
         "variables": {},
     }
+
+
+_BUCKET_MS = 3_600_000
+_TRACE_BUCKET_FIX = (0, 117, 0)
+
+
+def _filters_on_trace_id(payload) -> bool:
+    """True when every live query in a raw request is a traces query pinned to a
+    single trace_id — the shape that triggers the replay described in
+    _query_range. Only equality qualifies: it is what makes the server derive
+    the window from the trace, so narrowing loses nothing."""
+    import re
+    if not isinstance(payload, dict) or payload.get("requestType") != "raw":
+        return False
+    if not isinstance(payload.get("start"), int) \
+            or not isinstance(payload.get("end"), int):
+        return False
+    composite = payload.get("compositeQuery")
+    queries = composite.get("queries") if isinstance(composite, dict) else None
+    if not isinstance(queries, list) or not queries:
+        return False
+    live = 0
+    for query in queries:
+        spec = query.get("spec") if isinstance(query, dict) else None
+        if not isinstance(spec, dict) or spec.get("disabled"):
+            continue
+        live += 1
+        if spec.get("signal") != "traces":
+            return False
+        expression = (spec.get("filter") or {}).get("expression")
+        if not re.search(r"\btrace_id\s*=\s*['\"]", str(expression or "")):
+            return False
+    return live > 0
+
+
+def _query_range(conn: dict, payload):
+    """POST a Query Builder v5 request, collapsing the window of a
+    trace_id-filtered raw traces query to a single server bucket.
+
+    SigNoz before 0.117.0 slices the window into exponentially growing buckets
+    and runs the statement once per bucket, but a trace_id filter makes the
+    traces statement builder replace the bucket bounds with the trace's own
+    range from trace_summary. Every bucket then runs identical SQL and the rows
+    are concatenated, so each span comes back once per bucket — a factor that
+    grows with the window (SigNoz#10449, fixed by SigNoz#10637). One bucket
+    yields each span once, and the server still derives the real range from the
+    trace, so no span is lost."""
+    if _filters_on_trace_id(payload) and payload["end"] - payload["start"] > _BUCKET_MS:
+        if "_trace_bucket_replay" not in conn:
+            conn["_trace_bucket_replay"] = not _version_at_least(
+                _server_info(conn)["version"], _TRACE_BUCKET_FIX)
+        if conn["_trace_bucket_replay"]:
+            payload = {**payload, "start": payload["end"] - _BUCKET_MS}
+    return _request(conn, "POST", "/api/v5/query_range", json_body=payload)
 
 
 def _read_json_input(source: str):
@@ -1641,6 +1780,8 @@ def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
     parser.add_argument("--filter", default="")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--offset", type=int, default=0)
+    if signal == "traces":
+        _add_select_args(parser)
     _add_dimension_args(parser)
     _add_environment_args(parser)
     if signal == "logs":
@@ -1675,8 +1816,10 @@ def _cmd_signal_search(conn: dict, signal: str, argv: list[str]):
     start, end = _window(args)
     payload = _query_payload(
         signal, start, end, " AND ".join(parts),
-        _bounded_limit(args.limit), args.offset)
-    return _request(conn, "POST", "/api/v5/query_range", json_body=payload)
+        _bounded_limit(args.limit), args.offset,
+        _select_fields(conn, signal,
+                       _split_selection(getattr(args, "select", []))))
+    return _query_range(conn, payload)
 
 
 def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
@@ -1708,10 +1851,8 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
             conn, signal, dimension, identifier))
         expression = " AND ".join(parts)
         filters[signal] = expression
-        data[signal] = _request(
-            conn, "POST", "/api/v5/query_range",
-            json_body=_query_payload(
-                signal, start, end, expression, limit, 0))
+        data[signal] = _query_range(conn, _query_payload(
+            signal, start, end, expression, limit, 0))
 
     result = {
         "entity": dimension,
@@ -1730,13 +1871,15 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
 def _cmd_trace(conn: dict, argv: list[str]):
     parser = _parser("trace")
     parser.add_argument("trace_id")
+    _add_select_args(parser)
     _add_time_args(parser, "6h")
     args = parser.parse_args(argv)
     start, end = _window(args)
     payload = _query_payload(
         "traces", start, end,
-        f"trace_id = '{_qb_quote(args.trace_id)}'", 1_000, 0)
-    return _request(conn, "POST", "/api/v5/query_range", json_body=payload)
+        f"trace_id = '{_qb_quote(args.trace_id)}'", 1_000, 0,
+        _select_fields(conn, "traces", _split_selection(args.select)))
+    return _query_range(conn, payload)
 
 
 def _cmd_views(conn: dict, argv: list[str]):
@@ -1825,8 +1968,7 @@ def main() -> None:
     elif command == "query":
         if len(rest) != 1:
             _die(6, "input", "usage: signoz query <file|->")
-        result = _request(conn, "POST", "/api/v5/query_range",
-                          json_body=_read_json_input(rest[0]))
+        result = _query_range(conn, _read_json_input(rest[0]))
     elif command == "dashboards":
         parser = _parser("dashboards")
         parser.add_argument("id", nargs="?")
