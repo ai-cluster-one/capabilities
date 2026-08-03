@@ -67,7 +67,7 @@
     },
     "macmail": {
       "path": "capabilities/macmail",
-      "payload_sha256": "f5146fc16198bc4938b58db24a9a32fde3b6801242309c24160b6a6b19684715",
+      "payload_sha256": "041c847ddc1504b1127099218c4e5452db4fb8ed69e7b07551f0b1a6f7b22f78",
       "summary": "Mail.app CLI over macOS Automation — read/search mail across configured accounts, show a message, save attachments, draft (never send), and export a mailbox to JSON."
     },
     "mailbox": {
