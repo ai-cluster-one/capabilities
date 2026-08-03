@@ -105,6 +105,9 @@ Commands (`-f key=value` is repeatable for list filters):
   calls webhook-logs <call_id> [--per-page N] [--page N] [--sort F] [-f k=v ...]
   calls automation-runs <call_id> [--per-page N] [--page N] [-f k=v ...]
                         [--no-include-args]
+                        (the prepared view for runs whose args carry the id as a
+                         nested call object, {"call":{"id":"<call_id>"}}; for any
+                         other args shape use `automations all-runs --args-filter`)
 
   transcripts get <call_id>
   transcripts store <call_id> (--data JSON | --data-file F)
@@ -2140,7 +2143,7 @@ def build_parser():
     cl_wl.add_argument("--filter", "-f", action="append",
                        help="Extra filter as key=value (repeatable); related_call_id is forced from the route")
     cl_ar = cl_sub.add_parser("automation-runs",
-                              help="List automation runs triggered for a specific call (include_args=true by default)")
+                              help="List automation runs whose args carry the id as a nested call object, {\"call\":{\"id\":\"<call_id>\"}} (include_args=true by default)")
     cl_ar.add_argument("call_id", help="Call UUID")
     cl_ar.add_argument("--per-page", type=int, help="Results per page")
     cl_ar.add_argument("--page", type=int, help="Page number")
@@ -2300,7 +2303,7 @@ def build_parser():
     aut_arl.add_argument("--page", type=int, help="Page number")
     aut_arl.add_argument("--filter", "-f", action="append",
                          help="Scalar filter as key=value (repeatable): automation, status, triggered_by, started_after, started_before")
-    aut_arl.add_argument("--args-filter", help="JSONB containment filter on the triggering payload")
+    aut_arl.add_argument("--args-filter", help="JSONB containment filter on the triggering payload — any key at any shape, e.g. {\"call_id\":\"<id>\"}")
     aut_arl.add_argument("--result-filter", help="JSONB containment filter on the run result")
     aut_arl.add_argument("--include-args", action="store_true", help="Include the full args payload in each run")
     aut_rd = aut_sub.add_parser("run-detail", help="Get run detail (result, logs)")

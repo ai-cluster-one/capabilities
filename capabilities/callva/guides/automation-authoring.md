@@ -121,6 +121,11 @@ stop and ask whether the value can be derived, loaded from a variable, or
 defaulted — a scheduled automation that refuses to run without arguments is a
 design bug.
 
+An automation the voice runtime invokes mid-conversation takes the call as a
+nested `call` object parameter — that is the argument shape the prepared
+per-call run view matches (`callva help`), so its runs stay discoverable under
+the call they belong to.
+
 ## Return value
 
 Return an object with at least a `status` and enough structure to debug a failed
