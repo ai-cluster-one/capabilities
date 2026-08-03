@@ -44,7 +44,7 @@ def test_help_documents_every_domain_command():
         assert f"signoz {command}" in help_text
     assert "SIGNOZ_API_KEY" in help_text
     assert "SIGNOZ_INGESTION_KEY" in help_text
-    assert help_text.count("[--select FIELD]") == 2
+    assert help_text.count("[--select FIELD]") == 3
 
 
 def test_declared_connection_accepts_existing_aliases(tmp_path, monkeypatch):
@@ -1091,6 +1091,46 @@ def test_select_rejects_an_ambiguous_name_until_qualified():
         assert exc.value.code == 6
         assert module._select_field(
             connection(), "traces", "resource:host.name")["fieldContext"] == "resource"
+
+
+def test_correlated_select_reaches_the_traces_half_only():
+    calls = []
+    entries = [{"name": "http.route", "fieldContext": "span",
+                "fieldDataType": "string"}]
+    inner = _fields_keys(entries)
+
+    def request(conn, method, path, **kwargs):
+        calls.append((path, kwargs))
+        return inner(conn, method, path, **kwargs)
+
+    with patch.object(module, "_request", side_effect=request):
+        module._cmd_correlated(connection(), "call", [
+            "call-123", "--select", "http.route",
+            "--start", "1", "--end", "2"])
+
+    bodies = [c[1]["json_body"] for c in calls if c[0] == "/api/v5/query_range"]
+    specs = {b["compositeQuery"]["queries"][0]["spec"]["signal"]:
+             b["compositeQuery"]["queries"][0]["spec"] for b in bodies}
+    assert specs["traces"]["selectFields"][-1] == {
+        "name": "http.route", "fieldDataType": "string",
+        "signal": "traces", "fieldContext": "span"}
+    assert "selectFields" not in specs["logs"]
+
+
+def test_correlated_select_is_refused_when_no_traces_half_is_queried():
+    with pytest.raises(SystemExit) as exc:
+        module._cmd_correlated(connection(), "agent", [
+            "agent-1", "--signal", "logs", "--select", "http.route",
+            "--start", "1", "--end", "2"])
+    assert exc.value.code == 6
+
+
+def test_correlated_select_rejects_an_unknown_field():
+    with patch.object(module, "_request", side_effect=_fields_keys([])):
+        with pytest.raises(SystemExit) as exc:
+            module._cmd_correlated(connection(), "call", [
+                "call-123", "--select", "nope", "--start", "1", "--end", "2"])
+    assert exc.value.code == 3
 
 
 def test_trace_id_query_collapses_to_one_bucket_on_replaying_servers():

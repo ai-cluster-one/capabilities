@@ -98,7 +98,13 @@ signoz agent agent-42 --service voice-worker --since 24h
 signoz call call-123 --signal traces --limit 50
 signoz call call-123 --environment production
 signoz agent agent-42 --all-environments
+signoz call call-123 --select http.route,resource:host.name
 ```
+
+`--select` means here what it means on `traces search`, and reaches the traces
+half alone: a log row already carries every attribute, so the logs half is
+returned untouched. Under `--signal logs` there is no traces half for it to
+reach, and the flag is refused rather than quietly dropped.
 
 The result includes the resolved time window, environment scope, the exact
 filter used for each signal, and a `data` object containing `logs`, `traces`,

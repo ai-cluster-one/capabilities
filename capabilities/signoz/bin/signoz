@@ -107,12 +107,16 @@ COMMANDS
       attribute in attributes_string and resources_string, so logs need no
       --select.
   signoz call <call-id> [--signal logs|traces|both] [--service NAME]
-                        [--filter EXPR] [--environment ENV] [--all-environments]
-                        [--legacy-unscoped] [--limit N] [time options]
+                        [--filter EXPR] [--select FIELD] [--environment ENV]
+                        [--all-environments] [--legacy-unscoped] [--limit N]
+                        [time options]
   signoz agent <agent-id> [same options]
       Fetch correlated logs and traces for one domain identifier. Connection
       dimensions map logical agent/call/room names to project-specific fields.
-      Environment scope applies unless overridden.
+      Environment scope applies unless overridden. --select carries the meaning
+      it has on `traces search` and reaches the traces half alone; under
+      --signal logs there is no such half, so it is refused rather than
+      silently ignored.
   signoz query <file|->
       Execute a complete Query Builder v5 JSON request from a file or stdin.
       On servers before 0.117.0 a raw traces request pinned to one trace with
@@ -1830,9 +1834,15 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
     parser.add_argument("--service", default="")
     parser.add_argument("--filter", default="")
     parser.add_argument("--limit", type=int, default=100)
+    _add_select_args(parser)
     _add_environment_args(parser)
     _add_time_args(parser, "24h")
     args = parser.parse_args(argv)
+    select = _split_selection(args.select)
+    if select and args.signal == "logs":
+        _die(6, "input",
+             "--select reaches the traces half, and --signal logs has none",
+             "query --signal traces or both, or drop --select")
     limit = _bounded_limit(args.limit)
     start, end = _window(args)
     identifier = getattr(args, f"{dimension}_id")
@@ -1852,7 +1862,9 @@ def _cmd_correlated(conn: dict, dimension: str, argv: list[str]):
         expression = " AND ".join(parts)
         filters[signal] = expression
         data[signal] = _query_range(conn, _query_payload(
-            signal, start, end, expression, limit, 0))
+            signal, start, end, expression, limit, 0,
+            _select_fields(conn, signal, select)
+            if signal == "traces" else None))
 
     result = {
         "entity": dimension,
