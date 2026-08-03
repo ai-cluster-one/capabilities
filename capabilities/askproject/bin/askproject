@@ -247,7 +247,9 @@ def _parse_env_file(path: Path) -> dict:
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
     the first directory holding capabilities/, legacy .capabilities/,
-    .env(.local), or .git.
+    .contextkit/config.toml, .env(.local), or .git.
+    Markers are read from the filesystem alone: the root is what the envelope
+    location is resolved against, so resolving one cannot depend on the other.
     $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
@@ -256,6 +258,7 @@ def _project_root() -> Path | None:
         if d == home:
             return None
         if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".contextkit" / "config.toml").is_file()
                 or (d / ".capabilities").is_dir()
                 or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
@@ -263,15 +266,69 @@ def _project_root() -> Path | None:
     return None
 
 
+_ENVELOPE_HOME: dict = {}
+
+
+def _contextkit_envelope(root: Path):
+    """Ask ContextKit where it keeps this project's envelope; None if it cannot.
+
+    $CAPABILITIES_PROJECT_ENVELOPE is the same answer handed over in advance.
+    """
+    import subprocess
+
+    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
+    if override:
+        candidate = Path(override)
+    else:
+        try:
+            proc = subprocess.run(["contextkit", "path", "capabilities"], cwd=root,
+                                  capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if not lines:
+            return None
+        candidate = Path(lines[0])
+    if not candidate.is_absolute():
+        return None
+    try:
+        resolved = candidate.resolve()
+        if root.resolve() not in resolved.parents:
+            return None
+    except OSError:
+        return None
+    return resolved
+
+
+def _envelope_home(root: Path) -> Path:
+    """The project's envelope root, resolved once per invocation.
+
+    ContextKit owns the location of a project it manages (`.contextkit/
+    config.toml`), so it is asked rather than assumed. Every other project — and
+    every ContextKit answer that does not arrive usable — keeps the envelope at
+    `<root>/capabilities`.
+    """
+    cached = _ENVELOPE_HOME.get(root)
+    if cached is not None:
+        return cached
+    home = root / "capabilities"
+    if (root / ".contextkit" / "config.toml").is_file():
+        home = _contextkit_envelope(root) or home
+    _ENVELOPE_HOME[root] = home
+    return home
+
+
 def _project_capabilities_dir(root: Path) -> Path:
     """The active project envelope root.
 
-    `capabilities/` is canonical. A legacy `.capabilities/` remains readable
-    until `capabilities init` migrates it. If both exist, the canonical tree
-    wins once it carries settings.json; otherwise the legacy configured tree
+    The resolved envelope is canonical. A legacy `.capabilities/` remains
+    readable until `capabilities init` migrates it. If both exist, the canonical
+    tree wins once it carries settings.json; otherwise the legacy configured tree
     remains active so merely creating an empty visible directory loses no gate.
     """
-    current = root / "capabilities"
+    current = _envelope_home(root)
     legacy = root / ".capabilities"
     if (current / "settings.json").is_file() or not legacy.is_dir():
         return current

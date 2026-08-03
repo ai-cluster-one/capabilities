@@ -148,11 +148,27 @@ capabilities/<name>/
 
 (`capabilities/settings.json` — one level up — is the manager-owned gate; the script only ever reads it.)
 
-`capabilities/` is canonical and intentionally visible so ContextKit and humans
-share one project body. The runtime also reads a legacy `.capabilities/` tree
-until `capabilities init` migrates it. Migration is manager-owned and
-preflighted: disjoint gate entries and gitignore lines merge; any other content
-collision stops before either tree changes. Capability scripts never migrate.
+`capabilities/` is canonical and intentionally visible so the project's context
+owner and humans share one project body. The runtime also reads a legacy
+`.capabilities/` tree until `capabilities init` migrates it. Migration is
+manager-owned and preflighted: disjoint gate entries and gitignore lines merge;
+any other content collision stops before either tree changes. Capability scripts
+never migrate.
+
+**Where the envelope sits is resolved, not assumed.** A project bound by
+`.contextkit/config.toml` has a context owner that owns its visible body, so the
+runtime asks it — `contextkit path capabilities`, run in the project root,
+printing the absolute envelope path — and everything derived from the envelope
+follows that answer: the gate, the manager-owned `.gitignore`, per-capability
+identifiers, references, connections, and state. `$CAPABILITIES_PROJECT_ENVELOPE`
+supplies the same answer in advance, so a context owner composing through
+`capabilities context --fragment` is never called back mid-compose. Resolution is
+filesystem-cheap and side-effect free: at most one lookup per invocation, cached
+per project root, and never during project-root discovery. Every other case —
+no `.contextkit/config.toml`, no `contextkit` on `PATH`, a failing command, or
+output that is not an absolute path inside the project — keeps the envelope at
+`<root>/capabilities`, so a project without a context owner depends on nothing
+but itself.
 
 - **`identifiers.json`** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). A thin standard envelope — label → `{ value, note }` — so any reader can render the menu without understanding the capability; capability-specific structure lives inside values:
 
@@ -200,7 +216,9 @@ An explicit project entry wins. An absent project entry inherits the global entr
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
     the first directory holding capabilities/settings.json, legacy
-    .capabilities/, .env(.local), or .git.
+    .capabilities/, .contextkit/config.toml, .env(.local), or .git.
+    Markers are read from the filesystem alone: the root is what the envelope
+    location is resolved against, so resolving one cannot depend on the other.
     $HOME is never a project root (the machine registry lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
@@ -209,6 +227,7 @@ def _project_root() -> Path | None:
         if d == home:
             return None
         if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".contextkit" / "config.toml").is_file()
                 or (d / ".capabilities").is_dir() or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
