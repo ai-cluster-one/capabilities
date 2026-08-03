@@ -126,6 +126,20 @@ nested `call` object parameter — that is the argument shape the prepared
 per-call run view matches (`callva help`), so its runs stay discoverable under
 the call they belong to.
 
+That parameter is only half the contract; the other half lives in the agent
+config, and correlation needs both. The runtime reaches the automation through
+an `http_request` tool the agent declares, and a run carries exactly what that
+declaration's request body sends — so the body sets the key `call` to
+`{"id": "{{context.call_id}}"}`, where `{{context.call_id}}` is the token the
+voice runtime substitutes with the live call id. A script whose `main()` takes
+`call` faultlessly still produces runs nobody can find under their call when the
+declaration sends a flat `call_id`, or sends no call reference at all.
+
+Prove the chain rather than the shape: with the script deployed and the tool
+declared, invoke the automation once against a real call id and confirm that
+`callva calls automation-runs <that id>` grew by one — that single run is the
+evidence both halves hold.
+
 ## Return value
 
 Return an object with at least a `status` and enough structure to debug a failed
