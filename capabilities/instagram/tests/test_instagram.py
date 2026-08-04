@@ -88,6 +88,28 @@ def _bootstrap_page() -> str:
     )
 
 
+def _requests_payload(*, edges=None, has_next_page: bool = False):
+    return {
+        "data": {
+            "get_slide_mailbox_for_iris_subscription": {
+                "threads_by_folder": {
+                    "edges": edges or [],
+                    "page_info": {
+                        "end_cursor": "next-requests" if has_next_page else None,
+                        "has_next_page": has_next_page,
+                    },
+                }
+            },
+            "spamMailbox": {
+                "threads_by_folder": {
+                    "edges": [],
+                    "page_info": {"end_cursor": None, "has_next_page": False},
+                }
+            },
+        }
+    }
+
+
 class CaptureTests(unittest.TestCase):
     def test_parse_redacts_message_and_sensitive_headers(self) -> None:
         template = _template()
@@ -531,6 +553,15 @@ class ClientTests(unittest.TestCase):
                         },
                         request=request,
                     )
+                if request.url.path == "/api/graphql":
+                    form = parse_qs(request.content.decode())
+                    self.assertEqual(
+                        form["fb_api_req_friendly_name"][0],
+                        instagram.DIRECT_REQUESTS_FRIENDLY_NAME,
+                    )
+                    return httpx.Response(
+                        200, json=_requests_payload(), request=request
+                    )
                 self.assertEqual(request.url.path, "/api/v1/direct_v2/inbox/")
                 return httpx.Response(
                     200,
@@ -553,6 +584,161 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(result["status"], "no_conversation")
             self.assertFalse(result["viewer_sent_message"])
             self.assertTrue(result["scan_complete"])
+
+    def test_messages_inspect_finds_prior_outgoing_in_requests(self) -> None:
+        page = _bootstrap_page()
+        edge = {
+            "node": {
+                "as_ig_direct_thread": {
+                    "id": "igid-request-1",
+                    "thread_fbid": "igid-request-1",
+                    "thread_id": "thread-request-1",
+                    "is_group": False,
+                    "users": [{"id": "12345", "username": "target.user"}],
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/target.user/":
+                    return httpx.Response(200, text=page, request=request)
+                if request.url.path == "/api/v1/users/web_profile_info/":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "ok",
+                            "data": {
+                                "user": {"id": "12345", "username": "target.user"}
+                            },
+                        },
+                        request=request,
+                    )
+                if request.url.path == "/api/v1/direct_v2/inbox/":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "ok",
+                            "inbox": {"threads": [], "has_older": False},
+                        },
+                        request=request,
+                    )
+                if request.url.path == "/api/graphql":
+                    return httpx.Response(
+                        200, json=_requests_payload(edges=[edge]), request=request
+                    )
+                self.assertEqual(
+                    request.url.path,
+                    "/api/v1/direct_v2/threads/thread-request-1/",
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "thread": {
+                            "thread_id": "thread-request-1",
+                            "viewer_id": "sender-1",
+                            "items": [
+                                {
+                                    "item_id": "outgoing-request-1",
+                                    "message_id": "mid.request",
+                                    "client_context": "offline-request",
+                                    "user_id": "sender-1",
+                                    "is_sent_by_viewer": True,
+                                    "timestamp": "100",
+                                    "item_type": "text",
+                                    "text": "private text",
+                                }
+                            ],
+                            "has_older": False,
+                        },
+                    },
+                    request=request,
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                result = client.messages_inspect("target.user")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "already_contacted")
+            self.assertEqual(result["folder"], "requests")
+            self.assertTrue(result["pending"])
+            self.assertNotIn("private text", json.dumps(result))
+
+    def test_messages_reconcile_matches_offline_id_without_exposing_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.conversation_find = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+                "found": True,
+                "scan_complete": True,
+                "folders_scanned": ["main"],
+                "thread_id": "thread-1",
+                "thread_igid": "igid-1",
+                "pending": False,
+                "folder": "main",
+            }
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                self.assertEqual(
+                    request.url.path, "/api/v1/direct_v2/threads/thread-1/"
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "thread": {
+                            "thread_id": "thread-1",
+                            "viewer_id": "sender-1",
+                            "items": [
+                                {
+                                    "item_id": "item-1",
+                                    "message_id": "mid.delivered",
+                                    "client_context": "offline-123",
+                                    "user_id": "sender-1",
+                                    "is_sent_by_viewer": True,
+                                    "timestamp": "100",
+                                    "item_type": "text",
+                                    "text": "private text",
+                                }
+                            ],
+                            "has_older": False,
+                        },
+                    },
+                    request=request,
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                result = client.messages_reconcile(
+                    "target.user", offline_id="offline-123"
+                )
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "delivered")
+            self.assertTrue(result["delivery_confirmed"])
+            self.assertFalse(result["retry_safe"])
+            self.assertEqual(
+                result["matched_item"]["message_id"], "mid.delivered"
+            )
+            self.assertNotIn("private text", json.dumps(result))
 
     def test_messages_eligibility_marks_new_invitation_as_unverified(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -679,7 +865,9 @@ class ClientTests(unittest.TestCase):
                 follow_redirects=True,
             )
             try:
-                result = client.conversation_find("target.user", max_pages=1)
+                result = client.conversation_find(
+                    "target.user", max_pages=1, folders="main"
+                )
             finally:
                 client.close()
             self.assertEqual(result["status"], "unknown")
