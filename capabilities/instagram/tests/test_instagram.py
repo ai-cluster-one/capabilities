@@ -554,6 +554,92 @@ class ClientTests(unittest.TestCase):
             self.assertFalse(result["viewer_sent_message"])
             self.assertTrue(result["scan_complete"])
 
+    def test_messages_eligibility_marks_new_invitation_as_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.relationship_show = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+                "following": True,
+                "followed_by": False,
+                "blocked": False,
+                "restricted": False,
+            }
+            client.messages_inspect = lambda *_args, **_kwargs: {
+                "conversation_found": False,
+                "scan_complete": True,
+                "inbox_pages_scanned": 2,
+            }
+            try:
+                result = client.messages_eligibility("target.user")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "new_invitation_unverified")
+            self.assertIsNone(result["eligible"])
+            self.assertTrue(result["requires_new_invitation"])
+
+    def test_messages_eligibility_accepts_existing_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.relationship_show = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+                "following": True,
+                "followed_by": True,
+                "blocked": False,
+                "restricted": False,
+            }
+            client.messages_inspect = lambda *_args, **_kwargs: {
+                "conversation_found": True,
+                "scan_complete": True,
+                "inbox_pages_scanned": 1,
+                "thread_id": "thread-1",
+                "thread_igid": "igid-1",
+                "pending": False,
+                "viewer_sent_message": True,
+            }
+            try:
+                result = client.messages_eligibility("target.user")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "existing_conversation")
+            self.assertTrue(result["eligible"])
+            self.assertFalse(result["requires_new_invitation"])
+
+    def test_messages_eligibility_rejects_pending_outgoing_invitation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.relationship_show = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+                "following": False,
+                "followed_by": False,
+                "blocked": False,
+                "restricted": False,
+            }
+            client.messages_inspect = lambda *_args, **_kwargs: {
+                "conversation_found": True,
+                "scan_complete": True,
+                "inbox_pages_scanned": 1,
+                "thread_id": "thread-1",
+                "thread_igid": "igid-1",
+                "pending": True,
+                "viewer_sent_message": True,
+            }
+            try:
+                result = client.messages_eligibility("target.user")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "awaiting_acceptance")
+            self.assertFalse(result["eligible"])
+            self.assertEqual(result["reason"], "existing_chat_invitation_is_pending")
+
     def test_conversation_find_returns_unknown_when_page_limit_is_reached(self) -> None:
         page = _bootstrap_page()
         with tempfile.TemporaryDirectory() as temporary:

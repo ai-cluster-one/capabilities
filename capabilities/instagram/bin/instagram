@@ -797,6 +797,8 @@ Commands
                                                   Find an existing thread without creating one.
   instagram messages inspect <handle-or-url> [--max-pages N]
                                                   Detect prior outgoing messages without exposing text.
+  instagram messages eligibility <handle-or-url> [--max-pages N]
+                                                  Read-only DM routing verdict; null means Instagram exposes no decisive preflight.
   instagram conversations resolve <handle-or-url> Obtain/create the private thread.
   instagram messages send <handle-or-url>
       (--text TEXT | --text-file PATH | --stdin)
@@ -2239,6 +2241,84 @@ class InstagramWebClient:
             "reason": "message_history_incomplete",
         }
 
+    def messages_eligibility(
+        self, profile_value: str, *, max_pages: int = 25
+    ) -> dict[str, Any]:
+        """Return the strongest read-only verdict Instagram makes observable.
+
+        Instagram does not expose a reliable preflight for a first Direct message.
+        A missing conversation therefore stays unknown rather than being reported as
+        allowed. Existing thread state can still identify a normal send path or an
+        invitation that must be accepted before another message is sent.
+        """
+        relationship = self.relationship_show(profile_value)
+        base = {
+            "username": relationship["username"],
+            "recipient_pk": relationship["recipient_pk"],
+            "eligible": None,
+            "following": relationship["following"],
+            "followed_by": relationship["followed_by"],
+            "blocked": relationship["blocked"],
+            "restricted": relationship["restricted"],
+        }
+        if relationship["blocked"]:
+            return {
+                **base,
+                "status": "blocked_by_viewer",
+                "eligible": False,
+                "conversation_found": None,
+                "requires_new_invitation": None,
+                "reason": "recipient_is_blocked_by_viewer",
+            }
+
+        inspection = self.messages_inspect(profile_value, max_pages=max_pages)
+        base.update(
+            {
+                "conversation_found": inspection["conversation_found"],
+                "scan_complete": inspection["scan_complete"],
+                "inbox_pages_scanned": inspection["inbox_pages_scanned"],
+            }
+        )
+        if not inspection["scan_complete"]:
+            return {
+                **base,
+                "status": "unknown",
+                "requires_new_invitation": None,
+                "reason": inspection.get("reason") or "conversation_scan_incomplete",
+            }
+        if not inspection["conversation_found"]:
+            return {
+                **base,
+                "status": "new_invitation_unverified",
+                "requires_new_invitation": True,
+                "reason": "instagram_exposes_no_read_only_first_message_preflight",
+            }
+
+        pending = bool(inspection.get("pending"))
+        viewer_sent_message = inspection.get("viewer_sent_message")
+        thread_fields = {
+            "thread_id": inspection.get("thread_id"),
+            "thread_igid": inspection.get("thread_igid"),
+            "pending": pending,
+            "viewer_sent_message": viewer_sent_message,
+            "requires_new_invitation": False,
+        }
+        if pending and viewer_sent_message is True:
+            return {
+                **base,
+                **thread_fields,
+                "status": "awaiting_acceptance",
+                "eligible": False,
+                "reason": "existing_chat_invitation_is_pending",
+            }
+        return {
+            **base,
+            **thread_fields,
+            "status": "existing_conversation",
+            "eligible": True,
+            "reason": "validated_existing_thread",
+        }
+
     def resolve_thread(self, profile_value: str) -> RoutingResult:
         profile = self.profile(profile_value)
         username = str(profile["username"])
@@ -2639,6 +2719,12 @@ def main() -> None:
             max_pages = _max_pages_options(argv[3:])
             with InstagramWebClient(conn) as client:
                 result = client.messages_inspect(argv[2], max_pages=max_pages)
+            _emit({"connection": conn.id, **result})
+            return
+        if len(argv) >= 3 and argv[:2] == ["messages", "eligibility"]:
+            max_pages = _max_pages_options(argv[3:])
+            with InstagramWebClient(conn) as client:
+                result = client.messages_eligibility(argv[2], max_pages=max_pages)
             _emit({"connection": conn.id, **result})
             return
         if len(argv) == 3 and argv[:2] == ["conversations", "resolve"]:
