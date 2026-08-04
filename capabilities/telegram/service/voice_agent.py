@@ -51,10 +51,13 @@ TURN_JOIN_GAP_SECONDS = 4.0
 # anyone is mid-sentence. A project may set its own pace.
 DEFAULT_PROGRESS_INTERVAL = 10.0
 PROGRESS_CALLER_QUIET = 3.0
-# A capability read answered inside the turn that asked for it. The caller is on
-# the line, so the ceiling is what a person will sit through in silence, not what
-# the command might eventually manage; past it the work belongs to a worker.
-CAPABILITY_TIMEOUT = 5.0
+# A capability read answered inside the turn that asked for it. The ceiling is
+# not what a person will sit through in silence — it is that against the only
+# alternative, which is a worker taking a minute. These tools read over the
+# network and sit in the two-to-four second range, where an ordinary spike
+# reaches six; a tighter ceiling does not protect the caller's patience, it just
+# spends it on the slow path instead.
+CAPABILITY_TIMEOUT = 15.0
 # What comes back is spoken from, not read, so it is bounded before it reaches
 # the model at all. Set by what these tools actually answer with rather than by
 # what a speech model looks like it needs: a `connections` listing runs to ten
@@ -156,6 +159,13 @@ RUN_CAPABILITY_TOOL = {
         "The same goes for any name you put in a command — a mailbox, a board, "
         "a client. Take the exact value from the tool that owns it ('ids' with "
         "'list', or 'connections'); never spell one from what you heard said."
+        "\n\n"
+        "What comes back is yours for the rest of the call: keep it rather than "
+        "asking again. Running the same command twice returns the same answer "
+        "and spends the caller's time twice. And if an option is not in a "
+        "tool's help, it does not exist — asking a second time will not add it. "
+        "Work with what the tool does offer, or say plainly that it cannot be "
+        "asked that way."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -180,6 +190,45 @@ RUN_CAPABILITY_TOOL = {
             },
         },
         "required": ["capability", "args"],
+    },
+}
+
+
+READ_PROJECT_FILE_TOOL = {
+    "name": "read_project_file",
+    "description": (
+        "Read one file from the project — a reference, a routine, a settings "
+        "file, a note. The project body you were given names these; this is how "
+        "you actually open one."
+        "\n\n"
+        "Reach for it when the answer is written down somewhere in the project "
+        "rather than held in a system: how something is treated, what was "
+        "agreed with a counterparty, which account something books to."
+        "\n\n"
+        "The project body you were given lists each tool's references by path, "
+        "with a line saying what is in them; you can also ask a tool for its own "
+        "list with 'refs'. Either way the path it names is the path to give here."
+        "\n\n"
+        "A guide belonging to a tool is not read this way — ask the tool itself "
+        "with run_capability, 'guide' and its topic."
+        "\n\n"
+        "Paths are relative to the project, e.g. "
+        "'capabilities/simplbooks/reference/vat-regimes.md'. Not every part of "
+        "the project can be opened, and what is refused is refused for a "
+        "reason: say you cannot see it rather than working around it."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "path": {
+                "type": "STRING",
+                "description": (
+                    "The file's path inside the project, with no leading slash "
+                    "and no '..'."
+                ),
+            },
+        },
+        "required": ["path"],
     },
 }
 
@@ -433,6 +482,23 @@ def live_config(system_instruction, voice, tools=None):
         },
         "input_audio_transcription": {},
         "output_audio_transcription": {},
+        # A Live session has a fixed lifetime, and a call that reaches it is cut
+        # off mid-sentence by the server. Compression trades the far end of the
+        # conversation for the session outliving the call: the alternative is not
+        # a longer memory, it is a dropped line at ten minutes.
+        #
+        # Both numbers are stated because the empty form is accepted and does
+        # nothing — a compression with no trigger never triggers. The trigger
+        # sits far above one call prompt (the project body alone is some eleven
+        # thousand tokens) so trimming starts only once a conversation has really
+        # accumulated, and the target keeps half of that.
+        "context_window_compression": {
+            "trigger_tokens": 60000,
+            "sliding_window": {"target_tokens": 30000},
+        },
+        # And a handle to come back with, so a session that does end can be
+        # resumed rather than started over.
+        "session_resumption": {},
     }
     if tools:
         config["tools"] = [{"function_declarations": list(tools)}]
@@ -540,7 +606,7 @@ class VoiceCallSession:
     def __init__(self, calls, chat_id, *, api_key, model, voice,
                  system_instruction, caller_name, caller_track=None,
                  agent_track=None, task_runner=None, send_to_chat=None,
-                 capability_runner=None,
+                 capability_runner=None, file_reader=None, on_stream_end=None,
                  progress_interval=DEFAULT_PROGRESS_INTERVAL, log=print):
         self._calls = calls
         self._chat_id = chat_id
@@ -552,6 +618,9 @@ class VoiceCallSession:
         self._task_runner = task_runner
         self._send_to_chat = send_to_chat
         self._capability_runner = capability_runner
+        self._file_reader = file_reader
+        self._on_stream_end = on_stream_end
+        self._stream_ended = False
         self._log = log
 
         # A completion is injected only between turns: cutting into speech the
@@ -672,6 +741,8 @@ class VoiceCallSession:
             tools.append(SEND_TO_CHAT_TOOL)
         if self._capability_runner is not None:
             tools.append(RUN_CAPABILITY_TOOL)
+        if self._file_reader is not None:
+            tools.append(READ_PROJECT_FILE_TOOL)
         self._log("voice: tools declared — "
                   + (", ".join(t["name"] for t in tools) if tools else "none"))
         return tools or None
@@ -727,9 +798,26 @@ class VoiceCallSession:
                     await self._handle_tool_call(response)
             except Exception as exc:
                 self._log(f"voice: Gemini stream ended — {type(exc).__name__}: {exc}")
+                await self._speech_is_over()
                 return
             if not received:
+                await self._speech_is_over()
                 return
+
+    async def _speech_is_over(self):
+        """The speech session is gone and cannot come back on this call. Hang up
+        rather than hold the line: a caller left listening to silence has no way
+        to tell a dead session from a long pause, and waits through both."""
+        if self._stream_ended:
+            return
+        self._stream_ended = True
+        if self._on_stream_end is None:
+            return
+        try:
+            await self._on_stream_end()
+        except Exception as exc:
+            self._log(f"voice: could not end the call after the stream stopped — "
+                      f"{type(exc).__name__}: {exc}")
 
     def _consume(self, response):
         content = getattr(response, "server_content", None)
@@ -772,21 +860,36 @@ class VoiceCallSession:
         for call in calls:
             name = getattr(call, "name", None)
             args = getattr(call, "args", None) or {}
-            if name == AGENT_TASK_TOOL["name"] and self._task_runner is not None:
-                result = self._task_runner.start(args.get("task"))
-                self._log(f"voice: agent_task {result.get('status')} "
-                          f"({result.get('job_id') or '-'})")
-            elif name == SEND_TO_CHAT_TOOL["name"] and self._send_to_chat is not None:
-                result = await self._write_to_chat(args.get("text"))
-            elif name == RUN_CAPABILITY_TOOL["name"] and self._capability_runner is not None:
-                result = await self._run_capability(args.get("capability"),
-                                                    args.get("args"))
-            else:
-                result = {"ok": False, "status": "unknown_tool",
-                          "instruction": f"There is no tool named {name}."}
+            try:
+                result = await self._dispatch_tool(name, args)
+            except Exception as exc:
+                # A tool that breaks costs its own answer, never the call. An
+                # exception raised here reaches the stream instead of the model,
+                # and the caller is left holding a dead line.
+                self._log(f"voice: tool {name} raised — {type(exc).__name__}: {exc}")
+                result = {"ok": False, "status": "tool_failed",
+                          "instruction": "That did not work. Tell the caller you "
+                                         "could not do it, and carry on."}
             answers.append(types.FunctionResponse(
                 name=name, id=getattr(call, "id", None), response={"result": result}))
         await self._live.send_tool_response(function_responses=answers)
+
+    async def _dispatch_tool(self, name, args):
+        """One tool call to its handler. Only what this call was given is
+        answerable; anything else is named back rather than guessed at."""
+        if name == AGENT_TASK_TOOL["name"] and self._task_runner is not None:
+            result = self._task_runner.start(args.get("task"))
+            self._log(f"voice: agent_task {result.get('status')} "
+                      f"({result.get('job_id') or '-'})")
+            return result
+        if name == SEND_TO_CHAT_TOOL["name"] and self._send_to_chat is not None:
+            return await self._write_to_chat(args.get("text"))
+        if name == RUN_CAPABILITY_TOOL["name"] and self._capability_runner is not None:
+            return await self._run_capability(args.get("capability"), args.get("args"))
+        if name == READ_PROJECT_FILE_TOOL["name"] and self._file_reader is not None:
+            return await self._read_project_file(args.get("path"))
+        return {"ok": False, "status": "unknown_tool",
+                "instruction": f"There is no tool named {name}."}
 
     async def _write_to_chat(self, text):
         body = str(text or "").strip()
@@ -831,6 +934,17 @@ class VoiceCallSession:
         result = await self._capability_runner(name, argv)
         self._log(f"voice: run_capability {name} {' '.join(argv)[:80]} "
                   f"-> {result.get('status')}")
+        return result
+
+    async def _read_project_file(self, path):
+        """One file out of the project. The path is checked where the project
+        is — here it is only kept from arriving empty."""
+        wanted = str(path or "").strip()
+        if not wanted:
+            return {"ok": False, "status": "no_path",
+                    "instruction": "Name the file to read, relative to the project."}
+        result = await self._file_reader(wanted)
+        self._log(f"voice: read_project_file {wanted[:100]} -> {result.get('status')}")
         return result
 
     def note_progress(self, note, source="stream"):

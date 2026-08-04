@@ -1864,6 +1864,48 @@ def resolve_project_context_path(target=PROJECT_CONTEXT_TARGET, timeout=30.0):
     return path
 
 
+# What a call may open. An allowed list rather than a forbidden one: the project
+# holds credentials, sessions and bank material, and a caller on a phone must not
+# be one clever path away from any of it.
+PROJECT_READ_ROOTS = ("context", "routines", "assets", "capabilities", "deployment")
+# And inside those, what is never opened however it is reached.
+PROJECT_READ_DENY_NAMES = (".env",)
+PROJECT_READ_DENY_PARTS = ("state", "credentials", ".git")
+PROJECT_READ_DENY_SUFFIXES = (".session", ".key", ".pem", ".p12", ".sqlite", ".db")
+
+
+def resolve_project_file(wanted):
+    """A project-relative path, or a refusal saying why. Resolved before it is
+    judged, so a path that climbs out with '..' or follows a link is caught by
+    where it lands rather than by how it was spelled."""
+    raw = str(wanted or "").strip()
+    if not raw:
+        return None, "no_path"
+    try:
+        root = PROJECT_ROOT.resolve()
+        candidate = Path(raw)
+        # `refs` and `ids` hand out absolute paths while the project body lists
+        # relative ones. Both name the same file, so both are accepted — an
+        # absolute path is still judged by where it lands, not by its form.
+        path = (candidate if candidate.is_absolute() else PROJECT_ROOT / raw).resolve()
+        path.relative_to(root)
+    except (ValueError, OSError):
+        return None, "outside_project"
+
+    rel = path.relative_to(root)
+    parts = rel.parts
+    if not parts or parts[0] not in PROJECT_READ_ROOTS:
+        return None, "not_readable_here"
+    lowered = [p.lower() for p in parts]
+    if any(p in PROJECT_READ_DENY_PARTS for p in lowered):
+        return None, "not_readable_here"
+    if any(lowered[-1].startswith(n) for n in PROJECT_READ_DENY_NAMES):
+        return None, "not_readable_here"
+    if path.suffix.lower() in PROJECT_READ_DENY_SUFFIXES:
+        return None, "not_readable_here"
+    return path, None
+
+
 def project_context_text():
     """The compiled body, read fresh so an edit to the project reaches the next
     call without restarting the daemon. Absent is not fatal: a call without it
@@ -1902,6 +1944,40 @@ def truncate_capability_output(text, limit):
     if len(body) <= limit:
         return body, False
     return body[:limit] + "\n…[cut]", True
+
+
+def read_project_file_result(wanted):
+    """Resolve, read and bound one project file, as the answer the model gets.
+    Whole rather than split across a closure: the reading is the part that can
+    be wrong, so it is the part a test has to be able to reach."""
+    path, refusal = resolve_project_file(wanted)
+    if refusal == "no_path":
+        return {"ok": False, "status": refusal,
+                "instruction": "Name the file, relative to the project."}
+    if refusal is not None:
+        return {"ok": False, "status": refusal,
+                "instruction": "That part of the project is not open to a call. "
+                               "Say you cannot see it; do not look for another "
+                               "way in."}
+    if not path.is_file():
+        return {"ok": False, "status": "not_found",
+                "instruction": "There is no such file. Say so rather than guessing "
+                               "at what it would have said."}
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return {"ok": False, "status": "unreadable",
+                "instruction": "That file would not open. Say you could not read it."}
+    body, truncated = truncate_capability_output(
+        text, voice_agent.CAPABILITY_OUTPUT_LIMIT)
+    result = {"ok": True, "status": "ok",
+              "path": str(path.relative_to(PROJECT_ROOT.resolve())),
+              "text": body, "truncated": truncated}
+    if truncated:
+        result["instruction"] = ("Only the start of the file is here. Reading it "
+                                 "again returns the same start; if the rest matters, "
+                                 "hand the question to agent_task.")
+    return result
 
 
 async def run_capability_process(binary, args, env, timeout):
@@ -3317,16 +3393,38 @@ async def run_session(client):
             # costs a fifth of a second and it is the only thing that reliably
             # stops the guessing.
             helped = active_voice_call.setdefault("helped_capabilities", set())
-            asking_for_help = bool(args) and args[0] == "help"
-            if asking_for_help:
+            # Every capability's own contract verbs. Reaching for one of these is
+            # already the behaviour the gate exists to produce, so it passes:
+            # charging a round trip for asking what a tool is would teach the
+            # opposite of what is wanted.
+            discovering = bool(args) and args[0] in (
+                "help", "guide", "ids", "connections", "refs", "stub", "manifest")
+            if discovering:
                 helped.add(capability)
             elif capability not in helped:
+                # The round trip is owed anyway, so it is made to carry both
+                # halves of what a guess gets wrong: the wording, and the values
+                # that go in it. Handed over rather than asked for — a caller
+                # waits the same whether the model fetches these or we do.
                 helped.add(capability)
-                log(f"voice: run_capability {capability} sent to help first")
-                return {"ok": False, "status": "read_help_first",
-                        "instruction": f"Call {capability} with ['help'] first and "
-                                       "read what it actually takes, then make the "
-                                       "real call. Do not repeat this one unchanged."}
+                primer = {}
+                for verb in ("help", "ids"):
+                    argv = [verb] if verb == "help" else [verb, "list"]
+                    code, out, _ = await run_capability_process(
+                        binary, argv, worker_env({"chat_type": "private"}),
+                        voice_agent.CAPABILITY_TIMEOUT)
+                    if code == 0 and out:
+                        primer[verb], _ = truncate_capability_output(
+                            out, voice_agent.CAPABILITY_OUTPUT_LIMIT)
+                log(f"voice: run_capability {capability} primed "
+                    f"({', '.join(primer) or 'nothing'})")
+                return {"ok": False, "status": "read_this_first",
+                        "help": primer.get("help"),
+                        "identifiers": primer.get("ids"),
+                        "instruction": f"Here is what {capability} takes, and the "
+                                       "identifiers it knows. Make your real call "
+                                       "now, using values from this — never one you "
+                                       "made up or heard said."}
 
             authority_context = None
             proc = None
@@ -3399,6 +3497,46 @@ async def run_session(client):
                 result["instruction"] = ("The tool refused or failed. Say what you "
                                          "could not check rather than guessing at "
                                          "the answer.")
+            return result
+
+        # Finalisation started from inside the session's own receiver would be
+        # cancelled by the `stop()` it runs, so it is handed to a task instead
+        # and kept referenced until it is done.
+        stream_loss_finalisers = set()
+
+        async def end_call_after_stream_loss(caller_id):
+            """The speech session is gone, so the call is over whether or not the
+            line is still open. Ending it says that; holding the slots open
+            leaves the caller talking to a session that stopped listening, with
+            nothing to distinguish it from a long pause.
+
+            This goes through the ordinary ending — which stops the session,
+            joins the tracks, delivers the recording, writes the summary and
+            only then leaves the call. Leaving first looks like the same thing
+            and is not: the ending hangs off the `LEFT_CALL` update, which our
+            own leave does not raise, so the call would end with its recording
+            and summary silently dropped."""
+            log(f"voice: speech session lost — ending the call with {caller_id}")
+
+            async def _finalise():
+                try:
+                    await finish_voice_call("speech_session_lost")
+                    await flush_call_summary()
+                except Exception as exc:
+                    log(f"voice: could not end the call cleanly — "
+                        f"{type(exc).__name__}: {exc}")
+
+            task = asyncio.create_task(_finalise())
+            stream_loss_finalisers.add(task)
+            task.add_done_callback(stream_loss_finalisers.discard)
+
+        async def read_voice_project_file(wanted):
+            """One project file, read for the caller. The project body names
+            these; without this the call could only be told they exist."""
+            result = read_project_file_result(wanted)
+            if not result.get("ok"):
+                log(f"voice: read_project_file {str(wanted)[:100]} "
+                    f"-> {result.get('status')}")
             return result
 
         # The summary of the call that just ended, in flight while the recording
@@ -3588,6 +3726,8 @@ async def run_session(client):
                 send_to_chat=lambda body: send_channel_message(caller_id, body, True),
                 capability_runner=lambda capability, args: run_voice_capability(
                     caller_id, caller_name, capability, args),
+                file_reader=read_voice_project_file,
+                on_stream_end=lambda: end_call_after_stream_loss(caller_id),
                 progress_interval=VOICE_PROGRESS_INTERVAL,
                 log=log,
             )

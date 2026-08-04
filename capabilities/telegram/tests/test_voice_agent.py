@@ -985,6 +985,61 @@ class RunCapabilityToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], "no_capability")
 
+    async def test_a_lost_speech_session_hangs_up_once(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            hangups = []
+
+            async def on_stream_end():
+                hangups.append(True)
+
+            session = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                system_instruction="s", caller_name="Caller",
+                on_stream_end=on_stream_end, log=lambda *_: None)
+            session._live = FakeLive()
+
+            await session._speech_is_over()
+            # The receiver can reach this twice — the stream raising and then the
+            # loop ending — and the caller must not be hung up on twice.
+            await session._speech_is_over()
+            self.assertEqual(len(hangups), 1)
+
+    async def test_a_hang_up_that_fails_does_not_escape(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+
+            async def on_stream_end():
+                raise RuntimeError("the call was already gone")
+
+            session = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                system_instruction="s", caller_name="Caller",
+                on_stream_end=on_stream_end, log=lambda *_: None)
+            session._live = FakeLive()
+            # Already-ended calls are the normal case here, not an exception to
+            # propagate into the receiver.
+            await session._speech_is_over()
+
+    async def test_a_tool_that_breaks_costs_its_answer_not_the_call(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+
+            async def runner(capability, args):
+                raise AttributeError("something in the handler is wrong")
+
+            session = self.session(va, runner)
+            call = types.SimpleNamespace(
+                tool_call=types.SimpleNamespace(function_calls=[
+                    types.SimpleNamespace(name="run_capability", id="1",
+                                          args={"capability": "clickup",
+                                                "args": ["help"]})]))
+            # The stream must survive a broken handler: an exception here reaches
+            # the Live session instead of the model and the caller holds a dead
+            # line.
+            await session._handle_tool_call(call)
+            self.assertEqual(len(session._live.tool_responses), 1)
+
     async def test_arguments_reach_the_runner_as_given(self):
         with fake_runtime_modules(), fake_genai_types():
             va = import_voice_agent()

@@ -2149,5 +2149,109 @@ class VoiceCapabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("no", err)
 
 
+class VoiceProjectFileTests(unittest.IsolatedAsyncioTestCase):
+    """What a call may open. The project holds credentials, sessions and bank
+    material, so this is the boundary that matters most in the call path."""
+
+    async def test_only_the_named_roots_can_be_opened(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            path, refusal = daemon.resolve_project_file(
+                "capabilities/simplbooks/reference/vat-regimes.md")
+            self.assertIsNone(refusal)
+            self.assertTrue(str(path).endswith("vat-regimes.md"))
+
+            for allowed in ("context/identity/SOUL.md", "routines/second-opinion.md",
+                            "assets/sessions/note.md", "deployment/runtime.json"):
+                _, refusal = daemon.resolve_project_file(allowed)
+                self.assertIsNone(refusal, allowed)
+
+            # Anything not named is refused, including the repository root itself.
+            for outside in ("README.md", ".git/config", ".claude/settings.json",
+                            "src/main.py"):
+                _, refusal = daemon.resolve_project_file(outside)
+                self.assertEqual(refusal, "not_readable_here", outside)
+
+    async def test_a_path_that_climbs_out_is_judged_by_where_it_lands(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            for escape in ("../../etc/passwd",
+                           "context/../../etc/passwd",
+                           "/etc/passwd",
+                           "capabilities/../../../.ssh/id_rsa"):
+                _, refusal = daemon.resolve_project_file(escape)
+                self.assertIn(refusal, ("outside_project", "not_readable_here"), escape)
+
+    async def test_an_absolute_path_inside_the_project_names_the_same_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td) / "project"
+            rel = "capabilities/simplbooks/reference/vat-regimes.md"
+
+            # `refs` hands out absolute paths and the project body lists relative
+            # ones; both name one file and both have to open it.
+            by_relative, refusal = daemon.resolve_project_file(rel)
+            self.assertIsNone(refusal)
+            by_absolute, refusal = daemon.resolve_project_file(str(root / rel))
+            self.assertIsNone(refusal)
+            self.assertEqual(by_relative, by_absolute)
+
+    async def test_secrets_are_refused_inside_the_allowed_roots(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            for secret in ("capabilities/telegram/.env",
+                           "capabilities/telegram/.env.local",
+                           "capabilities/simplbooks/state/session.json",
+                           "capabilities/telegram/credentials/token.txt",
+                           "capabilities/telegram/service/jess.session",
+                           "deployment/deploy.key",
+                           "capabilities/automations/runs.sqlite"):
+                _, refusal = daemon.resolve_project_file(secret)
+                self.assertEqual(refusal, "not_readable_here", secret)
+
+    async def test_an_empty_path_is_answered_rather_than_resolved(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path, refusal = daemon.resolve_project_file("   ")
+            self.assertIsNone(path)
+            self.assertEqual(refusal, "no_path")
+
+    async def test_a_readable_file_comes_back_as_its_contents(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td) / "project"
+            note = root / "context" / "identity" / "COMPANY.md"
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text("# Company\n\nVAT number: EE101369226\n")
+
+            result = daemon.read_project_file_result("context/identity/COMPANY.md")
+            self.assertTrue(result["ok"], result)
+            self.assertIn("EE101369226", result["text"])
+            self.assertFalse(result["truncated"])
+            self.assertEqual(result["path"], "context/identity/COMPANY.md")
+
+    async def test_a_long_file_is_bounded_and_says_so(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td) / "project"
+            big = root / "context" / "long.md"
+            big.parent.mkdir(parents=True, exist_ok=True)
+            big.write_text("x" * 60000)
+
+            result = daemon.read_project_file_result("context/long.md")
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["truncated"])
+            self.assertTrue(result["text"].endswith("…[cut]"))
+            self.assertIn("agent_task", result["instruction"])
+
+    async def test_a_file_that_is_not_there_is_said_to_be_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            result = daemon.read_project_file_result("context/nothing-here.md")
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "not_found")
+
+
 if __name__ == "__main__":
     unittest.main()
