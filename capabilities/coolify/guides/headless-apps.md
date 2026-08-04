@@ -108,6 +108,16 @@ passing an explicit empty value:
 coolify app update <application-uuid> --domains ''
 ```
 
+Disable source-webhook auto-deploys without affecting manual deploys:
+
+```sh
+coolify app update <application-uuid> --no-auto-deploy-enabled
+coolify deploy <application-uuid>
+```
+
+Re-enable source-webhook auto-deploys with `--auto-deploy-enabled`. The two
+flags are mutually exclusive, and omitting both leaves the setting unchanged.
+
 Repository/build changes use the same field names:
 
 ```sh

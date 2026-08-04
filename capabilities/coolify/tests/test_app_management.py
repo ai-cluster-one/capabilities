@@ -3,6 +3,7 @@
 
 import sys
 import types
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -95,6 +96,53 @@ def test_app_update_refuses_empty_patch():
     with pytest.raises(SystemExit) as exc:
         coolify_module.cmd_app_update(None, SimpleNamespace(uuid="app-uuid"))
     assert exc.value.code == 6
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("--auto-deploy-enabled", True),
+        ("--no-auto-deploy-enabled", False),
+    ],
+)
+def test_app_update_patches_only_explicit_auto_deploy_value(flag, expected):
+    argv = ["coolify", "app", "update", "app-uuid", flag]
+    connection = {
+        "id": "production",
+        "allow_write": True,
+        "base_url": "https://coolify.example",
+        "token": "test-token",
+    }
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(coolify_module, "_gate"),
+        patch.object(coolify_module, "_resolve_conn", return_value=connection),
+        patch.object(coolify_module, "_client", return_value=nullcontext(None)),
+        patch.object(coolify_module, "_request", return_value={"uuid": "app-uuid"}) as request,
+    ):
+        coolify_module.main()
+
+    request.assert_called_once_with(
+        None,
+        "PATCH",
+        "/applications/app-uuid",
+        json_body={"is_auto_deploy_enabled": expected},
+    )
+
+
+def test_app_update_rejects_conflicting_auto_deploy_flags():
+    argv = [
+        "coolify", "app", "update", "app-uuid",
+        "--auto-deploy-enabled", "--no-auto-deploy-enabled",
+    ]
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(coolify_module, "_gate"),
+        pytest.raises(SystemExit) as exc,
+    ):
+        coolify_module.main()
+
+    assert exc.value.code == 2
 
 
 def test_sources_lists_uuids_without_key_material():
@@ -239,4 +287,5 @@ def test_help_and_manifest_declare_new_surface():
     assert "--base-directory" in help_text
     assert "--health-check-start-period" in help_text
     assert "--watch-paths" in help_text
+    assert "--auto-deploy-enabled / --no-auto-deploy-enabled" in help_text
     assert coolify_module.TOPICS == ["headless-apps"]

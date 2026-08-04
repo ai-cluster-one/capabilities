@@ -106,6 +106,7 @@ COMMANDS
       --name --domains --ports-exposes --base-directory
       --dockerfile-location --docker-compose-location --build-pack
       --git-repository --git-branch --watch-paths
+      --auto-deploy-enabled / --no-auto-deploy-enabled
       --health-check-enabled / --no-health-check-enabled
       --health-check-path --health-check-port --health-check-host
       --health-check-scheme --health-check-return-code
@@ -1444,6 +1445,7 @@ APP_PATCH_FIELDS = (
     ("git_repository", "git_repository"),
     ("git_branch", "git_branch"),
     ("watch_paths", "watch_paths"),
+    ("is_auto_deploy_enabled", "is_auto_deploy_enabled"),
     ("health_check_enabled", "health_check_enabled"),
     ("health_check_path", "health_check_path"),
     ("health_check_port", "health_check_port"),
@@ -1699,6 +1701,17 @@ def main() -> None:
     )
     sp_update.add_argument("uuid", help="application UUID")
     _add_app_patch_arguments(sp_update)
+    auto_deploy = sp_update.add_mutually_exclusive_group()
+    auto_deploy.add_argument(
+        "--auto-deploy-enabled", dest="is_auto_deploy_enabled",
+        action="store_true", default=None,
+        help="enable automatic deployments from source webhooks",
+    )
+    auto_deploy.add_argument(
+        "--no-auto-deploy-enabled", dest="is_auto_deploy_enabled",
+        action="store_false",
+        help="disable automatic deployments from source webhooks",
+    )
 
     # service create
     sp = sub.add_parser("service", help="create service")

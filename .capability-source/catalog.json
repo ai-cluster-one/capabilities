@@ -17,7 +17,7 @@
     },
     "callva": {
       "path": "capabilities/callva",
-      "payload_sha256": "8fe18c7b1feb6f49e1a4f0a8e6196f460ffed6b069be96fb0ba7400d36f11f89",
+      "payload_sha256": "6b2b0bd0dae4f7b7397c76882c3584d5280332e92a9e92b03a4b0269ee909bb4",
       "summary": "CallVA voice-AI platform CLI over the External API — read/create/update/delete agents, assets (prompts), calls, transcripts, recordings, call analytics, custom fields, webhook schedules, automations (Windmill scripts), webhook logs, variables, settings, projects, phone numbers, and providers."
     },
     "clickup": {
@@ -27,7 +27,7 @@
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "3a1cdf6266148edeff4cd623f1e0e89656fa381f8a8df4ba58bccdaec45357b7",
+      "payload_sha256": "add20ca4935cdd69f68ff5620d8430366bcdc438f9d64e0504bdc2f3b7e7f1bd",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
@@ -92,7 +92,7 @@
     },
     "signoz": {
       "path": "capabilities/signoz",
-      "payload_sha256": "17d8d49b13e84af52f91dddaae460e7c06bd2cd18556556b5940ba166ae705cc",
+      "payload_sha256": "42adf3f2f1a6154996e0ea7e2ba5f0622995e949bbfe8a19bd999d2c17e0dd68",
       "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances."
     },
     "simplbooks": {
