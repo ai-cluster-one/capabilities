@@ -219,6 +219,59 @@ class ClientTests(unittest.TestCase):
             finally:
                 client.close()
 
+    def test_profile_falls_back_to_web_profile_info(self) -> None:
+        bootstrap = {
+            "require": [
+                ["DTSGInitialData", [], {"token": "dtsg-token"}],
+                ["LSD", [], {"token": "lsd-token"}],
+                ["SiteData", [], {"server_revision": 123}],
+            ]
+        }
+        page = (
+            '<script type="application/json">'
+            + html.escape(json.dumps(bootstrap), quote=False)
+            + "</script>"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/target.user/":
+                    return httpx.Response(200, text=page, request=request)
+                self.assertEqual(request.url.path, "/api/v1/users/web_profile_info/")
+                self.assertEqual(request.url.params["username"], "target.user")
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "data": {
+                            "user": {
+                                "id": "12345",
+                                "username": "target.user",
+                                "full_name": "Target User",
+                                "is_private": False,
+                                "edge_followed_by": {"count": 42},
+                            }
+                        },
+                    },
+                    request=request,
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                profile = client.profile("target.user")
+            finally:
+                client.close()
+            self.assertEqual(profile["recipient_pk"], "12345")
+            self.assertEqual(profile["follower_count"], 42)
+
     def test_resolve_thread_validates_recipient(self) -> None:
         payload = {
             "require": [

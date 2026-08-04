@@ -62,7 +62,7 @@
     },
     "instagram": {
       "path": "capabilities/instagram",
-      "payload_sha256": "5d03c45493ddfcc2fde1126f4997d6448774dded1737411c6902561045f4e0bd",
+      "payload_sha256": "028bf6996457ac1f01a52b68ef9b058f21a5f4037275db4b2cf6d45a8bb9b0c8",
       "summary": "Instagram CLI over a captured browser session — validate identity, read profiles, resolve Direct threads, and send text messages. Stateful — run `instagram doctor` first."
     },
     "journal": {

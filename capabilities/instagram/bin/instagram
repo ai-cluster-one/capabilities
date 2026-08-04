@@ -720,6 +720,7 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
 PROFILE_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 GRAPHQL_URL = "https://www.instagram.com/api/graphql"
 PREFLIGHT_URL = "https://www.instagram.com/api/v1/accounts/edit/web_form_data/"
+WEB_PROFILE_INFO_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
 CREATE_THREAD_URL = (
     "https://www.instagram.com/api/v1/direct_v2/create_group_thread/"
 )
@@ -1192,9 +1193,9 @@ def _cmd_connections() -> None:
     _emit(_connections_report())
 
 
-def _bootstrap_profile(
+def _bootstrap_data(
     html: str, expected_username: str
-) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+) -> tuple[str, str, dict[str, Any], dict[str, Any] | None]:
     parser = _JsonScripts()
     parser.feed(html)
     modules: dict[str, dict[str, Any]] = {}
@@ -1229,11 +1230,11 @@ def _bootstrap_profile(
             elif isinstance(value, list):
                 stack.extend(value)
     missing = {"DTSGInitialData", "LSD", "SiteData"} - modules.keys()
-    if missing or matched is None:
+    if missing:
         raise InstagramFailure(
             5,
             "profile_bootstrap_missing",
-            "Profile page did not contain required routing data",
+            "Profile page did not contain fresh request tokens",
         )
     dtsg = str(modules["DTSGInitialData"].get("token") or "")
     lsd = str(modules["LSD"].get("token") or "")
@@ -1244,6 +1245,19 @@ def _bootstrap_profile(
             "Profile page did not contain fresh request tokens",
         )
     return dtsg, lsd, modules["SiteData"], matched
+
+
+def _bootstrap_profile(
+    html: str, expected_username: str
+) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+    dtsg, lsd, site, matched = _bootstrap_data(html, expected_username)
+    if matched is None:
+        raise InstagramFailure(
+            5,
+            "profile_bootstrap_missing",
+            "Profile page did not contain required routing data",
+        )
+    return dtsg, lsd, site, matched
 
 
 def _decode_json(text: str) -> dict[str, Any]:
@@ -1410,6 +1424,68 @@ class InstagramWebClient:
             )
         return {"username": username, "status": "healthy"}
 
+    def _profile_api(self, canonical_url: str, username: str) -> dict[str, Any]:
+        headers = {
+            "Accept": "*/*",
+            "Referer": canonical_url,
+            "User-Agent": self._header_value("User-Agent"),
+            "X-IG-App-ID": self._header_value("X-IG-App-ID"),
+        }
+        csrf = self._cookie_value("csrftoken")
+        if csrf:
+            headers["X-CSRFToken"] = csrf
+        try:
+            response = self.http.get(
+                WEB_PROFILE_INFO_URL,
+                params={"username": username},
+                headers={key: value for key, value in headers.items() if value},
+            )
+        except httpx.HTTPError as exc:
+            raise InstagramFailure(
+                5,
+                "network_error",
+                f"Profile metadata request failed: {type(exc).__name__}",
+            ) from exc
+        finally:
+            self._persist()
+        if response.status_code in {401, 403}:
+            raise InstagramFailure(
+                2,
+                "auth_failed",
+                "Instagram login is required",
+                status=response.status_code,
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise InstagramFailure(
+                5,
+                "invalid_response",
+                "Profile metadata response was not JSON",
+                status=response.status_code,
+            ) from exc
+        raw = (payload.get("data") or {}).get("user")
+        if response.status_code == 404 or not isinstance(raw, dict):
+            raise InstagramFailure(3, "not_found", f"Profile @{username} was not found")
+        if response.status_code != 200 or payload.get("status") != "ok":
+            raise InstagramFailure(
+                5,
+                "instagram_error",
+                "Profile metadata request was rejected",
+                status=response.status_code,
+            )
+        actual_username = str(raw.get("username") or "")
+        recipient_pk = raw.get("pk") or raw.get("pk_id") or raw.get("id")
+        if actual_username.lower() != username.lower() or recipient_pk is None:
+            raise InstagramFailure(
+                5,
+                "profile_unvalidated",
+                "Instagram did not return validated profile routing data",
+            )
+        result = dict(raw)
+        result["pk"] = str(recipient_pk)
+        return result
+
     def profile(self, profile_value: str) -> dict[str, Any]:
         canonical_url, username = _normalize_profile(profile_value)
         headers = {
@@ -1442,7 +1518,9 @@ class InstagramWebClient:
                 "Profile page request was rejected",
                 status=response.status_code,
             )
-        dtsg, lsd, site, raw = _bootstrap_profile(response.text, username)
+        dtsg, lsd, site, raw = _bootstrap_data(response.text, username)
+        if raw is None:
+            raw = self._profile_api(canonical_url, username)
         self.template.form["fb_dtsg"] = dtsg
         self.template.form["lsd"] = lsd
         self.template.form["jazoest"] = "2" + str(sum(ord(char) for char in dtsg))
@@ -1464,6 +1542,16 @@ class InstagramWebClient:
         if claim:
             self.template.headers["X-IG-WWW-Claim"] = claim
         _write_template(self.template, self.connection.session_path)
+        follower_count = raw.get("follower_count")
+        if follower_count is None and isinstance(raw.get("edge_followed_by"), dict):
+            follower_count = raw["edge_followed_by"].get("count")
+        following_count = raw.get("following_count")
+        if following_count is None and isinstance(raw.get("edge_follow"), dict):
+            following_count = raw["edge_follow"].get("count")
+        media_count = raw.get("media_count")
+        timeline = raw.get("edge_owner_to_timeline_media")
+        if media_count is None and isinstance(timeline, dict):
+            media_count = timeline.get("count")
         fields = {
             "username": str(raw.get("username") or username),
             "profile_url": canonical_url,
@@ -1471,9 +1559,9 @@ class InstagramWebClient:
             "full_name": raw.get("full_name"),
             "is_private": raw.get("is_private"),
             "is_verified": raw.get("is_verified"),
-            "follower_count": raw.get("follower_count"),
-            "following_count": raw.get("following_count"),
-            "media_count": raw.get("media_count"),
+            "follower_count": follower_count,
+            "following_count": following_count,
+            "media_count": media_count,
         }
         return {key: value for key, value in fields.items() if value is not None}
 
