@@ -64,6 +64,11 @@ CAPABILITY_TIMEOUT = 15.0
 # thousand characters and puts the part worth having at the end, so a tighter
 # ceiling does not summarise it — it hides the answer and buys a re-ask.
 CAPABILITY_OUTPUT_LIMIT = 20000
+# How many times one call may come back on a new connection. Connections are
+# retired on the order of ten minutes, so this is a very long call rather than a
+# limit anyone will meet talking; it is here because a server that drops every
+# connection the instant it opens would otherwise be reconnected to forever.
+MAX_RESUMES = 12
 
 CALLER_RATE = 16000
 AGENT_RATE = 24000
@@ -482,7 +487,7 @@ def greeting_prompt(caller_name, template=None):
     )
 
 
-def live_config(system_instruction, voice, tools=None):
+def live_config(system_instruction, voice, tools=None, resume_handle=None):
     config = {
         "response_modalities": ["AUDIO"],
         "system_instruction": {"parts": [{"text": system_instruction}]},
@@ -505,9 +510,14 @@ def live_config(system_instruction, voice, tools=None):
             "trigger_tokens": 60000,
             "sliding_window": {"target_tokens": 30000},
         },
-        # And a handle to come back with, so a session that does end can be
-        # resumed rather than started over.
-        "session_resumption": {},
+        # And a handle to come back with. A connection has a lifetime of its
+        # own, shorter than a long call and independent of how much has been
+        # said: the server warns with a go-away and drops it. Asked for, the
+        # handle is reissued as the conversation goes; given back on the next
+        # connect, the same conversation continues rather than starting over
+        # with a stranger who has forgotten the last nine minutes.
+        "session_resumption": (
+            {"handle": resume_handle} if resume_handle else {}),
     }
     if tools:
         config["tools"] = [{"function_declarations": list(tools)}]
@@ -640,6 +650,12 @@ class VoiceCallSession:
         self._model_idle.set()
         self._live = None
         self._stack = None
+        # The handle the server keeps reissuing, and how many times it has been
+        # spent. Cleared to `not ready` while a connection is being replaced, so
+        # audio spoken into the gap is dropped rather than played in late.
+        self._resume_handle = None
+        self._resumes = 0
+        self._live_ready = asyncio.Event()
         self._tasks = []
         self._pending_input = bytearray()
         self._input_queue = asyncio.Queue(maxsize=INPUT_QUEUE_FRAMES)
@@ -758,23 +774,41 @@ class VoiceCallSession:
                   + (", ".join(t["name"] for t in tools) if tools else "none"))
         return tools or None
 
-    async def start_agent(self):
+    async def _open_live(self, resume_handle=None):
+        """One connection to the speech model. Opened the same way whether it is
+        the first of a call or the one replacing a connection the server retired,
+        so a resumed call is not a second, subtly different code path."""
         from google import genai
 
-        self._stack = contextlib.AsyncExitStack()
+        stack = contextlib.AsyncExitStack()
         try:
             client = genai.Client(api_key=self._api_key)
-            self._live = await self._stack.enter_async_context(
+            self._live = await stack.enter_async_context(
                 client.aio.live.connect(
                     model=self._model,
                     config=live_config(
                         self._system_instruction, self._voice,
-                        tools=self._declared_tools()),
+                        tools=self._declared_tools(),
+                        resume_handle=resume_handle),
                 )
             )
+        except Exception:
+            await stack.aclose()
+            raise
+        self._stack = stack
+        self._live_ready.set()
+
+    async def _close_live(self):
+        stack, self._stack = self._stack, None
+        self._live = None
+        if stack is not None:
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+
+    async def start_agent(self):
+        try:
+            await self._open_live()
         except Exception as exc:
-            await self._stack.aclose()
-            self._stack = None
             raise VoiceAgentError(f"{type(exc).__name__}: {exc}") from exc
         self._tasks.append(asyncio.create_task(self._gemini_sender()))
         self._tasks.append(asyncio.create_task(self._gemini_receiver()))
@@ -789,6 +823,11 @@ class VoiceCallSession:
 
         while True:
             chunk = await self._input_queue.get()
+            if not self._live_ready.is_set():
+                # Between two connections. Audio spoken now has nowhere to go,
+                # and holding it would play it into the resumed conversation
+                # seconds late, on top of whatever is said next.
+                continue
             try:
                 await self._live.send_realtime_input(
                     audio=types.Blob(
@@ -797,8 +836,19 @@ class VoiceCallSession:
                     )
                 )
             except Exception as exc:
-                self._log(f"voice: Gemini input stopped — {type(exc).__name__}: {exc}")
-                return
+                if self._stream_ended:
+                    self._log(f"voice: Gemini input stopped — "
+                              f"{type(exc).__name__}: {exc}")
+                    return
+                # The receiver owns the decision to resume or hang up, and it is
+                # reading the same dying connection. A send that fails while that
+                # decision is being made is not itself the end of the call — but
+                # it is said once, or a fault that is not the connection at all
+                # would spend the whole call dropping audio in silence.
+                if self._live_ready.is_set():
+                    self._log(f"voice: Gemini input interrupted — "
+                              f"{type(exc).__name__}: {exc}")
+                self._live_ready.clear()
 
     async def _gemini_receiver(self):
         while True:
@@ -809,15 +859,51 @@ class VoiceCallSession:
                     self._consume(response)
                     await self._handle_tool_call(response)
             except Exception as exc:
+                if await self._resume(exc):
+                    continue
                 self._log(f"voice: Gemini stream ended — {type(exc).__name__}: {exc}")
                 await self._speech_is_over()
                 return
-            if not received:
-                await self._speech_is_over()
-                return
+            if received:
+                continue
+            if await self._resume(None):
+                continue
+            await self._speech_is_over()
+            return
+
+    async def _resume(self, exc):
+        """Come back on a new connection with the conversation intact.
+
+        A connection to the speech model is retired on its own schedule, long
+        before a talkative caller is finished: the server sends a go-away and
+        closes it. Without the handle that is exactly what the caller
+        experiences as the line dying mid-sentence. With it, the same
+        conversation continues — so what a resume must never do is quietly
+        become a fresh session that has forgotten the call so far, which is why
+        no handle means no resume, and why nothing is greeted a second time."""
+        if self._stream_ended or not self._resume_handle:
+            return False
+        if self._resumes >= MAX_RESUMES:
+            self._log(f"voice: {self._resumes} resumes already on this call — "
+                      "not asking for another")
+            return False
+        self._resumes += 1
+        self._live_ready.clear()
+        why = f"{type(exc).__name__}: {exc}" if exc is not None else "closed"
+        self._log(f"voice: speech connection {why} — resuming "
+                  f"(attempt {self._resumes} of {MAX_RESUMES})")
+        try:
+            await self._close_live()
+            await self._open_live(self._resume_handle)
+        except Exception as reopen:
+            self._log(f"voice: could not resume — "
+                      f"{type(reopen).__name__}: {reopen}")
+            return False
+        self._log("voice: resumed; the conversation carries on")
+        return True
 
     async def _speech_is_over(self):
-        """The speech session is gone and cannot come back on this call. Hang up
+        """The speech session is gone and could not be brought back. Hang up
         rather than hold the line: a caller left listening to silence has no way
         to tell a dead session from a long pause, and waits through both."""
         if self._stream_ended:
@@ -832,6 +918,19 @@ class VoiceCallSession:
                       f"{type(exc).__name__}: {exc}")
 
     def _consume(self, response):
+        # The handle is reissued as the conversation grows, and only a resumable
+        # one is worth keeping: the newest is what a resume must come back with.
+        update = getattr(response, "session_resumption_update", None)
+        if (update is not None and getattr(update, "resumable", False)
+                and getattr(update, "new_handle", None)):
+            self._resume_handle = update.new_handle
+        # The server's notice that this connection is being retired. Nothing is
+        # done with it beyond saying so: the stream ends by itself a moment
+        # later, and that single path is what resumes.
+        going = getattr(response, "go_away", None)
+        if going is not None:
+            self._log(f"voice: speech connection retiring in "
+                      f"{getattr(going, 'time_left', None) or 'a moment'}")
         content = getattr(response, "server_content", None)
         if content is None:
             return
@@ -977,6 +1076,11 @@ class VoiceCallSession:
                 # Nothing is running, so nothing in the window is still current.
                 self._progress_window.clear()
                 continue
+            if not self._live_ready.is_set():
+                # A connection is being replaced. Asked before the digest is
+                # taken, so the window survives the gap and what happened during
+                # it is still there to be said once the conversation is back.
+                continue
             note = self._due_progress()
             if note is None:
                 continue
@@ -984,9 +1088,15 @@ class VoiceCallSession:
                 await self._live.send_realtime_input(text=progress_prompt(note))
                 self._log(f"voice: progress offered to the model — {note[:80]!r}")
             except Exception as exc:
-                self._log("voice: cannot offer progress — "
-                          f"{type(exc).__name__}: {exc}")
-                return
+                if self._stream_ended:
+                    return
+                # Ending here would leave the caller in silence for the rest of
+                # a call that is otherwise fine — a resume the tick landed in
+                # the middle of must cost one note, not every later one.
+                if self._live_ready.is_set():
+                    self._log("voice: cannot offer progress — "
+                              f"{type(exc).__name__}: {exc}")
+                self._live_ready.clear()
 
     def _due_progress(self):
         """The digest to offer now, or None while any of the conditions that keep
@@ -1033,6 +1143,15 @@ class VoiceCallSession:
                     # failed to arrive; interrupting is better than losing it.
                     self._log(f"voice: task {job_id} still waiting after "
                               f"{ANNOUNCE_IDLE_TIMEOUT}s — speaking it anyway")
+            if not self._live_ready.is_set():
+                # There is no conversation to speak into for a moment. Waiting
+                # is right — the result is already off the queue and held in
+                # _announcing — but only for as long as waiting beats the chat.
+                self._log(f"voice: task {job_id} ready, waiting for the "
+                          "connection to come back")
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._live_ready.wait(),
+                                           timeout=ANNOUNCE_IDLE_TIMEOUT)
             try:
                 await self._live.send_realtime_input(
                     text=completion_prompt(completion))
@@ -1043,8 +1162,12 @@ class VoiceCallSession:
                 self._announcing = None
                 self._log("voice: cannot announce a finished task — "
                           f"{type(exc).__name__}: {exc}")
+                # The result is never lost: what cannot be spoken is written to
+                # the chat. But one that could not be spoken is no reason to
+                # stop speaking the next — only the call ending is.
                 await self._task_runner.deliver(completion)
-                return
+                if self._stream_ended:
+                    return
 
     def _record_fragment(self, speaker, text):
         """Transcriptions arrive as one-to-three-word fragments; join

@@ -1987,6 +1987,33 @@ def truncate_capability_output(text, limit):
     return body[:limit] + "\n…[cut]", True
 
 
+# The contract verbs every capability answers. On a call they pass the primer
+# untouched: reaching for one is already the behaviour the primer exists to
+# produce, and charging a round trip for asking what a tool is would teach the
+# opposite of what is wanted.
+CONTRACT_VERBS = ("help", "guide", "ids", "connections", "refs", "stub", "manifest")
+
+
+def voice_capability_step(args, capability, helped):
+    """What to do with a call's next capability command: `help` when the model
+    asks for the one verb that says how a tool is called, `contract` for the
+    other verbs, `prime` when a real command arrives at a tool nobody has read
+    yet, and `run` once it has been read.
+
+    Whole rather than split across a closure, because the rule it carries is
+    easy to get subtly wrong: only help stands in for help. A call that opened
+    with `guide` has been told what a tool is *for* and still has every flag left
+    to guess — and it guessed, twice, on the caller's time."""
+    first = args[0] if args else None
+    if first == "help":
+        return "help"
+    if first in CONTRACT_VERBS:
+        return "contract"
+    if capability not in helped:
+        return "prime"
+    return "run"
+
+
 def read_project_file_result(wanted):
     """Resolve, read and bound one project file, as the answer the model gets.
     Whole rather than split across a closure: the reading is the part that can
@@ -3452,12 +3479,10 @@ async def run_session(client):
                 # identifiers. These discovery reads receive the same authority
                 # envelope as the eventual command.
                 helped = active_voice_call.setdefault("helped_capabilities", set())
-                discovering = bool(args) and args[0] in (
-                    "help", "guide", "ids", "connections", "refs", "stub", "manifest")
-                if discovering:
+                step = voice_capability_step(args, capability, helped)
+                if step in ("help", "prime"):
                     helped.add(capability)
-                elif capability not in helped:
-                    helped.add(capability)
+                if step == "prime":
                     primer = {}
                     for verb in ("help", "ids"):
                         argv = [verb] if verb == "help" else [verb, "list"]

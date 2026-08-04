@@ -2125,6 +2125,40 @@ class VoiceCapabilityTests(unittest.IsolatedAsyncioTestCase):
             # one — the same answer the worker path gives.
             self.assertTrue(daemon.capability_allowed(None, "simplbooks"))
 
+    async def test_only_help_stands_in_for_help(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon(td)
+            helped = set()
+
+            # A real command at a tool nobody has read is answered with what the
+            # tool takes, rather than run on a guessed flag.
+            self.assertEqual(
+                daemon.voice_capability_step(["list", "--unread"], "mailbox", helped),
+                "prime")
+
+            # The other contract verbs pass through — asking what a tool is, is
+            # the behaviour worth having — but none of them says how it is
+            # called, so the primer is still owed afterwards.
+            for verb in ("guide", "refs", "ids", "connections", "manifest"):
+                self.assertEqual(
+                    daemon.voice_capability_step([verb], "telegram", helped),
+                    "contract", verb)
+            self.assertEqual(
+                daemon.voice_capability_step(["search", "-100"], "telegram", helped),
+                "prime")
+
+            # Help is what the primer is made of, so asking for it settles the
+            # debt and the next command runs.
+            self.assertEqual(
+                daemon.voice_capability_step(["help"], "coolify", helped), "help")
+            helped.add("coolify")
+            self.assertEqual(
+                daemon.voice_capability_step(["logs", "abc"], "coolify", helped), "run")
+
+            # No arguments at all is a real call, not a contract verb.
+            self.assertEqual(
+                daemon.voice_capability_step([], "fathom", helped), "prime")
+
     async def test_output_is_bounded_and_says_where_it_was_cut(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon(td)

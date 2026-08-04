@@ -221,7 +221,8 @@ def channel_onsets(path, rate=16000, block=0.01):
 
 @contextmanager
 def fake_genai_types():
-    """_handle_tool_call builds its reply with google.genai's FunctionResponse."""
+    """_handle_tool_call builds its reply with google.genai's FunctionResponse,
+    and the sender wraps caller audio in a Blob."""
     names = ("google", "google.genai", "google.genai.types")
     saved = {name: sys.modules.get(name) for name in names}
 
@@ -235,8 +236,14 @@ def fake_genai_types():
     google.__path__ = []
     genai = types.ModuleType("google.genai")
     genai.__path__ = []
+    class Blob:
+        def __init__(self, data=None, mime_type=None):
+            self.data = data
+            self.mime_type = mime_type
+
     genai_types = types.ModuleType("google.genai.types")
     genai_types.FunctionResponse = FunctionResponse
+    genai_types.Blob = Blob
     genai.types = genai_types
     google.genai = genai
     sys.modules.update({"google": google, "google.genai": genai,
@@ -282,7 +289,11 @@ def task_session(va, runner):
         RecordingCalls(), 42, api_key="k", model=None, voice=None,
         system_instruction="s", caller_name="Caller", task_runner=runner,
         log=lambda *_: None)
+    # A session handed a live socket is a connected one: the readiness the real
+    # connect sets is part of that, and without it these tests would be sitting
+    # in the reconnect gap without saying so.
     session._live = FakeLive()
+    session._live_ready.set()
     return session
 
 
@@ -1072,6 +1083,221 @@ class RunCapabilityToolTests(unittest.IsolatedAsyncioTestCase):
             # No arguments at all is a legitimate call, not a malformed one.
             await session._run_capability("clickup", None)
             self.assertEqual(seen[-1], ("clickup", []))
+
+
+class ScriptedLive(FakeLive):
+    """A Live socket that ends the way a real one does: some messages, then the
+    connection going away under the session."""
+
+    def __init__(self, messages, fail=None):
+        super().__init__()
+        self.messages = list(messages)
+        self.fail = fail
+        self.audio = []
+
+    async def send_realtime_input(self, text=None, audio=None):
+        if audio is not None:
+            self.audio.append(audio)
+        else:
+            self.texts.append(text)
+
+    async def receive(self):
+        for message in self.messages:
+            yield message
+        if self.fail is not None:
+            raise self.fail
+
+
+def resumption_update(handle, resumable=True):
+    return types.SimpleNamespace(
+        session_resumption_update=types.SimpleNamespace(
+            resumable=resumable, new_handle=handle),
+        go_away=None, server_content=None, tool_call=None)
+
+
+class SessionResumptionTests(unittest.IsolatedAsyncioTestCase):
+    """A connection to the speech model is retired long before a talkative
+    caller is finished. What must survive that is the conversation."""
+
+    def session(self, va, on_stream_end=None):
+        return va.VoiceCallSession(
+            RecordingCalls(), 42, api_key="k", model=None, voice=None,
+            system_instruction="s", caller_name="Caller",
+            on_stream_end=on_stream_end, log=lambda *_: None)
+
+    def reconnects_through(self, session, lives):
+        """Stand in for the real connect, recording the handle each one is
+        opened with — that handle is the whole difference between continuing a
+        conversation and starting a stranger's."""
+        opened = []
+
+        async def _open_live(resume_handle=None):
+            opened.append(resume_handle)
+            if not lives:
+                raise ConnectionError("nothing left to connect to")
+            session._live = lives.pop(0)
+            session._live_ready.set()
+
+        session._open_live = _open_live
+        return opened
+
+    async def test_a_retired_connection_comes_back_with_the_conversation(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            hangups = []
+
+            async def on_stream_end():
+                hangups.append(True)
+
+            session = self.session(va, on_stream_end)
+            second = ScriptedLive([], fail=None)
+            opened = self.reconnects_through(session, [second])
+            session._live = ScriptedLive(
+                [resumption_update("handle-1")],
+                fail=ConnectionError("1008 go away"))
+            session._live_ready.set()
+
+            await session._gemini_receiver()
+
+            # The newest handle went back on the wire, so the model still knows
+            # what was said before the drop.
+            self.assertEqual(opened[0], "handle-1")
+            # A resumed call is not a new one: greeting it again would have the
+            # assistant introduce itself in the middle of a conversation.
+            self.assertEqual(second.texts, [])
+            # And the caller was hung up on only after the second connection
+            # ended too, with nothing left to come back with.
+            self.assertEqual(len(hangups), 1)
+            self.assertEqual(session._resumes, 2)
+
+    async def test_a_connection_lost_before_any_handle_ends_the_call(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            hangups = []
+
+            async def on_stream_end():
+                hangups.append(True)
+
+            session = self.session(va, on_stream_end)
+            opened = self.reconnects_through(session, [])
+            session._live = ScriptedLive([], fail=ConnectionError("gone"))
+            session._live_ready.set()
+
+            await session._gemini_receiver()
+
+            # Reconnecting without a handle would silently swap the caller onto a
+            # session that has forgotten them. Hanging up is the honest end.
+            self.assertEqual(opened, [])
+            self.assertEqual(len(hangups), 1)
+
+    async def test_only_a_resumable_handle_is_kept(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            session = self.session(va)
+            session._live = FakeLive()
+
+            session._consume(resumption_update("h1"))
+            self.assertEqual(session._resume_handle, "h1")
+            # The server reissues as the conversation grows; the newest wins.
+            session._consume(resumption_update("h2"))
+            self.assertEqual(session._resume_handle, "h2")
+            # A handle the server says cannot be resumed with is not one.
+            session._consume(resumption_update("h3", resumable=False))
+            self.assertEqual(session._resume_handle, "h2")
+
+    async def test_coming_back_is_bounded(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            session = self.session(va)
+            session._live = FakeLive()
+            session._resume_handle = "h"
+            session._resumes = va.MAX_RESUMES
+            # A server dropping every connection the instant it opens must not
+            # be reconnected to forever.
+            self.assertFalse(await session._resume(ConnectionError("again")))
+
+    async def never(self, *_args, **_kwargs):
+        raise AssertionError("this call should not have been made")
+
+    def gap_session(self, va):
+        """A session mid-resume: a task running, and no connection to speak
+        into. This is not an edge of the resume scenario — progress ticks once a
+        second into exactly the lull a dead connection produces."""
+        runner = va.VoiceTaskRunner(lambda text: self.never(), self.never,
+                                    log=lambda *_: None)
+        session = task_session(va, runner)
+        session._live = None            # mid-resume: there is nothing to send to
+        session._live_ready.clear()
+        return runner, session
+
+    async def test_progress_survives_a_reconnect_it_ticks_into(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner, session = self.gap_session(va)
+            runner._jobs["j"] = object()          # something is running
+            session._progress_interval = 0.0
+            session.note_progress("searching for it")
+            session._caller_spoke_at = time.monotonic() - va.PROGRESS_CALLER_QUIET - 1
+
+            progress = asyncio.create_task(session._announce_progress())
+            await asyncio.sleep(1.3)
+            # Alive, and the window is untouched: what happened during the gap
+            # is still there to be said once the conversation is back.
+            self.assertFalse(progress.done())
+            self.assertTrue(session._progress_window)
+
+            session._live = FakeLive()
+            session._live_ready.set()
+            await asyncio.sleep(1.3)
+            self.assertTrue(session._live.texts)
+
+            progress.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress
+
+    async def test_a_finished_task_waits_for_the_connection_to_come_back(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner, session = self.gap_session(va)
+
+            announcer = asyncio.create_task(session._announce_completions())
+            runner.completions.put_nowait({"job_id": "task-1", "result": "done"})
+            await asyncio.sleep(0.1)
+            # Held rather than spoken into nothing — and never dropped.
+            self.assertIsNotNone(session._announcing)
+
+            session._live = FakeLive()
+            session._live_ready.set()
+            await asyncio.sleep(0.2)
+            self.assertTrue(session._live.texts)
+            self.assertIsNone(session._announcing)
+
+            announcer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await announcer
+
+    async def test_audio_spoken_between_connections_is_dropped(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            session = self.session(va)
+            live = ScriptedLive([])
+            session._live = live
+
+            session._live_ready.clear()
+            session._input_queue.put_nowait(b"\x00\x01")
+            sender = asyncio.create_task(session._gemini_sender())
+            await asyncio.sleep(0.05)
+            # Held audio would be played into the resumed conversation seconds
+            # late, on top of whatever is being said by then.
+            self.assertEqual(live.audio, [])
+
+            session._live_ready.set()
+            session._input_queue.put_nowait(b"\x02\x03")
+            await asyncio.sleep(0.05)
+            self.assertEqual(len(live.audio), 1)
+            sender.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sender
 
 
 if __name__ == "__main__":
