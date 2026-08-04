@@ -203,9 +203,8 @@ SERVICE = {
         "default_policy": "auto",
         "command": ["telegram", "service", "run"],
         "environment": {
-            "required": ["TELEGRAM_API_HASH"],
+            "required": ["TELEGRAM_API_ID", "TELEGRAM_API_HASH"],
             "optional": [
-                {"key": "TELEGRAM_API_ID"},
                 {"key": "TELEGRAM_SESSION"},
                 {"key": "DEEPGRAM_API_KEY"},
                 {"key": "TELEGRAM_CHANNEL_ENABLED", "default": "true"},
@@ -214,11 +213,11 @@ SERVICE = {
         },
         "mounts": [
             {"name": "telegram_state", "kind": "state",
-             "target": "/home/agent/.local/state/telegram"},
+             "target": "{agent_home}/.local/state/telegram"},
             {"name": "claude_state", "kind": "shared",
-             "target": "/home/agent/.claude"},
+             "target": "{agent_home}/.claude"},
             {"name": "codex_state", "kind": "shared",
-             "target": "/home/agent/.codex"},
+             "target": "{agent_home}/.codex"},
         ],
         "restart": "unless-stopped",
         "doctor": ["telegram", "service", "doctor"],

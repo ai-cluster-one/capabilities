@@ -114,8 +114,8 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
         "optional": [{"key": "ASANA_SERVICE_MODE", "default": "worker"}]
       },
       "mounts": [
-        {"name": "asana_state", "kind": "state", "target": "/home/agent/.local/state/asana"},
-        {"name": "codex_state", "kind": "shared", "target": "/home/agent/.codex"}
+        {"name": "asana_state", "kind": "state", "target": "{agent_home}/.local/state/asana"},
+        {"name": "codex_state", "kind": "shared", "target": "{agent_home}/.codex"}
       ],
       "restart": "unless-stopped",
       "doctor": ["asana", "service", "doctor"]
@@ -134,7 +134,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `state` | `true` declares the capability writes session/cache state (see [state](#state)). |
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
 | `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
-| `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts with absolute container targets, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Generic CLI credentials do not become service requirements unless the descriptor declares them. |
+| `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Mount targets are absolute or start with `{agent_home}` / `{project_root}` and are resolved by the consuming runtime. Generic CLI credentials do not become service requirements unless the descriptor declares them. |
 
 `default_policy: "auto"` makes an explicitly project-enabled capability eligible
 when the deployment runtime's `service_policy.auto_include` is true. `disabled`

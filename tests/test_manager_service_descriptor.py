@@ -39,3 +39,20 @@ def test_manager_rejects_unknown_deploy_schema(tmp_path: Path) -> None:
     assert proc.returncode == 7
     payload = json.loads(proc.stdout)
     assert any("service.deploy.schema" in failure for failure in payload["failures"])
+
+
+def test_telegram_descriptor_matches_runtime_credentials_and_uses_portable_mounts() -> None:
+    script = ROOT / "capabilities" / "telegram" / "bin" / "telegram"
+    proc = subprocess.run(
+        [str(script), "manifest", "--json"], cwd=ROOT,
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    deploy = json.loads(proc.stdout)["service"]["deploy"]
+    assert set(deploy["environment"]["required"]) == {
+        "TELEGRAM_API_ID", "TELEGRAM_API_HASH",
+    }
+    assert "TELEGRAM_API_ID" not in {
+        item["key"] for item in deploy["environment"]["optional"]
+    }
+    assert all(item["target"].startswith(("{agent_home}", "{project_root}"))
+               for item in deploy["mounts"])

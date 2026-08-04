@@ -674,6 +674,7 @@ def _bin_dir() -> Path:
 REQUIRED_MANIFEST_FIELDS = ("name", "summary", "credentials",
                             "docs", "state", "post_install")
 SERVICE_DEPLOY_SCHEMA = "capabilities.service.deploy.v1"
+SERVICE_MOUNT_TOKENS = ("{agent_home}", "{project_root}")
 
 
 def _validate_service_deploy(deploy: object) -> list[str]:
@@ -736,9 +737,14 @@ def _validate_service_deploy(deploy: object) -> list[str]:
                 names.add(name)
             if mount.get("kind") not in ("state", "shared"):
                 problems.append(f"service.deploy.mount kind must be state|shared: {mount!r}")
-            if (not isinstance(mount.get("target"), str)
-                    or not str(mount.get("target")).startswith("/")):
-                problems.append(f"service.deploy.mount target must be absolute: {mount!r}")
+            target = mount.get("target")
+            if (not isinstance(target, str) or not target
+                    or not (target.startswith("/")
+                            or any(target == token or target.startswith(token + "/")
+                                   for token in SERVICE_MOUNT_TOKENS))):
+                problems.append(
+                    "service.deploy.mount target must be absolute or start with "
+                    f"a portable token {SERVICE_MOUNT_TOKENS}: {mount!r}")
     if deploy.get("restart") not in ("no", "on-failure", "always", "unless-stopped"):
         problems.append("service.deploy.restart is invalid")
     return problems
