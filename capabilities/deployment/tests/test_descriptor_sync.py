@@ -118,6 +118,23 @@ def test_restart_no_is_rendered_as_a_yaml_string(tmp_path: Path) -> None:
     assert 'restart: "no"' in (root / "docker-compose.yaml").read_text()
 
 
+def test_optional_defaults_are_scoped_to_each_service(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram", "automations"))
+    for name, default in (("telegram", "telegram"), ("automations", "automations")):
+        manifest_path = Path(env["CAPABILITIES_HOME"]) / name / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["service"]["deploy"]["environment"]["optional"].append(
+            {"key": "SHARED_MODE", "default": default}
+        )
+        manifest_path.write_text(json.dumps(manifest) + "\n")
+
+    result = _setup(root, env)
+    assert result["services"] == ["automations", "telegram"]
+    compose = (root / "docker-compose.yaml").read_text()
+    assert compose.count('SHARED_MODE: "${SHARED_MODE:-automations}"') == 1
+    assert compose.count('SHARED_MODE: "${SHARED_MODE:-telegram}"') == 1
+
+
 def test_stale_service_directory_is_ignored(tmp_path: Path) -> None:
     root, env = _project(tmp_path)
     (root / "capabilities" / "telegram" / "service").mkdir(parents=True)

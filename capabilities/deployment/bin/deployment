@@ -908,7 +908,6 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[dict[str, dict], lis
         if include:
             active[name] = service
     mount_contracts: dict[str, tuple[str, str]] = {}
-    optional_defaults: dict[str, str] = {}
     for name, service in active.items():
         deploy = service["deploy"]
         for mount in deploy["mounts"]:
@@ -917,12 +916,6 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[dict[str, dict], lis
             if previous != contract:
                 findings.append({"severity": "error", "path": f"registry:{name}/manifest.json",
                                  "message": f"mount {mount['name']!r} conflicts with another active descriptor"})
-        for entry in deploy["environment"]["optional"]:
-            default = entry.get("default", "")
-            previous = optional_defaults.setdefault(entry["key"], default)
-            if previous != default:
-                findings.append({"severity": "error", "path": f"registry:{name}/manifest.json",
-                                 "message": f"optional env {entry['key']!r} has conflicting defaults"})
     return active, findings, migrated
 
 
