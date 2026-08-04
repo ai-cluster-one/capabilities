@@ -727,6 +727,8 @@ GRAPHQL_URL = "https://www.instagram.com/api/graphql"
 PREFLIGHT_URL = "https://www.instagram.com/api/v1/accounts/edit/web_form_data/"
 WEB_PROFILE_INFO_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
 USER_FEED_URL = "https://www.instagram.com/api/v1/feed/user/{user_id}/"
+DIRECT_INBOX_URL = "https://www.instagram.com/api/v1/direct_v2/inbox/"
+DIRECT_THREAD_URL = "https://www.instagram.com/api/v1/direct_v2/threads/{thread_id}/"
 LIKE_FRIENDLY_NAME = "usePolarisLikeMediaXIGLikeMutation"
 LIKE_DOC_ID = "27182485238052618"
 FOLLOW_FRIENDLY_NAME = "usePolarisFollowMutation"
@@ -791,6 +793,10 @@ Commands
                                                   List recent profile media.
   instagram media like <handle-or-url> <code-or-id>
                                                   Like one listed media item.
+  instagram conversations find <handle-or-url> [--max-pages N]
+                                                  Find an existing thread without creating one.
+  instagram messages inspect <handle-or-url> [--max-pages N]
+                                                  Detect prior outgoing messages without exposing text.
   instagram conversations resolve <handle-or-url> Obtain/create the private thread.
   instagram messages send <handle-or-url>
       (--text TEXT | --text-file PATH | --stdin)
@@ -1939,6 +1945,300 @@ class InstagramWebClient:
             )
         return {"status": "liked", **public_item, "server_media_id": response_id}
 
+    def _direct_headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "*/*",
+            "Referer": "https://www.instagram.com/direct/inbox/",
+            "User-Agent": self._header_value("User-Agent"),
+            "X-IG-App-ID": self._header_value("X-IG-App-ID"),
+            "X-ASBD-ID": self._header_value("X-ASBD-ID"),
+        }
+        csrf = self._cookie_value("csrftoken")
+        if csrf:
+            headers["X-CSRFToken"] = csrf
+        return {key: value for key, value in headers.items() if value}
+
+    def conversation_find(
+        self, profile_value: str, *, max_pages: int = 25
+    ) -> dict[str, Any]:
+        if max_pages < 1 or max_pages > 100:
+            raise InstagramFailure(6, "input", "max_pages must be between 1 and 100")
+        profile = self.profile(profile_value)
+        username = str(profile["username"])
+        recipient_pk = str(profile["recipient_pk"])
+        cursor = None
+        pages_scanned = 0
+        threads_scanned = 0
+        while pages_scanned < max_pages:
+            params = {"limit": "20"}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                response = self.http.get(
+                    DIRECT_INBOX_URL,
+                    params=params,
+                    headers=self._direct_headers(),
+                )
+            except httpx.HTTPError as exc:
+                raise InstagramFailure(
+                    5,
+                    "network_error",
+                    f"Inbox request failed: {type(exc).__name__}",
+                ) from exc
+            finally:
+                self._persist()
+            if response.status_code in {401, 403}:
+                raise InstagramFailure(
+                    2,
+                    "auth_failed",
+                    "Instagram login is required",
+                    status=response.status_code,
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise InstagramFailure(
+                    5,
+                    "invalid_response",
+                    "Inbox response was not JSON",
+                    status=response.status_code,
+                ) from exc
+            inbox = payload.get("inbox")
+            threads = inbox.get("threads") if isinstance(inbox, dict) else None
+            if (
+                response.status_code != 200
+                or payload.get("status") != "ok"
+                or not isinstance(threads, list)
+            ):
+                raise InstagramFailure(
+                    5,
+                    "inbox_unvalidated",
+                    "Instagram did not return a validated inbox page",
+                    status=response.status_code,
+                )
+            pages_scanned += 1
+            threads_scanned += len(threads)
+            for thread in threads:
+                if not isinstance(thread, dict) or thread.get("is_group") is True:
+                    continue
+                users = thread.get("users") if isinstance(thread.get("users"), list) else []
+                recipient_matches = any(
+                    isinstance(user, dict)
+                    and str(user.get("pk") or user.get("pk_id") or user.get("id") or "")
+                    == recipient_pk
+                    and str(user.get("username") or "").lower() == username.lower()
+                    for user in users
+                )
+                thread_id = str(thread.get("thread_id") or "")
+                thread_igid = str(thread.get("thread_v2_id") or "")
+                if recipient_matches and thread_id and thread_igid:
+                    return {
+                        "status": "found",
+                        "found": True,
+                        "scan_complete": True,
+                        "username": username,
+                        "recipient_pk": recipient_pk,
+                        "thread_id": thread_id,
+                        "thread_igid": thread_igid,
+                        "pending": bool(thread.get("pending")),
+                        "pages_scanned": pages_scanned,
+                        "threads_scanned": threads_scanned,
+                    }
+            if not inbox.get("has_older"):
+                return {
+                    "status": "not_found",
+                    "found": False,
+                    "scan_complete": True,
+                    "username": username,
+                    "recipient_pk": recipient_pk,
+                    "pages_scanned": pages_scanned,
+                    "threads_scanned": threads_scanned,
+                }
+            next_cursor = str(inbox.get("oldest_cursor") or "")
+            if not next_cursor or next_cursor == cursor:
+                return {
+                    "status": "unknown",
+                    "found": False,
+                    "scan_complete": False,
+                    "username": username,
+                    "recipient_pk": recipient_pk,
+                    "pages_scanned": pages_scanned,
+                    "threads_scanned": threads_scanned,
+                    "reason": "inbox_cursor_missing",
+                }
+            cursor = next_cursor
+        return {
+            "status": "unknown",
+            "found": False,
+            "scan_complete": False,
+            "username": username,
+            "recipient_pk": recipient_pk,
+            "pages_scanned": pages_scanned,
+            "threads_scanned": threads_scanned,
+            "reason": "max_pages_reached",
+        }
+
+    @staticmethod
+    def _message_metadata(
+        item: dict[str, Any], *, viewer_id: str, recipient_pk: str
+    ) -> dict[str, Any]:
+        user_id = str(item.get("user_id") or "")
+        if item.get("is_sent_by_viewer") is True or user_id == viewer_id:
+            sender = "viewer"
+        elif user_id == recipient_pk:
+            sender = "recipient"
+        else:
+            sender = "other"
+        return {
+            "item_id": str(item.get("item_id") or ""),
+            "message_id": str(item.get("message_id") or "") or None,
+            "item_type": item.get("item_type"),
+            "timestamp": str(item.get("timestamp") or "") or None,
+            "sender": sender,
+            "has_text": isinstance(item.get("text"), str),
+        }
+
+    def messages_inspect(
+        self, profile_value: str, *, max_pages: int = 25
+    ) -> dict[str, Any]:
+        conversation = self.conversation_find(profile_value, max_pages=max_pages)
+        base = {
+            "username": conversation["username"],
+            "recipient_pk": conversation["recipient_pk"],
+            "conversation_found": conversation["found"],
+            "inbox_pages_scanned": conversation["pages_scanned"],
+        }
+        if not conversation["found"]:
+            if conversation["scan_complete"]:
+                return {
+                    **base,
+                    "status": "no_conversation",
+                    "viewer_sent_message": False,
+                    "scan_complete": True,
+                    "history_pages_scanned": 0,
+                    "items_scanned": 0,
+                }
+            return {
+                **base,
+                "status": "unknown",
+                "viewer_sent_message": None,
+                "scan_complete": False,
+                "history_pages_scanned": 0,
+                "items_scanned": 0,
+                "reason": conversation.get("reason"),
+            }
+
+        thread_id = str(conversation["thread_id"])
+        cursor = None
+        pages_scanned = 0
+        items_scanned = 0
+        last_item = None
+        while pages_scanned < max_pages:
+            params = {"limit": "50"}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                response = self.http.get(
+                    DIRECT_THREAD_URL.format(thread_id=thread_id),
+                    params=params,
+                    headers=self._direct_headers(),
+                )
+            except httpx.HTTPError as exc:
+                raise InstagramFailure(
+                    5,
+                    "network_error",
+                    f"Thread history request failed: {type(exc).__name__}",
+                ) from exc
+            finally:
+                self._persist()
+            if response.status_code in {401, 403}:
+                raise InstagramFailure(
+                    2,
+                    "auth_failed",
+                    "Instagram login is required",
+                    status=response.status_code,
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise InstagramFailure(
+                    5,
+                    "invalid_response",
+                    "Thread history response was not JSON",
+                    status=response.status_code,
+                ) from exc
+            thread = payload.get("thread")
+            items = thread.get("items") if isinstance(thread, dict) else None
+            if (
+                response.status_code != 200
+                or payload.get("status") != "ok"
+                or not isinstance(items, list)
+                or str(thread.get("thread_id") or "") != thread_id
+            ):
+                raise InstagramFailure(
+                    5,
+                    "thread_history_unvalidated",
+                    "Instagram did not return validated thread history",
+                    status=response.status_code,
+                )
+            pages_scanned += 1
+            viewer_id = str(thread.get("viewer_id") or "")
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                metadata = self._message_metadata(
+                    item,
+                    viewer_id=viewer_id,
+                    recipient_pk=str(conversation["recipient_pk"]),
+                )
+                if last_item is None:
+                    last_item = metadata
+                items_scanned += 1
+                if metadata["sender"] == "viewer" and metadata["item_type"] != "action_log":
+                    return {
+                        **base,
+                        "status": "already_contacted",
+                        "viewer_sent_message": True,
+                        "scan_complete": True,
+                        "thread_id": thread_id,
+                        "thread_igid": conversation["thread_igid"],
+                        "pending": conversation["pending"],
+                        "history_pages_scanned": pages_scanned,
+                        "items_scanned": items_scanned,
+                        "last_item": last_item,
+                        "last_outgoing_item": metadata,
+                    }
+            if not thread.get("has_older"):
+                return {
+                    **base,
+                    "status": "no_outgoing_messages",
+                    "viewer_sent_message": False,
+                    "scan_complete": True,
+                    "thread_id": thread_id,
+                    "thread_igid": conversation["thread_igid"],
+                    "pending": conversation["pending"],
+                    "history_pages_scanned": pages_scanned,
+                    "items_scanned": items_scanned,
+                    "last_item": last_item,
+                }
+            next_cursor = str(thread.get("oldest_cursor") or "")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        return {
+            **base,
+            "status": "unknown",
+            "viewer_sent_message": None,
+            "scan_complete": False,
+            "thread_id": thread_id,
+            "thread_igid": conversation["thread_igid"],
+            "pending": conversation["pending"],
+            "history_pages_scanned": pages_scanned,
+            "items_scanned": items_scanned,
+            "last_item": last_item,
+            "reason": "message_history_incomplete",
+        }
+
     def resolve_thread(self, profile_value: str) -> RoutingResult:
         profile = self.profile(profile_value)
         username = str(profile["username"])
@@ -2233,6 +2533,20 @@ def _media_list_options(args: list[str]) -> tuple[int, str | None]:
     return limit, max_id
 
 
+def _max_pages_options(args: list[str]) -> int:
+    if not args:
+        return 25
+    if len(args) != 2 or args[0] != "--max-pages":
+        raise InstagramFailure(6, "input", "Expected --max-pages N")
+    try:
+        max_pages = int(args[1])
+    except ValueError as exc:
+        raise InstagramFailure(6, "input", "--max-pages must be an integer") from exc
+    if max_pages < 1 or max_pages > 100:
+        raise InstagramFailure(6, "input", "--max-pages must be between 1 and 100")
+    return max_pages
+
+
 def _raise_send_failure(result: SendResult) -> None:
     if result.status == "auth_failure":
         raise InstagramFailure(
@@ -2313,6 +2627,18 @@ def main() -> None:
             _write_gate(conn.id, conn.allow_write, "media.like")
             with InstagramWebClient(conn) as client:
                 result = client.like_media(argv[2], argv[3])
+            _emit({"connection": conn.id, **result})
+            return
+        if len(argv) >= 3 and argv[:2] == ["conversations", "find"]:
+            max_pages = _max_pages_options(argv[3:])
+            with InstagramWebClient(conn) as client:
+                result = client.conversation_find(argv[2], max_pages=max_pages)
+            _emit({"connection": conn.id, **result})
+            return
+        if len(argv) >= 3 and argv[:2] == ["messages", "inspect"]:
+            max_pages = _max_pages_options(argv[3:])
+            with InstagramWebClient(conn) as client:
+                result = client.messages_inspect(argv[2], max_pages=max_pages)
             _emit({"connection": conn.id, **result})
             return
         if len(argv) == 3 and argv[:2] == ["conversations", "resolve"]:

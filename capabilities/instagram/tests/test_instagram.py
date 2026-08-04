@@ -73,6 +73,21 @@ def _connection(path: Path, *, allow_write: bool = False):
     )
 
 
+def _bootstrap_page() -> str:
+    bootstrap = {
+        "require": [
+            ["DTSGInitialData", [], {"token": "dtsg-token"}],
+            ["LSD", [], {"token": "lsd-token"}],
+            ["SiteData", [], {"server_revision": 123}],
+        ]
+    }
+    return (
+        '<script type="application/json">'
+        + html.escape(json.dumps(bootstrap), quote=False)
+        + "</script>"
+    )
+
+
 class CaptureTests(unittest.TestCase):
     def test_parse_redacts_message_and_sensitive_headers(self) -> None:
         template = _template()
@@ -379,6 +394,211 @@ class ClientTests(unittest.TestCase):
                 client.close()
             self.assertEqual(result["status"], "already_following")
             self.assertTrue(result["following"])
+
+    def test_messages_inspect_finds_thread_and_prior_outgoing_without_text(self) -> None:
+        page = _bootstrap_page()
+        inbox_calls = 0
+        post_calls = 0
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal inbox_calls, post_calls
+                if request.method == "POST":
+                    post_calls += 1
+                    return httpx.Response(500, request=request)
+                if request.url.path == "/target.user/":
+                    return httpx.Response(200, text=page, request=request)
+                if request.url.path == "/api/v1/users/web_profile_info/":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "ok",
+                            "data": {"user": {"id": "12345", "username": "target.user"}},
+                        },
+                        request=request,
+                    )
+                if request.url.path == "/api/v1/direct_v2/inbox/":
+                    inbox_calls += 1
+                    if inbox_calls == 1:
+                        return httpx.Response(
+                            200,
+                            json={
+                                "status": "ok",
+                                "inbox": {
+                                    "threads": [],
+                                    "has_older": True,
+                                    "oldest_cursor": "next-page",
+                                },
+                            },
+                            request=request,
+                        )
+                    self.assertEqual(request.url.params.get("cursor"), "next-page")
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "ok",
+                            "inbox": {
+                                "threads": [
+                                    {
+                                        "thread_id": "thread-1",
+                                        "thread_v2_id": "igid-1",
+                                        "is_group": False,
+                                        "pending": False,
+                                        "users": [
+                                            {"pk": "12345", "username": "target.user"}
+                                        ],
+                                    }
+                                ],
+                                "has_older": False,
+                            },
+                        },
+                        request=request,
+                    )
+                self.assertEqual(
+                    request.url.path, "/api/v1/direct_v2/threads/thread-1/"
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "thread": {
+                            "thread_id": "thread-1",
+                            "viewer_id": "sender-1",
+                            "items": [
+                                {
+                                    "item_id": "incoming-1",
+                                    "user_id": "12345",
+                                    "timestamp": "200",
+                                    "item_type": "text",
+                                    "text": "recipient secret",
+                                },
+                                {
+                                    "item_id": "outgoing-1",
+                                    "message_id": "mid.outgoing",
+                                    "user_id": "sender-1",
+                                    "is_sent_by_viewer": True,
+                                    "timestamp": "100",
+                                    "item_type": "text",
+                                    "text": "viewer secret",
+                                },
+                            ],
+                            "has_older": True,
+                            "oldest_cursor": "older",
+                        },
+                    },
+                    request=request,
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                result = client.messages_inspect("target.user")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "already_contacted")
+            self.assertTrue(result["viewer_sent_message"])
+            self.assertEqual(result["last_outgoing_item"]["item_id"], "outgoing-1")
+            rendered = json.dumps(result)
+            self.assertNotIn("recipient secret", rendered)
+            self.assertNotIn("viewer secret", rendered)
+            self.assertEqual(inbox_calls, 2)
+            self.assertEqual(post_calls, 0)
+
+    def test_messages_inspect_proves_no_conversation_after_complete_scan(self) -> None:
+        page = _bootstrap_page()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/target.user/":
+                    return httpx.Response(200, text=page, request=request)
+                if request.url.path == "/api/v1/users/web_profile_info/":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "ok",
+                            "data": {"user": {"id": "12345", "username": "target.user"}},
+                        },
+                        request=request,
+                    )
+                self.assertEqual(request.url.path, "/api/v1/direct_v2/inbox/")
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "inbox": {"threads": [], "has_older": False},
+                    },
+                    request=request,
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                result = client.messages_inspect("target.user")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "no_conversation")
+            self.assertFalse(result["viewer_sent_message"])
+            self.assertTrue(result["scan_complete"])
+
+    def test_conversation_find_returns_unknown_when_page_limit_is_reached(self) -> None:
+        page = _bootstrap_page()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/target.user/":
+                    return httpx.Response(200, text=page, request=request)
+                if request.url.path == "/api/v1/users/web_profile_info/":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "ok",
+                            "data": {"user": {"id": "12345", "username": "target.user"}},
+                        },
+                        request=request,
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "inbox": {
+                            "threads": [],
+                            "has_older": True,
+                            "oldest_cursor": "older",
+                        },
+                    },
+                    request=request,
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                result = client.conversation_find("target.user", max_pages=1)
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "unknown")
+            self.assertFalse(result["scan_complete"])
+            self.assertEqual(result["reason"], "max_pages_reached")
 
     def test_media_list_and_like_use_validated_feed_item(self) -> None:
         bootstrap = {
