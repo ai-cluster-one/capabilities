@@ -48,11 +48,9 @@ def test_telegram_descriptor_matches_runtime_credentials_and_uses_portable_mount
         capture_output=True, text=True, timeout=30, check=True,
     )
     deploy = json.loads(proc.stdout)["service"]["deploy"]
-    assert set(deploy["environment"]["required"]) == {
-        "TELEGRAM_API_ID", "TELEGRAM_API_HASH",
-    }
-    assert "TELEGRAM_API_ID" not in {
-        item["key"] for item in deploy["environment"]["optional"]
-    }
+    assert deploy["environment"]["required"] == ["TELEGRAM_API_HASH"]
+    optional = {item["key"]: item for item in deploy["environment"]["optional"]}
+    assert "TELEGRAM_API_ID" in optional
+    assert "default" not in optional["TG_WORKER"]
     assert all(item["target"].startswith(("{agent_home}", "{project_root}"))
                for item in deploy["mounts"])

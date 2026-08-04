@@ -58,7 +58,7 @@ USAGE
       Only capabilities explicitly enabled in project settings are candidates.
       --check is read-only and exits 7 with structured drift details.
       --adopt explicitly replaces unmarked files at the runtime-declared
-      artifact paths; without it, the ownership boundary is preserved.
+      managed artifact paths; external artifacts and overlays are never written.
 
   deployment doctor [--target <name>]
       Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
@@ -98,12 +98,15 @@ FILES
       Dockerfile, entrypoint, env example, and dockerignore paths;
       compose_file declares the generated base Compose file;
       compiler.compose_overlays declares untouched project-owned overlays;
-      compiler.container supplies agent_home and project_root for portable mounts.
+      compiler.container supplies agent_home and project_root for portable mounts;
+      compiler.build_args is the only source of generated Compose build args.
+      A service environment_defaults mapping overrides descriptor env defaults.
 
   Runtime-declared compiler artifact paths
-      Compiler-owned artifacts carrying a generated marker. Setup defaults to
-      root paths; sync honors custom/nested paths, updates only marked files,
-      and preserves unmarked files and declared local Compose overlays.
+      A string path is compiler-managed for compatibility. Object declarations
+      use {path, ownership}, where ownership is managed or external. External
+      files must exist but are excluded from drift, sync, and adoption. Setup
+      defaults to managed root paths; declared local Compose overlays are external.
 
   deployment/targets/*.json
       One deployment target per file. Each target chooses a provider
@@ -934,6 +937,7 @@ def _compiler_config(runtime: dict) -> dict:
         },
         "compose_overlays": [],
         "container": {"agent_home": "/home/agent", "project_root": "/app"},
+        "build_args": {},
     }
     raw = runtime.get("compiler")
     if not isinstance(raw, dict):
@@ -942,8 +946,11 @@ def _compiler_config(runtime: dict) -> dict:
     raw_artifacts = raw.get("artifacts")
     if isinstance(raw_artifacts, dict):
         for key in artifacts:
-            if _safe_relative_path(raw_artifacts.get(key)):
-                artifacts[key] = raw_artifacts[key]
+            value = raw_artifacts.get(key)
+            path, ownership = _artifact_declaration(value)
+            if _safe_relative_path(path) and ownership in ("managed", "external"):
+                artifacts[key] = (value if isinstance(value, str) else
+                                  {"path": path, "ownership": ownership})
     container = dict(defaults["container"])
     raw_container = raw.get("container")
     if isinstance(raw_container, dict):
@@ -951,12 +958,29 @@ def _compiler_config(runtime: dict) -> dict:
             if _safe_container_path(raw_container.get(key)):
                 container[key] = raw_container[key]
     overlays = raw.get("compose_overlays")
+    raw_build_args = raw.get("build_args")
+    build_args = ({key: value for key, value in raw_build_args.items()
+                   if _safe_env_key(key) and isinstance(value, str)}
+                  if isinstance(raw_build_args, dict) else {})
     return {
         "artifacts": artifacts,
         "compose_overlays": ([value for value in overlays if _safe_relative_path(value)]
                              if isinstance(overlays, list) else []),
         "container": container,
+        "build_args": build_args,
     }
+
+
+def _artifact_declaration(value: object) -> tuple[object, object]:
+    if isinstance(value, str):
+        return value, "managed"
+    if isinstance(value, dict):
+        return value.get("path"), value.get("ownership")
+    return None, None
+
+
+def _safe_env_key(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[A-Z_][A-Z0-9_]*", value) is not None
 
 
 def _safe_relative_path(value: object) -> bool:
@@ -977,10 +1001,18 @@ def _artifact_paths(root: Path, runtime: dict) -> tuple[dict[str, Path], list[Pa
     compose = runtime.get("compose_file")
     compose_rel = compose if _safe_relative_path(compose) else "docker-compose.yaml"
     paths = {"compose": root / compose_rel}
-    paths.update({key: root / value for key, value in compiler["artifacts"].items()})
+    for key, value in compiler["artifacts"].items():
+        path, _ownership = _artifact_declaration(value)
+        paths[key] = root / str(path)
     overlays = [root / value for value in compiler["compose_overlays"]
                 if _safe_relative_path(value)]
     return paths, overlays
+
+
+def _artifact_ownership(runtime: dict, key: str) -> str:
+    value = _compiler_config(runtime)["artifacts"][key]
+    _path, ownership = _artifact_declaration(value)
+    return str(ownership)
 
 
 def _resolve_mount_target(target: str, compiler: dict) -> str:
@@ -1040,36 +1072,37 @@ def _dockerignore_template(has_contextkit: bool) -> str:
 
 def _env_example_template(runtime: dict, descriptors: dict[str, dict],
                           has_contextkit: bool = False) -> str:
-    lines = [
-        "# Image/build knobs",
-        "AGENT_IMAGE=agent-box",
-        "CAPABILITIES_REF=main",
-        "CODEX_REF=rust-v0.142.5",
-    ]
-    if has_contextkit:
-        lines.append("CONTEXTKIT_REF=main")
+    del has_contextkit
+    compiler = _compiler_config(runtime)
+    lines = ["# Image/build knobs", "AGENT_IMAGE=agent-box"]
+    lines += [f"{key}={value}" for key, value in sorted(compiler["build_args"].items())]
     lines += [
         "",
         "# Runtime secrets injected by Coolify / docker compose env.",
     ]
     required: set[str] = set(x for x in runtime.get("required_env", [])
                              if isinstance(x, str))
-    optional: dict[str, str] = {}
+    optional: dict[str, str] = {"GIT_DEPLOY_KEY_B64": ""}
     for key in runtime.get("optional_env", []):
         if isinstance(key, str):
             optional.setdefault(key, "")
     services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
-    for service in services.values():
+    for name, service in sorted(services.items()):
         if not isinstance(service, dict):
             continue
         required.update(x for x in service.get("required_env", []) if isinstance(x, str))
+        descriptor = descriptors.get(name)
+        if isinstance(descriptor, dict):
+            for entry in descriptor["deploy"]["environment"]["optional"]:
+                optional.setdefault(entry["key"], entry.get("default", ""))
         for key in service.get("optional_env", []):
             if isinstance(key, str):
                 optional.setdefault(key, "")
-    for service in descriptors.values():
-        env = service["deploy"]["environment"]
-        for entry in env["optional"]:
-            optional[entry["key"]] = entry.get("default", optional.get(entry["key"], ""))
+        defaults = service.get("environment_defaults")
+        if isinstance(defaults, dict):
+            for key, value in defaults.items():
+                if _safe_env_key(key) and isinstance(value, str):
+                    optional[key] = value
     for key in required:
         optional.pop(key, None)
     if required:
@@ -1080,10 +1113,6 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
         lines += ["# Optional capability-service settings."]
         lines += [f"{key}={optional[key]}" for key in sorted(optional)]
         lines.append("")
-    lines += [
-        "# Optional git push identity for agent-originated branches.",
-        "GIT_DEPLOY_KEY_B64=",
-    ]
     return "\n".join(lines) + "\n"
 
 
@@ -1241,22 +1270,13 @@ ENTRYPOINT [{json.dumps(entrypoint_path)}]
 def _compose_template(project_name: str, runtime: dict,
                       descriptors: dict[str, dict], build_context: str,
                       dockerfile_rel: str, has_contextkit: bool = False) -> str:
+    del has_contextkit
     slug = _slug(project_name)
     env_lines = [
         "x-agent-env: &agent-env",
         "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
     ]
-    build_args = [
-        "        CAPABILITIES_REF: ${CAPABILITIES_REF:-main}",
-        "        CODEX_REF: ${CODEX_REF:-rust-v0.142.5}",
-    ]
-    if has_contextkit:
-        build_args.append("        CONTEXTKIT_REF: ${CONTEXTKIT_REF:-main}")
-    build_args_text = "\n".join(build_args)
-    optional_defaults: dict[str, str] = {}
-    for descriptor in descriptors.values():
-        for item in descriptor["deploy"]["environment"]["optional"]:
-            optional_defaults[item["key"]] = item.get("default", "")
+    build_args = _compiler_config(runtime)["build_args"]
     runtime_services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
     runtime_volumes = runtime.get("volumes") if isinstance(runtime.get("volumes"), dict) else {}
     service_blocks: list[str] = []
@@ -1269,8 +1289,12 @@ def _compose_template(project_name: str, runtime: dict,
             "    build:",
             f"      context: {json.dumps(build_context)}",
             f"      dockerfile: {json.dumps(dockerfile_rel)}",
-            "      args:",
-            build_args_text,
+        ]
+        if build_args:
+            block.append("      args:")
+            block.extend(f"        {key}: {json.dumps(value)}"
+                         for key, value in sorted(build_args.items()))
+        block += [
             f"    image: ${{AGENT_IMAGE:-{slug}-agent}}",
             f"    container_name: {slug}-{compose_name}",
             f"    restart: {json.dumps(str(service.get('restart') or 'unless-stopped'))}",
@@ -1283,11 +1307,19 @@ def _compose_template(project_name: str, runtime: dict,
         required = [key for key in service.get("required_env", []) if isinstance(key, str)]
         optional = [key for key in service.get("optional_env", [])
                     if isinstance(key, str) and key not in required]
-        for key in sorted(set(required)):
-            block.append(f"      {key}: ${{{key}:?{key} is required}}")
-        for key in sorted(set(optional)):
-            default = optional_defaults.get(key, "")
-            block.append(f"      {key}: ${{{key}:-{default}}}")
+        defaults: dict[str, str] = {}
+        descriptor = descriptors.get(name)
+        if isinstance(descriptor, dict):
+            defaults.update({item["key"]: item.get("default", "")
+                             for item in descriptor["deploy"]["environment"]["optional"]})
+        project_defaults = service.get("environment_defaults")
+        if isinstance(project_defaults, dict):
+            defaults.update({key: value for key, value in project_defaults.items()
+                             if _safe_env_key(key) and isinstance(value, str)})
+        environment_keys = set(required) | set(optional) | set(defaults)
+        for key in sorted(environment_keys):
+            expression = f"${{{key}:-{defaults.get(key, '')}}}"
+            block.append(f"      {key}: {json.dumps(expression)}")
         states = [value for value in service.get("state", []) if isinstance(value, str)]
         if states:
             block.append("    volumes:")
@@ -1585,15 +1617,17 @@ def _artifact_texts(root: Path, runtime: dict,
     build_context = Path(os.path.relpath(root, paths["compose"].parent)).as_posix()
     dockerfile_rel = paths["dockerfile"].relative_to(root).as_posix()
     entrypoint_rel = paths["entrypoint"].relative_to(root).as_posix()
-    raw = {
-        paths["dockerignore"]: _dockerignore_template(has_contextkit),
-        paths["env_example"]: _env_example_template(runtime, active, has_contextkit),
-        paths["dockerfile"]: _dockerfile_template(
-            has_contextkit, compiler, entrypoint_rel),
-        paths["compose"]: _compose_template(
-            project_name, runtime, active, build_context, dockerfile_rel, has_contextkit),
-        paths["entrypoint"]: _entrypoint_template(project_name),
+    raw = {paths["compose"]: _compose_template(
+        project_name, runtime, active, build_context, dockerfile_rel, has_contextkit)}
+    candidates = {
+        "dockerignore": _dockerignore_template(has_contextkit),
+        "env_example": _env_example_template(runtime, active, has_contextkit),
+        "dockerfile": _dockerfile_template(has_contextkit, compiler, entrypoint_rel),
+        "entrypoint": _entrypoint_template(project_name),
     }
+    for key, text in candidates.items():
+        if _artifact_ownership(runtime, key) == "managed":
+            raw[paths[key]] = text
     return {path: _mark_generated(path, text) for path, text in raw.items()}
 
 
@@ -1764,6 +1798,12 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                 if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
                     findings.append({"severity": "error", "path": _rel(root, path),
                                      "message": f"services.{service_name}.{field} must be a list of strings"})
+            defaults = service.get("environment_defaults", {})
+            if (not isinstance(defaults, dict)
+                    or not all(_safe_env_key(key) and isinstance(value, str)
+                               for key, value in defaults.items())):
+                findings.append({"severity": "error", "path": _rel(root, path),
+                                 "message": f"services.{service_name}.environment_defaults must map env keys to strings"})
     volumes = data.get("volumes", {})
     if not isinstance(volumes, dict):
         findings.append({"severity": "error", "path": _rel(root, path),
@@ -1788,9 +1828,16 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                              "message": "compiler.artifacts must be an object"})
         else:
             for key in ("dockerfile", "entrypoint", "env_example", "dockerignore"):
-                if not _safe_relative_path(artifacts.get(key)):
+                declaration = artifacts.get(key)
+                artifact_path, ownership = _artifact_declaration(declaration)
+                if (not _safe_relative_path(artifact_path)
+                        or ownership not in ("managed", "external")):
                     findings.append({"severity": "error", "path": _rel(root, path),
-                                     "message": f"compiler.artifacts.{key} must be a safe project-relative path"})
+                                     "message": (f"compiler.artifacts.{key} must be a safe path string or "
+                                                 "{path, ownership: managed|external}")})
+                elif ownership == "external" and not (root / str(artifact_path)).is_file():
+                    findings.append({"severity": "error", "path": str(artifact_path),
+                                     "message": f"external compiler artifact {key!r} does not exist"})
         overlays = compiler_raw.get("compose_overlays", [])
         if (not isinstance(overlays, list)
                 or not all(_safe_relative_path(value) for value in overlays)):
@@ -1814,9 +1861,18 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
             if isinstance(home, str) and Path(home).parent.as_posix() != "/home":
                 findings.append({"severity": "error", "path": _rel(root, path),
                                  "message": "compiler.container.agent_home must be /home/<user> for the generated agent image"})
+        build_args = compiler_raw.get("build_args", {})
+        if (not isinstance(build_args, dict)
+                or not all(_safe_env_key(key) and isinstance(value, str)
+                           for key, value in build_args.items())):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": "compiler.build_args must map env-style keys to strings"})
         configured = ([compose_file] if isinstance(compose_file, str) else [])
         if isinstance(artifacts, dict):
-            configured.extend(value for value in artifacts.values() if isinstance(value, str))
+            for value in artifacts.values():
+                artifact_path, _ownership = _artifact_declaration(value)
+                if isinstance(artifact_path, str):
+                    configured.append(artifact_path)
         if len(configured) != len(set(configured)):
             findings.append({"severity": "error", "path": _rel(root, path),
                              "message": "compiler artifact paths must be distinct"})

@@ -272,36 +272,37 @@ def test_dockerfile_uses_public_installer(tmp_path: Path) -> None:
     print("✓ Dockerfile uses public installer with correct build order")
 
 
-def test_compose_includes_contextkit_ref(tmp_path: Path) -> None:
-    """Verify docker-compose.yaml includes CONTEXTKIT_REF build arg."""
+def test_compose_omits_undeclared_contextkit_ref(tmp_path: Path) -> None:
+    """Dockerfile ARG defaults remain authoritative unless runtime opts in."""
     project = setup_test_project(tmp_path, with_contextkit=True, name="test-compose")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
     compose = (project / "docker-compose.yaml").read_text()
 
-    # Should include CONTEXTKIT_REF build arg
-    assert "CONTEXTKIT_REF:" in compose, \
-        "Should include CONTEXTKIT_REF build arg"
-    assert "${CONTEXTKIT_REF:-main}" in compose, \
-        "Should default CONTEXTKIT_REF to main"
+    assert "CONTEXTKIT_REF:" not in compose
+    assert "      args:" not in compose
 
-    print("✓ docker-compose.yaml includes CONTEXTKIT_REF")
+    print("✓ docker-compose.yaml omits undeclared build args")
 
 
-def test_env_example_includes_contextkit_ref(tmp_path: Path) -> None:
-    """Verify .env.example includes CONTEXTKIT_REF for ContextKit projects."""
+def test_declared_build_arg_is_compiled_and_documented(tmp_path: Path) -> None:
+    """Explicit runtime build args are emitted into Compose and env example."""
     project = setup_test_project(tmp_path, with_contextkit=True, name="test-env")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
+    runtime_path = project / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["compiler"]["build_args"] = {"CONTEXTKIT_REF": "pinned-contextkit"}
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    run_cmd(["deployment", "sync"], cwd=project)
 
+    compose = (project / "docker-compose.yaml").read_text()
     env_example = (project / ".env.example").read_text()
+    assert 'CONTEXTKIT_REF: "pinned-contextkit"' in compose
+    assert "CONTEXTKIT_REF=pinned-contextkit" in env_example
 
-    # Should include CONTEXTKIT_REF
-    assert "CONTEXTKIT_REF=" in env_example, \
-        "Should include CONTEXTKIT_REF in .env.example"
-
-    print("✓ .env.example includes CONTEXTKIT_REF")
+    print("✓ declared build arg is compiled and documented")
 
 
 def test_non_contextkit_behavior_preserved(tmp_path: Path) -> None:
@@ -361,8 +362,8 @@ def main() -> None:
         test_dry_run_no_contextkit_copy(tmppath)
         test_dockerignore_excludes_contextkit(tmppath)
         test_dockerfile_uses_public_installer(tmppath)
-        test_compose_includes_contextkit_ref(tmppath)
-        test_env_example_includes_contextkit_ref(tmppath)
+        test_compose_omits_undeclared_contextkit_ref(tmppath)
+        test_declared_build_arg_is_compiled_and_documented(tmppath)
         test_non_contextkit_behavior_preserved(tmppath)
         test_build_fails_on_missing_steps(tmppath)
 

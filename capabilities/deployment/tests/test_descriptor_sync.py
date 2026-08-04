@@ -103,8 +103,9 @@ def test_slack_requires_bot_and_app_tokens(tmp_path: Path) -> None:
     compose = (root / "docker-compose.yaml").read_text()
     env_example = (root / ".env.example").read_text()
     for key in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
-        assert f"{key}: ${{{key}:?{key} is required}}" in compose
+        assert f'{key}: "${{{key}:-}}"' in compose
         assert f"{key}=" in env_example
+    assert env_example.count("GIT_DEPLOY_KEY_B64=") == 1
 
 
 def test_restart_no_is_rendered_as_a_yaml_string(tmp_path: Path) -> None:
@@ -200,8 +201,30 @@ def test_unmarked_owned_path_is_preserved(tmp_path: Path) -> None:
     assert not (root / "deployment" / "runtime.json").exists()
 
 
-def test_nested_layout_adoption_preserves_project_service_extensions(tmp_path: Path) -> None:
-    root, env = _project(tmp_path, ("telegram",))
+def test_external_artifact_must_exist_and_is_not_created(tmp_path: Path) -> None:
+    root, env = _project(tmp_path)
+    init = _run(root, env, "init", "--provider", "manual", "--force")
+    assert init.returncode == 0, init.stderr
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["compiler"]["artifacts"]["dockerfile"] = {
+        "path": "deployment/docker/Dockerfile",
+        "ownership": "external",
+    }
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    proc = _run(root, env, "sync", "--adopt")
+    assert proc.returncode == 6
+    payload = json.loads(proc.stdout)
+    assert any(finding["path"] == "deployment/docker/Dockerfile"
+               and "does not exist" in finding["message"]
+               for finding in payload["findings"])
+    assert not (root / "deployment" / "docker" / "Dockerfile").exists()
+
+
+def test_mixed_ownership_nested_layout_preserves_external_files_and_compose_semantics(
+        tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram", "automations"))
     init = _run(root, env, "init", "--provider", "manual", "--force")
     assert init.returncode == 0, init.stderr
 
@@ -210,10 +233,10 @@ def test_nested_layout_adoption_preserves_project_service_extensions(tmp_path: P
     runtime["compose_file"] = "deployment/compose.yaml"
     runtime["compiler"] = {
         "artifacts": {
-            "dockerfile": "deployment/docker/Dockerfile",
-            "entrypoint": "deployment/docker/entrypoint.sh",
-            "env_example": ".env.example",
-            "dockerignore": ".dockerignore",
+            "dockerfile": {"path": "deployment/docker/Dockerfile", "ownership": "external"},
+            "entrypoint": {"path": "deployment/docker/entrypoint.sh", "ownership": "external"},
+            "env_example": {"path": ".env.example", "ownership": "external"},
+            "dockerignore": {"path": ".dockerignore", "ownership": "external"},
         },
         "compose_overlays": ["deployment/compose.local.yaml"],
         "container": {"agent_home": "/home/jess", "project_root": "/app"},
@@ -222,7 +245,12 @@ def test_nested_layout_adoption_preserves_project_service_extensions(tmp_path: P
         "role": "project-worker",
         "description": "Project-owned worker declaration.",
         "required_env": ["WORKER_SESSION"],
-        "optional_env": ["AGENT_IMAGE", "WORKER_MODE"],
+        "optional_env": ["AGENT_IMAGE", "WORKER_MODE", "GOOGLE_API_KEY",
+                         "MAILBOX_INTAKE_AGENT_RUNTIME", "MAILBOX_INTAKE_MAX_USD"],
+        "environment_defaults": {
+            "MAILBOX_INTAKE_AGENT_RUNTIME": "codex",
+            "MAILBOX_INTAKE_MAX_USD": "10",
+        },
         "state": ["claude_state", "codex_state", "worker_state"],
         "project_extension": {"queue": "primary"},
     })
@@ -234,13 +262,32 @@ def test_nested_layout_adoption_preserves_project_service_extensions(tmp_path: P
         "restart": "always",
         "required_env": ["PROJECT_CHANNEL_TOKEN"],
         "optional_env": ["PROJECT_CHANNEL_MODE"],
+        "environment_defaults": {
+            "TELEGRAM_CHANNEL_ENABLED": "false",
+            "TG_WORKER": "",
+        },
         "state": ["worker_state"],
         "project_extension": {"routing": "project"},
+    }
+    runtime["services"]["automations"] = {
+        "capability": "automations",
+        "role": "project-scheduler",
+        "compose_service": "automations",
+        "description": "Project scheduler overrides.",
+        "required_env": [],
+        "optional_env": ["MAILBOX_INTAKE_AGENT_RUNTIME", "MAILBOX_INTAKE_MAX_USD"],
+        "environment_defaults": {
+            "AUTOMATIONS_NAMESPACE": "project",
+            "MAILBOX_INTAKE_AGENT_RUNTIME": "codex",
+            "MAILBOX_INTAKE_MAX_USD": "10",
+        },
+        "state": ["worker_state"],
     }
     runtime["volumes"] = {
         "claude_state": {"kind": "shared", "mount": "/home/jess/.claude"},
         "codex_state": {"kind": "shared", "mount": "/home/jess/.codex"},
         "telegram_state": {"kind": "state", "mount": "/home/jess/.local/state/telegram"},
+        "automations_state": {"kind": "state", "mount": "/app/capabilities/automations/state"},
         "worker_state": {"kind": "shared", "mount": "/home/jess/.local/state/worker"},
     }
     runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
@@ -251,10 +298,23 @@ def test_nested_layout_adoption_preserves_project_service_extensions(tmp_path: P
 
     owned = {
         root / "deployment" / "compose.yaml": "services: {}\n",
-        root / "deployment" / "docker" / "Dockerfile": "FROM scratch\n",
-        root / "deployment" / "docker" / "entrypoint.sh": "#!/bin/sh\n",
-        root / ".env.example": "PROJECT_OWNED=1\n",
-        root / ".dockerignore": "project-owned\n",
+        root / "deployment" / "docker" / "Dockerfile": (
+            "FROM debian:bookworm-slim\nARG CAPABILITIES_REF=1111111\n"
+            "ARG CONTEXTKIT_REF=2222222\nARG CODEX_REF=rust-v0.139.0\n"
+            "RUN mkdir -p /workspace/project capabilities/automations/state\n"
+            "RUN telegram help >/dev/null\n"
+        ),
+        root / "deployment" / "docker" / "entrypoint.sh": (
+            "#!/bin/sh\ngit config --global user.name 'Project Agent'\n"
+            "git config --global user.email agent@example.invalid\nexec \"$@\"\n"
+        ),
+        root / ".env.example": (
+            "# Project-owned documentation\nGOOGLE_API_KEY=\n"
+            "MAILBOX_INTAKE_AGENT_RUNTIME=codex\nGIT_DEPLOY_KEY_B64=\n"
+        ),
+        root / ".dockerignore": (
+            "expenses/\nmessages/\n*.log\n.claude/rules/generated/\n"
+        ),
     }
     for path, content in owned.items():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,9 +323,18 @@ def test_nested_layout_adoption_preserves_project_service_extensions(tmp_path: P
     overlay_content = "services:\n  telegram:\n    environment:\n      LOCAL_ONLY: 'true'\n"
     overlay.write_text(overlay_content)
     (root / "capabilities" / "telegram" / "service").mkdir(parents=True)
+    automation_config = root / "capabilities" / "automations" / "service" / "config.toml"
+    automation_config.parent.mkdir(parents=True)
+    automation_config.write_text("[automations]\n")
+    (root / "capabilities" / "telegram" / "connections.json").write_text(
+        json.dumps({"default": "main", "connections": {
+            "main": {"api_id": 123456, "secret_env": "TELEGRAM_API_HASH",
+                     "allow_write": True}
+        }}) + "\n"
+    )
     (root / ".env.local").write_text(
         "WORKER_SESSION=test\nPROJECT_CHANNEL_TOKEN=test\n"
-        "TELEGRAM_API_ID=1\nTELEGRAM_API_HASH=test\n"
+        "TELEGRAM_API_HASH=test\n"
     )
 
     before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
@@ -274,18 +343,21 @@ def test_nested_layout_adoption_preserves_project_service_extensions(tmp_path: P
     check_payload = json.loads(check.stdout)
     unmanaged = {item["path"]: item for item in check_payload["drift"]
                  if item["kind"] == "unmanaged_conflict"}
-    assert set(unmanaged) == {
-        ".dockerignore", ".env.example", "deployment/compose.yaml",
-        "deployment/docker/Dockerfile", "deployment/docker/entrypoint.sh",
-    }
+    assert set(unmanaged) == {"deployment/compose.yaml"}
     assert all("sync --adopt" in item["hint"] for item in unmanaged.values())
-    assert not any(item["path"] in {"Dockerfile", "docker-compose.yaml", "entrypoint.sh"}
+    external_paths = {path.relative_to(root).as_posix() for path in owned
+                      if path != root / "deployment" / "compose.yaml"}
+    assert not any(item["path"] in external_paths
                    for item in check_payload["drift"])
     assert before == {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
     adopt = _run(root, env, "sync", "--adopt")
     assert adopt.returncode == 0, adopt.stdout + adopt.stderr
     assert overlay.read_text() == overlay_content
+    assert external_paths.isdisjoint({item["path"] for item in json.loads(adopt.stdout)["written"]})
+    for path, content in owned.items():
+        if path != root / "deployment" / "compose.yaml":
+            assert path.read_text() == content
     compiled = json.loads(runtime_path.read_text())
     agent = compiled["services"]["agent"]
     telegram = compiled["services"]["telegram"]
@@ -297,26 +369,39 @@ def test_nested_layout_adoption_preserves_project_service_extensions(tmp_path: P
     assert telegram["description"] == "Project-owned Telegram worker overrides."
     assert telegram["restart"] == "always"
     assert telegram["project_extension"] == {"routing": "project"}
-    assert set(telegram["required_env"]) == {
-        "PROJECT_CHANNEL_TOKEN", "TELEGRAM_API_ID", "TELEGRAM_API_HASH",
+    assert set(telegram["required_env"]) == {"PROJECT_CHANNEL_TOKEN", "TELEGRAM_API_HASH"}
+    assert set(telegram["optional_env"]) >= {"PROJECT_CHANNEL_MODE", "TELEGRAM_API_ID"}
+    assert telegram["environment_defaults"] == {
+        "TELEGRAM_CHANNEL_ENABLED": "false", "TG_WORKER": "",
     }
-    assert "PROJECT_CHANNEL_MODE" in telegram["optional_env"]
     assert set(telegram["state"]) >= {
         "worker_state", "telegram_state", "claude_state", "codex_state",
     }
-    assert all(volume["mount"].startswith("/home/jess")
-               for volume in compiled["volumes"].values())
+    assert compiled["volumes"]["claude_state"]["mount"] == "/home/jess/.claude"
+    assert compiled["volumes"]["codex_state"]["mount"] == "/home/jess/.codex"
+    assert compiled["volumes"]["automations_state"]["mount"] == "/app/capabilities/automations/state"
 
     compose = (root / "deployment" / "compose.yaml").read_text()
-    dockerfile = (root / "deployment" / "docker" / "Dockerfile").read_text()
     assert 'context: ".."' in compose
     assert 'dockerfile: "deployment/docker/Dockerfile"' in compose
-    assert "PROJECT_CHANNEL_TOKEN: ${PROJECT_CHANNEL_TOKEN:?PROJECT_CHANNEL_TOKEN is required}" in compose
-    assert "TELEGRAM_API_ID: ${TELEGRAM_API_ID:?TELEGRAM_API_ID is required}" in compose
+    assert "      args:" not in compose
+    assert "CAPABILITIES_REF" not in compose
+    assert 'PROJECT_CHANNEL_TOKEN: "${PROJECT_CHANNEL_TOKEN:-}"' in compose
+    assert 'TELEGRAM_API_ID: "${TELEGRAM_API_ID:-}"' in compose
+    assert 'TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"' in compose
+    assert 'TELEGRAM_CHANNEL_ENABLED: "${TELEGRAM_CHANNEL_ENABLED:-false}"' in compose
+    assert 'TG_WORKER: "${TG_WORKER:-}"' in compose
+    assert 'AUTOMATIONS_NAMESPACE: "${AUTOMATIONS_NAMESPACE:-project}"' in compose
+    assert 'MAILBOX_INTAKE_AGENT_RUNTIME: "${MAILBOX_INTAKE_AGENT_RUNTIME:-codex}"' in compose
+    assert 'MAILBOX_INTAKE_MAX_USD: "${MAILBOX_INTAKE_MAX_USD:-10}"' in compose
+    assert 'GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"' in compose
+    assert ":?" not in compose
     assert "worker_state:/home/jess/.local/state/worker" in compose
-    assert "ARG USERNAME=jess" in dockerfile
-    assert "WORKDIR /app" in dockerfile
-    assert "ENTRYPOINT [\"/app/deployment/docker/entrypoint.sh\"]" in dockerfile
+    assert "telegram_state:/home/jess/.local/state/telegram" in compose
+    assert "automations_state:/app/capabilities/automations/state" in compose
+    for volume_name in ("claude_state", "codex_state", "telegram_state",
+                        "automations_state", "worker_state"):
+        assert f"  {volume_name}:" in compose
 
     clean_check = _run(root, env, "sync", "--check")
     assert clean_check.returncode == 0, clean_check.stdout + clean_check.stderr
@@ -324,4 +409,6 @@ def test_nested_layout_adoption_preserves_project_service_extensions(tmp_path: P
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
     doctor_payload = json.loads(doctor.stdout)
     assert doctor_payload["drift"] == []
+    assert not any("TELEGRAM_API_ID" in finding["message"]
+                   for finding in doctor_payload["findings"])
     assert overlay.read_text() == overlay_content

@@ -49,16 +49,26 @@ and `compiler.container` resolves portable service mount targets:
   "compose_file": "deployment/compose.yaml",
   "compiler": {
     "artifacts": {
-      "dockerfile": "deployment/docker/Dockerfile",
-      "entrypoint": "deployment/docker/entrypoint.sh",
-      "env_example": ".env.example",
-      "dockerignore": ".dockerignore"
+      "dockerfile": {"path": "deployment/docker/Dockerfile", "ownership": "external"},
+      "entrypoint": {"path": "deployment/docker/entrypoint.sh", "ownership": "external"},
+      "env_example": {"path": ".env.example", "ownership": "external"},
+      "dockerignore": {"path": ".dockerignore", "ownership": "external"}
     },
     "compose_overlays": ["deployment/compose.local.yaml"],
     "container": {"agent_home": "/home/jess", "project_root": "/app"}
   }
 }
 ```
+
+Artifact strings remain managed for compatibility. The object form makes
+ownership explicit: `managed` artifacts participate in generation, drift, and
+`--adopt`; `external` artifacts must exist but are never generated, compared,
+or overwritten. Compose remains managed through `compose_file`, while declared
+overlays remain external.
+
+Compose build arguments are emitted only from `compiler.build_args`. When that
+mapping is absent or empty, generated Compose has no `build.args`, so an
+external Dockerfile's own `ARG` defaults remain authoritative.
 
 Capability descriptors use `{agent_home}` and `{project_root}` mount targets.
 Compilation resolves those tokens through `compiler.container`; an existing
@@ -69,13 +79,20 @@ restart, additional required/optional environment, additional state, and
 extension fields are preserved. Descriptor requirements are added as a union,
 not used as a replacement.
 
-Generated artifacts carry an ownership marker. Sync updates marked files and
+Each runtime service may declare `environment_defaults`, a mapping from env key
+to string fallback. These project defaults take precedence over descriptor
+optional defaults and may introduce additional project env keys. Required env
+uses non-failing `${KEY:-}` interpolation in Compose; readiness belongs to
+doctor/preflight rather than Compose parsing.
+
+Managed generated artifacts carry an ownership marker. Sync updates marked files and
 creates missing files, but refuses an unmarked file at any declared artifact
-path. Declared Compose overlays, additional env files, and unrelated project
-files are left untouched. For a pre-standard project, first declare the exact
+path. External artifacts are validated for existence and otherwise ignored.
+Declared Compose overlays, additional env files, and unrelated project files
+are left untouched. For a pre-standard project, first declare the exact
 layout and container paths in `runtime.json`, run `deployment sync --check`,
 review its ownership drift, then run `deployment sync --adopt` to transfer only
-those declared artifact paths to the compiler. For a `manual` target, also set
+declared managed artifact paths to the compiler. For a `manual` target, also set
 `resource.compose_file` to the same value as runtime `compose_file`; doctor and
 plan reject a mismatch. A legacy runtime without
 `service_policy` or `compiler` records root-layout defaults on first sync;
