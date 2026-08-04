@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 
@@ -41,6 +41,7 @@ def _capture(message: str = "secret probe") -> str:
     }
     form = urlencode(
         {
+            "av": "actor-123",
             "fb_dtsg": "token",
             "variables": json.dumps(variables),
             "doc_id": "123456789",
@@ -271,6 +272,138 @@ class ClientTests(unittest.TestCase):
                 client.close()
             self.assertEqual(profile["recipient_pk"], "12345")
             self.assertEqual(profile["follower_count"], 42)
+
+    def test_media_list_and_like_use_validated_feed_item(self) -> None:
+        bootstrap = {
+            "require": [
+                ["DTSGInitialData", [], {"token": "dtsg-token"}],
+                ["LSD", [], {"token": "lsd-token"}],
+                ["SiteData", [], {"server_revision": 123}],
+            ]
+        }
+        page = (
+            '<script type="application/json">'
+            + html.escape(json.dumps(bootstrap), quote=False)
+            + "</script>"
+        )
+        posts = []
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path, allow_write=True))
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.method == "POST":
+                    posts.append(request)
+                    form = parse_qs(request.content.decode())
+                    self.assertEqual(
+                        form["fb_api_req_friendly_name"][0],
+                        instagram.LIKE_FRIENDLY_NAME,
+                    )
+                    self.assertEqual(form["doc_id"][0], instagram.LIKE_DOC_ID)
+                    variables = json.loads(form["variables"][0])
+                    self.assertEqual(variables["input"]["actor_id"], "actor-123")
+                    self.assertEqual(variables["input"]["media_id"], "98765")
+                    self.assertEqual(
+                        variables["input"]["tracking_token"], "tracking-token"
+                    )
+                    return httpx.Response(
+                        200,
+                        json={
+                            "data": {
+                                "xig_media_like": {
+                                    "media": {
+                                        "id": "98765_12345",
+                                        "has_liked": True,
+                                    }
+                                }
+                            }
+                        },
+                        request=request,
+                    )
+                if request.url.path == "/target.user/":
+                    return httpx.Response(200, text=page, request=request)
+                if request.url.path == "/api/v1/users/web_profile_info/":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "ok",
+                            "data": {"user": {"id": "12345", "username": "target.user"}},
+                        },
+                        request=request,
+                    )
+                self.assertEqual(request.url.path, "/api/v1/feed/user/12345/")
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "items": [
+                            {
+                                "pk": "98765",
+                                "id": "98765_12345",
+                                "code": "POSTCODE",
+                                "media_type": 1,
+                                "product_type": "feed",
+                                "has_liked": False,
+                                "like_count": 10,
+                                "taken_at": 123,
+                                "organic_tracking_token": "tracking-token",
+                                "user": {"username": "target.user"},
+                            }
+                        ],
+                        "more_available": False,
+                    },
+                    request=request,
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                result = client.like_media("target.user", "POSTCODE")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "liked")
+            self.assertEqual(result["media_pk"], "98765")
+            self.assertNotIn("_tracking_token", result)
+            self.assertEqual(len(posts), 1)
+
+    def test_media_like_is_idempotent_when_feed_is_already_liked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path, allow_write=True))
+            client.media_list = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+                "items": [
+                    {
+                        "media_pk": "98765",
+                        "media_id": "98765_12345",
+                        "code": "POSTCODE",
+                        "permalink": "https://www.instagram.com/p/POSTCODE/",
+                        "owner_username": "target.user",
+                        "media_type": 1,
+                        "product_type": "feed",
+                        "has_liked": True,
+                        "like_count": 11,
+                        "taken_at": 123,
+                        "is_pinned": False,
+                        "_tracking_token": "tracking-token",
+                    }
+                ],
+                "more_available": False,
+                "next_max_id": None,
+            }
+            try:
+                result = client.like_media("target.user", "POSTCODE")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "already_liked")
+            self.assertNotIn("_tracking_token", result)
 
     def test_resolve_thread_validates_recipient(self) -> None:
         payload = {
