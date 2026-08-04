@@ -166,6 +166,7 @@ def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path
         "print(json.dumps({'cwd':os.getcwd(),'home':os.environ.get('HOME'),"
         "'cache':os.environ.get('XDG_CACHE_HOME'),"
         "'uv_cache':os.environ.get('UV_CACHE_DIR'),"
+        "'project_dir':os.environ.get('CLAUDE_PROJECT_DIR'),"
         "'secret':os.environ.get('DEV_TEST_SECRET'),'argv':sys.argv[1:]}))"
     )
     isolated = json.loads(
@@ -190,6 +191,7 @@ def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path
     assert isolated["uv_cache"] == str(
         Path(started["isolated"]["cache"]) / "uv"
     )
+    assert isolated["project_dir"] is None
     assert isolated["secret"] is None
     assert isolated["argv"] == ["--cwd", "consumer"]
 
@@ -208,6 +210,7 @@ def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path
         ).stdout
     )
     assert inherited["cwd"] == str(consumer_worktree)
+    assert inherited["project_dir"] == str(consumer_worktree)
     assert inherited["secret"] == "only-when-named"
 
     managed = _run(

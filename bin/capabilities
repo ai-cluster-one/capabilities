@@ -1645,6 +1645,8 @@ def cmd_dev_exec(session_id: str, command: list[str], cwd_choice: str | None,
     session = _dev_session(session_id)
     env = _dev_env(session, inherit)
     cwd = _dev_cwd(session, cwd_choice)
+    if cwd == Path(session["source"]["worktree"]):
+        env.pop("CLAUDE_PROJECT_DIR", None)
     name = command[0]
     canonical_names = set(_installed()) | {"capabilities"}
     if "/" not in name and name in canonical_names:
