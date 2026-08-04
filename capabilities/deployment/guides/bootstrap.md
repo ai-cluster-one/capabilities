@@ -13,9 +13,9 @@ deployment next
 
 The default profile is `agent-box`: a long-running container image with Codex,
 Claude, ContextKit when the project uses it, and capability CLIs installed by
-the capabilities manager. If Telegram or Automations is enabled or already
-configured, `setup` also creates the corresponding service in
-`docker-compose.yaml` with its own persistent state volume.
+the capabilities manager. Setup compiles deploy descriptors for capabilities
+explicitly enabled in project settings. Global inheritance, installed payloads,
+and existing service directories do not authorize runtime services.
 
 `deployment setup --dry-run` shows which files would be written before changing
 the project.
@@ -24,8 +24,12 @@ The human-facing questions are intentionally simple:
 
 - What kind of thing is being deployed? Default: `agent-box`.
 - Where should it run? Default: `coolify`.
-- Should it run a Telegram assistant service? Default: `auto`.
-- Should it run the automation scheduler service? Default: `auto`.
+- Which explicitly project-enabled capability services should run? Default:
+  descriptor policy plus `service_policy.auto_include`.
+
+The Telegram and automations setup flags remain compatibility shorthands. They
+write `enabled` or `disabled` overrides into `runtime.json`; `auto` leaves the
+generic descriptor policy in control.
 
 After setup, `deployment next` prints the checklist for the chosen target:
 which files were created, which secrets must be entered, local validation

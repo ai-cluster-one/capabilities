@@ -12,7 +12,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "b7f45a26aad2ecd03c223fd89787af7dee177d85eb4737b146f1a0922fa6851c",
+      "payload_sha256": "9da5d809fd89b885456265266ee3ffac76385b4aecf44079d4f9012c0edaf446",
       "summary": "Project-local scheduler and subprocess runner with versioned config, SQLite run history, concurrency, retries, timeouts, and cancellation."
     },
     "callva": {
@@ -32,7 +32,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "7782a4e8e028f70249dbfe0663f63cc495aaf416c3637a4f597e795b92c54908",
+      "payload_sha256": "5d4389ac91882a9cbb15e1adb686ad4f5f0b7ef2622e50ace40f15fa8761b139",
       "summary": "Project deployment standard - declare runtime services, target providers, references, and capability locks without depending on any one deployment adapter."
     },
     "directo": {
@@ -102,7 +102,7 @@
     },
     "slack": {
       "path": "capabilities/slack",
-      "payload_sha256": "503852e3fc1262f59fd35574f4480639e452314b98356ed30e772d9a38b92f44",
+      "payload_sha256": "24ccda531bf96391897481ded39843e718c026849e173a3efc3c376d4e9d8998",
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
     "stripe": {
@@ -112,7 +112,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "2d2e5bdd886fcab86653f8fb635a66cfaea272f9995c48dbf0d6e3079a31f931",
+      "payload_sha256": "bb13d83db34e78af663fde635941681972610cf90ec073dec16e4916524428ef",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, send, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {

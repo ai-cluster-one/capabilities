@@ -673,6 +673,75 @@ def _bin_dir() -> Path:
 
 REQUIRED_MANIFEST_FIELDS = ("name", "summary", "credentials",
                             "docs", "state", "post_install")
+SERVICE_DEPLOY_SCHEMA = "capabilities.service.deploy.v1"
+
+
+def _validate_service_deploy(deploy: object) -> list[str]:
+    problems: list[str] = []
+    if not isinstance(deploy, dict):
+        return ["service.deploy is not an object"]
+    if deploy.get("schema") != SERVICE_DEPLOY_SCHEMA:
+        problems.append(f"service.deploy.schema must be {SERVICE_DEPLOY_SCHEMA!r}")
+    if deploy.get("default_policy") not in ("auto", "disabled"):
+        problems.append("service.deploy.default_policy must be auto|disabled")
+    for field in ("command", "doctor"):
+        value = deploy.get(field)
+        if field == "doctor" and value is None:
+            continue
+        if (not isinstance(value, list) or not value
+                or not all(isinstance(v, str) and v for v in value)):
+            problems.append(f"service.deploy.{field} must be a non-empty argv list")
+    environment = deploy.get("environment")
+    if not isinstance(environment, dict):
+        problems.append("service.deploy.environment is not an object")
+    else:
+        required = environment.get("required")
+        if (not isinstance(required, list)
+                or not all(isinstance(v, str) and re.match(r"^[A-Z_][A-Z0-9_]*$", v)
+                           for v in required)
+                or len(required) != len(set(required))):
+            problems.append("service.deploy.environment.required must be a list of env keys")
+        optional = environment.get("optional")
+        if not isinstance(optional, list):
+            problems.append("service.deploy.environment.optional is not a list")
+        else:
+            optional_names: set[str] = set()
+            for entry in optional:
+                if (not isinstance(entry, dict)
+                        or not isinstance(entry.get("key"), str)
+                        or not re.match(r"^[A-Z_][A-Z0-9_]*$", entry.get("key", ""))
+                        or entry.get("key") in optional_names
+                        or entry.get("key") in (required if isinstance(required, list) else [])):
+                    problems.append(
+                        f"service.deploy.environment.optional entry malformed: {entry!r}")
+                else:
+                    optional_names.add(entry["key"])
+                if isinstance(entry, dict) and "default" in entry and not isinstance(entry["default"], str):
+                    problems.append(
+                        f"service.deploy.environment.optional default is not a string: {entry!r}")
+    mounts = deploy.get("mounts")
+    if not isinstance(mounts, list):
+        problems.append("service.deploy.mounts is not a list")
+    else:
+        names: set[str] = set()
+        for mount in mounts:
+            if not isinstance(mount, dict):
+                problems.append(f"service.deploy.mount entry malformed: {mount!r}")
+                continue
+            name = mount.get("name")
+            if (not isinstance(name, str) or not re.match(r"^[a-z][a-z0-9_]*$", name)
+                    or name in names):
+                problems.append(f"service.deploy.mount name malformed or duplicated: {name!r}")
+            else:
+                names.add(name)
+            if mount.get("kind") not in ("state", "shared"):
+                problems.append(f"service.deploy.mount kind must be state|shared: {mount!r}")
+            if (not isinstance(mount.get("target"), str)
+                    or not str(mount.get("target")).startswith("/")):
+                problems.append(f"service.deploy.mount target must be absolute: {mount!r}")
+    if deploy.get("restart") not in ("no", "on-failure", "always", "unless-stopped"):
+        problems.append("service.deploy.restart is invalid")
+    return problems
 
 
 def _validate_manifest(name: str, manifest) -> list[str]:
@@ -731,6 +800,8 @@ def _validate_manifest(name: str, manifest) -> list[str]:
             verbs = service.get("verbs")
             if not isinstance(verbs, list) or not all(isinstance(v, str) for v in verbs):
                 problems.append("service.verbs is not a list of strings")
+            if "deploy" in service:
+                problems.extend(_validate_service_deploy(service["deploy"]))
     return problems
 
 # ---------------------------------------------------------------- snapshots

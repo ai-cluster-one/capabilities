@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -10,6 +11,7 @@ from pathlib import Path
 
 
 DEPLOYMENT = Path(__file__).resolve().parents[1] / "bin" / "deployment"
+AUTOMATIONS = Path(__file__).resolve().parents[2] / "automations" / "bin" / "automations"
 
 
 class DeploymentAutomationsTests(unittest.TestCase):
@@ -28,6 +30,14 @@ class DeploymentAutomationsTests(unittest.TestCase):
             )
             + "\n"
         )
+        self.registry = Path(self.tmp.name) / "registry"
+        manifest_dir = self.registry / "automations"
+        manifest_dir.mkdir(parents=True)
+        manifest = subprocess.run(
+            [str(AUTOMATIONS), "manifest", "--json"], capture_output=True,
+            text=True, check=True, timeout=30,
+        ).stdout
+        (manifest_dir / "manifest.json").write_text(manifest)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -45,6 +55,7 @@ class DeploymentAutomationsTests(unittest.TestCase):
                 *extra,
             ],
             cwd=self.root,
+            env={**os.environ, "CAPABILITIES_HOME": str(self.registry)},
             capture_output=True,
             text=True,
             timeout=30,

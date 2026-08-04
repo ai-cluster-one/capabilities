@@ -24,12 +24,36 @@ The standard files are:
   setup. When present, they hold genuine project-specific deployment context
   rather than pointers duplicating runtime.json or target JSON schemas.
 
-Use `deployment setup` for a full bootstrap, including Dockerfile,
-docker-compose, env example, entrypoint, deployment declarations, and human next
-steps. Use `deployment init` only when you want the declaration files without
-Docker scaffolding. Use `deployment freeze` after the capability gate changes,
-`deployment doctor` before relying on the declaration, and `deployment plan`
-when deciding which provider adapter would execute a target.
+Use `deployment setup` for a full bootstrap, including Dockerfile, Compose, env
+example, entrypoint, deployment declarations, and human next steps. Use
+`deployment init` only when you want declarations. `deployment sync` is the sole
+compiler for capability services: it discovers installed
+`manifest.service.deploy` descriptors, filters them through explicit project
+enablement and `runtime.json` service policy, and reconciles the runtime graph,
+lock, Compose, env example, Dockerfile, dockerignore, and entrypoint.
+
+`service_policy.auto_include` controls descriptor-default auto inclusion.
+`service_policy.capabilities` accepts `enabled`, `disabled`, or `auto` per
+capability. An override cannot bypass the explicit project gate. Run
+`deployment sync --check` in CI; it performs no writes and reports structured
+missing/content/ownership drift with exit 7.
+
+Generated root artifacts carry an ownership marker. Sync updates marked files
+and creates missing files, but refuses an unmarked file at an owned path. Local
+Compose overlays, additional env files, and unrelated project files are left
+untouched. For a pre-standard project, review the finding and either move local
+customization into an overlay or deliberately adopt the generated boundary with
+`deployment setup --force`. A legacy runtime without `service_policy` migrates
+listed capability services to explicit enabled overrides on first sync. Legacy
+Telegram/automations setup flags remain policy shorthands.
+
+This stage compiles generated container artifacts for the `agent-box` profile.
+The `generic` profile remains a declaration-only runtime and doctor reports an
+actionable finding if sync is requested for it.
+
+Use `deployment freeze` after a capability gate change when only the lock is
+needed, `deployment doctor` to validate settings → lock → runtime services →
+compiled artifacts, and `deployment plan` to select the provider adapter.
 
 Docker builds should bootstrap the capabilities manager from the selected
 `CAPABILITIES_REF`, then run `capabilities install <name>` for each non-comment

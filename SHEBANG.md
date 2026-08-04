@@ -104,7 +104,22 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
   "service": {
     "name": "assistant",
     "summary": "Project-local assistant daemon using the bundled service engine.",
-    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"]
+    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
+    "deploy": {
+      "schema": "capabilities.service.deploy.v1",
+      "default_policy": "auto",
+      "command": ["asana", "service", "run"],
+      "environment": {
+        "required": ["ASANA_SERVICE_TOKEN"],
+        "optional": [{"key": "ASANA_SERVICE_MODE", "default": "worker"}]
+      },
+      "mounts": [
+        {"name": "asana_state", "kind": "state", "target": "/home/agent/.local/state/asana"},
+        {"name": "codex_state", "kind": "shared", "target": "/home/agent/.codex"}
+      ],
+      "restart": "unless-stopped",
+      "doctor": ["asana", "service", "doctor"]
+    }
   }
 }
 ```
@@ -118,7 +133,15 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `docs.topics` | The shipped topic list; `[]` when no guides ship. |
 | `state` | `true` declares the capability writes session/cache state (see [state](#state)). |
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
-| `service` *(optional)* | Conservative metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns the detailed lifecycle contract, usually under `<name> service ...`. |
+| `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
+| `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts with absolute container targets, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Generic CLI credentials do not become service requirements unless the descriptor declares them. |
+
+`default_policy: "auto"` makes an explicitly project-enabled capability eligible
+when the deployment runtime's `service_policy.auto_include` is true. `disabled`
+requires that runtime to name the capability with an `enabled` override. Neither
+value authorizes a service: explicit project capability enablement remains the
+outer gate. The manager validates v1 descriptors during audit, source check, and
+install; capabilities without `service` or without `service.deploy` remain valid.
 
 ## Guides
 

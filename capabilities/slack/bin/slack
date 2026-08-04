@@ -134,6 +134,25 @@ SERVICE = {
     "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
     "config": "capabilities/slack/service",
     "state": "$XDG_STATE_HOME/slack/<connection>/service",
+    "deploy": {
+        "schema": "capabilities.service.deploy.v1",
+        "default_policy": "auto",
+        "command": ["slack", "service", "run"],
+        "environment": {
+            "required": ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"],
+            "optional": [],
+        },
+        "mounts": [
+            {"name": "slack_state", "kind": "state",
+             "target": "/home/agent/.local/state/slack"},
+            {"name": "claude_state", "kind": "shared",
+             "target": "/home/agent/.claude"},
+            {"name": "codex_state", "kind": "shared",
+             "target": "/home/agent/.codex"},
+        ],
+        "restart": "unless-stopped",
+        "doctor": ["slack", "service", "doctor"],
+    },
 }
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))

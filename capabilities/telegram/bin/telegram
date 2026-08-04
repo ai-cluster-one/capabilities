@@ -198,6 +198,31 @@ SERVICE = {
     "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
     "config": "capabilities/telegram/service",
     "state": "<connection-state>/service",
+    "deploy": {
+        "schema": "capabilities.service.deploy.v1",
+        "default_policy": "auto",
+        "command": ["telegram", "service", "run"],
+        "environment": {
+            "required": ["TELEGRAM_API_HASH"],
+            "optional": [
+                {"key": "TELEGRAM_API_ID"},
+                {"key": "TELEGRAM_SESSION"},
+                {"key": "DEEPGRAM_API_KEY"},
+                {"key": "TELEGRAM_CHANNEL_ENABLED", "default": "true"},
+                {"key": "TG_WORKER", "default": "codex"},
+            ],
+        },
+        "mounts": [
+            {"name": "telegram_state", "kind": "state",
+             "target": "/home/agent/.local/state/telegram"},
+            {"name": "claude_state", "kind": "shared",
+             "target": "/home/agent/.claude"},
+            {"name": "codex_state", "kind": "shared",
+             "target": "/home/agent/.codex"},
+        ],
+        "restart": "unless-stopped",
+        "doctor": ["telegram", "service", "doctor"],
+    },
 }
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
