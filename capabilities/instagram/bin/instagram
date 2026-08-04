@@ -1,0 +1,1846 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""instagram — agent-first CLI over an authenticated Instagram web session.
+
+Contract:
+  instagram help
+  instagram doctor [--connection ID]
+  instagram connections
+  instagram stub
+  instagram manifest --json
+  instagram guide [topic]
+  instagram ids list|get|set|rm
+  instagram refs
+
+Run `instagram help` for the complete command and authentication contract.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from html.parser import HTMLParser
+from http.cookies import SimpleCookie
+from pathlib import Path
+from typing import Any, NoReturn, Self
+from urllib.parse import parse_qsl, urlparse
+
+import httpx
+
+NAME = "instagram"
+SUMMARY = (
+    "Instagram CLI over a captured browser session — validate identity, read "
+    "profiles, resolve Direct threads, and send text messages. Stateful — run "
+    "`instagram doctor` first."
+)
+SCOPE = "user"
+CRED_KEYS: list[dict[str, Any]] = []
+WRITE_VERBS = {"conversations.resolve", "messages.send"}
+WRITE_DEFAULT = False
+DOCS_BASE = ""
+TOPICS: list[str] = []
+STATE = True
+POST_INSTALL: list[dict] = []
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding capabilities/, legacy .capabilities/,
+    .contextkit/config.toml, .env(.local), or .git.
+    Markers are read from the filesystem alone: the root is what the envelope
+    location is resolved against, so resolving one cannot depend on the other.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".contextkit" / "config.toml").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+_ENVELOPE_HOME: dict = {}
+
+
+def _contextkit_envelope(root: Path):
+    """Ask ContextKit where it keeps this project's envelope; None if it cannot.
+
+    $CAPABILITIES_PROJECT_ENVELOPE is the same answer handed over in advance.
+    """
+    import subprocess
+
+    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
+    if override:
+        candidate = Path(override)
+    else:
+        try:
+            proc = subprocess.run(["contextkit", "path", "capabilities"], cwd=root,
+                                  capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if not lines:
+            return None
+        candidate = Path(lines[0])
+    if not candidate.is_absolute():
+        return None
+    try:
+        resolved = candidate.resolve()
+        if root.resolve() not in resolved.parents:
+            return None
+    except OSError:
+        return None
+    return resolved
+
+
+def _envelope_home(root: Path) -> Path:
+    """The project's envelope root, resolved once per invocation.
+
+    ContextKit owns the location of a project it manages (`.contextkit/
+    config.toml`), so it is asked rather than assumed. Every other project — and
+    every ContextKit answer that does not arrive usable — keeps the envelope at
+    `<root>/capabilities`.
+    """
+    cached = _ENVELOPE_HOME.get(root)
+    if cached is not None:
+        return cached
+    home = root / "capabilities"
+    if (root / ".contextkit" / "config.toml").is_file():
+        home = _contextkit_envelope(root) or home
+    _ENVELOPE_HOME[root] = home
+    return home
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    The resolved envelope is canonical. A legacy `.capabilities/` remains
+    readable until `capabilities init` migrates it. If both exist, the canonical
+    tree wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = _envelope_home(root)
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _auth_context() -> dict | None:
+    """Optional runtime authority envelope passed by an ingress/service.
+
+    Absence means the ordinary project gate is the whole policy. Presence means
+    a request-scoped authority layer exists and must fail closed before any
+    credential or network work happens.
+    """
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return None
+    try:
+        if raw.lstrip().startswith("{"):
+            data = json.loads(raw)
+        else:
+            data = json.loads(Path(raw).read_text())
+    except (OSError, ValueError) as e:
+        _die(4, "auth_context_unreadable",
+             "runtime authority context could not be read",
+             f"{raw}: {e}")
+    if not isinstance(data, dict):
+        _die(4, "auth_context_invalid",
+             "runtime authority context is not an object")
+    return data
+
+
+def _auth_capability_allowed(rule) -> bool:
+    if rule is True or rule == "*":
+        return True
+    if rule in (False, None):
+        return False
+    if isinstance(rule, dict):
+        if rule.get("deny") is True:
+            return False
+        if rule.get("enabled") is False or rule.get("allow") is False:
+            return False
+        return True
+    return False
+
+
+def _auth_gate() -> None:
+    ctx = _auth_context()
+    if ctx is None:
+        return
+    allowed = ctx.get("allowed_capabilities")
+    if allowed is None:
+        return
+    if allowed is True or allowed == "*":
+        return
+    if isinstance(allowed, list):
+        if NAME in allowed or "*" in allowed:
+            return
+    elif isinstance(allowed, dict):
+        if _auth_capability_allowed(allowed.get(NAME, allowed.get("*"))):
+            return
+    else:
+        _die(4, "auth_context_invalid",
+             "runtime authority context has invalid allowed_capabilities")
+    source = ctx.get("source") or "runtime"
+    role = ctx.get("sender_role") or ctx.get("role") or "unknown"
+    chat = ctx.get("chat_id") or "unknown"
+    _die(4, "capability_not_authorized",
+         f"{NAME} is not authorized for this {source} request",
+         f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
+
+
+def _policy_entry(path: Path):
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        _die(6, "bad_policy", f"cannot read capability policy {path}: {e}")
+    capabilities = data.get("capabilities") if isinstance(data, dict) else None
+    if not isinstance(capabilities, dict):
+        _die(6, "bad_policy", f"{path} is not a capability policy",
+             'expected {"capabilities": {"<name>": {"enabled": true}}}')
+    entry = capabilities.get(NAME)
+    if entry is not None and (not isinstance(entry, dict)
+                              or set(entry) != {"enabled"}
+                              or not isinstance(entry.get("enabled"), bool)):
+        _die(6, "bad_policy", f"invalid {NAME} policy entry in {path}",
+             'expected {"enabled": true|false}')
+    return entry
+
+
+def _project_enabled_explicitly() -> bool:
+    """True only for an explicit project enabled entry; global inheritance is
+    deliberately insufficient for project-owned service activation."""
+    root = _project_root()
+    if root is None:
+        return False
+    entry = _policy_entry(_project_capabilities_dir(root) / "settings.json")
+    return isinstance(entry, dict) and entry.get("enabled") is True
+
+
+def _require_project_enabled_for_service() -> Path:
+    root = _project_root()
+    if root is None or not _project_enabled_explicitly():
+        _die(4, "project_enable_required",
+             f"{NAME} service activation requires an explicit project enable",
+             f"ask the user, then run `capabilities enable {NAME} --project` "
+             "before service init/start/run")
+    return root
+
+
+def _gate() -> None:
+    """Project policy overrides global policy; absence inherits, and absence at
+    both scopes is default deny. Safe local discovery verbs remain available so
+    a disabled capability can be understood and configured before use.
+
+    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
+    is stricter and runs first, before credentials or network calls.
+    """
+    _auth_gate()
+    verb = sys.argv[1] if len(sys.argv) > 1 else "help"
+    service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    service_contract = globals().get("SERVICE")
+    if isinstance(service_contract, dict) and verb == "service" \
+            and service_action in {"init", "start", "run"}:
+        _require_project_enabled_for_service()
+    if verb in {"help", "stub", "manifest", "connections"}:
+        return
+    root = _project_root()
+    project_file = (_project_capabilities_dir(root) / "settings.json") \
+        if root is not None else None
+    project_entry = _policy_entry(project_file) if project_file else None
+    global_file = _CONFIG_HOME / "capabilities" / "settings.json"
+    global_entry = _policy_entry(global_file)
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is True:
+        return
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({project_file})",
+             f"ask the user whether to enable {NAME} for this project; if yes, "
+             f"run `capabilities enable {NAME} --project`")
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is True:
+        return
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is False:
+        message = f"{NAME} is disabled globally ({global_file})"
+    else:
+        message = f"{NAME} is not enabled by project or global policy"
+    _die(4, "not_enabled", message,
+         f"ask the user whether to enable {NAME} only for this project or "
+         f"globally for every project; then run `capabilities enable {NAME} "
+         "--project` or `--global` exactly as requested")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project's active capabilities/."""
+    root = _project_root()
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract — the declaration surface --------------------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import urllib.error as _ue
+    import urllib.request as _ur
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10.0) as resp:
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(text); return
+    except _ue.HTTPError as e:
+        if e.code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if e.code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        err = f"upstream returned {e.code}"
+    except _ue.URLError as e:
+        err = str(e.reason)
+    except OSError as e:
+        err = str(e)
+    if cache.exists():
+        sys.stderr.write(json.dumps(
+            {"warning": f"upstream unreachable; serving cached copy ({err})"},
+            ensure_ascii=False) + "\n")
+        _emit(cache.read_text()); return
+    _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _render_ids_markdown(data: dict) -> str:
+    """Render the {label: {value, note}} envelope as the labelled markdown
+    list the manager's `capabilities ids <NAME>` also produces — one shared
+    format across the ids surface and the identifiers section of `help`."""
+    lines: list[str] = []
+    for label, entry in sorted(data.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        v = entry.get("value")
+        vs = f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+        line = f"- **{label}**: {vs}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _identifiers_section() -> str:
+    """The Identifiers block appended to the bare top-level help — deterministic
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
+    agent following the `<NAME> help` startup protocol loads the discovered
+    labels/values/notes into context at once. Empty when no project envelope
+    or nothing recorded (do not bloat help with an empty section)."""
+    envdir = _env_dir()
+    if envdir is None:
+        return ""
+    ids_file = envdir / "identifiers.json"
+    if not ids_file.exists():
+        return ""
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    header = (
+        "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
+        f"Structural lookups discovered for `{NAME}` in this project. Fetch a single\n"
+        f"raw value with `{NAME} ids get <label>`; the full envelope is also at\n"
+        f"`capabilities ids {NAME}`.\n\n"
+    )
+    return header + _render_ids_markdown(data) + "\n"
+
+
+def _cmd_help() -> None:
+    """Bare top-level help: the CLI's HELP body (module-level `HELP` if
+    defined, else the module docstring), then the project's Identifiers
+    section. Only fires when no extra args follow — per-verb help stays
+    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    g = globals()
+    text = g.get("HELP") or g.get("__doc__") or ""
+    if text.startswith("\n"):
+        text = text.lstrip("\n")
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    section = _identifiers_section()
+    if section:
+        sys.stdout.write(section)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved.
+
+    `help` is a contract verb only when bare (no extra args) — the top-level
+    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
+    through to the CLI so per-verb help stays clean."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    elif cmd == "help" and len(argv) == 1:
+        _cmd_help()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged. Every connection-bearing
+    capability requires a registry, even when it declares only one connection."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    project_path = (envdir / "connections.json") if envdir else None
+    homes = ([str(project_path)] if project_path else []) + \
+            [str(_CONFIG_HOME / NAME / "connections.json")]
+    _die(6, "connections_required",
+         f"{NAME} requires an explicit connections registry",
+         "create one of: " + ", ".join(homes) +
+         '; expected {"default": "<id>", "connections": {"<id>": { ... }}}')
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. A connection's own
+    `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        _die(6, "connections_required",
+             f"{NAME} requires an explicit connections registry")
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+# <<< contract: connections <<<
+
+PROFILE_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+GRAPHQL_URL = "https://www.instagram.com/api/graphql"
+PREFLIGHT_URL = "https://www.instagram.com/api/v1/accounts/edit/web_form_data/"
+CREATE_THREAD_URL = (
+    "https://www.instagram.com/api/v1/direct_v2/create_group_thread/"
+)
+SESSION_VERSION = 1
+SENSITIVE_HEADERS = {"cookie", "x-csrftoken"}
+REMOVED_HEADERS = {"content-length", "accept-encoding"}
+DATA_FLAGS = {"--data", "--data-raw", "--data-binary", "-d"}
+
+HELP = """instagram — agent-first CLI over an authenticated Instagram web session.
+
+This capability drives the same private browser-session endpoints used by
+instagram.com. It is stateful and may stop working when Instagram changes its
+web client. Run `instagram doctor` before domain work. Checkpoints, challenges,
+CAPTCHA, and 2FA always require the user in the browser; this tool never bypasses
+them.
+
+Connections
+  An explicit connections registry is required, even for one account. Put it in
+  the consuming project's Instagram envelope or in
+  ~/.config/instagram/connections.json:
+
+    {
+      "default": "main",
+      "connections": {
+        "main": {
+          "expected_username": "account.handle",
+          "allow_write": false,
+          "timeout_seconds": 30
+        }
+      }
+    }
+
+  `expected_username` is mandatory and doctor refuses a session authenticated as
+  another account. Each connection owns a separate session under the user state
+  home. Session JSON contains live cookies and is written with mode 0600.
+
+Authentication
+  Sign in to Instagram in a browser, send one authorized test text DM, select the
+  successful IGDirectTextSendMutation in Network, and choose Copy as cURL. Keep
+  the capture out of chat and import it locally:
+
+    instagram refresh --clipboard [--connection ID]
+    instagram refresh /protected/path/request.curl [--connection ID]
+    instagram refresh - [--connection ID]        # read cURL from stdin
+
+  Refresh only mints local session state. Run doctor immediately afterwards.
+
+Commands
+  instagram help
+  instagram doctor [--connection ID]             Validate identity and session.
+  instagram connections                           Local masked configuration report.
+  instagram refresh <PATH|-|--clipboard>          Import a browser capture locally.
+  instagram whoami [--connection ID]              Return authenticated username.
+  instagram profile show <handle-or-url>           Read profile routing metadata.
+  instagram conversations resolve <handle-or-url> Obtain/create the private thread.
+  instagram messages send <handle-or-url>
+      (--text TEXT | --text-file PATH | --stdin)
+                                                  Resolve the thread and send text.
+
+Write policy
+  `conversations resolve` and `messages send` leave state on Instagram and are
+  refused unless the selected connection has `allow_write: true`. Exit 4 means
+  policy refusal; ask the user rather than changing the gate. `messages send`
+  reports success only when Instagram returns a server message id. Ambiguous
+  transport failures are not retried automatically because that could duplicate
+  a message.
+
+Exit codes
+  0 success · 2 authentication/session · 3 profile not found · 4 policy refusal
+  5 Instagram/network failure · 6 input/configuration · 7 contract/audit failure
+
+Contract commands
+  instagram stub
+  instagram manifest --json
+  instagram guide [topic]
+  instagram ids list|get|set|rm
+  instagram refs
+"""
+
+
+@dataclass
+class RequestTemplate:
+    version: int
+    captured_at: str
+    url: str
+    method: str
+    headers: dict[str, str]
+    cookies: dict[str, str]
+    form: dict[str, str]
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> RequestTemplate:
+        try:
+            return cls(
+                version=int(raw["version"]),
+                captured_at=str(raw["captured_at"]),
+                url=str(raw["url"]),
+                method=str(raw["method"]),
+                headers={str(k): str(v) for k, v in dict(raw["headers"]).items()},
+                cookies={str(k): str(v) for k, v in dict(raw["cookies"]).items()},
+                form={str(k): str(v) for k, v in dict(raw["form"]).items()},
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InstagramFailure(
+                2, "session_invalid", "Stored session has an invalid shape"
+            ) from exc
+
+
+@dataclass(frozen=True)
+class Connection:
+    id: str
+    expected_username: str
+    allow_write: bool
+    timeout_seconds: int
+    session_path: Path
+
+
+@dataclass(frozen=True)
+class RoutingResult:
+    username: str
+    recipient_pk: str
+    thread_igid: str
+
+
+@dataclass(frozen=True)
+class SendResult:
+    status: str
+    server_message_id: str | None = None
+    timestamp_ms: str | None = None
+    error_code: str | None = None
+    error_summary: str | None = None
+
+
+class InstagramFailure(RuntimeError):
+    def __init__(
+        self,
+        exit_code: int,
+        code: str,
+        message: str,
+        hint: str | None = None,
+        status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.code = code
+        self.message = message
+        self.hint = hint
+        self.status = status
+
+
+class _JsonScripts(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = False
+        self.parts: list[str] = []
+        self.scripts: list[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag == "script" and dict(attrs).get("type") == "application/json":
+            self.active = True
+            self.parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self.active:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self.active:
+            self.scripts.append("".join(self.parts))
+            self.active = False
+
+
+def _normalize_profile(value: str) -> tuple[str, str]:
+    raw = value.strip()
+    if not raw:
+        raise InstagramFailure(6, "input", "Profile must not be empty")
+    if "://" not in raw:
+        username = raw.removeprefix("@").strip("/")
+    else:
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"http", "https"}:
+            raise InstagramFailure(
+                6, "input", f"Unsupported profile URL scheme: {parsed.scheme!r}"
+            )
+        if parsed.hostname not in {"instagram.com", "www.instagram.com"}:
+            raise InstagramFailure(
+                6, "input", "Profile URL must use instagram.com"
+            )
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 1:
+            raise InstagramFailure(
+                6, "input", "Expected an Instagram profile URL with one path segment"
+            )
+        username = parts[0]
+    if not PROFILE_RE.fullmatch(username):
+        raise InstagramFailure(
+            6, "input", f"Invalid Instagram username: {username!r}"
+        )
+    return f"https://www.instagram.com/{username}/", username
+
+
+def _header_name(name: str) -> str:
+    return "-".join(part.capitalize() for part in name.split("-"))
+
+
+def _parse_cookie_header(value: str) -> dict[str, str]:
+    parsed = SimpleCookie()
+    parsed.load(value)
+    cookies = {name: morsel.value for name, morsel in parsed.items()}
+    if not cookies:
+        raise InstagramFailure(
+            6, "capture_invalid", "Cookie header could not be parsed"
+        )
+    return cookies
+
+
+def _consume_option(tokens: list[str], index: int) -> tuple[str, int]:
+    if index + 1 >= len(tokens):
+        raise InstagramFailure(
+            6, "capture_invalid", f"Missing value after {tokens[index]}"
+        )
+    return tokens[index + 1], index + 2
+
+
+def _parse_curl(text: str) -> RequestTemplate:
+    normalized = re.sub(r"\\\s*\n", " ", text).strip()
+    try:
+        tokens = shlex.split(normalized, posix=True)
+    except ValueError as exc:
+        raise InstagramFailure(6, "capture_invalid", str(exc)) from exc
+    if not tokens or Path(tokens[0]).name != "curl":
+        raise InstagramFailure(6, "capture_invalid", "Input must start with curl")
+
+    url = ""
+    method = "GET"
+    headers: dict[str, str] = {}
+    data_parts: list[str] = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-X", "--request"}:
+            method, index = _consume_option(tokens, index)
+            method = method.upper()
+        elif token in {"-H", "--header"}:
+            header, index = _consume_option(tokens, index)
+            if ":" not in header:
+                raise InstagramFailure(
+                    6, "capture_invalid", f"Invalid header: {header!r}"
+                )
+            name, value = header.split(":", 1)
+            headers[_header_name(name.strip())] = value.strip()
+        elif token in DATA_FLAGS:
+            value, index = _consume_option(tokens, index)
+            data_parts.append(value)
+            method = "POST"
+        elif any(token.startswith(f"{flag}=") for flag in DATA_FLAGS):
+            data_parts.append(token.split("=", 1)[1])
+            method = "POST"
+            index += 1
+        elif token in {"--compressed", "-s", "-S", "-sS", "--location"}:
+            index += 1
+        elif token in {
+            "--max-time",
+            "--connect-timeout",
+            "-w",
+            "--write-out",
+        }:
+            _, index = _consume_option(tokens, index)
+        elif token.startswith("-"):
+            raise InstagramFailure(
+                6, "capture_invalid", f"Unsupported curl option: {token}"
+            )
+        elif not url:
+            url = token
+            index += 1
+        else:
+            raise InstagramFailure(
+                6, "capture_invalid", f"Unexpected curl argument: {token!r}"
+            )
+
+    if method != "POST":
+        raise InstagramFailure(
+            6, "capture_invalid", f"Expected POST request, got {method}"
+        )
+    if url.rstrip("/") != GRAPHQL_URL:
+        raise InstagramFailure(
+            6, "capture_invalid", f"Expected {GRAPHQL_URL}"
+        )
+    if len(data_parts) != 1:
+        raise InstagramFailure(
+            6, "capture_invalid", "Expected one complete --data value"
+        )
+    lower_headers = {name.lower(): value for name, value in headers.items()}
+    if lower_headers.get("x-fb-friendly-name") != "IGDirectTextSendMutation":
+        raise InstagramFailure(
+            6, "capture_invalid", "Request is not IGDirectTextSendMutation"
+        )
+    cookie_header = lower_headers.get("cookie")
+    if not cookie_header:
+        raise InstagramFailure(
+            6, "capture_invalid", "Captured request has no Cookie header"
+        )
+    form = dict(parse_qsl(data_parts[0], keep_blank_values=True))
+    if "variables" not in form or "doc_id" not in form:
+        raise InstagramFailure(
+            6, "capture_invalid", "Captured form lacks variables or doc_id"
+        )
+    try:
+        variables = json.loads(form["variables"])
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise InstagramFailure(
+            6, "capture_invalid", "variables is not valid JSON"
+        ) from exc
+    if not isinstance(variables, dict) or not {
+        "ig_thread_igid",
+        "text",
+    }.issubset(variables):
+        raise InstagramFailure(
+            6, "capture_invalid", "variables lacks thread or text fields"
+        )
+    variables["offline_threading_id"] = ""
+    variables["text"] = {"sensitive_string_value": ""}
+    form["variables"] = json.dumps(
+        variables, ensure_ascii=False, separators=(",", ":")
+    )
+    clean_headers = {
+        name: value
+        for name, value in headers.items()
+        if name.lower() not in SENSITIVE_HEADERS | REMOVED_HEADERS
+    }
+    return RequestTemplate(
+        version=SESSION_VERSION,
+        captured_at=datetime.now(UTC).isoformat(),
+        url=url,
+        method=method,
+        headers=clean_headers,
+        cookies=_parse_cookie_header(cookie_header),
+        form=form,
+    )
+
+
+def _write_template(template: RequestTemplate, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    payload = json.dumps(asdict(template), ensure_ascii=False, indent=2) + "\n"
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _load_template(path: Path) -> RequestTemplate:
+    if not path.is_file():
+        raise InstagramFailure(
+            2,
+            "session_missing",
+            "Instagram browser session has not been imported",
+            "run `instagram refresh --clipboard`, then `instagram doctor`",
+        )
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        raise InstagramFailure(
+            2,
+            "session_permissions",
+            f"Session file must be mode 0600, found {mode:04o}: {path}",
+        )
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InstagramFailure(
+            2, "session_invalid", f"Cannot read stored session: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise InstagramFailure(2, "session_invalid", "Stored session is not an object")
+    return RequestTemplate.from_dict(raw)
+
+
+def _connection_from_entry(cid: str, raw: Any) -> Connection:
+    if not isinstance(raw, dict):
+        raise InstagramFailure(
+            6, "bad_config", f"Connection {cid!r} must be a JSON object"
+        )
+    username = str(raw.get("expected_username") or "").strip().removeprefix("@")
+    if not PROFILE_RE.fullmatch(username):
+        raise InstagramFailure(
+            6,
+            "bad_config",
+            f"Connection {cid!r} requires a valid expected_username",
+        )
+    try:
+        timeout = int(raw.get("timeout_seconds", 30))
+    except (TypeError, ValueError) as exc:
+        raise InstagramFailure(
+            6, "bad_config", f"Connection {cid!r} timeout_seconds must be an integer"
+        ) from exc
+    if timeout < 5 or timeout > 120:
+        raise InstagramFailure(
+            6,
+            "bad_config",
+            f"Connection {cid!r} timeout_seconds must be between 5 and 120",
+        )
+    return Connection(
+        id=cid,
+        expected_username=username,
+        allow_write=bool(raw.get("allow_write", WRITE_DEFAULT)),
+        timeout_seconds=timeout,
+        session_path=_state_dir() / cid / "session.json",
+    )
+
+
+def _connection(wanted: str | None) -> Connection:
+    reg, _ = _connections_registry()
+    cid, raw = _select_connection(reg, wanted)
+    return _connection_from_entry(cid, raw)
+
+
+def _connections_report() -> dict:
+    reg, reg_file = _connections_registry()
+    conns = reg["connections"]
+    out: dict[str, Any] = {
+        "default": reg.get("default")
+        or (next(iter(conns)) if len(conns) == 1 else None),
+        "registry": str(reg_file) if reg_file else None,
+        "connections": {},
+    }
+    for cid, raw in conns.items():
+        try:
+            conn = _connection_from_entry(cid, raw)
+            path = conn.session_path
+            present = path.is_file()
+            mode = (path.stat().st_mode & 0o777) if present else None
+            out["connections"][cid] = {
+                "allow_write": conn.allow_write,
+                "expected_username": conn.expected_username,
+                "timeout_seconds": conn.timeout_seconds,
+                "keys": [],
+                "session": {
+                    "set": present,
+                    "path": str(path),
+                    "secure": bool(present and mode is not None and not (mode & 0o077)),
+                },
+            }
+        except InstagramFailure as exc:
+            out["connections"][cid] = {
+                "allow_write": bool(
+                    raw.get("allow_write", WRITE_DEFAULT)
+                    if isinstance(raw, dict)
+                    else WRITE_DEFAULT
+                ),
+                "keys": [],
+                "configuration_error": exc.message,
+            }
+    return out
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+def _bootstrap_profile(
+    html: str, expected_username: str
+) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+    parser = _JsonScripts()
+    parser.feed(html)
+    modules: dict[str, dict[str, Any]] = {}
+    matched: dict[str, Any] | None = None
+    for raw in parser.scripts:
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        stack: list[Any] = [decoded]
+        while stack:
+            value = stack.pop()
+            if isinstance(value, dict):
+                candidate = str(value.get("username") or "")
+                if (
+                    candidate.lower() == expected_username.lower()
+                    and value.get("pk") is not None
+                    and (matched is None or len(value) > len(matched))
+                ):
+                    matched = value
+                for key, child in value.items():
+                    if key in {"define", "require"} and isinstance(child, list):
+                        for entry in child:
+                            if (
+                                isinstance(entry, list)
+                                and len(entry) > 2
+                                and entry[0] in {"DTSGInitialData", "LSD", "SiteData"}
+                                and isinstance(entry[2], dict)
+                            ):
+                                modules[str(entry[0])] = entry[2]
+                    stack.append(child)
+            elif isinstance(value, list):
+                stack.extend(value)
+    missing = {"DTSGInitialData", "LSD", "SiteData"} - modules.keys()
+    if missing or matched is None:
+        raise InstagramFailure(
+            5,
+            "profile_bootstrap_missing",
+            "Profile page did not contain required routing data",
+        )
+    dtsg = str(modules["DTSGInitialData"].get("token") or "")
+    lsd = str(modules["LSD"].get("token") or "")
+    if not dtsg or not lsd:
+        raise InstagramFailure(
+            5,
+            "profile_tokens_missing",
+            "Profile page did not contain fresh request tokens",
+        )
+    return dtsg, lsd, modules["SiteData"], matched
+
+
+def _decode_json(text: str) -> dict[str, Any]:
+    payload = text.strip().removeprefix("for (;;);")
+    decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise TypeError("Expected a JSON object")
+    return decoded
+
+
+def _parse_send_response(http_status: int, text: str) -> SendResult:
+    if http_status in {401, 403}:
+        return SendResult(status="auth_failure", error_code=str(http_status))
+    if http_status == 429:
+        return SendResult(status="rate_limited", error_code="429")
+    if http_status >= 500:
+        return SendResult(status="unknown", error_code=str(http_status))
+    try:
+        payload = _decode_json(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return SendResult(status="unknown", error_code="invalid_json")
+    data = payload.get("data")
+    result = (
+        data.get("xig_direct_text_send_with_slide_messaging_response")
+        if isinstance(data, dict)
+        else None
+    )
+    if isinstance(result, dict) and result.get("message_id"):
+        return SendResult(
+            status="sent",
+            server_message_id=str(result["message_id"]),
+            timestamp_ms=(
+                str(result["timestamp_ms"])
+                if result.get("timestamp_ms") is not None
+                else None
+            ),
+        )
+    errors = payload.get("errors")
+    graphql_error = (
+        errors[0]
+        if isinstance(errors, list) and errors and isinstance(errors[0], dict)
+        else {}
+    )
+    error_code = (
+        graphql_error.get("code")
+        or graphql_error.get("api_error_code")
+        or payload.get("error")
+        or payload.get("error_code")
+    )
+    summary = (
+        graphql_error.get("description_raw")
+        or graphql_error.get("description")
+        or graphql_error.get("summary")
+        or graphql_error.get("message")
+        or payload.get("errorSummary")
+        or payload.get("message")
+    )
+    normalized = json.dumps(payload, ensure_ascii=False).lower()
+    if str(error_code) == "1545120" or (
+        "invitation to chat" in normalized and "accepted" in normalized
+    ):
+        status = "awaiting_acceptance"
+    elif any(
+        marker in normalized
+        for marker in ("login_required", "checkpoint", "challenge_required")
+    ):
+        status = "auth_failure"
+    elif str(error_code) == "1357054":
+        status = "template_failure"
+    else:
+        status = "explicit_failure"
+    return SendResult(
+        status=status,
+        error_code=str(error_code) if error_code is not None else None,
+        error_summary=str(summary) if summary is not None else None,
+    )
+
+
+class InstagramWebClient:
+    def __init__(self, connection: Connection) -> None:
+        self.connection = connection
+        self.template = _load_template(connection.session_path)
+        self.http = httpx.Client(
+            cookies=self.template.cookies,
+            follow_redirects=True,
+            timeout=connection.timeout_seconds,
+        )
+
+    def close(self) -> None:
+        self.http.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def _cookie_value(self, name: str) -> str | None:
+        values = [cookie.value for cookie in self.http.cookies.jar if cookie.name == name]
+        return values[-1] if values else None
+
+    def _header_value(self, name: str) -> str:
+        lowered = name.lower()
+        for header_name, value in self.template.headers.items():
+            if header_name.lower() == lowered:
+                return value
+        return ""
+
+    def _persist(self) -> None:
+        latest: dict[str, str] = {}
+        for cookie in self.http.cookies.jar:
+            if not cookie.domain or cookie.domain.endswith("instagram.com"):
+                latest[str(cookie.name)] = str(cookie.value)
+        self.template.cookies.update(latest)
+        _write_template(self.template, self.connection.session_path)
+
+    def preflight(self) -> dict[str, Any]:
+        csrf = self._cookie_value("csrftoken")
+        headers = {
+            "Accept": "*/*",
+            "Referer": "https://www.instagram.com/accounts/edit/",
+            "User-Agent": self._header_value("User-Agent"),
+            "X-IG-App-ID": self._header_value("X-IG-App-ID"),
+        }
+        if csrf:
+            headers["X-CSRFToken"] = csrf
+        try:
+            response = self.http.get(
+                PREFLIGHT_URL,
+                headers={key: value for key, value in headers.items() if value},
+            )
+        except httpx.HTTPError as exc:
+            raise InstagramFailure(
+                5,
+                "network_error",
+                f"Instagram preflight failed: {type(exc).__name__}",
+            ) from exc
+        finally:
+            self._persist()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise InstagramFailure(
+                2,
+                "auth_invalid_response",
+                f"Instagram preflight returned non-JSON HTTP {response.status_code}",
+                status=response.status_code,
+            ) from exc
+        username = str((payload.get("form_data") or {}).get("username") or "")
+        if response.status_code != 200 or payload.get("status") != "ok" or not username:
+            raise InstagramFailure(
+                2,
+                "auth_failed",
+                "Instagram session is missing or expired",
+                "refresh it from a fresh successful browser request",
+                response.status_code,
+            )
+        if username.lower() != self.connection.expected_username.lower():
+            raise InstagramFailure(
+                2,
+                "unexpected_account",
+                f"Session is authenticated as {username!r}, expected "
+                f"{self.connection.expected_username!r}",
+            )
+        return {"username": username, "status": "healthy"}
+
+    def profile(self, profile_value: str) -> dict[str, Any]:
+        canonical_url, username = _normalize_profile(profile_value)
+        headers = {
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": self._header_value("User-Agent"),
+        }
+        try:
+            response = self.http.get(
+                canonical_url,
+                headers={key: value for key, value in headers.items() if value},
+            )
+        except httpx.HTTPError as exc:
+            raise InstagramFailure(
+                5, "network_error", f"Profile request failed: {type(exc).__name__}"
+            ) from exc
+        finally:
+            self._persist()
+        if response.status_code in {401, 403} or "/accounts/login" in str(
+            response.url
+        ):
+            raise InstagramFailure(
+                2, "auth_failed", "Instagram login is required", status=response.status_code
+            )
+        if response.status_code == 404:
+            raise InstagramFailure(3, "not_found", f"Profile @{username} was not found")
+        if response.status_code != 200:
+            raise InstagramFailure(
+                5,
+                "instagram_error",
+                "Profile page request was rejected",
+                status=response.status_code,
+            )
+        dtsg, lsd, site, raw = _bootstrap_profile(response.text, username)
+        self.template.form["fb_dtsg"] = dtsg
+        self.template.form["lsd"] = lsd
+        self.template.form["jazoest"] = "2" + str(sum(ord(char) for char in dtsg))
+        for form_key, site_key in (
+            ("__rev", "server_revision"),
+            ("__hsi", "hsi"),
+            ("__spin_r", "__spin_r"),
+            ("__spin_b", "__spin_b"),
+            ("__spin_t", "__spin_t"),
+        ):
+            if site.get(site_key) is not None:
+                self.template.form[form_key] = str(site[site_key])
+        for name in list(self.template.headers):
+            if name.lower() == "x-fb-lsd":
+                self.template.headers[name] = lsd
+            elif name.lower() == "referer":
+                self.template.headers[name] = canonical_url
+        claim = response.headers.get("x-ig-set-www-claim")
+        if claim:
+            self.template.headers["X-IG-WWW-Claim"] = claim
+        _write_template(self.template, self.connection.session_path)
+        fields = {
+            "username": str(raw.get("username") or username),
+            "profile_url": canonical_url,
+            "recipient_pk": str(raw.get("pk")),
+            "full_name": raw.get("full_name"),
+            "is_private": raw.get("is_private"),
+            "is_verified": raw.get("is_verified"),
+            "follower_count": raw.get("follower_count"),
+            "following_count": raw.get("following_count"),
+            "media_count": raw.get("media_count"),
+        }
+        return {key: value for key, value in fields.items() if value is not None}
+
+    def resolve_thread(self, profile_value: str) -> RoutingResult:
+        profile = self.profile(profile_value)
+        username = str(profile["username"])
+        recipient_pk = str(profile["recipient_pk"])
+        canonical_url = str(profile["profile_url"])
+        csrf = self._cookie_value("csrftoken")
+        fb_dtsg = self.template.form.get("fb_dtsg", "")
+        if not csrf or not fb_dtsg:
+            raise InstagramFailure(
+                2, "session_tokens_missing", "Session tokens are missing"
+            )
+        headers = {
+            "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.instagram.com",
+            "Referer": canonical_url,
+            "User-Agent": self._header_value("User-Agent"),
+            "X-Requested-With": "XMLHttpRequest",
+            "X-IG-App-ID": self._header_value("X-IG-App-ID"),
+            "X-ASBD-ID": self._header_value("X-ASBD-ID"),
+            "X-CSRFToken": csrf,
+            "X-Instagram-AJAX": self.template.form.get("__rev", ""),
+            "X-Web-Session-ID": self.template.form.get("__s", ""),
+            "X-IG-WWW-Claim": self._header_value("X-IG-WWW-Claim"),
+        }
+        data = {
+            "recipient_users": json.dumps([recipient_pk], separators=(",", ":")),
+            "fb_dtsg": fb_dtsg,
+            "jazoest": "2" + str(sum(ord(char) for char in csrf)),
+        }
+        try:
+            response = self.http.post(
+                CREATE_THREAD_URL,
+                headers={key: value for key, value in headers.items() if value},
+                data=data,
+            )
+        except httpx.HTTPError as exc:
+            raise InstagramFailure(
+                5, "network_error", f"Thread request failed: {type(exc).__name__}"
+            ) from exc
+        finally:
+            self._persist()
+        if response.status_code in {401, 403}:
+            raise InstagramFailure(
+                2, "auth_failed", "Instagram login is required", status=response.status_code
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise InstagramFailure(
+                5,
+                "invalid_response",
+                "Thread response was not JSON",
+                status=response.status_code,
+            ) from exc
+        users = payload.get("users") if isinstance(payload.get("users"), list) else []
+        recipient_matches = any(
+            isinstance(user, dict)
+            and str(user.get("pk") or user.get("pk_id") or user.get("id") or "")
+            == recipient_pk
+            and str(user.get("username") or "").lower() == username.lower()
+            for user in users
+        )
+        thread_igid = str(payload.get("thread_v2_id") or "")
+        if (
+            response.status_code != 200
+            or not recipient_matches
+            or not thread_igid
+            or payload.get("thread_type") != "private"
+        ):
+            raise InstagramFailure(
+                5,
+                "thread_unvalidated",
+                "Instagram did not return a validated private thread",
+                status=response.status_code,
+            )
+        return RoutingResult(username, recipient_pk, thread_igid)
+
+    def send_text(
+        self, thread_igid: str, text: str, offline_threading_id: str
+    ) -> SendResult:
+        form = dict(self.template.form)
+        try:
+            variables = json.loads(form["variables"])
+        except (KeyError, json.JSONDecodeError, TypeError) as exc:
+            raise InstagramFailure(
+                2, "session_invalid", "Stored send template has invalid variables"
+            ) from exc
+        variables["ig_thread_igid"] = str(thread_igid)
+        variables["offline_threading_id"] = str(offline_threading_id)
+        variables["text"] = {"sensitive_string_value": text}
+        form["variables"] = json.dumps(
+            variables, ensure_ascii=False, separators=(",", ":")
+        )
+        headers = {
+            name: value
+            for name, value in self.template.headers.items()
+            if name.lower()
+            not in {"cookie", "content-length", "accept-encoding", "x-csrftoken"}
+        }
+        csrf = self._cookie_value("csrftoken")
+        if not csrf:
+            return SendResult(status="auth_failure", error_summary="missing csrftoken")
+        headers["X-CSRFToken"] = csrf
+        try:
+            response = self.http.post(self.template.url, headers=headers, data=form)
+        except httpx.HTTPError as exc:
+            return SendResult(
+                status="unknown",
+                error_code=type(exc).__name__,
+                error_summary="Transport failed after send began; delivery is unknown",
+            )
+        finally:
+            self._persist()
+        return _parse_send_response(response.status_code, response.text)
+
+
+def _offline_threading_id() -> str:
+    return str(int(time.time() * 1000) * (1 << 22) + secrets.randbelow(1 << 22))
+
+
+def _selected_connections(wanted: str | None) -> list[Connection]:
+    reg, _ = _connections_registry()
+    if wanted:
+        cid, raw = _select_connection(reg, wanted)
+        return [_connection_from_entry(cid, raw)]
+    return [_connection_from_entry(cid, raw) for cid, raw in reg["connections"].items()]
+
+
+def cmd_doctor(wanted: str | None) -> None:
+    report = _connections_report()
+    _doctor_gate(report, wanted)
+    results = []
+    failures = []
+    for conn in _selected_connections(wanted):
+        try:
+            with InstagramWebClient(conn) as client:
+                identity = client.preflight()
+            results.append(
+                {
+                    "connection": conn.id,
+                    "ok": True,
+                    "username": identity["username"],
+                    "session_path": str(conn.session_path),
+                }
+            )
+        except InstagramFailure as exc:
+            failures.append(
+                {"connection": conn.id, "code": exc.code, "message": exc.message}
+            )
+    if failures:
+        raise InstagramFailure(
+            2,
+            "doctor_failed",
+            "One or more Instagram connections are not ready: "
+            + "; ".join(
+                f"{item['connection']}: {item['code']}" for item in failures
+            ),
+            "run `instagram connections`, refresh the affected session, and retry",
+        )
+    _emit({"ok": True, "connections": results})
+
+
+def _read_capture_source(args: list[str]) -> str:
+    if args == ["--clipboard"]:
+        try:
+            proc = subprocess.run(
+                ["pbpaste"], capture_output=True, text=True, timeout=10, check=False
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise InstagramFailure(
+                6, "clipboard_unavailable", f"Cannot read clipboard: {exc}"
+            ) from exc
+        if proc.returncode != 0:
+            raise InstagramFailure(
+                6, "clipboard_unavailable", "pbpaste could not read the clipboard"
+            )
+        return proc.stdout
+    if len(args) != 1:
+        raise InstagramFailure(
+            6,
+            "input",
+            "usage: instagram refresh <PATH|-|--clipboard> [--connection ID]",
+        )
+    if args[0] == "-":
+        return sys.stdin.read()
+    source = Path(args[0]).expanduser()
+    try:
+        return source.read_text()
+    except OSError as exc:
+        raise InstagramFailure(
+            6, "input", f"Cannot read captured cURL file: {exc}"
+        ) from exc
+
+
+def cmd_refresh(conn: Connection, args: list[str]) -> None:
+    template = _parse_curl(_read_capture_source(args))
+    _write_template(template, conn.session_path)
+    _emit(
+        {
+            "refreshed": True,
+            "connection": conn.id,
+            "session_path": str(conn.session_path),
+            "captured_at": template.captured_at,
+            "cookies": len(template.cookies),
+            "next": f"instagram doctor --connection {conn.id}",
+        }
+    )
+
+
+def _message_text(args: list[str]) -> tuple[str, list[str]]:
+    values: list[tuple[str, str]] = []
+    remaining: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in {"--text", "--text-file"}:
+            if index + 1 >= len(args):
+                raise InstagramFailure(6, "input", f"{token} needs a value")
+            values.append((token, args[index + 1]))
+            index += 2
+        elif token == "--stdin":
+            values.append((token, ""))
+            index += 1
+        else:
+            remaining.append(token)
+            index += 1
+    if len(values) != 1:
+        raise InstagramFailure(
+            6, "input", "choose exactly one of --text, --text-file, or --stdin"
+        )
+    kind, value = values[0]
+    if kind == "--text":
+        text = value
+    elif kind == "--text-file":
+        try:
+            text = Path(value).expanduser().read_text()
+        except OSError as exc:
+            raise InstagramFailure(6, "input", f"Cannot read message file: {exc}") from exc
+    else:
+        text = sys.stdin.read()
+    text = text.strip()
+    if not text:
+        raise InstagramFailure(6, "input", "Message text must not be empty")
+    if len(text) > 1000:
+        raise InstagramFailure(6, "input", "Message text exceeds 1000 characters")
+    return text, remaining
+
+
+def _extract_connection(argv: list[str]) -> tuple[str | None, list[str]]:
+    wanted = None
+    cleaned = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--connection":
+            if index + 1 >= len(argv):
+                raise InstagramFailure(6, "input", "--connection needs a value")
+            wanted = argv[index + 1]
+            index += 2
+        elif token.startswith("--connection="):
+            wanted = token.split("=", 1)[1]
+            index += 1
+        else:
+            cleaned.append(token)
+            index += 1
+    return wanted, cleaned
+
+
+def _raise_send_failure(result: SendResult) -> None:
+    if result.status == "auth_failure":
+        raise InstagramFailure(
+            2,
+            "auth_failed",
+            "Instagram rejected the current session",
+            "refresh the browser session and run doctor",
+        )
+    if result.status == "awaiting_acceptance":
+        raise InstagramFailure(
+            5,
+            "awaiting_acceptance",
+            "The recipient must accept the chat invitation before more messages",
+        )
+    if result.status == "rate_limited":
+        raise InstagramFailure(5, "rate_limited", "Instagram rate-limited the send")
+    if result.status == "unknown":
+        raise InstagramFailure(
+            5,
+            "delivery_unknown",
+            "Delivery could not be confirmed; do not retry automatically",
+        )
+    raise InstagramFailure(
+        5,
+        result.status,
+        result.error_summary or "Instagram rejected the message",
+    )
+
+
+def main() -> None:
+    try:
+        wanted, argv = _extract_connection(sys.argv[1:])
+        sys.argv = [sys.argv[0], *argv]
+        _gate()
+        _contract(argv)
+        if argv and argv[0] == "help":
+            _emit(HELP)
+            return
+        if argv == ["doctor"]:
+            cmd_doctor(wanted)
+            return
+        conn = _connection(wanted)
+        if argv == ["whoami"]:
+            with InstagramWebClient(conn) as client:
+                identity = client.preflight()
+            _emit({"connection": conn.id, **identity})
+            return
+        if argv and argv[0] == "refresh":
+            cmd_refresh(conn, argv[1:])
+            return
+        if len(argv) == 3 and argv[:2] == ["profile", "show"]:
+            with InstagramWebClient(conn) as client:
+                profile = client.profile(argv[2])
+            _emit({"connection": conn.id, **profile})
+            return
+        if len(argv) == 3 and argv[:2] == ["conversations", "resolve"]:
+            _write_gate(conn.id, conn.allow_write, "conversations.resolve")
+            with InstagramWebClient(conn) as client:
+                routing = client.resolve_thread(argv[2])
+            _emit({"connection": conn.id, **asdict(routing)})
+            return
+        if len(argv) >= 3 and argv[:2] == ["messages", "send"]:
+            text, remaining = _message_text(argv[3:])
+            if remaining:
+                raise InstagramFailure(
+                    6,
+                    "input",
+                    "Unexpected messages send arguments: " + " ".join(remaining),
+                )
+            _write_gate(conn.id, conn.allow_write, "messages.send")
+            offline_id = _offline_threading_id()
+            with InstagramWebClient(conn) as client:
+                routing = client.resolve_thread(argv[2])
+                result = client.send_text(routing.thread_igid, text, offline_id)
+            if result.status != "sent" or not result.server_message_id:
+                _raise_send_failure(result)
+            _emit(
+                {
+                    "status": "sent",
+                    "connection": conn.id,
+                    "username": routing.username,
+                    "recipient_pk": routing.recipient_pk,
+                    "thread_igid": routing.thread_igid,
+                    "offline_threading_id": offline_id,
+                    "server_message_id": result.server_message_id,
+                    "timestamp_ms": result.timestamp_ms,
+                }
+            )
+            return
+        raise InstagramFailure(
+            6, "input", "unknown or incomplete command", f"run `{NAME} help`"
+        )
+    except InstagramFailure as exc:
+        _die(exc.exit_code, exc.code, exc.message, exc.hint, exc.status)
+
+
+if __name__ == "__main__":
+    main()
