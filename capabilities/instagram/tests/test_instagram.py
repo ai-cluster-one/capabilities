@@ -300,7 +300,15 @@ class PolicyTests(unittest.TestCase):
                 }
             )
             proc = subprocess.run(
-                [str(SCRIPT), "messages", "send", "target.user", "--text", "hi"],
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "messages",
+                    "send",
+                    "target.user",
+                    "--text",
+                    "hi",
+                ],
                 env=env,
                 text=True,
                 capture_output=True,
