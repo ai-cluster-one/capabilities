@@ -164,6 +164,8 @@ def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path
     probe = (
         "import json,os,sys; "
         "print(json.dumps({'cwd':os.getcwd(),'home':os.environ.get('HOME'),"
+        "'cache':os.environ.get('XDG_CACHE_HOME'),"
+        "'uv_cache':os.environ.get('UV_CACHE_DIR'),"
         "'secret':os.environ.get('DEV_TEST_SECRET'),'argv':sys.argv[1:]}))"
     )
     isolated = json.loads(
@@ -184,6 +186,10 @@ def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path
     )
     assert isolated["cwd"] == str(source_worktree)
     assert isolated["home"] != env["HOME"]
+    assert isolated["cache"] == started["isolated"]["cache"]
+    assert isolated["uv_cache"] == str(
+        Path(started["isolated"]["cache"]) / "uv"
+    )
     assert isolated["secret"] is None
     assert isolated["argv"] == ["--cwd", "consumer"]
 
@@ -224,6 +230,8 @@ def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path
     assert doctor["ok"] is True
     assert doctor["cleanup_ready"] is True
     assert doctor["source"]["dirty"] is False
+    assert doctor["environment"]["cache"] == started["isolated"]["cache"]
+    assert doctor["environment"]["logs"] == started["isolated"]["logs"]
 
     stopped = json.loads(_run(env, "dev", "stop", "deployment-test").stdout)
     assert stopped == {"removed": True, "session": "deployment-test"}
@@ -404,3 +412,26 @@ def test_dev_gc_removes_old_safe_sessions_and_retains_dirty_work(tmp_path):
 
     dirty_marker.unlink()
     _run(env, "dev", "stop", "dirty-session")
+
+
+def test_dev_stop_refuses_recorded_worktree_outside_session_data(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer)
+    session_file = (
+        Path(env["XDG_STATE_HOME"])
+        / "capabilities"
+        / "dev"
+        / "deployment-test"
+        / "session.json"
+    )
+    session = json.loads(session_file.read_text())
+    session["source"]["worktree"] = str(source)
+    session_file.write_text(json.dumps(session) + "\n")
+
+    refused = _run(env, "dev", "stop", "deployment-test", check=False)
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "unsafe_dev_path"
+    assert source.is_dir()
+    assert Path(started["source_worktree"]).is_dir()

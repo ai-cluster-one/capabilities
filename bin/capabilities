@@ -1549,7 +1549,8 @@ def cmd_dev_start(name: str, source_ref: str, consumer_ref: str | None,
         "source_branch": source_branch,
         "consumer_worktree": str(consumer_worktree) if consumer_worktree else None,
         "isolated": {key: str(paths[key]) for key in
-                     ("registry", "bin", "config", "state", "data", "home")},
+                     ("registry", "bin", "config", "state", "data", "cache",
+                      "home", "logs")},
         "next_commands": [
             f"capabilities dev install {session_id} {name}",
             f"capabilities dev doctor {session_id}",
@@ -1578,7 +1579,7 @@ def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
         "CAPABILITIES_DEV_SESSION": session["id"],
         "CAPABILITIES_DEV_SOURCE": session["source"]["worktree"],
         "PATH": paths["bin"] + os.pathsep + os.environ.get("PATH", os.defpath),
-        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(_CACHE_HOME / "uv")),
+        "UV_CACHE_DIR": str(Path(paths["cache"]) / "uv"),
     })
     consumer = session.get("consumer")
     if isinstance(consumer, dict):
@@ -1752,6 +1753,9 @@ def cmd_dev_doctor(session_id: str) -> None:
             "home": session["paths"]["home"],
             "config": session["paths"]["config"],
             "state": session["paths"]["state"],
+            "data": session["paths"]["data"],
+            "cache": session["paths"]["cache"],
+            "logs": session["paths"]["logs"],
         },
         "installed": installed,
         "cleanup_ready": not _dev_cleanup_problems(session),
@@ -1813,20 +1817,23 @@ def _dev_assert_owned_path(path: Path, root: Path) -> None:
 
 def _dev_stop(session_id: str, emit_result: bool) -> dict:
     session = _dev_session(session_id)
+    state_dir = _dev_state_dir(session_id)
+    data_dir = _dev_data_dir(session_id)
+    _dev_assert_owned_path(state_dir, DEV_STATE_ROOT)
+    _dev_assert_owned_path(data_dir, DEV_DATA_ROOT)
+    _dev_assert_owned_path(Path(session["source"]["worktree"]), data_dir)
+    consumer = session.get("consumer")
+    if isinstance(consumer, dict) and not consumer.get("live"):
+        _dev_assert_owned_path(Path(consumer["worktree"]), data_dir)
     problems = _dev_cleanup_problems(session)
     if problems:
         if emit_result:
             _die(6, "dev_cleanup_refused", f"dev session {session_id} is not removable",
                  "; ".join(problems))
         return {"session": session_id, "removed": False, "problems": problems}
-    consumer = session.get("consumer")
     if isinstance(consumer, dict):
         _dev_remove_worktree(consumer)
     _dev_remove_worktree(session["source"])
-    state_dir = _dev_state_dir(session_id)
-    data_dir = _dev_data_dir(session_id)
-    _dev_assert_owned_path(state_dir, DEV_STATE_ROOT)
-    _dev_assert_owned_path(data_dir, DEV_DATA_ROOT)
     if data_dir.exists():
         shutil.rmtree(data_dir)
     if state_dir.exists():
