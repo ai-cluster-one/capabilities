@@ -273,6 +273,113 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(profile["recipient_pk"], "12345")
             self.assertEqual(profile["follower_count"], 42)
 
+    def test_relationship_follow_uses_validated_profile_and_server_confirmation(self) -> None:
+        bootstrap = {
+            "require": [
+                ["DTSGInitialData", [], {"token": "dtsg-token"}],
+                ["LSD", [], {"token": "lsd-token"}],
+                ["SiteData", [], {"server_revision": 123}],
+            ]
+        }
+        page = (
+            '<script type="application/json">'
+            + html.escape(json.dumps(bootstrap), quote=False)
+            + "</script>"
+        )
+        posts = []
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path, allow_write=True))
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.method == "POST":
+                    posts.append(request)
+                    form = parse_qs(request.content.decode())
+                    self.assertEqual(
+                        form["fb_api_req_friendly_name"][0],
+                        instagram.FOLLOW_FRIENDLY_NAME,
+                    )
+                    self.assertEqual(form["doc_id"][0], instagram.FOLLOW_DOC_ID)
+                    variables = json.loads(form["variables"][0])
+                    self.assertEqual(variables["target_user_id"], "12345")
+                    self.assertEqual(variables["container_module"], "profile")
+                    return httpx.Response(
+                        200,
+                        json={
+                            "data": {
+                                "xdt_create_friendship": {
+                                    "username": "target.user",
+                                    "id": "12345",
+                                    "friendship_status": {
+                                        "following": True,
+                                        "outgoing_request": False,
+                                        "followed_by": False,
+                                    },
+                                }
+                            }
+                        },
+                        request=request,
+                    )
+                if request.url.path == "/target.user/":
+                    return httpx.Response(200, text=page, request=request)
+                self.assertEqual(request.url.path, "/api/v1/users/web_profile_info/")
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "data": {
+                            "user": {
+                                "id": "12345",
+                                "username": "target.user",
+                                "is_private": False,
+                                "followed_by_viewer": False,
+                                "requested_by_viewer": False,
+                                "follows_viewer": False,
+                            }
+                        },
+                    },
+                    request=request,
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                result = client.follow("target.user")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "followed")
+            self.assertTrue(result["following"])
+            self.assertFalse(result["outgoing_request"])
+            self.assertEqual(len(posts), 1)
+
+    def test_relationship_follow_is_idempotent_when_already_following(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path, allow_write=True))
+            client.relationship_show = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+                "is_private": False,
+                "status": "following",
+                "following": True,
+                "outgoing_request": False,
+                "followed_by": False,
+                "blocked": False,
+                "restricted": False,
+            }
+            try:
+                result = client.follow("target.user")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "already_following")
+            self.assertTrue(result["following"])
+
     def test_media_list_and_like_use_validated_feed_item(self) -> None:
         bootstrap = {
             "require": [

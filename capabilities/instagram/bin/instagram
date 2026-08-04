@@ -49,7 +49,12 @@ SUMMARY = (
 )
 SCOPE = "user"
 CRED_KEYS: list[dict[str, Any]] = []
-WRITE_VERBS = {"conversations.resolve", "media.like", "messages.send"}
+WRITE_VERBS = {
+    "conversations.resolve",
+    "media.like",
+    "messages.send",
+    "relationship.follow",
+}
 WRITE_DEFAULT = False
 DOCS_BASE = ""
 TOPICS: list[str] = []
@@ -724,6 +729,8 @@ WEB_PROFILE_INFO_URL = "https://www.instagram.com/api/v1/users/web_profile_info/
 USER_FEED_URL = "https://www.instagram.com/api/v1/feed/user/{user_id}/"
 LIKE_FRIENDLY_NAME = "usePolarisLikeMediaXIGLikeMutation"
 LIKE_DOC_ID = "27182485238052618"
+FOLLOW_FRIENDLY_NAME = "usePolarisFollowMutation"
+FOLLOW_DOC_ID = "26508036048874888"
 CREATE_THREAD_URL = (
     "https://www.instagram.com/api/v1/direct_v2/create_group_thread/"
 )
@@ -778,6 +785,8 @@ Commands
   instagram refresh <PATH|-|--clipboard>          Import a browser capture locally.
   instagram whoami [--connection ID]              Return authenticated username.
   instagram profile show <handle-or-url>           Read profile routing metadata.
+  instagram relationship show <handle-or-url>      Read current follow relationship.
+  instagram relationship follow <handle-or-url>    Follow unless already followed/requested.
   instagram media list <handle-or-url> [--limit N]
                                                   List recent profile media.
   instagram media like <handle-or-url> <code-or-id>
@@ -788,12 +797,12 @@ Commands
                                                   Resolve the thread and send text.
 
 Write policy
-  `media like`, `conversations resolve`, and `messages send` leave state on
-  Instagram and are refused unless the selected connection has
+  `relationship follow`, `media like`, `conversations resolve`, and
+  `messages send` leave state on Instagram and are refused unless the selected connection has
   `allow_write: true`. Exit 4 means policy refusal; ask the user rather than
-  changing the gate. A media already liked returns `already_liked` without a
-  write. Ambiguous write failures are never retried automatically because that
-  could duplicate an action.
+  changing the gate. Existing follows, pending requests, and media already
+  liked return without a write. Ambiguous write failures are never retried
+  automatically because that could duplicate an action.
 
 Exit codes
   0 success · 2 authentication/session · 3 profile not found · 4 policy refusal
@@ -1569,8 +1578,141 @@ class InstagramWebClient:
             "follower_count": follower_count,
             "following_count": following_count,
             "media_count": media_count,
+            "followed_by_viewer": bool(raw.get("followed_by_viewer")),
+            "requested_by_viewer": bool(raw.get("requested_by_viewer")),
+            "follows_viewer": bool(raw.get("follows_viewer")),
+            "blocked_by_viewer": bool(raw.get("blocked_by_viewer")),
+            "restricted_by_viewer": bool(raw.get("restricted_by_viewer")),
         }
         return {key: value for key, value in fields.items() if value is not None}
+
+    def relationship_show(self, profile_value: str) -> dict[str, Any]:
+        profile = self.profile(profile_value)
+        if profile["blocked_by_viewer"]:
+            status = "blocked"
+        elif profile["followed_by_viewer"]:
+            status = "following"
+        elif profile["requested_by_viewer"]:
+            status = "requested"
+        else:
+            status = "not_following"
+        return {
+            "username": profile["username"],
+            "recipient_pk": profile["recipient_pk"],
+            "is_private": profile.get("is_private"),
+            "status": status,
+            "following": profile["followed_by_viewer"],
+            "outgoing_request": profile["requested_by_viewer"],
+            "followed_by": profile["follows_viewer"],
+            "blocked": profile["blocked_by_viewer"],
+            "restricted": profile["restricted_by_viewer"],
+        }
+
+    def follow(self, profile_value: str) -> dict[str, Any]:
+        relationship = self.relationship_show(profile_value)
+        if relationship["blocked"]:
+            return {**relationship, "status": "blocked"}
+        if relationship["following"]:
+            return {**relationship, "status": "already_following"}
+        if relationship["outgoing_request"]:
+            return {**relationship, "status": "already_requested"}
+
+        csrf = self._cookie_value("csrftoken")
+        if not csrf:
+            raise InstagramFailure(
+                2,
+                "session_tokens_missing",
+                "Follow request requires a current CSRF token",
+                "refresh the browser session and retry relationship show",
+            )
+        variables = {
+            "target_user_id": relationship["recipient_pk"],
+            "container_module": "profile",
+            "nav_chain": "PolarisProfilePostsTabRoot:profilePage:1:via_cold_start",
+        }
+        form = dict(self.template.form)
+        form.update(
+            {
+                "fb_api_caller_class": "RelayModern",
+                "fb_api_req_friendly_name": FOLLOW_FRIENDLY_NAME,
+                "server_timestamps": "true",
+                "variables": json.dumps(variables, separators=(",", ":")),
+                "doc_id": FOLLOW_DOC_ID,
+            }
+        )
+        headers = {
+            name: value
+            for name, value in self.template.headers.items()
+            if name.lower()
+            not in {
+                "cookie",
+                "content-length",
+                "accept-encoding",
+                "x-csrftoken",
+                "x-fb-friendly-name",
+            }
+        }
+        headers.update(
+            {
+                "Referer": f"https://www.instagram.com/{relationship['username']}/",
+                "X-CSRFToken": csrf,
+                "X-FB-Friendly-Name": FOLLOW_FRIENDLY_NAME,
+            }
+        )
+        try:
+            response = self.http.post(GRAPHQL_URL, headers=headers, data=form)
+        except httpx.HTTPError as exc:
+            raise InstagramFailure(
+                5,
+                "follow_unknown",
+                "Follow result is unknown; do not retry automatically",
+                type(exc).__name__,
+            ) from exc
+        finally:
+            self._persist()
+        if response.status_code in {401, 403}:
+            raise InstagramFailure(
+                2,
+                "auth_failed",
+                "Instagram rejected the current session",
+                status=response.status_code,
+            )
+        if response.status_code == 429:
+            raise InstagramFailure(5, "rate_limited", "Instagram rate-limited the follow")
+        try:
+            payload = _decode_json(response.text)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise InstagramFailure(
+                5,
+                "follow_unknown",
+                "Follow response was not valid JSON; do not retry automatically",
+                status=response.status_code,
+            ) from exc
+        result = ((payload.get("data") or {}).get("xdt_create_friendship") or {})
+        friendship = result.get("friendship_status")
+        result_id = str(result.get("id") or "")
+        following = bool(friendship.get("following")) if isinstance(friendship, dict) else False
+        outgoing_request = (
+            bool(friendship.get("outgoing_request")) if isinstance(friendship, dict) else False
+        )
+        if (
+            response.status_code != 200
+            or result_id != relationship["recipient_pk"]
+            or not isinstance(friendship, dict)
+            or not (following or outgoing_request)
+        ):
+            raise InstagramFailure(
+                5,
+                "follow_rejected",
+                "Instagram did not confirm the follow or outgoing request",
+                status=response.status_code,
+            )
+        return {
+            **relationship,
+            "status": "followed" if following else "requested",
+            "following": following,
+            "outgoing_request": outgoing_request,
+        }
 
     def media_list(
         self, profile_value: str, *, limit: int = 12, max_id: str | None = None
@@ -2145,6 +2287,17 @@ def main() -> None:
             with InstagramWebClient(conn) as client:
                 profile = client.profile(argv[2])
             _emit({"connection": conn.id, **profile})
+            return
+        if len(argv) == 3 and argv[:2] == ["relationship", "show"]:
+            with InstagramWebClient(conn) as client:
+                relationship = client.relationship_show(argv[2])
+            _emit({"connection": conn.id, **relationship})
+            return
+        if len(argv) == 3 and argv[:2] == ["relationship", "follow"]:
+            _write_gate(conn.id, conn.allow_write, "relationship.follow")
+            with InstagramWebClient(conn) as client:
+                result = client.follow(argv[2])
+            _emit({"connection": conn.id, **result})
             return
         if len(argv) >= 3 and argv[:2] == ["media", "list"]:
             limit, max_id = _media_list_options(argv[3:])
