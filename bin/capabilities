@@ -92,6 +92,32 @@ MACHINE VERBS
         after clean audits, or unregister a source. Removing never deletes an
         editable workspace.
 
+DEVELOPMENT VERBS
+  dev start <name> --source PATH [--consumer PATH | --consumer-live PATH]
+            [--ref REF] [--consumer-ref REF] [--session ID]
+        Create a persistent development session: an isolated source worktree,
+        optional isolated consumer worktree, registry, PATH bin, HOME, config,
+        state, data, cache, and logs. No daemon is started and the canonical
+        registry/PATH are not changed.
+  dev install <session> <name> [<name> ...]
+        Audit and install capabilities from the session source worktree into
+        its isolated registry. Re-run after source edits to refresh payloads.
+  dev exec <session> [--cwd source|consumer] [--inherit-env KEY ...] -- <command>
+        Execute one foreground command inside the session environment. Output
+        and exit status are passed through. Parent env is denied by default;
+        named keys may be inherited without putting values on argv.
+  dev doctor <session> | dev list
+        Inspect provenance, worktrees, isolation paths, installed payloads, and
+        cleanup readiness. Source dirtiness is visible development state, not
+        by itself a failure.
+  dev stop <session>
+        Remove only a clean session whose commits are absent, merged, or
+        patch-equivalent to commits on its recorded base ref. Dirty or
+        unpublished worktrees are preserved and refused.
+  dev gc [--older-than 7d]
+        Apply the same safe cleanup rule to old sessions; unsafe sessions are
+        reported and retained.
+
 POLICY VERBS
   enable <name> --project|--global / disable <name> --project|--global [--deny]
         Write an explicit project gate (capabilities/settings.json) or the
@@ -165,7 +191,7 @@ AUTHORING VERBS (emit agent-executable instructions; judgment stays with the age
                    With no name, emit the authoring procedure. With a name,
                    create a canonical capability skeleton in that source;
                    generated contract regions are stamped by the manager.
-  guide <authoring|repositories|publishing|contract>
+  guide <authoring|repositories|publishing|contract|dev>
                    Manager-bundled offline guidance for custom sources.
   conform <ref>    The procedure for bringing an existing script to the contract.
   groom <name>     The procedure for reviewing an installed capability.
@@ -192,6 +218,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 from typing import NoReturn
 
@@ -202,6 +229,8 @@ SOURCE = os.environ.get("CAPABILITIES_SOURCE") or \
 CAP_HOME = Path(os.environ.get("CAPABILITIES_HOME") or (Path.home() / ".capabilities"))
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 _CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
 SOURCE_WORKSPACE_ROOT = CAP_HOME / "sources"
 LEGACY_SOURCE_WORKSPACE_ROOT = Path.home() / "capabilities-sources"
 SOURCES_FILE = _CONFIG_HOME / "capabilities" / "sources.json"
@@ -209,6 +238,15 @@ SOURCE_CACHE_ROOT = _CACHE_HOME / "capabilities" / "sources"
 OFFICIAL_SOURCE_ID = "official"
 OFFICIAL_GIT_URL = "https://github.com/ai-cluster-one/capabilities.git"
 RESERVED_CAPABILITY_NAMES = {"sources"}
+DEV_SESSION_SCHEMA = "capabilities.dev.session.v1"
+DEV_STATE_ROOT = _STATE_HOME / "capabilities" / "dev"
+DEV_DATA_ROOT = _DATA_HOME / "capabilities" / "dev"
+DEV_MANAGED_ENV_KEYS = {
+    "HOME", "PATH", "CAPABILITIES_HOME", "CAPABILITIES_BIN",
+    "CAPABILITIES_DEV_SESSION", "CAPABILITIES_DEV_SOURCE",
+    "CAPABILITIES_DEV_CONSUMER", "CLAUDE_PROJECT_DIR", "UV_CACHE_DIR",
+    "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+}
 
 PROJECT_CAPABILITIES_REL = Path("capabilities")
 LEGACY_PROJECT_CAPABILITIES_REL = Path(".capabilities")
@@ -1301,6 +1339,530 @@ def cmd_list() -> None:
     if enabled_not_installed:
         out["enabled_not_installed"] = enabled_not_installed
     _emit(out)
+
+# ---------------------------------------------------------------- dev sessions
+
+def _dev_safe_id(value: str) -> bool:
+    return re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", value) is not None
+
+
+def _dev_safe_env_key(value: str) -> bool:
+    return re.fullmatch(r"[A-Z_][A-Z0-9_]*", value) is not None
+
+
+def _dev_slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return (slug or "capability")[:40]
+
+
+def _dev_git(
+        repo: Path, *args: str, timeout: int = 60
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True,
+            timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _die(6, "git_failed", f"git {' '.join(args)} failed for {repo}", str(exc))
+
+
+def _dev_git_value(repo: Path, *args: str) -> str:
+    proc = _dev_git(repo, *args)
+    if proc.returncode != 0:
+        _die(6, "git_failed", f"git {' '.join(args)} failed for {repo}",
+             proc.stderr.strip() or proc.stdout.strip() or None)
+    return proc.stdout.strip()
+
+
+def _dev_require_repo(path: str, role: str) -> Path:
+    root = Path(path).expanduser().resolve()
+    if not root.is_dir():
+        _die(3, "not_found", f"{role} repository does not exist: {root}")
+    top = _dev_git(root, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        _die(6, "not_git_repository", f"{role} is not a git repository: {root}")
+    if Path(top.stdout.strip()).resolve() != root:
+        _die(6, "repository_root_required", f"{role} must name the git root: {root}",
+             f"repository root is {top.stdout.strip()}")
+    return root
+
+
+def _dev_state_dir(session_id: str) -> Path:
+    if not _dev_safe_id(session_id):
+        _die(6, "bad_session", f"invalid dev session id: {session_id!r}",
+             "use lowercase letters, digits, and hyphens")
+    return DEV_STATE_ROOT / session_id
+
+
+def _dev_data_dir(session_id: str) -> Path:
+    if not _dev_safe_id(session_id):
+        _die(6, "bad_session", f"invalid dev session id: {session_id!r}")
+    return DEV_DATA_ROOT / session_id
+
+
+def _dev_session(session_id: str) -> dict:
+    path = _dev_state_dir(session_id) / "session.json"
+    data = _read_json(path)
+    if not isinstance(data, dict) or data.get("schema") != DEV_SESSION_SCHEMA:
+        _die(3, "dev_session_not_found", f"unknown dev session: {session_id}",
+             "run `capabilities dev list`")
+    return data
+
+
+def _dev_branch_exists(repo: Path, branch: str) -> bool:
+    return _dev_git(repo, "show-ref", "--verify", "--quiet",
+                    f"refs/heads/{branch}").returncode == 0
+
+
+def _dev_add_worktree(repo: Path, target: Path, branch: str, ref: str) -> str:
+    base = _dev_git_value(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if _dev_branch_exists(repo, branch):
+        _die(6, "branch_exists", f"dev branch already exists: {branch}")
+    proc = _dev_git(repo, "worktree", "add", str(target), "-b", branch, ref,
+                    timeout=120)
+    if proc.returncode != 0:
+        # `git worktree add -b` can leave the newly-created branch behind even
+        # when worktree creation fails. It did not exist at entry, so removing
+        # that exact branch is a rollback, not loss of caller-owned work.
+        if _dev_branch_exists(repo, branch):
+            _dev_git(repo, "branch", "-D", branch)
+        _die(6, "worktree_failed", f"cannot create dev worktree {target}",
+             proc.stderr.strip() or proc.stdout.strip() or None)
+    return base
+
+
+def _dev_rollback_worktree(repo: Path, target: Path, branch: str) -> None:
+    """Best-effort rollback for a worktree/branch created by this invocation."""
+    try:
+        if target.exists():
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "remove", "--force", str(target)],
+                capture_output=True, text=True, timeout=120, check=False)
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", "-D", branch],
+            capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def cmd_dev_start(name: str, source_ref: str, consumer_ref: str | None,
+                  consumer_live_ref: str | None, git_ref: str,
+                  consumer_git_ref: str, requested_session: str | None) -> None:
+    _reject_reserved_capability_name(name)
+    if consumer_ref and consumer_live_ref:
+        _die(6, "input", "dev start accepts --consumer or --consumer-live, not both")
+    source_repo = _dev_require_repo(source_ref, "source")
+    if not (source_repo / "capabilities.repo.json").is_file():
+        _die(6, "not_capability_source",
+             f"source is missing capabilities.repo.json: {source_repo}")
+    session_id = requested_session or (
+        f"{_dev_slug(name)}-"
+        f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{os.getpid()}")
+    if not _dev_safe_id(session_id):
+        _die(6, "bad_session", f"invalid dev session id: {session_id!r}",
+             "use lowercase letters, digits, and hyphens")
+    state_dir = _dev_state_dir(session_id)
+    data_dir = _dev_data_dir(session_id)
+    if state_dir.exists() or data_dir.exists():
+        _die(6, "session_exists", f"dev session already exists: {session_id}")
+    source_branch = f"dev/{session_id}"
+    source_worktree = data_dir / "source"
+
+    consumer_repo: Path | None = None
+    consumer_worktree: Path | None = None
+    consumer_branch: str | None = None
+    consumer_base: str | None = None
+    consumer_live = False
+    if consumer_ref:
+        consumer_repo = _dev_require_repo(consumer_ref, "consumer")
+        consumer_worktree = data_dir / "consumer"
+        consumer_branch = f"dev/{session_id}-consumer"
+    elif consumer_live_ref:
+        consumer_repo = _dev_require_repo(consumer_live_ref, "live consumer")
+        consumer_worktree = consumer_repo
+        consumer_live = True
+
+    # Resolve both bases and reject branch conflicts before mutating either repo.
+    _dev_git_value(source_repo, "rev-parse", "--verify", f"{git_ref}^{{commit}}")
+    if _dev_branch_exists(source_repo, source_branch):
+        _die(6, "branch_exists", f"dev branch already exists: {source_branch}")
+    if consumer_repo and consumer_branch:
+        _dev_git_value(
+            consumer_repo, "rev-parse", "--verify", f"{consumer_git_ref}^{{commit}}")
+        if _dev_branch_exists(consumer_repo, consumer_branch):
+            _die(6, "branch_exists", f"dev branch already exists: {consumer_branch}")
+
+    paths = {
+        "home": state_dir / "home",
+        "registry": state_dir / "registry",
+        "bin": state_dir / "bin",
+        "config": state_dir / "config",
+        "state": state_dir / "runtime-state",
+        "cache": state_dir / "cache",
+        "data": state_dir / "runtime-data",
+        "logs": state_dir / "logs",
+    }
+    source_created = False
+    consumer_created = False
+    try:
+        state_dir.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+        source_base = _dev_add_worktree(
+            source_repo, source_worktree, source_branch, git_ref)
+        source_created = True
+        if consumer_repo and consumer_worktree and consumer_branch:
+            consumer_base = _dev_add_worktree(
+                consumer_repo, consumer_worktree, consumer_branch, consumer_git_ref)
+            consumer_created = True
+        for path in paths.values():
+            path.mkdir(parents=True, exist_ok=True)
+        manager_link = paths["bin"] / "capabilities"
+        manager_link.symlink_to(source_worktree / "bin" / "capabilities")
+        session = {
+            "schema": DEV_SESSION_SCHEMA,
+            "id": session_id,
+            "capability": name,
+            "created_at": int(time.time()),
+            "source": {
+                "repo": str(source_repo), "worktree": str(source_worktree),
+                "branch": source_branch, "ref": git_ref, "base_commit": source_base,
+            },
+            "consumer": ({
+                "repo": str(consumer_repo), "worktree": str(consumer_worktree),
+                "branch": consumer_branch, "ref": consumer_git_ref,
+                "base_commit": consumer_base, "live": consumer_live,
+            } if consumer_worktree else None),
+            "paths": {key: str(value) for key, value in paths.items()},
+        }
+        _write_json(state_dir / "session.json", session)
+    except BaseException:
+        if consumer_created and consumer_repo and consumer_worktree and consumer_branch:
+            _dev_rollback_worktree(consumer_repo, consumer_worktree, consumer_branch)
+        if source_created:
+            _dev_rollback_worktree(source_repo, source_worktree, source_branch)
+        shutil.rmtree(state_dir, ignore_errors=True)
+        shutil.rmtree(data_dir, ignore_errors=True)
+        raise
+    _emit({
+        "ok": True, "session": session_id,
+        "source_worktree": str(source_worktree),
+        "source_branch": source_branch,
+        "consumer_worktree": str(consumer_worktree) if consumer_worktree else None,
+        "isolated": {key: str(paths[key]) for key in
+                     ("registry", "bin", "config", "state", "data", "home")},
+        "next_commands": [
+            f"capabilities dev install {session_id} {name}",
+            f"capabilities dev doctor {session_id}",
+            f"capabilities dev exec {session_id} -- {name} help",
+        ],
+    })
+
+
+def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
+    safe_keys = {
+        "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "USER", "LOGNAME",
+        "SHELL", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE", "NO_COLOR",
+    }
+    env = {key: value for key, value in os.environ.items()
+           if key in safe_keys or key.startswith("LC_")}
+    paths = session["paths"]
+    env.update({
+        "HOME": paths["home"],
+        "CAPABILITIES_HOME": paths["registry"],
+        "CAPABILITIES_BIN": paths["bin"],
+        "XDG_CONFIG_HOME": paths["config"],
+        "XDG_STATE_HOME": paths["state"],
+        "XDG_DATA_HOME": paths["data"],
+        "XDG_CACHE_HOME": paths["cache"],
+        "CAPABILITIES_DEV_SESSION": session["id"],
+        "CAPABILITIES_DEV_SOURCE": session["source"]["worktree"],
+        "PATH": paths["bin"] + os.pathsep + os.environ.get("PATH", os.defpath),
+        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(_CACHE_HOME / "uv")),
+    })
+    consumer = session.get("consumer")
+    if isinstance(consumer, dict):
+        env["CLAUDE_PROJECT_DIR"] = consumer["worktree"]
+        env["CAPABILITIES_DEV_CONSUMER"] = consumer["worktree"]
+    for key in inherit or []:
+        if not _dev_safe_env_key(key):
+            _die(6, "bad_env_key", f"invalid inherited env key: {key!r}")
+        if key in DEV_MANAGED_ENV_KEYS:
+            _die(6, "managed_env_key",
+                 f"dev isolation owns environment key {key}; it cannot be inherited")
+        if key not in os.environ:
+            _die(6, "env_missing", f"cannot inherit unset env key: {key}")
+        env[key] = os.environ[key]
+    return env
+
+
+def _dev_cwd(session: dict, requested: str | None) -> Path:
+    choice = requested or ("consumer" if session.get("consumer") else "source")
+    if choice == "source":
+        return Path(session["source"]["worktree"])
+    if choice == "consumer" and isinstance(session.get("consumer"), dict):
+        return Path(session["consumer"]["worktree"])
+    _die(6, "bad_dev_cwd", f"dev session has no cwd target {choice!r}",
+         "use --cwd source, or attach a consumer at dev start")
+
+
+def cmd_dev_install(session_id: str, names: list[str]) -> None:
+    if not names:
+        _die(6, "input", "dev install needs at least one capability name")
+    session = _dev_session(session_id)
+    env = _dev_env(session)
+    manager = Path(session["paths"]["bin"]) / "capabilities"
+    cwd = _dev_cwd(session, None)
+    installed = []
+    for name in names:
+        _reject_reserved_capability_name(name)
+        proc = subprocess.run(
+            [str(manager), "install", name, "--from", session["source"]["worktree"]],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=300,
+            check=False)
+        if proc.returncode != 0:
+            sys.stdout.write(proc.stdout)
+            sys.stderr.write(proc.stderr)
+            sys.exit(proc.returncode)
+        try:
+            installed.append(json.loads(proc.stdout))
+        except ValueError:
+            installed.append({"name": name, "output": proc.stdout.strip()})
+    _emit({
+        "ok": True, "session": session_id, "installed": installed,
+        "next_commands": [
+            f"capabilities dev doctor {session_id}",
+            f"capabilities dev exec {session_id} -- {names[0]} help",
+        ],
+    })
+
+
+def cmd_dev_exec(session_id: str, command: list[str], cwd_choice: str | None,
+                 inherit: list[str]) -> None:
+    if not command:
+        _die(6, "input", "dev exec needs a command after --")
+    session = _dev_session(session_id)
+    env = _dev_env(session, inherit)
+    cwd = _dev_cwd(session, cwd_choice)
+    name = command[0]
+    canonical_names = set(_installed()) | {"capabilities"}
+    if "/" not in name and name in canonical_names:
+        candidate = Path(session["paths"]["bin"]) / name
+        if not candidate.exists():
+            _die(6, "dev_capability_not_installed",
+                 f"{name} is available canonically but not in dev session {session_id}",
+                 f"run `capabilities dev install {session_id} {name}`")
+        resolved = shutil.which(name, path=env["PATH"])
+        if not resolved or Path(resolved).resolve() != candidate.resolve():
+            _die(6, "dev_path_escape", f"{name} does not resolve from the dev bin",
+                 f"expected {candidate}")
+    try:
+        proc = subprocess.run(command, cwd=cwd, env=env, check=False)
+    except FileNotFoundError:
+        _die(3, "command_not_found", f"dev command not found: {name}")
+    except OSError as exc:
+        _die(6, "exec_failed", f"cannot execute dev command: {name}", str(exc))
+    sys.exit(proc.returncode)
+
+
+def _dev_git_status(worktree: Path) -> tuple[str | None, str | None]:
+    if not worktree.is_dir():
+        return None, "worktree is missing"
+    status = _dev_git(worktree, "status", "--porcelain")
+    if status.returncode != 0:
+        return None, status.stderr.strip() or "git status failed"
+    return status.stdout, None
+
+
+def _dev_worktree_cleanup_problem(info: dict) -> str | None:
+    if info.get("live"):
+        return None
+    worktree = Path(info["worktree"])
+    status, error = _dev_git_status(worktree)
+    if error:
+        return error
+    if status:
+        return f"dirty worktree: {worktree}"
+    head = _dev_git_value(worktree, "rev-parse", "HEAD")
+    if head == info.get("base_commit"):
+        return None
+    merged = _dev_git(Path(info["repo"]), "merge-base", "--is-ancestor",
+                      head, str(info.get("ref") or "main"))
+    if merged.returncode == 0:
+        return None
+    upstream = str(info.get("ref") or "main")
+    cherry = _dev_git(Path(info["repo"]), "cherry", upstream, head)
+    patch_states = [line[:1] for line in cherry.stdout.splitlines() if line.strip()]
+    if cherry.returncode == 0 and patch_states and all(
+            state == "-" for state in patch_states):
+        return None
+    return f"unpublished commits on {info.get('branch')}: {head}"
+
+
+def _dev_cleanup_problems(session: dict) -> list[str]:
+    problems = []
+    source_problem = _dev_worktree_cleanup_problem(session["source"])
+    if source_problem:
+        problems.append(source_problem)
+    consumer = session.get("consumer")
+    if isinstance(consumer, dict):
+        consumer_problem = _dev_worktree_cleanup_problem(consumer)
+        if consumer_problem:
+            problems.append(consumer_problem)
+    return problems
+
+
+def cmd_dev_doctor(session_id: str) -> None:
+    session = _dev_session(session_id)
+    findings: list[str] = []
+    source = session["source"]
+    source_status, source_error = _dev_git_status(Path(source["worktree"]))
+    if source_error:
+        findings.append(source_error)
+    manager = Path(session["paths"]["bin"]) / "capabilities"
+    expected_manager = Path(source["worktree"]) / "bin" / "capabilities"
+    if not manager.is_symlink() or manager.resolve() != expected_manager.resolve():
+        findings.append(f"dev manager link does not point to {expected_manager}")
+    installed = []
+    registry = Path(session["paths"]["registry"])
+    bindir = Path(session["paths"]["bin"])
+    if registry.is_dir():
+        for path in sorted(registry.iterdir()):
+            if path.name.startswith(".") or not (path / path.name).is_file():
+                continue
+            link = bindir / path.name
+            ok = link.is_symlink() and link.resolve() == (path / path.name).resolve()
+            installed.append({"name": path.name, "executable": str(link), "ok": ok})
+            if not ok:
+                findings.append(f"{path.name} dev symlink is missing or misdirected")
+    consumer = session.get("consumer")
+    consumer_status = None
+    if isinstance(consumer, dict) and not consumer.get("live"):
+        consumer_status, consumer_error = _dev_git_status(Path(consumer["worktree"]))
+        if consumer_error:
+            findings.append(consumer_error)
+    _emit({
+        "ok": not findings, "session": session_id,
+        "source": {**source, "dirty": bool(source_status)},
+        "consumer": ({**consumer, "dirty": bool(consumer_status)}
+                     if isinstance(consumer, dict) else None),
+        "environment": {
+            "registry": session["paths"]["registry"],
+            "bin": session["paths"]["bin"],
+            "home": session["paths"]["home"],
+            "config": session["paths"]["config"],
+            "state": session["paths"]["state"],
+        },
+        "installed": installed,
+        "cleanup_ready": not _dev_cleanup_problems(session),
+        "cleanup_problems": _dev_cleanup_problems(session),
+        "findings": findings,
+    })
+    if findings:
+        sys.exit(7)
+
+
+def _dev_session_summaries() -> list[dict]:
+    sessions = []
+    if not DEV_STATE_ROOT.is_dir():
+        return sessions
+    for path in sorted(DEV_STATE_ROOT.iterdir()):
+        data = _read_json(path / "session.json") if path.is_dir() else None
+        if not isinstance(data, dict) or data.get("schema") != DEV_SESSION_SCHEMA:
+            continue
+        sessions.append({
+            "id": data["id"], "capability": data.get("capability"),
+            "created_at": data.get("created_at"),
+            "source_worktree": data.get("source", {}).get("worktree"),
+            "consumer_worktree": (data.get("consumer") or {}).get("worktree"),
+            "cleanup_ready": not _dev_cleanup_problems(data),
+            "cleanup_problems": _dev_cleanup_problems(data),
+        })
+    return sessions
+
+
+def cmd_dev_list() -> None:
+    _emit({"sessions": _dev_session_summaries(),
+           "state_root": str(DEV_STATE_ROOT), "data_root": str(DEV_DATA_ROOT)})
+
+
+def _dev_remove_worktree(info: dict) -> None:
+    if info.get("live"):
+        return
+    repo = Path(info["repo"])
+    worktree = Path(info["worktree"])
+    branch = info.get("branch")
+    proc = _dev_git(repo, "worktree", "remove", str(worktree), timeout=120)
+    if proc.returncode != 0:
+        _die(6, "worktree_remove_failed", f"cannot remove worktree {worktree}",
+             proc.stderr.strip() or proc.stdout.strip() or None)
+    if branch and _dev_branch_exists(repo, branch):
+        # Cleanup eligibility was checked against the recorded base ref first.
+        proc = _dev_git(repo, "branch", "-D", branch)
+        if proc.returncode != 0:
+            _die(6, "branch_remove_failed", f"cannot remove preserved branch {branch}",
+                 proc.stderr.strip() or proc.stdout.strip() or None)
+
+
+def _dev_assert_owned_path(path: Path, root: Path) -> None:
+    resolved = path.resolve()
+    parent = root.resolve()
+    if resolved == parent or parent not in resolved.parents:
+        _die(6, "unsafe_dev_path", f"refusing cleanup outside dev root: {resolved}")
+
+
+def _dev_stop(session_id: str, emit_result: bool) -> dict:
+    session = _dev_session(session_id)
+    problems = _dev_cleanup_problems(session)
+    if problems:
+        if emit_result:
+            _die(6, "dev_cleanup_refused", f"dev session {session_id} is not removable",
+                 "; ".join(problems))
+        return {"session": session_id, "removed": False, "problems": problems}
+    consumer = session.get("consumer")
+    if isinstance(consumer, dict):
+        _dev_remove_worktree(consumer)
+    _dev_remove_worktree(session["source"])
+    state_dir = _dev_state_dir(session_id)
+    data_dir = _dev_data_dir(session_id)
+    _dev_assert_owned_path(state_dir, DEV_STATE_ROOT)
+    _dev_assert_owned_path(data_dir, DEV_DATA_ROOT)
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
+    if state_dir.exists():
+        shutil.rmtree(state_dir)
+    result = {"session": session_id, "removed": True}
+    if emit_result:
+        _emit(result)
+    return result
+
+
+def cmd_dev_stop(session_id: str) -> None:
+    _dev_stop(session_id, True)
+
+
+def _dev_duration(value: str) -> int:
+    match = re.fullmatch(r"([1-9][0-9]*)([smhd])", value)
+    if not match:
+        _die(6, "bad_duration", f"invalid duration: {value!r}",
+             "use an integer followed by s, m, h, or d")
+    amount = int(match.group(1))
+    return amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+
+
+def cmd_dev_gc(older_than: str) -> None:
+    cutoff = int(time.time()) - _dev_duration(older_than)
+    removed, retained = [], []
+    for summary in _dev_session_summaries():
+        if int(summary.get("created_at") or 0) > cutoff:
+            retained.append({"session": summary["id"], "reason": "younger than cutoff"})
+            continue
+        result = _dev_stop(summary["id"], False)
+        (removed if result["removed"] else retained).append(
+            result if result["removed"] else {
+                "session": result["session"], "reason": "; ".join(result["problems"]),
+            })
+    _emit({"older_than": older_than, "removed": removed, "retained": retained})
 
 # ---------------------------------------------------------------- gate
 
@@ -3431,6 +3993,27 @@ its fenced regions; agents never write them by hand. `capabilities source sync
 `source check` and installation reject missing or changed regions. No force or
 skip flag exists.
 """,
+        "dev": """\
+# Isolated capability development
+
+Use `capabilities dev` when a consuming project needs to iterate on capability
+source before publication. `dev start` creates a dedicated git worktree and a
+session-scoped HOME, registry, PATH bin, config, state, data, cache, and logs.
+Attach a consumer with `--consumer` for an isolated consumer worktree; use
+`--consumer-live` only for a deliberate final read-only smoke test.
+
+The loop is: `dev start`, edit only the returned source worktree, `dev install`
+changed packages, then run focused checks through `dev exec`. Parent environment
+is denied by default; `--inherit-env KEY` opts in one named value without putting
+the value on argv. `dev doctor` proves executable provenance and cleanup state.
+
+`dev stop` removes only clean worktrees whose commits are absent, merged, or
+patch-equivalent to published commits. `dev gc` applies the same rule to old
+sessions and retains anything dirty or unpublished. After consumer behavior is
+proven, hand the prepared commit to the source owner for one final source
+index/check, review, and publication; update the canonical installed capability
+and repeat the original smoke test outside the dev session.
+""",
     }
     if topic not in guides:
         _die(3, "not_found", f"unknown manager guide {topic!r}",
@@ -3716,7 +4299,74 @@ def main() -> None:
 
     pos = positional()
 
-    if cmd == "install":
+    if cmd == "dev":
+        if not rest:
+            _die(
+                6, "input",
+                "dev needs a subcommand: start, install, exec, doctor, list, stop, or gc",
+            )
+        sub, dev_args = rest[0], rest[1:]
+
+        def dev_opt(name: str, argv: list[str] | None = None) -> str | None:
+            values = dev_opts(name, argv)
+            return values[-1] if values else None
+
+        def dev_opts(name: str, argv: list[str] | None = None) -> list[str]:
+            args = dev_args if argv is None else argv
+            values: list[str] = []
+            i = 0
+            while i < len(args):
+                value = args[i]
+                if value == name:
+                    if i + 1 >= len(args):
+                        _die(6, "input", f"{name} needs a value")
+                    values.append(args[i + 1])
+                    i += 2
+                    continue
+                if value.startswith(name + "="):
+                    values.append(value.split("=", 1)[1])
+                i += 1
+            return values
+
+        if sub == "start":
+            if len(dev_args) < 1 or dev_args[0].startswith("--"):
+                _die(6, "input", "dev start needs a primary capability name")
+            source_ref = dev_opt("--source")
+            if not source_ref:
+                _die(6, "input", "dev start needs --source PATH")
+            cmd_dev_start(
+                dev_args[0], source_ref, dev_opt("--consumer"),
+                dev_opt("--consumer-live"), dev_opt("--ref") or "main",
+                dev_opt("--consumer-ref") or "HEAD", dev_opt("--session"))
+        elif sub == "install":
+            values = [value for value in dev_args if not value.startswith("--")]
+            if len(values) < 2:
+                _die(6, "input", "dev install needs a session and capability name(s)")
+            cmd_dev_install(values[0], values[1:])
+        elif sub == "exec":
+            if "--" not in dev_args:
+                _die(6, "input", "dev exec needs -- before the child command")
+            divider = dev_args.index("--")
+            controls, command = dev_args[:divider], dev_args[divider + 1:]
+            if not controls or controls[0].startswith("--"):
+                _die(6, "input", "dev exec needs a session id")
+            cmd_dev_exec(controls[0], command, dev_opt("--cwd", controls),
+                         dev_opts("--inherit-env", controls))
+        elif sub == "doctor":
+            if not dev_args:
+                _die(6, "input", "dev doctor needs a session id")
+            cmd_dev_doctor(dev_args[0])
+        elif sub == "list":
+            cmd_dev_list()
+        elif sub == "stop":
+            if not dev_args:
+                _die(6, "input", "dev stop needs a session id")
+            cmd_dev_stop(dev_args[0])
+        elif sub == "gc":
+            cmd_dev_gc(dev_opt("--older-than") or "7d")
+        else:
+            _die(6, "input", f"unknown dev subcommand: {sub}")
+    elif cmd == "install":
         if not pos:
             _die(6, "input", "install needs a capability name")
         cmd_install(pos[0], opt("--from"), opt("--source"), flag("--yes"))
@@ -3828,7 +4478,10 @@ def main() -> None:
             cmd_new_capability(pos[0], source_id, flag("--core-only"))
     elif cmd == "guide":
         if not pos:
-            _die(6, "input", "guide needs a topic: authoring, repositories, publishing, or contract")
+            _die(
+                6, "input",
+                "guide needs a topic: authoring, repositories, publishing, contract, or dev",
+            )
         _emit(_manager_guide(pos[0]))
     elif cmd == "conform":
         if not pos:

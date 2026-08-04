@@ -7,7 +7,7 @@
     },
     "askproject": {
       "path": "capabilities/askproject",
-      "payload_sha256": "12c06a2d2e00223ef9b420aaca34d933194c331d11f85a2e82871cc423aa288f",
+      "payload_sha256": "6575570b46c6c14a30c72a581f41e7f44e6c9e82a0c758ccc09334b6fc14bc80",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project, fenced by mode (read/act), and return its answer with cost, token, and files-changed traceability."
     },
     "automations": {
@@ -27,7 +27,7 @@
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "add20ca4935cdd69f68ff5620d8430366bcdc438f9d64e0504bdc2f3b7e7f1bd",
+      "payload_sha256": "19ce2937f634c56096a0b6e1d32751e4539c9cfdc75cccab6550d571ac8626a4",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
@@ -92,7 +92,7 @@
     },
     "signoz": {
       "path": "capabilities/signoz",
-      "payload_sha256": "42adf3f2f1a6154996e0ea7e2ba5f0622995e949bbfe8a19bd999d2c17e0dd68",
+      "payload_sha256": "b76ea6e5f1ca6c457169223543e060405bf44d1369d38082999e755c040030ac",
       "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances."
     },
     "simplbooks": {
@@ -112,7 +112,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "dfe05d0f63b4ebc3670f543e5b52161824a2714ce1dc4c0e24d2fe2ef3ae1421",
+      "payload_sha256": "02ba18cf39ca92c49e287e7434bb87c7d123464ffd8ad79f947f8bb556daa562",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, send, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {

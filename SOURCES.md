@@ -15,6 +15,12 @@ The workspace root is fixed by the manager under `CAPABILITIES_HOME` (default
 payloads, remote caches, and project envelopes are never capability source
 code. The name `sources` is reserved and cannot be used as a capability name.
 
+When a consuming project needs a short-lived integration loop against a Git
+capability source, use `capabilities dev` instead of moving or editing this
+canonical workspace in place. The dev lifecycle creates an isolated source
+worktree and runtime registry while leaving the source checkout and normal
+installation untouched. `capabilities guide dev` owns that workflow.
+
 The manager owns the source registry at
 `~/.config/capabilities/sources.json` (or the platform's `XDG_CONFIG_HOME`
 equivalent). Its stable shape is:
