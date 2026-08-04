@@ -79,13 +79,19 @@ class DeploymentAutomationsTests(unittest.TestCase):
         self.assertIn("automations", lock)
         env = (self.root / ".env.example").read_text()
         self.assertIn("AUTOMATIONS_ENVIRONMENT=production", env)
-        if shutil.which("docker"):
+        docker = shutil.which("docker")
+        compose_available = (subprocess.run(
+            [docker, "compose", "version"], capture_output=True, text=True,
+            timeout=30, check=False,
+        ).returncode == 0) if docker else False
+        if compose_available:
             parsed = subprocess.run(
                 ["docker", "compose", "config", "--quiet"],
                 cwd=self.root,
                 capture_output=True,
                 text=True,
                 timeout=30,
+                check=False,
             )
             self.assertEqual(parsed.returncode, 0, parsed.stderr)
 
