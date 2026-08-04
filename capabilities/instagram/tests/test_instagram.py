@@ -88,26 +88,36 @@ def _bootstrap_page() -> str:
     )
 
 
-def _requests_payload(*, edges=None, has_next_page: bool = False):
-    return {
-        "data": {
-            "get_slide_mailbox_for_iris_subscription": {
-                "threads_by_folder": {
-                    "edges": edges or [],
-                    "page_info": {
-                        "end_cursor": "next-requests" if has_next_page else None,
-                        "has_next_page": has_next_page,
-                    },
-                }
-            },
-            "spamMailbox": {
-                "threads_by_folder": {
-                    "edges": [],
-                    "page_info": {"end_cursor": None, "has_next_page": False},
-                }
-            },
+def _requests_payload(
+    *,
+    edges=None,
+    has_next_page: bool = False,
+    spam_edges=None,
+    spam_has_next_page: bool = False,
+    include_spam: bool = True,
+):
+    data = {
+        "get_slide_mailbox_for_iris_subscription": {
+            "threads_by_folder": {
+                "edges": edges or [],
+                "page_info": {
+                    "end_cursor": "next-requests" if has_next_page else None,
+                    "has_next_page": has_next_page,
+                },
+            }
         }
     }
+    if include_spam:
+        data["spamMailbox"] = {
+            "threads_by_folder": {
+                "edges": spam_edges or [],
+                "page_info": {
+                    "end_cursor": "next-spam" if spam_has_next_page else None,
+                    "has_next_page": spam_has_next_page,
+                },
+            }
+        }
+    return {"data": data}
 
 
 class CaptureTests(unittest.TestCase):
@@ -674,6 +684,125 @@ class ClientTests(unittest.TestCase):
             self.assertTrue(result["pending"])
             self.assertNotIn("private text", json.dumps(result))
 
+    def test_conversation_find_paginates_requests_by_id_not_stale_handle(self) -> None:
+        calls = 0
+        edge = {
+            "node": {
+                "as_ig_direct_thread": {
+                    "id": "igid-request-2",
+                    "thread_id": "thread-request-2",
+                    "is_group": False,
+                    "users": [{"id": "12345", "username": "old.handle"}],
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.profile = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+            }
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal calls
+                calls += 1
+                variables = json.loads(
+                    parse_qs(request.content.decode())["variables"][0]
+                )
+                if calls == 1:
+                    self.assertNotIn("after", variables)
+                    return httpx.Response(
+                        200,
+                        json=_requests_payload(has_next_page=True),
+                        request=request,
+                    )
+                self.assertEqual(variables["after"], "next-requests")
+                return httpx.Response(
+                    200, json=_requests_payload(edges=[edge]), request=request
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                result = client.conversation_find("target.user", folders="requests")
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "found")
+            self.assertEqual(result["folder"], "requests")
+            self.assertEqual(result["pages_scanned"], 2)
+            self.assertEqual(calls, 2)
+
+    def test_conversation_find_labels_spam_and_fails_closed_if_missing(self) -> None:
+        edge = {
+            "node": {
+                "as_ig_direct_thread": {
+                    "id": "igid-spam-1",
+                    "thread_id": "thread-spam-1",
+                    "is_group": False,
+                    "users": [{"id": "12345", "username": "target.user"}],
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.profile = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+            }
+            client.http.close()
+            responses = iter(
+                [
+                    _requests_payload(spam_edges=[edge]),
+                    _requests_payload(include_spam=False),
+                ]
+            )
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, json=next(responses), request=request)
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                found = client.conversation_find("target.user", folders="spam")
+                unknown = client.conversation_find("target.user", folders="spam")
+            finally:
+                client.close()
+            self.assertEqual(found["status"], "found")
+            self.assertEqual(found["folder"], "spam")
+            self.assertEqual(found["folders_scanned"], ["spam"])
+            self.assertEqual(unknown["status"], "unknown")
+            self.assertFalse(unknown["scan_complete"])
+            self.assertEqual(unknown["reason"], "direct_folder_unvalidated")
+
+    def test_thread_identity_never_falls_back_to_handle_only(self) -> None:
+        self.assertEqual(
+            instagram.InstagramWebClient._thread_match_status(
+                {"users": [{"id": "999", "username": "target.user"}]},
+                username="target.user",
+                recipient_pk="12345",
+            ),
+            "different",
+        )
+        self.assertEqual(
+            instagram.InstagramWebClient._thread_match_status(
+                {"users": [{"username": "target.user"}]},
+                username="target.user",
+                recipient_pk="12345",
+            ),
+            "unknown",
+        )
+
     def test_messages_reconcile_matches_offline_id_without_exposing_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "session.json"
@@ -739,6 +868,92 @@ class ClientTests(unittest.TestCase):
                 result["matched_item"]["message_id"], "mid.delivered"
             )
             self.assertNotIn("private text", json.dumps(result))
+
+    def test_messages_reconcile_matches_server_id_from_item_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.conversation_find = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+                "found": True,
+                "scan_complete": True,
+                "folders_scanned": ["spam"],
+                "thread_id": "thread-1",
+                "thread_igid": "igid-1",
+                "pending": True,
+                "folder": "spam",
+            }
+            client.http.close()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "thread": {
+                            "thread_id": "thread-1",
+                            "viewer_id": "sender-1",
+                            "items": [
+                                {
+                                    "item_id": "mid.server-returned",
+                                    "user_id": "sender-1",
+                                    "is_sent_by_viewer": True,
+                                    "item_type": "text",
+                                    "text": "never expose this",
+                                }
+                            ],
+                            "has_older": False,
+                        },
+                    },
+                    request=request,
+                )
+
+            client.http = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                cookies=client.template.cookies,
+                follow_redirects=True,
+            )
+            try:
+                result = client.messages_reconcile(
+                    "target.user", server_message_id="mid.server-returned"
+                )
+            finally:
+                client.close()
+            self.assertTrue(result["delivery_confirmed"])
+            self.assertFalse(result["retry_safe"])
+            self.assertNotIn("never expose this", json.dumps(result))
+
+    def test_messages_reconcile_not_found_never_authorizes_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            instagram._write_template(_template(), path)
+            client = instagram.InstagramWebClient(_connection(path))
+            client.conversation_find = lambda *_args, **_kwargs: {
+                "username": "target.user",
+                "recipient_pk": "12345",
+                "found": False,
+                "scan_complete": True,
+                "folders_scanned": ["main", "requests", "spam"],
+            }
+            try:
+                result = client.messages_reconcile(
+                    "target.user", offline_id="offline-missing"
+                )
+            finally:
+                client.close()
+            self.assertEqual(result["status"], "not_found")
+            self.assertFalse(result["delivery_confirmed"])
+            self.assertFalse(result["retry_safe"])
+
+    def test_cli_contract_includes_spam_as_read_only(self) -> None:
+        self.assertEqual(
+            instagram._conversation_options(["--folders", "spam"]),
+            (25, "spam"),
+        )
+        self.assertNotIn("messages.reconcile", instagram.WRITE_VERBS)
+        self.assertIn("main|requests|spam|all", instagram.HELP)
 
     def test_messages_eligibility_marks_new_invitation_as_unverified(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

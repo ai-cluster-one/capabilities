@@ -795,11 +795,11 @@ Commands
                                                   List recent profile media.
   instagram media like <handle-or-url> <code-or-id>
                                                   Like one listed media item.
-  instagram conversations find <handle-or-url> [--max-pages N] [--folders main|requests|all]
-                                                  Find a thread in main inbox and/or message requests.
-  instagram messages inspect <handle-or-url> [--max-pages N] [--folders main|requests|all]
+  instagram conversations find <handle-or-url> [--max-pages N] [--folders main|requests|spam|all]
+                                                  Find a thread in main inbox, message requests, and/or spam.
+  instagram messages inspect <handle-or-url> [--max-pages N] [--folders main|requests|spam|all]
                                                   Detect prior outgoing messages without exposing text.
-  instagram messages eligibility <handle-or-url> [--max-pages N] [--folders main|requests|all]
+  instagram messages eligibility <handle-or-url> [--max-pages N] [--folders main|requests|spam|all]
                                                   Read-only DM routing verdict; null means Instagram exposes no decisive preflight.
   instagram messages reconcile <handle-or-url>
       (--offline-id ID | --server-message-id ID) [--max-pages N]
@@ -1966,19 +1966,31 @@ class InstagramWebClient:
         return {key: value for key, value in headers.items() if value}
 
     @staticmethod
-    def _thread_matches(
+    def _thread_match_status(
         thread: dict[str, Any], *, username: str, recipient_pk: str
-    ) -> bool:
+    ) -> str:
+        """Return match, different, or unknown without trusting a mutable handle.
+
+        A matching immutable user id is decisive even if a cached username is
+        absent or stale.  A handle-only candidate is not enough to identify a
+        private thread and makes an otherwise negative scan incomplete.
+        """
         if thread.get("is_group") is True:
-            return False
+            return "different"
         users = thread.get("users") if isinstance(thread.get("users"), list) else []
-        return any(
-            isinstance(user, dict)
-            and str(user.get("pk") or user.get("pk_id") or user.get("id") or "")
-            == recipient_pk
-            and str(user.get("username") or "").lower() == username.lower()
-            for user in users
-        )
+        handle_only_candidate = False
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+            user_id = str(user.get("pk") or user.get("pk_id") or user.get("id") or "")
+            handle_matches = str(user.get("username") or "").lower() == username.lower()
+            if user_id:
+                if user_id == recipient_pk:
+                    return "match"
+                continue
+            if handle_matches:
+                handle_only_candidate = True
+        return "unknown" if handle_only_candidate else "different"
 
     def _conversation_find_main(
         self, profile: dict[str, Any], *, max_pages: int
@@ -1988,6 +2000,7 @@ class InstagramWebClient:
         cursor = None
         pages_scanned = 0
         threads_scanned = 0
+        identity_unknown = False
         while pages_scanned < max_pages:
             params = {"limit": "20"}
             if cursor:
@@ -2038,9 +2051,14 @@ class InstagramWebClient:
             pages_scanned += 1
             threads_scanned += len(threads)
             for thread in threads:
-                if not isinstance(thread, dict) or not self._thread_matches(
+                if not isinstance(thread, dict):
+                    continue
+                match_status = self._thread_match_status(
                     thread, username=username, recipient_pk=recipient_pk
-                ):
+                )
+                if match_status == "unknown":
+                    identity_unknown = True
+                if match_status != "match":
                     continue
                 thread_id = str(thread.get("thread_id") or "")
                 thread_igid = str(thread.get("thread_v2_id") or "")
@@ -2059,6 +2077,18 @@ class InstagramWebClient:
                         "threads_scanned": threads_scanned,
                     }
             if not inbox.get("has_older"):
+                if identity_unknown:
+                    return {
+                        "status": "unknown",
+                        "found": False,
+                        "scan_complete": False,
+                        "username": username,
+                        "recipient_pk": recipient_pk,
+                        "folder": "main",
+                        "pages_scanned": pages_scanned,
+                        "threads_scanned": threads_scanned,
+                        "reason": "thread_identity_unverified",
+                    }
                 return {
                     "status": "not_found",
                     "found": False,
@@ -2151,13 +2181,18 @@ class InstagramWebClient:
         return form
 
     def _conversation_find_requests(
-        self, profile: dict[str, Any], *, max_pages: int
+        self,
+        profile: dict[str, Any],
+        *,
+        max_pages: int,
+        folders: tuple[str, ...] = ("requests", "spam"),
     ) -> dict[str, Any]:
         username = str(profile["username"])
         recipient_pk = str(profile["recipient_pk"])
         cursor = None
         pages_scanned = 0
         threads_scanned = 0
+        identity_unknown = False
         while pages_scanned < max_pages:
             headers = self._direct_headers()
             headers.update(
@@ -2196,7 +2231,7 @@ class InstagramWebClient:
                     "scan_complete": False,
                     "username": username,
                     "recipient_pk": recipient_pk,
-                    "folder": "requests",
+                    "folders_scanned": list(folders),
                     "pages_scanned": pages_scanned,
                     "threads_scanned": threads_scanned,
                     "reason": "requests_scan_rate_limited",
@@ -2210,83 +2245,124 @@ class InstagramWebClient:
                     "scan_complete": False,
                     "username": username,
                     "recipient_pk": recipient_pk,
-                    "folder": "requests",
+                    "folders_scanned": list(folders),
                     "pages_scanned": pages_scanned,
                     "threads_scanned": threads_scanned,
                     "reason": "requests_invalid_response",
                     "http_status": response.status_code,
                 }
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-            mailbox = data.get("get_slide_mailbox_for_iris_subscription")
-            spam_mailbox = data.get("spamMailbox")
-            if response.status_code != 200 or not isinstance(mailbox, dict):
+            mailboxes = {
+                "requests": data.get("get_slide_mailbox_for_iris_subscription"),
+                "spam": data.get("spamMailbox"),
+            }
+            if response.status_code != 200:
                 return {
                     "status": "unknown",
                     "found": False,
                     "scan_complete": False,
                     "username": username,
                     "recipient_pk": recipient_pk,
-                    "folder": "requests",
+                    "folders_scanned": list(folders),
                     "pages_scanned": pages_scanned,
                     "threads_scanned": threads_scanned,
                     "reason": "requests_unvalidated",
                     "http_status": response.status_code,
                 }
-            connections = []
-            for candidate in (mailbox, spam_mailbox):
-                if not isinstance(candidate, dict):
-                    continue
-                connection = candidate.get("threads_by_folder")
-                if isinstance(connection, dict):
-                    connections.append(connection)
-            edges: list[Any] = []
-            for connection in connections:
-                raw_edges = connection.get("edges")
-                if isinstance(raw_edges, list):
-                    edges.extend(raw_edges)
-            pages_scanned += 1
-            threads_scanned += len(edges)
-            for edge in edges:
-                node = edge.get("node") if isinstance(edge, dict) else None
-                thread = (
-                    node.get("as_ig_direct_thread") if isinstance(node, dict) else None
+            connections: list[tuple[str, dict[str, Any]]] = []
+            invalid_folders = []
+            for folder in folders:
+                mailbox = mailboxes.get(folder)
+                connection = (
+                    mailbox.get("threads_by_folder")
+                    if isinstance(mailbox, dict)
+                    else None
                 )
-                if not isinstance(thread, dict) or not self._thread_matches(
-                    thread, username=username, recipient_pk=recipient_pk
+                if (
+                    not isinstance(connection, dict)
+                    or not isinstance(connection.get("edges"), list)
+                    or not isinstance(connection.get("page_info"), dict)
                 ):
+                    invalid_folders.append(folder)
                     continue
-                thread_id = str(thread.get("thread_id") or "")
-                thread_igid = str(
-                    thread.get("thread_fbid") or thread.get("id") or ""
-                )
-                if thread_id and thread_igid:
-                    return {
-                        "status": "found",
-                        "found": True,
-                        "scan_complete": True,
-                        "username": username,
-                        "recipient_pk": recipient_pk,
-                        "thread_id": thread_id,
-                        "thread_igid": thread_igid,
-                        "pending": True,
-                        "folder": "requests",
-                        "pages_scanned": pages_scanned,
-                        "threads_scanned": threads_scanned,
-                    }
+                connections.append((folder, connection))
+            pages_scanned += 1
+            for folder, connection in connections:
+                edges = connection["edges"]
+                threads_scanned += len(edges)
+                for edge in edges:
+                    node = edge.get("node") if isinstance(edge, dict) else None
+                    thread = (
+                        node.get("as_ig_direct_thread")
+                        if isinstance(node, dict)
+                        else None
+                    )
+                    if not isinstance(thread, dict):
+                        continue
+                    match_status = self._thread_match_status(
+                        thread, username=username, recipient_pk=recipient_pk
+                    )
+                    if match_status == "unknown":
+                        identity_unknown = True
+                    if match_status != "match":
+                        continue
+                    thread_id = str(thread.get("thread_id") or "")
+                    thread_igid = str(
+                        thread.get("thread_fbid") or thread.get("id") or ""
+                    )
+                    if thread_id and thread_igid:
+                        return {
+                            "status": "found",
+                            "found": True,
+                            "scan_complete": True,
+                            "username": username,
+                            "recipient_pk": recipient_pk,
+                            "thread_id": thread_id,
+                            "thread_igid": thread_igid,
+                            "pending": True,
+                            "folder": folder,
+                            "folders_scanned": list(folders),
+                            "pages_scanned": pages_scanned,
+                            "threads_scanned": threads_scanned,
+                        }
+            if invalid_folders:
+                return {
+                    "status": "unknown",
+                    "found": False,
+                    "scan_complete": False,
+                    "username": username,
+                    "recipient_pk": recipient_pk,
+                    "folders_scanned": list(folders),
+                    "pages_scanned": pages_scanned,
+                    "threads_scanned": threads_scanned,
+                    "reason": "direct_folder_unvalidated",
+                }
             page_infos = [
                 connection.get("page_info")
-                for connection in connections
+                for _folder, connection in connections
                 if isinstance(connection.get("page_info"), dict)
             ]
             paged = [info for info in page_infos if info.get("has_next_page")]
             if not paged:
+                if identity_unknown:
+                    return {
+                        "status": "unknown",
+                        "found": False,
+                        "scan_complete": False,
+                        "username": username,
+                        "recipient_pk": recipient_pk,
+                        "folders_scanned": list(folders),
+                        "pages_scanned": pages_scanned,
+                        "threads_scanned": threads_scanned,
+                        "reason": "thread_identity_unverified",
+                    }
                 return {
                     "status": "not_found",
                     "found": False,
                     "scan_complete": True,
                     "username": username,
                     "recipient_pk": recipient_pk,
-                    "folder": "requests",
+                    "folders_scanned": list(folders),
                     "pages_scanned": pages_scanned,
                     "threads_scanned": threads_scanned,
                 }
@@ -2300,7 +2376,7 @@ class InstagramWebClient:
                     "scan_complete": False,
                     "username": username,
                     "recipient_pk": recipient_pk,
-                    "folder": "requests",
+                    "folders_scanned": list(folders),
                     "pages_scanned": pages_scanned,
                     "threads_scanned": threads_scanned,
                     "reason": "requests_cursor_ambiguous",
@@ -2312,7 +2388,7 @@ class InstagramWebClient:
             "scan_complete": False,
             "username": username,
             "recipient_pk": recipient_pk,
-            "folder": "requests",
+            "folders_scanned": list(folders),
             "pages_scanned": pages_scanned,
             "threads_scanned": threads_scanned,
             "reason": "max_pages_reached",
@@ -2323,9 +2399,9 @@ class InstagramWebClient:
     ) -> dict[str, Any]:
         if max_pages < 1 or max_pages > 100:
             raise InstagramFailure(6, "input", "max_pages must be between 1 and 100")
-        if folders not in {"main", "requests", "all"}:
+        if folders not in {"main", "requests", "spam", "all"}:
             raise InstagramFailure(
-                6, "input", "folders must be one of main, requests, or all"
+                6, "input", "folders must be one of main, requests, spam, or all"
             )
         profile = self.profile(profile_value)
         scans = []
@@ -2333,12 +2409,26 @@ class InstagramWebClient:
             scans.append(self._conversation_find_main(profile, max_pages=max_pages))
             if scans[-1]["found"]:
                 return {**scans[-1], "folders_scanned": ["main"]}
-        if folders in {"requests", "all"}:
-            scans.append(self._conversation_find_requests(profile, max_pages=max_pages))
+        direct_folders = (
+            (("requests", "spam") if folders == "all" else (folders,))
+            if folders in {"requests", "spam", "all"}
+            else ()
+        )
+        if direct_folders:
+            scans.append(
+                self._conversation_find_requests(
+                    profile, max_pages=max_pages, folders=direct_folders
+                )
+            )
             if scans[-1]["found"]:
                 return {
                     **scans[-1],
-                    "folders_scanned": [scan["folder"] for scan in scans],
+                    "folders_scanned": [
+                        folder
+                        for scan in scans
+                        for folder in scan.get("folders_scanned", [scan.get("folder")])
+                        if folder
+                    ],
                     "pages_scanned": sum(scan["pages_scanned"] for scan in scans),
                     "threads_scanned": sum(scan["threads_scanned"] for scan in scans),
                 }
@@ -2351,7 +2441,12 @@ class InstagramWebClient:
             "recipient_pk": str(profile["recipient_pk"]),
             "pages_scanned": sum(scan["pages_scanned"] for scan in scans),
             "threads_scanned": sum(scan["threads_scanned"] for scan in scans),
-            "folders_scanned": [scan["folder"] for scan in scans],
+            "folders_scanned": [
+                folder
+                for scan in scans
+                for folder in scan.get("folders_scanned", [scan.get("folder")])
+                if folder
+            ],
             **({"reason": incomplete.get("reason")} if incomplete else {}),
         }
 
@@ -2370,6 +2465,10 @@ class InstagramWebClient:
             "item_id": str(item.get("item_id") or ""),
             "message_id": str(item.get("message_id") or "") or None,
             "client_context": str(item.get("client_context") or "") or None,
+            "offline_threading_id": str(
+                item.get("offline_threading_id") or ""
+            )
+            or None,
             "item_type": item.get("item_type"),
             "timestamp": str(item.get("timestamp") or "") or None,
             "sender": sender,
@@ -2710,9 +2809,14 @@ class InstagramWebClient:
                 if metadata["sender"] != "viewer":
                     continue
                 matched = (
-                    metadata["client_context"] == offline_id
+                    offline_id
+                    in {
+                        metadata["client_context"],
+                        metadata["offline_threading_id"],
+                    }
                     if offline_id
-                    else metadata["message_id"] == server_message_id
+                    else server_message_id
+                    in {metadata["message_id"], metadata["item_id"]}
                 )
                 if matched:
                     return {
@@ -3058,7 +3162,7 @@ def _conversation_options(args: list[str]) -> tuple[int, str]:
         token = args[index]
         if token not in {"--max-pages", "--folders"} or index + 1 >= len(args):
             raise InstagramFailure(
-                6, "input", "Expected --max-pages N and/or --folders main|requests|all"
+                6, "input", "Expected --max-pages N and/or --folders main|requests|spam|all"
             )
         value = args[index + 1]
         if token == "--max-pages":
@@ -3073,9 +3177,9 @@ def _conversation_options(args: list[str]) -> tuple[int, str]:
         index += 2
     if max_pages < 1 or max_pages > 100:
         raise InstagramFailure(6, "input", "--max-pages must be between 1 and 100")
-    if folders not in {"main", "requests", "all"}:
+    if folders not in {"main", "requests", "spam", "all"}:
         raise InstagramFailure(
-            6, "input", "--folders must be one of main, requests, or all"
+            6, "input", "--folders must be one of main, requests, spam, or all"
         )
     return max_pages, folders
 
