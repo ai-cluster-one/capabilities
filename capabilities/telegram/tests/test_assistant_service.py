@@ -442,6 +442,8 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 "name": "Default",
                 "model": daemon.voice_agent.DEFAULT_MODEL,
                 "voice": daemon.voice_agent.DEFAULT_VOICE,
+                # Unset by default: the shipped greeting is the engine's own.
+                "greeting": None,
                 "history": daemon.voice_agent.DEFAULT_HISTORY_MESSAGES,
             })
             self.assertEqual(users[2]["model"], "other-live")

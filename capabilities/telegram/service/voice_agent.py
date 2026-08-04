@@ -466,7 +466,16 @@ def current_time_line(zone, label):
             f"({stamp:%A}), timezone {label}.")
 
 
-def greeting_prompt(caller_name):
+def greeting_prompt(caller_name, template=None):
+    """The last thing said to the model before it speaks, so the language it is
+    written in is the language the call opens in — however plainly the prompt
+    above asked for another one. A project whose calls are not in English gives
+    its own line here; `{caller}` is where the caller's name goes."""
+    if template:
+        try:
+            return template.format(caller=caller_name)
+        except (KeyError, IndexError, ValueError):
+            return template
     return (
         f"{caller_name} has just picked up and the call is connected. "
         "Greet them briefly in one short spoken sentence and let them speak."
@@ -607,6 +616,7 @@ class VoiceCallSession:
                  system_instruction, caller_name, caller_track=None,
                  agent_track=None, task_runner=None, send_to_chat=None,
                  capability_runner=None, file_reader=None, on_stream_end=None,
+                 greeting=None,
                  progress_interval=DEFAULT_PROGRESS_INTERVAL, log=print):
         self._calls = calls
         self._chat_id = chat_id
@@ -619,6 +629,7 @@ class VoiceCallSession:
         self._send_to_chat = send_to_chat
         self._capability_runner = capability_runner
         self._file_reader = file_reader
+        self._greeting = greeting
         self._on_stream_end = on_stream_end
         self._stream_ended = False
         self._log = log
@@ -770,7 +781,8 @@ class VoiceCallSession:
         if self._task_runner is not None:
             self._tasks.append(asyncio.create_task(self._announce_completions()))
             self._tasks.append(asyncio.create_task(self._announce_progress()))
-        await self._live.send_realtime_input(text=greeting_prompt(self._caller_name))
+        await self._live.send_realtime_input(
+            text=greeting_prompt(self._caller_name, self._greeting))
 
     async def _gemini_sender(self):
         from google.genai import types

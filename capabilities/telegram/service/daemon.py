@@ -589,6 +589,7 @@ def configured_voice_agent_users():
             "name": policy.get("name") or str(user_id),
             "model": resolved("model", voice_agent.DEFAULT_MODEL),
             "voice": resolved("voice", voice_agent.DEFAULT_VOICE),
+            "greeting": resolved("greeting", None),
             "history": max(0, history),
         }
     return users
@@ -3720,6 +3721,7 @@ async def run_session(client):
                 # reading the chat tail, and that must not delay the pickup.
                 system_instruction="",
                 caller_name=caller_name,
+                greeting=policy.get("greeting"),
                 caller_track=caller_pcm,
                 agent_track=agent_pcm,
                 task_runner=task_runner,

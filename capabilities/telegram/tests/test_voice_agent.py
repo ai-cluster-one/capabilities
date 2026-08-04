@@ -985,6 +985,21 @@ class RunCapabilityToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], "no_capability")
 
+    async def test_the_greeting_is_the_projects_when_it_supplies_one(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            # The last thing said before the model speaks decides the language
+            # the call opens in, whatever the prompt above asked for.
+            self.assertEqual(
+                va.greeting_prompt("KZ", "{caller} снял трубку. Поздоровайся по-русски."),
+                "KZ снял трубку. Поздоровайся по-русски.")
+            # A template with nothing to fill in is used as written.
+            self.assertEqual(va.greeting_prompt("KZ", "Поздоровайся."), "Поздоровайся.")
+            # A malformed one is still spoken rather than crashing the pickup.
+            self.assertEqual(va.greeting_prompt("KZ", "{nope}"), "{nope}")
+            # Unset falls back to the shipped English line.
+            self.assertIn("has just picked up", va.greeting_prompt("KZ"))
+
     async def test_a_lost_speech_session_hangs_up_once(self):
         with fake_runtime_modules(), fake_genai_types():
             va = import_voice_agent()
