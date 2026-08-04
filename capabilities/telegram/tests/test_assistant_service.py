@@ -14,6 +14,7 @@ import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
@@ -644,6 +645,19 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         flush = source.split("async def flush_call_summary", 1)[1].split("\n\n        async def", 1)[0]
         self.assertIn("force_reply=True", flush)
         self.assertIn('(metadata.get("delivery") or {}).get("message_id")', flush)
+
+    async def test_stream_loss_and_session_close_own_finalisation(self):
+        source = DAEMON_PATH.read_text()
+        stream_loss = source.split("async def end_call_after_stream_loss", 1)[1]
+        stream_loss = stream_loss.split("async def read_voice_project_file", 1)[0]
+        self.assertIn("finally:", stream_loss)
+        self.assertIn("await flush_call_summary()", stream_loss)
+
+        shutdown = source.split("closing = True", 1)[1]
+        shutdown = shutdown.split("cleanup_tasks =", 1)[0]
+        self.assertIn("await asyncio.gather(*finalisers", shutdown)
+        self.assertIn('await finish_voice_call("session_closing")', shutdown)
+        self.assertIn("await flush_call_summary()", shutdown)
 
     async def test_voice_prompt_file_override_comes_from_settings(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2150,6 +2164,33 @@ class VoiceCapabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(code, 4)
             self.assertIn("no", err)
 
+    async def test_command_output_is_bounded_while_the_pipe_is_drained(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon(td)
+            code, out, err = await daemon.run_capability_process(
+                sys.executable,
+                ["-c", "import sys; print('x' * 100000); "
+                 "sys.stderr.write('y' * 100000)"],
+                dict(os.environ), timeout=5)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(out), daemon.voice_agent.CAPABILITY_OUTPUT_LIMIT + 1)
+            self.assertEqual(len(err), 4096)
+
+    async def test_authority_context_is_unique_and_owner_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon(td)
+            first = Path(daemon.write_authority_context(
+                {"allowed_capabilities": {"routine": True}}, "caller"))
+            second = Path(daemon.write_authority_context(
+                {"allowed_capabilities": {"routine": True}}, "caller"))
+            try:
+                self.assertNotEqual(first, second)
+                self.assertEqual(first.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(second.stat().st_mode & 0o777, 0o600)
+            finally:
+                first.unlink(missing_ok=True)
+                second.unlink(missing_ok=True)
+
 
 class VoiceProjectFileTests(unittest.IsolatedAsyncioTestCase):
     """What a call may open. The project holds credentials, sessions and bank
@@ -2204,8 +2245,11 @@ class VoiceProjectFileTests(unittest.IsolatedAsyncioTestCase):
             daemon = import_daemon(Path(td), settings())
             for secret in ("capabilities/telegram/.env",
                            "capabilities/telegram/.env.local",
+                           "capabilities/telegram/.env/backup.txt",
+                           "capabilities/simplbooks/connections.json",
                            "capabilities/simplbooks/state/session.json",
                            "capabilities/telegram/credentials/token.txt",
+                           "capabilities/telegram/secrets/api.txt",
                            "capabilities/telegram/service/jess.session",
                            "deployment/deploy.key",
                            "capabilities/automations/runs.sqlite"):
@@ -2253,6 +2297,36 @@ class VoiceProjectFileTests(unittest.IsolatedAsyncioTestCase):
             result = daemon.read_project_file_result("context/nothing-here.md")
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], "not_found")
+
+
+class VoiceProjectContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_contextkit_build_is_not_cached(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            calls = []
+
+            def failed(*args, **kwargs):
+                calls.append((args, kwargs))
+                return SimpleNamespace(returncode=1, stdout="", stderr="not ready")
+
+            with mock.patch.object(daemon.subprocess, "run", side_effect=failed):
+                self.assertIsNone(daemon.resolve_project_context_path())
+                self.assertIsNone(daemon.resolve_project_context_path())
+            self.assertEqual(len(calls), 2)
+
+    async def test_contextkit_relative_output_is_resolved_inside_project(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            target = Path(td) / "project" / ".codex" / "generated" / "context.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("compiled\n")
+            completed = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"written": {"codex": ".codex/generated/context.md"}}),
+                stderr="")
+            with mock.patch.object(daemon.subprocess, "run", return_value=completed):
+                self.assertEqual(daemon.resolve_project_context_path(), target.resolve())
+                self.assertEqual(daemon.project_context_text(), "compiled\n")
 
 
 if __name__ == "__main__":

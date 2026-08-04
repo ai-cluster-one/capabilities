@@ -1836,6 +1836,28 @@ def worker_env(state=None):
     return env
 
 
+def write_authority_context(authority, stem):
+    """Write one request authority envelope owner-only and without a reusable
+    name. The path is handed to a child process, then unlinked by its owner."""
+    AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
+    fd, raw_path = tempfile.mkstemp(
+        prefix=f"{_safe_file_part(stem)}-", suffix=".json", dir=AUTHORITY_DIR)
+    path = Path(raw_path)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(
+                json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+    return str(path)
+
+
 CAPABILITY_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
 # Which compiled body a call reads. The project's own agents read this one, so
 # a call and a worker are told the same thing about the same project.
@@ -1847,21 +1869,33 @@ def resolve_project_context_path(target=PROJECT_CONTEXT_TARGET, timeout=30.0):
     """Ask ContextKit where the compiled body is, and let it rebuild while
     answering. Its own command owns that path; a daemon that guessed it would
     be reading yesterday's copy the first time the layout moved."""
-    if "path" in _project_context_path:
-        return _project_context_path["path"]
+    cached = _project_context_path.get(target)
+    if cached is not None and cached.is_file():
+        return cached
     path = None
     try:
         proc = subprocess.run(["contextkit", "build", "--target", target, "--json"],
                               capture_output=True, text=True, timeout=timeout,
                               cwd=str(PROJECT_ROOT))
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "build failed").strip()[:300]
+            log(f"voice: no compiled project context — contextkit exit "
+                f"{proc.returncode}: {detail}")
+            return None
         written = (json.loads(proc.stdout) or {}).get("written") or {}
         if written.get(target):
-            path = Path(written[target])
+            candidate = Path(written[target])
+            path = (candidate if candidate.is_absolute()
+                    else PROJECT_ROOT / candidate).resolve()
+            path.relative_to(PROJECT_ROOT.resolve())
+            if not path.is_file():
+                raise OSError(f"compiled context is not a file: {path}")
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         log(f"voice: no compiled project context — {type(exc).__name__}: {exc}")
+        return None
     if path is not None:
         log(f"voice: project context resolved at {path}")
-    _project_context_path["path"] = path
+        _project_context_path[target] = path
     return path
 
 
@@ -1870,8 +1904,13 @@ def resolve_project_context_path(target=PROJECT_CONTEXT_TARGET, timeout=30.0):
 # be one clever path away from any of it.
 PROJECT_READ_ROOTS = ("context", "routines", "assets", "capabilities", "deployment")
 # And inside those, what is never opened however it is reached.
-PROJECT_READ_DENY_NAMES = (".env",)
-PROJECT_READ_DENY_PARTS = ("state", "credentials", ".git")
+PROJECT_READ_DENY_NAMES = (
+    ".env", ".netrc", "connections.json", "credentials.json", "secrets.json",
+)
+PROJECT_READ_DENY_PARTS = (
+    "state", ".state", "credential", "credentials", "secret", "secrets",
+    "token", "tokens", ".git", ".env", ".env.local",
+)
 PROJECT_READ_DENY_SUFFIXES = (".session", ".key", ".pem", ".p12", ".sqlite", ".db")
 
 
@@ -1900,7 +1939,8 @@ def resolve_project_file(wanted):
     lowered = [p.lower() for p in parts]
     if any(p in PROJECT_READ_DENY_PARTS for p in lowered):
         return None, "not_readable_here"
-    if any(lowered[-1].startswith(n) for n in PROJECT_READ_DENY_NAMES):
+    if any(lowered[-1] == n or lowered[-1].startswith(n + ".")
+           for n in PROJECT_READ_DENY_NAMES):
         return None, "not_readable_here"
     if path.suffix.lower() in PROJECT_READ_DENY_SUFFIXES:
         return None, "not_readable_here"
@@ -1981,24 +2021,40 @@ def read_project_file_result(wanted):
     return result
 
 
+async def _read_bounded_stream(stream, limit, *, tail=False):
+    """Drain a child pipe completely while retaining only a fixed amount."""
+    kept = bytearray()
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            break
+        if tail:
+            kept.extend(chunk)
+            del kept[:-limit]
+        elif len(kept) < limit:
+            kept.extend(chunk[:limit - len(kept)])
+    return bytes(kept).decode(errors="replace")
+
+
 async def run_capability_process(binary, args, env, timeout):
     """The subprocess half on its own: no shell, its own process group, and a
-    hard ceiling that kills the group rather than letting the call hang on it."""
-    def _spawn():
-        return subprocess.Popen(
-            [binary, *args], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=env, text=True, errors="replace", start_new_session=True,
-            cwd=str(PROJECT_ROOT))
-
-    loop = asyncio.get_running_loop()
-    proc = await loop.run_in_executor(None, _spawn)
+    hard ceiling that kills the group rather than letting the call hang on it.
+    Both pipes are drained, but only bounded slices are retained in memory."""
+    proc = await asyncio.create_subprocess_exec(
+        binary, *args, stdin=subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env=env, start_new_session=True, cwd=str(PROJECT_ROOT))
+    stdout_task = asyncio.create_task(_read_bounded_stream(
+        proc.stdout, voice_agent.CAPABILITY_OUTPUT_LIMIT + 1))
+    stderr_task = asyncio.create_task(_read_bounded_stream(proc.stderr, 4096, tail=True))
     try:
-        out, err = await asyncio.wait_for(
-            loop.run_in_executor(None, proc.communicate), timeout=timeout)
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         _kill_process_group(proc)
+        await proc.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         return None, None, None
+    out, err = await asyncio.gather(stdout_task, stderr_task)
     return proc.returncode, out, err
 
 
@@ -2559,11 +2615,8 @@ async def run_session(client):
             authority = _authority_policy_for(job, group_policy, is_direct)
             channel_context = _channel_context_from_policy(group_policy)
             if authority is not None:
-                AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
-                auth_path = AUTHORITY_DIR / f"{_safe_file_part(key)}-{job.get('message_id')}.json"
-                auth_path.write_text(
-                    json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-                authority_context = str(auth_path)
+                authority_context = write_authority_context(
+                    authority, f"{key}-{job.get('message_id')}")
             state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
                      "chat_type": "private" if is_direct else "group",
                      "chat_name": (group_policy or {}).get("name"),
@@ -3301,11 +3354,8 @@ async def run_session(client):
             try:
                 worker_session = prepare_worker_session(key, task_id)
                 if authority is not None:
-                    AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
-                    auth_path = AUTHORITY_DIR / f"{_safe_file_part(key)}-{task_id}.json"
-                    auth_path.write_text(
-                        json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-                    authority_context = str(auth_path)
+                    authority_context = write_authority_context(
+                        authority, f"{key}-{task_id}")
                 state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
                          "chat_type": "private", "chat_name": None,
                          "harness": s["worker"],
@@ -3388,73 +3438,47 @@ async def run_session(client):
                         "instruction": f"You cannot reach {capability} for this caller. "
                                        "Say so plainly and offer what you can do instead."}
 
-            # Three calls running, three of them spent guessing a flag: an
-            # instruction in the prompt did not survive the distance to the
-            # decision, so the first call to a tool is made to be `help`. It
-            # costs a fifth of a second and it is the only thing that reliably
-            # stops the guessing.
-            helped = active_voice_call.setdefault("helped_capabilities", set())
-            # Every capability's own contract verbs. Reaching for one of these is
-            # already the behaviour the gate exists to produce, so it passes:
-            # charging a round trip for asking what a tool is would teach the
-            # opposite of what is wanted.
-            discovering = bool(args) and args[0] in (
-                "help", "guide", "ids", "connections", "refs", "stub", "manifest")
-            if discovering:
-                helped.add(capability)
-            elif capability not in helped:
-                # The round trip is owed anyway, so it is made to carry both
-                # halves of what a guess gets wrong: the wording, and the values
-                # that go in it. Handed over rather than asked for — a caller
-                # waits the same whether the model fetches these or we do.
-                helped.add(capability)
-                primer = {}
-                for verb in ("help", "ids"):
-                    argv = [verb] if verb == "help" else [verb, "list"]
-                    code, out, _ = await run_capability_process(
-                        binary, argv, worker_env({"chat_type": "private"}),
-                        voice_agent.CAPABILITY_TIMEOUT)
-                    if code == 0 and out:
-                        primer[verb], _ = truncate_capability_output(
-                            out, voice_agent.CAPABILITY_OUTPUT_LIMIT)
-                log(f"voice: run_capability {capability} primed "
-                    f"({', '.join(primer) or 'nothing'})")
-                return {"ok": False, "status": "read_this_first",
-                        "help": primer.get("help"),
-                        "identifiers": primer.get("ids"),
-                        "instruction": f"Here is what {capability} takes, and the "
-                                       "identifiers it knows. Make your real call "
-                                       "now, using values from this — never one you "
-                                       "made up or heard said."}
-
             authority_context = None
-            proc = None
+            if authority is not None:
+                authority_context = write_authority_context(
+                    authority, f"{key}-cap-{capability}")
+            env = worker_env({"authority_context": authority_context,
+                              "chat_type": "private"})
+
             try:
-                if authority is not None:
-                    AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
-                    auth_path = (AUTHORITY_DIR /
-                                 f"{_safe_file_part(key)}-cap-{capability}.json")
-                    auth_path.write_text(
-                        json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-                    authority_context = str(auth_path)
-                env = worker_env({"authority_context": authority_context,
-                                  "chat_type": "private"})
+                # Three calls running, three of them spent guessing a flag: an
+                # instruction in the prompt did not survive the distance to the
+                # decision, so the first call to a tool is made to carry help and
+                # identifiers. These discovery reads receive the same authority
+                # envelope as the eventual command.
+                helped = active_voice_call.setdefault("helped_capabilities", set())
+                discovering = bool(args) and args[0] in (
+                    "help", "guide", "ids", "connections", "refs", "stub", "manifest")
+                if discovering:
+                    helped.add(capability)
+                elif capability not in helped:
+                    helped.add(capability)
+                    primer = {}
+                    for verb in ("help", "ids"):
+                        argv = [verb] if verb == "help" else [verb, "list"]
+                        code, out, _ = await run_capability_process(
+                            binary, argv, env, voice_agent.CAPABILITY_TIMEOUT)
+                        if code == 0 and out:
+                            primer[verb], _ = truncate_capability_output(
+                                out, voice_agent.CAPABILITY_OUTPUT_LIMIT)
+                    log(f"voice: run_capability {capability} primed "
+                        f"({', '.join(primer) or 'nothing'})")
+                    return {"ok": False, "status": "read_this_first",
+                            "help": primer.get("help"),
+                            "identifiers": primer.get("ids"),
+                            "instruction": f"Here is what {capability} takes, and the "
+                                           "identifiers it knows. Make your real call "
+                                           "now, using values from this — never one you "
+                                           "made up or heard said."}
 
-                def _spawn():
-                    return subprocess.Popen(
-                        [binary, *args], stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        env=env, text=True, errors="replace",
-                        start_new_session=True)
-
-                loop = asyncio.get_running_loop()
-                proc = await loop.run_in_executor(None, _spawn)
-                try:
-                    out, err = await asyncio.wait_for(
-                        loop.run_in_executor(None, proc.communicate),
-                        timeout=voice_agent.CAPABILITY_TIMEOUT)
-                except asyncio.TimeoutError:
-                    _kill_process_group(proc)
+                code, out, err = await run_capability_process(
+                    binary, args, env, voice_agent.CAPABILITY_TIMEOUT)
+                if code is None:
                     log(f"voice: run_capability {capability} abandoned after "
                         f"{voice_agent.CAPABILITY_TIMEOUT}s")
                     return {"ok": False, "status": "too_slow",
@@ -3472,7 +3496,6 @@ async def run_session(client):
                     with contextlib.suppress(OSError):
                         Path(authority_context).unlink()
 
-            code = proc.returncode
             if code == 4:
                 # The CLI's own policy gate, behind the check above: a capability
                 # disabled for the project refuses whoever asks.
@@ -3522,10 +3545,19 @@ async def run_session(client):
             async def _finalise():
                 try:
                     await finish_voice_call("speech_session_lost")
-                    await flush_call_summary()
                 except Exception as exc:
                     log(f"voice: could not end the call cleanly — "
                         f"{type(exc).__name__}: {exc}")
+                    # A failure before finish_voice_call releases the active
+                    # slot must not make every later call look permanently busy.
+                    if active_voice_call.get("caller_id") == caller_id:
+                        active_voice_call["finishing"] = False
+                finally:
+                    try:
+                        await flush_call_summary()
+                    except Exception as exc:
+                        log(f"voice: could not flush the call summary — "
+                            f"{type(exc).__name__}: {exc}")
 
             task = asyncio.create_task(_finalise())
             stream_loss_finalisers.add(task)
@@ -4491,6 +4523,23 @@ async def run_session(client):
         await disconnected_task
     finally:
         closing = True
+        # Stream-loss finalisation is deliberately detached from the Gemini
+        # receiver so stop() cannot cancel its own caller. It is still owned by
+        # this session: reconnect or shutdown waits for it, then finalises any
+        # other active call and flushes its summary before workers are killed.
+        if has_p2p_calls:
+            finalisers = list(stream_loss_finalisers)
+            if finalisers:
+                await asyncio.gather(*finalisers, return_exceptions=True)
+            if active_voice_call.get("session") is not None:
+                try:
+                    await finish_voice_call("session_closing")
+                except Exception as exc:
+                    log(f"voice: session-close finalisation failed — {_short_error(exc)}")
+            try:
+                await flush_call_summary()
+            except Exception as exc:
+                log(f"voice: session-close summary flush failed — {_short_error(exc)}")
         cleanup_tasks = [sync_task, disconnected_task]
         if group_watcher_task is not None:
             cleanup_tasks.append(group_watcher_task)
