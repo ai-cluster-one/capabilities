@@ -27,7 +27,7 @@
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "19ce2937f634c56096a0b6e1d32751e4539c9cfdc75cccab6550d571ac8626a4",
+      "payload_sha256": "add20ca4935cdd69f68ff5620d8430366bcdc438f9d64e0504bdc2f3b7e7f1bd",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
@@ -62,7 +62,7 @@
     },
     "instagram": {
       "path": "capabilities/instagram",
-      "payload_sha256": "336e6778d28cea0c4abc1770af6a93bcbcad1ce180f7a89a14193b6c96aa6c24",
+      "payload_sha256": "26a8ae8deb4a68d57a17b05e4c675d02c7678ea8060457fadac6a6088c3bfb3f",
       "summary": "Instagram CLI over a captured browser session — validate identity, read profiles, resolve Direct threads, and send text messages. Stateful — run `instagram doctor` first."
     },
     "journal": {
@@ -97,7 +97,7 @@
     },
     "signoz": {
       "path": "capabilities/signoz",
-      "payload_sha256": "b76ea6e5f1ca6c457169223543e060405bf44d1369d38082999e755c040030ac",
+      "payload_sha256": "42adf3f2f1a6154996e0ea7e2ba5f0622995e949bbfe8a19bd999d2c17e0dd68",
       "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances."
     },
     "simplbooks": {
@@ -117,7 +117,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "d6f2f3bc5777fd5f4e2604a37acf1f6c4cd87652641f74e59b501059935673b7",
+      "payload_sha256": "7076264b53255cf8bc97ffbeaf4daee2b7467bfaf87cca3d1fbc202470ad0a03",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, send, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
