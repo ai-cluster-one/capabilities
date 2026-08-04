@@ -930,5 +930,79 @@ class TranscriptTurnTests(unittest.TestCase):
                          ["one moment, looking", "here it is"])
 
 
+class RunCapabilityToolTests(unittest.IsolatedAsyncioTestCase):
+    """The tool is declared only where it works, and a malformed call comes
+    back as something the model can act on rather than an unanswered turn."""
+
+    def session(self, va, runner=None):
+        session = va.VoiceCallSession(
+            RecordingCalls(), 42, api_key="k", model=None, voice=None,
+            system_instruction="s", caller_name="Caller",
+            capability_runner=runner, log=lambda *_: None)
+        session._live = FakeLive()
+        return session
+
+    async def test_it_is_declared_only_when_a_runner_backs_it(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+
+            async def runner(capability, args):
+                return {"ok": True, "status": "ok"}
+
+            names = [t["name"] for t in self.session(va, runner)._declared_tools()]
+            self.assertIn("run_capability", names)
+
+            # No runner, no declaration: the model is never handed a tool that
+            # would fail the moment it reached for it.
+            self.assertIsNone(self.session(va, None)._declared_tools())
+
+    async def test_arguments_packed_into_one_string_are_refused_not_split(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            seen = []
+
+            async def runner(capability, args):
+                seen.append((capability, args))
+                return {"ok": True, "status": "ok"}
+
+            session = self.session(va, runner)
+            result = await session._run_capability("clickup", "tasks --list Accounting")
+            # Splitting that string is what puts shell metacharacters back into
+            # play, so it is refused and the shape is explained instead.
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "args_not_a_list")
+            self.assertIn("separate items", result["instruction"])
+            self.assertEqual(seen, [])
+
+    async def test_a_missing_name_is_answered_rather_than_run(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+
+            async def runner(capability, args):
+                raise AssertionError("must not run without a name")
+
+            result = await self.session(va, runner)._run_capability("  ", [])
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "no_capability")
+
+    async def test_arguments_reach_the_runner_as_given(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            seen = []
+
+            async def runner(capability, args):
+                seen.append((capability, args))
+                return {"ok": True, "status": "ok", "stdout": "[]"}
+
+            session = self.session(va, runner)
+            result = await session._run_capability("clickup", ["tasks", "--list", "A B"])
+            self.assertTrue(result["ok"])
+            self.assertEqual(seen, [("clickup", ["tasks", "--list", "A B"])])
+
+            # No arguments at all is a legitimate call, not a malformed one.
+            await session._run_capability("clickup", None)
+            self.assertEqual(seen[-1], ("clickup", []))
+
+
 if __name__ == "__main__":
     unittest.main()

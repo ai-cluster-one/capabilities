@@ -2080,5 +2080,74 @@ class TestCodexImageDiscovery(unittest.IsolatedAsyncioTestCase):
                 Path.home = original_home
 
 
+class VoiceCapabilityTests(unittest.IsolatedAsyncioTestCase):
+    """The capability read a call answers from: who may run what, what comes
+    back, and what happens when it does not come back in time."""
+
+    def daemon(self, td):
+        return import_daemon(Path(td), settings())
+
+    async def test_authority_decides_which_capabilities_a_call_reaches(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon(td)
+            everything = {"allowed_capabilities": {"*": True}}
+            self.assertTrue(daemon.capability_allowed(everything, "simplbooks"))
+
+            named = {"allowed_capabilities": {"clickup": True,
+                                              "simplbooks": {"allow": False},
+                                              "telegram": {"scope": "current_chat"}}}
+            self.assertTrue(daemon.capability_allowed(named, "clickup"))
+            # A scoped rule still allows the capability; the scope is the CLI's
+            # own business, not a reason to refuse the call.
+            self.assertTrue(daemon.capability_allowed(named, "telegram"))
+            self.assertFalse(daemon.capability_allowed(named, "simplbooks"))
+            # Absent is refused, not allowed: a capability nobody granted is one
+            # nobody thought about.
+            self.assertFalse(daemon.capability_allowed(named, "coolify"))
+
+            # No authority declared at all leaves the CLI's own gate as the only
+            # one — the same answer the worker path gives.
+            self.assertTrue(daemon.capability_allowed(None, "simplbooks"))
+
+    async def test_output_is_bounded_and_says_where_it_was_cut(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon(td)
+            body, cut = daemon.truncate_capability_output("short", 100)
+            self.assertEqual(body, "short")
+            self.assertFalse(cut)
+
+            body, cut = daemon.truncate_capability_output("x" * 500, 100)
+            self.assertTrue(cut)
+            self.assertTrue(body.endswith("…[cut]"))
+            self.assertEqual(body[:100], "x" * 100)
+
+    async def test_a_command_that_outlives_the_call_is_abandoned(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon(td)
+            started = time.monotonic()
+            code, out, err = await daemon.run_capability_process(
+                sys.executable, ["-c", "import time; time.sleep(30)"],
+                dict(os.environ), timeout=0.5)
+            # Nothing to report and nothing left running: the caller is told to
+            # hand the work to a worker instead.
+            self.assertIsNone(code)
+            self.assertIsNone(out)
+            self.assertLess(time.monotonic() - started, 10)
+
+    async def test_a_command_that_answers_returns_its_output_and_code(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon(td)
+            code, out, _ = await daemon.run_capability_process(
+                sys.executable, ["-c", "print('ok')"], dict(os.environ), timeout=5)
+            self.assertEqual(code, 0)
+            self.assertEqual(out.strip(), "ok")
+
+            code, _, err = await daemon.run_capability_process(
+                sys.executable, ["-c", "import sys; sys.stderr.write('no'); sys.exit(4)"],
+                dict(os.environ), timeout=5)
+            self.assertEqual(code, 4)
+            self.assertIn("no", err)
+
+
 if __name__ == "__main__":
     unittest.main()

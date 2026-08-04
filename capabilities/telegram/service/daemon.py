@@ -1835,6 +1835,96 @@ def worker_env(state=None):
     return env
 
 
+CAPABILITY_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
+# Which compiled body a call reads. The project's own agents read this one, so
+# a call and a worker are told the same thing about the same project.
+PROJECT_CONTEXT_TARGET = "codex"
+_project_context_path = {}
+
+
+def resolve_project_context_path(target=PROJECT_CONTEXT_TARGET, timeout=30.0):
+    """Ask ContextKit where the compiled body is, and let it rebuild while
+    answering. Its own command owns that path; a daemon that guessed it would
+    be reading yesterday's copy the first time the layout moved."""
+    if "path" in _project_context_path:
+        return _project_context_path["path"]
+    path = None
+    try:
+        proc = subprocess.run(["contextkit", "build", "--target", target, "--json"],
+                              capture_output=True, text=True, timeout=timeout,
+                              cwd=str(PROJECT_ROOT))
+        written = (json.loads(proc.stdout) or {}).get("written") or {}
+        if written.get(target):
+            path = Path(written[target])
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        log(f"voice: no compiled project context — {type(exc).__name__}: {exc}")
+    if path is not None:
+        log(f"voice: project context resolved at {path}")
+    _project_context_path["path"] = path
+    return path
+
+
+def project_context_text():
+    """The compiled body, read fresh so an edit to the project reaches the next
+    call without restarting the daemon. Absent is not fatal: a call without it
+    is the call we had before, not a broken one."""
+    path = resolve_project_context_path()
+    if path is None:
+        return ""
+    try:
+        return path.read_text()
+    except OSError as exc:
+        log(f"voice: cannot read the compiled project context — "
+            f"{type(exc).__name__}: {exc}")
+        return ""
+
+
+def capability_allowed(authority, capability):
+    """Whether this caller's authority reaches that capability. No authority
+    declared at all leaves the CLI's own gate as the only one, which is the
+    same answer the worker path gives."""
+    if authority is None:
+        return True
+    caps = authority.get("allowed_capabilities") or {}
+    if caps.get("*") is True:
+        return True
+    rule = caps.get(capability)
+    if rule is True:
+        return True
+    return isinstance(rule, dict) and rule.get("allow") is not False
+
+
+def truncate_capability_output(text, limit):
+    """Bound what reaches the model, and say so where it was cut: a silent
+    truncation reads as a complete answer, which is how a call ends up stating
+    half a list as the whole of it."""
+    body = text or ""
+    if len(body) <= limit:
+        return body, False
+    return body[:limit] + "\n…[cut]", True
+
+
+async def run_capability_process(binary, args, env, timeout):
+    """The subprocess half on its own: no shell, its own process group, and a
+    hard ceiling that kills the group rather than letting the call hang on it."""
+    def _spawn():
+        return subprocess.Popen(
+            [binary, *args], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, text=True, errors="replace", start_new_session=True,
+            cwd=str(PROJECT_ROOT))
+
+    loop = asyncio.get_running_loop()
+    proc = await loop.run_in_executor(None, _spawn)
+    try:
+        out, err = await asyncio.wait_for(
+            loop.run_in_executor(None, proc.communicate), timeout=timeout)
+    except asyncio.TimeoutError:
+        _kill_process_group(proc)
+        return None, None, None
+    return proc.returncode, out, err
+
+
 def _kill_process_group(proc):
     """Kill the process group created for a worker, even if its leader already exited."""
     try:
@@ -3192,6 +3282,125 @@ async def run_session(client):
                         Path(authority_context).unlink()
                 release_worker_proc(proc_key)
 
+        async def run_voice_capability(caller_id, caller_name, capability, args):
+            """One capability read for the caller, answered inside the turn that
+            asked for it. It runs under the authority that caller's own messages
+            resolve to — the same resolution a task gets — so speaking to the
+            assistant reaches exactly what writing to it reaches, and no more."""
+            key = str(caller_id)
+            if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", capability or ""):
+                return {"ok": False, "status": "not_a_capability",
+                        "instruction": "That is not a tool name. Give the name on "
+                                       "its own, such as 'clickup'."}
+            binary = shutil.which(capability)
+            if not binary:
+                return {"ok": False, "status": "not_installed",
+                        "instruction": f"There is no tool called {capability} on this "
+                                       "project. Run 'capabilities' with 'list' to see "
+                                       "what there is."}
+
+            job = voice_task_job(caller_id, caller_name, "", f"cap-{capability}")
+            authority = _authority_policy_for(job, None, True)
+            caps = (authority or {}).get("allowed_capabilities") or {}
+            rule = True if caps.get("*") is True else caps.get(capability)
+            allowed = rule is True or (isinstance(rule, dict) and rule.get("allow") is not False)
+            if authority is not None and not allowed:
+                log(f"voice: run_capability {capability} refused for {key} "
+                    f"(authority={_authority_summary(authority)})")
+                return {"ok": False, "status": "not_allowed",
+                        "instruction": f"You cannot reach {capability} for this caller. "
+                                       "Say so plainly and offer what you can do instead."}
+
+            # Three calls running, three of them spent guessing a flag: an
+            # instruction in the prompt did not survive the distance to the
+            # decision, so the first call to a tool is made to be `help`. It
+            # costs a fifth of a second and it is the only thing that reliably
+            # stops the guessing.
+            helped = active_voice_call.setdefault("helped_capabilities", set())
+            asking_for_help = bool(args) and args[0] == "help"
+            if asking_for_help:
+                helped.add(capability)
+            elif capability not in helped:
+                helped.add(capability)
+                log(f"voice: run_capability {capability} sent to help first")
+                return {"ok": False, "status": "read_help_first",
+                        "instruction": f"Call {capability} with ['help'] first and "
+                                       "read what it actually takes, then make the "
+                                       "real call. Do not repeat this one unchanged."}
+
+            authority_context = None
+            proc = None
+            try:
+                if authority is not None:
+                    AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
+                    auth_path = (AUTHORITY_DIR /
+                                 f"{_safe_file_part(key)}-cap-{capability}.json")
+                    auth_path.write_text(
+                        json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+                    authority_context = str(auth_path)
+                env = worker_env({"authority_context": authority_context,
+                                  "chat_type": "private"})
+
+                def _spawn():
+                    return subprocess.Popen(
+                        [binary, *args], stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        env=env, text=True, errors="replace",
+                        start_new_session=True)
+
+                loop = asyncio.get_running_loop()
+                proc = await loop.run_in_executor(None, _spawn)
+                try:
+                    out, err = await asyncio.wait_for(
+                        loop.run_in_executor(None, proc.communicate),
+                        timeout=voice_agent.CAPABILITY_TIMEOUT)
+                except asyncio.TimeoutError:
+                    _kill_process_group(proc)
+                    log(f"voice: run_capability {capability} abandoned after "
+                        f"{voice_agent.CAPABILITY_TIMEOUT}s")
+                    return {"ok": False, "status": "too_slow",
+                            "instruction": "That took too long to answer on a call. "
+                                           "Hand the same work to agent_task instead, "
+                                           "and tell the caller you are on it."}
+            except OSError as exc:
+                log(f"voice: run_capability {capability} failed to start — "
+                    f"{type(exc).__name__}: {exc}")
+                return {"ok": False, "status": "could_not_run",
+                        "instruction": "That tool would not start. Say you could not "
+                                       "check, and do not try it again on this call."}
+            finally:
+                if authority_context:
+                    with contextlib.suppress(OSError):
+                        Path(authority_context).unlink()
+
+            code = proc.returncode
+            if code == 4:
+                # The CLI's own policy gate, behind the check above: a capability
+                # disabled for the project refuses whoever asks.
+                log(f"voice: run_capability {capability} refused by policy (exit 4)")
+                return {"ok": False, "status": "refused_by_policy",
+                        "instruction": f"{capability} is not available to this project. "
+                                       "Say so plainly; do not try to work around it."}
+
+            body = out or ""
+            truncated = len(body) > voice_agent.CAPABILITY_OUTPUT_LIMIT
+            if truncated:
+                body = body[:voice_agent.CAPABILITY_OUTPUT_LIMIT] + "\n…[cut]"
+            result = {"ok": code == 0, "status": "ok" if code == 0 else "failed",
+                      "exit_code": code, "stdout": body, "truncated": truncated,
+                      "stderr_tail": (err or "")[-400:] if code != 0 else None}
+            if truncated:
+                result["instruction"] = ("Only the first part of the output is here. "
+                                         "Running this again returns the same first "
+                                         "part — the cut is where the output ends, "
+                                         "not a mishap. Ask a narrower question, or "
+                                         "hand it to agent_task.")
+            elif code != 0:
+                result["instruction"] = ("The tool refused or failed. Say what you "
+                                         "could not check rather than guessing at "
+                                         "the answer.")
+            return result
+
         # The summary of the call that just ended, in flight while the recording
         # is still being joined and uploaded — so it is ready to reply to it.
         pending_summary = {}
@@ -3377,6 +3586,8 @@ async def run_session(client):
                 agent_track=agent_pcm,
                 task_runner=task_runner,
                 send_to_chat=lambda body: send_channel_message(caller_id, body, True),
+                capability_runner=lambda capability, args: run_voice_capability(
+                    caller_id, caller_name, capability, args),
                 progress_interval=VOICE_PROGRESS_INTERVAL,
                 log=log,
             )
@@ -3384,6 +3595,9 @@ async def run_session(client):
                 "session": session,
                 "caller_id": caller_id,
                 "caller_name": caller_name,
+                # Per call, not per daemon: what one caller was shown the help
+                # for is not something the next caller has seen.
+                "helped_capabilities": set(),
                 "record": record,
                 "output": output,
                 "caller_pcm": caller_pcm,
@@ -3423,10 +3637,14 @@ async def run_session(client):
                     caller_id, policy["history"], caller_name)
                 log(f"voice: chat tail for {caller_id} — {len(history)} chars in "
                     f"{time.monotonic() - tail_started:.1f}s")
+                body = project_context_text()
+                log(f"voice: project context {len(body)} chars into the call prompt"
+                    if body else "voice: no project context for this call")
                 session.set_system_instruction(voice_agent.build_system_prompt(
                     voice_context, history,
                     now_line=voice_agent.current_time_line(
-                        VOICE_TIMEZONE, VOICE_TIMEZONE_NAME)))
+                        VOICE_TIMEZONE, VOICE_TIMEZONE_NAME),
+                    project_context=body))
                 await session.start_agent()
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"[:500]
