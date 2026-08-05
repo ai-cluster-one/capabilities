@@ -1074,5 +1074,48 @@ class RunCapabilityToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(seen[-1], ("clickup", []))
 
 
+class ReloadServiceToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reload_is_declared_only_for_an_authorized_call(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+
+            with_reload = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                system_instruction="s", caller_name="Caller",
+                reload_service=lambda: {"ok": True}, log=lambda *_: None)
+            without_reload = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                system_instruction="s", caller_name="Caller", log=lambda *_: None)
+
+            self.assertIn("reload_service",
+                          [tool["name"] for tool in with_reload._declared_tools()])
+            self.assertIsNone(without_reload._declared_tools())
+
+    async def test_reload_runs_inside_the_live_call_and_returns_its_result(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            called = []
+
+            def reload_service():
+                called.append(True)
+                return {"ok": True, "status": "reloaded", "generation": 2}
+
+            session = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                system_instruction="s", caller_name="Caller",
+                reload_service=reload_service, log=lambda *_: None)
+            session._live = FakeLive()
+            call = types.SimpleNamespace(
+                tool_call=types.SimpleNamespace(function_calls=[
+                    types.SimpleNamespace(
+                        name="reload_service", id="reload-1", args={})]))
+
+            await session._handle_tool_call(call)
+
+            result = session._live.tool_responses[0].response["result"]
+            self.assertEqual(called, [True])
+            self.assertEqual(result["status"], "reloaded")
+
+
 if __name__ == "__main__":
     unittest.main()

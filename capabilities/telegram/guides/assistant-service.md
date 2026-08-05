@@ -23,7 +23,7 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
    - Set `connection` or rely on the default in `capabilities/telegram/connections.json`.
    - Add `allowed_users` and `allowed_groups`.
    - Add optional per-channel `context_file` or short inline `context` entries when a chat needs its own soft prompt overlay.
-   - Review `control.roles`: this hard gate limits who may run service control commands such as `/set` and `/stop`.
+   - Review `control.roles`: this hard gate limits who may run service control commands such as `/set`, `/reload`, and `/stop`.
    - Review `authority.roles`: this request-scoped hard gate limits which capability CLIs a worker may invoke for each sender role.
    - Set group `aliases` / `address_aliases` if the assistant should react to names other than the default.
    - Set a group's `call_recording.mode` to `auto`, `on_request`, or `disabled`. Recording is opt-in per group and defaults to `disabled`.
@@ -63,6 +63,8 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
 
 Use `telegram service stop` or foreground `run` for supervisor-managed processes. On macOS/local dev, `start` uses a background process with a PID file under the connection's service state directory.
 
+After editing `settings.json`, use `telegram service reload`. The daemon validates the complete replacement before publishing it, keeps its PID and Telegram connection, and records the settings generation in `health.json`. Invalid JSON or a connection change is refused with the old settings left active; changing the selected connection still requires a real restart. The same operation is available as `/reload` and as the live-call `reload_service` tool only when the caller's `control.roles` policy permits `reload` (the shipped default grants it only to `supervisor`).
+
 ## State Layout
 
 For a connection named `assistant`, runtime state is:
@@ -88,6 +90,7 @@ The auth session and service runtime files are separate. Worker session copies l
 - Each addressed message becomes its own queued job.
 - The daemon performs protocol catch-up plus bounded watermark reconciliation when a Telegram session connects and at the configured sync interval. This recovers messages received while it was down and update packets the MTProto client could not deserialize.
 - `telegram service status` reports update-stream health from `health.json`; a live PID with a stale sync watermark is not reported as healthy.
+- `telegram service reload` applies policy and worker/voice defaults without disconnecting an active call. Prompt files are already read per request or call; reload is for `settings.json`.
 - A message is reserved in the persistent job register before voice transcription or any echo is attempted. Live re-delivery and startup catch-up therefore cannot transcribe or echo the same voice message twice.
 - Group final replies and progress updates are sent as replies to the addressed message. Direct-chat replies are plain messages.
 - `telegram send <chat> <text>` inside a worker writes to the daemon progress outbox instead of sending directly.
@@ -164,7 +167,7 @@ The system prompt is the project's own `capabilities/telegram/service/voice-agen
 
 The call is answered before the prompt is built. Reading a long chat tail first expires the ring window, after which the call layer tries to *place* a call instead of accepting one; so the daemon claims both media slots, then reads the tail, then sets the instruction and opens the speech session. The cost of that order is a second of dead air after pickup rather than a call that cannot be answered at all.
 
-A second tool, `send_to_chat`, writes into the caller's chat mid-call — for a link, an exact spelling, or a list that speech carries badly.
+A second tool, `send_to_chat`, writes into the caller's chat mid-call — for a link, an exact spelling, or a list that speech carries badly. An authorised supervisor also receives `reload_service`, which applies `settings.json` in the daemon itself; it never delegates to a worker and never ends the call.
 
 ### The record of a call
 
@@ -270,7 +273,7 @@ The prompt order is: global `context.md`, channel context overlay, daemon channe
 
 ## Control Authority
 
-Service control commands are handled by the daemon before a worker job exists, so they are governed by `control.roles` instead of `authority.roles`. `/status` is safe to expose broadly; `/set` changes per-channel runtime settings; `/stop` stops queued/running work for the channel.
+Service control commands are handled by the daemon before a worker job exists, so they are governed by `control.roles` instead of `authority.roles`. `/status` is safe to expose broadly; `/set` changes per-channel runtime settings; `/reload` validates and reapplies `settings.json` without disconnecting; `/stop` stops queued/running work for the channel.
 
 ```json
 {

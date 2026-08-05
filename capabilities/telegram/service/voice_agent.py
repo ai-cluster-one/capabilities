@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import time
@@ -229,6 +230,23 @@ READ_PROJECT_FILE_TOOL = {
             },
         },
         "required": ["path"],
+    },
+}
+
+
+RELOAD_SERVICE_TOOL = {
+    "name": "reload_service",
+    "description": (
+        "Apply the Telegram assistant's current settings.json to the live "
+        "daemon without hanging up this call. Use only when the caller "
+        "explicitly asks to reload, apply, or pick up updated Telegram service "
+        "settings. This is not a restart and does not reload source code. The "
+        "tool is exposed only to a caller whose control role permits reload; "
+        "never hand this operation to agent_task."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {},
     },
 }
 
@@ -616,7 +634,7 @@ class VoiceCallSession:
                  system_instruction, caller_name, caller_track=None,
                  agent_track=None, task_runner=None, send_to_chat=None,
                  capability_runner=None, file_reader=None, on_stream_end=None,
-                 greeting=None,
+                 reload_service=None, greeting=None,
                  progress_interval=DEFAULT_PROGRESS_INTERVAL, log=print):
         self._calls = calls
         self._chat_id = chat_id
@@ -629,6 +647,7 @@ class VoiceCallSession:
         self._send_to_chat = send_to_chat
         self._capability_runner = capability_runner
         self._file_reader = file_reader
+        self._reload_service = reload_service
         self._greeting = greeting
         self._on_stream_end = on_stream_end
         self._stream_ended = False
@@ -754,6 +773,8 @@ class VoiceCallSession:
             tools.append(RUN_CAPABILITY_TOOL)
         if self._file_reader is not None:
             tools.append(READ_PROJECT_FILE_TOOL)
+        if self._reload_service is not None:
+            tools.append(RELOAD_SERVICE_TOOL)
         self._log("voice: tools declared — "
                   + (", ".join(t["name"] for t in tools) if tools else "none"))
         return tools or None
@@ -900,6 +921,12 @@ class VoiceCallSession:
             return await self._run_capability(args.get("capability"), args.get("args"))
         if name == READ_PROJECT_FILE_TOOL["name"] and self._file_reader is not None:
             return await self._read_project_file(args.get("path"))
+        if name == RELOAD_SERVICE_TOOL["name"] and self._reload_service is not None:
+            result = self._reload_service()
+            if inspect.isawaitable(result):
+                result = await result
+            self._log(f"voice: reload_service {result.get('status', 'unknown')}")
+            return result
         return {"ok": False, "status": "unknown_tool",
                 "instruction": f"There is no tool named {name}."}
 

@@ -10,7 +10,7 @@
   "control": {
     "roles": {
       "supervisor": {
-        "commands": ["status", "set", "stop", "help"]
+        "commands": ["status", "set", "reload", "stop", "help"]
       },
       "channel_admin": {
         "commands": ["status", "set", "help"]

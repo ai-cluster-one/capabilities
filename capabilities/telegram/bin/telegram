@@ -94,7 +94,7 @@ Commands:
   telegram service init [--connection ID] [--force]
                                                Create project-local service settings
                                                and context templates.
-  telegram service doctor|run|start|stop|status|logs
+  telegram service doctor|run|start|reload|stop|status|logs
                                                Manage the bundled Telegram assistant
                                                service for this project. The engine
                                                runs from the installed capability
@@ -2188,6 +2188,55 @@ def _service_stop_result(connection_flag: str | None, session_flag: str | None,
          "retry with `telegram service stop --force`")
 
 
+def _service_reload_result(connection_flag: str | None, session_flag: str | None,
+                           timeout: float) -> dict:
+    """Ask the live daemon to validate and apply settings without disconnecting."""
+    import signal
+    import time
+
+    root = _service_project_root()
+    _require_service_initialized(root)
+    cid, paths = _service_state_dir(root, connection_flag, session_flag)
+    pid = _read_pid(paths["pid"])
+    if not _pid_alive(pid):
+        _die(5, "service_not_running", "telegram service is not running",
+             "run `telegram service start` before reloading settings")
+    before = _service_runtime_health(paths["health"], True)
+    before_attempt = int(before.get("settings_reload_attempts") or 0)
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except ProcessLookupError:
+        _die(5, "service_not_running", "telegram service exited before reload")
+    except PermissionError as exc:
+        _die(6, "service_reload_failed", f"cannot signal service process {pid}: {exc}")
+
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            _die(5, "service_reload_failed", "telegram service exited during reload",
+                 "inspect `telegram service logs`")
+        health = _service_runtime_health(paths["health"], True)
+        attempt = int(health.get("settings_reload_attempts") or 0)
+        if attempt > before_attempt:
+            error = health.get("settings_reload_error")
+            if error:
+                _die(6, "service_reload_refused", str(error),
+                     "fix settings.json and retry; the previous settings remain active")
+            return {
+                "reloaded": True,
+                "running": True,
+                "pid": pid,
+                "connection": cid,
+                "settings_generation": health.get("settings_generation"),
+                "settings_reloaded_at": health.get("settings_reloaded_at"),
+                "health_file": str(paths["health"]),
+            }
+        time.sleep(0.05)
+    _die(5, "service_reload_timeout",
+         f"telegram service did not acknowledge reload within {timeout:g}s",
+         "inspect `telegram service status` and `telegram service logs`")
+
+
 def cmd_service_logs(connection_flag: str | None, session_flag: str | None,
                      tail: int) -> dict:
     root = _service_project_root()
@@ -2304,6 +2353,9 @@ def main() -> None:
     svc_init.add_argument("--force", action="store_true",
                           help="overwrite existing service settings/context")
     svc.add_parser("start", help="start the assistant service in the background")
+    reload_service = svc.add_parser(
+        "reload", help="validate and apply settings without disconnecting")
+    reload_service.add_argument("--timeout", type=float, default=5.0)
     stop = svc.add_parser("stop", help="stop the assistant service")
     stop.add_argument("--timeout", type=float, default=10.0)
     stop.add_argument("--force", action="store_true")
@@ -2352,6 +2404,8 @@ def main() -> None:
             _emit(cmd_service_init(connection_flag, args.force))
         elif args.service_cmd == "start":
             _emit(_service_start_result(connection_flag, session_flag))
+        elif args.service_cmd == "reload":
+            _emit(_service_reload_result(connection_flag, session_flag, args.timeout))
         elif args.service_cmd == "stop":
             _emit(_service_stop_result(connection_flag, session_flag,
                                        args.timeout, args.force))

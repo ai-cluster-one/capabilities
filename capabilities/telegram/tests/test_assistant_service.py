@@ -387,6 +387,55 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)
 
+    async def test_reload_replaces_live_policy_without_reimporting_the_daemon(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=20)
+            service_settings["assistant_name"] = "Before"
+            daemon = import_daemon(Path(td), service_settings)
+            original_module = id(daemon)
+
+            updated = settings(sync_interval=7)
+            updated["assistant_name"] = "After"
+            updated["allowed_users"] = {"42": {"name": "New caller"}}
+            daemon.SETTINGS_FILE.write_text(json.dumps(updated) + "\n")
+            result = daemon.reload_runtime_settings()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(id(daemon), original_module)
+            self.assertEqual(daemon.ASSISTANT_NAME, "After")
+            self.assertEqual(daemon.SYNC_INTERVAL, 7)
+            self.assertIn("42", daemon.ALLOWED)
+            self.assertEqual(daemon.SETTINGS_GENERATION, 2)
+            health = json.loads(daemon.HEALTH_FILE.read_text())
+            self.assertEqual(health["settings_generation"], 2)
+
+    async def test_invalid_reload_keeps_the_previous_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["assistant_name"] = "Still here"
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.SETTINGS_FILE.write_text("{not-json\n")
+
+            result = daemon.reload_runtime_settings()
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "reload_refused")
+            self.assertEqual(daemon.ASSISTANT_NAME, "Still here")
+            self.assertEqual(daemon.SETTINGS_GENERATION, 1)
+
+    async def test_reload_refuses_a_connection_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            updated = settings()
+            updated["connection"] = "some-other-session"
+            daemon.SETTINGS_FILE.write_text(json.dumps(updated) + "\n")
+
+            result = daemon.reload_runtime_settings()
+
+            self.assertFalse(result["ok"])
+            self.assertIn("restart is required", result["error"])
+            self.assertEqual(daemon.SETTINGS["connection"], "test")
+
     async def test_call_recording_modes_are_read_from_group_policy(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()
