@@ -1851,7 +1851,7 @@ def deepgram_transcribe(audio, mime="audio/ogg"):
 
 # --- workers ------------------------------------------------------------------
 # Each worker turns (tail, state) into a normalized dict:
-#   {"reply": <text>, "meta": {harness, model, is_error,
+#   {"reply": <text>, "silent": <optional bool>, "meta": {harness, model, is_error,
 #     tokens:{input,output,cache_read,cache_write}, cost_usd, duration_ms, session_id}}
 # so the dispatch loop stays harness-blind and logs token/cost metadata uniformly.
 # `state` is the daemon-assembled channel state (time, channel/harness, participants,
@@ -2540,6 +2540,18 @@ def _codex_meta(stdout, model):
             "cost_usd": None, "duration_ms": None, "session_id": thread_id}
 
 
+def _codex_turn_completed(stdout):
+    """True only when Codex's JSONL protocol confirms a successful turn end."""
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "turn.completed":
+            return True
+    return False
+
+
 def discover_codex_images(thread_id):
     """Discover Codex-generated images for a thread, returning valid local paths.
     
@@ -2610,6 +2622,12 @@ def worker_codex(chat, tail, state=None, procs=None):
             raise RuntimeError(f"codex worker failed: {err.strip()[:200]}")
         reply = Path(out).read_text().strip()
         if not reply:
+            if _codex_turn_completed(stdout_txt):
+                return {
+                    "reply": "",
+                    "silent": True,
+                    "meta": _codex_meta(stdout_txt, model),
+                }
             raise RuntimeError("codex worker produced no final message")
         return {"reply": reply, "meta": _codex_meta(stdout_txt, model)}
     finally:
@@ -3047,6 +3065,11 @@ async def run_session(client):
                 retry_job(key, job, "session closed before worker reply was delivered")
                 return
             reply, meta = result["reply"], result["meta"]
+            if result.get("silent"):
+                log(f"{key}: completed silently job msg={job.get('message_id')} · "
+                    f"{meta.get('harness')}/{meta.get('model') or '?'}")
+                mark_job_finished(key, job, "done", meta=meta)
+                return
             
             # Discover and send Codex-generated images
             images = []

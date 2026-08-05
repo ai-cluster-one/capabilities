@@ -388,6 +388,58 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)
 
+    async def test_codex_completed_empty_final_is_a_silent_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            stdout = "\n".join([
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps({"type": "turn.completed", "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 0,
+                    "cached_input_tokens": 4,
+                }}),
+            ])
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
+                result = daemon.worker_codex("123", [], {}, {})
+
+            self.assertTrue(result["silent"])
+            self.assertEqual(result["reply"], "")
+            self.assertEqual(result["meta"]["session_id"], "thread-1")
+            self.assertEqual(result["meta"]["tokens"]["output"], 0)
+
+    async def test_codex_empty_final_without_completion_remains_an_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            stdout = json.dumps({"type": "thread.started", "thread_id": "thread-1"})
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
+                with self.assertRaisesRegex(RuntimeError, "produced no final message"):
+                    daemon.worker_codex("123", [], {}, {})
+
+    async def test_silent_worker_completion_marks_job_done_without_telegram_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            def silent_worker(*_args):
+                result = successful_result("")
+                result["silent"] = True
+                return result
+
+            daemon.WORKERS["stub"] = silent_worker
+            message = Message(90, text="Assistant, no acknowledgement needed")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 90)
+
+            self.assertEqual(client.sent, [])
+            self.assertTrue(any("completed silently job msg=90" in line
+                                for line in daemon._test_logs))
+            await self.stop_session(client, task)
+
     async def test_prompt_uses_compact_timestamps_and_reply_topology(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
