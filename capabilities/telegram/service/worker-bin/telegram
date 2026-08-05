@@ -71,7 +71,7 @@ def rule_scope(rule):
 
 
 def parse_command_and_chat(argv):
-    chat_commands = {"read", "search", "send", "download", "export"}
+    chat_commands = {"read", "search", "send", "send-media", "react", "download", "export"}
     takes_value = {"--session", "--connection", "--chat"}
     args = list(argv[1:])
     i = 0

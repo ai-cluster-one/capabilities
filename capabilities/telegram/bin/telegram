@@ -45,8 +45,8 @@ env-key indirection, and owns a per-connection session:
     }
   }
 
-The write gate: a `send` leaves the system (a message to a person), so it is off
-unless a connection grants it. Grant it with
+The write gate: outbound sends and reactions leave the system, so they are off
+unless a connection grants them. Grant them with
 `"allow_write": true` on a connection in connections.json. A refused write exits
 4 — ask the user, never lift the gate yourself.
 
@@ -77,6 +77,9 @@ Commands:
   telegram search <chat> <query> [--limit N] [--json]
                                                Search messages inside a chat.
   telegram send <chat> <text>                  Send a message.
+  telegram send-media <chat> <path> [--caption TEXT] [--reply-to MSG_ID]
+                                                 Send a local media file.
+  telegram react <chat> <msgid> <emoji> [...]  Add one or more emoji reactions.
   telegram download <chat> <msgid> [--json]    Materialize one message's media to a
                                                deterministic per-connection cache
                                                path (download only if absent);
@@ -166,13 +169,14 @@ from telethon.errors.rpcerrorlist import (
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
+from telethon.tl import functions, types
 from telethon.tl.types import Channel, Chat, MessageEmpty, User
 
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "telegram"
 SUMMARY = ("Telegram CLI over a personal MTProto account — read/search a chat, "
-           "send, export history to JSON, transcribe voice/audio. Stateful — "
+           "send text/media and reactions, export history to JSON, transcribe voice/audio. Stateful — "
            "run `telegram doctor` first.")
 SCOPE = "user"   # credential scope: "project" | "user"
 CRED_KEYS = [    # an override-free registry entry resolves these flat keys
@@ -185,8 +189,8 @@ CRED_KEYS = [    # an override-free registry entry resolves these flat keys
     {"key": "DEEPGRAM_API_KEY", "secret": True, "required": False,
      "note": "voice/audio transcription"},
 ]
-WRITE_VERBS = {"send"}   # the only domain verb that leaves the system — a message to a person
-WRITE_DEFAULT = False    # a send leaves the system; granted per connection, explicitly
+WRITE_VERBS = {"send", "send-media", "react"}
+WRITE_DEFAULT = False    # outbound messages and reactions need an explicit connection grant
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/telegram/guides/")
 TOPICS = ["assistant-service", "message-storage"]   # shipped guide topics
@@ -1331,6 +1335,38 @@ async def cmd_send(cfg, chat: str, text: str) -> dict:
     return {"sent_id": sent.id, "to": entity_label(entity)}
 
 
+async def cmd_send_media(cfg, chat: str, path: str, caption: str | None,
+                         reply_to: int | None, force_document: bool) -> dict:
+    media = Path(path).expanduser()
+    if not media.is_file():
+        raise ValueError(f"media file not found: {media}")
+    client = make_client(cfg)
+    await _require_auth(client)
+    entity = await resolve_chat(client, chat)
+    sent = await client.send_file(
+        entity,
+        str(media),
+        caption=caption or None,
+        reply_to=reply_to,
+        force_document=force_document,
+    )
+    await client.disconnect()
+    return {"sent_id": sent.id, "to": entity_label(entity), "path": str(media)}
+
+
+async def cmd_react(cfg, chat: str, msgid: int, emojis: list[str]) -> dict:
+    client = make_client(cfg)
+    await _require_auth(client)
+    entity = await resolve_chat(client, chat)
+    await client(functions.messages.SendReactionRequest(
+        peer=entity,
+        msg_id=msgid,
+        reaction=[types.ReactionEmoji(emoticon=emoji) for emoji in emojis],
+    ))
+    await client.disconnect()
+    return {"reacted_to": msgid, "to": entity_label(entity), "reactions": emojis}
+
+
 # --- Export ------------------------------------------------------------------
 
 def _classify_media(m):
@@ -2327,6 +2363,19 @@ def main() -> None:
     pn.add_argument("chat")
     pn.add_argument("text")
 
+    pm = sub.add_parser("send-media", help="send a local media file")
+    pm.add_argument("chat")
+    pm.add_argument("path", help="local file path")
+    pm.add_argument("--caption", help="optional caption")
+    pm.add_argument("--reply-to", type=int, help="message id to reply to")
+    pm.add_argument("--force-document", action="store_true",
+                    help="upload images as documents instead of photos")
+
+    prx = sub.add_parser("react", help="add emoji reactions to a message")
+    prx.add_argument("chat")
+    prx.add_argument("msgid", type=int)
+    prx.add_argument("emojis", nargs="+", help="one or more emoji, for example 👍")
+
     pd = sub.add_parser("download",
                         help="materialize one message's media to a deterministic cache path")
     pd.add_argument("chat")
@@ -2441,6 +2490,13 @@ def main() -> None:
             _emit(asyncio.run(cmd_search(cfg, args.chat, args.query, args.limit, args.json)))
         elif args.cmd == "send":
             _emit(asyncio.run(cmd_send(cfg, args.chat, args.text)))
+        elif args.cmd == "send-media":
+            _emit(asyncio.run(cmd_send_media(
+                cfg, args.chat, args.path, args.caption, args.reply_to,
+                args.force_document,
+            )))
+        elif args.cmd == "react":
+            _emit(asyncio.run(cmd_react(cfg, args.chat, args.msgid, args.emojis)))
         elif args.cmd == "download":
             _emit(asyncio.run(cmd_download(cfg, args.chat, args.msgid, args.json)))
         elif args.cmd == "export":
@@ -2458,6 +2514,8 @@ def main() -> None:
     except RPCError as e:
         _die(5, "rpc_error", f"Telegram RPC error: {e.__class__.__name__}: {e}",
              status=getattr(e, "code", None))
+    except ValueError as e:
+        _die(6, "invalid_input", str(e))
     except (ConnectionError, OSError) as e:
         _die(5, "network_error", f"network error reaching Telegram: {e}", "check connectivity")
 
