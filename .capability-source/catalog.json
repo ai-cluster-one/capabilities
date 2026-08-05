@@ -60,6 +60,11 @@
       "payload_sha256": "0bb2fff326264e014f29bee51297e59a7e17b5afc91a10ac7b2bf68578f99da4",
       "summary": "macOS Calendar CLI with indexed EventKit reads and Calendar.app automation writes across configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); no credential is stored on disk."
     },
+    "instagram": {
+      "path": "capabilities/instagram",
+      "payload_sha256": "26a8ae8deb4a68d57a17b05e4c675d02c7678ea8060457fadac6a6088c3bfb3f",
+      "summary": "Instagram CLI over a captured browser session — validate identity, read profiles, resolve Direct threads, and send text messages. Stateful — run `instagram doctor` first."
+    },
     "journal": {
       "path": "capabilities/journal",
       "payload_sha256": "6487bbde32140bdd17e2330a69feab04f70bc4985c825fc53abb72b0e8811ba0",
@@ -67,7 +72,7 @@
     },
     "macmail": {
       "path": "capabilities/macmail",
-      "payload_sha256": "33c62eaa0dcc62815bf1f1c2417352700b1a48733d22213dc0c69171e78fdc52",
+      "payload_sha256": "8d159f8d696f1c3331c09dfee35c716e52c70d51615bd758c0b9c9905b0c91d1",
       "summary": "Mail.app CLI over macOS Automation — read/search mail across configured accounts, show a message, save attachments, draft (never send), and export a mailbox to JSON."
     },
     "mailbox": {
@@ -112,7 +117,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "607c51646d0e36d9914f98ec98aeaa321849457778e78f15fc488f4dfaf85459",
+      "payload_sha256": "7987f3c73e755d11acc28a18fa7fe66fc96014c0178faea55469bd56d3188f07",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, send, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
