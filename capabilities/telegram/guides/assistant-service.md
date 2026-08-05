@@ -63,7 +63,7 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
 
 Use `telegram service stop` or foreground `run` for supervisor-managed processes. On macOS/local dev, `start` uses a background process with a PID file under the connection's service state directory.
 
-After editing `settings.json`, use `telegram service reload`. The daemon validates the complete replacement before publishing it, keeps its PID and Telegram connection, and records the settings generation in `health.json`. Invalid JSON or a connection change is refused with the old settings left active; changing the selected connection still requires a real restart. The same operation is available as `/reload` and as the live-call `reload_service` tool only when the caller's `control.roles` policy permits `reload` (the shipped default grants it only to `supervisor`).
+After editing `settings.json`, use `telegram service reload`. The daemon validates the complete replacement before publishing it, keeps its PID and Telegram connection, and records the settings generation in `health.json`. Invalid JSON or a connection change is refused with the old settings left active; changing the selected connection still requires a real restart. The same operation is available as `/reload` and as the live-call `reload_service` tool only when the caller's `control.roles` policy permits `reload` (the shipped default grants it only to `supervisor`). A worker may invoke the CLI form only when its request authority role is `supervisor`; an external terminal without request authority remains an operator surface.
 
 ## State Layout
 

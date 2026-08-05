@@ -2194,6 +2194,13 @@ def _service_reload_result(connection_flag: str | None, session_flag: str | None
     import signal
     import time
 
+    authority = _auth_context()
+    if authority is not None:
+        role = str(authority.get("sender_role") or authority.get("role") or "unknown")
+        if role != "supervisor":
+            _die(4, "service_reload_not_authorized",
+                 "telegram service reload is reserved for a supervisor request",
+                 f"role={role}; use the daemon's control policy instead of bypassing it")
     root = _service_project_root()
     _require_service_initialized(root)
     cid, paths = _service_state_dir(root, connection_flag, session_flag)
