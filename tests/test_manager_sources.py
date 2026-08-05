@@ -38,6 +38,17 @@ def _run(env: dict[str, str], *args: str, check: bool = True):
     return result
 
 
+def test_manager_and_generated_scaffold_each_have_one_pep723_block(tmp_path):
+    assert MANAGER.read_text().splitlines().count("# /// script") == 1
+
+    env = _env(tmp_path)
+    _run(env, "source", "init", "personal")
+    created = json.loads(_run(
+        env, "new", "demo", "--source", "personal").stdout)
+    generated = Path(created["executable"]).read_text()
+    assert generated.splitlines().count("# /// script") == 1
+
+
 def test_authoring_workspace_is_canonical_and_install_is_strict(tmp_path):
     env = _env(tmp_path)
     initialized = json.loads(_run(env, "source", "init", "personal").stdout)

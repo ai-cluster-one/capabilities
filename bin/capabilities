@@ -3545,6 +3545,10 @@ def _capability_skeleton(name: str, core_only: bool) -> str:
     canonical = _canonical_regions()
     core_open, core_close = _fence_markers("capability core")
     conn_open, conn_close = _fence_markers("connections")
+    # PEP 723 parsers scan the raw manager file rather than Python tokens. Keep
+    # the generated block marker out of the source text so the manager itself
+    # has exactly one `script` block while every scaffold still receives one.
+    script_metadata_open = "# " + "/// script"
     connections = ""
     report = """\
 def _connections_report() -> dict:
@@ -3589,7 +3593,7 @@ def cmd_doctor(_wanted: str | None) -> None:
 """
         connections = "\n" + report + "\n" + doctor
     return f'''#!/usr/bin/env -S uv run --script
-# /// script
+{script_metadata_open}
 # requires-python = ">=3.11"
 # ///
 """{name} — managed capability scaffold.
