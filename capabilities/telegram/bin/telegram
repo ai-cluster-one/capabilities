@@ -1045,13 +1045,15 @@ def make_client(cfg: dict) -> TelegramClient:
     return TelegramClient(str(session_path), cfg["api_id"], cfg["api_hash"])
 
 
-def _doctor_session_snapshot(cfg: dict) -> tuple[dict, tempfile.TemporaryDirectory]:
-    """Give doctor an isolated SQLite session so a running daemon cannot lock it.
+def _session_snapshot(cfg: dict) -> tuple[dict, tempfile.TemporaryDirectory]:
+    """Give one transient CLI invocation an isolated SQLite session.
 
-    Doctor is a readiness probe, not the owner of the durable MTProto session.
-    SQLite's backup API takes a consistent snapshot while the daemon is active;
-    Telethon may then update its transient copy during connect/disconnect without
-    contending with or mutating the canonical session database.
+    A running daemon owns the durable MTProto session.  Tools invoked through a
+    model host do not always inherit the worker's environment, so they cannot
+    reliably receive the daemon-provided clone.  Snapshotting here gives those
+    invocations the same safe behaviour: Telethon may update its temporary
+    session during connect/disconnect without contending with or mutating the
+    canonical database.
     """
     temporary = tempfile.TemporaryDirectory(prefix="telegram-doctor-")
     source = Path(str(cfg["session"]) + ".session").expanduser()
@@ -1133,7 +1135,7 @@ async def _check_connection(cfg: dict) -> dict:
     stop. Proves creds resolved, Telegram reachable, session authorized."""
     temporary = None
     try:
-        isolated_cfg, temporary = _doctor_session_snapshot(cfg)
+        isolated_cfg, temporary = _session_snapshot(cfg)
     except sqlite3.Error as e:
         return {"ok": False, "category": 5,
                 "error": f"cannot snapshot Telegram session: {e}"}
@@ -2477,6 +2479,19 @@ def main() -> None:
 
     cfg = _load_config(connection_flag, session_flag)
     _write_gate(cfg["id"], cfg["allow_write"], args.cmd)
+    temporary = None
+    # A normal CLI call may be launched by a model-host process rather than the
+    # daemon's direct child, in which case TELEGRAM_WORKER_SESSION is absent.
+    # It still must not open the daemon's live SQLite database.  An explicit
+    # --session is already an isolated worker lease (or a deliberate operator
+    # choice), and login is the sole command that must persist a new session.
+    if args.cmd != "login" and session_flag is None:
+        try:
+            cfg, temporary = _session_snapshot(cfg)
+        except sqlite3.Error as e:
+            _die(5, "session_snapshot_failed",
+                 f"could not snapshot Telegram session: {e}",
+                 "retry the command; do not disable SQLite locking")
     try:
         if args.cmd == "login":
             _emit(asyncio.run(cmd_login_qr(cfg) if args.qr else cmd_login(cfg)))
@@ -2518,6 +2533,9 @@ def main() -> None:
         _die(6, "invalid_input", str(e))
     except (ConnectionError, OSError) as e:
         _die(5, "network_error", f"network error reaching Telegram: {e}", "check connectivity")
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
 
 
 if __name__ == "__main__":
