@@ -1056,6 +1056,33 @@ async def _sender_profile(message, group_policy=None, direct=False):
     return {"id": sid, "name": _entity_name(sender, sid), "role": role}
 
 
+def _reply_target(message_id, sender_id, group_policy, is_direct):
+    """Where an outbound response is threaded for this sender.
+
+    A configured automation peer can receive top-level responses instead of
+    Telegram replies. That breaks mechanical bot-to-bot reply loops while the
+    response text remains free to address the peer by name when the model
+    deliberately wants to hand it another turn.
+    """
+    if is_direct:
+        return None
+    member = _as_mapping(
+        _as_mapping(_as_mapping(group_policy).get("members")).get(str(sender_id)))
+    mode = str(member.get("reply_mode") or "reply").strip().lower().replace("-", "_")
+    if mode in {"top_level", "plain", "new_message"}:
+        return None
+    return message_id
+
+
+def _delivery_description(reply_to, is_direct):
+    if is_direct:
+        return "final response is sent as a plain direct message"
+    if reply_to is None:
+        return ("final response is sent as a new top-level group message, never as a "
+                "Telegram reply to this sender")
+    return "final response is sent as a reply to the request message"
+
+
 # --- register (dynamic state: watermark + per-channel /set overrides) ---------
 def load_register():
     return json.loads(REGISTER.read_text()) if REGISTER.exists() else {}
@@ -2540,7 +2567,9 @@ async def run_session(client):
         row["last_processed_message_id"] = max(
             message.id, row.get("last_processed_message_id", 0))
         save_register(reg)
-        _, _ = await send_channel_message(chat_ref, reply, False, reply_to=message.id)
+        _, _ = await send_channel_message(
+            chat_ref, reply, False,
+            reply_to=_reply_target(message.id, profile["id"], group_policy, False))
         return True
 
     async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset):
@@ -2733,6 +2762,8 @@ async def run_session(client):
         try:
             tail, participants = await build_tail_and_participants(
                 key, ent_id, s, group_policy, is_direct, job)
+            reply_msg_id = _reply_target(
+                job.get("message_id"), job.get("sender_id"), group_policy, is_direct)
             current_request = {
                 "message_id": job.get("message_id"),
                 "sender_id": job.get("sender_id"),
@@ -2740,7 +2771,8 @@ async def run_session(client):
                 "sender_role": job.get("sender_role"),
                 "kind": job.get("kind"),
                 "text": job.get("text"),
-                "reply_to": None if is_direct else job.get("message_id"),
+                "reply_to": reply_msg_id,
+                "delivery": _delivery_description(reply_msg_id, is_direct),
             }
             PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
             progress_outbox = PROGRESS_DIR / f"{_safe_file_part(key)}-{job.get('message_id')}.jsonl"
@@ -2773,7 +2805,7 @@ async def run_session(client):
             progress_stop = asyncio.Event()
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
-                              job.get("message_id"), progress_stop))
+                              reply_msg_id, progress_stop))
             future = loop.run_in_executor(None, WORKERS[s["worker"]], key, tail, state, procs)
             async with client.action(ent_id, "typing"):
                 done, _ = await asyncio.wait({future}, timeout=float(s["worker_timeout"]))
@@ -2790,7 +2822,6 @@ async def run_session(client):
             if meta.get("harness") == "codex" and meta.get("session_id"):
                 images = discover_codex_images(meta["session_id"])
             
-            reply_msg_id = None if is_direct else job.get("message_id")
             if images:
                 try:
                     if len(reply) <= 1024:
@@ -2869,8 +2900,11 @@ async def run_session(client):
         notice = (f"Worker error:\n{error}" if is_supervisor
                   else "Something went wrong while processing this. Please tell an administrator.")
         try:
+            _, group_policy = _group_policy(key)
             _, _ = await send_channel_message(
-                ent_id, notice, is_direct, reply_to=None if is_direct else job.get("message_id"))
+                ent_id, notice, is_direct,
+                reply_to=_reply_target(
+                    job.get("message_id"), job.get("sender_id"), group_policy, is_direct))
         except Exception as se:
             log(f"{key}: failed to send error notice: {se}")
         mark_job_finished(key, job, "error", error=error)
@@ -2977,7 +3011,8 @@ async def run_session(client):
                 stopped = True
         return "Stopped." if stopped else "Nothing is running right now."
 
-    async def echo_voice_message(message, chat_id, key, is_direct, sender_name=None):
+    async def echo_voice_message(message, chat_id, key, is_direct, group_policy=None,
+                                 sender_name=None):
         """Transcribe a Telegram voice note and echo the text into the chat.
 
         The echo is the durable, worker-visible representation of the voice note. Both live
@@ -3009,7 +3044,9 @@ async def run_session(client):
                 text,
                 is_direct,
                 parse_mode="html",
-                reply_to=None if is_direct else message.id)
+                reply_to=_reply_target(
+                    message.id, getattr(message, "sender_id", None),
+                    group_policy, is_direct))
             # Record echo attribution so conversation history shows the sender, not the assistant
             if not is_direct and sender_name and echo_ids:
                 _record_voice_echo_sender(reg, key, echo_ids, sender_name)
@@ -3096,7 +3133,8 @@ async def run_session(client):
                     if job is None:
                         continue
                     profile = await _sender_profile(m, group_policy, direct=is_direct)
-                    spoken = await echo_voice_message(m, ent, key, is_direct, sender_name=profile["name"])
+                    spoken = await echo_voice_message(
+                        m, ent, key, is_direct, group_policy, sender_name=profile["name"])
                     # If transcript names the assistant, finalize and dispatch
                     if spoken and spoken != "[голосовое — не удалось расшифровать]" and _text_names_me(spoken, me, group_policy):
                         if await finalize_job(
@@ -3114,7 +3152,8 @@ async def run_session(client):
                 if _is_spoken_media(m):
                     profile = await _sender_profile(m, group_policy, direct=is_direct)
                     sender_name = None if is_direct else profile["name"]
-                    spoken = await echo_voice_message(m, ent, key, is_direct, sender_name=sender_name)
+                    spoken = await echo_voice_message(
+                        m, ent, key, is_direct, group_policy, sender_name=sender_name)
                 if await finalize_job(
                         key, m, group_policy, is_direct, f"catch-up/{reason}", job,
                         text_override=spoken):
@@ -3177,7 +3216,9 @@ async def run_session(client):
             if reply:
                 _, _ = await send_channel_message(
                     chat_ref, reply, access["kind"] == "private",
-                    reply_to=None if access["kind"] == "private" else event.message.id)
+                    reply_to=_reply_target(
+                        event.message.id, event.message.sender_id,
+                        group_policy, access["kind"] == "private"))
             return
         if access.get("ambient_voice"):                   # unaddressed voice in auto mode — check transcript
             job = reserve_job(key, event.message, group_policy, is_direct, "live/ambient")
@@ -3185,7 +3226,9 @@ async def run_session(client):
                 log(f"{key}: already queued/done msg={event.message.id}")
                 return
             profile = await _sender_profile(event.message, group_policy, direct=is_direct)
-            spoken = await echo_voice_message(event.message, chat_ref, key, is_direct, sender_name=profile["name"])
+            spoken = await echo_voice_message(
+                event.message, chat_ref, key, is_direct, group_policy,
+                sender_name=profile["name"])
             # If transcript names the assistant, dispatch as an addressed request
             if spoken and spoken != "[голосовое — не удалось расшифровать]" and _text_names_me(spoken, me, group_policy):
                 enqueued = await finalize_job(
@@ -3211,7 +3254,9 @@ async def run_session(client):
         if _is_spoken_media(event.message):               # transcribe → echo (visible + attributed by reply)
             profile = await _sender_profile(event.message, group_policy, direct=is_direct)
             sender_name = None if is_direct else profile["name"]
-            spoken = await echo_voice_message(event.message, chat_ref, key, is_direct, sender_name=sender_name)
+            spoken = await echo_voice_message(
+                event.message, chat_ref, key, is_direct, group_policy,
+                sender_name=sender_name)
         else:
             log(f"{key}: <- {_message_kind(event.message)} «{text[:60]}» "
                 f"(debounce {channel_settings(reg, key)['debounce']}s)")

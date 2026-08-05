@@ -387,6 +387,29 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)
 
+    async def test_member_can_receive_top_level_responses_instead_of_replies(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            group_policy = {
+                "members": {
+                    "5509911365": {
+                        "name": "Solomon",
+                        "reply_mode": "top_level",
+                    },
+                },
+            }
+
+            self.assertIsNone(
+                daemon._reply_target(100, "5509911365", group_policy, False))
+            self.assertEqual(
+                daemon._reply_target(100, "777", group_policy, False), 100)
+            self.assertIsNone(
+                daemon._reply_target(100, "5509911365", group_policy, True))
+            self.assertIn(
+                "top-level group message",
+                daemon._delivery_description(None, False),
+            )
+
     async def test_reload_replaces_live_policy_without_reimporting_the_daemon(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings(sync_interval=20)
