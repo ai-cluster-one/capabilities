@@ -1678,6 +1678,37 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             help_text = daemon._set_help(reg, "123", "voice-transcription")
             self.assertIn("only available in groups", help_text)
 
+    async def test_group_worker_timeout_and_runtime_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(worker_timeout=120)
+            service_settings["allowed_groups"] = {
+                "-200": {"worker_timeout": 600}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            reg = daemon.load_register()
+
+            self.assertEqual(daemon.channel_settings(reg, "-200")["worker_timeout"], 600)
+
+            result = daemon.set_channel_setting(reg, "-200", "worker-timeout", "300")
+            self.assertEqual(result, "worker-timeout = 300s")
+            self.assertEqual(daemon.channel_settings(reg, "-200")["worker_timeout"], 300)
+            self.assertIn("worker-timeout = 300s", daemon._status(reg, "-200"))
+
+            result = daemon.set_channel_setting(reg, "-200", "worker-timeout", "default")
+            self.assertEqual(result, "worker-timeout = default (600s effective)")
+            self.assertEqual(daemon.channel_settings(reg, "-200")["worker_timeout"], 600)
+            self.assertNotIn("worker_timeout", reg["-200"]["settings"])
+
+    async def test_set_worker_timeout_validation_and_help(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            reg = daemon.load_register()
+
+            help_text = daemon._set_help(reg, "123", "worker-timeout")
+            self.assertIn("1..3600|default", help_text)
+            with self.assertRaisesRegex(ValueError, "1..3600"):
+                daemon.set_channel_setting(reg, "123", "timeout", "0")
+
     async def test_ambient_voice_transcript_without_alias_echo_only(self):
         """Ambient voice with transcript that doesn't name assistant => echo only, no worker."""
         with tempfile.TemporaryDirectory() as td:

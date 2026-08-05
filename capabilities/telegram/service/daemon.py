@@ -1530,15 +1530,21 @@ def voice_task_authority(caller_id, caller_name, text, task_id="voice-task"):
 
 
 def channel_settings(reg, key):
-    """Defaults (settings.json) overlaid by this channel's /set overrides."""
+    """Project defaults and channel policy overlaid by this channel's /set overrides."""
     row = reg.get(key, {})
     s = row.get("settings", {})
+    _, group_policy = _group_policy(key)
+    configured_timeout = (
+        group_policy.get("worker_timeout", DEFAULTS.get("worker_timeout", 90))
+        if isinstance(group_policy, dict)
+        else DEFAULTS.get("worker_timeout", 90)
+    )
     worker = _active_worker(row)
     cfg = _worker_settings(row, worker)
     out = {
         "tail_size": s.get("tail_size", DEFAULTS.get("tail_size", 50)),
         "debounce": s.get("debounce", DEFAULTS.get("debounce", 3)),
-        "worker_timeout": s.get("worker_timeout", DEFAULTS.get("worker_timeout", 90)),
+        "worker_timeout": s.get("worker_timeout", configured_timeout),
         "progress_after": s.get("progress_after", DEFAULTS.get("progress_after", 15)),
         "max_parallel_jobs": s.get("max_parallel_jobs", DEFAULTS.get("max_parallel_jobs", 2)),
         "max_attempts": s.get("max_attempts", DEFAULTS.get("max_attempts", 3)),
@@ -1600,6 +1606,7 @@ def _status(reg, key):
     elif worker == "codex":
         lines.append(f"  codex.reasoning = {s.get('reasoning_effort') or 'default'}")
         lines.append(f"  codex.service_tier = {s.get('service_tier') or 'default'}")
+    lines.append(f"  worker-timeout = {s['worker_timeout']}s")
     _, group_policy = _group_policy(key)
     if group_policy is not None:
         mode = s.get("voice_transcription") or _voice_transcription_mode(group_policy, reg, key)
@@ -1641,6 +1648,9 @@ def _set_help(reg, key, topic=None):
         return f"usage: /set tail <1..500>\ncurrent: {s['tail_size']}"
     if topic == "debounce":
         return f"usage: /set debounce <0..300>\ncurrent: {s['debounce']}s"
+    if topic in ("worker-timeout", "worker_timeout", "timeout"):
+        return ("usage: /set worker-timeout <1..3600|default>\n"
+                f"current: {s['worker_timeout']}s")
     if topic in ("voice-transcription", "voice_transcription", "voice"):
         _, group_policy = _group_policy(key)
         if group_policy is None:
@@ -1681,6 +1691,7 @@ def _set_help(reg, key, topic=None):
         "settings:",
         "  tail <1..500>",
         "  debounce <0..300>",
+        "  worker-timeout <1..3600|default>",
         f"  worker <{_values(WORKER_CHOICES)}>",
         f"  model <{_model_hint(active)}>  (active worker)",
         "  reasoning <default|low|medium|high|xhigh>  (codex active)",
@@ -1713,6 +1724,16 @@ def set_channel_setting(reg, key, k, v):
             raise ValueError("debounce must be 0..300 (seconds; 0 = dispatch immediately)")
         s["debounce"] = n
         return f"debounce = {n}s"
+    if k in ("worker-timeout", "worker_timeout", "timeout"):
+        if v.strip().lower() == "default":
+            s.pop("worker_timeout", None)
+            effective = channel_settings(reg, key)["worker_timeout"]
+            return f"worker-timeout = default ({effective}s effective)"
+        n = int(v)
+        if not 1 <= n <= 3600:
+            raise ValueError("worker-timeout must be 1..3600 seconds or default")
+        s["worker_timeout"] = n
+        return f"worker-timeout = {n}s"
     if k == "worker":
         worker = v.strip().lower()
         if worker not in WORKER_NAMES:
@@ -1741,7 +1762,7 @@ def set_channel_setting(reg, key, k, v):
     if field in ("model", "effort", "reasoning", "reasoning_effort",
                  "speed", "service-tier", "service_tier"):
         return _set_worker_setting(reg, key, worker, field, v)
-    raise ValueError("unknown setting; use tail, debounce, worker, model, reasoning, "
+    raise ValueError("unknown setting; use tail, debounce, worker-timeout, worker, model, reasoning, "
                      "effort, speed, service-tier, or <worker>.<setting>")
 
 
