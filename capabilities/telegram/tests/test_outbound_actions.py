@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import sqlite3
 import sys
 import tempfile
 import time
@@ -160,6 +161,28 @@ class OutboundActionsTests(unittest.TestCase):
         self.assertEqual(request.msg_id, 99)
         self.assertEqual([item.emoticon for item in request.reaction], ["👍", "🔥"])
         self.assertTrue(self.client.disconnected)
+
+    def test_session_snapshot_is_an_independent_sqlite_copy(self):
+        """A model-host CLI call must never share the daemon's live session DB."""
+        with tempfile.TemporaryDirectory() as td:
+            session = Path(td) / "live"
+            source = session.with_suffix(".session")
+            with sqlite3.connect(source) as db:
+                db.execute("create table state (value text)")
+                db.execute("insert into state values ('daemon')")
+
+            isolated, temporary = self.cli._session_snapshot({"session": str(session)})
+            try:
+                clone = Path(isolated["session"]).with_suffix(".session")
+                self.assertNotEqual(clone, source)
+                with sqlite3.connect(clone) as db:
+                    self.assertEqual(db.execute("select value from state").fetchone(), ("daemon",))
+                    db.execute("insert into state values ('worker')")
+
+                with sqlite3.connect(source) as db:
+                    self.assertEqual(db.execute("select value from state").fetchall(), [("daemon",)])
+            finally:
+                temporary.cleanup()
 
     def test_send_media_rejects_missing_file_before_connecting(self):
         with self.assertRaisesRegex(ValueError, "media file not found"):
