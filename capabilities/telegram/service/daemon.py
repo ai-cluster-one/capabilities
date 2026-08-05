@@ -151,79 +151,132 @@ CHANNEL_ENABLED = os.environ.get(
     in ("1", "true", "yes", "on")
 
 
+class SettingsError(ValueError):
+    """A settings file that cannot safely replace the live configuration."""
+
+
+def _read_settings():
+    try:
+        settings = json.loads(SETTINGS_FILE.read_text())
+    except OSError as exc:
+        raise SettingsError(
+            f"Telegram service settings not found: {SETTINGS_FILE}") from exc
+    except json.JSONDecodeError as e:
+        raise SettingsError(f"{SETTINGS_FILE} is not valid JSON: {e}") from e
+    if not isinstance(settings, dict):
+        raise SettingsError(f"{SETTINGS_FILE} must contain a JSON object")
+    for key in ("allowed_users", "allowed_groups", "direct_messages", "defaults",
+                "control", "authority"):
+        if key in settings and not isinstance(settings[key], dict):
+            raise SettingsError(f"settings.{key} must be a JSON object")
+    return settings
+
+
 def _load_settings():
     try:
-        return json.loads(SETTINGS_FILE.read_text())
-    except OSError:
-        sys.exit(f"Telegram service settings not found: {SETTINGS_FILE}")
-    except json.JSONDecodeError as e:
-        sys.exit(f"{SETTINGS_FILE} is not valid JSON: {e}")
+        return _read_settings()
+    except SettingsError as exc:
+        sys.exit(str(exc))
+
+
+def _runtime_settings(settings):
+    """Validate and derive every setting that may be replaced while live.
+
+    Nothing in this function mutates module state. Reload first builds this
+    complete snapshot, then publishes it, so malformed JSON never leaves a
+    half-old, half-new policy behind.
+    """
+    allowed = settings.get("allowed_users", {})
+    allowed_groups = settings.get("allowed_groups", {})
+    direct_messages = settings.get("direct_messages", {})
+    defaults = settings.get("defaults", {})
+    direct_mode = str(direct_messages.get("mode") or "allowed_users").strip().lower()
+    voice_defaults = (defaults.get("voice_agent")
+                      if isinstance(defaults.get("voice_agent"), dict) else {})
+    try:
+        voice_progress_interval = float(
+            voice_defaults.get("progress_interval")
+            or voice_agent.DEFAULT_PROGRESS_INTERVAL)
+    except (TypeError, ValueError) as exc:
+        raise SettingsError("settings.defaults.voice_agent.progress_interval must be a number") from exc
+    if voice_progress_interval <= 0:
+        raise SettingsError("settings.defaults.voice_agent.progress_interval must be positive")
+    voice_timezone, voice_timezone_name = voice_agent.resolve_timezone(
+        voice_defaults.get("timezone"))
+    voice_prompt_file = str(
+        os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
+        or voice_defaults.get("prompt_file")
+        or "voice-agent.md")
+    voice_context_file = Path(voice_prompt_file)
+    if not voice_context_file.is_absolute():
+        voice_context_file = SERVICE_DIR / voice_context_file
+    assistant_name = str(
+        settings.get("assistant_name") or defaults.get("assistant_name") or "Assistant")
+    default_worker = str(
+        os.environ.get("TELEGRAM_SERVICE_WORKER")
+        or os.environ.get("TG_WORKER")
+        or defaults.get("worker")
+        or "stub"
+    ).strip().lower()
+    if default_worker not in WORKER_NAMES:
+        default_worker = "stub"
+
+    def positive_seconds(name, default, minimum=0.01):
+        try:
+            return max(minimum, float(defaults.get(name, default)))
+        except (TypeError, ValueError):
+            return float(default)
+
+    sync_interval = positive_seconds("sync_interval", 20)
+    aliases = defaults.get("group_aliases")
+    if aliases is None:
+        group_aliases = (assistant_name,)
+    elif isinstance(aliases, (list, tuple)):
+        group_aliases = tuple(str(alias) for alias in aliases if str(alias).strip())
+    else:
+        raise SettingsError("settings.defaults.group_aliases must be a JSON array")
+
+    return {
+        "SETTINGS": settings,
+        "ALLOWED": allowed,
+        "ALLOWED_GROUPS": allowed_groups,
+        "DIRECT_MESSAGES": direct_messages,
+        "DIRECT_MESSAGE_MODE": direct_mode,
+        "ALLOW_ANY_DIRECT": direct_mode in ("anyone", "all", "open", "public"),
+        "DIRECT_DEFAULT_ROLE": direct_messages.get("default_role") or "direct_user",
+        "DEFAULTS": defaults,
+        "VOICE_AGENT_DEFAULTS": voice_defaults,
+        "VOICE_TIMEZONE": voice_timezone,
+        "VOICE_TIMEZONE_NAME": voice_timezone_name,
+        "VOICE_RECORDING_CAPTION": str(voice_defaults.get("recording_caption") or "").strip(),
+        "VOICE_PROGRESS_INTERVAL": voice_progress_interval,
+        "VOICE_CONTEXT_FILE": voice_context_file,
+        "ASSISTANT_NAME": assistant_name,
+        "DEFAULT_GROUP_ALIASES": group_aliases or (assistant_name,),
+        "DEFAULT_WORKER": default_worker,
+        "SYNC_INTERVAL": sync_interval,
+        "SYNC_STALE_AFTER": max(
+            sync_interval * 2, positive_seconds("sync_stale_after", 60)),
+    }
+
+
+def _publish_runtime_settings(runtime):
+    globals().update(runtime)
 
 
 # --- static policy (project) --------------------------------------------------
 SETTINGS = _load_settings()
-ALLOWED = SETTINGS.get("allowed_users", {})           # {telegram_id(str): {...}}
-ALLOWED_GROUPS = SETTINGS.get("allowed_groups", {})   # {chat_id(str): {...}}
-DIRECT_MESSAGES = SETTINGS.get("direct_messages", {})
-DIRECT_MESSAGE_MODE = str(DIRECT_MESSAGES.get("mode") or "allowed_users").strip().lower()
-ALLOW_ANY_DIRECT = DIRECT_MESSAGE_MODE in ("anyone", "all", "open", "public")
-DIRECT_DEFAULT_ROLE = DIRECT_MESSAGES.get("default_role") or "direct_user"
-DEFAULTS = SETTINGS.get("defaults", {})
-# How the voice channel behaves — which worker its tasks run on, which model and
-# voice it speaks with, which zone it states times in, which prompt file it
-# speaks from. Worker policy lives here beside the text worker's, never in the
-# connection entry, which carries identity only.
-VOICE_AGENT_DEFAULTS = (DEFAULTS.get("voice_agent")
-                        if isinstance(DEFAULTS.get("voice_agent"), dict) else {})
-# The zone a call's "now" and its history timestamps are stated in, resolved
-# once so both say the same thing.
-VOICE_TIMEZONE, VOICE_TIMEZONE_NAME = voice_agent.resolve_timezone(
-    VOICE_AGENT_DEFAULTS.get("timezone"))
-# The line a voice recording is announced with. The summary then replies to it,
-# so this one line introduces both and the reply needs no heading of its own.
-VOICE_RECORDING_CAPTION = str(VOICE_AGENT_DEFAULTS.get("recording_caption") or "").strip()
-# The cadence of progress on a call, in seconds: how often a running task is
-# asked to report in, and how often the call may pass one of those notes on.
-VOICE_PROGRESS_INTERVAL = float(VOICE_AGENT_DEFAULTS.get("progress_interval")
-                                or voice_agent.DEFAULT_PROGRESS_INTERVAL)
-_voice_prompt_file = (os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
-                      or VOICE_AGENT_DEFAULTS.get("prompt_file")
-                      or "voice-agent.md")
-VOICE_CONTEXT_FILE = Path(_voice_prompt_file)
-if not VOICE_CONTEXT_FILE.is_absolute():
-    VOICE_CONTEXT_FILE = SERVICE_DIR / VOICE_CONTEXT_FILE
-ASSISTANT_NAME = SETTINGS.get("assistant_name") or DEFAULTS.get("assistant_name") or "Assistant"
-DEFAULT_GROUP_ALIASES = tuple(DEFAULTS.get("group_aliases") or (ASSISTANT_NAME,))
+_publish_runtime_settings(_runtime_settings(SETTINGS))
+SETTINGS_GENERATION = 1
+SETTINGS_RELOAD_ATTEMPTS = 0
 CONTROL_DEFAULTS = {
     "roles": {
-        "supervisor": {"commands": ["status", "set", "stop", "help"]},
+        "supervisor": {"commands": ["status", "set", "reload", "stop", "help"]},
         "channel_admin": {"commands": ["status", "set", "help"]},
         "direct_user": {"commands": ["status", "help"]},
         "group_member": {"commands": ["status", "help"]},
     }
 }
-DEFAULT_WORKER = (
-    os.environ.get("TELEGRAM_SERVICE_WORKER")
-    or os.environ.get("TG_WORKER")
-    or DEFAULTS.get("worker")
-    or "stub"
-).strip().lower()
-if DEFAULT_WORKER not in WORKER_NAMES:
-    DEFAULT_WORKER = "stub"
-
-
-def _positive_seconds(name, default, minimum=0.01):
-    try:
-        return max(minimum, float(DEFAULTS.get(name, default)))
-    except (TypeError, ValueError):
-        return float(default)
-
-
-SYNC_INTERVAL = _positive_seconds("sync_interval", 20)
-SYNC_STALE_AFTER = max(
-    SYNC_INTERVAL * 2,
-    _positive_seconds("sync_stale_after", 60),
-)
 
 
 # --- config/state resolution --------------------------------------------------
@@ -407,6 +460,61 @@ def write_health(state=None, **updates):
     temp = HEALTH_FILE.with_name(f".{HEALTH_FILE.name}.{os.getpid()}.tmp")
     temp.write_text(json.dumps(health, indent=2, ensure_ascii=False) + "\n")
     os.replace(temp, HEALTH_FILE)
+
+
+def reload_runtime_settings():
+    """Replace live policy from settings.json without disconnecting Telegram.
+
+    The connection owns the Telethon session and state directories, so changing
+    it cannot be a reload: accepting that would report one connection while the
+    existing socket and files still belong to another. All other derived values
+    are validated before any live global is replaced.
+    """
+    global SETTINGS_GENERATION, SETTINGS_RELOAD_ATTEMPTS
+    SETTINGS_RELOAD_ATTEMPTS += 1
+    attempted_at = now()
+    try:
+        candidate = _read_settings()
+        if candidate.get("connection") != SETTINGS.get("connection"):
+            raise SettingsError("settings.connection changed; a daemon restart is required")
+        runtime = _runtime_settings(candidate)
+    except (SettingsError, ValueError) as exc:
+        error = str(exc)
+        write_health(
+            settings_reload_attempts=SETTINGS_RELOAD_ATTEMPTS,
+            settings_reload_attempted_at=attempted_at,
+            settings_reload_error=error,
+        )
+        log(f"settings reload refused: {error}")
+        return {
+            "ok": False,
+            "status": "reload_refused",
+            "attempt": SETTINGS_RELOAD_ATTEMPTS,
+            "generation": SETTINGS_GENERATION,
+            "error": error,
+            "instruction": "The settings were not changed. Tell the caller why.",
+        }
+    _publish_runtime_settings(runtime)
+    SETTINGS_GENERATION += 1
+    write_health(
+        settings_reload_attempts=SETTINGS_RELOAD_ATTEMPTS,
+        settings_reload_attempted_at=attempted_at,
+        settings_reload_error=None,
+        settings_generation=SETTINGS_GENERATION,
+        settings_reloaded_at=attempted_at,
+        sync_interval_seconds=SYNC_INTERVAL,
+        stale_after_seconds=SYNC_STALE_AFTER,
+    )
+    log(f"settings reloaded: generation={SETTINGS_GENERATION} "
+        f"attempt={SETTINGS_RELOAD_ATTEMPTS}")
+    return {
+        "ok": True,
+        "status": "reloaded",
+        "attempt": SETTINGS_RELOAD_ATTEMPTS,
+        "generation": SETTINGS_GENERATION,
+        "reloaded_at": attempted_at,
+        "instruction": "Say briefly that the settings are applied. The call stayed connected.",
+    }
 
 
 def _short_error(exc, limit=220):
@@ -1506,7 +1614,7 @@ def _command_name(text):
 
 def _control_command_key(command):
     key = str(command or "").strip().split("@", 1)[0].lower().lstrip("/")
-    return key if key in {"status", "set", "stop"} else "help"
+    return key if key in {"status", "set", "reload", "stop"} else "help"
 
 
 def _control_commands_allow(commands, command):
@@ -1575,7 +1683,7 @@ def handle_command(reg, key, text):
             return "ok, " + set_channel_setting(reg, key, parts[1].lower(), parts[2])
         except ValueError as e:
             return f"nope: {e}\n\n{_set_help(reg, key, parts[1].lower())}"
-    return "commands: /status, /stop, /set help"
+    return "commands: /status, /reload, /stop, /set help"
 
 
 # --- voice transcription (Deepgram) -------------------------------------------
@@ -3057,6 +3165,10 @@ async def run_session(client):
                 log(f"{key}: denied command {cmd} for {profile['id']} ({profile['role']})")
             elif cmd == "/stop":
                 reply = stop_running(key)
+            elif cmd == "/reload":
+                result = reload_runtime_settings()
+                reply = ("ok, settings reloaded without disconnecting"
+                         if result["ok"] else f"nope: {result['error']}")
             else:
                 reply = handle_command(reg, key, text)
             row = reg.setdefault(key, {})
@@ -3704,8 +3816,17 @@ async def run_session(client):
             return "\n".join(rows)
 
         async def start_voice_call(caller_id, policy, api_key, voice_context):
-            record = caller_id in allowed_callers
+            record = caller_id in set(
+                configured_call_recording_users()["allowed_callers"])
             caller_name = policy["name"]
+            caller_profile = {
+                "id": str(caller_id),
+                "name": caller_name,
+                "role": sender_role_for(caller_id, None, True),
+            }
+            voice_reload = (reload_runtime_settings
+                            if _control_command_allowed("/reload", caller_profile)
+                            else None)
             output = recording_output(caller_id, "voice")
             output.parent.mkdir(parents=True, exist_ok=True)
             metadata_path = output.with_suffix(".json")
@@ -3786,6 +3907,7 @@ async def run_session(client):
                 capability_runner=lambda capability, args: run_voice_capability(
                     caller_id, caller_name, capability, args),
                 file_reader=read_voice_project_file,
+                reload_service=voice_reload,
                 on_stream_end=lambda: end_call_after_stream_loss(caller_id),
                 progress_interval=VOICE_PROGRESS_INTERVAL,
                 log=log,
@@ -4020,7 +4142,10 @@ async def run_session(client):
         @calls.on_update(filters.chat_update(ChatUpdate.Status.INCOMING_CALL))
         async def incoming_p2p_call(_call_client: PyTgCalls, update: ChatUpdate):
             caller_id = update.chat_id
-            if caller_id in voice_users:
+            current_voice_users = configured_voice_agent_users()
+            current_allowed_callers = set(
+                configured_call_recording_users()["allowed_callers"])
+            if caller_id in current_voice_users:
                 api_key, voice_context, blocked = voice_call_readiness()
                 if blocked:
                     log(f"voice: {blocked} — cannot answer {caller_id} by voice")
@@ -4028,10 +4153,10 @@ async def run_session(client):
                     if voice_call_busy() or active_recording["task"] is not None:
                         log(f"call: ignoring voice call from {caller_id} — a call is already active")
                         return
-                    begin_voice_call(caller_id, voice_users[caller_id], api_key,
+                    begin_voice_call(caller_id, current_voice_users[caller_id], api_key,
                                      voice_context)
                     return
-            if caller_id not in allowed_callers:
+            if caller_id not in current_allowed_callers:
                 log(f"call: ignoring p2p from {caller_id} — not in allowed_callers")
                 return
             await start_call_recording(caller_id, "p2p", CallConfig(timeout=60))
@@ -4147,7 +4272,8 @@ async def run_session(client):
                 peer_id = getattr(message, "peer_id", None)
                 if peer_id is not None and hasattr(peer_id, "user_id"):
                     caller_id = peer_id.user_id
-            if caller_id is None or caller_id not in allowed_callers:
+            if (caller_id is None or caller_id not in set(
+                    configured_call_recording_users()["allowed_callers"])):
                 return
             if message.id in seen_invite_ids:
                 return
@@ -4458,6 +4584,16 @@ async def run_session(client):
             """Background task: poll for active group calls and process requests."""
             POLL_SECONDS = 2.0
             while not closing:
+                # These sets are deliberately refreshed in place: a settings
+                # reload changes the next poll without restarting PyTgCalls or
+                # disturbing a recording already in progress.
+                current_groups = configured_call_recording_groups()
+                auto_groups.clear()
+                auto_groups.update(current_groups["auto"])
+                on_request_groups.clear()
+                on_request_groups.update(current_groups["on_request"])
+                send_to_chat_groups.clear()
+                send_to_chat_groups.update(current_groups["send_to_chat"])
                 # Finish active recording if call ended
                 if active_group_recording is not None:
                     try:
@@ -4652,9 +4788,14 @@ async def main():
         shutdown_requested = True
         main_task.cancel()
 
+    def request_reload():
+        reload_runtime_settings()
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, request_shutdown)
+    with contextlib.suppress(NotImplementedError):
+        loop.add_signal_handler(signal.SIGHUP, request_reload)
     lock_handle = None
     wrote_pid = False
     call_recorder_task = None

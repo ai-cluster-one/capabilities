@@ -40,6 +40,8 @@ Both of these read. Anything that changes something belongs to `agent_task`.
 
 ## Getting something done
 
+`reload_service` validates and applies updated Telegram service settings without ending the call. Use it directly when an authorised caller explicitly asks to reload or apply those settings. It is not a code restart; never hand reload to `agent_task`, and never stop the daemon to imitate one.
+
 `agent_task` hands one task to the project's worker while you keep talking. It is for work, not for looking: something to be written down, filed, registered, corrected, sent — or a question big enough that it needs reading around the project rather than one command. Reach for it when `run_capability` is the wrong shape, not as the first move.
 
 - Write the task so it stands on its own: the worker reads that text and not this conversation. It cannot see this call or these messages.

@@ -508,7 +508,7 @@ def test_telegram_control_authority_limits_settings_commands() -> None:
             },
             "control": {
                 "roles": {
-                    "supervisor": {"commands": ["status", "set", "stop", "help"]},
+                    "supervisor": {"commands": ["status", "set", "reload", "stop", "help"]},
                     "group_member": {"commands": ["status", "help"]},
                 },
             },
@@ -523,6 +523,7 @@ def test_telegram_control_authority_limits_settings_commands() -> None:
         assert not daemon._control_command_allowed("/stop", member, group_policy)
         assert daemon._control_command_allowed("/status", supervisor, group_policy)
         assert daemon._control_command_allowed("/set", supervisor, group_policy)
+        assert daemon._control_command_allowed("/reload", supervisor, group_policy)
         assert daemon._control_command_allowed("/stop", supervisor, group_policy)
 
 
