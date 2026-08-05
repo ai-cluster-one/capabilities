@@ -724,6 +724,117 @@ def sender_role_for(sender_id, group_policy, is_direct):
     return allowed.get("role") or member.get("role") or default_role
 
 
+def _member_policy(sender_id, group_policy):
+    return _as_mapping(
+        _as_mapping(_as_mapping(group_policy).get("members")).get(str(sender_id)))
+
+
+def _is_agent_member(sender_id, group_policy):
+    return str(_member_policy(sender_id, group_policy).get("kind") or "").strip().lower() == "agent"
+
+
+def _agent_dialogue_policy(group_policy):
+    policy = _as_mapping(_as_mapping(group_policy).get("agent_dialogue"))
+    try:
+        max_turns = max(0, int(policy.get("max_turns") or 0))
+    except (TypeError, ValueError):
+        max_turns = 0
+    return {
+        "max_turns": max_turns,
+        "reset_on_human_message": policy.get("reset_on_human_message") is not False,
+    }
+
+
+def _agent_peers(group_policy):
+    peers = []
+    for sender_id, raw in _as_mapping(_as_mapping(group_policy).get("members")).items():
+        member = _as_mapping(raw)
+        if str(member.get("kind") or "").strip().lower() != "agent":
+            continue
+        aliases = _as_list(member.get("address_aliases"))
+        if not aliases and member.get("name"):
+            aliases = [member["name"]]
+        peers.append({
+            "id": str(sender_id),
+            "name": member.get("name") or str(sender_id),
+            "aliases": aliases,
+        })
+    return peers
+
+
+def _agent_dialogue_state(reg, key):
+    return _channel_row(reg, key).setdefault("agent_dialogue", {"turns": 0})
+
+
+def _agent_dialogue_snapshot(reg, key, group_policy):
+    policy = _agent_dialogue_policy(group_policy)
+    if not policy["max_turns"]:
+        return None
+    state = _agent_dialogue_state(reg, key)
+    return {
+        "turns": max(0, int(state.get("turns") or 0)),
+        "max_turns": policy["max_turns"],
+        "reset_on_human_message": policy["reset_on_human_message"],
+    }
+
+
+def _reset_agent_dialogue_for_human(reg, key, message, group_policy):
+    """Reset the finite agent exchange when a human re-enters the channel.
+
+    The caller persists the register only when this returns True. Unaddressed
+    human messages count too: they are the natural boundary between autonomous
+    agent exchanges, not requests that the assistant needs to answer.
+    """
+    policy = _agent_dialogue_policy(group_policy)
+    sender_id = getattr(message, "sender_id", None)
+    if (not policy["max_turns"] or not policy["reset_on_human_message"]
+            or sender_id is None or _is_agent_member(sender_id, group_policy)):
+        return False
+    state = _agent_dialogue_state(reg, key)
+    if not int(state.get("turns") or 0):
+        return False
+    state.update({
+        "turns": 0,
+        "reset_message_id": getattr(message, "id", None),
+        "reset_at": now(),
+    })
+    return True
+
+
+def _admit_agent_turn(reg, key, message, group_policy):
+    """Consume one configured agent turn, or reject it once the cap is full.
+
+    A turn means one explicitly addressed incoming request from a configured
+    agent and the single Marvin response it may produce. The message job is the
+    idempotency boundary, so callers invoke this only after successfully
+    reserving that job.
+    """
+    sender_id = getattr(message, "sender_id", None)
+    if not _is_agent_member(sender_id, group_policy):
+        return True, None
+    policy = _agent_dialogue_policy(group_policy)
+    if not policy["max_turns"]:
+        return True, None
+    state = _agent_dialogue_state(reg, key)
+    turns = max(0, int(state.get("turns") or 0))
+    if turns >= policy["max_turns"]:
+        return False, {
+            "turns": turns,
+            "max_turns": policy["max_turns"],
+        }
+    turns += 1
+    state.update({
+        "turns": turns,
+        "last_agent_message_id": getattr(message, "id", None),
+        "last_agent_sender_id": str(sender_id),
+        "updated_at": now(),
+    })
+    return True, {
+        "turns": turns,
+        "max_turns": policy["max_turns"],
+    }
+
+
 def _policy_allowed_capabilities(policy):
     if not isinstance(policy, dict):
         return None
@@ -952,7 +1063,8 @@ async def _reply_is_to_me(message, me):
 
 
 async def _message_addresses_me(message, me, policy):
-    if (policy or {}).get("require_reference") is False:
+    agent_sender = _is_agent_member(getattr(message, "sender_id", None), policy)
+    if (policy or {}).get("require_reference") is False and not agent_sender:
         return True
     if (_call_recording_mode(policy) == "on_request"
             and _command_name(_message_text(message)) == "/record"):
@@ -961,6 +1073,10 @@ async def _message_addresses_me(message, me, policy):
         return True
     if _text_names_me(_message_text(message), me, policy):
         return True
+    # A reply is transport context, not an implicit invocation, for another
+    # configured agent. It must name or mention Marvin explicitly above.
+    if agent_sender:
+        return False
     return await _reply_is_to_me(message, me)
 
 
@@ -1059,17 +1175,14 @@ async def _sender_profile(message, group_policy=None, direct=False):
 def _reply_target(message_id, sender_id, group_policy, is_direct):
     """Where an outbound response is threaded for this sender.
 
-    A configured automation peer can receive top-level responses instead of
+    A configured agent peer receives top-level responses instead of
     Telegram replies. That breaks mechanical bot-to-bot reply loops while the
     response text remains free to address the peer by name when the model
     deliberately wants to hand it another turn.
     """
     if is_direct:
         return None
-    member = _as_mapping(
-        _as_mapping(_as_mapping(group_policy).get("members")).get(str(sender_id)))
-    mode = str(member.get("reply_mode") or "reply").strip().lower().replace("-", "_")
-    if mode in {"top_level", "plain", "new_message"}:
+    if _is_agent_member(sender_id, group_policy):
         return None
     return message_id
 
@@ -1843,6 +1956,23 @@ def build_prompt(tail, state=None):
         lines.append(f"Settings: {_settings_summary(s)}")
     if st.get("authority"):
         lines.append(f"Tool authority: {_authority_summary(st['authority'])}")
+    dialogue = st.get("agent_dialogue")
+    if dialogue:
+        reset = "; a human message resets the counter" if dialogue.get("reset_on_human_message") else ""
+        lines.append(
+            f"Agent dialogue: turn {dialogue['turns']}/{dialogue['max_turns']}{reset}. "
+            "A reply relationship from an agent is context only; another turn requires an explicit name or mention."
+        )
+    peers = st.get("agent_peers") or []
+    if peers:
+        rendered = []
+        for peer in peers:
+            aliases = ", ".join(peer.get("aliases") or [])
+            rendered.append(f"{peer['name']} (address as: {aliases})" if aliases else peer["name"])
+        lines.append(
+            "Agent peers: " + "; ".join(rendered)
+            + ". Start a response with a peer's address only when deliberately handing it the next turn."
+        )
     if st.get("messages") is not None:
         ctx = f"Context window: {st['messages']} msgs (of max {s.get('tail_size', '?')})"
         if st.get("history_chars") is not None:
@@ -2687,6 +2817,20 @@ async def run_session(client):
             _job_map(reg, key).pop(_job_id(message_id), None)
         save_register(reg)
 
+    def admit_or_finish_agent_job(key, message, group_policy, job, reason):
+        admitted, turn = _admit_agent_turn(reg, key, message, group_policy)
+        if admitted:
+            if turn:
+                job["agent_dialogue_turn"] = turn["turns"]
+                save_register(reg)
+                log(f"{key}: admitted agent turn {turn['turns']}/{turn['max_turns']} "
+                    f"msg={message.id} ({reason})")
+            return True
+        mark_job_finished(key, job, "done")
+        log(f"{key}: suppressed agent msg={message.id}; dialogue limit "
+            f"{turn['turns']}/{turn['max_turns']} reached ({reason})")
+        return False
+
     async def build_tail_and_participants(key, ent_id, s, group_policy, is_direct, job):
         raw = await client.get_messages(ent_id, limit=s["tail_size"])
         tail = []
@@ -2793,6 +2937,8 @@ async def run_session(client):
                      "channel_context": channel_context,
                      "prev_usage": reg.get(key, {}).get("last_usage"),
                      "current_request": current_request,
+                     "agent_dialogue": _agent_dialogue_snapshot(reg, key, group_policy),
+                     "agent_peers": _agent_peers(group_policy),
                      "authority": authority,
                      "authority_context": authority_context,
                      "progress_outbox": str(progress_outbox),
@@ -3113,6 +3259,10 @@ async def run_session(client):
                 if _message_is_known(reg, key, m.id):
                     continue
                 is_direct = group_policy is None
+                if group_policy is not None and _reset_agent_dialogue_for_human(
+                        reg, key, m, group_policy):
+                    save_register(reg)
+                    log(f"{key}: human msg={m.id} reset agent dialogue during catch-up")
                 addressed = False
                 if group_policy is not None:
                     addressed = await _message_addresses_me(m, me, group_policy)
@@ -3137,6 +3287,9 @@ async def run_session(client):
                         m, ent, key, is_direct, group_policy, sender_name=profile["name"])
                     # If transcript names the assistant, finalize and dispatch
                     if spoken and spoken != "[голосовое — не удалось расшифровать]" and _text_names_me(spoken, me, group_policy):
+                        if not admit_or_finish_agent_job(
+                                key, m, group_policy, job, f"catch-up/{reason}/ambient-addressed"):
+                            continue
                         if await finalize_job(
                                 key, m, group_policy, is_direct, f"catch-up/{reason}/ambient-addressed", job,
                                 text_override=spoken):
@@ -3147,6 +3300,9 @@ async def run_session(client):
                     continue
                 job = reserve_job(key, m, group_policy, is_direct, f"catch-up/{reason}")
                 if job is None:
+                    continue
+                if not admit_or_finish_agent_job(
+                        key, m, group_policy, job, f"catch-up/{reason}"):
                     continue
                 spoken = None
                 if _is_spoken_media(m):
@@ -3178,6 +3334,12 @@ async def run_session(client):
         write_health(
             last_live_update_at=now(),
         )
+        raw_key = str(event.chat_id)
+        _, raw_group_policy = _group_policy(event.chat_id)
+        if raw_group_policy is not None and _reset_agent_dialogue_for_human(
+                reg, raw_key, event.message, raw_group_policy):
+            save_register(reg)
+            log(f"{raw_key}: human msg={event.message.id} reset agent dialogue")
         access = await _event_access(event, me, reg)          # gate 1: the door
         if not access:
             log(f"{event.chat_id}: ignored {_message_kind(event.message)} from {event.sender_id}")
@@ -3231,6 +3393,9 @@ async def run_session(client):
                 sender_name=profile["name"])
             # If transcript names the assistant, dispatch as an addressed request
             if spoken and spoken != "[голосовое — не удалось расшифровать]" and _text_names_me(spoken, me, group_policy):
+                if not admit_or_finish_agent_job(
+                        key, event.message, group_policy, job, "live/ambient-addressed"):
+                    return
                 enqueued = await finalize_job(
                     key, event.message, group_policy, is_direct, "live/ambient-addressed", job, text_override=spoken)
                 if not enqueued:
@@ -3249,6 +3414,9 @@ async def run_session(client):
         job = reserve_job(key, event.message, group_policy, is_direct, "live")
         if job is None:
             log(f"{key}: already queued/done msg={event.message.id}")
+            return
+        if not admit_or_finish_agent_job(
+                key, event.message, group_policy, job, "live"):
             return
         spoken = None
         if _is_spoken_media(event.message):               # transcribe → echo (visible + attributed by reply)

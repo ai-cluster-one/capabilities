@@ -387,14 +387,15 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)
 
-    async def test_member_can_receive_top_level_responses_instead_of_replies(self):
+    async def test_agent_member_uses_explicit_address_and_top_level_responses(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             group_policy = {
                 "members": {
                     "5509911365": {
                         "name": "Solomon",
-                        "reply_mode": "top_level",
+                        "kind": "agent",
+                        "address_aliases": ["Соломон", "Solomon"],
                     },
                 },
             }
@@ -409,6 +410,131 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 "top-level group message",
                 daemon._delivery_description(None, False),
             )
+            self.assertEqual(daemon._agent_peers(group_policy), [{
+                "id": "5509911365",
+                "name": "Solomon",
+                "aliases": ["Соломон", "Solomon"],
+            }])
+
+            me = SimpleNamespace(id=99, username="marvin")
+            replied = SimpleNamespace(out=True, sender_id=99)
+
+            async def get_reply_message():
+                return replied
+
+            reply_only = SimpleNamespace(
+                sender_id=5509911365,
+                raw_text="Понял.",
+                mentioned=False,
+                is_reply=True,
+                get_reply_message=get_reply_message,
+            )
+            named = SimpleNamespace(
+                sender_id=5509911365,
+                raw_text="Марвин, продолжим?",
+                mentioned=False,
+                is_reply=True,
+                get_reply_message=get_reply_message,
+            )
+            policy = {**group_policy, "aliases": ["Марвин"]}
+            self.assertFalse(await daemon._message_addresses_me(reply_only, me, policy))
+            self.assertTrue(await daemon._message_addresses_me(named, me, policy))
+
+    async def test_agent_dialogue_has_finite_turns_and_human_reset(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            policy = {
+                "members": {"5509911365": {"name": "Solomon", "kind": "agent"}},
+                "agent_dialogue": {"max_turns": 2, "reset_on_human_message": True},
+            }
+            reg = {}
+            first = SimpleNamespace(id=10, sender_id=5509911365)
+            second = SimpleNamespace(id=11, sender_id=5509911365)
+            third = SimpleNamespace(id=12, sender_id=5509911365)
+
+            self.assertEqual(daemon._admit_agent_turn(reg, "-1", first, policy),
+                             (True, {"turns": 1, "max_turns": 2}))
+            self.assertEqual(daemon._admit_agent_turn(reg, "-1", second, policy),
+                             (True, {"turns": 2, "max_turns": 2}))
+            self.assertEqual(daemon._admit_agent_turn(reg, "-1", third, policy),
+                             (False, {"turns": 2, "max_turns": 2}))
+
+            human = SimpleNamespace(id=13, sender_id=777)
+            self.assertTrue(daemon._reset_agent_dialogue_for_human(
+                reg, "-1", human, policy))
+            self.assertEqual(daemon._agent_dialogue_snapshot(reg, "-1", policy)["turns"], 0)
+            self.assertEqual(daemon._admit_agent_turn(reg, "-1", third, policy),
+                             (True, {"turns": 1, "max_turns": 2}))
+
+    async def test_agent_loop_cap_is_enforced_by_live_delivery(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Марвин"],
+                    "require_reference": False,
+                    "members": {
+                        "5509911365": {"name": "Solomon", "kind": "agent"},
+                    },
+                    "agent_dialogue": {
+                        "max_turns": 1,
+                        "reset_on_human_message": True,
+                    },
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            daemon.WORKERS["stub"] = lambda *_args: successful_result("Ответ")
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            reply_only = Message(1, text="Продолжаю")
+            reply_only.sender_id = 5509911365
+            reply_only.mentioned = False
+            reply_only.is_reply = True
+            reply_only._reply_message = SimpleNamespace(out=True, sender_id=42)
+            reply_event = Event(reply_only, chat_id=-200)
+            reply_event.is_private = False
+            await client.handler(reply_event)
+            await asyncio.sleep(0.02)
+            self.assertEqual(client.send_attempts, 0)
+
+            first = Message(2, text="Марвин, продолжим")
+            first.sender_id = 5509911365
+            first.mentioned = False
+            first_event = Event(first, chat_id=-200)
+            first_event.is_private = False
+            await client.handler(first_event)
+            await wait_until(lambda: len(client.sent) == 1)
+            self.assertIsNone(client.sent[0].get("reply_to"))
+
+            capped = Message(3, text="Марвин, ещё ход")
+            capped.sender_id = 5509911365
+            capped.mentioned = False
+            capped_event = Event(capped, chat_id=-200)
+            capped_event.is_private = False
+            await client.handler(capped_event)
+            await asyncio.sleep(0.02)
+            self.assertEqual(len(client.sent), 1)
+
+            human = Message(4, text="Новая человеческая реплика")
+            human.sender_id = 777
+            human.mentioned = False
+            human_event = Event(human, chat_id=-200)
+            human_event.is_private = False
+            await client.handler(human_event)
+            await wait_until(lambda: len(client.sent) == 2)
+
+            after_reset = Message(5, text="Марвин, теперь можно")
+            after_reset.sender_id = 5509911365
+            after_reset.mentioned = False
+            after_reset_event = Event(after_reset, chat_id=-200)
+            after_reset_event.is_private = False
+            await client.handler(after_reset_event)
+            await wait_until(lambda: len(client.sent) == 3)
+            self.assertIsNone(client.sent[2].get("reply_to"))
+            await self.stop_session(client, task)
 
     async def test_reload_replaces_live_policy_without_reimporting_the_daemon(self):
         with tempfile.TemporaryDirectory() as td:
