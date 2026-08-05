@@ -1867,6 +1867,58 @@ def now_display():
         return f"{utc.isoformat(timespec='seconds')} (UTC)"
 
 
+def _message_display_time(message):
+    """Return one compact Tallinn calendar stamp for a Telegram message."""
+    value = getattr(message, "date", None)
+    if not isinstance(value, datetime):
+        return None, None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        value = value.astimezone(ZoneInfo("Europe/Tallinn"))
+    except Exception:
+        value = value.astimezone(timezone.utc)
+    return value.strftime("%Y-%m-%d"), value.strftime("%H:%M")
+
+
+def _reply_to_message_id(message):
+    value = getattr(message, "reply_to_msg_id", None)
+    if value is None:
+        value = getattr(getattr(message, "reply_to", None), "reply_to_msg_id", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_conversation(tail):
+    """Render a compact readable timeline without JSON property overhead."""
+    lines = [
+        ("Reply markers define conversational relationships. Message proximity alone "
+         "does not mean that a message addresses Marvin."),
+    ]
+    current_date = None
+    for message in tail:
+        message_date = message.get("date")
+        if message_date and message_date != current_date:
+            lines.append(f"--- {message_date} ---")
+            current_date = message_date
+        identity = " ".join(
+            part for part in (
+                message.get("time"),
+                f"#{message['id']}" if message.get("id") else None,
+            ) if part)
+        reply = message.get("in_reply_to") or {}
+        reply_marker = ""
+        if reply.get("id") and reply.get("sender"):
+            target = reply["sender"] + (" (assistant)" if reply.get("is_assistant") else "")
+            reply_marker = f" | reply to #{reply['id']} by {target}"
+        metadata = f"[{identity}{reply_marker}] " if identity or reply_marker else ""
+        lines.append(f'{metadata}{message["sender"]}: {message["text"]}')
+    return "\n".join(lines)
+
+
 def _settings_summary(s):
     bits = [
         f"tail_size={s.get('tail_size')}",
@@ -1992,18 +2044,23 @@ def build_prompt(tail, state=None):
     block = ("--- Channel state ---\n" + "\n".join(lines) + "\n\n") if lines else ""
     request_block = ""
     if req:
-        request_block = "\n".join([
+        request_lines = [
             "--- Current request ---",
             f"Message: #{req.get('message_id')}",
             f"From: {req.get('sender_name')} (role: {req.get('sender_role')})",
             f"Kind: {req.get('kind')}",
+        ]
+        reply = req.get("in_reply_to") or {}
+        if reply.get("id") and reply.get("sender"):
+            target = reply["sender"] + (" (assistant)" if reply.get("is_assistant") else "")
+            request_lines.append(f"Reply to: #{reply['id']} by {target}")
+        request_lines.extend([
             "Answer this request only. Other addressed messages in the tail are separate jobs.",
             req.get("text") or "",
             "",
         ])
-    history = "\n".join(
-        f'[{m.get("id")}] {m["sender"]}: {m["text"]}' if m.get("id") else f'{m["sender"]}: {m["text"]}'
-        for m in tail)
+        request_block = "\n".join(request_lines)
+    history = _format_conversation(tail)
     return f"{context}\n\n{channel_context}{block}{request_block}--- Conversation ---\n{history}"
 
 
@@ -2833,7 +2890,7 @@ async def run_session(client):
 
     async def build_tail_and_participants(key, ent_id, s, group_policy, is_direct, job):
         raw = await client.get_messages(ent_id, limit=s["tail_size"])
-        tail = []
+        visible = []
         echo_senders = _voice_echo_senders(reg, key)
         for m in reversed(raw or []):
             if not _tail_in_scope(m, group_policy):
@@ -2844,9 +2901,33 @@ async def run_session(client):
             if m.out:
                 # Check if this outgoing message is a recorded voice echo
                 sender = echo_senders.get(str(m.id), ASSISTANT_NAME)
+                is_assistant = str(m.id) not in echo_senders
             else:
                 sender = (await _sender_profile(m, group_policy, direct=is_direct))["name"]
-            tail.append({"id": m.id, "sender": sender, "text": t})
+                is_assistant = False
+            message_date, message_time = _message_display_time(m)
+            visible.append({
+                "message": m,
+                "id": m.id,
+                "sender": sender,
+                "is_assistant": is_assistant,
+                "text": t,
+                "date": message_date,
+                "time": message_time,
+            })
+
+        by_id = {row["id"]: row for row in visible}
+        tail = []
+        for row in visible:
+            target = by_id.get(_reply_to_message_id(row["message"]))
+            entry = {k: v for k, v in row.items() if k != "message"}
+            if target is not None:
+                entry["in_reply_to"] = {
+                    "id": target["id"],
+                    "sender": target["sender"],
+                    "is_assistant": target["is_assistant"],
+                }
+            tail.append(entry)
 
         profiles = {}
         for m in raw or []:
@@ -2918,6 +2999,10 @@ async def run_session(client):
                 "reply_to": reply_msg_id,
                 "delivery": _delivery_description(reply_msg_id, is_direct),
             }
+            current_tail_entry = next(
+                (item for item in tail if item.get("id") == job.get("message_id")), {})
+            if current_tail_entry.get("in_reply_to"):
+                current_request["in_reply_to"] = current_tail_entry["in_reply_to"]
             PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
             progress_outbox = PROGRESS_DIR / f"{_safe_file_part(key)}-{job.get('message_id')}.jsonl"
             with contextlib.suppress(OSError):

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -386,6 +387,86 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
     async def stop_session(self, client, task):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)
+
+    async def test_prompt_uses_compact_timestamps_and_reply_topology(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            tail = [
+                {"id": 100, "date": "2026-08-05", "time": "20:41",
+                 "sender": "Юрий", "text": "Первое сообщение"},
+                {"id": 101, "date": "2026-08-05", "time": "20:42",
+                 "sender": "Константин", "text": "Марвин, посмотри",
+                 "in_reply_to": {"id": 100, "sender": "Юрий", "is_assistant": False}},
+            ]
+            prompt = daemon.build_prompt(tail, {"current_request": {
+                "message_id": 101,
+                "sender_name": "Константин",
+                "sender_role": "supervisor",
+                "kind": "text",
+                "text": "Марвин, посмотри",
+                "in_reply_to": tail[1]["in_reply_to"],
+            }})
+
+            self.assertEqual(prompt.count("--- 2026-08-05 ---"), 1)
+            self.assertIn("[20:41 #100] Юрий: Первое сообщение", prompt)
+            self.assertIn(
+                "[20:42 #101 | reply to #100 by Юрий] Константин: Марвин, посмотри",
+                prompt,
+            )
+            self.assertIn("Reply to: #100 by Юрий", prompt)
+            self.assertIn("Message proximity alone", prompt)
+
+    async def test_live_tail_resolves_reply_author_only_inside_window(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {"-200": {"aliases": ["Марвин"]}}
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            captured = {}
+
+            def capture_worker(_chat, tail, state=None, _procs=None):
+                captured["tail"] = tail
+                captured["state"] = state
+                return successful_result("Готово")
+
+            daemon.WORKERS["stub"] = capture_worker
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            original = Message(100, text="Что думаешь?")
+            original.sender_id = 888
+            original.date = datetime(2026, 8, 5, 17, 41, tzinfo=timezone.utc)
+
+            async def original_sender():
+                return SimpleNamespace(first_name="Юрий", last_name="", username=None)
+
+            original.get_sender = original_sender
+            request = Message(101, text="Марвин, посмотри")
+            request.sender_id = 777
+            request.mentioned = False
+            request.is_reply = True
+            request.reply_to_msg_id = 100
+            request._reply_message = original
+            request.date = datetime(2026, 8, 5, 17, 42, tzinfo=timezone.utc)
+            client.messages.extend([original, request])
+
+            event = Event(request, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: "state" in captured)
+
+            current = captured["state"]["current_request"]
+            self.assertEqual(current["in_reply_to"], {
+                "id": 100,
+                "sender": "Юрий",
+                "is_assistant": False,
+            })
+            request_tail = next(row for row in captured["tail"] if row["id"] == 101)
+            self.assertEqual(request_tail["date"], "2026-08-05")
+            self.assertEqual(request_tail["time"], "20:42")
+            self.assertEqual(request_tail["in_reply_to"]["sender"], "Юрий")
+            await self.stop_session(client, task)
 
     async def test_agent_member_uses_explicit_address_and_top_level_responses(self):
         with tempfile.TemporaryDirectory() as td:

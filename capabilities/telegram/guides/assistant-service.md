@@ -88,6 +88,7 @@ The auth session and service runtime files are separate. Worker session copies l
 - Direct messages are accepted according to `direct_messages.mode` and `allowed_users`.
 - Group messages are accepted only for `allowed_groups` and only when addressed by mention, reply, or configured alias unless the group policy sets `require_reference` to `false`.
 - Each addressed message becomes its own queued job.
+- The worker tail is a compact Tallinn-time timeline. Each message keeps its Telegram id; replies whose target is present in the same tail include that target id and sender. The current request repeats its in-window reply target once for unambiguous routing. Targets outside the configured tail are neither fetched nor described.
 - The daemon performs protocol catch-up plus bounded watermark reconciliation when a Telegram session connects and at the configured sync interval. This recovers messages received while it was down and update packets the MTProto client could not deserialize.
 - `telegram service status` reports update-stream health from `health.json`; a live PID with a stale sync watermark is not reported as healthy.
 - `telegram service reload` applies policy and worker/voice defaults without disconnecting an active call. Prompt files are already read per request or call; reload is for `settings.json`.
