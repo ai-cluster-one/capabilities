@@ -4387,29 +4387,40 @@ _SHOW_FILE_PREVIEW_RE = re.compile(
 def _parse_purchase_attachments(html: str, account: str) -> list[dict]:
     """Attachment entries on a purchase view/edit page → [{file_id, type, url, name}].
 
-    SB does not render a real href for the stored copy — the "Vaata arve
-    koopiat" anchor sits under `Arve koopia` in the summary grid with
-    `onclick="showFilePreview('<file_id>', '<type>'); return false;"`. We
-    parse those calls anywhere in the document, build the authoritative
-    URL `.../purchases/view_file/<file_id>`, and let the download command
-    resolve the real filename from the response's Content-Disposition.
-    Verified against a live view page; the endpoint returns the stored
-    file with `Content-Type: application/pdf` and a filename header.
+    The read-only view uses `showFilePreview('<file_id>', '<type>')`; the edit
+    form uses a real `/purchases/view_file/<file_id>` href plus a hidden
+    `file_type` input. Both resolve to the same authenticated download endpoint.
+    The download command resolves the real filename from Content-Disposition.
     """
     out: list[dict] = []
     seen: set[str] = set()
-    for match in _SHOW_FILE_PREVIEW_RE.finditer(html):
-        file_id, ftype = match.group(1), match.group(2)
+
+    def add(file_id: str, ftype: str) -> None:
         if file_id in seen:
-            continue
+            return
         seen.add(file_id)
+        clean_type = (ftype or "pdf").lower().lstrip(".")
         url = urljoin(f"{BASE}/{account}/", f"purchases/view_file/{file_id}")
         out.append({
             "file_id": file_id,
-            "type": ftype,
+            "type": clean_type,
             "url": url,
-            "name": f"{file_id}.{ftype}",
+            "name": f"{file_id}.{clean_type}",
         })
+
+    for match in _SHOW_FILE_PREVIEW_RE.finditer(html):
+        file_id, ftype = match.group(1), match.group(2)
+        add(file_id, ftype)
+
+    # Editable purchases use a real /purchases/view_file/<id> href instead of
+    # showFilePreview(). The stored type sits in a sibling hidden input.
+    soup = BeautifulSoup(html, "html.parser")
+    type_input = soup.find("input", {"name": "data[Purchase][file_type]"})
+    edit_type = (type_input.get("value", "") if type_input else "") or "pdf"
+    for anchor in soup.find_all("a", href=True):
+        match = re.search(r"/purchases/view_file/(\d+)(?:[/?#]|$)", anchor["href"])
+        if match:
+            add(match.group(1), edit_type)
     return out
 
 
@@ -4802,6 +4813,187 @@ def build_purchase_fields(
     return fields
 
 
+def _purchase_multipart_parts(
+    fields: list[tuple[str, str]], attachment_path: str | None
+) -> list[tuple[str, tuple]]:
+    """Build the multipart body shared by purchase create and update."""
+    parts: list[tuple[str, tuple]] = [(name, (None, value)) for name, value in fields]
+    if attachment_path:
+        path = Path(attachment_path)
+        content_type = (
+            "application/pdf"
+            if path.name.lower().endswith(".pdf")
+            else "application/octet-stream"
+        )
+        parts.append(("data[Purchase][copy]", (path.name, path.read_bytes(), content_type)))
+    else:
+        parts.append(("data[Purchase][copy]", ("", b"", "application/octet-stream")))
+    return parts
+
+
+def _purchase_read_rounding(http: httpx.Client, account: str, purchase_id: int) -> str | None:
+    """Read the stored rounding value from an editable purchase."""
+    response = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
+    if response.status_code != 200:
+        return None
+    soup = BeautifulSoup(response.text, "html.parser")
+    field = soup.find("input", {"name": "data[Purchase][rounding]"})
+    return field.get("value", "") if field else None
+
+
+def _purchase_read_payable(http: httpx.Client, account: str, purchase_id: int) -> str | None:
+    """Read the final payable total from the purchase view page."""
+    response = http.get(f"{BASE}/{account}/purchases/view/{purchase_id}")
+    if response.status_code != 200:
+        return None
+    soup = BeautifulSoup(response.text, "html.parser")
+    for grid in soup.select("div.summary-grid"):
+        cells = [div.get_text(" ", strip=True) for div in grid.find_all("div", recursive=False)]
+        pairs = dict(zip(cells[::2], cells[1::2]))
+        if pairs.get("Arve kokku"):
+            return pairs["Arve kokku"]
+    return None
+
+
+def _purchase_expected_payable(
+    lines: list[dict], row_sum_with_vat: bool, vat_total: str, rounding: str
+) -> Decimal:
+    """Compute the document payable represented by the outgoing form."""
+    line_total = sum(
+        (Decimal(normalize_number(line["sum"])) for line in lines),
+        start=Decimal("0"),
+    )
+    gross = (
+        line_total
+        if row_sum_with_vat
+        else line_total + Decimal(normalize_number(vat_total))
+    )
+    return gross + Decimal(normalize_number(rounding))
+
+
+def _purchase_attachment_matches(
+    http: httpx.Client, account: str, purchase_id: int, expected_path: str
+) -> bool:
+    """Verify the stored purchase copy byte-for-byte against the local source."""
+    view = http.get(f"{BASE}/{account}/purchases/view/{purchase_id}")
+    if view.status_code != 200:
+        return False
+    expected = hashlib.sha256(Path(expected_path).read_bytes()).digest()
+    attachments = _parse_purchase_attachments(view.text, account)
+    for attachment in attachments:
+        http.headers["Referer"] = f"{BASE}/{account}/purchases/view/{purchase_id}"
+        response = http.get(attachment["url"])
+        if response.status_code == 200 and hashlib.sha256(response.content).digest() == expected:
+            return True
+    return False
+
+
+def _purchase_update_created_integrity(
+    http: httpx.Client,
+    account: str,
+    purchase_id: int,
+    *,
+    rounding: str | None,
+    attachment_path: str | None,
+) -> None:
+    """Apply fields that SimpleBooks may silently ignore on the create endpoint."""
+    fields, _row_index, _csrf = _scrape_purchase_edit_form(http, account, purchase_id)
+    _set_field(fields, "_csrfToken", fetch_fresh_csrf(http, account, path="purchases/add"))
+    if rounding is not None:
+        _set_field(fields, "data[Purchase][rounding]", to_estonian_number(rounding))
+
+    http.headers["Referer"] = f"{BASE}/{account}/purchases/edit/{purchase_id}"
+    http.headers["Origin"] = BASE
+    response = http.post(
+        f"{BASE}/{account}/purchases/update",
+        files=_purchase_multipart_parts(fields, attachment_path),
+    )
+    location = response.headers.get("location", "")
+    if response.status_code not in (200, 302) or (
+        "/purchases/view/" not in location and "/purchases/edit/" not in location
+    ):
+        fail = CONFIG_DIR / "last_expense_integrity_update_failure.html"
+        fail.write_text(response.text)
+        messages = _page_errors(response.text)
+        raise click.ClickException(
+            f"Purchase {purchase_id} was created, but its integrity update failed "
+            f"(HTTP {response.status_code}, loc={location!r})."
+            + (" SB says: " + " | ".join(messages) if messages else "")
+            + f" Response → {fail}"
+        )
+
+
+def _ensure_created_purchase_integrity(
+    http: httpx.Client,
+    account: str,
+    purchase_id: int,
+    *,
+    rounding: str,
+    expected_payable: Decimal,
+    attachment_path: str | None,
+) -> bool:
+    """Verify create readback; repair once through update and verify again.
+
+    Returns True when a corrective update was needed.
+    """
+    expected_rounding = Decimal(normalize_number(rounding))
+
+    def rounding_matches() -> bool:
+        actual = _purchase_read_rounding(http, account, purchase_id)
+        if actual is not None:
+            try:
+                return Decimal(normalize_number(actual)) == expected_rounding
+            except Exception:
+                return False
+        # A purchase may bind an existing payment immediately and become locked.
+        # Its view page still exposes the final payable total, which proves the
+        # rounding outcome without an unbind/edit/rebind cycle.
+        payable = _purchase_read_payable(http, account, purchase_id)
+        try:
+            return (
+                payable is not None
+                and Decimal(normalize_number(payable)) == expected_payable
+            )
+        except Exception:
+            return False
+
+    rounding_ok = rounding_matches()
+    attachment_ok = (
+        True
+        if attachment_path is None
+        else _purchase_attachment_matches(http, account, purchase_id, attachment_path)
+    )
+    if rounding_ok and attachment_ok:
+        return False
+
+    _purchase_update_created_integrity(
+        http,
+        account,
+        purchase_id,
+        rounding=rounding if not rounding_ok else None,
+        attachment_path=attachment_path if not attachment_ok else None,
+    )
+
+    rounding_ok = rounding_matches()
+    attachment_ok = (
+        True
+        if attachment_path is None
+        else _purchase_attachment_matches(http, account, purchase_id, attachment_path)
+    )
+    missing = []
+    if not rounding_ok:
+        missing.append(f"rounding={to_estonian_number(rounding)}")
+    if not attachment_ok:
+        missing.append("attachment bytes")
+    if missing:
+        raise click.ClickException(
+            f"Purchase {purchase_id} was created, but readback still does not match: "
+            + ", ".join(missing)
+            + "."
+        )
+    return True
+
+
 @purchases.command("create")
 @click.option("--supplier-id", required=True, type=int)
 @click.option("--number", required=True, help="Supplier-issued invoice number (e.g. MWQSHUMO-2026-04).")
@@ -4921,6 +5113,9 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
         vat_label = f"{vat_total} (computed from rows)"
     else:
         vat_label = vat_total
+    expected_payable = _purchase_expected_payable(
+        lines, row_sum_with_vat, vat_total, rounding
+    )
 
     with build_http(cookies, account) as http:
         page = fetch_add_page(http, account, "purchases/add")
@@ -4976,7 +5171,10 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
             click.echo(
                 f"  Totals   : net={to_estonian_number(doc_net)}  "
                 f"vat={to_estonian_number(vat_total)}  "
-                f"gross={to_estonian_number(doc_gross)}  ({vat_label})"
+                f"gross={to_estonian_number(doc_gross)}  "
+                f"rounding={to_estonian_number(rounding)}  "
+                f"payable={to_estonian_number(expected_payable)}  "
+                f"({vat_label})"
             )
             if fx_doc_total is not None:
                 click.echo(
@@ -4987,23 +5185,25 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
             click.echo(f"  Attach   : {attachment_path or '(none)'}")
             return
 
-        parts: list[tuple[str, tuple]] = [(n, (None, v)) for n, v in fields]
-
-        if attachment_path:
-            fname = Path(attachment_path).name
-            data_bytes = Path(attachment_path).read_bytes()
-            ctype = "application/pdf" if fname.lower().endswith(".pdf") else "application/octet-stream"
-            parts.append(("data[Purchase][copy]", (fname, data_bytes, ctype)))
-        else:
-            parts.append(("data[Purchase][copy]", ("", b"", "application/octet-stream")))
-
         http.headers["Referer"] = f"{BASE}/{account}/purchases/add"
         http.headers["Origin"] = BASE
-        r = http.post(f"{BASE}/{account}/purchases/create", files=parts)
+        r = http.post(
+            f"{BASE}/{account}/purchases/create",
+            files=_purchase_multipart_parts(fields, attachment_path),
+        )
 
     m = re.search(r"/purchases/view/(\d+)", r.headers.get("location", ""))
     if m:
-        pid = m.group(1)
+        pid = int(m.group(1))
+        with build_http(cookies, account) as verify_http:
+            repaired = _ensure_created_purchase_integrity(
+                verify_http,
+                account,
+                pid,
+                rounding=rounding,
+                expected_payable=expected_payable,
+                attachment_path=attachment_path,
+            )
         click.secho(f"✓ Created expense {pid} (number {number})", fg="green", bold=True)
         click.echo(f"  Supplier : {supplier.get('name')} [{supplier_id}]")
         click.echo(f"  Date     : {invoice_date}")
@@ -5016,7 +5216,10 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
                 f"SB rate 1 EUR = {currency_rate:.4f} {fx_source_currency}"
             )
         if attachment_path:
-            click.echo(f"  Attached : {attachment_path}")
+            click.echo(f"  Attached : {attachment_path} (byte-verified)")
+        click.echo(f"  Rounding : {to_estonian_number(rounding)} (readback verified)")
+        if repaired:
+            click.echo("  Integrity: corrected through purchase update, then verified")
         click.echo(f"  URL      : {BASE}/{account}/purchases/view/{pid}")
         return
     fail = CONFIG_DIR / "last_expense_create_failure.html"
@@ -5346,21 +5549,12 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
             k, v = raw.split("=", 1)
             _set_field(fields, k, v)
 
-        # /purchases/update expects multipart/form-data. The optional source-document
-        # file slot (data[Purchase][copy]): --attach sets/replaces it; otherwise send an
-        # empty part exactly as the rendered form does, leaving any existing file untouched.
-        parts = [(n, (None, v)) for n, v in fields]
-        if attach_path:
-            fname = Path(attach_path).name
-            data_bytes = Path(attach_path).read_bytes()
-            ctype = "application/pdf" if fname.lower().endswith(".pdf") else "application/octet-stream"
-            parts.append(("data[Purchase][copy]", (fname, data_bytes, ctype)))
-        else:
-            parts.append(("data[Purchase][copy]", ("", b"", "application/octet-stream")))
-
         http.headers["Referer"] = f"{BASE}/{account}/purchases/edit/{purchase_id}"
         http.headers["Origin"] = BASE
-        r = http.post(f"{BASE}/{account}/purchases/update", files=parts)
+        r = http.post(
+            f"{BASE}/{account}/purchases/update",
+            files=_purchase_multipart_parts(fields, attach_path),
+        )
 
     if r.status_code not in (200, 302):
         fail = CONFIG_DIR / "last_expense_update_failure.html"
@@ -5377,11 +5571,41 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
             + (" SB says: " + " | ".join(msgs) if msgs else "")
             + f" Response → {fail}"
         )
+
+    verification_failures = []
+    if rounding is not None or attach_path:
+        with build_http(cookies, account) as verify_http:
+            if rounding is not None:
+                stored_rounding = _purchase_read_rounding(verify_http, account, purchase_id)
+                try:
+                    rounding_ok = (
+                        stored_rounding is not None
+                        and Decimal(normalize_number(stored_rounding))
+                        == Decimal(normalize_number(rounding))
+                    )
+                except Exception:
+                    rounding_ok = False
+                if not rounding_ok:
+                    verification_failures.append(
+                        f"rounding expected {to_estonian_number(rounding)}, "
+                        f"stored {stored_rounding!r}"
+                    )
+            if attach_path and not _purchase_attachment_matches(
+                verify_http, account, purchase_id, attach_path
+            ):
+                verification_failures.append("stored attachment bytes do not match the source file")
+    if verification_failures:
+        raise click.ClickException(
+            f"Purchase {purchase_id} update returned success but failed readback: "
+            + "; ".join(verification_failures)
+        )
     click.secho(f"✓ Updated purchase {purchase_id}", fg="green", bold=True)
     if set_lines:
         click.echo(f"  Edited line(s): {', '.join(r.split(':', 1)[0] for r in set_lines)}")
     if attach_path:
-        click.echo(f"  Attached : {attach_path}")
+        click.echo(f"  Attached : {attach_path} (byte-verified)")
+    if rounding is not None:
+        click.echo(f"  Rounding : {to_estonian_number(rounding)} (readback verified)")
     if needs_rebind:
         for kind, bid in saved_bindings:
             _do_bind(kind, bid, [purchase_id])

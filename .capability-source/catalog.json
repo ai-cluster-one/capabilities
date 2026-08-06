@@ -102,7 +102,7 @@
     },
     "simplbooks": {
       "path": "capabilities/simplbooks",
-      "payload_sha256": "ec09946570034ac9bc0cb556072a9a85af0df1c6265bb777a9d51a58bda44166",
+      "payload_sha256": "3708a5f22105bf80dcb7454ef97012f74cf958d4529ca9848ebc5c578205e2d7",
       "summary": "SimpleBooks accounting CLI over a browser session (no public API) — read clients/invoices/purchases/accounts/bank-transactions/financial_transactions, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist. Stateful — run `simplbooks doctor` first."
     },
     "slack": {
