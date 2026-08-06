@@ -589,6 +589,64 @@ def test_dev_finish_reconciles_changed_installed_capability(tmp_path):
     assert meta["source_dirty"] is False
 
 
+def test_dev_finish_removes_deleted_installed_capability_and_resumes(tmp_path):
+    source, remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    installed = json.loads(_run(
+        env, "install", "askproject", "--from", str(source)).stdout)
+    registry = Path(installed["registry"])
+    link = Path(installed["symlink"])
+    started = json.loads(_run(
+        env,
+        "dev", "start", "askproject",
+        "--source", str(source),
+        "--consumer", str(consumer),
+        "--session", "payload-removal",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    _git(worktree, "rm", "-r", "capabilities/askproject")
+    (worktree / "capabilities").mkdir()
+    (worktree / "capabilities" / ".gitkeep").write_text("")
+    _git(worktree, "add", "capabilities/.gitkeep")
+    indexed = subprocess.run(
+        [str(worktree / "bin" / "capabilities"),
+         "source", "index", "official", "--staged"],
+        cwd=worktree, env=env, text=True, capture_output=True, timeout=300,
+        check=False,
+    )
+    assert indexed.returncode == 0, indexed.stderr
+    candidate = _commit_all(worktree, "Remove installed capability payload")
+
+    agents_dir = Path(env["HOME"]) / ".agents"
+    agents_dir.mkdir(parents=True)
+    blocked_skills = agents_dir / "skills"
+    blocked_skills.write_text("force one post-removal interruption\n")
+    interrupted = _run(
+        env, "dev", "finish", "payload-removal", check=False)
+    assert interrupted.returncode != 0
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() == candidate
+    assert not registry.exists()
+    assert not link.exists()
+    assert worktree.is_dir()
+
+    blocked_skills.unlink()
+    finished = json.loads(_run(
+        env, "dev", "finish", "payload-removal").stdout)
+    release = finished["release"]
+    assert release["commit"] == candidate
+    assert release["changed_capabilities"] == ["askproject"]
+    assert release["installed_updates"] == []
+    assert release["installed_removals"] == [{
+        "name": "askproject",
+        "removed": True,
+        "registry_removed": False,
+        "symlink_removed": False,
+    }]
+    assert not registry.exists()
+    assert not link.exists()
+
+
 def test_dev_finish_refuses_remote_race_without_touching_session(tmp_path):
     source, remote = _release_source_repo(tmp_path)
     consumer = _consumer_repo(tmp_path)

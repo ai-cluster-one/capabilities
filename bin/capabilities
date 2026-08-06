@@ -3888,6 +3888,29 @@ def _activate_released_capability(
     }
 
 
+def _remove_released_capability(name: str) -> dict:
+    """Idempotently retire one installed payload; credentials remain local."""
+    reg = _registry_dir(name)
+    link = _bin_dir() / name
+    removed_link = False
+    if link.is_symlink():
+        link.unlink()
+        removed_link = True
+    removed_registry = reg.is_dir()
+    if removed_registry:
+        shutil.rmtree(reg)
+    result = {
+        "name": name,
+        "removed": True,
+        "registry_removed": removed_registry,
+        "symlink_removed": removed_link,
+    }
+    cred_file = _CONFIG_HOME / name / "credentials.env"
+    if cred_file.exists():
+        result["credentials_kept"] = str(cred_file)
+    return result
+
+
 def _source_release(
     repo: Path,
     source_id: str | None,
@@ -3997,6 +4020,21 @@ def _source_release(
             "target_commit": candidate,
             "changed_paths": changed_paths,
         }
+    if not isinstance(state.get("installed_actions"), list):
+        candidate_capabilities = set(report["expected"]["capabilities"])
+        installed = _installed()
+        installed_actions = []
+        for name in changed_capabilities:
+            meta = installed.get(name)
+            if meta is None or not _installed_matches_release(
+                meta, source_id, repo, remote_url
+            ):
+                continue
+            installed_actions.append({
+                "name": name,
+                "action": "update" if name in candidate_capabilities else "remove",
+            })
+        state["installed_actions"] = installed_actions
         _write_json(state_path, state)
     release_branch = f"capabilities-release/{candidate[:12]}"
     release_ref = f"refs/heads/{release_branch}"
@@ -4047,17 +4085,33 @@ def _source_release(
                 merged.stderr.strip() or merged.stdout.strip() or str(state_path),
             )
     installed_updates = []
-    installed = _installed()
-    for name in changed_capabilities:
-        meta = installed.get(name)
-        if meta is None or not _installed_matches_release(
-            meta, source_id, repo, remote_url
-        ):
-            continue
-        installed_updates.append(_activate_released_capability(
-            name, repo, source_id, remote_url, branch, candidate
-        ))
-    if installed_updates:
+    installed_removals = []
+    for action in state["installed_actions"]:
+        if not isinstance(action, dict):
+            _die(7, "release_state_invalid", "release action is not an object",
+                 str(state_path))
+        name = str(action.get("name") or "")
+        if name not in changed_capabilities:
+            _die(
+                7,
+                "release_state_invalid",
+                f"release state names an unchanged capability: {name!r}",
+                str(state_path),
+            )
+        if action.get("action") == "update":
+            installed_updates.append(_activate_released_capability(
+                name, repo, source_id, remote_url, branch, candidate
+            ))
+        elif action.get("action") == "remove":
+            installed_removals.append(_remove_released_capability(name))
+        else:
+            _die(
+                7,
+                "release_state_invalid",
+                f"release state has an invalid installed action for {name!r}",
+                str(state_path),
+            )
+    if installed_updates or installed_removals:
         _regen_skills()
     manager_update = None
     if manager_changed and source_id == OFFICIAL_SOURCE_ID:
@@ -4100,6 +4154,7 @@ def _source_release(
         ),
         "changed_capabilities": changed_capabilities,
         "installed_updates": installed_updates,
+        "installed_removals": installed_removals,
         "manager_update": manager_update,
         "ok": True,
     }
