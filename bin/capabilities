@@ -3626,6 +3626,7 @@ def _source_snapshot_report(
     git_ref: str,
     manager_selfcheck: bool = False,
     audit_names: set[str] | None = None,
+    catalog_baseline: object | None = None,
 ) -> dict:
     """Evaluate one immutable Git tree without reading its working tree."""
     tree = _dev_git_value(root, "rev-parse", "--verify", f"{git_ref}^{{tree}}")
@@ -3657,7 +3658,11 @@ def _source_snapshot_report(
         expected, failures = (
             _catalog_payload(snapshot, audit=True)
             if audit_names is None
-            else _catalog_payload_scoped(snapshot, audit_names, current)
+            else _catalog_payload_scoped(
+                snapshot,
+                audit_names,
+                current if catalog_baseline is None else catalog_baseline,
+            )
         )
         manager = snapshot / "bin" / "capabilities"
         if manager_selfcheck and manager.is_file():
@@ -3704,19 +3709,32 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
         tree = _dev_git_value(root, "write-tree")
         head = _dev_git(root, "rev-parse", "--verify", "HEAD^{commit}")
         if head.returncode == 0:
+            head_commit = head.stdout.strip()
             changed_paths = _dev_git_value(
-                root, "diff", "--name-only", head.stdout.strip(), tree
+                root, "diff", "--name-only", head_commit, tree
             ).splitlines()
+            baseline_raw = _dev_git(
+                root,
+                "show",
+                f"{head_commit}:.capability-source/catalog.json",
+            )
+            try:
+                catalog_baseline = json.loads(baseline_raw.stdout) \
+                    if baseline_raw.returncode == 0 else {"capabilities": {}}
+            except ValueError:
+                catalog_baseline = {"capabilities": {}}
         else:
             changed_paths = _dev_git_value(
                 root, "ls-tree", "-r", "--name-only", tree
             ).splitlines()
+            catalog_baseline = {"capabilities": {}}
         manager_changed, changed_capabilities = _source_change_scope(changed_paths)
         report = _source_snapshot_report(
             root,
             tree,
             manager_selfcheck=manager_changed,
             audit_names=changed_capabilities,
+            catalog_baseline=catalog_baseline,
         )
         # A stale catalogue is the reason index exists, so it is not a blocker
         # while deriving the replacement. Contract or capability failures are.
@@ -3750,6 +3768,7 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
             final_tree,
             manager_selfcheck=manager_changed,
             audit_names=changed_capabilities,
+            catalog_baseline=catalog_baseline,
         )
         if not verified["ok"]:
             _emit({

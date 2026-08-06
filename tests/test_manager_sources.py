@@ -320,7 +320,12 @@ def test_staged_index_uses_editorial_profile_for_docs_only_change(tmp_path):
 
     authoring = workspace / "AUTHORING.md"
     authoring.write_text(authoring.read_text() + "\nEditorial clarification.\n")
-    _git(workspace, "add", "AUTHORING.md")
+    catalog_path = workspace / ".capability-source" / "catalog.json"
+    catalog = json.loads(catalog_path.read_text())
+    original_summary = catalog["capabilities"]["demo"]["summary"]
+    catalog["capabilities"]["demo"]["summary"] = "manually staged summary"
+    catalog_path.write_text(json.dumps(catalog, indent=2) + "\n")
+    _git(workspace, "add", "AUTHORING.md", ".capability-source/catalog.json")
     marker = tmp_path / "manifest-ran"
     editorial_env = dict(env)
     editorial_env["UNCHANGED_MANIFEST_MARKER"] = str(marker)
@@ -329,3 +334,5 @@ def test_staged_index_uses_editorial_profile_for_docs_only_change(tmp_path):
 
     assert indexed["verification_profile"] == "editorial"
     assert not marker.exists()
+    repaired = json.loads(catalog_path.read_text())
+    assert repaired["capabilities"]["demo"]["summary"] == original_summary
