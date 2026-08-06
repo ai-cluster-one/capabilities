@@ -108,6 +108,13 @@ Commands:
         [--body TEXT | --body-file F | -]     Send a message. Body from
         [--cc A ...] [--attach FILE ...]      --body, a file, or stdin.
         [--in-reply-to MESSAGE-ID]
+                                              Saves the exact MIME message in
+                                              the server's Sent folder. If SMTP
+                                              succeeds but that copy fails, the
+                                              result keeps sent=true and reports
+                                              sent_copy.saved=false; do not retry
+                                              the send or the recipient may get
+                                              a duplicate.
 
 IMAP concurrency:
   Folder reads (list/search/show/fetch) each open one IMAP connection. Many
@@ -157,6 +164,8 @@ import ssl
 import sys
 from datetime import date, datetime
 from email.message import EmailMessage
+from email.policy import SMTP
+from email.utils import format_datetime, getaddresses, make_msgid
 from pathlib import Path
 from typing import NoReturn
 
@@ -1482,8 +1491,28 @@ def cmd_move(cfg: dict, uid: str, folder: str, to_folder: str) -> dict:
     return {"uid": uid, "from_folder": folder, "moved_to": to_folder}
 
 
+_SENT_FOLDER_NAMES = ("Sent", "Sent Messages", "[Gmail]/Sent Mail")
+
+
+def _sent_folder_name(folders) -> str | None:
+    """Resolve the provider's Sent mailbox by special-use flag, then name."""
+    for folder in folders:
+        if any(str(flag).casefold() == r"\sent" for flag in (folder.flags or ())):
+            return folder.name
+    names = {folder.name for folder in folders}
+    return next((name for name in _SENT_FOLDER_NAMES if name in names), None)
+
+
+def _folder_has_message_id(mb: MailBox, folder: str, message_id: str) -> bool:
+    """Whether the selected provider already stored this outgoing message."""
+    mb.folder.set(folder)
+    criterion = f'HEADER MESSAGE-ID "{message_id.strip()}"'
+    return bool(mb.uids(criterion))
+
+
 def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
              body: str, attach: list[str], in_reply_to: str | None) -> dict:
+    sent_at = datetime.now().astimezone()
     msg = EmailMessage()
     msg["From"] = cfg["user"]
     msg["To"] = ", ".join(to)
@@ -1493,6 +1522,8 @@ def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
         msg["References"] = in_reply_to
+    msg["Date"] = format_datetime(sent_at)
+    msg["Message-ID"] = make_msgid(domain=cfg["user"].rsplit("@", 1)[-1])
     msg.set_content(body)
     for f in attach:
         p = Path(f)
@@ -1501,17 +1532,82 @@ def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
         ctype, _ = mimetypes.guess_type(p.name)
         maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
         msg.add_attachment(p.read_bytes(), maintype=maintype, subtype=subtype, filename=p.name)
+
+    from_addr = getaddresses([str(msg["From"])])[0][1]
+    recipient_addrs = [
+        addr for _, addr in getaddresses(
+            [str(msg["To"]), str(msg["Cc"] or "")]
+        )
+    ]
     try:
-        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=30) as s:
-            s.starttls(context=ssl.create_default_context())
-            s.login(cfg["user"], cfg["password"])
-            s.send_message(msg)
-    except smtplib.SMTPAuthenticationError as e:
-        _die(2, "smtp_auth", f"SMTP login failed: {e}")
-    except (OSError, smtplib.SMTPException) as e:
-        _die(5, "send_failed", f"send failed: {e}")
-    return {"sent": True, "to": to, "cc": cc, "subject": subject,
-            "attachments": [Path(f).name for f in attach]}
+        "".join([from_addr, *recipient_addrs]).encode("ascii")
+        international = False
+    except UnicodeEncodeError:
+        international = True
+
+    # Resolve a real Sent mailbox before crossing the irreversible SMTP line.
+    # Providers advertise it with the IMAP special-use \Sent flag; conventional
+    # names cover servers that omit that flag.
+    mb = _imap(cfg)
+    try:
+        try:
+            sent_folder = _sent_folder_name(mb.folder.list())
+        except Exception as exc:
+            _die(5, "sent_folder_lookup_failed",
+                 f"cannot inspect IMAP folders before send: {exc}",
+                 "message was not sent")
+        if sent_folder is None:
+            _die(6, "sent_folder_missing",
+                 "no IMAP Sent folder was advertised or found by a conventional name",
+                 "message was not sent; create/configure a Sent folder first")
+
+        try:
+            with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=30) as s:
+                s.starttls(context=ssl.create_default_context())
+                s.login(cfg["user"], cfg["password"])
+                if international and not s.has_extn("smtputf8"):
+                    raise smtplib.SMTPNotSupportedError(
+                        "internationalized addresses require SMTPUTF8"
+                    )
+                wire_message = msg.as_bytes(policy=SMTP.clone(utf8=international))
+                mail_options = ("SMTPUTF8", "BODY=8BITMIME") if international else ()
+                s.sendmail(from_addr, recipient_addrs, wire_message, mail_options)
+        except smtplib.SMTPAuthenticationError as e:
+            _die(2, "smtp_auth", f"SMTP login failed: {e}")
+        except (OSError, smtplib.SMTPException) as e:
+            _die(5, "send_failed", f"send failed: {e}")
+
+        message_id = str(msg["Message-ID"])
+        copy_result: dict = {"saved": True, "folder": sent_folder,
+                             "message_id": message_id}
+        try:
+            if _folder_has_message_id(mb, sent_folder, message_id):
+                copy_result["provider_saved"] = True
+            else:
+                mb.append(wire_message, folder=sent_folder, dt=sent_at,
+                          flag_set=[MailMessageFlags.SEEN])
+                copy_result["provider_saved"] = False
+        except Exception as exc:
+            copy_result = {"saved": False, "folder": sent_folder,
+                           "message_id": message_id, "error": str(exc)}
+    finally:
+        try:
+            mb.logout()
+        except Exception:
+            # Cleanup must never turn a successful, irreversible SMTP send into
+            # an apparent failure that invites the caller to resend it.
+            pass
+
+    result = {"sent": True, "to": to, "cc": cc, "subject": subject,
+              "message_id": str(msg["Message-ID"]),
+              "attachments": [Path(f).name for f in attach],
+              "sent_copy": copy_result}
+    if not copy_result["saved"]:
+        result["warning"] = (
+            "SMTP delivery succeeded but the Sent copy failed; do not retry send "
+            "because the recipient may receive a duplicate"
+        )
+    return result
 
 
 # --- CLI ---------------------------------------------------------------------
