@@ -86,11 +86,21 @@ MACHINE VERBS
   source clone ID GIT_URL [--ref REF]
         Clone an existing source into the canonical editable workspace and
         register it for authoring on this machine.
-  source list | path ID | refresh [ID] | sync ID | check ID | index ID | remove ID
+  source list | path ID | refresh [ID] | sync ID | check ID | remove ID
         Inspect sources, resolve the one editable path, refresh remote caches,
-        verify every capability and generated catalogue, rebuild that catalogue
-        after clean audits, or unregister a source. Removing never deletes an
-        editable workspace.
+        verify every capability and generated catalogue, or unregister a source.
+        Removing never deletes an editable workspace.
+  source index ID [--staged]
+        Rebuild the generated catalogue after clean audits. --staged derives it
+        from the Git index and stages the result, so ignored, unstaged, and
+        temporary files cannot influence the candidate commit.
+  source verify ID --ref REF
+        Verify an immutable Git tree: source contract, every capability audit,
+        and the checked-in catalogue. This is the publication/CI invariant.
+  source release ID --ref REF
+        Publish one already-committed, verified descendant of the clean source
+        checkout's tracked branch; fast-forward the checkout, reconcile locally
+        installed changed payloads, and update the manager when it changed.
 
 DEVELOPMENT VERBS
   dev start <name> --source PATH [--consumer PATH | --consumer-live PATH]
@@ -114,6 +124,10 @@ DEVELOPMENT VERBS
         Remove only a clean session whose commits are absent, merged, or
         patch-equivalent to commits on its recorded base ref. Dirty or
         unpublished worktrees are preserved and refused.
+  dev finish <session>
+        Require a clean prepared commit and clean consumer worktree, release it
+        through the source-level transaction, then remove the session. All
+        publication logic remains owned by `source release`.
   dev gc [--older-than 7d]
         Apply the same safe cleanup rule to old sessions; unsafe sessions are
         reported and retained.
@@ -208,6 +222,7 @@ I/O CONTRACT
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -686,7 +701,8 @@ def _run_script(script: Path, args: list[str], cwd: Path | None = None,
     try:
         proc = subprocess.run(
             [str(script), *args], capture_output=True, text=True,
-            cwd=str(cwd or script.parent), env=env or _snapshot_env(), timeout=timeout)
+            cwd=str(cwd or script.parent), env=env or _snapshot_env(), timeout=timeout,
+            start_new_session=True)
     except subprocess.TimeoutExpired:
         return (124, "", f"timed out after {timeout}s")
     except OSError as e:
@@ -1241,6 +1257,37 @@ def cmd_update(name: str | None) -> None:
     _emit({"updated": results})
 
 
+def _activate_manager_release(
+    content: bytes, assets: dict[str, bytes], source: str
+) -> dict:
+    """Install already-verified manager bytes and their authoring kit."""
+    if b"uv run" not in content.split(b"\n", 1)[0]:
+        _die(5, "server_error", "manager payload does not look executable", source)
+    manager = CAP_HOME / ".manager" / "capabilities"
+    before = _sha256(manager) if manager.exists() and not manager.is_symlink() else None
+    after = hashlib.sha256(content).hexdigest()
+    if before != after:
+        manager.parent.mkdir(parents=True, exist_ok=True)
+        if manager.is_symlink() or manager.exists():
+            manager.unlink()
+        manager.write_bytes(content)
+        manager.chmod(manager.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    for rel, body in assets.items():
+        target = manager.parent / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+    link = _symlink("capabilities", manager)
+    return {
+        "self_update": "already current" if before == after else "updated",
+        "manager": str(manager),
+        "sha256_before": before,
+        "sha256_after": after,
+        "symlink": str(link),
+        "source": source,
+        "authoring_assets": sorted(assets),
+    }
+
+
 def cmd_self_update() -> None:
     """Refresh the installed manager itself from the canonical source.
 
@@ -1269,40 +1316,7 @@ def cmd_self_update() -> None:
             _die(5, "server_error",
                  f"authoring asset fetch returned {asset_resp.status_code}", asset_url)
         assets[rel] = asset_resp.content
-    # The fetched bytes must actually be the manager script, not an error page
-    # or a redirect body — mirror install.sh's shebang guard.
-    if b"uv run" not in content.split(b"\n", 1)[0]:
-        _die(5, "server_error",
-             "fetched file does not look like the manager script", url)
-    manager = CAP_HOME / ".manager" / "capabilities"
-    before = _sha256(manager) if manager.exists() and not manager.is_symlink() else None
-    after = hashlib.sha256(content).hexdigest()
-    if before == after:
-        for rel, body in assets.items():
-            target = manager.parent / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(body)
-        _emit({"self_update": "already current",
-               "manager": str(manager), "sha256": after, "source": url,
-               "authoring_assets": sorted(assets)})
-        return
-    manager.parent.mkdir(parents=True, exist_ok=True)
-    # Never write through a stray symlink into a working tree — the same
-    # canonical-source discipline doctor enforces for capability registry
-    # entries. Replace with a fresh real file.
-    if manager.is_symlink() or manager.exists():
-        manager.unlink()
-    manager.write_bytes(content)
-    manager.chmod(manager.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    for rel, body in assets.items():
-        target = manager.parent / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(body)
-    link = _symlink("capabilities", manager)
-    _emit({"self_update": "updated", "manager": str(manager),
-           "sha256_before": before, "sha256_after": after,
-           "symlink": str(link), "source": url,
-           "authoring_assets": sorted(assets)})
+    _emit(_activate_manager_release(content, assets, url))
 
 
 def cmd_list() -> None:
@@ -1455,6 +1469,21 @@ def cmd_dev_start(name: str, source_ref: str, consumer_ref: str | None,
     if not (source_repo / "capabilities.repo.json").is_file():
         _die(6, "not_capability_source",
              f"source is missing capabilities.repo.json: {source_repo}")
+    source_status = _dev_git(source_repo, "status", "--porcelain")
+    if source_status.returncode != 0:
+        _die(
+            6,
+            "git_failed",
+            f"cannot inspect source integration checkout: {source_repo}",
+            source_status.stderr.strip() or source_status.stdout.strip() or None,
+        )
+    if source_status.stdout.strip():
+        _die(
+            6,
+            "source_checkout_dirty",
+            f"source integration checkout is dirty: {source_repo}",
+            "finish or move that work into its own dev session before starting another",
+        )
     session_id = requested_session or (
         f"{_dev_slug(name)}-"
         f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{os.getpid()}")
@@ -1766,6 +1795,58 @@ def cmd_dev_doctor(session_id: str) -> None:
     })
     if findings:
         sys.exit(7)
+
+
+def cmd_dev_finish(session_id: str) -> None:
+    session = _dev_session(session_id)
+    source = session["source"]
+    source_worktree = Path(source["worktree"])
+    source_status, source_error = _dev_git_status(source_worktree)
+    if source_error:
+        _die(6, "dev_source_unavailable", source_error)
+    if source_status:
+        _die(
+            6,
+            "dev_source_dirty",
+            f"dev source worktree has uncommitted changes: {source_worktree}",
+            "prepare one clean commit before finishing the session",
+        )
+    consumer = session.get("consumer")
+    if isinstance(consumer, dict):
+        consumer_problem = _dev_worktree_cleanup_problem(consumer)
+        if consumer_problem:
+            _die(
+                6,
+                "dev_consumer_unfinished",
+                "consumer worktree is not cleanup-ready",
+                consumer_problem,
+            )
+    repo = Path(source["repo"])
+    candidate = _dev_git_value(source_worktree, "rev-parse", "HEAD")
+    if candidate == source.get("base_commit"):
+        _die(6, "dev_no_change", f"dev session {session_id} has no prepared commit")
+    source_id = _source_id_for_repo(repo)
+    release = _source_release(
+        repo,
+        source_id,
+        candidate,
+        str(source.get("ref") or "main"),
+        expected_base=str(source.get("base_commit") or "") or None,
+    )
+    cleanup = _dev_stop(session_id, False)
+    if not cleanup.get("removed"):
+        _die(
+            7,
+            "dev_cleanup_incomplete",
+            "release succeeded but the dev session was not cleanup-ready",
+            "; ".join(cleanup.get("problems") or []),
+        )
+    _emit({
+        "session": session_id,
+        "release": release,
+        "cleanup": cleanup,
+        "ok": True,
+    })
 
 
 def _dev_session_summaries() -> list[dict]:
@@ -2457,7 +2538,8 @@ Manager surface: `capabilities list` (what is installed and gated where),
 Custom managed source code lives only under
 `~/.capabilities/sources/<source-id>/`: create it with `capabilities source init
 <id>`, create packages with `capabilities new <name> --source <id>`, and run
-`capabilities source index <id>` plus `source check <id>` before committing.
+`capabilities source index <id> --staged` before committing, then `source verify
+<id> --ref HEAD` before release.
 Remote catalogues attach through `capabilities source add`; `capabilities
 search` lists their generated indexes without executing package code. Never
 edit the read-only source cache, installed registry, or a project's capability
@@ -3188,17 +3270,20 @@ capabilities new <name> --source {source_id}
 
 The manager stamps generated contract regions from `contract/preamble.py`.
 Never edit text between `# >>> contract:` and `# <<< contract:` markers.
-Before every commit run:
+Before every commit, stage the intended source files and derive the catalogue
+from that exact index:
 
 ```sh
-capabilities source index {source_id}
-capabilities source check {source_id}
+git add <intended-files>
+capabilities source index {source_id} --staged
 ```
 
 Install for a local smoke test with `capabilities install <name> --source
-{source_id}`. Commit and push only from this workspace with ordinary git.
-There is no conformance override: a managed capability must pass the contract
-and audit. A free-form CLI remains usable directly, outside this manager.
+{source_id}`. After committing, run `capabilities source verify {source_id}
+--ref HEAD`, then publish only with `capabilities source release {source_id}
+--ref HEAD`. There is no conformance override: a managed capability must pass
+the contract and audit. A free-form CLI remains usable directly, outside this
+manager.
 """
 
 
@@ -3208,8 +3293,9 @@ def _repo_agent_markdown(source_id: str) -> str:
 
 Read `AUTHORING.md` before editing. Create packages with `capabilities new
 <name> --source {source_id}`. Never hand-edit generated contract regions.
-Run `capabilities source index {source_id}` and `capabilities source check
-{source_id}` before committing. Source code lives only under
+Stage intended files and run `capabilities source index {source_id} --staged`
+before committing; verify the commit and publish through the manager's source
+verbs described in `AUTHORING.md`. Source code lives only under
 `capabilities/<name>/`; installed and project-envelope copies are not source.
 """
 
@@ -3266,8 +3352,8 @@ def cmd_source_init(source_id: str, remote: str | None) -> None:
            "remote": remote, "next": [
                f"cd {shlex.quote(str(root))}",
                f"capabilities new <name> --source {source_id}",
-               f"capabilities source index {source_id}",
-               f"capabilities source check {source_id}"]})
+               f"capabilities source index {source_id} --staged",
+               f"capabilities source verify {source_id} --ref HEAD"]})
 
 
 def _refresh_source(source_id: str) -> dict:
@@ -3379,7 +3465,7 @@ def cmd_source_clone(source_id: str, url: str, ref: str) -> None:
     _emit({"source": source_id, "kind": "workspace", "path": str(root),
            "url": url, "ref": ref,
            "next": [f"cd {shlex.quote(str(root))}",
-                    f"capabilities source check {source_id}"]})
+                    f"capabilities source verify {source_id} --ref HEAD"]})
 
 
 def cmd_source_list() -> None:
@@ -3466,6 +3552,58 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
     return {"capabilities": entries}, failures
 
 
+def _catalog_payload_scoped(
+    root: Path, audit_names: set[str], current: object
+) -> tuple[dict, dict[str, list[str]]]:
+    """Rebuild all hashes while executing only changed capability contracts.
+
+    Unchanged summaries come from the previously verified catalogue. Their
+    payload bytes are still re-hashed, so the candidate cannot conceal drift.
+    """
+    cap_root = root / "capabilities"
+    listed = current.get("capabilities") if isinstance(current, dict) else {}
+    listed = listed if isinstance(listed, dict) else {}
+    entries: dict = {}
+    failures: dict[str, list[str]] = {}
+    if not cap_root.is_dir():
+        return {"capabilities": {}}, {"repository": ["missing capabilities/ directory"]}
+    for capdir in sorted(p for p in cap_root.iterdir() if p.is_dir()):
+        name = capdir.name
+        script = capdir / "bin" / name
+        if not script.is_file():
+            failures[name] = [f"missing canonical executable capabilities/{name}/bin/{name}"]
+            continue
+        if name in audit_names:
+            problems = _audit_script(name, script)
+            rc, out, err = _run_script(script, ["manifest", "--json"])
+            manifest = None
+            if rc == 0:
+                try:
+                    manifest = json.loads(out)
+                except ValueError:
+                    problems.append("manifest: not JSON")
+            else:
+                problems.append(f"manifest: exit {rc}: {err.strip()}")
+            if manifest is not None:
+                problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
+            if problems:
+                failures[name] = sorted(set(problems))
+                continue
+            summary = manifest.get("summary", "")
+        else:
+            previous = listed.get(name)
+            if not isinstance(previous, dict):
+                failures[name] = ["unchanged capability has no verified catalogue entry"]
+                continue
+            summary = previous.get("summary", "")
+        entries[name] = {
+            "path": f"capabilities/{name}",
+            "summary": summary,
+            "payload_sha256": _payload_sha256(capdir),
+        }
+    return {"capabilities": entries}, failures
+
+
 def _source_contract_failures(root: Path) -> list[str]:
     _require_authoring_assets()
     failures = []
@@ -3483,11 +3621,123 @@ def _source_contract_failures(root: Path) -> list[str]:
     return failures
 
 
-def cmd_source_index(source_id: str) -> None:
+def _source_snapshot_report(
+    root: Path,
+    git_ref: str,
+    manager_selfcheck: bool = False,
+    audit_names: set[str] | None = None,
+) -> dict:
+    """Evaluate one immutable Git tree without reading its working tree."""
+    tree = _dev_git_value(root, "rev-parse", "--verify", f"{git_ref}^{{tree}}")
+    try:
+        archived = subprocess.run(
+            ["git", "-C", str(root), "archive", "--format=tar", tree],
+            capture_output=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _die(6, "git_archive_failed", f"cannot archive Git tree {git_ref}", str(exc))
+    if archived.returncode != 0:
+        _die(
+            6,
+            "git_archive_failed",
+            f"cannot archive Git tree {git_ref}",
+            archived.stderr.decode(errors="replace").strip() or None,
+        )
+    with tempfile.TemporaryDirectory(prefix="capabilities-source-tree-") as tmp:
+        snapshot = Path(tmp)
+        with tarfile.open(fileobj=io.BytesIO(archived.stdout), mode="r:") as tar:
+            members = tar.getmembers()
+            for member in members:
+                target = (snapshot / member.name).resolve()
+                if target != snapshot and snapshot.resolve() not in target.parents:
+                    _die(7, "unsafe_source_tree", f"unsafe path in Git tree: {member.name}")
+            tar.extractall(snapshot, members=members, filter="data")
+        current = _read_json(snapshot / ".capability-source" / "catalog.json")
+        contract_failures = _source_contract_failures(snapshot)
+        expected, failures = (
+            _catalog_payload(snapshot, audit=True)
+            if audit_names is None
+            else _catalog_payload_scoped(snapshot, audit_names, current)
+        )
+        manager = snapshot / "bin" / "capabilities"
+        if manager_selfcheck and manager.is_file():
+            rc, _out, err = _run_script(
+                manager, ["selfcheck"], cwd=snapshot, timeout=300
+            )
+            if rc != 0:
+                failures.setdefault("manager", []).append(
+                    f"selfcheck exited {rc}: {err.strip() or 'no diagnostic output'}"
+                )
+    if current != expected:
+        failures.setdefault("catalog", []).append(
+            "generated catalog does not describe this Git tree"
+        )
+    return {
+        "tree": tree,
+        "contract": contract_failures,
+        "failures": failures,
+        "expected": expected,
+        "current": current,
+        "ok": not contract_failures and not failures,
+    }
+
+
+def cmd_source_index(source_id: str, staged: bool = False) -> None:
     root = _source_author_root(source_id)
     if not root.is_dir():
         _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
              f"run `capabilities source refresh {source_id}`")
+    if staged:
+        tree = _dev_git_value(root, "write-tree")
+        report = _source_snapshot_report(root, tree)
+        # A stale catalogue is the reason index exists, so it is not a blocker
+        # while deriving the replacement. Contract or capability failures are.
+        non_catalog_failures = {
+            key: value for key, value in report["failures"].items()
+            if key != "catalog"
+        }
+        if report["contract"] or non_catalog_failures:
+            _emit({
+                "source": source_id,
+                "basis": "staged",
+                "tree": tree,
+                "ok": False,
+                "contract": report["contract"],
+                "failures": non_catalog_failures,
+            })
+            sys.exit(7)
+        path = root / ".capability-source" / "catalog.json"
+        _write_json(path, report["expected"])
+        added = _dev_git(root, "add", "--", str(path.relative_to(root)))
+        if added.returncode != 0:
+            _die(
+                6,
+                "git_stage_failed",
+                "could not stage generated capability catalog",
+                added.stderr.strip() or added.stdout.strip() or None,
+            )
+        final_tree = _dev_git_value(root, "write-tree")
+        verified = _source_snapshot_report(root, final_tree)
+        if not verified["ok"]:
+            _emit({
+                "source": source_id,
+                "basis": "staged",
+                "tree": final_tree,
+                "ok": False,
+                "contract": verified["contract"],
+                "failures": verified["failures"],
+            })
+            sys.exit(7)
+        _emit({
+            "source": source_id,
+            "basis": "staged",
+            "tree": final_tree,
+            "indexed": sorted(verified["expected"]["capabilities"]),
+            "catalog": str(path),
+            "staged": True,
+            "ok": True,
+        })
+        return
     contract_failures = _source_contract_failures(root)
     catalog, failures = _catalog_payload(root, audit=True)
     if contract_failures or failures:
@@ -3517,6 +3767,349 @@ def cmd_source_check(source_id: str) -> None:
            "capabilities": sorted(expected["capabilities"])})
     if not ok:
         sys.exit(7)
+
+
+def cmd_source_verify(source_id: str, git_ref: str) -> None:
+    root = _source_author_root(source_id)
+    if not root.is_dir():
+        _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
+             f"run `capabilities source refresh {source_id}`")
+    commit = _dev_git_value(root, "rev-parse", "--verify", f"{git_ref}^{{commit}}")
+    report = _source_snapshot_report(root, commit, manager_selfcheck=True)
+    _emit({
+        "source": source_id,
+        "root": str(root),
+        "ref": git_ref,
+        "commit": commit,
+        "tree": report["tree"],
+        "ok": report["ok"],
+        "contract": report["contract"],
+        "failures": report["failures"],
+        "capabilities": sorted(report["expected"]["capabilities"]),
+    })
+    if not report["ok"]:
+        sys.exit(7)
+
+
+def _normal_git_url(value: str | None) -> str:
+    raw = (value or "").strip().removesuffix(".git")
+    if raw.startswith("git@") and ":" in raw:
+        host, path = raw[4:].split(":", 1)
+        return f"{host}/{path}".lower()
+    raw = re.sub(r"^[a-z]+://", "", raw, flags=re.IGNORECASE)
+    return raw.lower().rstrip("/")
+
+
+def _source_id_for_repo(repo: Path) -> str | None:
+    remote = _dev_git(repo, "remote", "get-url", "origin")
+    remote_url = remote.stdout.strip() if remote.returncode == 0 else None
+    if _normal_git_url(remote_url) == _normal_git_url(OFFICIAL_GIT_URL):
+        return OFFICIAL_SOURCE_ID
+    for source_id, entry in sorted((_sources_config().get("sources") or {}).items()):
+        if entry.get("kind") == "workspace":
+            configured = Path(entry.get("path") or _source_workspace(source_id)).expanduser()
+            if configured.resolve() == repo.resolve():
+                return source_id
+        if _normal_git_url(entry.get("url")) == _normal_git_url(remote_url):
+            return source_id
+    return None
+
+
+def _release_state_path(repo: Path, branch: str) -> Path:
+    key = hashlib.sha256(f"{repo.resolve()}\0{branch}".encode()).hexdigest()[:20]
+    return _STATE_HOME / "capabilities" / "releases" / f"{key}.json"
+
+
+def _installed_matches_release(
+    meta: dict, source_id: str | None, repo: Path, remote_url: str
+) -> bool:
+    if source_id and meta.get("source_id") == source_id:
+        return True
+    source = str(meta.get("source") or "")
+    try:
+        path = Path(source).expanduser().resolve()
+        if path == repo.resolve() or repo.resolve() in path.parents:
+            return True
+    except (OSError, RuntimeError):
+        pass
+    if source_id == OFFICIAL_SOURCE_ID and not meta.get("source_id"):
+        return (
+            _normal_git_url(remote_url) in _normal_git_url(source)
+            or source.startswith(SOURCE)
+            or "raw.githubusercontent.com/ai-cluster-one/capabilities/" in source
+        )
+    return False
+
+
+def _activate_released_capability(
+    name: str,
+    repo: Path,
+    source_id: str | None,
+    remote_url: str,
+    branch: str,
+    commit: str,
+) -> dict:
+    capdir = repo / "capabilities" / name
+    script = capdir / "bin" / name
+    old = _read_json(_registry_dir(name) / "meta.json") or {}
+    stage, manifest = _prepare_payload(
+        name, script.read_bytes(), capdir, None, str(capdir)
+    )
+    payload_hash = _payload_sha256(stage)
+    provenance = {
+        key: old[key]
+        for key in ("source_id", "source_url", "source_ref")
+        if key in old
+    }
+    if source_id and source_id != OFFICIAL_SOURCE_ID:
+        provenance.update({
+            "source_id": source_id,
+            "source_url": remote_url,
+            "source_ref": branch,
+        })
+    _write_json(stage / "meta.json", {
+        "name": name,
+        "source": old.get("source") or str(capdir),
+        "source_type": "directory",
+        "sha256": _sha256(stage / name),
+        "payload_sha256": payload_hash,
+        "source_commit": commit,
+        "source_dirty": False,
+        **provenance,
+    })
+    _activate_payload(name, stage)
+    _symlink(name, _script_path(name))
+    return {
+        "name": name,
+        "changed": old.get("payload_sha256") != payload_hash,
+        "payload_sha256": payload_hash,
+        "source_commit": commit,
+        "summary": manifest.get("summary"),
+    }
+
+
+def _source_release(
+    repo: Path,
+    source_id: str | None,
+    candidate_ref: str,
+    branch: str,
+    expected_base: str | None = None,
+) -> dict:
+    repo = repo.resolve()
+    if _dev_git_value(repo, "status", "--porcelain"):
+        _die(
+            6,
+            "release_checkout_dirty",
+            f"source integration checkout is dirty: {repo}",
+            "move work into a dev worktree and restore the integration checkout first",
+        )
+    current_branch = _dev_git_value(repo, "branch", "--show-current")
+    if current_branch != branch:
+        _die(
+            6,
+            "release_wrong_branch",
+            f"source checkout is on {current_branch!r}, expected {branch!r}",
+        )
+    remote = _dev_git(repo, "remote", "get-url", "origin")
+    if remote.returncode != 0 or not remote.stdout.strip():
+        _die(6, "release_remote_missing", f"source checkout has no origin remote: {repo}")
+    remote_url = remote.stdout.strip()
+    fetched = _dev_git(repo, "fetch", "origin", branch, timeout=120)
+    if fetched.returncode != 0:
+        _die(
+            5,
+            "release_fetch_failed",
+            f"could not fetch origin/{branch}",
+            fetched.stderr.strip() or fetched.stdout.strip() or None,
+        )
+    remote_commit = _dev_git_value(repo, "rev-parse", f"refs/remotes/origin/{branch}")
+    local_commit = _dev_git_value(repo, "rev-parse", "HEAD")
+    candidate = _dev_git_value(repo, "rev-parse", "--verify", f"{candidate_ref}^{{commit}}")
+    state_path = _release_state_path(repo, branch)
+    state = _read_json(state_path)
+    if isinstance(state, dict):
+        if state.get("target_commit") != candidate:
+            _die(
+                6,
+                "release_in_progress",
+                f"another release is incomplete for {repo}:{branch}",
+                f"resume target {state.get('target_commit')} before releasing {candidate}",
+            )
+        base_commit = str(state.get("base_commit"))
+    else:
+        base_commit = expected_base or remote_commit
+    if local_commit not in {base_commit, candidate}:
+        _die(
+            6,
+            "release_local_diverged",
+            f"local {branch} is neither the release base nor target",
+            f"local={local_commit} base={base_commit} target={candidate}",
+        )
+    if remote_commit not in {base_commit, candidate}:
+        _die(
+            6,
+            "release_remote_diverged",
+            f"origin/{branch} advanced outside this release",
+            f"remote={remote_commit} base={base_commit} target={candidate}",
+        )
+    ancestor = _dev_git(repo, "merge-base", "--is-ancestor", base_commit, candidate)
+    if ancestor.returncode != 0:
+        _die(
+            6,
+            "release_not_fast_forward",
+            f"candidate {candidate} is not a descendant of {base_commit}",
+        )
+    changed_paths = _dev_git_value(
+        repo, "diff", "--name-only", base_commit, candidate
+    ).splitlines()
+    manager_changed = any(
+        path == "bin/capabilities" or path in _AUTHORING_ASSETS
+        for path in changed_paths
+    )
+    changed_capabilities = sorted({
+        parts[1]
+        for path in changed_paths
+        if len(parts := Path(path).parts) >= 3 and parts[0] == "capabilities"
+    })
+    report = _source_snapshot_report(
+        repo,
+        candidate,
+        manager_selfcheck=manager_changed,
+        audit_names=set(changed_capabilities),
+    )
+    if not report["ok"]:
+        _emit({
+            "source": source_id or str(repo),
+            "ref": candidate_ref,
+            "commit": candidate,
+            "ok": False,
+            "contract": report["contract"],
+            "failures": report["failures"],
+        })
+        sys.exit(7)
+    if not isinstance(state, dict):
+        state = {
+            "schema": "capabilities.source.release.v1",
+            "source": source_id,
+            "repo": str(repo),
+            "branch": branch,
+            "base_commit": base_commit,
+            "target_commit": candidate,
+            "changed_paths": changed_paths,
+        }
+        _write_json(state_path, state)
+    release_branch = f"capabilities-release/{candidate[:12]}"
+    release_ref = f"refs/heads/{release_branch}"
+    if remote_commit != candidate:
+        staged_remote = _dev_git(
+            repo, "push", "origin", f"{candidate}:{release_ref}", timeout=120
+        )
+        if staged_remote.returncode != 0:
+            state_path.unlink(missing_ok=True)
+            _die(
+                5,
+                "release_candidate_push_failed",
+                f"could not publish candidate ref {release_branch}",
+                staged_remote.stderr.strip() or staged_remote.stdout.strip() or None,
+            )
+        pushed = _dev_git(
+            repo, "push", "origin", f"{candidate}:refs/heads/{branch}", timeout=120
+        )
+        if pushed.returncode != 0:
+            refreshed = _dev_git(repo, "fetch", "origin", branch, timeout=120)
+            current_remote = remote_commit
+            if refreshed.returncode == 0:
+                current_remote = _dev_git_value(
+                    repo, "rev-parse", f"refs/remotes/origin/{branch}"
+                )
+            if current_remote not in {base_commit, candidate}:
+                _dev_git(repo, "push", "origin", "--delete", release_branch, timeout=120)
+                state_path.unlink(missing_ok=True)
+                _die(
+                    6,
+                    "release_remote_diverged",
+                    f"origin/{branch} advanced while the candidate was verifying",
+                    f"remote={current_remote} base={base_commit} target={candidate}",
+                )
+            _die(
+                5,
+                "release_pending",
+                f"candidate {candidate} is published but origin/{branch} did not accept it yet",
+                "wait for the required source-integrity status, then rerun the same release",
+            )
+    if local_commit != candidate:
+        merged = _dev_git(repo, "merge", "--ff-only", candidate, timeout=120)
+        if merged.returncode != 0:
+            _die(
+                6,
+                "release_local_update_failed",
+                f"origin was published but local {branch} could not fast-forward",
+                merged.stderr.strip() or merged.stdout.strip() or str(state_path),
+            )
+    installed_updates = []
+    installed = _installed()
+    for name in changed_capabilities:
+        meta = installed.get(name)
+        if meta is None or not _installed_matches_release(
+            meta, source_id, repo, remote_url
+        ):
+            continue
+        installed_updates.append(_activate_released_capability(
+            name, repo, source_id, remote_url, branch, candidate
+        ))
+    if installed_updates:
+        _regen_skills()
+    manager_update = None
+    if manager_changed and source_id == OFFICIAL_SOURCE_ID:
+        assets = {
+            rel: (repo / rel).read_bytes()
+            for rel in _AUTHORING_ASSETS
+        }
+        manager_update = _activate_manager_release(
+            (repo / "bin" / "capabilities").read_bytes(),
+            assets,
+            f"git:{remote_url}@{candidate}",
+        )
+    final_local = _dev_git_value(repo, "rev-parse", "HEAD")
+    if final_local != candidate:
+        _die(7, "release_incomplete", "local source checkout did not reach target")
+    cleanup_ref = _dev_git(
+        repo, "push", "origin", "--delete", release_branch, timeout=120
+    )
+    if cleanup_ref.returncode != 0 and "remote ref does not exist" not in (
+        cleanup_ref.stderr + cleanup_ref.stdout
+    ).lower():
+        _die(
+            5,
+            "release_ref_cleanup_failed",
+            f"release completed but candidate ref {release_branch} remains",
+            cleanup_ref.stderr.strip() or cleanup_ref.stdout.strip() or str(state_path),
+        )
+    state_path.unlink(missing_ok=True)
+    return {
+        "source": source_id or str(repo),
+        "branch": branch,
+        "base_commit": base_commit,
+        "commit": candidate,
+        "published": True,
+        "checkout_synced": True,
+        "verification_profile": (
+            "manager" if manager_changed
+            else "capability" if changed_capabilities
+            else "editorial"
+        ),
+        "changed_capabilities": changed_capabilities,
+        "installed_updates": installed_updates,
+        "manager_update": manager_update,
+        "ok": True,
+    }
+
+
+def cmd_source_release(source_id: str, git_ref: str) -> None:
+    root = _source_author_root(source_id)
+    entry = _source_entry(source_id)
+    branch = str(entry.get("ref") or "main")
+    _emit(_source_release(root, source_id, git_ref, branch))
 
 
 def cmd_search(query: str | None, source_id: str | None) -> None:
@@ -3695,8 +4288,8 @@ def cmd_new_capability(name: str, source_id: str, core_only: bool) -> None:
     _emit({"created": name, "source": source_id, "path": str(capdir),
            "executable": str(script), "core_only": core_only,
            "next": [f"edit only outside generated contract regions in {script}",
-                    f"capabilities source index {source_id}",
-                    f"capabilities source check {source_id}",
+                    f"git add {capdir}",
+                    f"capabilities source index {source_id} --staged",
                     f"capabilities install {name} --source {source_id}"]})
 
 
@@ -3959,10 +4552,11 @@ Create a package only with `capabilities new <name> --source <id>` (add
 Replace every scaffold placeholder and implement domain declarations, doctor,
 and the smallest useful verb surface outside those fences.
 
-Acceptance is fixed: `capabilities source index <id>`, `capabilities source
-check <id>`, then `capabilities install <name> --source <id>` for a local smoke
-test. Indexing and installation both run the full audit. There is no
-conformance override; free-form CLIs remain outside the manager.
+Acceptance is fixed: stage the intended files, run `capabilities source index
+<id> --staged`, commit, then prove the immutable result with `capabilities
+source verify <id> --ref HEAD`. `capabilities source release <id> --ref HEAD`
+owns publication and local reconciliation. There is no conformance override;
+free-form CLIs remain outside the manager.
 """,
         "repositories": f"""\
 # Capability source repositories
@@ -3984,12 +4578,19 @@ vendored `contract/`, and generated `.capability-source/catalog.json`.
         "publishing": """\
 # Publishing a capability source
 
-Before committing, run `capabilities source index <id>` and `capabilities source
-check <id>`, then smoke-install changed packages with `capabilities install
-<name> --source <id>`. Use ordinary git only from the path returned by
-`capabilities source path <id>`: `git add .`, commit intentionally, and `git
-push -u origin main`. The manager validates and records provenance; it does not
-commit or push.
+The release unit is an immutable Git commit. Stage the intended source changes,
+then run `capabilities source index <id> --staged`; the generated catalogue is
+derived from and added to that same Git index. Commit intentionally and prove
+the result with `capabilities source verify <id> --ref HEAD`.
+
+`capabilities source release <id> --ref HEAD` is the one publication boundary.
+It accepts only a verified fast-forward from a clean integration checkout,
+publishes a temporary candidate ref for the remote integrity check, advances the
+protected source branch, synchronizes that checkout, and reconciles locally
+installed changed payloads. The operation is idempotent: a pending or interrupted
+release resumes the same target commit; a different target is refused until that
+release is resolved. The manager never creates the commit because scope and
+message remain author judgment.
 
 Consumers attach the published repository with `capabilities source add <id>
 <git-url> [--ref <ref>]`, inspect it with `capabilities search --source <id>`,
@@ -4020,12 +4621,17 @@ changed packages, then run focused checks through `dev exec`. Parent environment
 is denied by default; `--inherit-env KEY` opts in one named value without putting
 the value on argv. `dev doctor` proves executable provenance and cleanup state.
 
-`dev stop` removes only clean worktrees whose commits are absent, merged, or
-patch-equivalent to published commits. `dev gc` applies the same rule to old
-sessions and retains anything dirty or unpublished. After consumer behavior is
-proven, hand the prepared commit to the source owner for one final source
-index/check, review, and publication; update the canonical installed capability
-and repeat the original smoke test outside the dev session.
+The source checkout is integration-only and must be clean before `dev start` or
+publication. After consumer behavior is proven, stage the intended source
+changes, derive the catalogue with `source index --staged`, and create one clean
+commit. `dev finish <session>` passes that commit to the source-level release
+transaction and removes the worktrees only after publication, checkout sync,
+and local registry reconciliation all succeed.
+
+`dev stop` remains the non-publishing cleanup primitive for an empty, already
+integrated, or patch-equivalent session. `dev gc` applies that preservation rule
+to old sessions. Dirty, unpublished, remotely diverged, or partially released
+work is retained with a precise refusal rather than silently discarded.
 """,
     }
     if topic not in guides:
@@ -4080,8 +4686,8 @@ cascade.
 
 ## 4. Verify mechanically, then by judgment
 
-- `capabilities source index <source-id>` to regenerate discovery metadata.
-- `capabilities source check <source-id>` until the full repository passes.
+- Stage intended files and run `capabilities source index <source-id> --staged`.
+- Commit, then run `capabilities source verify <source-id> --ref HEAD`.
 - Smoke-test: `doctor` against the real service; one read verb; one write
   verb if any.
 - Judgment pass: is each verb worth its place? Is the help written for an
@@ -4316,7 +4922,7 @@ def main() -> None:
         if not rest:
             _die(
                 6, "input",
-                "dev needs a subcommand: start, install, exec, doctor, list, stop, or gc",
+                "dev needs a subcommand: start, install, exec, doctor, list, finish, stop, or gc",
             )
         sub, dev_args = rest[0], rest[1:]
 
@@ -4375,6 +4981,10 @@ def main() -> None:
             if not dev_args:
                 _die(6, "input", "dev stop needs a session id")
             cmd_dev_stop(dev_args[0])
+        elif sub == "finish":
+            if not dev_args:
+                _die(6, "input", "dev finish needs a session id")
+            cmd_dev_finish(dev_args[0])
         elif sub == "gc":
             cmd_dev_gc(dev_opt("--older-than") or "7d")
         else:
@@ -4427,10 +5037,24 @@ def main() -> None:
             if len(pos) < 2:
                 _die(6, "input", "source check needs an id")
             cmd_source_check(pos[1])
+        elif sub == "verify":
+            if len(pos) < 2:
+                _die(6, "input", "source verify needs an id")
+            git_ref = opt("--ref")
+            if not git_ref:
+                _die(6, "input", "source verify needs --ref REF")
+            cmd_source_verify(pos[1], git_ref)
+        elif sub == "release":
+            if len(pos) < 2:
+                _die(6, "input", "source release needs an id")
+            git_ref = opt("--ref")
+            if not git_ref:
+                _die(6, "input", "source release needs --ref REF")
+            cmd_source_release(pos[1], git_ref)
         elif sub == "index":
             if len(pos) < 2:
                 _die(6, "input", "source index needs an id")
-            cmd_source_index(pos[1])
+            cmd_source_index(pos[1], staged=flag("--staged"))
         elif sub == "remove":
             if len(pos) < 2:
                 _die(6, "input", "source remove needs an id")

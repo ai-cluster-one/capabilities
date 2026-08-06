@@ -187,6 +187,35 @@ class TelegramClient:
     async def disconnect(self):
         pass
 """.lstrip())
+    fake_tl = fake_telethon / "tl"
+    fake_tl.mkdir()
+    (fake_tl / "__init__.py").write_text("")
+    (fake_tl / "types.py").write_text("""
+class MessageActionConferenceCall:
+    pass
+
+
+class MessageActionInviteToGroupCall:
+    pass
+
+
+class MessageService:
+    pass
+
+
+class UpdateNewMessage:
+    pass
+
+
+class DocumentAttributeAudio:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class DocumentAttributeFilename:
+    def __init__(self, *args, **kwargs):
+        pass
+""".lstrip())
 
 
 def _import_telegram_daemon(tmp: Path, settings: dict) -> object:
@@ -209,6 +238,10 @@ def _import_telegram_daemon(tmp: Path, settings: dict) -> object:
     _write_fake_telethon(fake_telethon)
     old_env = dict(os.environ)
     old_path = list(sys.path)
+    old_telethon_modules = {
+        name: module for name, module in sys.modules.items()
+        if name == "telethon" or name.startswith("telethon.")
+    }
     try:
         os.environ.update({
             "HOME": str(tmp / "home"),
@@ -224,6 +257,8 @@ def _import_telegram_daemon(tmp: Path, settings: dict) -> object:
             "TELEGRAM_SERVICE_STATE_DIR": str(tmp / "service-state"),
         })
         sys.path.insert(0, str(tmp / "fake"))
+        for name in old_telethon_modules:
+            sys.modules.pop(name, None)
         module_name = f"telegram_daemon_test_{time.time_ns()}"
         spec = importlib.util.spec_from_file_location(module_name, TELEGRAM_DAEMON)
         if spec is None or spec.loader is None:
@@ -236,6 +271,10 @@ def _import_telegram_daemon(tmp: Path, settings: dict) -> object:
         os.environ.clear()
         os.environ.update(old_env)
         sys.path[:] = old_path
+        for name in list(sys.modules):
+            if name == "telethon" or name.startswith("telethon."):
+                sys.modules.pop(name, None)
+        sys.modules.update(old_telethon_modules)
 
 
 def test_install_from_source_script_installs_bundle() -> None:
@@ -305,44 +344,7 @@ def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
                 },
             },
         }) + "\n")
-        (fake_telethon / "__init__.py").write_text("""
-import asyncio
-from types import SimpleNamespace
-
-
-class _NewMessage:
-    def __init__(self, *args, **kwargs):
-        pass
-
-
-class events:
-    NewMessage = _NewMessage
-
-
-class TelegramClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    async def connect(self):
-        pass
-
-    async def is_user_authorized(self):
-        return True
-
-    async def get_me(self):
-        return SimpleNamespace(first_name="Stub", id=42)
-
-    def on(self, _event):
-        def decorate(fn):
-            return fn
-        return decorate
-
-    async def run_until_disconnected(self):
-        await asyncio.Event().wait()
-
-    async def disconnect(self):
-        pass
-""".lstrip())
+        _write_fake_telethon(fake_telethon)
         env = dict(os.environ)
         env.update({
             "HOME": str(tmp / "home"),

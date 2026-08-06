@@ -38,6 +38,28 @@ def _run(env: dict[str, str], *args: str, check: bool = True):
     return result
 
 
+def _git(repo: Path, *args: str, check: bool = True):
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], text=True, capture_output=True,
+        timeout=60, check=False,
+    )
+    if check and result.returncode != 0:
+        raise AssertionError(
+            f"git {' '.join(args)} exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result
+
+
+def _commit(repo: Path, message: str) -> str:
+    _git(
+        repo,
+        "-c", "user.name=Test", "-c", "user.email=test@example.com",
+        "commit", "-m", message,
+    )
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
 def test_manager_and_generated_scaffold_each_have_one_pep723_block(tmp_path):
     assert MANAGER.read_text().splitlines().count("# /// script") == 1
 
@@ -214,3 +236,54 @@ def test_standalone_manager_has_complete_authoring_kit(tmp_path):
         tmp_path / "registry" / "sources" / "friend")
     assert Path(initialized["path"], "AUTHORING.md").is_file()
     assert Path(initialized["path"], "contract", "preamble.py").is_file()
+
+
+def test_staged_index_is_commit_exact_and_verify_rejects_worktree_hashes(tmp_path):
+    env = _env(tmp_path)
+    initialized = json.loads(_run(env, "source", "init", "personal").stdout)
+    workspace = Path(initialized["path"])
+    created = json.loads(_run(
+        env, "new", "demo", "--source", "personal").stdout)
+    script = Path(created["executable"])
+    script.write_text(script.read_text().replace(
+        "TODO: describe the capability's smallest useful surface.",
+        "Test capability with a completed managed manifest.",
+    ).replace(
+        "Replace this scaffold check with",
+        "Test readiness uses",
+    ))
+    _git(workspace, "add", ".")
+    indexed = json.loads(_run(
+        env, "source", "index", "personal", "--staged").stdout)
+    assert indexed["basis"] == "staged"
+    assert indexed["staged"] is True
+    _commit(workspace, "Initial valid source")
+    assert json.loads(_run(
+        env, "source", "verify", "personal", "--ref", "HEAD").stdout)["ok"] is True
+
+    staged_text = script.read_text().replace(
+        "Test readiness uses", "Staged readiness uses")
+    script.write_text(staged_text)
+    _git(workspace, "add", str(script.relative_to(workspace)))
+    script.write_text(staged_text + "\n# unstaged working-tree noise\n")
+    _run(env, "source", "index", "personal", "--staged")
+    committed = _commit(workspace, "Index the staged tree")
+    verified = json.loads(_run(
+        env, "source", "verify", "personal", "--ref", committed).stdout)
+    assert verified["ok"] is True
+    committed_script = _git(
+        workspace, "show", f"{committed}:capabilities/demo/bin/demo"
+    ).stdout
+    assert "unstaged working-tree noise" not in committed_script
+
+    _git(workspace, "restore", str(script.relative_to(workspace)))
+    script.write_text(script.read_text() + "\n# payload change left uncommitted\n")
+    _run(env, "source", "index", "personal")
+    _git(workspace, "add", ".capability-source/catalog.json")
+    bad_commit = _commit(workspace, "Commit only a worktree-derived catalog")
+    rejected = _run(
+        env, "source", "verify", "personal", "--ref", bad_commit, check=False)
+    assert rejected.returncode == 7
+    failure = json.loads(rejected.stdout)
+    assert failure["ok"] is False
+    assert "catalog" in failure["failures"]

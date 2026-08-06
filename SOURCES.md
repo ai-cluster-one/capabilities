@@ -41,7 +41,7 @@ Use `source init`, `source clone`, `source add`, and `source remove` to change
 it rather than editing it. `capabilities source list` is the supported way to
 inspect both this registry and the built-in `official` source.
 
-## Create and publish a source
+## Create and release a source
 
 ```sh
 capabilities source init personal \
@@ -55,19 +55,10 @@ authoring contract, and creates host-readable authoring instructions. `new`
 creates the canonical `capabilities/<name>/bin/<name>` bundle and stamps the
 generated contract regions. Never edit those fenced regions by hand.
 
-Before a commit:
-
-```sh
-capabilities source index personal
-capabilities source check personal
-capabilities install my-service --source personal
-git add .
-git commit -m "Add my-service capability"
-git push -u origin main
-```
-
-The manager does not commit or push. It makes the source deterministic,
-validates it, and records installation provenance.
+The release unit is a prepared Git commit. Run `capabilities guide publishing`
+for the live staged-index, immutable verification, and release transaction.
+The manager leaves commit scope and message to the author, then owns validation,
+publication, checkout synchronization, and local installed-payload reconciliation.
 
 ## Consume a source
 

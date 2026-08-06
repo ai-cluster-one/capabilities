@@ -84,6 +84,40 @@ def _consumer_repo(tmp_path: Path) -> Path:
     return consumer
 
 
+def _release_source_repo(tmp_path: Path) -> tuple[Path, Path]:
+    source = tmp_path / "release-source"
+    _init_repo(source)
+    (source / "bin").mkdir()
+    shutil.copy2(MANAGER, source / "bin" / "capabilities")
+    shutil.copy2(REPO / "capabilities.repo.json", source / "capabilities.repo.json")
+    for name in ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md"):
+        shutil.copy2(REPO / name, source / name)
+    shutil.copytree(REPO / "contract", source / "contract")
+    shutil.copytree(
+        REPO / "capabilities" / "askproject",
+        source / "capabilities" / "askproject",
+    )
+    (source / ".capability-source").mkdir()
+    (source / ".capability-source" / "catalog.json").write_text(
+        json.dumps({"capabilities": {}}) + "\n"
+    )
+    (source / "README.md").write_text("release fixture\n")
+    index_env = _env(tmp_path / "release-index")
+    indexed = subprocess.run(
+        [str(source / "bin" / "capabilities"), "source", "index", "official"],
+        cwd=source, env=index_env, text=True, capture_output=True, timeout=300,
+        check=False,
+    )
+    assert indexed.returncode == 0, indexed.stderr
+    _commit_all(source, "Initial releasable source")
+    remote = tmp_path / "release-remote.git"
+    remote.mkdir()
+    _git(remote, "init", "--bare", "--initial-branch", "main")
+    _git(source, "remote", "add", "origin", str(remote))
+    _git(source, "push", "-u", "origin", "main")
+    return source, remote
+
+
 def _env(tmp_path: Path) -> dict[str, str]:
     env = dict(os.environ)
     env.update(
@@ -438,3 +472,199 @@ def test_dev_stop_refuses_recorded_worktree_outside_session_data(tmp_path):
     assert _error(refused)["code"] == "unsafe_dev_path"
     assert source.is_dir()
     assert Path(started["source_worktree"]).is_dir()
+
+
+def test_dev_start_refuses_dirty_integration_checkout(tmp_path):
+    source, _remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    (source / "unfinished.txt").write_text("must move to a dev worktree\n")
+
+    refused = _run(
+        env,
+        "dev", "start", "askproject",
+        "--source", str(source),
+        "--consumer", str(consumer),
+        "--session", "dirty-source",
+        check=False,
+    )
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "source_checkout_dirty"
+
+
+def test_dev_finish_releases_commit_syncs_checkout_and_removes_session(tmp_path):
+    source, remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = json.loads(_run(
+        env,
+        "dev", "start", "askproject",
+        "--source", str(source),
+        "--consumer", str(consumer),
+        "--session", "finish-release",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    (worktree / "README.md").write_text("released from the dev worktree\n")
+    candidate = _commit_all(worktree, "Prepare release candidate")
+
+    finished = json.loads(_run(
+        env, "dev", "finish", "finish-release").stdout)
+    assert finished["ok"] is True
+    assert finished["release"]["commit"] == candidate
+    assert finished["release"]["published"] is True
+    assert finished["release"]["checkout_synced"] is True
+    assert finished["release"]["verification_profile"] == "editorial"
+    assert finished["cleanup"]["removed"] is True
+    assert _git(source, "rev-parse", "HEAD").stdout.strip() == candidate
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() == candidate
+    assert _git(source, "status", "--porcelain").stdout == ""
+    assert not worktree.exists()
+    listed = json.loads(_run(env, "dev", "list").stdout)
+    assert listed["sessions"] == []
+
+
+def test_dev_finish_refuses_dirty_main_before_publication(tmp_path):
+    source, remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = json.loads(_run(
+        env,
+        "dev", "start", "askproject",
+        "--source", str(source),
+        "--consumer", str(consumer),
+        "--session", "blocked-release",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    (worktree / "README.md").write_text("prepared candidate\n")
+    _commit_all(worktree, "Prepare blocked candidate")
+    before = _git(remote, "rev-parse", "refs/heads/main").stdout.strip()
+    (source / "unexpected.txt").write_text("dirty integration checkout\n")
+
+    refused = _run(
+        env, "dev", "finish", "blocked-release", check=False)
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "release_checkout_dirty"
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() == before
+    assert worktree.is_dir()
+
+
+def test_dev_finish_reconciles_changed_installed_capability(tmp_path):
+    source, _remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    installed = json.loads(_run(
+        env, "install", "askproject", "--from", str(source)).stdout)
+    registry = Path(installed["registry"])
+    started = json.loads(_run(
+        env,
+        "dev", "start", "askproject",
+        "--source", str(source),
+        "--consumer", str(consumer),
+        "--session", "payload-release",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    guide = worktree / "capabilities" / "askproject" / "guides" / "capability-changes.md"
+    marker = "\nRelease reconciliation fixture.\n"
+    guide.write_text(guide.read_text() + marker)
+    _git(worktree, "add", str(guide.relative_to(worktree)))
+    indexed = subprocess.run(
+        [str(worktree / "bin" / "capabilities"),
+         "source", "index", "official", "--staged"],
+        cwd=worktree, env=env, text=True, capture_output=True, timeout=300,
+        check=False,
+    )
+    assert indexed.returncode == 0, indexed.stderr
+    candidate = _commit_all(worktree, "Change installed capability payload")
+
+    finished = json.loads(_run(
+        env, "dev", "finish", "payload-release").stdout)
+    assert finished["release"]["changed_capabilities"] == ["askproject"]
+    assert finished["release"]["verification_profile"] == "capability"
+    assert finished["release"]["installed_updates"][0]["name"] == "askproject"
+    assert marker.strip() in (
+        registry / "guides" / "capability-changes.md"
+    ).read_text()
+    meta = json.loads((registry / "meta.json").read_text())
+    assert meta["source_commit"] == candidate
+    assert meta["source_dirty"] is False
+
+
+def test_dev_finish_refuses_remote_race_without_touching_session(tmp_path):
+    source, remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = json.loads(_run(
+        env,
+        "dev", "start", "askproject",
+        "--source", str(source),
+        "--consumer", str(consumer),
+        "--session", "remote-race",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    (worktree / "README.md").write_text("candidate from original base\n")
+    candidate = _commit_all(worktree, "Prepare candidate before remote race")
+
+    peer = tmp_path / "peer"
+    _git(tmp_path, "clone", str(remote), str(peer))
+    (peer / "peer.txt").write_text("remote advanced independently\n")
+    _commit_all(peer, "Advance remote independently")
+    _git(peer, "push", "origin", "main")
+    remote_head = _git(remote, "rev-parse", "refs/heads/main").stdout.strip()
+    assert remote_head != candidate
+
+    refused = _run(env, "dev", "finish", "remote-race", check=False)
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "release_remote_diverged"
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() == remote_head
+    assert worktree.is_dir()
+
+
+def test_dev_finish_resumes_after_remote_integrity_gate(tmp_path):
+    source, remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = json.loads(_run(
+        env,
+        "dev", "start", "askproject",
+        "--source", str(source),
+        "--consumer", str(consumer),
+        "--session", "pending-gate",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    (worktree / "README.md").write_text("candidate waits for integrity status\n")
+    candidate = _commit_all(worktree, "Prepare gated candidate")
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "while read old new ref; do\n"
+        "  if [ \"$ref\" = refs/heads/main ]; then\n"
+        "    echo 'required status pending' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "done\n"
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+
+    pending = _run(env, "dev", "finish", "pending-gate", check=False)
+    assert pending.returncode == 5
+    assert _error(pending)["code"] == "release_pending"
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() != candidate
+    assert _git(
+        remote, "rev-parse", f"refs/heads/capabilities-release/{candidate[:12]}"
+    ).stdout.strip() == candidate
+    assert worktree.is_dir()
+
+    hook.unlink()
+    finished = json.loads(_run(
+        env, "dev", "finish", "pending-gate").stdout)
+    assert finished["ok"] is True
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() == candidate
+    assert _git(
+        remote,
+        "show-ref",
+        "--verify",
+        f"refs/heads/capabilities-release/{candidate[:12]}",
+        check=False,
+    ).returncode != 0
+    assert not worktree.exists()
