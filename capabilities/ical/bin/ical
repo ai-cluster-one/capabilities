@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "pyobjc-framework-EventKit>=12.1",
+#     "pyobjc-framework-EventKit>=12.1; sys_platform == 'darwin'",
 # ]
 # ///
 """
