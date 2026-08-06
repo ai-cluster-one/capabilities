@@ -287,3 +287,45 @@ def test_staged_index_is_commit_exact_and_verify_rejects_worktree_hashes(tmp_pat
     failure = json.loads(rejected.stdout)
     assert failure["ok"] is False
     assert "catalog" in failure["failures"]
+
+
+def test_staged_index_uses_editorial_profile_for_docs_only_change(tmp_path):
+    env = _env(tmp_path)
+    initialized = json.loads(_run(env, "source", "init", "personal").stdout)
+    workspace = Path(initialized["path"])
+    created = json.loads(_run(
+        env, "new", "demo", "--source", "personal").stdout)
+    script = Path(created["executable"])
+    source = script.read_text().replace(
+        "TODO: describe the capability's smallest useful surface.",
+        "Test capability with a completed managed manifest.",
+    ).replace(
+        "Replace this scaffold check with",
+        "Test readiness uses",
+    )
+    marker_hook = '''if os.environ.get("UNCHANGED_MANIFEST_MARKER") and sys.argv[1:3] == ["manifest", "--json"]:
+    Path(os.environ["UNCHANGED_MANIFEST_MARKER"]).write_text("manifest executed\\n")
+
+
+'''
+    script.write_text(source.replace(
+        'if __name__ == "__main__":',
+        marker_hook + 'if __name__ == "__main__":',
+    ))
+    _git(workspace, "add", ".")
+    initial = json.loads(_run(
+        env, "source", "index", "personal", "--staged").stdout)
+    assert initial["verification_profile"] == "manager"
+    _commit(workspace, "Initial valid source")
+
+    authoring = workspace / "AUTHORING.md"
+    authoring.write_text(authoring.read_text() + "\nEditorial clarification.\n")
+    _git(workspace, "add", "AUTHORING.md")
+    marker = tmp_path / "manifest-ran"
+    editorial_env = dict(env)
+    editorial_env["UNCHANGED_MANIFEST_MARKER"] = str(marker)
+    indexed = json.loads(_run(
+        editorial_env, "source", "index", "personal", "--staged").stdout)
+
+    assert indexed["verification_profile"] == "editorial"
+    assert not marker.exists()

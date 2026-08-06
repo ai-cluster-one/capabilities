@@ -3682,6 +3682,19 @@ def _source_snapshot_report(
     }
 
 
+def _source_change_scope(changed_paths: list[str]) -> tuple[bool, set[str]]:
+    manager_changed = any(
+        path == "bin/capabilities" or path in _AUTHORING_ASSETS
+        for path in changed_paths
+    )
+    changed_capabilities = {
+        parts[1]
+        for path in changed_paths
+        if len(parts := Path(path).parts) >= 3 and parts[0] == "capabilities"
+    }
+    return manager_changed, changed_capabilities
+
+
 def cmd_source_index(source_id: str, staged: bool = False) -> None:
     root = _source_author_root(source_id)
     if not root.is_dir():
@@ -3689,7 +3702,22 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
              f"run `capabilities source refresh {source_id}`")
     if staged:
         tree = _dev_git_value(root, "write-tree")
-        report = _source_snapshot_report(root, tree)
+        head = _dev_git(root, "rev-parse", "--verify", "HEAD^{commit}")
+        if head.returncode == 0:
+            changed_paths = _dev_git_value(
+                root, "diff", "--name-only", head.stdout.strip(), tree
+            ).splitlines()
+        else:
+            changed_paths = _dev_git_value(
+                root, "ls-tree", "-r", "--name-only", tree
+            ).splitlines()
+        manager_changed, changed_capabilities = _source_change_scope(changed_paths)
+        report = _source_snapshot_report(
+            root,
+            tree,
+            manager_selfcheck=manager_changed,
+            audit_names=changed_capabilities,
+        )
         # A stale catalogue is the reason index exists, so it is not a blocker
         # while deriving the replacement. Contract or capability failures are.
         non_catalog_failures = {
@@ -3717,7 +3745,12 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
                 added.stderr.strip() or added.stdout.strip() or None,
             )
         final_tree = _dev_git_value(root, "write-tree")
-        verified = _source_snapshot_report(root, final_tree)
+        verified = _source_snapshot_report(
+            root,
+            final_tree,
+            manager_selfcheck=manager_changed,
+            audit_names=changed_capabilities,
+        )
         if not verified["ok"]:
             _emit({
                 "source": source_id,
@@ -3735,6 +3768,11 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
             "indexed": sorted(verified["expected"]["capabilities"]),
             "catalog": str(path),
             "staged": True,
+            "verification_profile": (
+                "manager" if manager_changed
+                else "capability" if changed_capabilities
+                else "editorial"
+            ),
             "ok": True,
         })
         return
@@ -4008,15 +4046,8 @@ def _source_release(
     changed_paths = _dev_git_value(
         repo, "diff", "--name-only", base_commit, candidate
     ).splitlines()
-    manager_changed = any(
-        path == "bin/capabilities" or path in _AUTHORING_ASSETS
-        for path in changed_paths
-    )
-    changed_capabilities = sorted({
-        parts[1]
-        for path in changed_paths
-        if len(parts := Path(path).parts) >= 3 and parts[0] == "capabilities"
-    })
+    manager_changed, changed_capability_names = _source_change_scope(changed_paths)
+    changed_capabilities = sorted(changed_capability_names)
     report = _source_snapshot_report(
         repo,
         candidate,
