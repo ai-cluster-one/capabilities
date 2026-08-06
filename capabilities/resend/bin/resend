@@ -1,0 +1,1137 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+"""resend — send-only email CLI over the Resend HTTP API (resend.com).
+
+USAGE
+  resend <command> [options]
+
+One-way by construction: the surface can deliver mail from a verified sending
+domain and inspect that domain's status — it has no read, receive, or mailbox
+surface at all. Identity-free: it sends as whatever sender RESEND_API_KEY and
+the selected connection authorize.
+
+CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. Each entry names its key's env var ("secret_env"); the value
+  resolves in a cascade (first non-empty wins):
+    1. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
+    2. user config    $XDG_CONFIG_HOME/resend/credentials.env (default ~/.config/resend/)
+    3. process env    the named env var
+  The secret has no flag — only its env-var NAME resolves it, never the
+  command line. The write gate is off by default, so a project that sends
+  declares a connection granting it in
+  <project>/capabilities/resend/connections.json:
+    {
+      "default": "sender",
+      "connections": {
+        "sender": { "secret_env": "RESEND_API_KEY",
+                    "from": "Agent <agent@example.com>",
+                    "allow_write": true,
+                    "allow_to": ["owner@example.com", "*@example.com"] }
+      }
+    }
+  The registry resolves project envelope first, else the machine-level
+  ~/.config/resend/connections.json; first found wins, never merged.
+
+  Per-connection keys:
+    secret_env    env var holding the API key (resolved through the cascade)
+    from          default From for `send` (overridden by --from)
+    allow_write   the write gate — `send` leaves the system, so it is off
+                  unless the connection grants it; a refused send exits 4
+    allow_to      optional recipient allow-list: exact addresses or
+                  `*@domain` globs, matched case-insensitively against every
+                  recipient (to + cc + bcc). Present ⇒ a non-matching
+                  recipient is refused (exit 4). Absent ⇒ any recipient once
+                  allow_write grants sending. Committed policy — nothing in
+                  the cascade lifts it.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+COMMANDS
+  connections
+      Where every connection's values resolve from (tier, source, secrets
+      masked). Local only — no network.
+
+  doctor [--connection <id>]
+      Validate key + API reachability (GET /domains) — every connection, or
+      one. A 403 counts as healthy-restricted: the key is valid but
+      sending-only, so the domain list is not visible to it. Exit 0 all
+      healthy / 2 missing-or-rejected key / 5 unreachable.
+
+  send --to ADDR [--to ADDR ...] --subject SUBJ (--text BODY | --html BODY)
+       [--cc ADDR ...] [--bcc ADDR ...] [--from FROM] [--reply-to ADDR]
+       [--idempotency-key KEY]
+      Deliver one email via POST /emails and print {"id", "from", "to"}.
+      --text/--html accept a literal body or `-` to read it from stdin (one
+      of the two may be `-`, not both). --from falls back to the
+      connection's `from`; without either the send is refused (exit 6).
+      --idempotency-key makes retries of the same logical send safe —
+      Resend deduplicates on it for 24h.
+
+  domains
+      List the account's sending domains and their verification status
+      (GET /domains). Read-only inspection; a sending-only key sees 403.
+
+Contract commands (the same on every capability):
+  resend stub                                 One-line awareness text.
+  resend manifest --json                      Machine-readable declaration.
+  resend guide [<topic>]                      Guide topics / one guide body,
+                                               fetched live from the docs base.
+  resend ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
+              [--note <text>]                  (capabilities/resend/identifiers.json).
+  resend refs                                 Menu of the project's reference
+                                               files for this capability.
+
+EXIT CODES
+  0 success · 2 auth/credentials · 3 not found · 4 policy refusal — the
+  project gate (capabilities/settings.json) on any verb, a send on a
+  connection without allow_write, or a recipient outside allow_to; ask the
+  user, never lift a gate yourself · 5 server/network · 6 input
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import NoReturn
+
+import httpx
+
+RESEND_API = "https://api.resend.com"
+TIMEOUT = httpx.Timeout(30.0)
+MAX_RETRIES = 3
+
+# --- Capability declaration — one home for every contract fact ---------------
+
+NAME = "resend"
+SUMMARY = ("Send-only email CLI over the Resend HTTP API — deliver mail from "
+           "a verified sending domain (send, write-gated with an optional "
+           "recipient allow-list), list sending domains and their "
+           "verification status (domains), and prove key + reachability "
+           "(doctor). One-way by construction: no read or receive surface.")
+SCOPE = "project"   # credential scope: "project" | "user"
+CRED_KEYS = [
+    {"key": "RESEND_API_KEY", "secret": True, "required": True,
+     "note": "API key from resend.com; a domain-restricted sending-only key is preferred"},
+]
+WRITE_VERBS: set = {"send"}   # a send leaves the system
+WRITE_DEFAULT = False   # off unless a connection grants allow_write
+DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
+TOPICS: list = []   # shipped guide topics
+STATE = False       # True when the capability writes session/cache state
+POST_INSTALL: list = []
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / "resend" / "credentials.env"
+KEY_NAME = "RESEND_API_KEY"
+
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding capabilities/, legacy .capabilities/,
+    .contextkit/config.toml, .env(.local), or .git.
+    Markers are read from the filesystem alone: the root is what the envelope
+    location is resolved against, so resolving one cannot depend on the other.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".contextkit" / "config.toml").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+_ENVELOPE_HOME: dict = {}
+
+
+def _contextkit_envelope(root: Path):
+    """Ask ContextKit where it keeps this project's envelope; None if it cannot.
+
+    $CAPABILITIES_PROJECT_ENVELOPE is the same answer handed over in advance.
+    """
+    import subprocess
+
+    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
+    if override:
+        candidate = Path(override)
+    else:
+        try:
+            proc = subprocess.run(["contextkit", "path", "capabilities"], cwd=root,
+                                  capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if not lines:
+            return None
+        candidate = Path(lines[0])
+    if not candidate.is_absolute():
+        return None
+    try:
+        resolved = candidate.resolve()
+        if root.resolve() not in resolved.parents:
+            return None
+    except OSError:
+        return None
+    return resolved
+
+
+def _envelope_home(root: Path) -> Path:
+    """The project's envelope root, resolved once per invocation.
+
+    ContextKit owns the location of a project it manages (`.contextkit/
+    config.toml`), so it is asked rather than assumed. Every other project — and
+    every ContextKit answer that does not arrive usable — keeps the envelope at
+    `<root>/capabilities`.
+    """
+    cached = _ENVELOPE_HOME.get(root)
+    if cached is not None:
+        return cached
+    home = root / "capabilities"
+    if (root / ".contextkit" / "config.toml").is_file():
+        home = _contextkit_envelope(root) or home
+    _ENVELOPE_HOME[root] = home
+    return home
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    The resolved envelope is canonical. A legacy `.capabilities/` remains
+    readable until `capabilities init` migrates it. If both exist, the canonical
+    tree wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = _envelope_home(root)
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _auth_context() -> dict | None:
+    """Optional runtime authority envelope passed by an ingress/service.
+
+    Absence means the ordinary project gate is the whole policy. Presence means
+    a request-scoped authority layer exists and must fail closed before any
+    credential or network work happens.
+    """
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return None
+    try:
+        if raw.lstrip().startswith("{"):
+            data = json.loads(raw)
+        else:
+            data = json.loads(Path(raw).read_text())
+    except (OSError, ValueError) as e:
+        _die(4, "auth_context_unreadable",
+             "runtime authority context could not be read",
+             f"{raw}: {e}")
+    if not isinstance(data, dict):
+        _die(4, "auth_context_invalid",
+             "runtime authority context is not an object")
+    return data
+
+
+def _auth_capability_allowed(rule) -> bool:
+    if rule is True or rule == "*":
+        return True
+    if rule in (False, None):
+        return False
+    if isinstance(rule, dict):
+        if rule.get("deny") is True:
+            return False
+        if rule.get("enabled") is False or rule.get("allow") is False:
+            return False
+        return True
+    return False
+
+
+def _auth_gate() -> None:
+    ctx = _auth_context()
+    if ctx is None:
+        return
+    allowed = ctx.get("allowed_capabilities")
+    if allowed is None:
+        return
+    if allowed is True or allowed == "*":
+        return
+    if isinstance(allowed, list):
+        if NAME in allowed or "*" in allowed:
+            return
+    elif isinstance(allowed, dict):
+        if _auth_capability_allowed(allowed.get(NAME, allowed.get("*"))):
+            return
+    else:
+        _die(4, "auth_context_invalid",
+             "runtime authority context has invalid allowed_capabilities")
+    source = ctx.get("source") or "runtime"
+    role = ctx.get("sender_role") or ctx.get("role") or "unknown"
+    chat = ctx.get("chat_id") or "unknown"
+    _die(4, "capability_not_authorized",
+         f"{NAME} is not authorized for this {source} request",
+         f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
+
+
+def _policy_entry(path: Path):
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        _die(6, "bad_policy", f"cannot read capability policy {path}: {e}")
+    capabilities = data.get("capabilities") if isinstance(data, dict) else None
+    if not isinstance(capabilities, dict):
+        _die(6, "bad_policy", f"{path} is not a capability policy",
+             'expected {"capabilities": {"<name>": {"enabled": true}}}')
+    entry = capabilities.get(NAME)
+    if entry is not None and (not isinstance(entry, dict)
+                              or set(entry) != {"enabled"}
+                              or not isinstance(entry.get("enabled"), bool)):
+        _die(6, "bad_policy", f"invalid {NAME} policy entry in {path}",
+             'expected {"enabled": true|false}')
+    return entry
+
+
+def _project_enabled_explicitly() -> bool:
+    """True only for an explicit project enabled entry; global inheritance is
+    deliberately insufficient for project-owned service activation."""
+    root = _project_root()
+    if root is None:
+        return False
+    entry = _policy_entry(_project_capabilities_dir(root) / "settings.json")
+    return isinstance(entry, dict) and entry.get("enabled") is True
+
+
+def _require_project_enabled_for_service() -> Path:
+    root = _project_root()
+    if root is None or not _project_enabled_explicitly():
+        _die(4, "project_enable_required",
+             f"{NAME} service activation requires an explicit project enable",
+             f"ask the user, then run `capabilities enable {NAME} --project` "
+             "before service init/start/run")
+    return root
+
+
+def _gate() -> None:
+    """Project policy overrides global policy; absence inherits, and absence at
+    both scopes is default deny. Safe local discovery verbs remain available so
+    a disabled capability can be understood and configured before use.
+
+    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
+    is stricter and runs first, before credentials or network calls.
+    """
+    _auth_gate()
+    verb = sys.argv[1] if len(sys.argv) > 1 else "help"
+    service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    service_contract = globals().get("SERVICE")
+    if isinstance(service_contract, dict) and verb == "service" \
+            and service_action in {"init", "start", "run"}:
+        _require_project_enabled_for_service()
+    if verb in {"help", "stub", "manifest", "connections"}:
+        return
+    root = _project_root()
+    project_file = (_project_capabilities_dir(root) / "settings.json") \
+        if root is not None else None
+    project_entry = _policy_entry(project_file) if project_file else None
+    global_file = _CONFIG_HOME / "capabilities" / "settings.json"
+    global_entry = _policy_entry(global_file)
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is True:
+        return
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({project_file})",
+             f"ask the user whether to enable {NAME} for this project; if yes, "
+             f"run `capabilities enable {NAME} --project`")
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is True:
+        return
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is False:
+        message = f"{NAME} is disabled globally ({global_file})"
+    else:
+        message = f"{NAME} is not enabled by project or global policy"
+    _die(4, "not_enabled", message,
+         f"ask the user whether to enable {NAME} only for this project or "
+         f"globally for every project; then run `capabilities enable {NAME} "
+         "--project` or `--global` exactly as requested")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project's active capabilities/."""
+    root = _project_root()
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract — the declaration surface --------------------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import urllib.error as _ue
+    import urllib.request as _ur
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10.0) as resp:
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(text); return
+    except _ue.HTTPError as e:
+        if e.code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if e.code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        err = f"upstream returned {e.code}"
+    except _ue.URLError as e:
+        err = str(e.reason)
+    except OSError as e:
+        err = str(e)
+    if cache.exists():
+        sys.stderr.write(json.dumps(
+            {"warning": f"upstream unreachable; serving cached copy ({err})"},
+            ensure_ascii=False) + "\n")
+        _emit(cache.read_text()); return
+    _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _render_ids_markdown(data: dict) -> str:
+    """Render the {label: {value, note}} envelope as the labelled markdown
+    list the manager's `capabilities ids <NAME>` also produces — one shared
+    format across the ids surface and the identifiers section of `help`."""
+    lines: list[str] = []
+    for label, entry in sorted(data.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        v = entry.get("value")
+        vs = f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+        line = f"- **{label}**: {vs}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _identifiers_section() -> str:
+    """The Identifiers block appended to the bare top-level help — deterministic
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
+    agent following the `<NAME> help` startup protocol loads the discovered
+    labels/values/notes into context at once. Empty when no project envelope
+    or nothing recorded (do not bloat help with an empty section)."""
+    envdir = _env_dir()
+    if envdir is None:
+        return ""
+    ids_file = envdir / "identifiers.json"
+    if not ids_file.exists():
+        return ""
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    header = (
+        "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
+        f"Structural lookups discovered for `{NAME}` in this project. Fetch a single\n"
+        f"raw value with `{NAME} ids get <label>`; the full envelope is also at\n"
+        f"`capabilities ids {NAME}`.\n\n"
+    )
+    return header + _render_ids_markdown(data) + "\n"
+
+
+def _cmd_help() -> None:
+    """Bare top-level help: the CLI's HELP body (module-level `HELP` if
+    defined, else the module docstring), then the project's Identifiers
+    section. Only fires when no extra args follow — per-verb help stays
+    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    g = globals()
+    text = g.get("HELP") or g.get("__doc__") or ""
+    if text.startswith("\n"):
+        text = text.lstrip("\n")
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    section = _identifiers_section()
+    if section:
+        sys.stdout.write(section)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved.
+
+    `help` is a contract verb only when bare (no extra args) — the top-level
+    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
+    through to the CLI so per-verb help stays clean."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    elif cmd == "help" and len(argv) == 1:
+        _cmd_help()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged. Every connection-bearing
+    capability requires a registry, even when it declares only one connection."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    project_path = (envdir / "connections.json") if envdir else None
+    homes = ([str(project_path)] if project_path else []) + \
+            [str(_CONFIG_HOME / NAME / "connections.json")]
+    _die(6, "connections_required",
+         f"{NAME} requires an explicit connections registry",
+         "create one of: " + ", ".join(homes) +
+         '; expected {"default": "<id>", "connections": {"<id>": { ... }}}')
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. A connection's own
+    `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        _die(6, "connections_required",
+             f"{NAME} requires an explicit connections registry")
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+# <<< contract: connections <<<
+
+
+# ── credentials ─────────────────────────────────────────────────────────────
+
+def _connections_report() -> dict:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, _ = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        value, tier, source = _resolve_env_key(KEY_NAME)
+        report["default"] = "default"
+        report["connections"]["default"] = {
+            "allow_write": WRITE_DEFAULT,
+            "keys": [_key_report(KEY_NAME, True, True, value, tier, source)]}
+        return report
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys = [_key_report(secret_env, True, True, value, tier, source)]
+        else:
+            keys = [_key_report("secret_env", False, True, None, None, None)]
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    return report
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+def _resolve_key(entry: dict | None, cid: str) -> str:
+    """The selected connection's key: an entry resolves its named secret_env;
+    the implicit default the flat key. The secret never travels on argv."""
+    if entry is None:
+        key = _resolve_env_key(KEY_NAME)[0]
+        if not key:
+            _die(2, "missing_credentials",
+                 f"{KEY_NAME} is required",
+                 f"set it in a project .env(.local), {CREDENTIALS_ENV}, "
+                 f"or the environment")
+        return key
+    secret_env = entry.get("secret_env")
+    if not secret_env:
+        _die(6, "no_secret_env", f"connection {cid!r} is missing 'secret_env'")
+    key = _resolve_env_key(secret_env)[0]
+    if not key:
+        _die(2, "missing_credentials",
+             f"env var {secret_env} (for connection {cid!r}) is unset",
+             f"set {secret_env} in the project's .env / .env.local, "
+             f"{CREDENTIALS_ENV}, or the environment")
+    return key
+
+
+# ── HTTP with 429/5xx backoff ───────────────────────────────────────────────
+
+def _client(key: str) -> httpx.Client:
+    return httpx.Client(base_url=RESEND_API, timeout=TIMEOUT,
+                        headers={"Authorization": f"Bearer {key}"})
+
+
+def _request(client: httpx.Client, method: str, path: str,
+             body: dict | None = None, extra_headers: dict | None = None):
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, path, json=body, headers=extra_headers)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "timeout", f"request timed out: {method} {path}",
+                 "Resend was unresponsive")
+        except httpx.RequestError as e:
+            _die(5, "network_error", f"network error: {e}",
+                 "check connectivity to api.resend.com")
+
+        last_status = resp.status_code
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", str(attempt * 1.5)))
+            if attempt < MAX_RETRIES:
+                time.sleep(retry_after)
+                continue
+            _die(5, "rate_limited", "rate-limited by Resend", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "server_error", f"Resend returned {resp.status_code}",
+                 (resp.text or "")[:300], status=resp.status_code)
+
+        if resp.status_code >= 400:
+            msg = (resp.text or "").strip()[:400] or "unknown error"
+            try:
+                j = resp.json()
+                if isinstance(j, dict) and j.get("message"):
+                    msg = j["message"]
+            except ValueError:
+                pass
+            if resp.status_code in (401, 403):
+                _die(2, "unauthorized", msg,
+                     "RESEND_API_KEY invalid or lacks scope", status=resp.status_code)
+            if resp.status_code == 404:
+                _die(3, "not_found", msg, status=resp.status_code)
+            _die(6, "invalid_request", msg, status=resp.status_code)
+
+        try:
+            return resp.json()
+        except ValueError:
+            return {}
+
+    _die(5, "exhausted_retries",
+         f"exhausted {MAX_RETRIES} attempts on {method} {path}", status=last_status)
+
+
+# ── doctor ──────────────────────────────────────────────────────────────────
+
+def _check_connection(key: str) -> dict:
+    """One probe: GET /domains. 200 proves key + reachability and shows the
+    sending domains; 403 proves the key is valid but sending-only (the domain
+    list is not visible to it) — still healthy for this CLI's purpose."""
+    try:
+        with _client(key) as c:
+            resp = c.get("/domains")
+    except httpx.TimeoutException:
+        return {"ok": False, "category": 5, "error": "request timed out"}
+    except httpx.RequestError as e:
+        return {"ok": False, "category": 5, "error": f"network error: {e}"}
+    if resp.status_code == 200:
+        try:
+            data = resp.json().get("data") or []
+        except ValueError:
+            data = []
+        return {"ok": True, "domains": [
+            {"name": d.get("name"), "status": d.get("status")} for d in data]}
+    if resp.status_code == 403:
+        return {"ok": True, "restricted": True,
+                "note": "key is valid but sending-only; domain list not visible"}
+    try:
+        msg = (resp.json() or {}).get("message")
+    except ValueError:
+        msg = None
+    if resp.status_code in (400, 401):
+        # Resend answers 400 validation_error (not 401) to a malformed key here
+        return {"ok": False, "category": 2,
+                "error": msg or "Resend rejected the key",
+                "status": resp.status_code}
+    return {"ok": False, "category": 5,
+            "error": msg or f"Resend returned {resp.status_code}",
+            "status": resp.status_code}
+
+
+def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
+    """Every connection bare; one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category."""
+    _doctor_gate(_connections_report(), wanted)
+    if wanted is not None or reg is None:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        secret_env = KEY_NAME if entry is None else entry.get("secret_env")
+        if not secret_env:
+            res = {"ok": False, "category": 6,
+                   "error": f"connection {cid!r} is missing 'secret_env'"}
+        else:
+            key = _resolve_env_key(secret_env)[0]
+            if not key:
+                res = {"ok": False, "category": 2,
+                       "error": f"{secret_env} not found in a project .env, "
+                                f"{CREDENTIALS_ENV}, or the environment"}
+            else:
+                res = _check_connection(key)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
+
+
+# ── send ────────────────────────────────────────────────────────────────────
+
+def _addr_only(value: str) -> str:
+    """The bare address from `Name <addr>` or a bare addr, lowercased."""
+    v = value.strip()
+    if "<" in v and v.endswith(">"):
+        v = v[v.rindex("<") + 1:-1]
+    return v.strip().lower()
+
+
+def _enforce_allow_to(entry: dict | None, recipients: list[str]) -> None:
+    """Committed recipient policy: when the connection carries `allow_to`,
+    every recipient (to + cc + bcc) must match an exact address or a
+    `*@domain` glob, case-insensitively. Nothing in the cascade lifts it."""
+    if entry is None:
+        return
+    allow = entry.get("allow_to")
+    if allow is None:
+        return
+    if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
+        _die(6, "bad_config", "`allow_to` must be a list of address patterns")
+    patterns = [a.strip().lower() for a in allow]
+    for rcpt in recipients:
+        addr = _addr_only(rcpt)
+        if not any(fnmatch.fnmatchcase(addr, pat) for pat in patterns):
+            _die(4, "recipient_not_allowed",
+                 f"recipient {addr!r} is outside this connection's allow_to policy",
+                 "Do not widen the policy yourself — ask the user; the "
+                 "allow-list lives on the connection in connections.json.")
+
+
+def _body_arg(value: str | None, other: str | None, flag: str) -> str | None:
+    """A body flag's value; `-` reads stdin (only one of --text/--html may)."""
+    if value is None:
+        return None
+    if value == "-":
+        if other == "-":
+            _die(6, "input", "only one of --text/--html may read stdin")
+        data = sys.stdin.read()
+        if not data.strip():
+            _die(6, "input", f"{flag} - was given but stdin is empty")
+        return data
+    return value
+
+
+def cmd_send(client: httpx.Client, args, entry: dict | None) -> dict:
+    sender = args.from_ or (entry or {}).get("from")
+    if not sender:
+        _die(6, "no_sender",
+             "no From address: pass --from or set `from` on the connection")
+    text = _body_arg(args.text, args.html, "--text")
+    html = _body_arg(args.html, args.text, "--html")
+    if not text and not html:
+        _die(6, "no_body", "one of --text or --html is required")
+    payload: dict = {"from": sender, "to": args.to, "subject": args.subject}
+    if text:
+        payload["text"] = text
+    if html:
+        payload["html"] = html
+    if args.cc:
+        payload["cc"] = args.cc
+    if args.bcc:
+        payload["bcc"] = args.bcc
+    if args.reply_to:
+        payload["reply_to"] = args.reply_to
+    headers = {"Idempotency-Key": args.idempotency_key} if args.idempotency_key else None
+    resp = _request(client, "POST", "/emails", body=payload, extra_headers=headers)
+    return {"id": (resp or {}).get("id"), "from": sender, "to": args.to}
+
+
+# ── domains ─────────────────────────────────────────────────────────────────
+
+def cmd_domains(client: httpx.Client) -> list:
+    resp = _request(client, "GET", "/domains")
+    return [{"name": d.get("name"), "status": d.get("status"),
+             "region": d.get("region"), "created_at": d.get("created_at")}
+            for d in (resp or {}).get("data") or []]
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    _gate()                      # every verb passes the project gate first
+    _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
+    p = argparse.ArgumentParser(prog="resend", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("help")
+    sub.add_parser("doctor")
+    sub.add_parser("domains")
+
+    sp = sub.add_parser("send")
+    sp.add_argument("--to", action="append", required=True)
+    sp.add_argument("--subject", required=True)
+    sp.add_argument("--text", default=None, help="plain-text body, or - for stdin")
+    sp.add_argument("--html", default=None, help="HTML body, or - for stdin")
+    sp.add_argument("--cc", action="append", default=None)
+    sp.add_argument("--bcc", action="append", default=None)
+    sp.add_argument("--from", dest="from_", default=None,
+                    help="From address; defaults to the connection's `from`")
+    sp.add_argument("--reply-to", dest="reply_to", default=None)
+    sp.add_argument("--idempotency-key", dest="idempotency_key", default=None)
+
+    # `--connection <id>` is a global selector accepted anywhere on the line
+    # (extracted before argparse so it works after the subcommand too).
+    argv = sys.argv[1:]
+    wanted_conn: str | None = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--connection" and i + 1 < len(argv):
+            wanted_conn = argv[i + 1]; i += 2; continue
+        if a.startswith("--connection="):
+            wanted_conn = a.split("=", 1)[1]; i += 1; continue
+        cleaned.append(a); i += 1
+
+    args = p.parse_args(cleaned)
+    if args.cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+
+    reg, _ = _connections_registry()
+    if args.cmd == "doctor":
+        cmd_doctor(reg, wanted_conn)
+        return
+
+    cid, entry = _select_connection(reg, wanted_conn)
+    allow_write = WRITE_DEFAULT if entry is None else \
+        bool(entry.get("allow_write", WRITE_DEFAULT))
+    _write_gate(cid, allow_write, args.cmd)
+    if args.cmd == "send":
+        _enforce_allow_to(entry, list(args.to) + list(args.cc or []) + list(args.bcc or []))
+    key = _resolve_key(entry, cid)
+    try:
+        with _client(key) as c:
+            if args.cmd == "send":
+                _emit(cmd_send(c, args, entry))
+            elif args.cmd == "domains":
+                _emit(cmd_domains(c))
+            else:
+                _die(6, "unknown_command", f"no handler for {args.cmd!r}")
+    finally:
+        del key
+
+
+if __name__ == "__main__":
+    main()

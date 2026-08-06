@@ -90,6 +90,11 @@
       "payload_sha256": "1b12b86a61bc31433b0a3af89660d69266d57dda219b9b6d5cfd87e213aabda2",
       "summary": "Credential harness around the official `railway` CLI — resolves a project-scoped Railway token, injects it, and forwards your command straight to `railway` (everything but railwayc's own verbs passes through untouched); the command surface is `railway help`."
     },
+    "resend": {
+      "path": "capabilities/resend",
+      "payload_sha256": "93e98335cdd90b9062f586e1c2c8f4dbf0ab5fd66b9b75a4f1b786dc16ea796f",
+      "summary": "Send-only email CLI over the Resend HTTP API — deliver mail from a verified sending domain (send, write-gated with an optional recipient allow-list), list sending domains and their verification status (domains), and prove key + reachability (doctor). One-way by construction: no read or receive surface."
+    },
     "routine": {
       "path": "capabilities/routine",
       "payload_sha256": "bee31a14c5eb32b79bdf7700a239f30c3bc53821314a66d7f3fbc4eb91f67f02",
