@@ -243,6 +243,70 @@ def _log(message: str) -> None:
     sys.stderr.flush()
 
 
+def _service_worker_context() -> bool:
+    """True when this CLI invocation belongs to the live assistant daemon.
+
+    Worker subprocesses normally reach the bundled wrapper through PATH. A
+    login shell may reorder PATH, though, so the real CLI must enforce the same
+    process-boundary rules rather than relying on the wrapper alone.
+    """
+    if os.environ.get("TELEGRAM_PROGRESS_OUTBOX") \
+            or os.environ.get("TELEGRAM_WORKER_SESSION"):
+        return True
+    authority = _auth_context()
+    return bool(authority and authority.get("source") == "telegram")
+
+
+def _enforce_service_worker_chat_scope(chat: str) -> None:
+    """Keep the real CLI's fallback path under the wrapper's chat scope."""
+    authority = _auth_context()
+    if not authority:
+        return
+    capabilities = authority.get("allowed_capabilities") or {}
+    if not isinstance(capabilities, dict):
+        return
+    rule = capabilities.get(NAME, capabilities.get("*"))
+    if not isinstance(rule, dict) or rule.get("scope") != "current_chat":
+        return
+    current = str(authority.get("chat_id") or "")
+    if str(chat) in (current, "current", "$current"):
+        return
+    _die(4, "chat_scope_denied",
+         "telegram is limited to the current chat for this request",
+         f"requested={chat}; current_chat_id={current}")
+
+
+def _queue_service_worker_send(chat: str, text: str) -> dict | None:
+    """Route a worker's send through the daemon instead of its live session.
+
+    The daemon owns the connection and drains this outbox. Returning None means
+    this is an ordinary operator invocation and the normal MTProto path applies.
+    """
+    raw_outbox = os.environ.get("TELEGRAM_PROGRESS_OUTBOX")
+    if not raw_outbox:
+        return None
+    _enforce_service_worker_chat_scope(chat)
+    clean = text.strip()
+    if clean in ("", "-", ".", "..."):
+        return {"ok": True, "queued": "telegram-service-progress"}
+    outbox = Path(raw_outbox).expanduser()
+    record = {
+        "time": datetime.now(timezone.utc).timestamp(),
+        "chat": chat,
+        "text": clean,
+        "reply_to": os.environ.get("TELEGRAM_PROGRESS_REPLY_TO") or None,
+        "chat_type": os.environ.get("TELEGRAM_PROGRESS_CHAT_TYPE") or None,
+    }
+    try:
+        outbox.parent.mkdir(parents=True, exist_ok=True)
+        with outbox.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        _die(6, "service_outbox_write_failed",
+             f"cannot queue Telegram worker message: {exc}", str(outbox))
+    return {"ok": True, "queued": "telegram-service-progress"}
+
+
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
 # --- Error reporting ---------------------------------------------------------
@@ -2152,6 +2216,11 @@ def _service_stop_result(connection_flag: str | None, session_flag: str | None,
     import signal
     import time
 
+    if _service_worker_context():
+        _die(4, "service_self_stop_refused",
+             "a Telegram service worker cannot stop its own supervising daemon",
+             "use the daemon's channel control command, or stop the service from an operator terminal")
+
     root = _service_project_root()
     cid, paths = _service_state_dir(root, connection_flag, session_flag)
     pid = _read_pid(paths["pid"])
@@ -2393,6 +2462,9 @@ def main() -> None:
             connection_flag = a.split("=", 1)[1]; i += 1; continue
         cleaned.append(a); i += 1
 
+    if session_flag is None and os.environ.get("TELEGRAM_WORKER_SESSION"):
+        session_flag = os.environ["TELEGRAM_WORKER_SESSION"]
+
     connection_flag, session_flag = _auth_connection_gate(connection_flag, session_flag)
 
     args = p.parse_args(cleaned)
@@ -2440,7 +2512,9 @@ def main() -> None:
         elif args.cmd == "search":
             _emit(asyncio.run(cmd_search(cfg, args.chat, args.query, args.limit, args.json)))
         elif args.cmd == "send":
-            _emit(asyncio.run(cmd_send(cfg, args.chat, args.text)))
+            queued = _queue_service_worker_send(args.chat, args.text)
+            _emit(queued if queued is not None
+                  else asyncio.run(cmd_send(cfg, args.chat, args.text)))
         elif args.cmd == "download":
             _emit(asyncio.run(cmd_download(cfg, args.chat, args.msgid, args.json)))
         elif args.cmd == "export":

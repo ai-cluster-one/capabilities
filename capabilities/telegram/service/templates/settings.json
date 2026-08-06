@@ -6,6 +6,7 @@
     "default_role": "direct_user"
   },
   "allowed_users": {},
+  "group_defaults": {},
   "allowed_groups": {},
   "control": {
     "roles": {

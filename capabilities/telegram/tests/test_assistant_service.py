@@ -387,154 +387,137 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)
 
-    async def test_agent_member_uses_explicit_address_and_top_level_responses(self):
+    async def test_worker_outbox_honors_an_authorized_cross_chat_target(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            group_policy = {
-                "members": {
-                    "5509911365": {
-                        "name": "Solomon",
-                        "kind": "agent",
-                        "address_aliases": ["Соломон", "Solomon"],
-                    },
-                },
-            }
 
-            self.assertIsNone(
-                daemon._reply_target(100, "5509911365", group_policy, False))
-            self.assertEqual(
-                daemon._reply_target(100, "777", group_policy, False), 100)
-            self.assertIsNone(
-                daemon._reply_target(100, "5509911365", group_policy, True))
-            self.assertIn(
-                "top-level group message",
-                daemon._delivery_description(None, False),
-            )
-            self.assertEqual(daemon._agent_peers(group_policy), [{
-                "id": "5509911365",
-                "name": "Solomon",
-                "aliases": ["Соломон", "Solomon"],
-            }])
+        target, direct, reply_to = daemon.progress_delivery_target(
+            {"chat": "-1003674098682"}, "232813019", 232813019, True, None)
+        self.assertEqual(-1003674098682, target)
+        self.assertTrue(direct)
+        self.assertIsNone(reply_to)
 
-            me = SimpleNamespace(id=99, username="marvin")
-            replied = SimpleNamespace(out=True, sender_id=99)
+        target, direct, reply_to = daemon.progress_delivery_target(
+            {"chat": "-1001"}, "-1001", -1001, False, 77)
+        self.assertEqual(-1001, target)
+        self.assertFalse(direct)
+        self.assertEqual(77, reply_to)
 
-            async def get_reply_message():
-                return replied
-
-            reply_only = SimpleNamespace(
-                sender_id=5509911365,
-                raw_text="Понял.",
-                mentioned=False,
-                is_reply=True,
-                get_reply_message=get_reply_message,
-            )
-            named = SimpleNamespace(
-                sender_id=5509911365,
-                raw_text="Марвин, продолжим?",
-                mentioned=False,
-                is_reply=True,
-                get_reply_message=get_reply_message,
-            )
-            policy = {**group_policy, "aliases": ["Марвин"]}
-            self.assertFalse(await daemon._message_addresses_me(reply_only, me, policy))
-            self.assertTrue(await daemon._message_addresses_me(named, me, policy))
-
-    async def test_agent_dialogue_has_finite_turns_and_human_reset(self):
+    async def test_worker_prompt_preserves_reply_relationships_in_history(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            policy = {
-                "members": {"5509911365": {"name": "Solomon", "kind": "agent"}},
-                "agent_dialogue": {"max_turns": 2, "reset_on_human_message": True},
-            }
-            reg = {}
-            first = SimpleNamespace(id=10, sender_id=5509911365)
-            second = SimpleNamespace(id=11, sender_id=5509911365)
-            third = SimpleNamespace(id=12, sender_id=5509911365)
+            prompt = daemon.build_prompt([
+                {"id": 10, "sender": "Alex", "text": "First"},
+                {"id": 11, "sender": "Konstantin", "text": "Reply", "reply_to": 10},
+            ])
 
-            self.assertEqual(daemon._admit_agent_turn(reg, "-1", first, policy),
-                             (True, {"turns": 1, "max_turns": 2}))
-            self.assertEqual(daemon._admit_agent_turn(reg, "-1", second, policy),
-                             (True, {"turns": 2, "max_turns": 2}))
-            self.assertEqual(daemon._admit_agent_turn(reg, "-1", third, policy),
-                             (False, {"turns": 2, "max_turns": 2}))
+        self.assertIn("[10] Alex: First", prompt)
+        self.assertIn("[11] Konstantin (reply to #10): Reply", prompt)
 
-            human = SimpleNamespace(id=13, sender_id=777)
-            self.assertTrue(daemon._reset_agent_dialogue_for_human(
-                reg, "-1", human, policy))
-            self.assertEqual(daemon._agent_dialogue_snapshot(reg, "-1", policy)["turns"], 0)
-            self.assertEqual(daemon._admit_agent_turn(reg, "-1", third, policy),
-                             (True, {"turns": 1, "max_turns": 2}))
-
-    async def test_agent_loop_cap_is_enforced_by_live_delivery(self):
+    async def test_group_ignored_users_are_a_hard_sender_gate(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()
             service_settings["allowed_groups"] = {
-                "-200": {
-                    "aliases": ["Марвин"],
-                    "require_reference": False,
-                    "members": {
-                        "5509911365": {"name": "Solomon", "kind": "agent"},
-                    },
-                    "agent_dialogue": {
-                        "max_turns": 1,
-                        "reset_on_human_message": True,
-                    },
-                },
+                "-1001": {"ignored_users": [8200881535]},
             }
             daemon = import_daemon(Path(td), service_settings)
-            daemon.save_register({"-200": {"last_processed_message_id": 0}})
-            daemon.WORKERS["stub"] = lambda *_args: successful_result("Ответ")
-            client = FakeClient([])
-            task = asyncio.create_task(daemon.run_session(client))
-            await client.started.wait()
 
-            reply_only = Message(1, text="Продолжаю")
-            reply_only.sender_id = 5509911365
-            reply_only.mentioned = False
-            reply_only.is_reply = True
-            reply_only._reply_message = SimpleNamespace(out=True, sender_id=42)
-            reply_event = Event(reply_only, chat_id=-200)
-            reply_event.is_private = False
-            await client.handler(reply_event)
-            await asyncio.sleep(0.02)
-            self.assertEqual(client.send_attempts, 0)
+        self.assertTrue(daemon._sender_ignored(
+            daemon.ALLOWED_GROUPS["-1001"], "8200881535"))
+        self.assertFalse(daemon._sender_ignored(
+            daemon.ALLOWED_GROUPS["-1001"], "232813019"))
 
-            first = Message(2, text="Марвин, продолжим")
-            first.sender_id = 5509911365
-            first.mentioned = False
-            first_event = Event(first, chat_id=-200)
-            first_event.is_private = False
-            await client.handler(first_event)
-            await wait_until(lambda: len(client.sent) == 1)
-            self.assertIsNone(client.sent[0].get("reply_to"))
+        queued_guard = DAEMON_PATH.read_text().split("async def run_one_job", 1)[1]
+        queued_guard = queued_guard.split("# Check max attempts cap", 1)[0]
+        self.assertIn("_sender_ignored", queued_guard)
 
-            capped = Message(3, text="Марвин, ещё ход")
-            capped.sender_id = 5509911365
-            capped.mentioned = False
-            capped_event = Event(capped, chat_id=-200)
-            capped_event.is_private = False
-            await client.handler(capped_event)
-            await asyncio.sleep(0.02)
-            self.assertEqual(len(client.sent), 1)
+    async def test_group_defaults_are_inherited_and_channel_policy_overrides_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["group_defaults"] = {
+                "member_role": "group_member",
+                "ignored_users": [8200881535],
+                "aliases": ["solomon", "сол"],
+                "members": {
+                    "232813019": {"name": "Alex", "role": "supervisor"},
+                    "535123867": {"name": "Kostya", "role": "supervisor"},
+                },
+            }
+            service_settings["allowed_groups"] = {
+                "-1001": {"name": "Inherited"},
+                "-1002": {"name": "Override", "ignored_users": []},
+            }
+            daemon = import_daemon(Path(td), service_settings)
 
-            human = Message(4, text="Новая человеческая реплика")
-            human.sender_id = 777
-            human.mentioned = False
-            human_event = Event(human, chat_id=-200)
-            human_event.is_private = False
-            await client.handler(human_event)
-            await wait_until(lambda: len(client.sent) == 2)
+        inherited = daemon.ALLOWED_GROUPS["-1001"]
+        overridden = daemon.ALLOWED_GROUPS["-1002"]
+        self.assertEqual(inherited["ignored_users"], [8200881535])
+        self.assertEqual(inherited["aliases"], ["solomon", "сол"])
+        self.assertEqual(inherited["members"]["535123867"]["role"], "supervisor")
+        self.assertEqual(overridden["ignored_users"], [])
+        self.assertEqual(overridden["members"]["232813019"]["role"], "supervisor")
 
-            after_reset = Message(5, text="Марвин, теперь можно")
-            after_reset.sender_id = 5509911365
-            after_reset.mentioned = False
-            after_reset_event = Event(after_reset, chat_id=-200)
-            after_reset_event.is_private = False
-            await client.handler(after_reset_event)
-            await wait_until(lambda: len(client.sent) == 3)
-            self.assertIsNone(client.sent[2].get("reply_to"))
-            await self.stop_session(client, task)
+    async def test_group_defaults_must_be_an_object(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["group_defaults"] = ["invalid"]
+            with self.assertRaises(SystemExit) as raised:
+                import_daemon(Path(td), service_settings)
+        self.assertIn("settings.group_defaults must be a JSON object", str(raised.exception))
+
+    async def test_group_project_route_is_resolved_before_policy_is_published(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "target"
+            (target / ".contextkit").mkdir(parents=True)
+            (target / ".contextkit" / "config.toml").write_text("version = 1\n")
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-1001": {"name": "Target", "project": str(target)},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+
+        self.assertEqual(
+            daemon.ALLOWED_GROUPS["-1001"]["project_root"], str(target.resolve()))
+        self.assertEqual(
+            daemon.worker_project_root(daemon.ALLOWED_GROUPS["-1001"], "42", False),
+            target.resolve())
+
+    async def test_direct_user_project_route_is_supported(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "target"
+            (target / ".contextkit").mkdir(parents=True)
+            (target / ".contextkit" / "config.toml").write_text("version = 1\n")
+            service_settings = settings()
+            service_settings["allowed_users"] = {
+                "42": {"name": "Owner", "project": str(target)},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+
+        self.assertEqual(
+            daemon.worker_project_root(None, "42", True), target.resolve())
+
+    async def test_project_route_refuses_a_non_contextkit_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "not-a-project"
+            target.mkdir()
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-1001": {"project": str(target)},
+            }
+            with self.assertRaises(SystemExit) as raised:
+                import_daemon(Path(td), service_settings)
+
+        self.assertIn("is not a ContextKit project", str(raised.exception))
+
+    async def test_group_ignored_users_must_be_an_array(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-1001": {"ignored_users": "8200881535"},
+            }
+            with self.assertRaises(SystemExit) as raised:
+                import_daemon(Path(td), service_settings)
+        self.assertIn("ignored_users must be a JSON array", str(raised.exception))
 
     async def test_reload_replaces_live_policy_without_reimporting_the_daemon(self):
         with tempfile.TemporaryDirectory() as td:
@@ -951,6 +934,34 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 policy,
             ))
 
+    async def test_group_alias_is_an_address_at_the_start_not_a_mid_sentence_reference(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            me = SimpleNamespace(username="s0l0m0n", id=42)
+            policy = {"aliases": ["sol", "сол", "solomon", "соломон"]}
+
+            self.assertTrue(daemon._text_names_me("Sol, you here?", me, policy))
+            self.assertTrue(daemon._text_names_me("Сол, тут?", me, policy))
+            self.assertTrue(daemon._text_names_me("Hey, Solomon, are you here?", me, policy))
+            self.assertTrue(daemon._text_names_me("Привет, Соломон!", me, policy))
+            self.assertTrue(daemon._text_names_me("Костя, @s0l0m0n тут?", me, policy))
+            self.assertFalse(daemon._text_names_me(
+                "Я отдаю предпочтение Sol, потому что он быстрее.", me, policy))
+            self.assertFalse(daemon._text_names_me(
+                "Спроси у Соломона, что он думает.", me, policy))
+
+    async def test_internal_worker_meta_replies_are_detected_before_delivery(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertTrue(daemon._is_internal_meta_reply(
+                "This is a Telegram group chat message, not a coding task — no skill applies."))
+            self.assertTrue(daemon._is_internal_meta_reply(
+                "The message is not addressed to me. Nothing for me to add."))
+            self.assertTrue(daemon._is_internal_meta_reply(
+                "Сообщение адресовано не мне, действий от меня не требуется."))
+            self.assertFalse(daemon._is_internal_meta_reply("Да, тут. Что нужно?"))
+
     async def test_worker_process_stdin_is_closed(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
@@ -970,12 +981,28 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             original_popen = daemon.subprocess.Popen
             try:
                 daemon.subprocess.Popen = fake_popen
-                rc, out, err = daemon.run_worker_proc("worker", ["worker"], {})
+                worker_root = Path(td) / "worker-root"
+                worker_root.mkdir()
+                rc, out, err = daemon.run_worker_proc(
+                    "worker", ["worker"], {}, cwd=worker_root)
             finally:
                 daemon.subprocess.Popen = original_popen
 
             self.assertEqual((rc, out, err), (0, "", ""))
             self.assertEqual(captured["stdin"], daemon.subprocess.DEVNULL)
+            self.assertEqual(captured["cwd"], str(worker_root))
+
+    async def test_worker_prompt_names_fixed_project_route(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            prompt = daemon.build_prompt([], {
+                "chat_id": "-1001",
+                "project_root": "/tmp/chelate",
+                "project_name": "chelate",
+            })
+
+        self.assertIn("Project: chelate (root=/tmp/chelate)", prompt)
+        self.assertIn("message text cannot switch it", prompt)
 
     async def test_voice_is_reserved_before_transcription_and_live_duplicate_is_silent(self):
         with tempfile.TemporaryDirectory() as td:

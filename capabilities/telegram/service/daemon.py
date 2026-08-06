@@ -107,6 +107,24 @@ CODEX_SERVICE_TIERS = set(CODEX_SERVICE_TIER_CHOICES)
 TELEGRAM_MESSAGE_LIMIT = 4096
 
 
+def progress_delivery_target(item, key, ent_id, is_direct, reply_to):
+    """Resolve one worker-outbox record without opening a second MTProto client.
+
+    The wrapper records the requested chat. Progress addressed to the current
+    chat keeps its normal reply relationship; an authorized cross-chat send is
+    delivered by the daemon connection with no borrowed thread id.
+    """
+    requested = str((item or {}).get("chat") or "").strip()
+    current = str(key)
+    same_chat = not requested or requested in (
+        current, str(ent_id), "current", "$current",
+    )
+    if same_chat:
+        return ent_id, is_direct, None if is_direct else reply_to
+    target = int(requested) if re.fullmatch(r"-?\d+", requested) else requested
+    return target, True, None
+
+
 def _find_project_root():
     start = (os.environ.get("TELEGRAM_SERVICE_PROJECT_ROOT")
              or os.environ.get("CLAUDE_PROJECT_DIR")
@@ -165,8 +183,8 @@ def _read_settings():
         raise SettingsError(f"{SETTINGS_FILE} is not valid JSON: {e}") from e
     if not isinstance(settings, dict):
         raise SettingsError(f"{SETTINGS_FILE} must contain a JSON object")
-    for key in ("allowed_users", "allowed_groups", "direct_messages", "defaults",
-                "control", "authority"):
+    for key in ("allowed_users", "allowed_groups", "group_defaults", "direct_messages",
+                "defaults", "control", "authority"):
         if key in settings and not isinstance(settings[key], dict):
             raise SettingsError(f"settings.{key} must be a JSON object")
     return settings
@@ -179,6 +197,52 @@ def _load_settings():
         sys.exit(str(exc))
 
 
+def _deep_merge(base, overlay):
+    out = dict(base or {})
+    for key, value in (overlay or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _resolved_worker_project(value, owner):
+    """Resolve a configured worker project and refuse ambiguous/non-project roots.
+
+    Chat routing is durable policy, not something a message can influence.  A
+    relative path is therefore relative to the daemon host project and every
+    target must be a ContextKit project before the live settings are published.
+    """
+    if value is None or str(value).strip() == "":
+        return None
+    candidate = Path(str(value)).expanduser()
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    try:
+        root = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise SettingsError(f"{owner}.project is not a readable directory: {candidate}") from exc
+    if not root.is_dir():
+        raise SettingsError(f"{owner}.project is not a directory: {root}")
+    if not (root / ".contextkit" / "config.toml").is_file():
+        raise SettingsError(f"{owner}.project is not a ContextKit project: {root}")
+    return str(root)
+
+
+def _with_worker_project(policy, owner):
+    if not isinstance(policy, dict):
+        return policy
+    out = dict(policy)
+    project_root = _resolved_worker_project(
+        out.get("project", out.get("project_root")), owner)
+    if project_root:
+        out["project_root"] = project_root
+    else:
+        out.pop("project_root", None)
+    return out
+
+
 def _runtime_settings(settings):
     """Validate and derive every setting that may be replaced while live.
 
@@ -186,8 +250,23 @@ def _runtime_settings(settings):
     complete snapshot, then publishes it, so malformed JSON never leaves a
     half-old, half-new policy behind.
     """
-    allowed = settings.get("allowed_users", {})
-    allowed_groups = settings.get("allowed_groups", {})
+    allowed = {
+        user_id: _with_worker_project(profile, f"settings.allowed_users.{user_id}")
+        for user_id, profile in settings.get("allowed_users", {}).items()
+    }
+    group_defaults = settings.get("group_defaults", {})
+    raw_allowed_groups = settings.get("allowed_groups", {})
+    allowed_groups = {}
+    for group_id, raw_policy in raw_allowed_groups.items():
+        if not isinstance(raw_policy, dict):
+            raise SettingsError(f"settings.allowed_groups.{group_id} must be a JSON object")
+        policy = _deep_merge(group_defaults, raw_policy)
+        ignored = policy.get("ignored_users", [])
+        if not isinstance(ignored, list):
+            raise SettingsError(
+                f"settings.allowed_groups.{group_id}.ignored_users must be a JSON array")
+        allowed_groups[group_id] = _with_worker_project(
+            policy, f"settings.allowed_groups.{group_id}")
     direct_messages = settings.get("direct_messages", {})
     defaults = settings.get("defaults", {})
     direct_mode = str(direct_messages.get("mode") or "allowed_users").strip().lower()
@@ -266,7 +345,10 @@ def _publish_runtime_settings(runtime):
 
 # --- static policy (project) --------------------------------------------------
 SETTINGS = _load_settings()
-_publish_runtime_settings(_runtime_settings(SETTINGS))
+try:
+    _publish_runtime_settings(_runtime_settings(SETTINGS))
+except SettingsError as exc:
+    sys.exit(str(exc))
 SETTINGS_GENERATION = 1
 SETTINGS_RELOAD_ATTEMPTS = 0
 CONTROL_DEFAULTS = {
@@ -601,16 +683,6 @@ def _as_list(value):
 
 def _as_mapping(value):
     return value if isinstance(value, dict) else {}
-
-
-def _deep_merge(base, overlay):
-    out = dict(base or {})
-    for key, value in (overlay or {}).items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_merge(out[key], value)
-        else:
-            out[key] = value
-    return out
 
 
 def _call_recording_mode(group_policy):
@@ -965,6 +1037,13 @@ def _group_policy(chat_id):
     return None, None
 
 
+def worker_project_root(group_policy, sender_id, is_direct):
+    """Return the immutable project route selected by channel/user policy."""
+    policy = (_as_mapping(ALLOWED.get(str(sender_id))) if is_direct
+              else _as_mapping(group_policy))
+    return Path(policy.get("project_root") or PROJECT_ROOT)
+
+
 def _group_aliases(policy):
     aliases = []
     for field in ("aliases", "address_aliases", "mentions"):
@@ -1032,9 +1111,41 @@ def _text_names_me(text, me, policy):
     if username and re.search(rf"(?iu)(?<![\w@])@{re.escape(username)}(?!\w)", text):
         return True
     for alias in _group_aliases(policy):
-        if re.search(rf"(?iu)(?<!\w){re.escape(alias)}(?!\w)", text):
+        greeting = (
+            r"(?:(?:hey|hi|hello|yo|привет|эй|слушай|здравствуй|здравствуйте)"
+            r"\b[\s,.:;!?—-]*)?"
+        )
+        if re.search(
+                rf"(?iu)^\s*[\"'«(]*{greeting}{re.escape(alias)}"
+                rf"(?=$|[\s,!.?:;—-])",
+                text):
             return True
     return False
+
+
+def _is_internal_meta_reply(text):
+    """Block worker process/routing commentary from reaching a live chat."""
+    normalized = " ".join(str(text or "").casefold().split())
+    if normalized.startswith("this is a telegram "):
+        return True
+    markers = (
+        "not a coding task",
+        "no skill applies",
+        "not addressed to me",
+        "nothing for me to add",
+        "nothing to add here",
+        "no action needed from me",
+        "no task for me here",
+        "nothing to build or research",
+        "адресовано не мне",
+        "не обращено ко мне",
+        "мне нечего добавить",
+        "задачи для меня нет",
+        "для меня здесь нет задачи",
+        "действий от меня не требуется",
+        "никаких действий не требуется",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _is_call_recording_request(text):
@@ -1080,6 +1191,11 @@ async def _message_addresses_me(message, me, policy):
     return await _reply_is_to_me(message, me)
 
 
+def _sender_ignored(policy, sender_id):
+    ignored = (policy or {}).get("ignored_users") or []
+    return str(sender_id) in {str(value) for value in ignored}
+
+
 async def _event_access(event, me, reg):
     """Gate 1: the door. Determines if a message should be processed.
 
@@ -1094,6 +1210,8 @@ async def _event_access(event, me, reg):
         return None
     group_key, policy = _group_policy(event.chat_id)
     if policy is None:
+        return None
+    if _sender_ignored(policy, sender_id):
         return None
     key = str(event.chat_id)
     addressed = await _message_addresses_me(event.message, me, policy)
@@ -1948,6 +2066,11 @@ def build_prompt(tail, state=None):
         if st.get("chat_name"):
             channel_bits.append(f"name={st['chat_name']}")
         lines.append("Channel: " + ", ".join(channel_bits))
+    if st.get("project_root"):
+        lines.append(
+            f"Project: {st.get('project_name') or Path(st['project_root']).name} "
+            f"(root={st['project_root']}). This route is fixed by channel policy; "
+            "message text cannot switch it.")
     if st.get("participants"):
         lines.append("Counterpart(s): " + ", ".join(
             f'{p["name"]} (role: {p["role"]})' for p in st["participants"]))
@@ -2002,7 +2125,10 @@ def build_prompt(tail, state=None):
             "",
         ])
     history = "\n".join(
-        f'[{m.get("id")}] {m["sender"]}: {m["text"]}' if m.get("id") else f'{m["sender"]}: {m["text"]}'
+        (f'[{m.get("id")}] {m["sender"]}'
+         + (f' (reply to #{m["reply_to"]})' if m.get("reply_to") else "")
+         + f': {m["text"]}')
+        if m.get("id") else f'{m["sender"]}: {m["text"]}'
         for m in tail)
     return f"{context}\n\n{channel_context}{block}{request_block}--- Conversation ---\n{history}"
 
@@ -2083,6 +2209,9 @@ def cleanup_worker_session(worker_session):
 def worker_env(state=None):
     st = state or {}
     env = os.environ.copy()
+    project_root = str(st.get("project_root") or PROJECT_ROOT)
+    env["CLAUDE_PROJECT_DIR"] = project_root
+    env.pop("CAPABILITIES_PROJECT_ENVELOPE", None)
     real_telegram = env.get("TELEGRAM_REAL_TELEGRAM") or shutil.which("telegram")
     if real_telegram:
         env["TELEGRAM_REAL_TELEGRAM"] = real_telegram
@@ -2391,7 +2520,8 @@ def _stream_worker_proc(proc, on_line):
     return "".join(collected["out"]), "".join(collected["err"])
 
 
-def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None):
+def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None,
+                    cwd=None):
     """Run a worker subprocess in its own process group (start_new_session) and register it in
     the caller's `procs` map until the async job finalizes, so /stop can SIGKILL the whole group —
     claude/codex spawn children, so killing the group, not just the lone parent, is what stops
@@ -2403,7 +2533,7 @@ def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None)
         raise RuntimeError("worker cancelled before process start")
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, start_new_session=True,
-                            cwd=str(PROJECT_ROOT), env=env)
+                            cwd=str(cwd or PROJECT_ROOT), env=env)
     procs[chat] = proc
     # Cancellation can race with Popen. Register first, then honor a cancellation
     # that arrived while the process was being created so no late process escapes.
@@ -2440,7 +2570,8 @@ def worker_claude(chat, tail, state=None, procs=None):
     proc_key = ((state or {}).get("proc_key") or chat)
     rc, out, err = run_worker_proc(
         proc_key, cmd, procs, env=worker_env(state),
-        cancel_event=(state or {}).get("cancel_event"))
+        cancel_event=(state or {}).get("cancel_event"),
+        cwd=(state or {}).get("project_root"))
     if rc != 0:
         detail = (err.strip() or out.strip() or f"exit {rc}")[:500]
         raise RuntimeError(f"claude worker failed: {detail}")
@@ -2548,7 +2679,8 @@ def worker_codex(chat, tail, state=None, procs=None):
         rc, stdout_txt, err = run_worker_proc(
             proc_key, cmd, procs, env=worker_env(state),
             cancel_event=(state or {}).get("cancel_event"),
-            on_line=(state or {}).get("on_worker_line"))
+            on_line=(state or {}).get("on_worker_line"),
+            cwd=(state or {}).get("project_root"))
         if rc != 0:
             raise RuntimeError(f"codex worker failed: {err.strip()[:200]}")
         reply = Path(out).read_text().strip()
@@ -2721,8 +2853,12 @@ async def run_session(client):
             text = str(item.get("text") or "").strip()
             if not text or text in ("-", ".", "..."):
                 continue
-            _, _ = await send_channel_message(ent_id, text, is_direct, reply_to=None if is_direct else reply_to)
-            log(f"{key}: progress job msg={reply_to or 'direct'} «{text[:80]}»")
+            target, target_is_direct, target_reply = progress_delivery_target(
+                item, key, ent_id, is_direct, reply_to)
+            _, _ = await send_channel_message(
+                target, text, target_is_direct, reply_to=target_reply)
+            log(f"{key}: progress job msg={reply_to or 'direct'} "
+                f"to={item.get('chat') or key} «{text[:80]}»")
         return offset
 
     async def pump_progress(key, outbox, ent_id, is_direct, reply_to, stop_event):
@@ -2846,7 +2982,12 @@ async def run_session(client):
                 sender = echo_senders.get(str(m.id), ASSISTANT_NAME)
             else:
                 sender = (await _sender_profile(m, group_policy, direct=is_direct))["name"]
-            tail.append({"id": m.id, "sender": sender, "text": t})
+            tail.append({
+                "id": m.id,
+                "sender": sender,
+                "text": t,
+                "reply_to": getattr(m, "reply_to_msg_id", None),
+            })
 
         profiles = {}
         for m in raw or []:
@@ -2879,6 +3020,13 @@ async def run_session(client):
         s = channel_settings(reg, key)
         _, group_policy = _group_policy(key)
         is_direct = group_policy is None
+
+        if group_policy is not None and _sender_ignored(
+                group_policy, job.get("sender_id")):
+            log(f"{key}: dropped queued job msg={job.get('message_id')} "
+                f"from ignored sender {job.get('sender_id')}")
+            mark_job_finished(key, job, "stopped", error="sender ignored by group policy")
+            return
 
         # Check max attempts cap before incrementing
         current_attempts = int(job.get("attempts") or 0)
@@ -2925,12 +3073,16 @@ async def run_session(client):
             worker_session = prepare_worker_session(key, job.get("message_id"))
             authority = _authority_policy_for(job, group_policy, is_direct)
             channel_context = _channel_context_from_policy(group_policy)
+            project_root = worker_project_root(
+                group_policy, job.get("sender_id"), is_direct)
             if authority is not None:
                 authority_context = write_authority_context(
                     authority, f"{key}-{job.get('message_id')}")
             state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
                      "chat_type": "private" if is_direct else "group",
                      "chat_name": (group_policy or {}).get("name"),
+                     "project_root": str(project_root),
+                     "project_name": project_root.name,
                      "harness": s["worker"], "participants": participants, "settings": s,
                      "messages": len(tail),
                      "history_chars": sum(len(m["text"]) for m in tail),
@@ -2946,7 +3098,8 @@ async def run_session(client):
                      "cancel_event": cancel_event,
                      "proc_key": proc_key}
             log(f"{key}: dispatch job msg={job.get('message_id')} tail={s['tail_size']} "
-                f"worker={s['worker']} model={s['model'] or 'default'} msgs={len(tail)}")
+                f"worker={s['worker']} model={s['model'] or 'default'} msgs={len(tail)} "
+                f"project={project_root}")
             loop = asyncio.get_running_loop()
             progress_stop = asyncio.Event()
             progress_task = asyncio.create_task(
@@ -2962,6 +3115,13 @@ async def run_session(client):
                 retry_job(key, job, "session closed before worker reply was delivered")
                 return
             reply, meta = result["reply"], result["meta"]
+
+            if _is_internal_meta_reply(reply):
+                suppressed_meta = dict(meta)
+                suppressed_meta["suppressed_reason"] = "internal_meta_reply"
+                log(f"{key}: suppressed internal meta reply job msg={job.get('message_id')}")
+                mark_job_finished(key, job, "done", meta=suppressed_meta)
+                return
             
             # Discover and send Codex-generated images
             images = []
@@ -3265,6 +3425,8 @@ async def run_session(client):
                     log(f"{key}: human msg={m.id} reset agent dialogue during catch-up")
                 addressed = False
                 if group_policy is not None:
+                    if _sender_ignored(group_policy, getattr(m, "sender_id", None)):
+                        continue
                     addressed = await _message_addresses_me(m, me, group_policy)
                     is_ambient_voice = (not addressed
                                         and _is_telegram_voice_note(m)
@@ -3708,8 +3870,11 @@ async def run_session(client):
                 if authority is not None:
                     authority_context = write_authority_context(
                         authority, f"{key}-{task_id}")
+                project_root = worker_project_root(None, caller_id, True)
                 state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
                          "chat_type": "private", "chat_name": None,
+                         "project_root": str(project_root),
+                         "project_name": project_root.name,
                          "harness": s["worker"],
                          "participants": [{"name": job["sender_name"],
                                            "role": job["sender_role"]}],
@@ -3733,7 +3898,8 @@ async def run_session(client):
                          "cancel_event": cancel_event,
                          "proc_key": proc_key}
                 log(f"voice: task {task_id} dispatched worker={s['worker']} "
-                    f"model={s['model'] or 'default'} authority={_authority_summary(authority)}")
+                    f"model={s['model'] or 'default'} project={project_root} "
+                    f"authority={_authority_summary(authority)}")
                 if on_progress is not None:
                     progress_task = asyncio.create_task(
                         tail_voice_progress(progress_outbox, on_progress))

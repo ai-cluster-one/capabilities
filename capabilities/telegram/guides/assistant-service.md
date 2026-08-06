@@ -22,6 +22,11 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
 
    - Set `connection` or rely on the default in `capabilities/telegram/connections.json`.
    - Add `allowed_users` and `allowed_groups`.
+   - Put policy shared by every allowed group in `group_defaults`. Each
+     `allowed_groups.<chat_id>` object inherits that policy and may override it.
+   - Add a group's `ignored_users` array when another bot or integration must be
+     visible in chat but must never dispatch this assistant; queued jobs from an
+     ignored sender are dropped on restart too.
    - Add optional per-channel `context_file` or short inline `context` entries when a chat needs its own soft prompt overlay.
    - Review `control.roles`: this hard gate limits who may run service control commands such as `/set`, `/reload`, and `/stop`.
    - Review `authority.roles`: this request-scoped hard gate limits which capability CLIs a worker may invoke for each sender role.
@@ -65,6 +70,8 @@ Use `telegram service stop` or foreground `run` for supervisor-managed processes
 
 After editing `settings.json`, use `telegram service reload`. The daemon validates the complete replacement before publishing it, keeps its PID and Telegram connection, and records the settings generation in `health.json`. Invalid JSON or a connection change is refused with the old settings left active; changing the selected connection still requires a real restart. The same operation is available as `/reload` and as the live-call `reload_service` tool only when the caller's `control.roles` policy permits `reload` (the shipped default grants it only to `supervisor`). A worker may invoke the CLI form only when its request authority role is `supervisor`; an external terminal without request authority remains an operator surface.
 
+An allowed group or allowed direct-user profile may set `"project"` to an absolute path or a path relative to the daemon host project. The daemon resolves and validates that route during startup/reload, requires a ContextKit project at the target, and launches every text worker for that channel from the target root. The route is static policy: message text cannot select or change it. Channels without a route run in the daemon host project. Only the worker changes project; the Telegram connection, register, call handling, and service controls remain owned by the daemon host.
+
 ## State Layout
 
 For a connection named `assistant`, runtime state is:
@@ -86,15 +93,31 @@ The auth session and service runtime files are separate. Worker session copies l
 ## Behavior
 
 - Direct messages are accepted according to `direct_messages.mode` and `allowed_users`.
-- Group messages are accepted only for `allowed_groups` and only when addressed by mention, reply, or configured alias unless the group policy sets `require_reference` to `false`.
+- Group messages are accepted only for `allowed_groups` and only when addressed
+  by mention, reply, or a configured alias used as an opening form of address
+  (optionally after a short greeting), unless the group policy sets
+  `require_reference` to `false`. Merely discussing the assistant by name in
+  the middle of a message does not dispatch it.
+- `group_defaults` is deep-merged into every allowed group before access,
+  routing, recording, transcription, control roles, and worker context are
+  resolved. A channel's own values win; arrays replace the inherited array.
 - Each addressed message becomes its own queued job.
+- Worker replies that expose routing or process commentary such as "not a
+  coding task", "no skill applies", or "not addressed to me" are suppressed
+  before Telegram delivery. The prompt also tells workers to answer casual
+  addressed conversation naturally instead of classifying it.
 - The daemon performs protocol catch-up plus bounded watermark reconciliation when a Telegram session connects and at the configured sync interval. This recovers messages received while it was down and update packets the MTProto client could not deserialize.
 - `telegram service status` reports update-stream health from `health.json`; a live PID with a stale sync watermark is not reported as healthy.
 - `telegram service reload` applies policy and worker/voice defaults without disconnecting an active call. Prompt files are already read per request or call; reload is for `settings.json`.
 - A message is reserved in the persistent job register before voice transcription or any echo is attempted. Live re-delivery and startup catch-up therefore cannot transcribe or echo the same voice message twice.
 - Group final replies and progress updates are sent as replies to the addressed message. Direct-chat replies are plain messages.
 - A group member entry may set `"kind": "agent"` for another automation peer, plus `"address_aliases": ["Solomon"]` for deliberate handoffs in the worker prompt. A Telegram reply from that peer is then context rather than an implicit invocation: the peer must explicitly name or mention the assistant. Final responses, progress, control responses, transcription echoes, and error notices triggered by that peer are sent as new group messages rather than Telegram replies. Set group-level `"agent_dialogue": {"max_turns": 4, "reset_on_human_message": true}` to hard-limit consecutive accepted agent turns; further agent requests are silently consumed until a human message resets the counter.
-- `telegram send <chat> <text>` inside a worker writes to the daemon progress outbox instead of sending directly.
+- `telegram send <chat> <text>` inside a worker writes to the daemon progress
+  outbox instead of sending directly; the daemon honours the requested chat
+  after the worker authority gate has approved its scope.
+- The real Telegram CLI enforces the same outbox routing when a login shell
+  reorders `PATH`, and it refuses `telegram service stop` from a service worker:
+  a child process cannot stop and then restart its own supervising daemon.
 - Workers can be `codex`, `claude`, or `stub`; `/set` and `/status` in Telegram adjust or inspect per-channel runtime settings when `control.roles` allows the sender role to run that command.
 - Worker subprocesses run in dedicated process groups. Timeout, task cancellation, reconnect, and incomplete post-worker delivery all terminate that group and move the persisted job to a terminal error or startup-retry state.
 - The daemon supervises its media recorder when at least one allowed group opts in. The recorder joins muted and uses PyTgCalls' built-in `RecordStream` for the complete joined interval. That supported path captures MP3; after Marvin leaves, FFmpeg converts the closed capture to the final OGG/Opus artifact. The source MP3 is removed only after successful conversion and is retained if conversion fails. The JSON sidecar stores the group, Telegram call id, joined interval, trigger, and participant state changes. It does not create a call or transcribe audio.
