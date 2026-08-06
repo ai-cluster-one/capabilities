@@ -639,10 +639,13 @@ def test_dev_finish_removes_deleted_installed_capability_and_resumes(tmp_path):
     assert release["installed_updates"] == []
     assert release["installed_removals"] == [{
         "name": "askproject",
+        "action": "remove",
+        "outcome": "applied",
         "removed": True,
-        "registry_removed": False,
-        "symlink_removed": False,
+        "registry_removed": True,
+        "symlink_removed": True,
     }]
+    assert release["installed_skipped"] == []
     assert not registry.exists()
     assert not link.exists()
 
@@ -726,3 +729,127 @@ def test_dev_finish_resumes_after_remote_integrity_gate(tmp_path):
         check=False,
     ).returncode != 0
     assert not worktree.exists()
+
+
+def test_pending_release_preserves_newer_local_installation(tmp_path):
+    source, remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    installed = json.loads(_run(
+        env, "install", "askproject", "--from", str(source)).stdout)
+    registry = Path(installed["registry"])
+    started = json.loads(_run(
+        env,
+        "dev", "start", "askproject",
+        "--source", str(source),
+        "--consumer", str(consumer),
+        "--session", "superseded-removal",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    _git(worktree, "rm", "-r", "capabilities/askproject")
+    (worktree / "capabilities").mkdir()
+    (worktree / "capabilities" / ".gitkeep").write_text("")
+    _git(worktree, "add", "capabilities/.gitkeep")
+    indexed = subprocess.run(
+        [str(worktree / "bin" / "capabilities"),
+         "source", "index", "official", "--staged"],
+        cwd=worktree, env=env, text=True, capture_output=True, timeout=300,
+        check=False,
+    )
+    assert indexed.returncode == 0, indexed.stderr
+    candidate = _commit_all(worktree, "Remove capability after integrity gate")
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "while read old new ref; do\n"
+        "  if [ \"$ref\" = refs/heads/main ]; then exit 1; fi\n"
+        "done\n"
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+
+    pending = _run(
+        env, "dev", "finish", "superseded-removal", check=False)
+    assert pending.returncode == 5
+    assert _error(pending)["code"] == "release_pending"
+
+    replacement = tmp_path / "replacement-askproject"
+    shutil.copytree(source / "capabilities" / "askproject", replacement)
+    guide = replacement / "guides" / "capability-changes.md"
+    marker = "\nNewer local installation wins over pending release.\n"
+    guide.write_text(guide.read_text() + marker)
+    _run(env, "install", "askproject", "--from", str(replacement))
+    hook.unlink()
+
+    finished = json.loads(_run(
+        env, "dev", "finish", "superseded-removal").stdout)
+    release = finished["release"]
+    assert release["commit"] == candidate
+    assert release["installed_removals"] == []
+    assert release["installed_skipped"] == [{
+        "name": "askproject",
+        "action": "remove",
+        "outcome": "superseded",
+        "reason": "local_installation_changed",
+    }]
+    assert registry.is_dir()
+    assert marker.strip() in (registry / "guides" / "capability-changes.md").read_text()
+
+
+def test_pending_release_does_not_reinstall_explicitly_removed_payload(tmp_path):
+    source, remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    installed = json.loads(_run(
+        env, "install", "askproject", "--from", str(source)).stdout)
+    registry = Path(installed["registry"])
+    link = Path(installed["symlink"])
+    started = json.loads(_run(
+        env,
+        "dev", "start", "askproject",
+        "--source", str(source),
+        "--consumer", str(consumer),
+        "--session", "superseded-update",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    guide = worktree / "capabilities" / "askproject" / "guides" / "capability-changes.md"
+    guide.write_text(guide.read_text() + "\nPending update fixture.\n")
+    _git(worktree, "add", str(guide.relative_to(worktree)))
+    indexed = subprocess.run(
+        [str(worktree / "bin" / "capabilities"),
+         "source", "index", "official", "--staged"],
+        cwd=worktree, env=env, text=True, capture_output=True, timeout=300,
+        check=False,
+    )
+    assert indexed.returncode == 0, indexed.stderr
+    candidate = _commit_all(worktree, "Update capability before integrity gate")
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "while read old new ref; do\n"
+        "  if [ \"$ref\" = refs/heads/main ]; then exit 1; fi\n"
+        "done\n"
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+
+    pending = _run(
+        env, "dev", "finish", "superseded-update", check=False)
+    assert pending.returncode == 5
+    assert _error(pending)["code"] == "release_pending"
+    _run(env, "uninstall", "askproject")
+    hook.unlink()
+
+    finished = json.loads(_run(
+        env, "dev", "finish", "superseded-update").stdout)
+    release = finished["release"]
+    assert release["commit"] == candidate
+    assert release["installed_updates"] == []
+    assert release["installed_skipped"] == [{
+        "name": "askproject",
+        "action": "update",
+        "outcome": "superseded",
+        "reason": "capability_uninstalled",
+    }]
+    assert not registry.exists()
+    assert not link.exists()

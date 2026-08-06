@@ -3841,6 +3841,25 @@ def _installed_matches_release(
     return False
 
 
+def _installed_release_identity(name: str) -> tuple[dict, dict] | None:
+    """Return a process-independent identity for compare-and-swap reconciliation."""
+    reg = _registry_dir(name)
+    script = reg / name
+    meta_file = reg / "meta.json"
+    if not reg.is_dir() or not script.is_file() or not meta_file.is_file():
+        return None
+    meta = _read_json(meta_file)
+    if not isinstance(meta, dict):
+        return None
+    stat_result = reg.stat()
+    return meta, {
+        "registry_device": stat_result.st_dev,
+        "registry_inode": stat_result.st_ino,
+        "meta_sha256": _sha256(meta_file),
+        "payload_sha256": _payload_sha256(reg),
+    }
+
+
 def _activate_released_capability(
     name: str,
     repo: Path,
@@ -3881,6 +3900,8 @@ def _activate_released_capability(
     _symlink(name, _script_path(name))
     return {
         "name": name,
+        "action": "update",
+        "outcome": "applied",
         "changed": old.get("payload_sha256") != payload_hash,
         "payload_sha256": payload_hash,
         "source_commit": commit,
@@ -3901,6 +3922,8 @@ def _remove_released_capability(name: str) -> dict:
         shutil.rmtree(reg)
     result = {
         "name": name,
+        "action": "remove",
+        "outcome": "applied",
         "removed": True,
         "registry_removed": removed_registry,
         "symlink_removed": removed_link,
@@ -4030,9 +4053,15 @@ def _source_release(
                 meta, source_id, repo, remote_url
             ):
                 continue
+            identity = _installed_release_identity(name)
+            if identity is None:
+                continue
+            candidate_entry = report["expected"]["capabilities"].get(name) or {}
             installed_actions.append({
                 "name": name,
                 "action": "update" if name in candidate_capabilities else "remove",
+                "before": identity[1],
+                "desired_payload_sha256": candidate_entry.get("payload_sha256"),
             })
         state["installed_actions"] = installed_actions
         _write_json(state_path, state)
@@ -4086,6 +4115,7 @@ def _source_release(
             )
     installed_updates = []
     installed_removals = []
+    installed_skipped = []
     for action in state["installed_actions"]:
         if not isinstance(action, dict):
             _die(7, "release_state_invalid", "release action is not an object",
@@ -4098,20 +4128,77 @@ def _source_release(
                 f"release state names an unchanged capability: {name!r}",
                 str(state_path),
             )
-        if action.get("action") == "update":
-            installed_updates.append(_activate_released_capability(
-                name, repo, source_id, remote_url, branch, candidate
-            ))
-        elif action.get("action") == "remove":
-            installed_removals.append(_remove_released_capability(name))
-        else:
+        kind = action.get("action")
+        if kind not in {"update", "remove"} or not isinstance(
+            action.get("before"), dict
+        ):
             _die(
                 7,
                 "release_state_invalid",
                 f"release state has an invalid installed action for {name!r}",
                 str(state_path),
             )
-    if installed_updates or installed_removals:
+        result = action.get("result") if action.get("status") == "complete" else None
+        if not isinstance(result, dict):
+            current = _installed_release_identity(name)
+            current_meta = current[0] if current is not None else None
+            current_identity = current[1] if current is not None else None
+            if current_identity == action["before"]:
+                if kind == "update":
+                    result = _activate_released_capability(
+                        name, repo, source_id, remote_url, branch, candidate
+                    )
+                else:
+                    result = _remove_released_capability(name)
+            elif kind == "remove" and not _registry_dir(name).exists():
+                result = {
+                    "name": name,
+                    "action": "remove",
+                    "outcome": "already_applied",
+                    "removed": True,
+                    "registry_removed": False,
+                    "symlink_removed": False,
+                }
+            elif (
+                kind == "update"
+                and current_meta is not None
+                and current_identity is not None
+                and current_meta.get("source_commit") == candidate
+                and current_identity.get("payload_sha256")
+                    == action.get("desired_payload_sha256")
+                and _installed_matches_release(
+                    current_meta, source_id, repo, remote_url
+                )
+            ):
+                result = {
+                    "name": name,
+                    "action": "update",
+                    "outcome": "already_applied",
+                    "changed": False,
+                    "payload_sha256": action.get("desired_payload_sha256"),
+                    "source_commit": candidate,
+                }
+            else:
+                result = {
+                    "name": name,
+                    "action": kind,
+                    "outcome": "superseded",
+                    "reason": (
+                        "capability_uninstalled"
+                        if current is None and not _registry_dir(name).exists()
+                        else "local_installation_changed"
+                    ),
+                }
+            action["status"] = "complete"
+            action["result"] = result
+            _write_json(state_path, state)
+        if result.get("outcome") == "superseded":
+            installed_skipped.append(result)
+        elif kind == "update":
+            installed_updates.append(result)
+        else:
+            installed_removals.append(result)
+    if state["installed_actions"]:
         _regen_skills()
     manager_update = None
     if manager_changed and source_id == OFFICIAL_SOURCE_ID:
@@ -4155,6 +4242,7 @@ def _source_release(
         "changed_capabilities": changed_capabilities,
         "installed_updates": installed_updates,
         "installed_removals": installed_removals,
+        "installed_skipped": installed_skipped,
         "manager_update": manager_update,
         "ok": True,
     }
