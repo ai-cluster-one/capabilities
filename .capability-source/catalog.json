@@ -92,7 +92,7 @@
     },
     "resend": {
       "path": "capabilities/resend",
-      "payload_sha256": "93e98335cdd90b9062f586e1c2c8f4dbf0ab5fd66b9b75a4f1b786dc16ea796f",
+      "payload_sha256": "ba4161fa5c3de77464efd04d821bcbe885ec5fc90230b2d715bfecbc4c41a7e1",
       "summary": "Send-only email CLI over the Resend HTTP API — deliver mail from a verified sending domain (send, write-gated with an optional recipient allow-list), list sending domains and their verification status (domains), and prove key + reachability (doctor). One-way by construction: no read or receive surface."
     },
     "routine": {
