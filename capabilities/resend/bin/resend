@@ -61,9 +61,9 @@ COMMANDS
 
   doctor [--connection <id>]
       Validate key + API reachability (GET /domains) — every connection, or
-      one. A 403 counts as healthy-restricted: the key is valid but
-      sending-only, so the domain list is not visible to it. Exit 0 all
-      healthy / 2 missing-or-rejected key / 5 unreachable.
+      one. A refused read from a valid sending-only key (401
+      restricted_api_key, historically 403) counts as healthy-restricted.
+      Exit 0 all healthy / 2 missing-or-rejected key / 5 unreachable.
 
   send --to ADDR [--to ADDR ...] --subject SUBJ (--text BODY | --html BODY)
        [--cc ADDR ...] [--bcc ADDR ...] [--from FROM] [--reply-to ADDR]
@@ -77,7 +77,9 @@ COMMANDS
 
   domains
       List the account's sending domains and their verification status
-      (GET /domains). Read-only inspection; a sending-only key sees 403.
+      (GET /domains). Read-only inspection; a sending-only key is refused
+      this read (exit 2 restricted_api_key) — use doctor, which reads the
+      refusal as healthy-restricted.
 
 Contract commands (the same on every capability):
   resend stub                                 One-line awareness text.
@@ -921,8 +923,10 @@ def _request(client: httpx.Client, method: str, path: str,
 
 def _check_connection(key: str) -> dict:
     """One probe: GET /domains. 200 proves key + reachability and shows the
-    sending domains; 403 proves the key is valid but sending-only (the domain
-    list is not visible to it) — still healthy for this CLI's purpose."""
+    sending domains; a valid but sending-only key is refused this read —
+    observed as 401 name=restricted_api_key ("This API key is restricted to
+    only send emails"), historically 403 — and both count healthy: the key
+    can do everything this CLI is for."""
     try:
         with _client(key) as c:
             resp = c.get("/domains")
@@ -937,13 +941,16 @@ def _check_connection(key: str) -> dict:
             data = []
         return {"ok": True, "domains": [
             {"name": d.get("name"), "status": d.get("status")} for d in data]}
-    if resp.status_code == 403:
+    try:
+        body = resp.json() or {}
+    except ValueError:
+        body = {}
+    msg = body.get("message")
+    restricted = (body.get("name") == "restricted_api_key"
+                  or "restricted" in (msg or "").lower())
+    if resp.status_code == 403 or (resp.status_code == 401 and restricted):
         return {"ok": True, "restricted": True,
                 "note": "key is valid but sending-only; domain list not visible"}
-    try:
-        msg = (resp.json() or {}).get("message")
-    except ValueError:
-        msg = None
     if resp.status_code in (400, 401):
         # Resend answers 400 validation_error (not 401) to a malformed key here
         return {"ok": False, "category": 2,
