@@ -238,6 +238,31 @@ def test_standalone_manager_has_complete_authoring_kit(tmp_path):
     assert Path(initialized["path"], "contract", "preamble.py").is_file()
 
 
+def test_standalone_manager_selfcheck_reports_missing_source_without_traceback(tmp_path):
+    env = _env(tmp_path)
+    manager_dir = tmp_path / "registry" / ".manager"
+    manager_dir.mkdir(parents=True)
+    standalone = manager_dir / "capabilities"
+    shutil.copy2(MANAGER, standalone)
+    for relative in (
+        "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
+        "contract/preamble.py",
+    ):
+        target = manager_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / relative, target)
+
+    result = subprocess.run(
+        [str(standalone), "selfcheck"], cwd=tmp_path, env=env, text=True,
+        capture_output=True, timeout=120,
+    )
+    assert result.returncode == 7
+    assert "Traceback" not in result.stderr
+    report = json.loads(result.stdout)
+    assert report["ok"] is False
+    assert any(finding.startswith("source:") for finding in report["findings"])
+
+
 def test_staged_index_is_commit_exact_and_verify_rejects_worktree_hashes(tmp_path):
     env = _env(tmp_path)
     initialized = json.loads(_run(env, "source", "init", "personal").stdout)

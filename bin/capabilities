@@ -4621,12 +4621,21 @@ def _inject_before_main(text: str, snippet: str) -> str | None:
     return None if i == -1 else text[:i] + "\n\n" + snippet + "\n" + text[i:]
 
 
-def _selfcheck_negatives(canonical: dict[str, str]) -> list[str]:
+def _selfcheck_source_root() -> Path | None:
+    """Locate a complete capability source tree in checkout and runtime layouts."""
+    candidates = (_REPO_ROOT, _source_cache(OFFICIAL_SOURCE_ID))
+    for root in candidates:
+        if (root / "capabilities").is_dir():
+            return root
+    return None
+
+
+def _selfcheck_negatives(canonical: dict[str, str], source_root: Path) -> list[str]:
     """Prove the high-value audit checks BITE. Stamp a real capability fresh,
     apply one targeted break, and require the expected check to fire; a check that
     stays silent on its own break is vacuous (how the core-only gap survived)."""
     findings: list[str] = []
-    src = _REPO_ROOT / "capabilities"
+    src = source_root / "capabilities"
     core = conn = None
     for capdir in sorted(p for p in src.iterdir() if p.is_dir()):
         script = capdir / "bin" / capdir.name
@@ -4699,7 +4708,7 @@ def _selfcheck_doctrine() -> list[str]:
     """Every standing rule names how it is enforced; every Validate(audit: id)
     names a check the audit performs; every audit check backs some rule."""
     import re
-    doc = _REPO_ROOT / "DOCTRINE.md"
+    doc = _ASSET_ROOT / "DOCTRINE.md"
     if not doc.is_file():
         return ["doctrine: DOCTRINE.md not found"]
     findings: list[str] = []
@@ -4739,9 +4748,9 @@ def _selfcheck_doclinks() -> list[str]:
     import re
     findings: list[str] = []
     link_re = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
-    docs = [_REPO_ROOT / n for n in
+    docs = [_ASSET_ROOT / n for n in
             ("DOCTRINE.md", "SHEBANG.md", "TEMPLATE.md", "ROUTINES.md", "README.md")]
-    docs += sorted((_REPO_ROOT / ".claude" / "rules").glob("*.md"))
+    docs += sorted((_ASSET_ROOT / ".claude" / "rules").glob("*.md"))
     for doc in docs:
         if not doc.is_file():
             continue
@@ -4763,21 +4772,27 @@ def cmd_selfcheck() -> None:
     import ast as _ast
     findings: list[str] = []
 
-    for f in (_REPO_ROOT / "bin" / "capabilities", _PREAMBLE):
+    for f in (Path(__file__).resolve(), _PREAMBLE):
         try:
             _ast.parse(f.read_text())
         except (OSError, SyntaxError) as e:
             findings.append(f"parse: {f.name}: {e}")
 
     canonical = _canonical_regions()
-    for capdir in sorted(p for p in (_REPO_ROOT / "capabilities").iterdir() if p.is_dir()):
-        script = capdir / "bin" / capdir.name
-        if not script.is_file():
-            continue
-        for fail in _audit_script(capdir.name, script):
-            findings.append(f"audit: {capdir.name}: {fail}")
-
-    findings += _selfcheck_negatives(canonical)
+    source_root = _selfcheck_source_root()
+    if source_root is None:
+        findings.append(
+            "source: no complete capability source tree; run "
+            "`capabilities source refresh official` and retry")
+    else:
+        for capdir in sorted(
+                p for p in (source_root / "capabilities").iterdir() if p.is_dir()):
+            script = capdir / "bin" / capdir.name
+            if not script.is_file():
+                continue
+            for fail in _audit_script(capdir.name, script):
+                findings.append(f"audit: {capdir.name}: {fail}")
+        findings += _selfcheck_negatives(canonical, source_root)
     findings += _selfcheck_doctrine()
     findings += _selfcheck_doclinks()
 
