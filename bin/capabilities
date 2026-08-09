@@ -321,8 +321,10 @@ _ASSET_ROOT = _REPO_ROOT if (_REPO_ROOT / "contract" / "preamble.py").is_file() 
     else _MANAGER_DIR
 _PREAMBLE = _ASSET_ROOT / "contract" / "preamble.py"
 _CONTRACT_REGIONS = ("capability core", "connections")
-_AUTHORING_ASSETS = ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
-                     "contract/preamble.py")
+_AUTHORING_ASSETS = (
+    "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md", "ROUTINES.md",
+    "contract/preamble.py",
+)
 
 # ---------------------------------------------------------------- I/O contract
 

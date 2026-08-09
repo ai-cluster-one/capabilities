@@ -219,7 +219,7 @@ def test_standalone_manager_has_complete_authoring_kit(tmp_path):
     standalone = manager_dir / "capabilities"
     shutil.copy2(MANAGER, standalone)
     for relative in (
-        "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
+        "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md", "ROUTINES.md",
         "contract/preamble.py",
     ):
         target = manager_dir / relative
@@ -245,7 +245,7 @@ def test_standalone_manager_selfcheck_reports_missing_source_without_traceback(t
     standalone = manager_dir / "capabilities"
     shutil.copy2(MANAGER, standalone)
     for relative in (
-        "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
+        "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md", "ROUTINES.md",
         "contract/preamble.py",
     ):
         target = manager_dir / relative
