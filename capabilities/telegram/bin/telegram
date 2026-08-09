@@ -23,8 +23,8 @@ Agent startup protocol (this is a STATEFUL CLI — it holds a login session):
      reuse it with no prompt.
   3. A healthy `telegram doctor` (exit 0) means ready to work.
 
-Configuration requires explicit named connections, including the one-account
-case. The selected connection's app credentials and session resolve by the
+Configuration requires explicit account-ID-keyed connections, including the
+one-account case. The selected connection's app credentials and session resolve by the
 cascade (first non-empty wins): the `--session` flag
 (session path only) > a project .env(.local) > ~/.config/telegram/credentials.env
 > the process environment. Secrets (TELEGRAM_API_HASH, DEEPGRAM_API_KEY) have no
@@ -37,13 +37,19 @@ first found wins. Each entry names its app id literally and its app hash by
 env-key indirection, and owns a per-connection session:
 
   {
-    "default": "main",
+    "default": "8200881535",
     "connections": {
-      "main": { "api_id": 1234567, "secret_env": "TELEGRAM_API_HASH" },
-      "work": { "api_id": 7654321, "secret_env": "TELEGRAM_WORK_HASH",
-                "allow_write": true }
+      "8200881535": { "name": "Marvin AI", "username": "marvin_kz",
+                       "api_id": 1234567, "secret_env": "TELEGRAM_API_HASH",
+                       "allow_write": true }
     }
   }
+
+The registry key is the Telegram user/account ID, not the API application id.
+Legacy labels may be used only for one discovery login: `telegram login
+--connection <label>` reports the actual ID and the required explicit registry
+migration. Doctor, service start, and normal operations refuse legacy labels or
+a session whose actual account differs from the key.
 
 The write gate: outbound sends and reactions leave the system, so they are off
 unless a connection grants them. Grant them with
@@ -152,9 +158,11 @@ import asyncio
 import contextlib
 import getpass
 import io
+import importlib.util
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -317,53 +325,91 @@ def _project_root() -> Path | None:
 _ENVELOPE_HOME: dict = {}
 
 
-def _contextkit_envelope(root: Path):
-    """Ask ContextKit where it keeps this project's envelope; None if it cannot.
-
-    $CAPABILITIES_PROJECT_ENVELOPE is the same answer handed over in advance.
-    """
-    import subprocess
-
-    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
-    if override:
-        candidate = Path(override)
-    else:
-        try:
-            proc = subprocess.run(["contextkit", "path", "capabilities"], cwd=root,
-                                  capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if proc.returncode != 0:
-            return None
-        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-        if not lines:
-            return None
-        candidate = Path(lines[0])
+def _validated_project_envelope(root: Path, raw, provider: str) -> Path:
+    """Validate the manager/context-owner answer without selecting a fallback."""
+    value = str(raw or "").strip()
+    if not value:
+        _die(6, "project_envelope_empty",
+             f"{provider} returned an empty capabilities envelope path")
+    candidate = Path(value).expanduser()
     if not candidate.is_absolute():
-        return None
+        _die(6, "project_envelope_relative",
+             f"{provider} returned a relative capabilities envelope path: {value!r}")
     try:
         resolved = candidate.resolve()
-        if root.resolve() not in resolved.parents:
-            return None
-    except OSError:
-        return None
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        _die(6, "project_envelope_outside_project",
+             f"{provider} returned a capabilities envelope outside the project: {candidate}")
     return resolved
+
+
+def _manager_project_envelope(root: Path) -> Path:
+    """Consume the capabilities manager's one authoritative project answer."""
+    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
+    if override:
+        return _validated_project_envelope(root, override, "environment handoff")
+
+    import subprocess
+
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(root)
+    manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip()
+    if not manager:
+        source_manager = Path(__file__).resolve().parents[3] / "bin" / "capabilities"
+        manager = str(source_manager) if source_manager.is_file() else "capabilities"
+    try:
+        proc = subprocess.run(
+            [manager, "path", "--json"], cwd=root, env=env,
+            capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        _die(6, "capabilities_manager_unavailable",
+             "the capabilities manager is required to resolve the project envelope",
+             "install or repair the `capabilities` command")
+    except subprocess.TimeoutExpired:
+        _die(6, "capabilities_path_timeout",
+             "the capabilities manager did not resolve the project envelope within 10 seconds")
+    except OSError as exc:
+        _die(6, "capabilities_manager_unavailable",
+             f"could not run the capabilities manager: {exc}")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        try:
+            error = json.loads(detail).get("error", {})
+        except (AttributeError, ValueError):
+            error = {}
+        _die(proc.returncode if proc.returncode in (3, 4, 5, 6) else 6,
+             str(error.get("code") or "capabilities_path_failed"),
+             str(error.get("message") or "the capabilities manager could not resolve the project envelope"),
+             str(error.get("hint") or detail or "run `capabilities path --json` for details"))
+    try:
+        answer = json.loads(proc.stdout)
+    except ValueError as exc:
+        _die(6, "capabilities_path_malformed",
+             f"the capabilities manager returned invalid JSON: {exc}")
+    if not isinstance(answer, dict):
+        _die(6, "capabilities_path_malformed",
+             "the capabilities manager path answer must be a JSON object")
+    manager_root = Path(str(answer.get("project_root") or ""))
+    if not manager_root.is_absolute() or manager_root.resolve() != root.resolve():
+        _die(6, "capabilities_project_mismatch",
+             "the capabilities manager resolved a different project root")
+    provider = str(answer.get("provider") or "capabilities manager")
+    return _validated_project_envelope(
+        root, answer.get("project_envelope"), provider)
 
 
 def _envelope_home(root: Path) -> Path:
     """The project's envelope root, resolved once per invocation.
 
-    ContextKit owns the location of a project it manages (`.contextkit/
-    config.toml`), so it is asked rather than assumed. Every other project — and
-    every ContextKit answer that does not arrive usable — keeps the envelope at
-    `<root>/capabilities`.
+    The capabilities manager owns project-envelope discovery, including any
+    delegation to ContextKit. Capability CLIs consume that answer and never
+    duplicate context-owner detection.
     """
     cached = _ENVELOPE_HOME.get(root)
     if cached is not None:
         return cached
-    home = root / "capabilities"
-    if (root / ".contextkit" / "config.toml").is_file():
-        home = _contextkit_envelope(root) or home
+    home = _manager_project_envelope(root)
     _ENVELOPE_HOME[root] = home
     return home
 
@@ -982,16 +1028,34 @@ def _build_cfg(cid: str, entry: dict | None,
         return None, {"exit": 6, "code": "bad_api_id",
                       "message": f"api id for connection {cid!r} must be an integer",
                       "hint": "copy the numeric App api_id from my.telegram.org/apps"}
+    try:
+        expected_account_id = int(cid)
+        if expected_account_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        expected_account_id = None
     return {"id": cid, "api_id": api_id_int, "api_hash": api_hash,
-            "session": session, "allow_write": allow_write}, None
+            "session": session, "allow_write": allow_write,
+            "expected_account_id": expected_account_id}, None
 
 
-def _load_config(wanted: str | None, session_flag: str | None) -> dict:
+def _require_account_connection(cfg: dict, *, allow_discovery: bool = False) -> None:
+    if cfg.get("expected_account_id") is not None or allow_discovery:
+        return
+    _die(6, "legacy_connection_id",
+         f"Telegram connection {cfg['id']!r} is a legacy label, not an account ID",
+         f"run `telegram login --connection {cfg['id']}` to discover the account ID, "
+         "then rename the connections.json key/default and restart the service")
+
+
+def _load_config(wanted: str | None, session_flag: str | None,
+                 *, allow_discovery: bool = False) -> dict:
     reg, _ = _connections_registry()
     cid, entry = _select_connection(reg, wanted)
     cfg, problem = _build_cfg(cid, entry, session_flag)
     if problem:
         _die(problem["exit"], problem["code"], problem["message"], problem.get("hint"))
+    _require_account_connection(cfg, allow_discovery=allow_discovery)
     return cfg
 
 
@@ -1042,7 +1106,10 @@ def make_client(cfg: dict) -> TelegramClient:
     identify the app, the session FILE holds the persisted login."""
     session_path = Path(cfg["session"]).expanduser()
     session_path.parent.mkdir(parents=True, exist_ok=True)
-    return TelegramClient(str(session_path), cfg["api_id"], cfg["api_hash"])
+    client = TelegramClient(str(session_path), cfg["api_id"], cfg["api_hash"])
+    client._cap_expected_account_id = cfg.get("expected_account_id")
+    client._cap_connection_id = cfg.get("id")
+    return client
 
 
 def _session_snapshot(cfg: dict) -> tuple[dict, tempfile.TemporaryDirectory]:
@@ -1115,6 +1182,13 @@ async def _require_auth(client: TelegramClient) -> None:
         await client.disconnect()
         _die(2, "not_authorized", "not logged in to Telegram",
              "run: telegram login  (or: telegram login --qr)")
+    me = await client.get_me()
+    expected = getattr(client, "_cap_expected_account_id", None)
+    if expected is not None and int(me.id) != int(expected):
+        await client.disconnect()
+        _die(2, "account_identity_mismatch",
+             f"Telegram session account mismatch: expected {expected}, got {me.id}",
+             "use the session owned by the configured account or correct the registry key")
 
 
 def _parse_since(since: str | None) -> datetime | None:
@@ -1147,8 +1221,21 @@ async def _check_connection(cfg: dict) -> dict:
                     "hint": (f"run: telegram login --connection {cfg['id']} "
                              f"(or: telegram login --qr --connection {cfg['id']})")}
         me = await client.get_me()
+        expected = cfg.get("expected_account_id")
+        if expected is not None and int(me.id) != expected:
+            return {
+                "ok": False,
+                "category": 2,
+                "error": f"account identity mismatch: expected {expected}, got {me.id}",
+                "expected_account_id": expected,
+                "actual_account_id": int(me.id),
+                "actual_account": entity_label(me),
+                "hint": "use the session owned by the configured account or correct the registry key",
+            }
         return {"ok": True, "reachable": True,
-                "account": entity_label(me), "id": me.id}
+                "account": entity_label(me), "id": me.id,
+                "expected_account_id": expected,
+                "actual_account_id": int(me.id)}
     except (ApiIdInvalidError, AuthKeyUnregisteredError) as e:
         return {"ok": False, "category": 2,
                 "error": f"Telegram rejected the session/credentials: {e.__class__.__name__}",
@@ -1184,7 +1271,16 @@ def cmd_doctor(wanted: str | None) -> None:
             if problem.get("hint"):
                 res["hint"] = problem["hint"]
         else:
-            res = asyncio.run(_check_connection(cfg))
+            if cfg.get("expected_account_id") is None:
+                res = {
+                    "ok": False,
+                    "category": 6,
+                    "error": f"legacy connection label {cid!r} is not a Telegram account ID",
+                    "hint": (f"run `telegram login --connection {cid}` to discover the account ID, "
+                             "then rename the registry key/default"),
+                }
+            else:
+                res = asyncio.run(_check_connection(cfg))
         if not res.get("ok") and not fail_exit:
             fail_exit = res.get("category") or 5
         res.pop("category", None)
@@ -1194,13 +1290,29 @@ def cmd_doctor(wanted: str | None) -> None:
         sys.exit(fail_exit)
 
 
+def _login_result(cfg: dict, me, **extra) -> dict:
+    out = {"ok": True, "connection": cfg["id"],
+           "logged_in_as": entity_label(me), "id": me.id, **extra}
+    if cfg.get("expected_account_id") is None:
+        out["migration"] = {
+            "from": cfg["id"],
+            "to": str(me.id),
+            "instruction": ("rename this connections.json key to the discovered account ID "
+                            "and update default; name/username remain display metadata"),
+        }
+    elif int(me.id) != cfg["expected_account_id"]:
+        _die(2, "account_identity_mismatch",
+             f"Telegram session account mismatch: expected {cfg['expected_account_id']}, got {me.id}",
+             "use the session owned by the configured account or correct the registry key")
+    return out
+
+
 async def cmd_login(cfg: dict) -> dict:
     client = make_client(cfg)
     await client.start()  # interactive: phone + code (+ 2FA password if set)
     me = await client.get_me()
     await client.disconnect()
-    return {"ok": True, "connection": cfg["id"],
-            "logged_in_as": entity_label(me), "id": me.id}
+    return _login_result(cfg, me)
 
 
 def _show_qr_login(url: str, expires) -> None:
@@ -1227,9 +1339,7 @@ async def cmd_login_qr(cfg: dict) -> dict:
         await client.connect()
         if await client.is_user_authorized():
             me = await client.get_me()
-            return {"ok": True, "connection": cfg["id"],
-                    "logged_in_as": entity_label(me), "id": me.id,
-                    "already_authorized": True}
+            return _login_result(cfg, me, already_authorized=True)
 
         qr_login = await client.qr_login()
         _show_qr_login(qr_login.url, qr_login.expires)
@@ -1242,8 +1352,7 @@ async def cmd_login_qr(cfg: dict) -> dict:
         except asyncio.TimeoutError:
             _die(2, "qr_expired", "QR login expired before it was approved",
                  "run `telegram login --qr` again to generate a fresh QR")
-        return {"ok": True, "connection": cfg["id"],
-                "logged_in_as": entity_label(me), "id": me.id}
+        return _login_result(cfg, me)
     finally:
         await client.disconnect()
 
@@ -1371,6 +1480,65 @@ async def cmd_react(cfg, chat: str, msgid: int, emojis: list[str]) -> dict:
 
 # --- Export ------------------------------------------------------------------
 
+def _json_text(value) -> str | None:
+    """Normalize Telethon text wrappers without leaking their raw repr."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    text = getattr(value, "text", None)
+    if isinstance(text, str):
+        return text
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return None
+
+
+def _safe_iso(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        return value.astimezone(timezone.utc).isoformat()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _safe_export_error(exc: Exception) -> str:
+    text = str(exc).replace("\n", " ")[:240]
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _poll_meta(message) -> dict:
+    wrapper = message.poll
+    poll = getattr(wrapper, "poll", None)
+    answers = []
+    for answer in getattr(poll, "answers", None) or []:
+        option = getattr(answer, "option", None)
+        answers.append({
+            "text": _json_text(getattr(answer, "text", None)),
+            "option": option.hex() if isinstance(option, bytes) else None,
+        })
+    results = []
+    for result in getattr(getattr(wrapper, "results", None), "results", None) or []:
+        option = getattr(result, "option", None)
+        results.append({
+            "option": option.hex() if isinstance(option, bytes) else None,
+            "voters": getattr(result, "voters", None),
+            "chosen": bool(getattr(result, "chosen", False)),
+            "correct": bool(getattr(result, "correct", False)),
+        })
+    return {
+        "id": getattr(poll, "id", None),
+        "question": _json_text(getattr(poll, "question", None)),
+        "answers": answers,
+        "closed": bool(getattr(poll, "closed", False)),
+        "anonymous": not bool(getattr(poll, "public_voters", False)),
+        "multiple_choice": bool(getattr(poll, "multiple_choice", False)),
+        "quiz": bool(getattr(poll, "quiz", False)),
+        "results": results,
+        "total_voters": getattr(getattr(wrapper, "results", None), "total_voters", None),
+    }
+
 def _classify_media(m):
     """Return (kind, details_dict_or_None). Kind is one of:
     text, voice, audio, photo, video, video_note, sticker, document, webpage, poll, contact, geo, other, service.
@@ -1424,14 +1592,74 @@ def _classify_media(m):
     if m.web_preview:
         return "webpage", {"url": getattr(m.web_preview, "url", None)}
     if m.poll:
-        return "poll", {"question": getattr(m.poll.poll, "question", None)}
+        return "poll", _poll_meta(m)
     if m.contact:
         return "contact", {}
     if m.geo:
         return "geo", {}
     if m.media is not None:
-        return "other", {"type": type(m.media).__name__}
+        return "unsupported", {"telegram_type": type(m.media).__name__}
     return "text", None
+
+
+def _unsupported_export_entry(message, exc: Exception) -> dict:
+    return {
+        "id": getattr(message, "id", None),
+        "date": _safe_iso(getattr(message, "date", None)),
+        "edited_at": _safe_iso(getattr(message, "edit_date", None)),
+        "sender": None,
+        "reply_to_msg_id": getattr(message, "reply_to_msg_id", None),
+        "forward": None,
+        "type": "unsupported",
+        "text": _json_text(getattr(message, "message", None)),
+        "media": {
+            "telegram_type": type(getattr(message, "media", None)).__name__,
+            "serialization_error": _safe_export_error(exc),
+        },
+    }
+
+
+def _export_message_entry(message) -> dict:
+    kind, media_meta = _classify_media(message)
+    sender = None
+    if message.sender is not None:
+        sender = {
+            "id": message.sender_id,
+            "name": _json_text(entity_label(message.sender)),
+            "username": _json_text(getattr(message.sender, "username", None)),
+            "type": type(message.sender).__name__,
+        }
+    elif message.sender_id is not None:
+        sender = {"id": message.sender_id, "name": None, "username": None, "type": None}
+
+    forward = None
+    if message.forward is not None:
+        forward_name = None
+        try:
+            if message.forward.sender is not None:
+                forward_name = entity_label(message.forward.sender)
+            elif message.forward.chat is not None:
+                forward_name = entity_label(message.forward.chat)
+        except Exception:
+            pass
+        forward = {
+            "date": _safe_iso(getattr(message.forward, "date", None)),
+            "from_id": (getattr(message.forward, "sender_id", None)
+                        or getattr(message.forward, "chat_id", None)),
+            "from_name": _json_text(forward_name),
+        }
+
+    return {
+        "id": message.id,
+        "date": _safe_iso(getattr(message, "date", None)),
+        "edited_at": _safe_iso(getattr(message, "edit_date", None)),
+        "sender": sender,
+        "reply_to_msg_id": getattr(message, "reply_to_msg_id", None),
+        "forward": forward,
+        "type": kind,
+        "text": _json_text(getattr(message, "message", None)),
+        "media": media_meta,
+    }
 
 
 def _find_existing_media(media_dir: Path, msg_id: int) -> Path | None:
@@ -1508,46 +1736,11 @@ async def cmd_export(cfg, chat: str, out_path: str, media_dir: str | None,
         if since_dt and m.date and m.date < since_dt:
             break
 
-        kind, media_meta = _classify_media(m)
-
-        sender = None
-        if m.sender is not None:
-            sender = {
-                "id": m.sender_id,
-                "name": entity_label(m.sender),
-                "username": getattr(m.sender, "username", None),
-                "type": type(m.sender).__name__,
-            }
-        elif m.sender_id is not None:
-            sender = {"id": m.sender_id, "name": None, "username": None, "type": None}
-
-        fwd = None
-        if m.forward is not None:
-            fwd_name = None
-            try:
-                if m.forward.sender is not None:
-                    fwd_name = entity_label(m.forward.sender)
-                elif m.forward.chat is not None:
-                    fwd_name = entity_label(m.forward.chat)
-            except Exception:
-                pass
-            fwd = {
-                "date": m.forward.date.astimezone(timezone.utc).isoformat() if m.forward.date else None,
-                "from_id": getattr(m.forward, "sender_id", None) or getattr(m.forward, "chat_id", None),
-                "from_name": fwd_name,
-            }
-
-        entry: dict = {
-            "id": m.id,
-            "date": m.date.astimezone(timezone.utc).isoformat() if m.date else None,
-            "edited_at": m.edit_date.astimezone(timezone.utc).isoformat() if m.edit_date else None,
-            "sender": sender,
-            "reply_to_msg_id": m.reply_to_msg_id,
-            "forward": fwd,
-            "type": kind,
-            "text": m.message or None,
-            "media": media_meta,
-        }
+        try:
+            entry = _export_message_entry(m)
+        except Exception as exc:
+            entry = _unsupported_export_entry(m, exc)
+        kind = entry["type"]
 
         if kind in download_types:
             existing = _find_existing_media(media_dir_path, m.id)
@@ -1565,10 +1758,14 @@ async def cmd_export(cfg, chat: str, out_path: str, media_dir: str | None,
                     entry["transcription"] = prior_transcriptions.get(m.id)
             except Exception as e:
                 entry["media"] = entry["media"] or {}
-                entry["media"]["download_error"] = repr(e)
+                entry["media"]["download_error"] = _safe_export_error(e)
                 if kind in ("voice", "audio"):
                     entry["transcription"] = prior_transcriptions.get(m.id)
 
+        try:
+            json.dumps(entry, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            entry = _unsupported_export_entry(m, exc)
         messages_out.append(entry)
         count += 1
         if count % progress_every == 0:
@@ -1601,7 +1798,7 @@ async def cmd_export(cfg, chat: str, out_path: str, media_dir: str | None,
         ),
         "messages": messages_out,
     }
-    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     await client.disconnect()
     _log(f"Done. {len(messages_out)} messages written. New downloads: {dl_counts}")
     return {
@@ -1899,6 +2096,10 @@ def _service_daemon() -> Path:
     return _service_bundle_dir() / "service" / "daemon.py"
 
 
+def _service_schema() -> Path:
+    return _service_bundle_dir() / "service" / "settings_schema.py"
+
+
 def _service_template(name: str) -> Path:
     return _service_bundle_dir() / "service" / "templates" / name
 
@@ -1948,9 +2149,99 @@ def _service_voice_context_path(root: Path) -> Path:
     return _service_dir(root) / "voice-agent.md"
 
 
+def _layout_path(root: Path, value: str, owner: str) -> str:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        _die(6, "project_layout_invalid", f"{owner} returned a relative path: {value!r}")
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        _die(6, "project_layout_invalid",
+             f"{owner} returned a path outside the project: {candidate}")
+    return str(resolved)
+
+
+def _contextkit_layer(root: Path, name: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["contextkit", "path", name], cwd=root, capture_output=True,
+            text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    if len(lines) != 1:
+        _die(6, "project_layout_invalid",
+             f"ContextKit returned a malformed path for {name}")
+    return _layout_path(root, lines[0], f"ContextKit {name}")
+
+
+def _resolve_project_layout(root: Path) -> dict:
+    root = root.resolve()
+    layout: dict = {
+        "project_root": str(root),
+        "capabilities": str(_project_capabilities_dir(root).resolve()),
+        "provider": ("contextkit" if (root / ".contextkit" / "config.toml").is_file()
+                     else "default"),
+    }
+    layer_names = ("context", "routines", "assets", "memory", "deployment")
+    if layout["provider"] == "contextkit":
+        for name in layer_names:
+            value = _contextkit_layer(root, name)
+            if value and Path(value).exists():
+                layout[name] = value
+    else:
+        for name in layer_names:
+            candidate = (root / name).resolve()
+            if candidate.exists():
+                layout[name] = str(candidate)
+    compiled = root / ".codex" / "generated" / "context.md"
+    if compiled.is_file():
+        layout["compiled_context"] = str(compiled.resolve())
+    else:
+        layout["compiled_context"] = None
+    return layout
+
+
+def _write_project_layout(path: Path, layout: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(layout, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
 def _service_settings(root: Path) -> dict:
     data = _json_file(_service_settings_path(root))
     return data if isinstance(data, dict) else {}
+
+
+def _validate_service_settings(root: Path, data: dict | None = None) -> dict:
+    settings_path = _service_settings_path(root)
+    if data is None:
+        try:
+            data = json.loads(settings_path.read_text())
+        except OSError as exc:
+            _die(6, "service_settings_missing", f"cannot read {settings_path}: {exc}")
+        except json.JSONDecodeError as exc:
+            _die(6, "service_settings_invalid", f"{settings_path} is not valid JSON: {exc}")
+    schema_path = _service_schema()
+    _require_service_bundle_files(schema_path)
+    spec = importlib.util.spec_from_file_location("telegram_settings_schema", schema_path)
+    if spec is None or spec.loader is None:
+        _die(3, "service_bundle_missing", f"cannot load bundled settings schema: {schema_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.validate_settings(data, root.resolve(), _service_dir(root).resolve())
+    except ValueError as exc:
+        _die(6, "service_settings_invalid", str(exc),
+             "fix settings.json; unsupported properties are never ignored")
+    return data
 
 
 def _service_wanted_connection(root: Path, connection_flag: str | None) -> str | None:
@@ -1979,9 +2270,11 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
         settings = json.loads(settings_template.read_text())
         if connection_flag:
             settings["connection"] = connection_flag
+        _validate_service_settings(root, settings)
         settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
         written.append(str(settings_path))
     else:
+        _validate_service_settings(root)
         skipped.append(str(settings_path))
 
     if force or not context_path.exists():
@@ -2098,6 +2391,7 @@ def _service_runtime_health(path: Path, running: bool) -> dict:
 
 def cmd_service_status(connection_flag: str | None, session_flag: str | None) -> dict:
     root = _service_project_root()
+    envelope = _project_capabilities_dir(root).resolve()
     initialized = _service_settings_path(root).exists() and _service_context_path(root).exists()
     cid, paths = _service_state_dir(root, connection_flag, session_flag)
     pid = _read_pid(paths["pid"])
@@ -2112,6 +2406,8 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
         "health": health,
         "connection": cid,
         "project": str(root),
+        "project_envelope": str(envelope),
+        "project_layout": _resolve_project_layout(root),
         "daemon": str(_service_daemon()),
         "settings": str(_service_settings_path(root)),
         "context": str(_service_context_path(root)),
@@ -2139,11 +2435,17 @@ def _require_service_initialized(root: Path) -> None:
 
 def _service_env(root: Path, connection_id: str) -> dict:
     env = dict(os.environ)
+    envelope = _project_capabilities_dir(root).resolve()
+    layout = _resolve_project_layout(root)
     env["TELEGRAM_SERVICE_PROJECT_ROOT"] = str(root)
+    env["TELEGRAM_SERVICE_PROJECT_ENVELOPE"] = str(envelope)
+    env["CAPABILITIES_PROJECT_ENVELOPE"] = str(envelope)
     env["TELEGRAM_SERVICE_SETTINGS"] = str(_service_settings_path(root))
     env["TELEGRAM_SERVICE_CONTEXT"] = str(_service_context_path(root))
     env["TELEGRAM_SERVICE_VOICE_CONTEXT"] = str(_service_voice_context_path(root))
     env["TELEGRAM_SERVICE_CONNECTION"] = connection_id
+    env["TELEGRAM_SERVICE_PROJECT_LAYOUT"] = json.dumps(
+        layout, ensure_ascii=False, sort_keys=True)
     env["TELEGRAM_REAL_TELEGRAM"] = str(Path(__file__).resolve())
     return env
 
@@ -2154,6 +2456,7 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
 
     root = _service_project_root()
     _require_service_initialized(root)
+    _validate_service_settings(root)
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
@@ -2167,6 +2470,8 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
              "reinstall/update telegram from a bundled source directory")
     cid, paths = _service_state_dir(root, cfg["id"], session_flag)
     paths["state"].mkdir(parents=True, exist_ok=True)
+    _write_project_layout(paths["state"] / "project-layout.json",
+                          _resolve_project_layout(root))
     with paths["log"].open("a", encoding="utf-8") as log:
         proc = subprocess.Popen(
             [str(daemon)], cwd=str(root), env=_service_env(root, cid),
@@ -2242,6 +2547,8 @@ def _service_reload_result(connection_flag: str | None, session_flag: str | None
     root = _service_project_root()
     _require_service_initialized(root)
     cid, paths = _service_state_dir(root, connection_flag, session_flag)
+    _write_project_layout(paths["state"] / "project-layout.json",
+                          _resolve_project_layout(root))
     pid = _read_pid(paths["pid"])
     if not _pid_alive(pid):
         _die(5, "service_not_running", "telegram service is not running",
@@ -2297,6 +2604,7 @@ def cmd_service_logs(connection_flag: str | None, session_flag: str | None,
 def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) -> dict:
     root = _service_project_root()
     _require_service_initialized(root)
+    _validate_service_settings(root)
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
@@ -2314,6 +2622,7 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) ->
 def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> None:
     root = _service_project_root()
     _require_service_initialized(root)
+    _validate_service_settings(root)
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
@@ -2477,7 +2786,8 @@ def main() -> None:
             cmd_service_run(connection_flag, session_flag)
         return
 
-    cfg = _load_config(connection_flag, session_flag)
+    cfg = _load_config(
+        connection_flag, session_flag, allow_discovery=args.cmd == "login")
     _write_gate(cfg["id"], cfg["allow_write"], args.cmd)
     temporary = None
     # A normal CLI call may be launched by a model-host process rather than the

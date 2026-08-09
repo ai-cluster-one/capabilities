@@ -53,6 +53,7 @@ def _env(tmp: Path) -> tuple[dict[str, str], Path, Path]:
         "HOME": str(home),
         "CAPABILITIES_HOME": str(cap_home),
         "CAPABILITIES_BIN": str(bin_dir),
+        "CAPABILITIES_MANAGER_BIN": str(MANAGER),
         "XDG_CONFIG_HOME": str(tmp / "config"),
         "XDG_STATE_HOME": str(tmp / "state"),
         "XDG_DATA_HOME": str(tmp / "data"),
@@ -131,7 +132,7 @@ def _run_service_init(bin_dir: Path, env: dict[str, str], project: Path) -> None
         "capabilities": {"telegram": {"enabled": True}},
     }) + "\n")
     init_argv = [str(bin_dir / "telegram"), "service", "init",
-                 "--connection", "marvin"]
+                 "--connection", "42"]
     init_env = {**env, "CLAUDE_PROJECT_DIR": str(project)}
     proc = _run(init_argv, init_env, cwd=project)
     if "FileNotFoundError" in proc.stderr:
@@ -218,6 +219,65 @@ class DocumentAttributeFilename:
 """.lstrip())
 
 
+def _write_fake_pytgcalls(fake_root: Path) -> None:
+    package = fake_root / "pytgcalls"
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "__init__.py").write_text("""
+from . import filters
+
+class PyTgCalls:
+    def __init__(self, *args, **kwargs):
+        pass
+
+__version__ = "2.3.3-test"
+""".lstrip())
+    (package / "filters.py").write_text("""
+def chat_update(*args, **kwargs):
+    return lambda *a, **k: False
+
+def stream_frame(*args, **kwargs):
+    return lambda *a, **k: False
+""".lstrip())
+    (package / "exceptions.py").write_text(
+        "class NoActiveGroupCall(Exception): pass\n"
+        "class NotInCallError(Exception): pass\n"
+    )
+    types_pkg = package / "types"
+    types_pkg.mkdir()
+    (types_pkg / "__init__.py").write_text("""
+class _Placeholder:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.__dict__.update(kwargs)
+
+class CallConfig(_Placeholder): pass
+class ChatUpdate(_Placeholder):
+    class Status:
+        INCOMING_CALL = "incoming_call"
+        LEFT_CALL = "left_call"
+class Device:
+    MICROPHONE = "microphone"
+class Direction:
+    INCOMING = "incoming"
+class ExternalMedia:
+    AUDIO = "audio"
+class Frame(_Placeholder):
+    class Info(_Placeholder): pass
+class GroupCallConfig(_Placeholder): pass
+class MediaStream(_Placeholder):
+    class Flags:
+        REQUIRED = 1
+        IGNORE = 2
+class RecordStream(_Placeholder): pass
+""".lstrip())
+    (types_pkg / "raw.py").write_text("""
+class AudioParameters:
+    def __init__(self, bitrate=48000, channels=1):
+        self.bitrate = bitrate
+        self.channels = channels
+""".lstrip())
+
+
 def _import_telegram_daemon(tmp: Path, settings: dict) -> object:
     project = tmp / "project"
     _ensure_project_envelope(project)
@@ -228,14 +288,16 @@ def _import_telegram_daemon(tmp: Path, settings: dict) -> object:
     connections = tmp / "connections.json"
     connections.write_text(json.dumps({
         "connections": {
-            "marvin": {
+            "42": {
                 "api_id": 12345,
                 "allow_write": True,
             },
         },
     }) + "\n")
     fake_telethon = tmp / "fake" / "telethon"
+    fake_root = tmp / "fake"
     _write_fake_telethon(fake_telethon)
+    _write_fake_pytgcalls(fake_root)
     old_env = dict(os.environ)
     old_path = list(sys.path)
     old_telethon_modules = {
@@ -249,10 +311,16 @@ def _import_telegram_daemon(tmp: Path, settings: dict) -> object:
             "XDG_STATE_HOME": str(tmp / "state"),
             "PYTHONPATH": str(tmp / "fake") + os.pathsep + os.environ.get("PYTHONPATH", ""),
             "TELEGRAM_API_HASH": "test-hash",
-            "TELEGRAM_SERVICE_CONNECTION": "marvin",
+            "TELEGRAM_SERVICE_CONNECTION": "42",
             "TELEGRAM_SERVICE_CONNECTIONS_FILE": str(connections),
             "TELEGRAM_SERVICE_CONTEXT": str(service_dir / "context.md"),
             "TELEGRAM_SERVICE_PROJECT_ROOT": str(project),
+            "TELEGRAM_SERVICE_PROJECT_ENVELOPE": str(project / "capabilities"),
+            "TELEGRAM_SERVICE_PROJECT_LAYOUT": json.dumps({
+                "project_root": str(project),
+                "capabilities": str(project / "capabilities"),
+                "provider": "test",
+            }),
             "TELEGRAM_SERVICE_SETTINGS": str(service_dir / "settings.json"),
             "TELEGRAM_SERVICE_STATE_DIR": str(tmp / "service-state"),
         })
@@ -327,7 +395,7 @@ def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
         for path in (service_dir, fake_telethon, state_dir):
             path.mkdir(parents=True, exist_ok=True)
         (service_dir / "settings.json").write_text(json.dumps({
-            "connection": "marvin",
+            "connection": "42",
             "assistant_name": "Assistant",
             "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
             "allowed_users": {},
@@ -338,13 +406,14 @@ def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
         connections = tmp / "connections.json"
         connections.write_text(json.dumps({
             "connections": {
-                "marvin": {
+                "42": {
                     "api_id": 12345,
                     "allow_write": True,
                 },
             },
         }) + "\n")
         _write_fake_telethon(fake_telethon)
+        _write_fake_pytgcalls(tmp / "fake")
         env = dict(os.environ)
         env.update({
             "HOME": str(tmp / "home"),
@@ -352,10 +421,16 @@ def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
             "XDG_STATE_HOME": str(tmp / "state"),
             "PYTHONPATH": str(tmp / "fake") + os.pathsep + env.get("PYTHONPATH", ""),
             "TELEGRAM_API_HASH": "test-hash",
-            "TELEGRAM_SERVICE_CONNECTION": "marvin",
+            "TELEGRAM_SERVICE_CONNECTION": "42",
             "TELEGRAM_SERVICE_CONNECTIONS_FILE": str(connections),
             "TELEGRAM_SERVICE_CONTEXT": str(service_dir / "context.md"),
             "TELEGRAM_SERVICE_PROJECT_ROOT": str(project),
+            "TELEGRAM_SERVICE_PROJECT_ENVELOPE": str(project / "capabilities"),
+            "TELEGRAM_SERVICE_PROJECT_LAYOUT": json.dumps({
+                "project_root": str(project),
+                "capabilities": str(project / "capabilities"),
+                "provider": "test",
+            }),
             "TELEGRAM_SERVICE_SETTINGS": str(service_dir / "settings.json"),
             "TELEGRAM_SERVICE_STATE_DIR": str(state_dir),
         })
@@ -471,7 +546,7 @@ def test_telegram_service_authority_pins_connection_and_session() -> None:
         env["XDG_CONFIG_HOME"] = str(config)
         env["CAPABILITIES_AUTH_CONTEXT"] = json.dumps({
             "source": "telegram",
-            "connection": "marvin",
+            "connection": "42",
             "chat_id": "-1001",
             "sender_role": "group_member",
             "allowed_capabilities": {
@@ -499,7 +574,7 @@ def test_telegram_control_authority_limits_settings_commands() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         daemon = _import_telegram_daemon(tmp, {
-            "connection": "marvin",
+            "connection": "42",
             "assistant_name": "Assistant",
             "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
             "allowed_users": {
@@ -533,7 +608,7 @@ def test_telegram_group_chat_ref_never_falls_back_to_sender() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         daemon = _import_telegram_daemon(tmp, {
-            "connection": "marvin",
+            "connection": "42",
             "assistant_name": "Assistant",
             "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
             "allowed_users": {},
@@ -574,7 +649,7 @@ def test_telegram_channel_context_overlay_is_added_to_prompt() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         daemon = _import_telegram_daemon(tmp, {
-            "connection": "marvin",
+            "connection": "42",
             "assistant_name": "Assistant",
             "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
             "allowed_users": {},
@@ -598,7 +673,7 @@ def test_telegram_channel_context_overlay_is_added_to_prompt() -> None:
             {
                 "chat_id": "-1001",
                 "chat_type": "group",
-                "connection": "marvin",
+                "connection": "42",
                 "harness": "stub",
                 "chat_name": "Family",
                 "channel_context": overlay,

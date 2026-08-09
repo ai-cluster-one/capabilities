@@ -32,15 +32,22 @@ ENVIRONMENT
                        the project envelope location, supplied by the project's
                        context owner in advance of the lookup below.
 
+PROJECT PATH VERB
+  path --json
+        Resolve the current project root and capability envelope once, returning
+        project_root, project_envelope, and provider. Plain projects use
+        <root>/capabilities. ContextKit-bound projects must return a usable
+        absolute in-project path; a broken binding is an error, never a fallback.
+
 THE PROJECT ENVELOPE
   Every project file the system owns — the gate, the state guard, and each
   capability's identifiers, references, connections and state — sits in one
   envelope. In a project bound by `.contextkit/config.toml` its location
   belongs to ContextKit and is asked for, never assumed or stored:
-  `contextkit path capabilities`, once per invocation. Without that binding, or
-  without a usable answer (no `contextkit` on PATH, a failing command, output
-  that is not an absolute path inside the project), the envelope is
-  <root>/capabilities and the project depends on nothing outside itself.
+  `contextkit path capabilities`, once per invocation. Without that binding the
+  envelope is <root>/capabilities and the project depends on nothing outside
+  itself. A configured ContextKit binding that cannot return exactly one
+  absolute in-project path is an error; it never silently selects another tree.
 
 MACHINE VERBS
   install <name> [--from <path|url> | --source ID] [--yes]
@@ -372,8 +379,29 @@ def _require_project() -> Path:
 _ENVELOPE_HOME: dict[Path, Path] = {}
 
 
-def _contextkit_envelope(root: Path) -> Path | None:
-    """Where ContextKit keeps this project's envelope. None when unanswerable.
+def _validated_envelope(root: Path, raw: str, provider: str) -> Path:
+    """Validate one owner-provided envelope without guessing a replacement."""
+    if not raw.strip():
+        _die(6, "project_envelope_empty",
+             f"{provider} returned an empty capabilities envelope path",
+             "repair the project context binding, then retry")
+    candidate = Path(raw.strip()).expanduser()
+    if not candidate.is_absolute():
+        _die(6, "project_envelope_relative",
+             f"{provider} returned a relative capabilities envelope path: {raw!r}",
+             "the resolved project envelope must be absolute")
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        _die(6, "project_envelope_outside_project",
+             f"{provider} returned a capabilities envelope outside the project: {candidate}",
+             f"the path must be inside {root.resolve()}")
+    return resolved
+
+
+def _contextkit_envelope(root: Path) -> Path:
+    """Where ContextKit keeps this project's envelope, or a structured error.
 
     $CAPABILITIES_PROJECT_ENVELOPE is the same answer handed over in advance, so
     a context owner composing through `capabilities context --fragment` never
@@ -381,44 +409,52 @@ def _contextkit_envelope(root: Path) -> Path | None:
     """
     override = os.environ.get(ENVELOPE_ENV, "").strip()
     if override:
-        candidate = Path(override)
-    else:
-        try:
-            proc = subprocess.run([CONTEXTKIT_BIN, *CONTEXTKIT_ENVELOPE_QUERY],
-                                  cwd=root, capture_output=True, text=True,
-                                  timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if proc.returncode != 0:
-            return None
-        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-        if not lines:
-            return None
-        candidate = Path(lines[0])
-    if not candidate.is_absolute():
-        return None
+        return _validated_envelope(root, override, "environment handoff")
     try:
-        resolved = candidate.resolve()
-        if root.resolve() not in resolved.parents:
-            return None
-    except OSError:
-        return None
-    return resolved
+        proc = subprocess.run([CONTEXTKIT_BIN, *CONTEXTKIT_ENVELOPE_QUERY],
+                              cwd=root, capture_output=True, text=True,
+                              timeout=10)
+    except FileNotFoundError:
+        _die(6, "contextkit_unavailable",
+             "this project is bound to ContextKit but contextkit is not available",
+             "install/repair ContextKit or remove the broken .contextkit binding")
+    except subprocess.TimeoutExpired:
+        _die(6, "contextkit_timeout",
+             "ContextKit did not resolve the capabilities envelope within 10 seconds",
+             "repair the project context binding, then retry")
+    except OSError as exc:
+        _die(6, "contextkit_unavailable",
+             f"could not run ContextKit: {exc}",
+             "install/repair ContextKit or remove the broken .contextkit binding")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        _die(6, "contextkit_path_failed",
+             f"ContextKit could not resolve the capabilities envelope (exit {proc.returncode})",
+             detail or "repair the project context binding, then retry")
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        _die(6, "contextkit_path_malformed",
+             "ContextKit returned a malformed capabilities envelope answer",
+             "expected exactly one absolute path")
+    return _validated_envelope(root, lines[0], "ContextKit")
 
 
 def _envelope_home(root: Path) -> Path:
     """The project's capabilities envelope, resolved once per invocation.
 
     ContextKit owns the location of the projects it manages, so it is asked
-    rather than assumed; every other project — and every ContextKit answer that
-    does not arrive usable — keeps the envelope at <root>/capabilities.
+    rather than assumed. Broken configured bindings fail closed. Every other
+    project keeps the envelope at <root>/capabilities.
     """
     cached = _ENVELOPE_HOME.get(root)
     if cached is not None:
         return cached
     home = root / PROJECT_CAPABILITIES_REL
-    if _contextkit_managed(root):
-        home = _contextkit_envelope(root) or home
+    if os.environ.get(ENVELOPE_ENV, "").strip():
+        home = _validated_envelope(
+            root, os.environ[ENVELOPE_ENV], "environment handoff")
+    elif _contextkit_managed(root):
+        home = _contextkit_envelope(root)
     _ENVELOPE_HOME[root] = home
     return home
 
@@ -434,6 +470,24 @@ def _project_capabilities_dir(root: Path) -> Path:
 
 def _gate_file(root: Path) -> Path:
     return _project_capabilities_dir(root) / "settings.json"
+
+
+def cmd_path(json_output: bool) -> None:
+    if not json_output:
+        _die(6, "input", "path requires --json")
+    root = _require_project().resolve()
+    envelope = _envelope_home(root).resolve()
+    if os.environ.get(ENVELOPE_ENV, "").strip():
+        provider = "handoff"
+    elif _contextkit_managed(root):
+        provider = "contextkit"
+    else:
+        provider = "default"
+    _emit({
+        "project_root": str(root),
+        "project_envelope": str(envelope),
+        "provider": provider,
+    })
 
 
 def _read_json(path: Path):
@@ -2567,10 +2621,10 @@ and the combined generated context. It obtains the manager-owned capability
 block through `capabilities context --fragment` and inserts it verbatim.
 `capabilities init` and the host-writing context modes do not write host wiring
 there; refresh with `contextkit build`. ContextKit also owns where the project
-envelope sits: the location is asked for (`contextkit path capabilities`), so
-read a path from `capabilities init`/`enable` output rather than assuming
-`capabilities/` at the project root. Without ContextKit, or without a usable
-answer, that root default is the envelope.
+envelope sits: the manager asks it for that location and exposes the result via
+`capabilities path --json`. Capability CLIs consume the manager-owned answer
+rather than invoking ContextKit. Without ContextKit the root `capabilities/`
+directory is the envelope; a broken configured binding is a structured error.
 
 THE GATES (both exit 4 — ask the user, never lift one yourself): a capability
 not enabled by effective project/global policy refuses operational verbs;
@@ -2849,6 +2903,9 @@ def cmd_sync_contract(check_only: bool) -> None:
 def _audit_script(name: str, script: Path) -> list[str]:
     failures: list[str] = []
     env = _snapshot_env()
+    # Source/isolated audit sandboxes may intentionally omit the manager from
+    # PATH. Capability CLIs still exercise the public manager-owned path contract.
+    env["CAPABILITIES_MANAGER_BIN"] = str(Path(__file__).resolve())
     script_text = script.read_text()
     # A capability with no `connections` fence is core-only: it carries the
     # capability-core declaration surface and stops (DOCTRINE — core-only is an
@@ -2875,7 +2932,7 @@ def _audit_script(name: str, script: Path) -> list[str]:
                 "— readiness must be judged through the cascade resolution, not "
                 "a parallel check")
 
-    rc, out, err = _run_script(script, ["stub"])
+    rc, out, err = _run_script(script, ["stub"], env=env)
     if rc != 0:
         failures.append(f"stub: exit {rc}")
     else:
@@ -2888,7 +2945,7 @@ def _audit_script(name: str, script: Path) -> list[str]:
             failures.append(f"stub: does not end in the discovery pointer `{name} help`")
 
     manifest = None
-    rc, out, err = _run_script(script, ["manifest", "--json"])
+    rc, out, err = _run_script(script, ["manifest", "--json"], env=env)
     if rc != 0:
         failures.append(f"manifest: exit {rc}")
     else:
@@ -2923,7 +2980,7 @@ def _audit_script(name: str, script: Path) -> list[str]:
     if "Replace this scaffold check with" in script_text:
         failures.append("doctor: scaffold readiness placeholder remains")
 
-    rc, out, err = _run_script(script, ["help"])
+    rc, out, err = _run_script(script, ["help"], env=env)
     if rc != 0:
         failures.append(f"help: exit {rc}")
     else:
@@ -5196,6 +5253,8 @@ def main() -> None:
         cmd_self_update()
     elif cmd == "list":
         cmd_list()
+    elif cmd == "path":
+        cmd_path(flag("--json"))
     elif cmd == "search":
         cmd_search(pos[0] if pos else None, opt("--source"))
     elif cmd == "source":

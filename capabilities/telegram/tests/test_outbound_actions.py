@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
+import os
 import sqlite3
 import sys
 import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -114,6 +117,20 @@ class _Client:
         self.disconnected = True
 
 
+class _ExportClient(_Client):
+    def __init__(self, messages):
+        super().__init__()
+        self.messages = messages
+
+    async def get_me(self):
+        return types.SimpleNamespace(
+            id=8200881535, first_name="Marvin", last_name="", username="marvin")
+
+    async def iter_messages(self, _entity, **_kwargs):
+        for message in self.messages:
+            yield message
+
+
 class OutboundActionsTests(unittest.TestCase):
     def setUp(self):
         self.cli = import_cli()
@@ -202,6 +219,112 @@ class OutboundActionsTests(unittest.TestCase):
                 ["telegram", "react", "-1001", "99", "👍"]),
             ("react", "-1001"),
         )
+
+    def _worker_env(self, outbox):
+        return {
+            "TELEGRAM_PROGRESS_OUTBOX": str(outbox),
+            "TELEGRAM_AUTHORIZED_CHAT_ID": "-1001",
+            "TELEGRAM_AUTHORIZED_TOPIC_ID": "77",
+            "TELEGRAM_AUTHORIZED_CONNECTION": "8200881535",
+        }
+
+    def test_worker_send_rejects_unknown_flag_after_text_before_outbox(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as td:
+            outbox = Path(td) / "progress.jsonl"
+            with mock.patch.dict(os.environ, self._worker_env(outbox), clear=False):
+                with self.assertRaises(SystemExit) as stopped:
+                    shim.write_progress(
+                        ["telegram", "send", "-1001", "hello", "--parse-mode"])
+            self.assertEqual(stopped.exception.code, 6)
+            self.assertFalse(outbox.exists())
+
+    def test_worker_send_rejects_chat_substitution_before_outbox(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as td:
+            outbox = Path(td) / "progress.jsonl"
+            with mock.patch.dict(os.environ, self._worker_env(outbox), clear=False):
+                with self.assertRaises(SystemExit) as stopped:
+                    shim.write_progress(["telegram", "send", "-9999", "hello"])
+            self.assertEqual(stopped.exception.code, 4)
+            self.assertFalse(outbox.exists())
+
+    def test_worker_send_rejects_topic_and_session_substitution(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as td:
+            outbox = Path(td) / "progress.jsonl"
+            for flag in ("--topic=99", "--session=/tmp/other", "--connection=other"):
+                argv = ["telegram", "send", "-1001", "hello", flag]
+                with mock.patch.dict(os.environ, self._worker_env(outbox), clear=False), \
+                     mock.patch.object(sys, "argv", argv):
+                    with self.assertRaises(SystemExit) as stopped:
+                        shim.main()
+                self.assertEqual(stopped.exception.code, 4)
+            self.assertFalse(outbox.exists())
+
+    def test_worker_send_queues_only_the_authorized_scope(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as td:
+            outbox = Path(td) / "progress.jsonl"
+            with mock.patch.dict(os.environ, self._worker_env(outbox), clear=False):
+                self.assertTrue(shim.write_progress(
+                    ["telegram", "send", "current", "checking the logs"]))
+            record = json.loads(outbox.read_text())
+            self.assertEqual(record["chat"], "-1001")
+            self.assertEqual(record["topic_id"], "77")
+            self.assertEqual(record["connection"], "8200881535")
+            self.assertEqual(record["text"], "checking the logs")
+
+    def test_poll_entities_and_unknown_media_do_not_abort_export(self):
+        class TextWithEntities:
+            def __init__(self, text):
+                self.text = text
+
+        def message(message_id, *, poll=None, media=None, text=None):
+            return types.SimpleNamespace(
+                id=message_id, date=None, edit_date=None, sender=None,
+                sender_id=77, reply_to_msg_id=None, forward=None,
+                message=text, action=None, voice=False, audio=False,
+                video_note=False, video=False, sticker=False, photo=False,
+                document=False, web_preview=False, poll=poll, contact=False,
+                geo=False, media=media, download_media=None,
+            )
+
+        poll = types.SimpleNamespace(
+            poll=types.SimpleNamespace(
+                id=91,
+                question=TextWithEntities("Choose one"),
+                answers=[
+                    types.SimpleNamespace(text=TextWithEntities("Alpha"), option=b"a"),
+                    types.SimpleNamespace(text=TextWithEntities("Beta"), option=b"b"),
+                ],
+                closed=True, public_voters=False, multiple_choice=False, quiz=False,
+            ),
+            results=types.SimpleNamespace(results=[], total_voters=3),
+        )
+        messages = [
+            message(3, text="later message"),
+            message(2, media=object()),
+            message(1, poll=poll, media=poll),
+        ]
+        self.client = _ExportClient(messages)
+        self.cli.make_client = lambda _cfg: self.client
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "export.json"
+            result = asyncio.run(self.cli.cmd_export(
+                {"id": "8200881535"}, "-1001", str(output), None, None, None,
+                False, False, False, False))
+            payload = json.loads(output.read_text())
+
+        self.assertEqual(result["message_count"], 3)
+        by_id = {row["id"]: row for row in payload["messages"]}
+        self.assertEqual(by_id[1]["media"]["question"], "Choose one")
+        self.assertEqual(
+            [answer["text"] for answer in by_id[1]["media"]["answers"]],
+            ["Alpha", "Beta"],
+        )
+        self.assertEqual(by_id[2]["type"], "unsupported")
+        self.assertEqual(by_id[3]["text"], "later message")
 
 
 if __name__ == "__main__":

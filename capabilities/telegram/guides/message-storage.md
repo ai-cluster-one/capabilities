@@ -19,6 +19,8 @@ capabilities/telegram/messages/
 
 The message store is mutable, personal, and potentially large or sensitive. Git-ignore the exported JSON and media. Commit only the connection wiring, identifiers, and any project reference that explains why a specific chat is registered.
 
+Poll questions and answers are normalized from Telegram text/entity wrappers to plain JSON strings. Every message is serialized independently: an unknown Telegram media subtype or serializer failure becomes a bounded `unsupported` record with safe type/message metadata, and later messages are still exported. Raw Telethon objects and credentials are never written to the archive.
+
 ## Export And Transcription
 
 Use `telegram export` to materialize a chat history into the chosen folder. Use `telegram transcribe` on that JSON when voice/audio needs text. The CLI owns the export schema and the transcription placeholders; project docs should not duplicate that schema.

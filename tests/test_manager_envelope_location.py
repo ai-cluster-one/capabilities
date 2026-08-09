@@ -128,39 +128,42 @@ def test_project_without_contextkit_never_asks(tmp_path: Path) -> None:
     assert not log.exists()
 
 
-def test_contextkit_absent_from_path_falls_back_to_the_root_envelope(tmp_path: Path) -> None:
+def test_contextkit_absent_from_path_is_a_structured_error(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True, body_root="agent")
     (tmp_path / "fakebin").mkdir()
     env = _env(tmp_path, project)
     env["PATH"] = str(tmp_path / "fakebin")
 
-    init = _json(_run(tmp_path, project, "init", env=env))
+    result = _run(tmp_path, project, "init", env=env)
 
-    assert init["gate"] == str((project / "capabilities" / "settings.json").resolve())
-    assert (project / "capabilities" / "settings.json").is_file()
+    assert result.returncode == 6
+    assert json.loads(result.stderr)["error"]["code"] == "contextkit_unavailable"
+    assert not (project / "capabilities").exists()
     assert not (project / "agent").exists()
 
 
-def test_failing_contextkit_falls_back_to_the_root_envelope(tmp_path: Path) -> None:
+def test_failing_contextkit_is_a_structured_error(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True, body_root="agent")
     log = _fake_contextkit(tmp_path, None, exit_code=1)
 
-    init = _json(_run(tmp_path, project, "init"))
+    result = _run(tmp_path, project, "init")
 
     assert log.exists()
-    assert init["gate"] == str((project / "capabilities" / "settings.json").resolve())
-    assert (project / "capabilities" / "settings.json").is_file()
+    assert result.returncode == 6
+    assert json.loads(result.stderr)["error"]["code"] == "contextkit_path_failed"
+    assert not (project / "capabilities").exists()
     assert not (project / "agent").exists()
 
 
-def test_answer_outside_the_project_is_unusable(tmp_path: Path) -> None:
+def test_answer_outside_the_project_is_a_structured_error(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True)
     outside = tmp_path / "elsewhere" / "capabilities"
     _fake_contextkit(tmp_path, outside)
 
-    init = _json(_run(tmp_path, project, "init"))
+    result = _run(tmp_path, project, "init")
 
-    assert init["gate"] == str((project / "capabilities" / "settings.json").resolve())
+    assert result.returncode == 6
+    assert json.loads(result.stderr)["error"]["code"] == "project_envelope_outside_project"
     assert not outside.exists()
 
 
@@ -190,3 +193,48 @@ def test_supplied_envelope_replaces_the_lookup(tmp_path: Path) -> None:
 
     assert init["gate"] == str(envelope.resolve() / "settings.json")
     assert not log.exists()
+
+
+def test_path_json_reports_plain_project_provenance(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=False)
+
+    answer = _json(_run(tmp_path, project, "path", "--json"))
+
+    assert answer == {
+        "project_root": str(project.resolve()),
+        "project_envelope": str((project / "capabilities").resolve()),
+        "provider": "default",
+    }
+
+
+def test_path_json_reports_contextkit_provenance(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root="agent")
+    envelope = project / "agent" / "capabilities"
+    _fake_contextkit(tmp_path, envelope)
+
+    answer = _json(_run(tmp_path, project, "path", "--json"))
+
+    assert answer["project_root"] == str(project.resolve())
+    assert answer["project_envelope"] == str(envelope.resolve())
+    assert answer["provider"] == "contextkit"
+
+
+def test_path_json_reports_handoff_provenance_without_contextkit(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=False)
+    envelope = project / "agent" / "capabilities"
+    env = _env(tmp_path, project)
+    env["CAPABILITIES_PROJECT_ENVELOPE"] = str(envelope)
+
+    answer = _json(_run(tmp_path, project, "path", "--json", env=env))
+
+    assert answer["project_envelope"] == str(envelope.resolve())
+    assert answer["provider"] == "handoff"
+
+
+def test_path_requires_json_output(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=False)
+
+    result = _run(tmp_path, project, "path")
+
+    assert result.returncode == 6
+    assert json.loads(result.stderr)["error"]["code"] == "input"

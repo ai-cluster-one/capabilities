@@ -81,6 +81,7 @@ from call_recording_helpers import (
     write_metadata,
 )
 import voice_agent
+from settings_schema import validate_settings
 sys.path.pop(0)
 
 logging.getLogger("telethon").setLevel(logging.CRITICAL)
@@ -107,6 +108,10 @@ CODEX_SERVICE_TIERS = set(CODEX_SERVICE_TIER_CHOICES)
 TELEGRAM_MESSAGE_LIMIT = 4096
 
 
+class SettingsError(ValueError):
+    """A settings/layout value that cannot safely become live configuration."""
+
+
 def _find_project_root():
     start = (os.environ.get("TELEGRAM_SERVICE_PROJECT_ROOT")
              or os.environ.get("CLAUDE_PROJECT_DIR")
@@ -127,12 +132,54 @@ def _find_project_root():
 PROJECT_ROOT = _find_project_root()
 
 
+def _validated_project_envelope(value, provider):
+    raw = str(value or "").strip()
+    if not raw:
+        raise SettingsError(f"{provider} returned an empty project envelope")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise SettingsError(f"{provider} returned a relative project envelope: {raw!r}")
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(PROJECT_ROOT.resolve())
+    except (OSError, ValueError) as exc:
+        raise SettingsError(
+            f"{provider} returned a project envelope outside {PROJECT_ROOT}: {candidate}") from exc
+    return resolved
+
+
 def _project_capabilities_dir():
-    current = PROJECT_ROOT / "capabilities"
-    legacy = PROJECT_ROOT / ".capabilities"
-    if (current / "settings.json").is_file() or not legacy.is_dir():
-        return current
-    return legacy
+    """Consume the launcher's resolved envelope, or ask the manager directly."""
+    supplied = (os.environ.get("TELEGRAM_SERVICE_PROJECT_ENVELOPE")
+                or os.environ.get("CAPABILITIES_PROJECT_ENVELOPE"))
+    if supplied:
+        return _validated_project_envelope(supplied, "service launcher")
+    source_manager = Path(__file__).resolve().parents[3] / "bin" / "capabilities"
+    manager = (os.environ.get("CAPABILITIES_MANAGER_BIN")
+               or (str(source_manager) if source_manager.is_file() else "capabilities"))
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(PROJECT_ROOT)
+    try:
+        proc = subprocess.run(
+            [manager, "path", "--json"], cwd=PROJECT_ROOT, env=env,
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SettingsError(f"could not resolve the project envelope through capabilities: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise SettingsError(
+            f"capabilities path failed with exit {proc.returncode}: {detail}")
+    try:
+        answer = json.loads(proc.stdout)
+    except (TypeError, ValueError) as exc:
+        raise SettingsError("capabilities path returned malformed JSON") from exc
+    if not isinstance(answer, dict):
+        raise SettingsError("capabilities path returned a non-object answer")
+    manager_root = Path(str(answer.get("project_root") or ""))
+    if not manager_root.is_absolute() or manager_root.resolve() != PROJECT_ROOT.resolve():
+        raise SettingsError("capabilities path resolved a different project root")
+    return _validated_project_envelope(
+        answer.get("project_envelope"), answer.get("provider") or "capabilities manager")
 
 
 PROJECT_CAPABILITIES_DIR = _project_capabilities_dir()
@@ -142,6 +189,74 @@ SETTINGS_FILE = Path(os.environ.get("TELEGRAM_SERVICE_SETTINGS")
 CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_CONTEXT")
                     or SERVICE_DIR / "context.md")
 
+
+def _read_project_layout(reload_file=False):
+    """Validate the launcher-owned absolute project layout snapshot."""
+    raw = os.environ.get("TELEGRAM_SERVICE_PROJECT_LAYOUT", "").strip()
+    layout_file = globals().get("PROJECT_LAYOUT_FILE")
+    if reload_file and layout_file is not None and layout_file.is_file():
+        try:
+            raw = layout_file.read_text()
+        except OSError as exc:
+            raise SettingsError(f"cannot read project layout snapshot: {exc}") from exc
+    if not raw:
+        # Direct daemon use remains ContextKit-independent, with only the manager-
+        # resolved envelope exposed. The service launcher supplies richer layers.
+        return {
+            "project_root": str(PROJECT_ROOT.resolve()),
+            "capabilities": str(PROJECT_CAPABILITIES_DIR.resolve()),
+            "compiled_context": None,
+            "provider": "minimal",
+        }
+    try:
+        layout = json.loads(raw)
+    except ValueError as exc:
+        raise SettingsError(f"project layout is not valid JSON: {exc}") from exc
+    if not isinstance(layout, dict):
+        raise SettingsError("project layout must be a JSON object")
+    allowed = {
+        "project_root", "capabilities", "context", "routines", "assets",
+        "memory", "deployment", "compiled_context", "provider",
+    }
+    unknown = set(layout) - allowed
+    if unknown:
+        key = sorted(unknown)[0]
+        raise SettingsError(f"project_layout.{key}: unsupported property {key!r}")
+    declared_root = Path(str(layout.get("project_root") or ""))
+    if not declared_root.is_absolute() or declared_root.resolve() != PROJECT_ROOT.resolve():
+        raise SettingsError("project_layout.project_root does not match the daemon project")
+    result = {"project_root": str(PROJECT_ROOT.resolve()),
+              "provider": str(layout.get("provider") or "unknown")}
+    for key in ("capabilities", "context", "routines", "assets", "memory", "deployment"):
+        value = layout.get(key)
+        if value is None:
+            continue
+        candidate = Path(str(value)).expanduser()
+        if not candidate.is_absolute():
+            raise SettingsError(f"project_layout.{key} must be absolute")
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(PROJECT_ROOT.resolve())
+        except (OSError, ValueError) as exc:
+            raise SettingsError(f"project_layout.{key} is outside the project") from exc
+        result[key] = str(resolved)
+    if Path(result.get("capabilities", "")).resolve() != PROJECT_CAPABILITIES_DIR.resolve():
+        raise SettingsError("project_layout.capabilities does not match the resolved envelope")
+    compiled = layout.get("compiled_context")
+    if compiled is None:
+        result["compiled_context"] = None
+    else:
+        candidate = Path(str(compiled)).expanduser()
+        if not candidate.is_absolute():
+            raise SettingsError("project_layout.compiled_context must be absolute")
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(PROJECT_ROOT.resolve())
+        except (OSError, ValueError) as exc:
+            raise SettingsError("project_layout.compiled_context is outside the project") from exc
+        result["compiled_context"] = str(resolved)
+    return result
+
 # Per-instance channel toggle. Default on (opt-out) — set falsey on instances
 # that should not consume the Telegram channel.
 CHANNEL_ENABLED = os.environ.get(
@@ -149,10 +264,6 @@ CHANNEL_ENABLED = os.environ.get(
     os.environ.get("TELEGRAM_CHANNEL_ENABLED", "true"),
 ).strip().lower() \
     in ("1", "true", "yes", "on")
-
-
-class SettingsError(ValueError):
-    """A settings file that cannot safely replace the live configuration."""
 
 
 def _read_settings():
@@ -165,10 +276,10 @@ def _read_settings():
         raise SettingsError(f"{SETTINGS_FILE} is not valid JSON: {e}") from e
     if not isinstance(settings, dict):
         raise SettingsError(f"{SETTINGS_FILE} must contain a JSON object")
-    for key in ("allowed_users", "allowed_groups", "direct_messages", "defaults",
-                "control", "authority"):
-        if key in settings and not isinstance(settings[key], dict):
-            raise SettingsError(f"settings.{key} must be a JSON object")
+    try:
+        validate_settings(settings, PROJECT_ROOT, SERVICE_DIR)
+    except ValueError as exc:
+        raise SettingsError(str(exc)) from exc
     return settings
 
 
@@ -179,7 +290,7 @@ def _load_settings():
         sys.exit(str(exc))
 
 
-def _runtime_settings(settings):
+def _runtime_settings(settings, project_layout=None):
     """Validate and derive every setting that may be replaced while live.
 
     Nothing in this function mutates module state. Reload first builds this
@@ -257,6 +368,7 @@ def _runtime_settings(settings):
         "SYNC_INTERVAL": sync_interval,
         "SYNC_STALE_AFTER": max(
             sync_interval * 2, positive_seconds("sync_stale_after", 60)),
+        "PROJECT_LAYOUT": project_layout if project_layout is not None else PROJECT_LAYOUT,
     }
 
 
@@ -266,7 +378,8 @@ def _publish_runtime_settings(runtime):
 
 # --- static policy (project) --------------------------------------------------
 SETTINGS = _load_settings()
-_publish_runtime_settings(_runtime_settings(SETTINGS))
+PROJECT_LAYOUT = _read_project_layout()
+_publish_runtime_settings(_runtime_settings(SETTINGS, PROJECT_LAYOUT))
 SETTINGS_GENERATION = 1
 SETTINGS_RELOAD_ATTEMPTS = 0
 CONTROL_DEFAULTS = {
@@ -391,6 +504,12 @@ def _select_connection(data):
 
 CONNECTIONS, CONN_FILE = _connections_envelope()
 CONNECTION, CONNECTION_ENTRY = _select_connection(CONNECTIONS)
+try:
+    EXPECTED_ACCOUNT_ID = int(CONNECTION)
+    if EXPECTED_ACCOUNT_ID <= 0:
+        raise ValueError
+except (TypeError, ValueError):
+    EXPECTED_ACCOUNT_ID = None
 if not bool((CONNECTION_ENTRY or {}).get("allow_write", False)):
     sys.exit(
         f"Telegram connection {CONNECTION!r} does not allow writes; "
@@ -425,6 +544,7 @@ PROGRESS_DIR = SERVICE_STATE_DIR / "progress"
 WORKER_SESSION_DIR = SERVICE_STATE_DIR / "worker-sessions"
 AUTHORITY_DIR = SERVICE_STATE_DIR / "authority"
 CALL_RECORDING_REQUEST_DIR = SERVICE_STATE_DIR / "call-recording-requests"
+PROJECT_LAYOUT_FILE = SERVICE_STATE_DIR / "project-layout.json"
 
 
 def now():
@@ -477,7 +597,8 @@ def reload_runtime_settings():
         candidate = _read_settings()
         if candidate.get("connection") != SETTINGS.get("connection"):
             raise SettingsError("settings.connection changed; a daemon restart is required")
-        runtime = _runtime_settings(candidate)
+        project_layout = _read_project_layout(reload_file=True)
+        runtime = _runtime_settings(candidate, project_layout)
     except (SettingsError, ValueError) as exc:
         error = str(exc)
         write_health(
@@ -910,6 +1031,8 @@ def _authority_policy_for(job, group_policy, is_direct):
         "source": "telegram",
         "connection": CONNECTION,
         "chat_id": job.get("chat_id"),
+        "topic_id": job.get("topic_id"),
+        "topic_title": job.get("topic_title"),
         "chat_type": "private" if is_direct else "group",
         "chat_name": (group_policy or {}).get("name") if isinstance(group_policy, dict) else None,
         "sender_id": sender_id,
@@ -1533,7 +1656,7 @@ def channel_settings(reg, key):
     """Project defaults and channel policy overlaid by this channel's /set overrides."""
     row = reg.get(key, {})
     s = row.get("settings", {})
-    _, group_policy = _group_policy(key)
+    _, group_policy = _group_policy(_channel_identity(key)[0])
     configured_timeout = (
         group_policy.get("worker_timeout", DEFAULTS.get("worker_timeout", 90))
         if isinstance(group_policy, dict)
@@ -1607,7 +1730,7 @@ def _status(reg, key):
         lines.append(f"  codex.reasoning = {s.get('reasoning_effort') or 'default'}")
         lines.append(f"  codex.service_tier = {s.get('service_tier') or 'default'}")
     lines.append(f"  worker-timeout = {s['worker_timeout']}s")
-    _, group_policy = _group_policy(key)
+    _, group_policy = _group_policy(_channel_identity(key)[0])
     if group_policy is not None:
         mode = s.get("voice_transcription") or _voice_transcription_mode(group_policy, reg, key)
         lines.append(f"  voice-transcription = {mode}")
@@ -1652,7 +1775,7 @@ def _set_help(reg, key, topic=None):
         return ("usage: /set worker-timeout <1..3600|default>\n"
                 f"current: {s['worker_timeout']}s")
     if topic in ("voice-transcription", "voice_transcription", "voice"):
-        _, group_policy = _group_policy(key)
+        _, group_policy = _group_policy(_channel_identity(key)[0])
         if group_policy is None:
             return "voice-transcription setting is only available in groups (direct messages always transcribe voice)"
         current = s.get("voice_transcription") or _voice_transcription_mode(group_policy, reg, key)
@@ -1698,7 +1821,7 @@ def _set_help(reg, key, topic=None):
         "  effort <default|low|medium|high|xhigh|max>  (claude active)",
         "  speed <default|fast|priority>  (codex active)",
     ]
-    _, group_policy = _group_policy(key)
+    _, group_policy = _group_policy(_channel_identity(key)[0])
     if group_policy is not None:
         lines.append("  voice-transcription <auto|disabled>  (groups only)")
     lines.extend([
@@ -1741,7 +1864,7 @@ def set_channel_setting(reg, key, k, v):
         s["worker"] = worker
         return f"worker = {worker}"
     if k in ("voice-transcription", "voice_transcription", "voice"):
-        _, group_policy = _group_policy(key)
+        _, group_policy = _group_policy(_channel_identity(key)[0])
         if group_policy is None:
             raise ValueError("voice-transcription setting is only available in groups (direct messages always transcribe voice)")
         mode = v.strip().lower()
@@ -1911,6 +2034,66 @@ def _reply_to_message_id(message):
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+CHANNEL_TOPIC_MARKER = "#topic:"
+
+
+def _message_topic_id(message):
+    """Canonical forum-topic root id, or None for ordinary chat messages."""
+    reply = getattr(message, "reply_to", None)
+    for value in (
+        getattr(message, "reply_to_top_id", None),
+        getattr(reply, "reply_to_top_id", None),
+        getattr(message, "topic_id", None),
+    ):
+        try:
+            if value is not None and int(value) > 0:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    is_topic = bool(
+        getattr(message, "forum_topic", False)
+        or getattr(reply, "forum_topic", False)
+    )
+    if not is_topic:
+        return None
+    # Telegram's general topic and a topic's root service message may expose
+    # only reply_to_msg_id / the message id rather than reply_to_top_id.
+    for value in (
+        getattr(message, "reply_to_msg_id", None),
+        getattr(reply, "reply_to_msg_id", None),
+        getattr(message, "id", None),
+    ):
+        try:
+            if value is not None and int(value) > 0:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _message_topic_title(message):
+    action = getattr(message, "action", None)
+    value = getattr(action, "title", None) or getattr(message, "topic_title", None)
+    text = str(value or "").strip()
+    return text or None
+
+
+def _channel_key(chat_id, topic_id=None):
+    base = str(chat_id)
+    return f"{base}{CHANNEL_TOPIC_MARKER}{int(topic_id)}" if topic_id is not None else base
+
+
+def _channel_identity(key):
+    raw = str(key)
+    if CHANNEL_TOPIC_MARKER not in raw:
+        return raw, None
+    chat_id, topic = raw.rsplit(CHANNEL_TOPIC_MARKER, 1)
+    try:
+        return chat_id, int(topic)
+    except (TypeError, ValueError):
+        return raw, None
 
 
 def _format_conversation(tail):
@@ -2173,6 +2356,14 @@ def worker_env(state=None):
         env["CAPABILITIES_AUTH_CONTEXT"] = st["authority_context"]
     if st.get("chat_type"):
         env["TELEGRAM_PROGRESS_CHAT_TYPE"] = st["chat_type"]
+    if st.get("chat_id") is not None:
+        env["TELEGRAM_AUTHORIZED_CHAT_ID"] = str(st["chat_id"])
+    if st.get("topic_id") is not None:
+        env["TELEGRAM_AUTHORIZED_TOPIC_ID"] = str(st["topic_id"])
+    else:
+        env.pop("TELEGRAM_AUTHORIZED_TOPIC_ID", None)
+    if st.get("connection") is not None:
+        env["TELEGRAM_AUTHORIZED_CONNECTION"] = str(st["connection"])
     req = st.get("current_request") or {}
     if req.get("reply_to"):
         env["TELEGRAM_PROGRESS_REPLY_TO"] = str(req["reply_to"])
@@ -2202,50 +2393,28 @@ def write_authority_context(authority, stem):
 
 
 CAPABILITY_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
-# Which compiled body a call reads. The project's own agents read this one, so
-# a call and a worker are told the same thing about the same project.
 PROJECT_CONTEXT_TARGET = "codex"
-_project_context_path = {}
 
 
 def resolve_project_context_path(target=PROJECT_CONTEXT_TARGET, timeout=30.0):
-    """Ask ContextKit where the compiled body is, and let it rebuild while
-    answering. Its own command owns that path; a daemon that guessed it would
-    be reading yesterday's copy the first time the layout moved."""
-    cached = _project_context_path.get(target)
-    if cached is not None and cached.is_file():
-        return cached
-    path = None
-    try:
-        proc = subprocess.run(["contextkit", "build", "--target", target, "--json"],
-                              capture_output=True, text=True, timeout=timeout,
-                              cwd=str(PROJECT_ROOT))
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "build failed").strip()[:300]
-            log(f"voice: no compiled project context — contextkit exit "
-                f"{proc.returncode}: {detail}")
-            return None
-        written = (json.loads(proc.stdout) or {}).get("written") or {}
-        if written.get(target):
-            candidate = Path(written[target])
-            path = (candidate if candidate.is_absolute()
-                    else PROJECT_ROOT / candidate).resolve()
-            path.relative_to(PROJECT_ROOT.resolve())
-            if not path.is_file():
-                raise OSError(f"compiled context is not a file: {path}")
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        log(f"voice: no compiled project context — {type(exc).__name__}: {exc}")
+    """Return the optional compiled context from the launcher-owned snapshot."""
+    del target, timeout
+    value = PROJECT_LAYOUT.get("compiled_context")
+    if not value:
         return None
-    if path is not None:
-        log(f"voice: project context resolved at {path}")
-        _project_context_path[target] = path
-    return path
+    try:
+        path = Path(value).resolve()
+        path.relative_to(PROJECT_ROOT.resolve())
+    except (OSError, ValueError) as exc:
+        log(f"voice: invalid compiled project context snapshot — {exc}")
+        return None
+    return path if path.is_file() else None
 
 
 # What a call may open. An allowed list rather than a forbidden one: the project
 # holds credentials, sessions and bank material, and a caller on a phone must not
 # be one clever path away from any of it.
-PROJECT_READ_ROOTS = ("context", "routines", "assets", "capabilities", "deployment")
+PROJECT_READ_LAYERS = ("context", "routines", "assets", "memory", "capabilities", "deployment")
 # And inside those, what is never opened however it is reached.
 PROJECT_READ_DENY_NAMES = (
     ".env", ".netrc", "connections.json", "credentials.json", "secrets.json",
@@ -2275,9 +2444,22 @@ def resolve_project_file(wanted):
     except (ValueError, OSError):
         return None, "outside_project"
 
-    rel = path.relative_to(root)
-    parts = rel.parts
-    if not parts or parts[0] not in PROJECT_READ_ROOTS:
+    matched_root = None
+    for name in PROJECT_READ_LAYERS:
+        value = PROJECT_LAYOUT.get(name)
+        if not value:
+            continue
+        layer_root = Path(value).resolve()
+        try:
+            path.relative_to(layer_root)
+            matched_root = layer_root
+            break
+        except ValueError:
+            continue
+    if matched_root is None:
+        return None, "not_readable_here"
+    parts = path.relative_to(matched_root).parts
+    if not parts:
         return None, "not_readable_here"
     lowered = [p.lower() for p in parts]
     if any(p in PROJECT_READ_DENY_PARTS for p in lowered):
@@ -2670,6 +2852,10 @@ class SessionUnhealthy(Exception):
     """The MTProto client is alive but no longer decoding Telegram updates reliably."""
 
 
+class IdentityMismatch(Exception):
+    """The durable session belongs to a different Telegram account."""
+
+
 class WorkerTimedOut(Exception):
     """The worker future exceeded its configured deadline without being cancelled."""
 
@@ -2680,6 +2866,16 @@ async def run_session(client):
         raise NotAuthorized(
             f"session not authorized — exec in and run: telegram login --connection {CONNECTION}")
     me = await client.get_me()
+    write_health(
+        expected_account_id=EXPECTED_ACCOUNT_ID,
+        actual_account_id=int(me.id),
+        actual_account=(getattr(me, "username", None)
+                        or getattr(me, "first_name", None)),
+    )
+    if EXPECTED_ACCOUNT_ID is not None and int(me.id) != EXPECTED_ACCOUNT_ID:
+        raise IdentityMismatch(
+            f"Telegram account mismatch: expected {EXPECTED_ACCOUNT_ID}, got {me.id} "
+            f"({getattr(me, 'username', None) or getattr(me, 'first_name', 'unknown')})")
     allowed_labels = [f"{v.get('name', k)}({k})" for k, v in ALLOWED.items()]
     allowed_group_labels = [
         f"{(v if isinstance(v, dict) else {}).get('name', k)}({k})"
@@ -2771,6 +2967,12 @@ async def run_session(client):
             sent_ids.append(sent.id)
         return sent, sent_ids
 
+    def thread_reply_target(message, sender_id, group_policy, is_direct):
+        target = _reply_target(message.id, sender_id, group_policy, is_direct)
+        if not is_direct and target is None:
+            target = _message_topic_id(message)
+        return target
+
     async def handle_call_recording_request(key, message, group_policy, chat_ref):
         text = _message_text(message)
         if not _is_call_recording_request(text):
@@ -2795,7 +2997,7 @@ async def run_session(client):
         save_register(reg)
         _, _ = await send_channel_message(
             chat_ref, reply, False,
-            reply_to=_reply_target(message.id, profile["id"], group_policy, False))
+            reply_to=thread_reply_target(message, profile["id"], group_policy, False))
         return True
 
     async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset):
@@ -2831,7 +3033,7 @@ async def run_session(client):
                 pass
         await drain_progress(key, outbox, ent_id, is_direct, reply_to, offset)
 
-    def reserve_job(key, message, group_policy, is_direct, reason):
+    def reserve_job(key, message, group_policy, is_direct, reason, chat_id=None):
         """Persist ownership of a message before any transcription or other await.
 
         The preparing state is recovered as queued on startup. This reservation is the
@@ -2848,7 +3050,10 @@ async def run_session(client):
         sender_role = sender_role_for(sender_id, group_policy, is_direct)
         job = {
             "message_id": message.id,
-            "chat_id": key,
+            "chat_id": str(chat_id if chat_id is not None else _channel_identity(key)[0]),
+            "channel_key": key,
+            "topic_id": _message_topic_id(message),
+            "topic_title": _message_topic_title(message),
             "sender_id": sender_id,
             "sender_name": sender_name,
             "sender_role": sender_role,
@@ -2928,10 +3133,22 @@ async def run_session(client):
         return False
 
     async def build_tail_and_participants(key, ent_id, s, group_policy, is_direct, job):
-        raw = await client.get_messages(ent_id, limit=s["tail_size"])
+        topic_id = job.get("topic_id")
+        if topic_id is None:
+            raw = await client.get_messages(ent_id, limit=s["tail_size"])
+        else:
+            try:
+                raw = await client.get_messages(
+                    ent_id, limit=s["tail_size"], reply_to=int(topic_id))
+            except TypeError:
+                # Test doubles and older clients may not expose reply_to; the
+                # defensive filter below still guarantees isolation.
+                raw = await client.get_messages(ent_id, limit=s["tail_size"] * 4)
         visible = []
         echo_senders = _voice_echo_senders(reg, key)
         for m in reversed(raw or []):
+            if topic_id is not None and _message_topic_id(m) != int(topic_id):
+                continue
             if not _tail_in_scope(m, group_policy):
                 continue
             t = message_tail_text(m)
@@ -2970,6 +3187,8 @@ async def run_session(client):
 
         profiles = {}
         for m in raw or []:
+            if topic_id is not None and _message_topic_id(m) != int(topic_id):
+                continue
             if _incoming_in_scope(m, group_policy):
                 profile = await _sender_profile(m, group_policy, direct=is_direct)
                 profiles[profile["id"]] = profile
@@ -2997,7 +3216,8 @@ async def run_session(client):
 
     async def run_one_job(key, ent_id, job):
         s = channel_settings(reg, key)
-        _, group_policy = _group_policy(key)
+        base_chat_id, _ = _channel_identity(key)
+        _, group_policy = _group_policy(job.get("chat_id") or base_chat_id)
         is_direct = group_policy is None
 
         # Check max attempts cap before incrementing
@@ -3028,6 +3248,9 @@ async def run_session(client):
                 key, ent_id, s, group_policy, is_direct, job)
             reply_msg_id = _reply_target(
                 job.get("message_id"), job.get("sender_id"), group_policy, is_direct)
+            delivery_reply_id = reply_msg_id
+            if not is_direct and delivery_reply_id is None and job.get("topic_id") is not None:
+                delivery_reply_id = int(job["topic_id"])
             current_request = {
                 "message_id": job.get("message_id"),
                 "sender_id": job.get("sender_id"),
@@ -3052,9 +3275,12 @@ async def run_session(client):
             if authority is not None:
                 authority_context = write_authority_context(
                     authority, f"{key}-{job.get('message_id')}")
-            state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
+            state = {"now": now_display(), "chat_id": job.get("chat_id") or base_chat_id,
+                     "channel_key": key, "connection": CONNECTION,
                      "chat_type": "private" if is_direct else "group",
                      "chat_name": (group_policy or {}).get("name"),
+                     "topic_id": job.get("topic_id"),
+                     "topic_title": job.get("topic_title"),
                      "harness": s["worker"], "participants": participants, "settings": s,
                      "messages": len(tail),
                      "history_chars": sum(len(m["text"]) for m in tail),
@@ -3075,7 +3301,7 @@ async def run_session(client):
             progress_stop = asyncio.Event()
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
-                              reply_msg_id, progress_stop))
+                              delivery_reply_id, progress_stop))
             future = loop.run_in_executor(None, WORKERS[s["worker"]], key, tail, state, procs)
             async with client.action(ent_id, "typing"):
                 done, _ = await asyncio.wait({future}, timeout=float(s["worker_timeout"]))
@@ -3102,18 +3328,21 @@ async def run_session(client):
                     if len(reply) <= 1024:
                         sent = await client.send_file(
                             ent_id, images, caption=reply,
-                            reply_to=reply_msg_id)
+                            reply_to=delivery_reply_id)
                     else:
                         sent = await client.send_file(
-                            ent_id, images, reply_to=reply_msg_id)
-                        _, _ = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
+                            ent_id, images, reply_to=delivery_reply_id)
+                        _, _ = await send_channel_message(
+                            ent_id, reply, is_direct, reply_to=delivery_reply_id)
                     image_count = len(images) if isinstance(images, list) else 1
                     log(f"{key}: sent {image_count} image(s) with reply job msg={job.get('message_id')}")
                 except Exception as send_err:
                     log(f"{key}: image send failed, delivering text only: {send_err}")
-                    sent, _ = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
+                    sent, _ = await send_channel_message(
+                        ent_id, reply, is_direct, reply_to=delivery_reply_id)
             else:
-                sent, _ = await send_channel_message(ent_id, reply, is_direct, reply_to=reply_msg_id)
+                sent, _ = await send_channel_message(
+                    ent_id, reply, is_direct, reply_to=delivery_reply_id)
             
             tok = meta.get("tokens", {})
             cost = f" ${meta['cost_usd']:.4f}" if meta.get("cost_usd") else ""
@@ -3175,11 +3404,14 @@ async def run_session(client):
         notice = (f"Worker error:\n{error}" if is_supervisor
                   else "Something went wrong while processing this. Please tell an administrator.")
         try:
-            _, group_policy = _group_policy(key)
+            _, group_policy = _group_policy(job.get("chat_id") or _channel_identity(key)[0])
+            reply_to = _reply_target(
+                job.get("message_id"), job.get("sender_id"), group_policy, is_direct)
+            if not is_direct and reply_to is None and job.get("topic_id") is not None:
+                reply_to = int(job["topic_id"])
             _, _ = await send_channel_message(
                 ent_id, notice, is_direct,
-                reply_to=_reply_target(
-                    job.get("message_id"), job.get("sender_id"), group_policy, is_direct))
+                reply_to=reply_to)
         except Exception as se:
             log(f"{key}: failed to send error notice: {se}")
         mark_job_finished(key, job, "error", error=error)
@@ -3319,8 +3551,8 @@ async def run_session(client):
                 text,
                 is_direct,
                 parse_mode="html",
-                reply_to=_reply_target(
-                    message.id, getattr(message, "sender_id", None),
+                reply_to=thread_reply_target(
+                    message, getattr(message, "sender_id", None),
                     group_policy, is_direct))
             # Record echo attribution so conversation history shows the sender, not the assistant
             if not is_direct and sender_name and echo_ids:
@@ -3334,8 +3566,9 @@ async def run_session(client):
         return spoken
 
     async def registered_chat_ref(key):
+        chat_id, _ = _channel_identity(key)
         try:
-            cid = int(key)
+            cid = int(chat_id)
         except ValueError:
             return None
         try:
@@ -3344,7 +3577,7 @@ async def run_session(client):
             pass
         try:
             async for dialog in client.iter_dialogs(limit=500):
-                if str(dialog.id) == key:
+                if str(dialog.id) == chat_id:
                     return getattr(dialog, "input_entity", None) or dialog.entity
         except Exception as e:
             log(f"{key}: dialog lookup failed: {_short_error(e)}")
@@ -3363,16 +3596,24 @@ async def run_session(client):
             if ent is None:
                 continue
             try:
-                cid = int(key)
+                chat_id, topic_id = _channel_identity(key)
+                cid = int(chat_id)
             except ValueError:
                 continue
-            _, group_policy = _group_policy(key)
+            _, group_policy = _group_policy(chat_id)
             if cid < 0 and group_policy is None:
                 continue
             wm = reg.get(key, {}).get("last_processed_message_id", 0)
             try:
                 checked += 1
-                raw = await client.get_messages(ent, limit=channel_settings(reg, key)["tail_size"])
+                limit = channel_settings(reg, key)["tail_size"]
+                if topic_id is None:
+                    raw = await client.get_messages(ent, limit=limit)
+                else:
+                    try:
+                        raw = await client.get_messages(ent, limit=limit, reply_to=topic_id)
+                    except TypeError:
+                        raw = await client.get_messages(ent, limit=limit * 4)
             except Exception as e:
                 log(f"{key}: catch-up skipped; cannot resolve chat: {_short_error(e)}")
                 failures += 1
@@ -3381,6 +3622,8 @@ async def run_session(client):
                 continue
             enqueued = 0
             for m in reversed(raw):
+                if topic_id is not None and _message_topic_id(m) != topic_id:
+                    continue
                 if getattr(m, "out", False):
                     continue
                 if getattr(m, "action", None) is not None:
@@ -3408,7 +3651,9 @@ async def run_session(client):
                         key, m, group_policy, ent):
                     continue
                 if is_ambient_voice:
-                    job = reserve_job(key, m, group_policy, is_direct, f"catch-up/{reason}/ambient")
+                    job = reserve_job(
+                        key, m, group_policy, is_direct,
+                        f"catch-up/{reason}/ambient", chat_id=chat_id)
                     if job is None:
                         continue
                     profile = await _sender_profile(m, group_policy, direct=is_direct)
@@ -3427,7 +3672,9 @@ async def run_session(client):
                     # Otherwise echo-only, no worker
                     mark_job_finished(key, job, "done")
                     continue
-                job = reserve_job(key, m, group_policy, is_direct, f"catch-up/{reason}")
+                job = reserve_job(
+                    key, m, group_policy, is_direct,
+                    f"catch-up/{reason}", chat_id=chat_id)
                 if job is None:
                     continue
                 if not admit_or_finish_agent_job(
@@ -3463,7 +3710,8 @@ async def run_session(client):
         write_health(
             last_live_update_at=now(),
         )
-        raw_key = str(event.chat_id)
+        topic_id = _message_topic_id(event.message)
+        raw_key = _channel_key(event.chat_id, topic_id)
         _, raw_group_policy = _group_policy(event.chat_id)
         if raw_group_policy is not None and _reset_agent_dialogue_for_human(
                 reg, raw_key, event.message, raw_group_policy):
@@ -3475,7 +3723,7 @@ async def run_session(client):
             return
         if getattr(event.message, "action", None) is not None:
             return
-        key = str(event.chat_id)
+        key = raw_key
         text = _message_text(event.message)
         group_policy = access.get("policy")
         is_direct = access["kind"] == "private"
@@ -3507,12 +3755,14 @@ async def run_session(client):
             if reply:
                 _, _ = await send_channel_message(
                     chat_ref, reply, access["kind"] == "private",
-                    reply_to=_reply_target(
-                        event.message.id, event.message.sender_id,
+                    reply_to=thread_reply_target(
+                        event.message, event.message.sender_id,
                         group_policy, access["kind"] == "private"))
             return
         if access.get("ambient_voice"):                   # unaddressed voice in auto mode — check transcript
-            job = reserve_job(key, event.message, group_policy, is_direct, "live/ambient")
+            job = reserve_job(
+                key, event.message, group_policy, is_direct, "live/ambient",
+                chat_id=event.chat_id)
             if job is None:
                 log(f"{key}: already queued/done msg={event.message.id}")
                 return
@@ -3540,7 +3790,9 @@ async def run_session(client):
             mark_job_finished(key, job, "done")
             log(f"{key}: ambient voice msg={event.message.id} transcribed; no worker dispatch")
             return
-        job = reserve_job(key, event.message, group_policy, is_direct, "live")
+        job = reserve_job(
+            key, event.message, group_policy, is_direct, "live",
+            chat_id=event.chat_id)
         if job is None:
             log(f"{key}: already queued/done msg={event.message.id}")
             return
@@ -5147,6 +5399,11 @@ async def main():
                 "set it true on instances that should run the channel")
             await asyncio.Event().wait()           # stay alive so restart:unless-stopped doesn't loop
             return
+        if EXPECTED_ACCOUNT_ID is None:
+            sys.exit(
+                f"Telegram connection {CONNECTION!r} is a legacy label, not an account ID; "
+                f"run `telegram login --connection {CONNECTION}` to discover the account ID, "
+                "then rename the connections.json key/default")
         api_id, api_hash = resolve_creds()
         CONNECTION_STATE_DIR.mkdir(parents=True, exist_ok=True)   # telethon opens the session sqlite here;
         lock_handle = acquire_daemon_lock()
@@ -5172,6 +5429,11 @@ async def main():
                 log(f"{e}; reconnecting in {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
+            except IdentityMismatch as e:
+                write_health("unhealthy", last_error=str(e),
+                             expected_account_id=EXPECTED_ACCOUNT_ID)
+                log(str(e))
+                raise
             except Exception as e:
                 write_health("unhealthy", last_error=_short_error(e))
                 log(f"session crashed ({_short_error(e, 120)}) — "

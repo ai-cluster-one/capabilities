@@ -20,7 +20,7 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
 
 3. Edit `capabilities/telegram/service/settings.json`:
 
-   - Set `connection` or rely on the default in `capabilities/telegram/connections.json`.
+   - Set `connection` to the Telegram account ID or rely on the account-ID default in `capabilities/telegram/connections.json`.
    - Add `allowed_users` and `allowed_groups`.
    - Add optional per-channel `context_file` or short inline `context` entries when a chat needs its own soft prompt overlay.
    - Review `control.roles`: this hard gate limits who may run service control commands such as `/set`, `/reload`, and `/stop`.
@@ -34,9 +34,11 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
 
    ```json
    {
-     "default": "assistant",
+     "default": "8200881535",
      "connections": {
-       "assistant": {
+       "8200881535": {
+         "name": "Assistant",
+         "username": "assistant_username",
          "api_id": 123456,
          "secret_env": "TELEGRAM_API_HASH",
          "allow_write": true
@@ -45,40 +47,59 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
    }
    ```
 
+   The connection key (`8200881535`) is the stable Telegram user/account ID;
+   `api_id` is the separate Telegram API application ID. `name` and `username`
+   are display metadata. For an existing labelled key such as `assistant`, run
+   `telegram login --connection assistant` once: the result reports the actual
+   account ID and an explicit rename/default migration. Labels are never
+   silently reinterpreted as identities.
+
 5. Authenticate and check readiness:
 
    ```sh
-   telegram login --connection assistant
-   telegram doctor --connection assistant
-   telegram service doctor --connection assistant
+   telegram login --connection 8200881535
+   telegram doctor --connection 8200881535
+   telegram service doctor --connection 8200881535
    ```
 
 6. Start and inspect the service:
 
    ```sh
-   telegram service start --connection assistant
-   telegram service status --connection assistant
-   telegram service logs --connection assistant --tail 80
+   telegram service start --connection 8200881535
+   telegram service status --connection 8200881535
+   telegram service logs --connection 8200881535 --tail 80
    ```
 
 Use `telegram service stop` or foreground `run` for supervisor-managed processes. On macOS/local dev, `start` uses a background process with a PID file under the connection's service state directory.
 
-After editing `settings.json`, use `telegram service reload`. The daemon validates the complete replacement before publishing it, keeps its PID and Telegram connection, and records the settings generation in `health.json`. Invalid JSON or a connection change is refused with the old settings left active; changing the selected connection still requires a real restart. The same operation is available as `/reload` and as the live-call `reload_service` tool only when the caller's `control.roles` policy permits `reload` (the shipped default grants it only to `supervisor`). A worker may invoke the CLI form only when its request authority role is `supervisor`; an external terminal without request authority remains an operator surface.
+After editing `settings.json`, use `telegram service reload`. The complete strict schema is validated before publishing: unknown properties, invalid shapes/enums/bounds, and unsafe overlay paths are errors with their full JSON path. A rejected cold start/doctor/init check never begins service work; a rejected reload keeps the previous immutable settings and project-layout snapshot active. Changing the selected connection still requires a real restart. The same operation is available as `/reload` and as the live-call `reload_service` tool only when the caller's `control.roles` policy permits `reload` (the shipped default grants it only to `supervisor`). A worker may invoke the CLI form only when its request authority role is `supervisor`; an external terminal without request authority remains an operator surface.
+
+The accepted schema is deliberately finite:
+
+- Top level: `connection`, `assistant_name`, `direct_messages`, `allowed_users`, `allowed_groups`, `control`, `authority`, and `defaults`.
+- `direct_messages`: `mode` and `default_role`.
+- User/member policy: display `name`/`username`, `role`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `call_recording`, and `voice_agent`; group members additionally accept `kind` and `address_aliases`.
+- Group policy: `name`, `role`/`member_role`, `aliases`/`address_aliases`/`mentions`, `require_reference`, `members`, `agent_dialogue`, `worker_timeout`, `voice_transcription`, `call_recording`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), and `context`/`context_file`.
+- Defaults: `assistant_name`, `tail_size`, `sync_interval`, `sync_stale_after`, `debounce`, `worker_timeout`, `progress_after`, `max_parallel_jobs`, `max_attempts`, `group_aliases`, `worker`, `workers`, and `voice_agent`.
+- Worker policy: `model`; Claude also accepts `effort`; Codex accepts `reasoning_effort` and `service_tier`. Voice defaults accept `worker`, `workers`, `model`, `voice`, `greeting`, `history`, `timezone`, `progress_interval`, `recording_caption`, and `prompt_file`.
+- Control policies contain `commands`; authority policies contain `allowed_capabilities` or `capabilities`. Capability rules accept booleans/`*`, verb lists, or `allow`/`deny`/`enabled`/`scope`/`verbs` objects.
+
+IDs must have the correct sign (users positive, groups negative), paths must resolve inside the Telegram service directory, and numeric settings use the bounds named by `/set help` or the shipped template. There is no permissive/legacy mode and no support for a `project` routing property.
 
 ## State Layout
 
-For a connection named `assistant`, runtime state is:
+For account ID `8200881535`, runtime state is:
 
 ```text
-$XDG_STATE_HOME/telegram/assistant/session.session
-$XDG_STATE_HOME/telegram/assistant/service/register.json
-$XDG_STATE_HOME/telegram/assistant/service/health.json
-$XDG_STATE_HOME/telegram/assistant/service/progress/
-$XDG_STATE_HOME/telegram/assistant/service/worker-sessions/
-$XDG_STATE_HOME/telegram/assistant/service/daemon.log
-$XDG_STATE_HOME/telegram/assistant/service/daemon.pid
-$XDG_STATE_HOME/telegram/assistant/calls/recordings/<timestamp>-<chat>-call-<id>.ogg
-$XDG_STATE_HOME/telegram/assistant/calls/recordings/<timestamp>-<chat>-call-<id>.json
+$XDG_STATE_HOME/telegram/8200881535/session.session
+$XDG_STATE_HOME/telegram/8200881535/service/register.json
+$XDG_STATE_HOME/telegram/8200881535/service/health.json
+$XDG_STATE_HOME/telegram/8200881535/service/progress/
+$XDG_STATE_HOME/telegram/8200881535/service/worker-sessions/
+$XDG_STATE_HOME/telegram/8200881535/service/daemon.log
+$XDG_STATE_HOME/telegram/8200881535/service/daemon.pid
+$XDG_STATE_HOME/telegram/8200881535/calls/recordings/<timestamp>-<chat>-call-<id>.ogg
+$XDG_STATE_HOME/telegram/8200881535/calls/recordings/<timestamp>-<chat>-call-<id>.json
 ```
 
 The auth session and service runtime files are separate. Worker session copies let `telegram download` run inside workers without contending on the daemon's Telethon SQLite session.
@@ -89,14 +110,14 @@ The auth session and service runtime files are separate. Worker session copies l
 - Group messages are accepted only for `allowed_groups` and only when addressed by mention, reply, or configured alias unless the group policy sets `require_reference` to `false`.
 - Each addressed message becomes its own queued job.
 - A Codex turn that exits successfully with `turn.completed` and an intentionally empty final answer completes silently: the job is marked done and nothing is posted to Telegram. An empty result without that protocol completion remains a worker error.
-- The worker tail is a compact Tallinn-time timeline. Each message keeps its Telegram id; replies whose target is present in the same tail include that target id and sender. The current request repeats its in-window reply target once for unambiguous routing. Targets outside the configured tail are neither fetched nor described.
+- The worker tail is a compact Tallinn-time timeline. Forum-topic messages automatically use a topic-specific channel key and fetch/filter only that topic; interleaved topics never share a tail, watermark, debounce, retry, progress, or parallel-job slot. Ordinary groups and direct chats keep whole-chat behavior. Each message keeps its Telegram id and in-window reply topology.
 - The daemon performs protocol catch-up plus bounded watermark reconciliation when a Telegram session connects and at the configured sync interval. This recovers messages received while it was down and update packets the MTProto client could not deserialize.
 - `telegram service status` reports update-stream health from `health.json`; a live PID with a stale sync watermark is not reported as healthy.
 - `telegram service reload` applies policy and worker/voice defaults without disconnecting an active call. Prompt files are already read per request or call; reload is for `settings.json`.
 - A message is reserved in the persistent job register before voice transcription or any echo is attempted. Live re-delivery and startup catch-up therefore cannot transcribe or echo the same voice message twice.
 - Group final replies and progress updates are sent as replies to the addressed message. Direct-chat replies are plain messages.
 - A group member entry may set `"kind": "agent"` for another automation peer, plus `"address_aliases": ["Solomon"]` for deliberate handoffs in the worker prompt. A Telegram reply from that peer is then context rather than an implicit invocation: the peer must explicitly name or mention the assistant. Final responses, progress, control responses, transcription echoes, and error notices triggered by that peer are sent as new group messages rather than Telegram replies. Set group-level `"agent_dialogue": {"max_turns": 4, "reset_on_human_message": true}` to hard-limit consecutive accepted agent turns; further agent requests are silently consumed until a human message resets the counter.
-- `telegram send <chat> <text>` inside a worker writes to the daemon progress outbox instead of sending directly.
+- `telegram send <chat> <text>` inside a worker writes to the daemon progress outbox instead of sending directly. The wrapper accepts exactly those three arguments, pins chat/topic/connection to the daemon-created authority scope, and rejects extra flags or destination/session/topic substitution before touching the outbox or Telegram.
 - Workers can be `codex`, `claude`, or `stub`; `/set` and `/status` in Telegram adjust or inspect per-channel runtime settings when `control.roles` allows the sender role to run that command.
 - Worker subprocesses run in dedicated process groups. Timeout, task cancellation, reconnect, and incomplete post-worker delivery all terminate that group and move the persisted job to a terminal error or startup-retry state.
 - The daemon supervises its media recorder when at least one allowed group opts in. The recorder joins muted and uses PyTgCalls' built-in `RecordStream` for the complete joined interval. That supported path captures MP3; after Marvin leaves, FFmpeg converts the closed capture to the final OGG/Opus artifact. The source MP3 is removed only after successful conversion and is retained if conversion fails. The JSON sidecar stores the group, Telegram call id, joined interval, trigger, and participant state changes. It does not create a call or transcribe audio.
@@ -166,7 +187,7 @@ The two media slots of one direct call are independent, and both honour the requ
 
 Recording a voice-agent call therefore writes two raw tracks against one shared time origin, each padded with silence up to that origin, which FFmpeg joins into one stereo Opus file with real speaker separation. Both call paths refuse to deliver a recording that captured no audio.
 
-The system prompt is the project's own `capabilities/telegram/service/voice-agent.md`, the time the call is happening, the project's compiled body, then the recent tail of that direct chat, each message stamped with when it was sent. The body is the same one the project's other agents read — ContextKit is asked where it is rather than the path being assumed, and it is re-read per call so an edit reaches the next one without a restart. It is framed as an account of the project, not as instructions: it is written for an agent sitting at files, and a call can open only what `read_project_file` allows. Without it a caller waits through guessed names for systems the project already documents. `telegram service init` scaffolds that file from the shipped template and never overwrites an existing one; the project owns it and edits it freely, including which language the assistant prefers on a call. Both speech directions are transcribed and the joined transcript is stored in the JSON sidecar next to the recording.
+The system prompt is the project's own resolved Telegram service `voice-agent.md`, the time the call is happening, the optional compiled project body, then the recent tail of that direct chat. The launcher resolves absolute project layers once and hands a snapshot to the daemon; ContextKit is consulted only by the owner/launcher when the project is bound to it. The daemon neither imports nor invokes ContextKit, and a missing compiled body never prevents a call. On controlled reload a fully valid new settings/layout pair replaces the old snapshot atomically. `read_project_file` allows only the resolved layer roots and still denies traversal, symlink escapes, credentials, secrets, state, sessions, databases, and key material.
 
 The call is answered before the prompt is built. Reading a long chat tail first expires the ring window, after which the call layer tries to *place* a call instead of accepting one; so the daemon claims both media slots, then reads the tail, then sets the instruction and opens the speech session. The cost of that order is a second of dead air after pickup rather than a call that cannot be answered at all.
 

@@ -192,6 +192,17 @@ def import_daemon(tmp: Path, service_settings: dict, *,
     old_env = dict(os.environ)
     old_path = list(sys.path)
     old_modules = {name: sys.modules.pop(name, None) for name in stubbed}
+    project_layout = {
+        "project_root": str(project),
+        "capabilities": str(project / "capabilities"),
+        "context": str(project / "context"),
+        "routines": str(project / "routines"),
+        "assets": str(project / "assets"),
+        "memory": str(project / "memory"),
+        "deployment": str(project / "deployment"),
+        "compiled_context": None,
+        "provider": "test",
+    }
     try:
         os.environ.update({
             "HOME": str(tmp / "home"),
@@ -202,6 +213,8 @@ def import_daemon(tmp: Path, service_settings: dict, *,
             "TELEGRAM_SERVICE_CONNECTIONS_FILE": str(connections_file),
             "TELEGRAM_SERVICE_CONTEXT": str(context_file),
             "TELEGRAM_SERVICE_PROJECT_ROOT": str(project),
+            "TELEGRAM_SERVICE_PROJECT_ENVELOPE": str(project / "capabilities"),
+            "TELEGRAM_SERVICE_PROJECT_LAYOUT": json.dumps(project_layout),
             "TELEGRAM_SERVICE_SETTINGS": str(settings_file),
             "TELEGRAM_SERVICE_STATE_DIR": str(tmp / "service-state"),
         })
@@ -520,6 +533,67 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request_tail["in_reply_to"]["sender"], "Юрий")
             await self.stop_session(client, task)
 
+    async def test_daemon_refuses_a_session_owned_by_another_account(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.EXPECTED_ACCOUNT_ID = 8200881535
+            client = FakeClient([])  # the fixture is account id 42
+
+            with self.assertRaisesRegex(
+                    daemon.IdentityMismatch, r"expected 8200881535, got 42"):
+                await daemon.run_session(client)
+
+    async def test_forum_topics_have_independent_history_and_channel_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {"-200": {"aliases": ["Assistant"]}}
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({})
+
+            def in_topic(message_id, topic_id, text, reply_to=None):
+                message = Message(message_id, text=text)
+                message.mentioned = "Assistant" in text
+                message.reply_to = SimpleNamespace(
+                    forum_topic=True,
+                    reply_to_top_id=topic_id,
+                    reply_to_msg_id=reply_to,
+                )
+                message.reply_to_msg_id = reply_to
+                return message
+
+            one = in_topic(101, 10, "topic one context")
+            two = in_topic(102, 20, "topic two context")
+            request_one = in_topic(103, 10, "Assistant, answer one", reply_to=101)
+            request_two = in_topic(104, 20, "Assistant, answer two", reply_to=102)
+            client = FakeClient([one, two, request_one, request_two])
+            captured = {}
+
+            def capture(_chat, tail, state=None, _procs=None):
+                captured[state["topic_id"]] = {"tail": tail, "state": state}
+                return successful_result(f"reply topic {state['topic_id']}")
+
+            daemon.WORKERS["stub"] = capture
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            for message in (request_one, request_two):
+                event = Event(message, chat_id=-200)
+                event.is_private = False
+                await client.handler(event)
+            await wait_until(lambda: set(captured) == {10, 20})
+
+            first_text = [row["text"] for row in captured[10]["tail"]]
+            second_text = [row["text"] for row in captured[20]["tail"]]
+            self.assertIn("topic one context", first_text)
+            self.assertNotIn("topic two context", first_text)
+            self.assertIn("topic two context", second_text)
+            self.assertNotIn("topic one context", second_text)
+            self.assertEqual(captured[10]["state"]["channel_key"], "-200#topic:10")
+            self.assertEqual(captured[20]["state"]["channel_key"], "-200#topic:20")
+            current = next(row for row in captured[10]["tail"] if row["id"] == 103)
+            self.assertEqual(current["in_reply_to"]["id"], 101)
+            await self.stop_session(client, task)
+
     async def test_agent_member_uses_explicit_address_and_top_level_responses(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
@@ -705,6 +779,37 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(daemon.ASSISTANT_NAME, "Still here")
             self.assertEqual(daemon.SETTINGS_GENERATION, 1)
 
+    async def test_unknown_nested_setting_is_rejected_without_partial_reload(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=20)
+            service_settings["assistant_name"] = "Stable"
+            daemon = import_daemon(Path(td), service_settings)
+            updated = settings(sync_interval=7)
+            updated["assistant_name"] = "Must not publish"
+            updated["allowed_groups"] = {"-200": {"project": "/tmp/other"}}
+            daemon.SETTINGS_FILE.write_text(json.dumps(updated) + "\n")
+
+            result = daemon.reload_runtime_settings()
+
+            self.assertFalse(result["ok"])
+            self.assertIn(
+                "settings.allowed_groups.-200.project: unsupported property",
+                result["error"],
+            )
+            self.assertEqual(daemon.ASSISTANT_NAME, "Stable")
+            self.assertEqual(daemon.SYNC_INTERVAL, 20)
+            self.assertEqual(daemon.SETTINGS_GENERATION, 1)
+
+    async def test_unsafe_context_overlay_path_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"context_file": "../../outside.md"},
+            }
+            with self.assertRaisesRegex(
+                    SystemExit, r"settings\.allowed_groups\.-200\.context_file"):
+                import_daemon(Path(td), service_settings)
+
     async def test_reload_refuses_a_connection_change(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
@@ -764,8 +869,6 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 "2": {"name": "Tuned", "voice_agent": {
                     "mode": "auto", "model": "other-live", "voice": "Puck",
                     "history": 5}},
-                "3": {"name": "Bad history", "voice_agent": {
-                    "mode": "auto", "history": "not-a-number"}},
             }
             daemon = import_daemon(Path(td), service_settings)
             users = daemon.configured_voice_agent_users()
@@ -781,8 +884,16 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(users[2]["model"], "other-live")
             self.assertEqual(users[2]["voice"], "Puck")
             self.assertEqual(users[2]["history"], 5)
-            self.assertEqual(
-                users[3]["history"], daemon.voice_agent.DEFAULT_HISTORY_MESSAGES)
+
+    async def test_invalid_voice_history_is_rejected_with_full_json_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_users"] = {
+                "3": {"voice_agent": {"mode": "auto", "history": "not-a-number"}},
+            }
+            with self.assertRaisesRegex(
+                    SystemExit, r"settings\.allowed_users\.3\.voice_agent\.history"):
+                import_daemon(Path(td), service_settings)
 
     async def test_a_call_runs_under_the_authority_the_callers_messages_resolve(self):
         """The one thing a voice channel must not do: widen what a caller can
@@ -2636,6 +2747,35 @@ class VoiceProjectFileTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(refusal)
             self.assertEqual(by_relative, by_absolute)
 
+    async def test_nested_resolved_layer_is_readable_without_root_conventions(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td) / "project"
+            nested = root / "agent" / "context"
+            note = nested / "identity.md"
+            note.parent.mkdir(parents=True)
+            note.write_text("nested\n")
+            daemon.PROJECT_LAYOUT["context"] = str(nested)
+
+            path, refusal = daemon.resolve_project_file("agent/context/identity.md")
+
+            self.assertIsNone(refusal)
+            self.assertEqual(path, note.resolve())
+
+    async def test_symlink_escape_from_resolved_layer_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td) / "project"
+            context = root / "context"
+            outside = Path(td) / "outside.txt"
+            context.mkdir(parents=True)
+            outside.write_text("secret\n")
+            (context / "escape.md").symlink_to(outside)
+
+            _, refusal = daemon.resolve_project_file("context/escape.md")
+
+            self.assertEqual(refusal, "outside_project")
+
     async def test_secrets_are_refused_inside_the_allowed_roots(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
@@ -2696,33 +2836,25 @@ class VoiceProjectFileTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VoiceProjectContextTests(unittest.IsolatedAsyncioTestCase):
-    async def test_failed_contextkit_build_is_not_cached(self):
+    async def test_missing_compiled_context_never_invokes_contextkit(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            calls = []
-
-            def failed(*args, **kwargs):
-                calls.append((args, kwargs))
-                return SimpleNamespace(returncode=1, stdout="", stderr="not ready")
-
-            with mock.patch.object(daemon.subprocess, "run", side_effect=failed):
+            with mock.patch.object(daemon.subprocess, "run") as run:
                 self.assertIsNone(daemon.resolve_project_context_path())
-                self.assertIsNone(daemon.resolve_project_context_path())
-            self.assertEqual(len(calls), 2)
+                self.assertEqual(daemon.project_context_text(), "")
+            run.assert_not_called()
 
-    async def test_contextkit_relative_output_is_resolved_inside_project(self):
+    async def test_compiled_context_comes_from_the_resolved_layout_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             target = Path(td) / "project" / ".codex" / "generated" / "context.md"
             target.parent.mkdir(parents=True)
             target.write_text("compiled\n")
-            completed = SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps({"written": {"codex": ".codex/generated/context.md"}}),
-                stderr="")
-            with mock.patch.object(daemon.subprocess, "run", return_value=completed):
+            daemon.PROJECT_LAYOUT["compiled_context"] = str(target)
+            with mock.patch.object(daemon.subprocess, "run") as run:
                 self.assertEqual(daemon.resolve_project_context_path(), target.resolve())
                 self.assertEqual(daemon.project_context_text(), "compiled\n")
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

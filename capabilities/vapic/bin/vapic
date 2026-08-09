@@ -275,53 +275,91 @@ def _project_root() -> Path | None:
 _ENVELOPE_HOME: dict = {}
 
 
-def _contextkit_envelope(root: Path):
-    """Ask ContextKit where it keeps this project's envelope; None if it cannot.
-
-    $CAPABILITIES_PROJECT_ENVELOPE is the same answer handed over in advance.
-    """
-    import subprocess
-
-    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
-    if override:
-        candidate = Path(override)
-    else:
-        try:
-            proc = subprocess.run(["contextkit", "path", "capabilities"], cwd=root,
-                                  capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if proc.returncode != 0:
-            return None
-        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-        if not lines:
-            return None
-        candidate = Path(lines[0])
+def _validated_project_envelope(root: Path, raw, provider: str) -> Path:
+    """Validate the manager/context-owner answer without selecting a fallback."""
+    value = str(raw or "").strip()
+    if not value:
+        _die(6, "project_envelope_empty",
+             f"{provider} returned an empty capabilities envelope path")
+    candidate = Path(value).expanduser()
     if not candidate.is_absolute():
-        return None
+        _die(6, "project_envelope_relative",
+             f"{provider} returned a relative capabilities envelope path: {value!r}")
     try:
         resolved = candidate.resolve()
-        if root.resolve() not in resolved.parents:
-            return None
-    except OSError:
-        return None
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        _die(6, "project_envelope_outside_project",
+             f"{provider} returned a capabilities envelope outside the project: {candidate}")
     return resolved
+
+
+def _manager_project_envelope(root: Path) -> Path:
+    """Consume the capabilities manager's one authoritative project answer."""
+    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
+    if override:
+        return _validated_project_envelope(root, override, "environment handoff")
+
+    import subprocess
+
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(root)
+    manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip()
+    if not manager:
+        source_manager = Path(__file__).resolve().parents[3] / "bin" / "capabilities"
+        manager = str(source_manager) if source_manager.is_file() else "capabilities"
+    try:
+        proc = subprocess.run(
+            [manager, "path", "--json"], cwd=root, env=env,
+            capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        _die(6, "capabilities_manager_unavailable",
+             "the capabilities manager is required to resolve the project envelope",
+             "install or repair the `capabilities` command")
+    except subprocess.TimeoutExpired:
+        _die(6, "capabilities_path_timeout",
+             "the capabilities manager did not resolve the project envelope within 10 seconds")
+    except OSError as exc:
+        _die(6, "capabilities_manager_unavailable",
+             f"could not run the capabilities manager: {exc}")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        try:
+            error = json.loads(detail).get("error", {})
+        except (AttributeError, ValueError):
+            error = {}
+        _die(proc.returncode if proc.returncode in (3, 4, 5, 6) else 6,
+             str(error.get("code") or "capabilities_path_failed"),
+             str(error.get("message") or "the capabilities manager could not resolve the project envelope"),
+             str(error.get("hint") or detail or "run `capabilities path --json` for details"))
+    try:
+        answer = json.loads(proc.stdout)
+    except ValueError as exc:
+        _die(6, "capabilities_path_malformed",
+             f"the capabilities manager returned invalid JSON: {exc}")
+    if not isinstance(answer, dict):
+        _die(6, "capabilities_path_malformed",
+             "the capabilities manager path answer must be a JSON object")
+    manager_root = Path(str(answer.get("project_root") or ""))
+    if not manager_root.is_absolute() or manager_root.resolve() != root.resolve():
+        _die(6, "capabilities_project_mismatch",
+             "the capabilities manager resolved a different project root")
+    provider = str(answer.get("provider") or "capabilities manager")
+    return _validated_project_envelope(
+        root, answer.get("project_envelope"), provider)
 
 
 def _envelope_home(root: Path) -> Path:
     """The project's envelope root, resolved once per invocation.
 
-    ContextKit owns the location of a project it manages (`.contextkit/
-    config.toml`), so it is asked rather than assumed. Every other project — and
-    every ContextKit answer that does not arrive usable — keeps the envelope at
-    `<root>/capabilities`.
+    The capabilities manager owns project-envelope discovery, including any
+    delegation to ContextKit. Capability CLIs consume that answer and never
+    duplicate context-owner detection.
     """
     cached = _ENVELOPE_HOME.get(root)
     if cached is not None:
         return cached
-    home = root / "capabilities"
-    if (root / ".contextkit" / "config.toml").is_file():
-        home = _contextkit_envelope(root) or home
+    home = _manager_project_envelope(root)
     _ENVELOPE_HOME[root] = home
     return home
 

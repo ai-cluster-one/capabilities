@@ -131,6 +131,21 @@ def find_project_root(explicit: str | None) -> Path:
 
 
 def project_capabilities_dir(root: Path) -> Path:
+    supplied = (os.environ.get("TELEGRAM_SERVICE_PROJECT_ENVELOPE")
+                or os.environ.get("CAPABILITIES_PROJECT_ENVELOPE"))
+    if supplied:
+        candidate = Path(supplied).expanduser()
+        if not candidate.is_absolute():
+            raise RecorderError(
+                6, "project_envelope_invalid", "project envelope must be absolute")
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root.resolve())
+        except (OSError, ValueError) as exc:
+            raise RecorderError(
+                6, "project_envelope_invalid",
+                f"project envelope is outside {root}: {candidate}") from exc
+        return resolved
     current = root / "capabilities"
     legacy = root / ".capabilities"
     if (current / "settings.json").is_file() or not legacy.is_dir():

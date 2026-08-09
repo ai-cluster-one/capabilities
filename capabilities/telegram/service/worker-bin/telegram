@@ -5,29 +5,74 @@ import sys
 import time
 
 
-def progress_text(argv):
-    text = " ".join(argv[3:]).strip()
-    if text == "-":
-        text = sys.stdin.read().strip()
-    if text in ("", "-", ".", "..."):
-        return ""
-    return text
+def fail(code, message, hint=None, exit_code=6):
+    error = {"code": code, "message": message}
+    if hint:
+        error["hint"] = hint
+    sys.stderr.write(json.dumps({"error": error}, ensure_ascii=False) + "\n")
+    raise SystemExit(exit_code)
+
+
+def worker_scope():
+    chat = os.environ.get("TELEGRAM_AUTHORIZED_CHAT_ID", "").strip()
+    topic = os.environ.get("TELEGRAM_AUTHORIZED_TOPIC_ID", "").strip() or None
+    connection = os.environ.get("TELEGRAM_AUTHORIZED_CONNECTION", "").strip()
+    return chat, topic, connection
+
+
+def parse_progress_send(argv):
+    """The complete worker-send grammar: send CHAT TEXT, exactly."""
+    args = list(argv[1:])
+    if not args or args[0] != "send":
+        return None
+    for forbidden in ("--connection", "--session"):
+        if forbidden in args or any(item.startswith(forbidden + "=") for item in args):
+            fail("worker_scope_denied",
+                 f"{forbidden} cannot be overridden inside a Telegram worker request",
+                 exit_code=4)
+    if len(args) != 3:
+        fail("worker_send_invalid",
+             "worker send syntax is: telegram send <authorized-chat> <one text argument>",
+             "quote the complete message; flags and extra arguments are unsupported")
+    _, chat, message = args
+    if chat.startswith("-") and not chat.lstrip("-").isdigit():
+        fail("worker_send_invalid", f"invalid chat argument: {chat!r}")
+    if message.startswith("--"):
+        fail("worker_send_invalid",
+             f"unsupported or misplaced flag in worker send: {message!r}")
+    text = sys.stdin.read().strip() if message == "-" else message.strip()
+    return chat, text
 
 
 def write_progress(argv):
-    if len(argv) < 4 or argv[1] != "send":
+    if argv[1:2] != ["send"]:
         return False
     outbox = os.environ.get("TELEGRAM_PROGRESS_OUTBOX")
     if not outbox:
         return False
-    chat = argv[2]
-    text = progress_text(argv)
+    parsed = parse_progress_send(argv)
+    chat, text = parsed
+    allowed_chat, allowed_topic, allowed_connection = worker_scope()
+    if not allowed_chat:
+        fail("worker_authority_missing",
+             "the daemon did not provide an authorized Telegram chat scope",
+             exit_code=4)
+    if chat in ("current", "$current"):
+        chat = allowed_chat
+    if str(chat) != allowed_chat:
+        fail("chat_scope_denied",
+             "worker send destination differs from the authorized chat",
+             f"requested={chat}; authorized_chat_id={allowed_chat}", exit_code=4)
     if not text:
-        return True
+        fail("worker_send_invalid", "worker send text must not be empty")
+    if text in ("-", ".", "..."):
+        fail("worker_send_invalid", "worker send text must contain a useful message")
     os.makedirs(os.path.dirname(outbox), exist_ok=True)
     record = {
         "time": time.time(),
-        "chat": chat,
+        "chat": allowed_chat,
+        "topic_id": allowed_topic,
+        "connection": allowed_connection,
         "text": text,
         "reply_to": os.environ.get("TELEGRAM_PROGRESS_REPLY_TO") or None,
         "chat_type": os.environ.get("TELEGRAM_PROGRESS_CHAT_TYPE") or None,
@@ -41,14 +86,15 @@ def write_progress(argv):
 def auth_context():
     raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
     if not raw:
-        return {}
+        return None
     try:
         if raw.lstrip().startswith("{"):
             return json.loads(raw)
         with open(raw, encoding="utf-8") as fh:
             return json.load(fh)
-    except (OSError, ValueError):
-        return {}
+    except (OSError, ValueError) as exc:
+        fail("worker_authority_invalid",
+             f"cannot read the daemon authority context: {exc}", exit_code=4)
 
 
 def telegram_rule(ctx):
@@ -95,6 +141,8 @@ def parse_command_and_chat(argv):
 
 def enforce_current_chat_scope(argv):
     ctx = auth_context()
+    if ctx is None:
+        return
     rule = telegram_rule(ctx)
     if rule in (None, False):
         return
@@ -117,6 +165,14 @@ def enforce_current_chat_scope(argv):
 
 
 def main():
+    # Explicit substitution is forbidden before outbox, credentials, or exec.
+    if os.environ.get("TELEGRAM_PROGRESS_OUTBOX"):
+        for forbidden in ("--connection", "--session", "--topic", "--thread"):
+            if forbidden in sys.argv[1:] or any(
+                    item.startswith(forbidden + "=") for item in sys.argv[1:]):
+                fail("worker_scope_denied",
+                     f"{forbidden} cannot be overridden inside a Telegram worker request",
+                     exit_code=4)
     if write_progress(sys.argv):
         return 0
     enforce_current_chat_scope(sys.argv)
