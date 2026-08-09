@@ -78,6 +78,10 @@ Commands:
                                                or scan a QR from an authorized app).
   telegram whoami                              Identity of the signed-in account.
   telegram chats [--limit N]                   List recent dialogs.
+  telegram topics <chat> [--limit N] [--query TEXT]
+                                               List a forum group's topics; each
+                                               `id` is the root message id the
+                                               send verbs take as --topic.
   telegram read <chat> [--limit N] [--since ISO] [--json]
                                                Read messages from a chat.
   telegram search <chat> <query> [--limit N] [--json]
@@ -192,7 +196,8 @@ from telethon.tl.types import Channel, Chat, MessageEmpty, User
 
 NAME = "telegram"
 SUMMARY = ("Telegram CLI over a personal MTProto account — read/search a chat, "
-           "send text/media and reactions, export history to JSON, transcribe voice/audio. Stateful — "
+           "list a forum's topics, send text/media and reactions into a chat or one of its "
+           "topics, export history to JSON, transcribe voice/audio. Stateful — "
            "run `telegram doctor` first.")
 SCOPE = "user"   # credential scope: "project" | "user"
 CRED_KEYS = [    # an override-free registry entry resolves these flat keys
@@ -1389,6 +1394,63 @@ async def cmd_chats(cfg: dict, limit: int) -> list[dict]:
         })
     await client.disconnect()
     return out
+
+
+def topic_to_dict(topic) -> dict:
+    """A forum topic; `id` is the root message id the send verbs take."""
+    return {
+        "id": topic.id,
+        "title": topic.title,
+        "top_message": getattr(topic, "top_message", None),
+        "unread": getattr(topic, "unread_count", 0) or 0,
+        "closed": bool(getattr(topic, "closed", False)),
+        "pinned": bool(getattr(topic, "pinned", False)),
+        "hidden": bool(getattr(topic, "hidden", False)),
+    }
+
+
+def _next_topic_offsets(page, last) -> tuple[object, int, int]:
+    """Page forward from the last topic's newest message, as Telegram expects."""
+    dates = {m.id: getattr(m, "date", None)
+             for m in (getattr(page, "messages", None) or [])
+             if getattr(m, "id", None) is not None}
+    top = getattr(last, "top_message", 0) or 0
+    return dates.get(top), top, last.id
+
+
+async def cmd_topics(cfg: dict, chat: str, limit: int,
+                     query: str | None) -> list[dict]:
+    client = make_client(cfg)
+    await _require_auth(client)
+    entity = await resolve_chat(client, chat)
+    if not getattr(entity, "forum", False):
+        await client.disconnect()
+        _die(3, "not_a_forum",
+             f"{entity_label(entity)} has no forum topics",
+             "topics exist only in a group with Telegram's topics feature on")
+    collected: list[dict] = []
+    offset_date, offset_id, offset_topic = None, 0, 0
+    while len(collected) < limit:
+        page = await client(functions.messages.GetForumTopicsRequest(
+            peer=entity,
+            offset_date=offset_date,
+            offset_id=offset_id,
+            offset_topic=offset_topic,
+            limit=min(100, limit - len(collected)),
+            q=query or None,
+        ))
+        returned = getattr(page, "topics", None) or []
+        if not returned:
+            break
+        # A deleted topic keeps its slot in the page but carries no title.
+        collected.extend(topic_to_dict(t) for t in returned
+                         if getattr(t, "title", None) is not None)
+        offset_date, offset_id, next_topic = _next_topic_offsets(page, returned[-1])
+        if next_topic == offset_topic:
+            break
+        offset_topic = next_topic
+    await client.disconnect()
+    return collected[:limit]
 
 
 def msg_to_dict(m) -> dict:
@@ -2693,6 +2755,11 @@ def main() -> None:
     pc = sub.add_parser("chats", help="list recent dialogs")
     pc.add_argument("--limit", type=int, default=50)
 
+    pt = sub.add_parser("topics", help="list a forum group's topics")
+    pt.add_argument("chat")
+    pt.add_argument("--limit", type=int, default=100)
+    pt.add_argument("--query", help="match topic titles")
+
     pr = sub.add_parser("read", help="read messages from a chat")
     pr.add_argument("chat")
     pr.add_argument("--limit", type=int, default=50)
@@ -2849,6 +2916,8 @@ def main() -> None:
             _emit(asyncio.run(cmd_whoami(cfg)))
         elif args.cmd == "chats":
             _emit(asyncio.run(cmd_chats(cfg, args.limit)))
+        elif args.cmd == "topics":
+            _emit(asyncio.run(cmd_topics(cfg, args.chat, args.limit, args.query)))
         elif args.cmd == "read":
             _emit(asyncio.run(cmd_read(cfg, args.chat, args.limit, args.since, args.json)))
         elif args.cmd == "search":

@@ -54,7 +54,8 @@ def import_cli():
 
     tl = types.ModuleType("telethon.tl")
     functions = types.ModuleType("telethon.tl.functions")
-    functions.messages = types.SimpleNamespace(SendReactionRequest=_Request)
+    functions.messages = types.SimpleNamespace(
+        SendReactionRequest=_Request, GetForumTopicsRequest=_Request)
     tl_types = types.ModuleType("telethon.tl.types")
     for name in ("Channel", "Chat", "MessageEmpty", "User"):
         setattr(tl_types, name, type(name, (), {}))
@@ -120,6 +121,25 @@ class _Client:
 
     async def disconnect(self):
         self.disconnected = True
+
+
+class _ForumClient(_Client):
+    """Answers GetForumTopicsRequest with queued pages, newest topic first."""
+
+    def __init__(self, pages):
+        super().__init__()
+        self.pages = list(pages)
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        return self.pages.pop(0) if self.pages else types.SimpleNamespace(
+            topics=[], messages=[])
+
+
+def _topic(topic_id, title, top_message, **flags):
+    return types.SimpleNamespace(
+        id=topic_id, title=title, top_message=top_message,
+        unread_count=flags.pop("unread_count", 0), **flags)
 
 
 class _ExportClient(_Client):
@@ -262,6 +282,84 @@ class OutboundActionsTests(unittest.TestCase):
 
         self.assertEqual(result["reply_to"], 7151)
         self.assertEqual(self.client.files[0][2]["reply_to"], 7151)
+
+    def _use_forum(self, pages):
+        self.client = _ForumClient(pages)
+        self.cli.make_client = lambda _cfg: self.client
+
+        async def resolve(_client, _chat):
+            return types.SimpleNamespace(forum=True, title="Example Forum")
+
+        self.cli.resolve_chat = resolve
+
+    def test_topics_report_the_root_id_the_send_verbs_take(self):
+        page = types.SimpleNamespace(
+            topics=[_topic(7151, "Tech and setup", 7614, pinned=True),
+                    _topic(1, "General", 12)],
+            messages=[types.SimpleNamespace(id=7614, date="d")])
+        self._use_forum([page])
+
+        result = asyncio.run(self.cli.cmd_topics({"id": "test"}, "-1001", 100, None))
+
+        self.assertEqual([(t["id"], t["title"]) for t in result],
+                         [(7151, "Tech and setup"), (1, "General")])
+        self.assertTrue(result[0]["pinned"])
+        self.assertEqual(result[0]["top_message"], 7614)
+        self.assertEqual(self.client.requests[0].q, None)
+        self.assertTrue(self.client.disconnected)
+
+    def test_topics_skip_a_deleted_slot_without_a_title(self):
+        page = types.SimpleNamespace(
+            topics=[_topic(7151, "Tech and setup", 7614),
+                    types.SimpleNamespace(id=42, top_message=None)],
+            messages=[])
+        self._use_forum([page])
+
+        result = asyncio.run(self.cli.cmd_topics({"id": "test"}, "-1001", 100, None))
+
+        self.assertEqual([t["id"] for t in result], [7151])
+
+    def test_topics_page_forward_until_the_limit_is_met(self):
+        pages = [
+            types.SimpleNamespace(
+                topics=[_topic(30, "third", 300)],
+                messages=[types.SimpleNamespace(id=300, date="d300")]),
+            types.SimpleNamespace(
+                topics=[_topic(20, "second", 200)],
+                messages=[types.SimpleNamespace(id=200, date="d200")]),
+            types.SimpleNamespace(topics=[], messages=[]),
+        ]
+        self._use_forum(pages)
+
+        result = asyncio.run(self.cli.cmd_topics({"id": "test"}, "-1001", 5, None))
+
+        self.assertEqual([t["title"] for t in result], ["third", "second"])
+        second_request = self.client.requests[1]
+        self.assertEqual(second_request.offset_topic, 30)
+        self.assertEqual(second_request.offset_id, 300)
+        self.assertEqual(second_request.offset_date, "d300")
+
+    def test_topics_refuse_a_chat_that_has_no_forum(self):
+        self.client = _ForumClient([])
+        self.cli.make_client = lambda _cfg: self.client
+
+        async def resolve(_client, _chat):
+            return types.SimpleNamespace(forum=False, title="Example Group")
+
+        self.cli.resolve_chat = resolve
+
+        with self.assertRaises(SystemExit) as stopped:
+            asyncio.run(self.cli.cmd_topics({"id": "test"}, "-1002", 100, None))
+
+        self.assertEqual(stopped.exception.code, 3)
+        self.assertEqual(self.client.requests, [])
+        self.assertTrue(self.client.disconnected)
+
+    def test_worker_scope_covers_the_topics_verb(self):
+        shim = import_worker_shim()
+        self.assertEqual(
+            shim.parse_command_and_chat(["telegram", "topics", "-1001"]),
+            ("topics", "-1001"))
 
     def test_worker_authority_refuses_topic_substitution_without_an_outbox(self):
         """A daemon-authorized worker inherits its topic; it cannot name another."""
