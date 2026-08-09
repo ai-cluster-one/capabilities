@@ -82,9 +82,17 @@ Commands:
                                                Read messages from a chat.
   telegram search <chat> <query> [--limit N] [--json]
                                                Search messages inside a chat.
-  telegram send <chat> <text>                  Send a message.
-  telegram send-media <chat> <path> [--caption TEXT] [--reply-to MSG_ID]
-                                                 Send a local media file.
+  telegram send <chat> <text> [--reply-to MSG_ID | --topic TOPIC_ID]
+                                               Send a message. In a forum, a
+                                               message lands in the topic named
+                                               by --topic (its root message id)
+                                               or in the topic owning the
+                                               --reply-to message; with neither
+                                               it lands in General.
+  telegram send-media <chat> <path> [--caption TEXT]
+            [--reply-to MSG_ID | --topic TOPIC_ID]
+                                                 Send a local media file; the
+                                                 same forum-topic addressing.
   telegram react <chat> <msgid> <emoji> [...]  Add one or more emoji reactions.
   telegram download <chat> <msgid> [--json]    Materialize one message's media to a
                                                deterministic per-connection cache
@@ -1437,17 +1445,43 @@ async def cmd_search(cfg, chat: str, query: str, limit: int, as_json: bool):
         f"# {entity_label(entity)}  search: {query!r}  ({len(messages)} hits)", messages)
 
 
-async def cmd_send(cfg, chat: str, text: str) -> dict:
+def _reply_target(reply_to: int | None, topic: int | None) -> int | None:
+    """Resolve the outbound reply target that also selects a forum topic.
+
+    Telegram addresses a forum topic through the reply target: a topic's root
+    message id posts into that topic, and a message id inside a topic replies
+    within the same one.  Both flags therefore resolve to one value, and asking
+    for both is ambiguous rather than additive — the replied message already
+    fixes the topic, so a second answer could only contradict it.
+    """
+    for value, flag in ((reply_to, "--reply-to"), (topic, "--topic")):
+        if value is not None and value <= 0:
+            _die(3, "invalid_message_id",
+                 f"{flag} must be a positive Telegram message id, got {value}",
+                 "read the chat to find the message or topic root id")
+    if reply_to is not None and topic is not None:
+        _die(3, "reply_target_conflict",
+             "--reply-to and --topic cannot be combined",
+             "a reply already lands in its own topic; pass --topic only when "
+             "posting to the topic root")
+    return reply_to if reply_to is not None else topic
+
+
+async def cmd_send(cfg, chat: str, text: str, reply_to: int | None = None,
+                   topic: int | None = None) -> dict:
+    target = _reply_target(reply_to, topic)
     client = make_client(cfg)
     await _require_auth(client)
     entity = await resolve_chat(client, chat)
-    sent = await client.send_message(entity, text)
+    sent = await client.send_message(entity, text, reply_to=target)
     await client.disconnect()
-    return {"sent_id": sent.id, "to": entity_label(entity)}
+    return {"sent_id": sent.id, "to": entity_label(entity), "reply_to": target}
 
 
 async def cmd_send_media(cfg, chat: str, path: str, caption: str | None,
-                         reply_to: int | None, force_document: bool) -> dict:
+                         reply_to: int | None, force_document: bool,
+                         topic: int | None = None) -> dict:
+    target = _reply_target(reply_to, topic)
     media = Path(path).expanduser()
     if not media.is_file():
         raise ValueError(f"media file not found: {media}")
@@ -1458,11 +1492,12 @@ async def cmd_send_media(cfg, chat: str, path: str, caption: str | None,
         entity,
         str(media),
         caption=caption or None,
-        reply_to=reply_to,
+        reply_to=target,
         force_document=force_document,
     )
     await client.disconnect()
-    return {"sent_id": sent.id, "to": entity_label(entity), "path": str(media)}
+    return {"sent_id": sent.id, "to": entity_label(entity), "path": str(media),
+            "reply_to": target}
 
 
 async def cmd_react(cfg, chat: str, msgid: int, emojis: list[str]) -> dict:
@@ -2673,12 +2708,17 @@ def main() -> None:
     pn = sub.add_parser("send", help="send a message")
     pn.add_argument("chat")
     pn.add_argument("text")
+    pn.add_argument("--reply-to", type=int, help="message id to reply to")
+    pn.add_argument("--topic", type=int,
+                    help="forum topic root message id to post into")
 
     pm = sub.add_parser("send-media", help="send a local media file")
     pm.add_argument("chat")
     pm.add_argument("path", help="local file path")
     pm.add_argument("--caption", help="optional caption")
     pm.add_argument("--reply-to", type=int, help="message id to reply to")
+    pm.add_argument("--topic", type=int,
+                    help="forum topic root message id to post into")
     pm.add_argument("--force-document", action="store_true",
                     help="upload images as documents instead of photos")
 
@@ -2814,11 +2854,12 @@ def main() -> None:
         elif args.cmd == "search":
             _emit(asyncio.run(cmd_search(cfg, args.chat, args.query, args.limit, args.json)))
         elif args.cmd == "send":
-            _emit(asyncio.run(cmd_send(cfg, args.chat, args.text)))
+            _emit(asyncio.run(cmd_send(
+                cfg, args.chat, args.text, args.reply_to, args.topic)))
         elif args.cmd == "send-media":
             _emit(asyncio.run(cmd_send_media(
                 cfg, args.chat, args.path, args.caption, args.reply_to,
-                args.force_document,
+                args.force_document, args.topic,
             )))
         elif args.cmd == "react":
             _emit(asyncio.run(cmd_react(cfg, args.chat, args.msgid, args.emojis)))

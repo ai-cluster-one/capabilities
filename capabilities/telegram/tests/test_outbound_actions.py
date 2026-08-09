@@ -103,8 +103,13 @@ def import_worker_shim():
 class _Client:
     def __init__(self):
         self.files = []
+        self.messages = []
         self.requests = []
         self.disconnected = False
+
+    async def send_message(self, entity, text, **kwargs):
+        self.messages.append((entity, text, kwargs))
+        return types.SimpleNamespace(id=713)
 
     async def send_file(self, entity, path, **kwargs):
         self.files.append((entity, path, kwargs))
@@ -206,6 +211,74 @@ class OutboundActionsTests(unittest.TestCase):
             asyncio.run(self.cli.cmd_send_media(
                 {"id": "test"}, "-1001", "/does/not/exist", None, None, False))
         self.assertEqual(self.client.files, [])
+
+    def test_send_without_a_reply_target_stays_unaddressed(self):
+        result = asyncio.run(self.cli.cmd_send({"id": "test"}, "-1001", "hello"))
+
+        self.assertEqual(result, {
+            "sent_id": 713, "to": "chat-entity", "reply_to": None,
+        })
+        _entity, text, kwargs = self.client.messages[0]
+        self.assertEqual(text, "hello")
+        self.assertEqual(kwargs, {"reply_to": None})
+        self.assertTrue(self.client.disconnected)
+
+    def test_send_addresses_a_forum_topic_through_its_root_id(self):
+        result = asyncio.run(self.cli.cmd_send(
+            {"id": "test"}, "-1001", "hello", None, 7151))
+
+        self.assertEqual(result["reply_to"], 7151)
+        self.assertEqual(self.client.messages[0][2], {"reply_to": 7151})
+
+    def test_send_reply_selects_the_replied_message_topic(self):
+        result = asyncio.run(self.cli.cmd_send(
+            {"id": "test"}, "-1001", "hello", 7597))
+
+        self.assertEqual(result["reply_to"], 7597)
+        self.assertEqual(self.client.messages[0][2], {"reply_to": 7597})
+
+    def test_send_refuses_two_conflicting_reply_targets(self):
+        with self.assertRaises(SystemExit) as stopped:
+            asyncio.run(self.cli.cmd_send(
+                {"id": "test"}, "-1001", "hello", 7597, 7151))
+
+        self.assertEqual(stopped.exception.code, 3)
+        self.assertEqual(self.client.messages, [])
+
+    def test_send_refuses_a_non_positive_message_id(self):
+        for reply_to, topic in ((0, None), (-4, None), (None, 0), (None, -4)):
+            with self.assertRaises(SystemExit) as stopped:
+                asyncio.run(self.cli.cmd_send(
+                    {"id": "test"}, "-1001", "hello", reply_to, topic))
+            self.assertEqual(stopped.exception.code, 3)
+        self.assertEqual(self.client.messages, [])
+
+    def test_send_media_addresses_a_forum_topic_through_its_root_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "report.pdf"
+            media.write_bytes(b"pdf")
+            result = asyncio.run(self.cli.cmd_send_media(
+                {"id": "test"}, "-1001", str(media), None, None, False, 7151))
+
+        self.assertEqual(result["reply_to"], 7151)
+        self.assertEqual(self.client.files[0][2]["reply_to"], 7151)
+
+    def test_worker_authority_refuses_topic_substitution_without_an_outbox(self):
+        """A daemon-authorized worker inherits its topic; it cannot name another."""
+        shim = import_worker_shim()
+        env = {
+            "TELEGRAM_AUTHORIZED_CHAT_ID": "-1001",
+            "TELEGRAM_AUTHORIZED_TOPIC_ID": "77",
+            "TELEGRAM_AUTHORIZED_CONNECTION": "8200881535",
+        }
+        for flag in ("--topic=99", "--thread=99"):
+            argv = ["telegram", "send", "-1001", "hello", flag]
+            with mock.patch.dict(os.environ, env, clear=False), \
+                 mock.patch.object(sys, "argv", argv):
+                os.environ.pop("TELEGRAM_PROGRESS_OUTBOX", None)
+                with self.assertRaises(SystemExit) as stopped:
+                    shim.main()
+            self.assertEqual(stopped.exception.code, 4)
 
     def test_worker_scope_recognizes_new_outbound_chat_commands(self):
         shim = import_worker_shim()
