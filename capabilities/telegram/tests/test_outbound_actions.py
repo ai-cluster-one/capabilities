@@ -242,7 +242,7 @@ class OutboundActionsTests(unittest.TestCase):
             asyncio.run(self.cli.cmd_send(
                 {"id": "test"}, "-1001", "hello", 7597, 7151))
 
-        self.assertEqual(stopped.exception.code, 3)
+        self.assertEqual(stopped.exception.code, 6)
         self.assertEqual(self.client.messages, [])
 
     def test_send_refuses_a_non_positive_message_id(self):
@@ -250,7 +250,7 @@ class OutboundActionsTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as stopped:
                 asyncio.run(self.cli.cmd_send(
                     {"id": "test"}, "-1001", "hello", reply_to, topic))
-            self.assertEqual(stopped.exception.code, 3)
+            self.assertEqual(stopped.exception.code, 6)
         self.assertEqual(self.client.messages, [])
 
     def test_send_media_addresses_a_forum_topic_through_its_root_id(self):

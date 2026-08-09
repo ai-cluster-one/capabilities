@@ -1456,11 +1456,11 @@ def _reply_target(reply_to: int | None, topic: int | None) -> int | None:
     """
     for value, flag in ((reply_to, "--reply-to"), (topic, "--topic")):
         if value is not None and value <= 0:
-            _die(3, "invalid_message_id",
+            _die(6, "invalid_message_id",
                  f"{flag} must be a positive Telegram message id, got {value}",
                  "read the chat to find the message or topic root id")
     if reply_to is not None and topic is not None:
-        _die(3, "reply_target_conflict",
+        _die(6, "reply_target_conflict",
              "--reply-to and --topic cannot be combined",
              "a reply already lands in its own topic; pass --topic only when "
              "posting to the topic root")
