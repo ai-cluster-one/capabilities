@@ -54,7 +54,8 @@ def _source_repo(tmp_path: Path) -> Path:
     (source / "bin").mkdir()
     shutil.copy2(MANAGER, source / "bin" / "capabilities")
     shutil.copy2(REPO / "capabilities.repo.json", source / "capabilities.repo.json")
-    for name in ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md"):
+    for name in ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
+                 "ROUTINES.md"):
         shutil.copy2(REPO / name, source / name)
     shutil.copytree(REPO / "contract", source / "contract")
     shutil.copytree(
@@ -90,7 +91,8 @@ def _release_source_repo(tmp_path: Path) -> tuple[Path, Path]:
     (source / "bin").mkdir()
     shutil.copy2(MANAGER, source / "bin" / "capabilities")
     shutil.copy2(REPO / "capabilities.repo.json", source / "capabilities.repo.json")
-    for name in ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md"):
+    for name in ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
+                 "ROUTINES.md"):
         shutil.copy2(REPO / name, source / name)
     shutil.copytree(REPO / "contract", source / "contract")
     shutil.copytree(
