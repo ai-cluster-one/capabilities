@@ -18,7 +18,8 @@ The standard files are:
 - `deployment/runtime.json` - one runtime declaration for the project.
 - `deployment/targets/*.json` - one target declaration per deploy destination.
 - `deployment/capabilities.lock` - lightweight install list for the agent image:
-  one capability name per line.
+  one capability name per line. It is derived from the project gate, minus the
+  host-only names declared by `runtime.json` under `capabilities.exclude`.
 - `capabilities/deployment/reference/*.md` - optional project-specific operational
   models. Reference files are neither created nor required by deployment init or
   setup. When present, they hold genuine project-specific deployment context
@@ -33,10 +34,31 @@ enablement and `runtime.json` service policy, and reconciles the runtime graph,
 lock, Compose, env example, Dockerfile, dockerignore, and entrypoint.
 
 `service_policy.auto_include` controls descriptor-default auto inclusion.
-`service_policy.capabilities` accepts `enabled`, `disabled`, or `auto` per
-capability. An override cannot bypass the explicit project gate. Run
+`service_policy.capabilities` accepts `enabled`, `embedded`, `disabled`, or
+`auto` per capability. `enabled` renders a separate Compose service;
+`embedded` merges the descriptor's environment and mounts into the agent
+service so a project-owned process supervisor can run it there; `disabled`
+omits the service runtime while leaving the CLI available. An override cannot
+bypass the explicit project gate. Run
 `deployment sync --check` in CI; it performs no writes and reports structured
 missing/content/ownership drift with exit 7.
+
+The project gate answers which capabilities are usable while working in the
+repository. The image lock answers which of those capabilities ship inside the
+deployed body. Keep operator-only adapters such as a deployment provider on the
+host with an explicit runtime exclusion:
+
+```json
+{
+  "capabilities": {
+    "lockfile": "deployment/capabilities.lock",
+    "exclude": ["deployment", "coolify"]
+  }
+}
+```
+
+An enabled or embedded service cannot be excluded because its runtime command
+would be absent from the image.
 
 New setup uses root artifact paths, but runtime v1 can explicitly declare a
 custom compiler layout. `compose_file` selects the generated base Compose file;
@@ -78,6 +100,12 @@ are reconciled into each capability service. Project-owned role, description,
 restart, additional required/optional environment, additional state, and
 extension fields are preserved. Descriptor requirements are added as a union,
 not used as a replacement.
+
+For an embedded descriptor, the same required/optional environment, defaults,
+and state mounts are reconciled into `services.agent`; its name is recorded in
+`services.agent.embedded_services`. Starting and supervising the embedded
+command remains project-owned because the generic compiler cannot assume one
+process supervisor.
 
 Each runtime service may declare `environment_defaults`, a mapping from env key
 to string fallback. These project defaults take precedence over descriptor

@@ -93,8 +93,9 @@ Contract commands:
 FILES
   deployment/runtime.json
       The project's runtime declaration: profile, compose file, services,
-      service-level required env, state volumes, capability lock path, and
-      service_policy and compiler layout. compiler.artifacts declares the
+      service-level required env, state volumes, runtime capability exclusions,
+      capability lock path, and service_policy and compiler layout.
+      compiler.artifacts declares the
       Dockerfile, entrypoint, env example, and dockerignore paths;
       compose_file declares the generated base Compose file;
       compiler.compose_overlays declares untouched project-owned overlays;
@@ -115,7 +116,9 @@ FILES
 
   deployment/capabilities.lock
       Lightweight install list for the agent image: one capability per line.
-      It is a deployment input, not a capability manager file.
+      It is a deployment input, not a capability manager file. The runtime's
+      capabilities.exclude list removes operator-only tools from the image
+      without changing their project policy on the host.
 
   capabilities/deployment/reference/*.md
       Optional project-specific operational models. Reference files are neither
@@ -920,22 +923,38 @@ def _service_policy(runtime: dict) -> tuple[dict, bool]:
     return {"auto_include": True, "capabilities": overrides}, True
 
 
-def _active_descriptors(root: Path, runtime: dict) -> tuple[dict[str, dict], list[dict], bool]:
+def _runtime_capability_excludes(runtime: dict) -> set[str]:
+    raw = runtime.get("capabilities")
+    if not isinstance(raw, dict):
+        return set()
+    values = raw.get("exclude", [])
+    if not isinstance(values, list):
+        return set()
+    return {value for value in values if isinstance(value, str)}
+
+
+def _active_descriptors(root: Path, runtime: dict) -> tuple[
+        dict[str, dict], dict[str, dict], list[dict], bool]:
     discovered, findings = _discover_service_descriptors(root)
     policy, migrated = _service_policy(runtime)
     overrides = policy["capabilities"]
     project_enabled = set(_enabled_capabilities(root))
+    runtime_excludes = _runtime_capability_excludes(runtime)
     for name, mode in sorted(overrides.items()):
-        if mode not in ("auto", "enabled", "disabled"):
+        if mode not in ("auto", "enabled", "disabled", "embedded"):
             findings.append({"severity": "error", "path": "deployment/runtime.json",
-                             "message": f"service_policy.capabilities.{name} must be auto|enabled|disabled"})
-        elif mode == "enabled" and name not in project_enabled:
+                             "message": f"service_policy.capabilities.{name} must be auto|enabled|disabled|embedded"})
+        elif mode in ("enabled", "embedded") and name not in project_enabled:
             findings.append({"severity": "error", "path": "deployment/runtime.json",
                              "message": f"service {name!r} is requested but is not explicitly project-enabled"})
-        elif mode == "enabled" and name not in discovered:
+        elif mode in ("enabled", "embedded") and name not in discovered:
             findings.append({"severity": "error", "path": "deployment/runtime.json",
                              "message": f"service {name!r} is requested but has no installed deploy descriptor"})
+        elif mode in ("enabled", "embedded") and name in runtime_excludes:
+            findings.append({"severity": "error", "path": "deployment/runtime.json",
+                             "message": f"service {name!r} cannot be both {mode} and excluded from the runtime image"})
     active: dict[str, dict] = {}
+    embedded: dict[str, dict] = {}
     for name, service in sorted(discovered.items()):
         mode = overrides.get(name, "auto")
         deploy = service["deploy"]
@@ -945,8 +964,10 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[dict[str, dict], lis
         )
         if include:
             active[name] = service
+        elif mode == "embedded":
+            embedded[name] = service
     mount_contracts: dict[str, tuple[str, str]] = {}
-    for name, service in active.items():
+    for name, service in {**active, **embedded}.items():
         deploy = service["deploy"]
         for mount in deploy["mounts"]:
             contract = (mount["kind"], mount["target"])
@@ -954,7 +975,7 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[dict[str, dict], lis
             if previous != contract:
                 findings.append({"severity": "error", "path": f"registry:{name}/manifest.json",
                                  "message": f"mount {mount['name']!r} conflicts with another active descriptor"})
-    return active, findings, migrated
+    return active, embedded, findings, migrated
 
 
 def _compiler_config(runtime: dict) -> dict:
@@ -1439,8 +1460,41 @@ def _merged_strings(existing: object, required: list[str]) -> list[str]:
     return values
 
 
+def _merge_descriptor_requirements(entry: dict, deploy: dict) -> dict:
+    merged = dict(entry)
+    required = sorted(deploy["environment"]["required"])
+    optional_entries = deploy["environment"]["optional"]
+    optional = sorted(item["key"] for item in optional_entries)
+    mounts = sorted(mount["name"] for mount in deploy["mounts"])
+    merged["required_env"] = _merged_strings(merged.get("required_env"), required)
+    merged["optional_env"] = [key for key in _merged_strings(
+        merged.get("optional_env"), optional) if key not in merged["required_env"]]
+    merged["state"] = _merged_strings(merged.get("state"), mounts)
+    defaults = {item["key"]: item.get("default", "") for item in optional_entries
+                if "default" in item}
+    project_defaults = merged.get("environment_defaults")
+    if isinstance(project_defaults, dict):
+        defaults.update(project_defaults)
+    if defaults:
+        merged["environment_defaults"] = defaults
+    return merged
+
+
+def _register_descriptor_volumes(volumes: dict, deploy: dict, compiler: dict) -> None:
+    for mount in deploy["mounts"]:
+        target = _resolve_mount_target(mount["target"], compiler)
+        existing = volumes.get(mount["name"])
+        if isinstance(existing, dict):
+            resolved = dict(existing)
+            resolved["kind"] = mount["kind"]
+            resolved.setdefault("mount", target)
+            volumes[mount["name"]] = resolved
+        else:
+            volumes[mount["name"]] = {"kind": mount["kind"], "mount": target}
+
+
 def _compile_runtime(root: Path, runtime: dict,
-                     active: dict[str, dict]) -> dict:
+                     active: dict[str, dict], embedded: dict[str, dict]) -> dict:
     compiled = dict(runtime)
     compiler = _compiler_config(runtime)
     container = compiler["container"]
@@ -1464,11 +1518,18 @@ def _compile_runtime(root: Path, runtime: dict,
     }
     for name, value in base_volumes.items():
         volumes.setdefault(name, value)
+    if embedded:
+        agent = services["agent"]
+        embedded_names = []
+        for name, service in sorted(embedded.items()):
+            deploy = service["deploy"]
+            agent = _merge_descriptor_requirements(agent, deploy)
+            _register_descriptor_volumes(volumes, deploy, compiler)
+            embedded_names.append(name)
+        agent["embedded_services"] = embedded_names
+        services["agent"] = agent
     for name, service in sorted(active.items()):
         deploy = service["deploy"]
-        required = sorted(deploy["environment"]["required"])
-        optional = sorted(entry["key"] for entry in deploy["environment"]["optional"])
-        mounts = sorted(mount["name"] for mount in deploy["mounts"])
         previous = existing_services.get(name)
         entry = dict(previous) if isinstance(previous, dict) else {}
         entry.setdefault("role", "capability-service")
@@ -1480,23 +1541,14 @@ def _compile_runtime(root: Path, runtime: dict,
             "deploy_schema": deploy["schema"],
             "command": deploy["command"],
             "doctor": deploy.get("doctor"),
-            "required_env": _merged_strings(entry.get("required_env"), required),
-            "state": _merged_strings(entry.get("state"), mounts),
         })
-        entry["optional_env"] = [key for key in _merged_strings(
-            entry.get("optional_env"), optional) if key not in entry["required_env"]]
+        entry = _merge_descriptor_requirements(entry, deploy)
         services[name] = entry
-        for mount in deploy["mounts"]:
-            target = _resolve_mount_target(mount["target"], compiler)
-            existing = volumes.get(mount["name"])
-            if isinstance(existing, dict):
-                resolved = dict(existing)
-                resolved["kind"] = mount["kind"]
-                resolved.setdefault("mount", target)
-                volumes[mount["name"]] = resolved
-            else:
-                volumes[mount["name"]] = {"kind": mount["kind"], "mount": target}
+        _register_descriptor_volumes(volumes, deploy, compiler)
     policy, _migrated = _service_policy(runtime)
+    capability_config = (dict(runtime.get("capabilities"))
+                         if isinstance(runtime.get("capabilities"), dict) else {})
+    capability_config.setdefault("lockfile", "deployment/capabilities.lock")
     compiled.update({
         "schema": RUNTIME_SCHEMA,
         "compose_file": runtime.get("compose_file") or "docker-compose.yaml",
@@ -1504,7 +1556,7 @@ def _compile_runtime(root: Path, runtime: dict,
         "volumes": volumes,
         "compiler": compiler,
         "service_policy": policy,
-        "capabilities": {"lockfile": "deployment/capabilities.lock"},
+        "capabilities": capability_config,
     })
     return compiled
 
@@ -1591,12 +1643,14 @@ def _capability_state(root: Path, name: str) -> dict:
     return {"name": name, "installed": _installed_capability(name), "gate": gate}
 
 
-def _lock_text(root: Path, extra: list[str] | None = None) -> str:
+def _lock_text(root: Path, extra: list[str] | None = None,
+               exclude: set[str] | None = None) -> str:
     caps = _settings(root).get("capabilities") or {}
     wanted = set(extra or [])
     wanted.add(NAME)
     wanted.update(name for name, gate in caps.items()
                   if isinstance(gate, dict) and gate.get("enabled") is True)
+    wanted.difference_update(exclude or set())
     enabled = sorted(wanted)
     lines = [
         "# Capabilities the image installs via the `capabilities` manager.",
@@ -1672,8 +1726,9 @@ def _read_text(path: Path) -> str | None:
 
 
 def _desired_state(root: Path, runtime: dict) -> tuple[dict, dict[Path, str],
-                                                        dict[str, dict], list[dict], bool]:
-    active, findings, migrated = _active_descriptors(root, runtime)
+                                                        dict[str, dict], dict[str, dict],
+                                                        list[dict], bool]:
+    active, embedded, findings, migrated = _active_descriptors(root, runtime)
     migrated = migrated or not isinstance(runtime.get("compiler"), dict)
     if runtime.get("profile") != "agent-box":
         findings.append({
@@ -1681,12 +1736,13 @@ def _desired_state(root: Path, runtime: dict) -> tuple[dict, dict[Path, str],
             "path": "deployment/runtime.json",
             "message": "generated service artifacts currently require profile 'agent-box'; generic runtimes remain declaration-only",
         })
-    compiled = _compile_runtime(root, runtime, active)
+    compiled = _compile_runtime(root, runtime, active, embedded)
     findings.extend(_compiled_runtime_findings(compiled, active))
     texts = _artifact_texts(root, compiled, active)
     texts[_runtime_path(root)] = _json_text(compiled)
-    texts[root / "deployment" / "capabilities.lock"] = _lock_text(root)
-    return compiled, texts, active, findings, migrated
+    texts[root / "deployment" / "capabilities.lock"] = _lock_text(
+        root, exclude=_runtime_capability_excludes(runtime))
+    return compiled, texts, active, embedded, findings, migrated
 
 
 def _artifact_drift(root: Path, texts: dict[Path, str]) -> list[dict]:
@@ -1716,7 +1772,7 @@ def _artifact_drift(root: Path, texts: dict[Path, str]) -> list[dict]:
 
 def _sync(root: Path, runtime: dict, *, check: bool,
           allow_takeover: bool = False) -> dict:
-    compiled, texts, active, findings, migrated = _desired_state(root, runtime)
+    compiled, texts, active, embedded, findings, migrated = _desired_state(root, runtime)
     findings = _validate_runtime(root, runtime, _runtime_path(root)) + findings
     drift = _artifact_drift(root, texts)
     conflicts = [d for d in drift if d["kind"] == "unmanaged_conflict"]
@@ -1741,6 +1797,7 @@ def _sync(root: Path, runtime: dict, *, check: bool,
         "check": check,
         "project": str(root),
         "services": sorted(active),
+        "embedded_services": sorted(embedded),
         "service_policy": compiled["service_policy"],
         "migrated_legacy_runtime": migrated,
         "drift": drift,
@@ -1818,6 +1875,25 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                 isinstance(x, str) for x in data.get(field, [])):
             findings.append({"severity": "error", "path": _rel(root, path),
                              "message": f"{field} must be a list of strings"})
+    capability_config = data.get("capabilities")
+    if not isinstance(capability_config, dict):
+        findings.append({"severity": "error", "path": _rel(root, path),
+                         "message": "capabilities must be an object"})
+    else:
+        if not _safe_relative_path(capability_config.get(
+                "lockfile", "deployment/capabilities.lock")):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": "capabilities.lockfile must be a safe project-relative path"})
+        excludes = capability_config.get("exclude", [])
+        if (not isinstance(excludes, list)
+                or not all(isinstance(name, str)
+                           and re.fullmatch(r"[a-z][a-z0-9_-]*", name)
+                           for name in excludes)):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": "capabilities.exclude must be a list of capability names"})
+        elif len(excludes) != len(set(excludes)):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": "capabilities.exclude must not contain duplicates"})
     if isinstance(services, dict):
         for service_name, service in services.items():
             if not isinstance(service, dict):
@@ -1934,9 +2010,9 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                              "message": "service_policy.capabilities must be an object"})
         else:
             for name, mode in overrides.items():
-                if mode not in ("auto", "enabled", "disabled"):
+                if mode not in ("auto", "enabled", "disabled", "embedded"):
                     findings.append({"severity": "error", "path": _rel(root, path),
-                                     "message": f"service_policy.capabilities.{name} must be auto|enabled|disabled"})
+                                     "message": f"service_policy.capabilities.{name} must be auto|enabled|disabled|embedded"})
     return findings
 
 
@@ -2069,8 +2145,11 @@ def cmd_freeze(args) -> None:
     root = _root()
     _require_envelope(root)
     path = root / "deployment" / "capabilities.lock"
+    runtime, err = _read_json(_runtime_path(root))
+    runtime = runtime if not err and isinstance(runtime, dict) else {}
     extra = _runtime_capabilities(root)
-    result = _write_file(root, path, _lock_text(root, extra), args.force)
+    result = _write_file(root, path, _lock_text(
+        root, extra, _runtime_capability_excludes(runtime)), args.force)
     _emit({"ok": result["action"] not in {"skipped", "error"}, "written": [result]})
     if result["action"] in {"skipped", "error"}:
         sys.exit(6)
@@ -2108,7 +2187,7 @@ def _deployment_questions() -> list[dict]:
         {"id": "service_policy",
          "question": "Which explicitly project-enabled capability services should run?",
          "default": "auto",
-         "plain_language": "Auto includes descriptor-default services; runtime.json can enable, disable, or auto each capability."},
+         "plain_language": "Auto includes descriptor-default services; runtime.json can enable, embed into the agent, disable, or auto each capability."},
     ]
 
 
@@ -2404,8 +2483,10 @@ def cmd_doctor(args) -> None:
             if runtime_obj is not None:
                 findings.extend(_target_runtime_findings(root, runtime_obj, data, path))
     active: dict[str, dict] = {}
+    embedded: dict[str, dict] = {}
     if runtime_obj is not None:
-        compiled, texts, active, descriptor_findings, migrated = _desired_state(root, runtime_obj)
+        compiled, texts, active, embedded, descriptor_findings, migrated = _desired_state(
+            root, runtime_obj)
         findings.extend(descriptor_findings)
         drift = _artifact_drift(root, texts)
         for item in drift:
@@ -2426,7 +2507,7 @@ def cmd_doctor(args) -> None:
         project_env = {}
         project_env.update(_parse_env_file(root / ".env"))
         project_env.update(_parse_env_file(root / ".env.local"))
-        for name, service in active.items():
+        for name, service in {**active, **embedded}.items():
             config = service.get("config")
             if isinstance(config, str) and config and not _service_config_path(root, config).exists():
                 findings.append({"severity": "error", "path": config,
@@ -2461,6 +2542,7 @@ def cmd_doctor(args) -> None:
         "targets": [_rel(root, p) for p in target_paths if p.exists()],
         "references": refs,
         "services": sorted(active),
+        "embedded_services": sorted(embedded),
         "drift": drift,
         "findings": findings,
     })

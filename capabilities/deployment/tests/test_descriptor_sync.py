@@ -87,6 +87,77 @@ def test_explicit_disable_and_enable_overrides(tmp_path: Path) -> None:
     assert "project-automations" not in compose
 
 
+def test_embedded_service_merges_contract_into_agent(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram", "automations"))
+    _setup(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["service_policy"] = {
+        "auto_include": False,
+        "capabilities": {"telegram": "embedded", "automations": "disabled"},
+    }
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    proc = _run(root, env, "sync")
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["services"] == []
+    assert result["embedded_services"] == ["telegram"]
+
+    compiled = json.loads(runtime_path.read_text())
+    agent = compiled["services"]["agent"]
+    assert agent["embedded_services"] == ["telegram"]
+    assert "TELEGRAM_API_HASH" in agent["required_env"]
+    assert "TELEGRAM_API_ID" in agent["optional_env"]
+    assert set(agent["state"]) >= {"telegram_state", "claude_state", "codex_state"}
+    assert "telegram" not in compiled["services"]
+
+    compose = (root / "docker-compose.yaml").read_text()
+    assert "project-telegram" not in compose
+    assert 'TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"' in compose
+    assert "telegram_state:/home/agent/.local/state/telegram" in compose
+
+
+def test_runtime_capability_exclusions_only_trim_image_lock(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["service_policy"] = {
+        "auto_include": False,
+        "capabilities": {"telegram": "disabled"},
+    }
+    runtime["capabilities"]["exclude"] = ["deployment"]
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    proc = _run(root, env, "sync")
+    assert proc.returncode == 0, proc.stderr
+    lock = (root / "deployment" / "capabilities.lock").read_text().splitlines()
+    assert "deployment" not in lock
+    assert "telegram" in lock
+    compiled = json.loads(runtime_path.read_text())
+    assert compiled["capabilities"]["exclude"] == ["deployment"]
+
+
+def test_runtime_cannot_exclude_an_embedded_service(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["service_policy"] = {
+        "auto_include": False,
+        "capabilities": {"telegram": "embedded"},
+    }
+    runtime["capabilities"]["exclude"] = ["telegram"]
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    proc = _run(root, env, "sync")
+    assert proc.returncode == 6
+    payload = json.loads(proc.stdout)
+    assert any("cannot be both embedded and excluded" in item["message"]
+               for item in payload["findings"])
+
+
 def test_global_enable_is_not_service_authorization(tmp_path: Path) -> None:
     root, env = _project(tmp_path)
     global_gate = Path(env["XDG_CONFIG_HOME"]) / "capabilities" / "settings.json"
