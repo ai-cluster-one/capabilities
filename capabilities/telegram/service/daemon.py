@@ -814,12 +814,23 @@ def configured_voice_agent_users():
             history = int(resolved("history", voice_agent.DEFAULT_HISTORY_MESSAGES))
         except (TypeError, ValueError):
             history = voice_agent.DEFAULT_HISTORY_MESSAGES
+        # Tools are the one field that layers rather than replaces: a project
+        # names the set its calls run on, and a caller turns one on or off
+        # without restating the rest. Everything starts off — a tool the model
+        # is holding is a tool it will reach for.
+        tools = {name: False for name in voice_agent.TOOL_NAMES}
+        for layer in (VOICE_AGENT_DEFAULTS.get("tools"),
+                      voice_policy.get("tools")):
+            for name, on in _as_mapping(layer).items():
+                if name in tools:
+                    tools[name] = bool(on)
         users[user_id] = {
             "name": policy.get("name") or str(user_id),
             "model": resolved("model", voice_agent.DEFAULT_MODEL),
             "voice": resolved("voice", voice_agent.DEFAULT_VOICE),
             "greeting": resolved("greeting", None),
             "history": max(0, history),
+            "tools": tools,
         }
     return users
 
@@ -1601,7 +1612,10 @@ def codex_event_stage(line):
     if kind == "thread.started":
         return "starting"
     if kind == "turn.completed":
-        return "finishing up"
+        # The turn is already over when this arrives, so anything it produces
+        # is a report about the past dressed as a report about now. The result
+        # itself is a second away and says the same thing truthfully.
+        return None
     item = event.get("item") if isinstance(event.get("item"), dict) else {}
     item_type = item.get("type") or item.get("item_type")
     if item_type in ("command_execution", "local_shell_call", "shell_call"):
@@ -1629,14 +1643,27 @@ def voice_task_preamble(chat_id, seconds):
         "Someone is waiting on a live phone call for this, so silence costs "
         "them directly.\n\n"
         "Report what you are doing as you go, by running\n"
-        f'    telegram send {chat_id} "<one short line>"\n'
-        f"once before you start looking, and again every {seconds:.0f} seconds "
-        "or so while the work continues.\n\n"
-        "Say what you are actually doing and what you have found so far, not "
-        "that you are still working. \"Looking through yesterday's calls\" and "
-        "\"got the list, now counting the failed ones\" are useful; \"still "
-        "working\" and \"one moment\" are not. One plain line each time, in the "
-        "language of the task, no paths, no commands, no markdown.\n\n"
+        f'    {WORKER_BIN / "telegram"} send {chat_id} "<one short line>"\n'
+        "spelled with that exact path. A worker that runs a shell finds the "
+        "same thing under the bare name, but one that executes commands "
+        "directly resolves the name its own way and reaches the real Telegram "
+        "instead - which sends your working notes to the caller as messages "
+        "rather than to the assistant holding the call.\n"
+        "as your very first action before you look at anything, and again "
+        f"after each real step - roughly every {seconds:.0f} seconds while the "
+        "work continues.\n\n"
+        "Report facts, not status. Each line is one concrete thing you just "
+        "did or just learned: which tool you asked, what it answered, what you "
+        "are about to try, what did not work and what you are doing instead. "
+        "\"Looking through yesterday's calls\", \"got the list, twelve of them, "
+        "counting the failed ones\", \"that connection is read-only, trying the "
+        "other one\" all tell the caller where the work stands. \"Still "
+        "working\", \"almost done\", \"finishing up\" and \"one moment\" tell "
+        "them nothing and are worse than saying nothing at all - never send a "
+        "line whose content is only that time is passing. Never guess at how "
+        "far along you are or how much is left.\n\n"
+        "One plain line each time, in the language of the task, no paths, no "
+        "commands, no markdown.\n\n"
         "These lines go to the assistant on the call, not to the caller. Do not "
         "message the caller yourself and do not address them; the assistant "
         "decides what to say aloud. The answer you return at the end is the "
@@ -4434,8 +4461,15 @@ async def run_session(client):
                 "name": caller_name,
                 "role": sender_role_for(caller_id, None, True),
             }
+            # Off unless the project named it, and reload additionally unless
+            # this caller's control role permits it: settings widen what a call
+            # may hold, they never widen who may do it.
+            enabled_tools = dict(policy.get("tools") or {})
+            def tool_enabled(name):
+                return bool(enabled_tools.get(name))
             voice_reload = (reload_runtime_settings
-                            if _control_command_allowed("/reload", caller_profile)
+                            if tool_enabled("reload_service")
+                            and _control_command_allowed("/reload", caller_profile)
                             else None)
             output = recording_output(caller_id, "voice")
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -4512,11 +4546,16 @@ async def run_session(client):
                 greeting=policy.get("greeting"),
                 caller_track=caller_pcm,
                 agent_track=agent_pcm,
-                task_runner=task_runner,
-                send_to_chat=lambda body: send_channel_message(caller_id, body, True),
-                capability_runner=lambda capability, args: run_voice_capability(
-                    caller_id, caller_name, capability, args),
-                file_reader=read_voice_project_file,
+                task_runner=task_runner if tool_enabled("agent_task") else None,
+                send_to_chat=(
+                    (lambda body: send_channel_message(caller_id, body, True))
+                    if tool_enabled("send_to_chat") else None),
+                capability_runner=(
+                    (lambda capability, args: run_voice_capability(
+                        caller_id, caller_name, capability, args))
+                    if tool_enabled("run_capability") else None),
+                file_reader=(read_voice_project_file
+                             if tool_enabled("read_project_file") else None),
                 reload_service=voice_reload,
                 on_stream_end=lambda: end_call_after_stream_loss(caller_id),
                 progress_interval=VOICE_PROGRESS_INTERVAL,

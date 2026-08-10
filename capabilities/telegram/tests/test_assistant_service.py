@@ -880,10 +880,39 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 # Unset by default: the shipped greeting is the engine's own.
                 "greeting": None,
                 "history": daemon.voice_agent.DEFAULT_HISTORY_MESSAGES,
+                # Every tool off until a project names it: one the model is
+                # holding is one it will reach for.
+                "tools": {name: False
+                          for name in daemon.voice_agent.TOOL_NAMES},
             })
             self.assertEqual(users[2]["model"], "other-live")
             self.assertEqual(users[2]["voice"], "Puck")
             self.assertEqual(users[2]["history"], 5)
+
+    async def test_voice_tools_layer_rather_than_replace(self):
+        """A project names the set its calls run on; a caller turns one on or
+        off without restating the rest. Anything unnamed stays off."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["defaults"]["voice_agent"] = {
+                "tools": {"agent_task": True, "send_to_chat": True}}
+            service_settings["allowed_users"] = {
+                "1": {"name": "Project set", "voice_agent": {"mode": "auto"}},
+                "2": {"name": "One overridden", "voice_agent": {
+                    "mode": "auto", "tools": {"send_to_chat": False,
+                                              "read_project_file": True}}},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            users = daemon.configured_voice_agent_users()
+
+            self.assertEqual(users[1]["tools"], {
+                "agent_task": True, "send_to_chat": True,
+                "run_capability": False, "read_project_file": False,
+                "reload_service": False})
+            self.assertEqual(users[2]["tools"], {
+                "agent_task": True, "send_to_chat": False,
+                "run_capability": False, "read_project_file": True,
+                "reload_service": False})
 
     async def test_invalid_voice_history_is_rejected_with_full_json_path(self):
         with tempfile.TemporaryDirectory() as td:

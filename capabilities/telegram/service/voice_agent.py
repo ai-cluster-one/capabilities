@@ -59,6 +59,47 @@ PROGRESS_CALLER_QUIET = 3.0
 # last frame has actually gone out, plus this much, so a note lands after the
 # caller's ear reaches the full stop rather than on the heel of it.
 PROGRESS_AGENT_QUIET = 1.0
+# Progress is paced by the work, not by a clock. A phrase is composed once
+# enough has happened to be worth a sentence, which arrives irregularly because
+# the work does, and a caller hears the rhythm of the task rather than a
+# metronome. The worker's own line skips the count: it was written to be passed
+# on. `progress_interval` survives as the floor between two spoken phrases, so
+# a burst cannot fire twice in a breath.
+PROGRESS_EVENT_BURST = 1
+# A composed phrase describes the last few seconds, so it goes stale on the
+# line. It waits this long for a gap in the conversation and is then dropped -
+# saying it late is worse than not saying it.
+PROGRESS_HOLD_SECONDS = 5.0
+# What the worker is doing arrives as a stream of small mechanical events, and
+# folding them by rule gives a phrase built out of the shape of the work rather
+# than its substance. A small model reads the same events and says what is
+# happening. It is a nicety on a path that must not fail, so it is given a short
+# leash and the rule-built digest stands behind it.
+PROGRESS_PHRASE_MODEL = "gemini-3.5-flash-lite"
+PROGRESS_PHRASE_TIMEOUT = 4.0
+PROGRESS_PHRASE_INSTRUCTION = (
+    "You are given the last few seconds of a worker's activity on a task, one "
+    "event per line: some are the worker's own words, the rest are mechanical "
+    "notes about the commands it ran.\n\n"
+    "Write ONE short phrase saying what is happening right now, for an "
+    "assistant to say aloud to someone waiting on a phone call. Under twelve "
+    "words. Same language as the lines themselves.\n\n"
+    "Say the substance: what was looked at, what came back, what is being "
+    "tried, what did not work and what is being tried instead. A line in the "
+    "worker's own words almost always carries substance - pass it on. A named "
+    "tool being asked something is worth saying too: which tool, and what "
+    "for.\n\n"
+    "Never say how far along the work is, never say it is nearly done or "
+    "finishing, never promise when it will end - you cannot know any of "
+    "that.\n\n"
+    "Answer with a single hyphen, and nothing else, when the window holds only "
+    "the worker thinking, or a command whose name says nothing, or the same "
+    "thing the previous phrase already said. A hyphen is a good answer - never "
+    "invent activity to fill one, and never repeat the previous phrase in "
+    "other words.\n\n"
+    "No quotes, no markdown, no preamble - the phrase only."
+)
+PROGRESS_PHRASE_SILENCE = {"-", "--", "—", "–", "-.", "()", "(silence)", "none"}
 # A capability read answered inside the turn that asked for it. The ceiling is
 # not what a person will sit through in silence — it is that against the only
 # alternative, which is a worker taking a minute. These tools read over the
@@ -106,6 +147,12 @@ AGENT_TASK_TOOL = {
         "external, or an action with an effect such as writing something down "
         "or filing something. If you are unsure, answer from what you have and "
         "say what you could not check."
+        "\n\n"
+        "One task at a time. While one is running you cannot start another: if "
+        "the caller asks for something else, say you will do it straight after "
+        "this one, hold on to it, and wait for the result before handing "
+        "anything over. Never hand the same task over twice, and never say you "
+        "have handed something over unless this tool has returned."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -263,6 +310,11 @@ RELOAD_SERVICE_TOOL = {
 }
 
 
+ALL_TOOLS = (AGENT_TASK_TOOL, SEND_TO_CHAT_TOOL, RUN_CAPABILITY_TOOL,
+             READ_PROJECT_FILE_TOOL, RELOAD_SERVICE_TOOL)
+TOOL_NAMES = tuple(tool["name"] for tool in ALL_TOOLS)
+
+
 class VoiceAgentError(RuntimeError):
     pass
 
@@ -295,16 +347,23 @@ def summarize_progress(window):
 
 def progress_prompt(note):
     return (
-        "Internal status note about the task you are running. The caller has "
-        "not said this and it is not a request.\n\n"
-        "It is a rough digest of the last few seconds of work, not a result and "
-        "not a verdict. Do not read it out, do not quote it, and do not treat "
-        "anything in it as finished or failed — the work is still going. Turn it "
-        "into at most one short clause in the language of the conversation, of "
-        "the kind a person drops while they are looking something up.\n\n"
-        "If the caller is in the middle of something else, or you have nothing "
-        "new to add, say nothing at all — silence is the right answer more often "
-        "than not.\n\n" + str(note)[:600]
+        "Where the task you are running has got to. The caller has not said "
+        "this and it is not a request.\n\n"
+        "Say it aloud, now, as one short clause in the language of the "
+        "conversation — the kind a person drops while they are looking "
+        "something up. Not word for word: it is written for you, often in "
+        "another language and in the shape of a command rather than a "
+        "sentence. Whatever it says, do not treat it as finished or failed; "
+        "the work is still going.\n\n"
+        "Say the thing that is happening, and only that. Never dress it up as "
+        "nearly done, almost there, on the home straight, or any other guess "
+        "at how far along the work is — you do not know, and a guess sounds "
+        "like information while telling them nothing.\n\n"
+        "Whether this was worth saying at all has already been decided before "
+        "it reached you, so pass it on rather than weighing it again. Only two "
+        "things override that: you are mid-sentence, or the caller is. Then "
+        "let it go and carry on — it will come round again.\n\n"
+        "Speak it. Never write it into the chat.\n\n" + str(note)[:600]
     )
 
 
@@ -715,6 +774,10 @@ class VoiceCallSession:
             progress_interval or DEFAULT_PROGRESS_INTERVAL))
         self._caller_spoke_at = 0.0
         self._agent_voiced_at = 0.0
+        self._progress_wanted = False
+        self._progress_pending = None
+        self._progress_composed_at = 0.0
+        self._phrase_client = None
 
     # --- media -------------------------------------------------------------
     def start_pump(self):
@@ -1102,25 +1165,49 @@ class VoiceCallSession:
             return
         self._progress_window.append((source, text))
         del self._progress_window[:-40]
+        if source == "worker":
+            # The worker stopped to write this. It does not wait its turn behind
+            # a count of machine events.
+            self._progress_wanted = True
 
     async def _announce_progress(self):
-        """Offer the latest progress at most once per interval, and only into a
-        genuine lull: the model done speaking and the caller done hearing it, the
-        caller silent, something new to say."""
+        """Compose a phrase when the work has produced enough to be worth one,
+        then wait for a gap to say it in. Two separate questions: what has
+        happened is the worker's business, when it can be said is the
+        conversation's, and a phrase that never finds its gap is dropped."""
         while True:
             await asyncio.sleep(1.0)
             if not self._task_runner.running:
-                # Nothing is running, so nothing in the window is still current.
+                # Nothing is running, so nothing held over is still current.
                 self._progress_window.clear()
+                self._progress_pending = None
+                self._progress_wanted = False
                 continue
             if not self._live_ready.is_set():
-                # A connection is being replaced. Asked before the digest is
-                # taken, so the window survives the gap and what happened during
-                # it is still there to be said once the conversation is back.
+                # A connection is being replaced. Asked before anything is
+                # composed, so the window survives the gap and what happened
+                # during it is still there to be said once talk resumes.
                 continue
-            note = self._due_progress()
-            if note is None:
+            if self._progress_pending is None:
+                events = self._due_progress()
+                if events is None:
+                    continue
+                note = await self._phrase_progress(events)
+                if note is None:
+                    continue
+                self._progress_pending = (note, time.monotonic() + PROGRESS_HOLD_SECONDS)
+            note, expires = self._progress_pending
+            if not self._can_speak_progress():
+                if time.monotonic() < expires:
+                    continue
+                # It waited for a gap that never came, and by now it describes
+                # a moment that has passed.
+                self._progress_pending = None
+                self._log(f"voice: progress dropped, no gap for it — {note[:60]!r}")
                 continue
+            self._progress_pending = None
+            self._progress_offered_at = time.monotonic()
+            self._progress_last_offered = note
             try:
                 await self._live.send_realtime_input(text=progress_prompt(note))
                 self._log(f"voice: progress offered to the model — {note[:80]!r}")
@@ -1135,28 +1222,103 @@ class VoiceCallSession:
                               f"{type(exc).__name__}: {exc}")
                 self._live_ready.clear()
 
+    def _can_speak_progress(self):
+        """Whether the line is free right now: the model done generating, its
+        audio drained from the caller's ear, the caller not mid-sentence, and
+        enough distance from the last thing progress said."""
+        now = time.monotonic()
+        return (self._model_idle.is_set()
+                and now - self._caller_spoke_at >= PROGRESS_CALLER_QUIET
+                and now - self._agent_voiced_at >= PROGRESS_AGENT_QUIET
+                and now - self._progress_offered_at >= self._progress_interval)
+
     def _due_progress(self):
-        """The digest to offer now, or None while any of the conditions that keep
-        progress off the line still holds."""
+        """The events worth a phrase now, or None while too little has happened.
+        Paced by the work: a burst of machine events, or one line the worker
+        wrote itself. The window is emptied here whether or not the phrase is
+        eventually spoken - these seconds have had their turn either way."""
         if not self._progress_window:
             return None
+        if not (self._progress_wanted
+                or len(self._progress_window) >= PROGRESS_EVENT_BURST):
+            return None
+        # Composing costs a request, and a phrase that finds no gap is dropped
+        # while the work carries on producing events. Without a floor of its
+        # own, a caller who talks through a busy task has one composed and
+        # thrown away every tick. This one is measured from the last
+        # composition rather than the last thing said, because a long silence
+        # is exactly when the two come apart.
         now = time.monotonic()
-        if now - self._progress_offered_at < self._progress_interval:
+        if now - self._progress_composed_at < self._progress_interval:
             return None
-        if not self._model_idle.is_set():
-            return None
-        if now - self._caller_spoke_at < PROGRESS_CALLER_QUIET:
-            return None
-        if now - self._agent_voiced_at < PROGRESS_AGENT_QUIET:
-            return None
-        note = summarize_progress(self._progress_window)
+        self._progress_composed_at = now
+        events = list(self._progress_window)
         self._progress_window.clear()
-        if note is None or note == self._progress_last_offered:
-            # Nothing has changed since the last time; saying it again is noise.
+        self._progress_wanted = False
+        return events
+
+    async def _phrase_progress(self, events):
+        """One phrase for this window, or None when there is nothing worth
+        saying: written by a small model where it can be, folded by rule where
+        it cannot. The written one is better - it reads the substance rather
+        than the shape - but a call cannot wait on it, so the rule-built digest
+        is both the fallback and the deadline. Saying again what was just said
+        is worse than silence, so a repeat is nothing worth saying."""
+        digest = self._unless_already_said(summarize_progress(events))
+        lines = [text for _, text in events if text]
+        if not lines:
+            return digest
+        # What was already said is what "again" means, so it goes in with the
+        # events rather than being left to guesswork.
+        said = self._progress_last_offered
+        prologue = (f"Previous phrase, already said aloud: {said}\n\n"
+                    if said else "")
+        contents = prologue + "New activity:\n" + "\n".join(lines[-40:])
+        started = time.monotonic()
+        try:
+            if self._phrase_client is None:
+                from google import genai
+
+                self._phrase_client = genai.Client(api_key=self._api_key)
+            # Off this loop entirely. The request itself takes about half a
+            # second, but this loop also feeds the outbound audio every 10ms and
+            # drains the speech socket, so awaiting it here means queueing
+            # behind all of that — which is how a half-second request timed out
+            # at three and the caller heard the machine digest instead.
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._phrase_client.models.generate_content,
+                    model=PROGRESS_PHRASE_MODEL,
+                    contents=contents,
+                    config={"system_instruction": PROGRESS_PHRASE_INSTRUCTION,
+                            "temperature": 0.4,
+                            "max_output_tokens": 2048},
+                ),
+                PROGRESS_PHRASE_TIMEOUT,
+            )
+            phrase = " ".join(str(response.text or "").split())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log("voice: progress phrase fell back to the digest after "
+                      f"{time.monotonic() - started:.2f}s — "
+                      f"{type(exc).__name__}: {exc}")
+            return digest
+        if not phrase:
+            return digest
+        if phrase.strip().lower().strip(".") in PROGRESS_PHRASE_SILENCE:
+            # It read the window and found nothing worth the caller's ear. That
+            # is an answer, and the rule-built digest must not overrule it —
+            # falling back here is how "still working" gets said out loud.
+            self._log("voice: progress phrased — nothing worth saying")
             return None
-        self._progress_last_offered = note
-        self._progress_offered_at = now
-        return note
+        self._log(f"voice: progress phrased in {time.monotonic() - started:.2f}s "
+                  f"from {len(lines)} event(s) — {phrase[:80]!r}")
+        return self._unless_already_said(phrase)
+
+    def _unless_already_said(self, note):
+        """Nothing, where this is what was said last time round."""
+        return None if note is not None and note == self._progress_last_offered else note
 
     async def _announce_completions(self):
         """Speak finished tasks between turns.

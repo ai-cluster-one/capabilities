@@ -10,6 +10,8 @@ TOP_LEVEL = {
 WORKERS = {"claude", "codex", "stub"}
 DIRECT_MODES = {"allowed_users", "anyone", "all", "open", "public"}
 VOICE_MODES = {"disabled", "enabled", "auto", "on"}
+VOICE_TOOLS = {"agent_task", "send_to_chat", "run_capability",
+               "read_project_file", "reload_service"}
 TRANSCRIPTION_MODES = {"disabled", "auto"}
 CALL_GROUP_MODES = {
     "disabled", "off", "none", "auto", "automatic", "on_request",
@@ -215,14 +217,26 @@ def _call_recording(value, path, *, group):
         _boolean(value["send_to_chat"], f"{path}.send_to_chat")
 
 
+def _voice_tools(value, path):
+    """Which tools a call declares to the model. Every one is off unless this
+    names it: a tool the model is holding is a tool it will reach for, and the
+    set that suits one project's calls is not the set that suits another's."""
+    value = _object(value, path)
+    _unknown(value, VOICE_TOOLS, path)
+    for name in value:
+        _boolean(value[name], f"{path}.{name}")
+
+
 def _voice_agent(value, path, *, defaults=False, project_root=None, service_dir=None):
     value = _object(value, path)
-    allowed = {"worker", "workers", "model", "voice", "greeting", "history"}
+    allowed = {"worker", "workers", "model", "voice", "greeting", "history", "tools"}
     if defaults:
         allowed.update({"timezone", "progress_interval", "recording_caption", "prompt_file"})
     else:
         allowed.add("mode")
     _unknown(value, allowed, path)
+    if "tools" in value:
+        _voice_tools(value["tools"], f"{path}.tools")
     if "mode" in value:
         _enum(value["mode"], VOICE_MODES, f"{path}.mode")
     if "worker" in value:

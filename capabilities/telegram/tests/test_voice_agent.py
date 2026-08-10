@@ -241,6 +241,23 @@ def fake_genai_types():
             self.data = data
             self.mime_type = mime_type
 
+    class FakeModels:
+        """`generate_content` as the phrase writer calls it: synchronously, off
+        the loop in a thread. `answer` is what it replies with; a BaseException
+        instance is raised instead, which is how the timeout is staged."""
+        answer = ""
+
+        def generate_content(self, **_kwargs):
+            if isinstance(FakeModels.answer, BaseException):
+                raise FakeModels.answer
+            return types.SimpleNamespace(text=FakeModels.answer)
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.models = FakeModels()
+
+    genai.Client = Client
+    genai.FakeModels = FakeModels
     genai_types = types.ModuleType("google.genai.types")
     genai_types.FunctionResponse = FunctionResponse
     genai_types.Blob = Blob
@@ -862,60 +879,174 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(note, "got the list, counting the failed ones")
 
     async def test_the_same_note_is_never_offered_twice(self):
-        """What the caller hears is bounded independently of how talkative the
-        worker is: once per interval, only into a lull, and never a repeat."""
+        """Saying again what was just said is worse than silence, whether the
+        phrase was written by the model or folded by rule."""
         with fake_runtime_modules(), fake_genai_types():
             va = import_voice_agent()
             runner = va.VoiceTaskRunner(lambda text: self.never(),
                                         self.never, log=lambda *_: None)
             session = task_session(va, runner)
-            session._progress_interval = 0.0
 
-            session.note_progress("searching for it")
-            first = session._due_progress()
-            session.note_progress("searching for it")
-            repeated = session._due_progress()
-            session.note_progress("changing files")
-            changed = session._due_progress()
+            # No usable model here, so every phrase is the rule-built digest —
+            # which is what makes this deterministic.
+            first = await session._phrase_progress([("stream", "searching for it")])
+            session._progress_last_offered = first
+            repeated = await session._phrase_progress([("stream", "searching for it")])
+            changed = await session._phrase_progress([("stream", "changing files")])
 
         self.assertEqual(first, "searching for it")
         self.assertIsNone(repeated)
         self.assertEqual(changed, "changing files")
 
-    async def test_progress_stays_off_the_line_until_there_is_a_lull(self):
+    async def test_a_window_is_composed_by_the_work_not_by_a_clock(self):
+        """Enough having happened is what asks for a phrase, and it arrives
+        irregularly because the work does. A line the worker wrote itself never
+        waits behind a count of machine events."""
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(lambda text: self.never(),
+                                        self.never, log=lambda *_: None)
+            session = task_session(va, runner)
+
+            nothing_yet = session._due_progress()
+            for n in range(va.PROGRESS_EVENT_BURST):
+                session.note_progress(f"step {n}")
+            burst = session._due_progress()
+            emptied = session._due_progress()
+
+            # Composing has a floor of its own, tested separately; step past it
+            # so this stays about what asks for a phrase.
+            session._progress_composed_at = 0.0
+            session.note_progress("stage", source="stream")
+            session.note_progress("got the list", source="worker")
+            with_a_worker_line = session._due_progress()
+
+        self.assertIsNone(nothing_yet)
+        self.assertEqual(len(burst), va.PROGRESS_EVENT_BURST)
+        # The window has had its turn whether or not anything is said from it.
+        self.assertIsNone(emptied)
+        self.assertIn(("worker", "got the list"), with_a_worker_line)
+
+    async def test_the_written_phrase_is_used_and_every_way_it_can_fail_falls_back(self):
+        """The phrase writer sits on the call's own path, so none of its failures
+        may reach the tick loop: what it cannot answer, the rule-built digest
+        answers instead. Its one non-fallback answer is silence, which it asks
+        for with a hyphen — and that must not be overruled by the digest, since
+        overruling it is how "still working" gets said out loud."""
+        with fake_runtime_modules(), fake_genai_types():
+            import google.genai as genai
+
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(lambda text: self.never(),
+                                        self.never, log=lambda *_: None)
+            session = task_session(va, runner)
+            events = [("stream", "searching for it")]
+
+            async def phrase_when(answer):
+                genai.FakeModels.answer = answer
+                session._phrase_client = None
+                session._progress_last_offered = None
+                return await session._phrase_progress(events)
+
+            written = await phrase_when("looking through yesterday's calls")
+            silent = await phrase_when("-")
+            empty = await phrase_when("")
+            timed_out = await phrase_when(asyncio.TimeoutError())
+            raised = await phrase_when(RuntimeError("upstream said no"))
+
+        self.assertEqual(written, "looking through yesterday's calls")
+        self.assertIsNone(silent)
+        self.assertEqual(empty, "searching for it")
+        self.assertEqual(timed_out, "searching for it")
+        self.assertEqual(raised, "searching for it")
+
+    async def test_composing_a_phrase_has_a_floor_of_its_own(self):
+        """A phrase that finds no gap is dropped while the work carries on
+        producing events. Without this, a caller who talks through a busy task
+        has one composed and thrown away every tick."""
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(lambda text: self.never(),
+                                        self.never, log=lambda *_: None)
+            session = task_session(va, runner)
+
+            session.note_progress("searching for it")
+            first = session._due_progress()
+            session.note_progress("changing files")
+            too_soon = session._due_progress()
+            session._progress_composed_at = (time.monotonic()
+                                             - session._progress_interval - 1)
+            later = session._due_progress()
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(too_soon)
+        self.assertIsNotNone(later)
+
+    async def test_a_phrase_that_finds_no_gap_is_dropped_rather_than_said_late(self):
+        """It describes the last few seconds, so it goes stale on the line."""
         with fake_runtime_modules(), fake_genai_types():
             va = import_voice_agent()
             runner = va.VoiceTaskRunner(lambda text: self.never(),
                                         self.never, log=lambda *_: None)
             session = task_session(va, runner)
             session._progress_interval = 0.0
-            session.note_progress("searching for it")
+            session._caller_spoke_at = time.monotonic()   # the caller is talking
+            session._progress_pending = ("got the list", time.monotonic() + 5.0)
 
-            session._model_idle.clear()               # the agent is speaking
-            while_speaking = session._due_progress()
-            session._model_idle.set()
-            session._caller_spoke_at = time.monotonic()   # the caller just spoke
-            while_caller_talks = session._due_progress()
+            held = session._can_speak_progress()
             session._caller_spoke_at = time.monotonic() - va.PROGRESS_CALLER_QUIET - 1
-            in_the_lull = session._due_progress()
+            session._agent_voiced_at = time.monotonic() - va.PROGRESS_AGENT_QUIET - 1
+            freed = session._can_speak_progress()
 
-        self.assertIsNone(while_speaking)
-        self.assertIsNone(while_caller_talks)
-        self.assertEqual(in_the_lull, "searching for it")
+        self.assertFalse(held)
+        self.assertTrue(freed)
 
-    async def test_progress_is_capped_to_one_note_per_interval(self):
+    async def test_progress_stays_off_the_line_until_there_is_a_lull(self):
+        """Composing is the work's business; saying is the conversation's. A
+        phrase waits while either party still holds the line — including while
+        the caller is still hearing audio the model finished generating."""
         with fake_runtime_modules(), fake_genai_types():
             va = import_voice_agent()
             runner = va.VoiceTaskRunner(lambda text: self.never(),
                                         self.never, log=lambda *_: None)
             session = task_session(va, runner)
-            session.note_progress("searching for it")
-            first = session._due_progress()
-            session.note_progress("changing files")
-            too_soon = session._due_progress()
+            session._progress_interval = 0.0
 
-        self.assertEqual(first, "searching for it")
-        self.assertIsNone(too_soon)
+            session._model_idle.clear()               # the agent is speaking
+            while_speaking = session._can_speak_progress()
+            session._model_idle.set()
+            session._caller_spoke_at = time.monotonic()   # the caller just spoke
+            while_caller_talks = session._can_speak_progress()
+            session._caller_spoke_at = time.monotonic() - va.PROGRESS_CALLER_QUIET - 1
+            session._agent_voiced_at = time.monotonic()   # its audio still playing
+            while_audio_drains = session._can_speak_progress()
+            session._agent_voiced_at = time.monotonic() - va.PROGRESS_AGENT_QUIET - 1
+            in_the_lull = session._can_speak_progress()
+
+        self.assertFalse(while_speaking)
+        self.assertFalse(while_caller_talks)
+        self.assertFalse(while_audio_drains)
+        self.assertTrue(in_the_lull)
+
+    async def test_two_phrases_never_land_in_the_same_breath(self):
+        """The work sets the rhythm, but a burst of it cannot fire twice over:
+        the interval survives as the floor between two spoken phrases."""
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(lambda text: self.never(),
+                                        self.never, log=lambda *_: None)
+            session = task_session(va, runner)
+            session._caller_spoke_at = time.monotonic() - va.PROGRESS_CALLER_QUIET - 1
+            session._agent_voiced_at = time.monotonic() - va.PROGRESS_AGENT_QUIET - 1
+
+            session._progress_offered_at = time.monotonic()      # just spoke
+            too_soon = session._can_speak_progress()
+            session._progress_offered_at = (time.monotonic()
+                                            - session._progress_interval - 1)
+            far_enough = session._can_speak_progress()
+
+        self.assertFalse(too_soon)
+        self.assertTrue(far_enough)
 
     async def never(self, *_args):
         raise AssertionError("nothing should run in a progress-only test")
