@@ -73,6 +73,52 @@ Path(outfile).write_text("FINAL ANSWER MUST NOT BE PROGRESS")
 '''
 
 
+CODEX_TIMEOUT_FAKE = r'''#!/usr/bin/env python3
+import json
+import time
+
+print(json.dumps({
+    "type": "thread.started", "thread_id": "codex-timeout-thread"
+}), flush=True)
+time.sleep(5)
+'''
+
+
+CODEX_TIMEOUT_WITHOUT_SESSION_FAKE = r'''#!/usr/bin/env python3
+import time
+
+time.sleep(5)
+'''
+
+
+CODEX_RESUME_ACT_FAKE = r'''#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[:3] != ["exec", "resume", "codex-timeout-thread"]:
+    print(f"unexpected resume args: {args[:3]}", file=sys.stderr)
+    raise SystemExit(20)
+if "--dangerously-bypass-approvals-and-sandbox" not in args:
+    print("resume lost act mode", file=sys.stderr)
+    raise SystemExit(21)
+if any("read-only" in value for value in args):
+    print("resume unexpectedly became read-only", file=sys.stderr)
+    raise SystemExit(22)
+
+outfile = args[args.index("-o") + 1]
+print(json.dumps({
+    "type": "thread.started", "thread_id": "codex-timeout-thread"
+}), flush=True)
+print(json.dumps({
+    "type": "turn.completed",
+    "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}
+}), flush=True)
+Path(outfile).write_text("RESUMED ACT SESSION")
+'''
+
+
 CLAUDE_FAKE = r'''#!/usr/bin/env python3
 import json
 import os
@@ -143,16 +189,16 @@ def _invoke(tmp_path: Path, engine: str, fake: str, *extra: str,
             expect_model: str | None = None,
             expect_effort: str | None = None):
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
+    fake_bin.mkdir(exist_ok=True)
     _write_executable(fake_bin / engine, fake)
 
     caller = tmp_path / "caller"
     target = tmp_path / "target"
-    caller.mkdir()
-    target.mkdir()
-    (caller / ".git").mkdir()
+    caller.mkdir(exist_ok=True)
+    target.mkdir(exist_ok=True)
+    (caller / ".git").mkdir(exist_ok=True)
     capdir = caller / "capabilities"
-    capdir.mkdir()
+    capdir.mkdir(exist_ok=True)
     (capdir / "settings.json").write_text(json.dumps({
         "capabilities": {"askproject": {"enabled": True}},
     }) + "\n")
@@ -292,3 +338,41 @@ def test_codex_reports_no_effort(tmp_path):
 
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)["effort"] is None
+
+
+def test_default_timeout_is_one_hour():
+    assert CLI.DEFAULT_TIMEOUT == 3600
+    assert "default 3600" in CLI.__doc__
+
+
+def test_timed_out_act_session_can_resume_without_repeating_act(tmp_path):
+    timed_out = _invoke(
+        tmp_path, "codex", CODEX_TIMEOUT_FAKE, "--act", "--timeout", "1")
+
+    assert timed_out.returncode == 1
+    assert "resume it with -c" in json.loads(timed_out.stdout)["error"]
+
+    resumed = _invoke(tmp_path, "codex", CODEX_RESUME_ACT_FAKE, "-c")
+
+    assert resumed.returncode == 0, resumed.stderr
+    result = json.loads(resumed.stdout)
+    assert result["mode"] == "act"
+    assert result["resumed"] is True
+    assert result["answer"] == "RESUMED ACT SESSION"
+
+
+def test_timeout_without_session_id_does_not_fall_back_to_older_session(tmp_path):
+    completed = _invoke(tmp_path, "codex", CODEX_FAKE, "--quiet")
+    assert completed.returncode == 0, completed.stderr
+
+    timed_out = _invoke(
+        tmp_path, "codex", CODEX_TIMEOUT_WITHOUT_SESSION_FAKE,
+        "--act", "--timeout", "1")
+    assert timed_out.returncode == 1
+
+    resumed = _invoke(tmp_path, "codex", CODEX_FAKE, "-c", "--quiet")
+
+    assert resumed.returncode == 1
+    error = json.loads(resumed.stdout)["error"]
+    assert "timed out before its session id was observed" in error
+    assert "without -c" in error

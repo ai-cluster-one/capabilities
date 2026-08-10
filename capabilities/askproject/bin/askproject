@@ -76,7 +76,8 @@ SESSION CONTINUITY  (state is LOCAL to the project you call from)
     - Otherwise: ~/.local/state/askproject/<project-key>/
 
   This state is local to YOUR project, not the targets. `-c/--continue` resumes
-  the last session for that target; add --fork to branch instead of continue.
+  the last session for that target with its original engine and read/act mode;
+  add --fork to branch instead of continue.
 
   Scope a session to ONE unit of work — resume with -c only while on that
   same item; start a fresh call for a new one; use --fork to branch off an
@@ -113,7 +114,8 @@ FLAGS
                         $ASKPROJECT_ENGINE). A -c resume adopts the session's
                         own engine — a codex thread can't be resumed by claude.
   --act                 Modification mode (bypass prompts).
-  -c, --continue        Resume the last session for this target.
+  -c, --continue        Resume the last session for this target, retaining its
+                        engine and read/act mode.
   --fork                Reserved; neither headless CLI has a non-interactive
                         fork, so this exits with a controlled error.
   --model <m>           Override the model, forcing it regardless of mode
@@ -126,7 +128,7 @@ FLAGS
                         (default: high, or $ASKPROJECT_EFFORT).
   --schema <file|json>  Pass a JSON Schema to constrain the peer's answer;
                         `answer` is then the parsed object.
-  --timeout <seconds>   Kill the peer after N seconds (default 600).
+  --timeout <seconds>   Kill the peer after N seconds (default 3600).
   --text                Print only the answer to stdout (still exits non-zero
                         on error).
   --quiet               Suppress the concise progress stream on stderr.
@@ -198,6 +200,7 @@ MODEL_ALIASES = {
 # config, so effort is a claude-engine control and stays null elsewhere.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_EFFORT = "high"
+DEFAULT_TIMEOUT = 3600
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -779,6 +782,30 @@ def die(msg: str, *, as_json: bool, code: int = 1):
     sys.exit(code)
 
 
+class PeerTimeout(Exception):
+    """A timed-out peer plus the native session id observed before it stopped."""
+
+    def __init__(self, seconds: int, session_id: str | None = None):
+        super().__init__(f"peer timed out after {seconds}s")
+        self.seconds = seconds
+        self.session_id = session_id
+
+
+def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
+    value = exc.output or ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
+
+
+def _parse_claude_session_id(stdout: str) -> str | None:
+    for line in (stdout or "").splitlines():
+        evt = _event(line)
+        if evt and evt.get("session_id"):
+            return evt["session_id"]
+    return None
+
+
 def _state_path() -> Path:
     """State home following the standard project envelope convention.
 
@@ -1208,9 +1235,10 @@ def run_claude(target, prompt, mode, model, effort, caller, append,
             proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
                                   text=True, timeout=timeout,
                                   stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         reporter.emit("failed", f"Peer timed out after {timeout}s")
-        die(f"peer timed out after {timeout}s", as_json=as_json)
+        session_id = _parse_claude_session_id(_timeout_output(exc)) or resume_id
+        raise PeerTimeout(timeout, session_id) from exc
     if proc.returncode != 0:
         reporter.emit("failed", f"Claude peer exited with status {proc.returncode}")
         snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
@@ -1320,9 +1348,10 @@ def run_codex(target, prompt, mode, model, effort, caller, append,
                 proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
                                       text=True, timeout=timeout,
                                       stdin=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             reporter.emit("failed", f"Peer timed out after {timeout}s")
-            die(f"peer timed out after {timeout}s", as_json=as_json)
+            _, session_id, _ = _parse_codex_events(_timeout_output(exc))
+            raise PeerTimeout(timeout, session_id or resume_id) from exc
         if proc.returncode != 0:
             reporter.emit("failed", f"Codex peer exited with status {proc.returncode}")
             snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
@@ -1375,7 +1404,7 @@ def run(args):
     if not target.is_dir():
         die(f"target is not a directory: {target}", as_json=as_json)
 
-    mode = "act" if args.act else "read"
+    requested_mode = "act" if args.act else "read"
     root = _project_root()
     caller = root.name if root else Path.cwd().name
 
@@ -1388,19 +1417,34 @@ def run(args):
     resumed = False
     resume_id = None
     if args.cont:
-        stored_engine = entry.get("engine") or "claude"
+        last_attempt = entry.get("last_attempt") or {}
+        timed_out = last_attempt.get("status") == "timed_out"
+        session_source = last_attempt if timed_out else entry
+        stored_engine = session_source.get("engine") or entry.get("engine") or "claude"
         if args.engine and args.engine != stored_engine:
             die(f"cannot resume {target} with {args.engine}: the last session "
                 f"used {stored_engine}", as_json=as_json)
         engine = args.engine or stored_engine
-        resume_id = entry.get("last_session_id")
+        resume_id = (session_source.get("session_id") if timed_out
+                     else entry.get("last_session_id"))
         if not resume_id:
+            if timed_out:
+                die(f"the last attempt for {target} timed out before its session "
+                    "id was observed; start a fresh call without -c",
+                    as_json=as_json)
             die(f"no prior session for {target}; run without -c first", as_json=as_json)
+        stored_mode = (session_source.get("mode") or entry.get("last_mode")
+                       or requested_mode)
+        if args.act and stored_mode != "act":
+            die(f"cannot resume {target} in act mode: the last session used "
+                f"{stored_mode}; start a fresh call without -c", as_json=as_json)
+        mode = stored_mode
         if args.fork:
             die("--fork is not supported in headless mode", as_json=as_json)
         resumed = True
     else:
         engine = args.engine or _default_engine()
+        mode = requested_mode
 
     if not shutil.which(engine):
         die(f"`{engine}` CLI not found on PATH", as_json=as_json)
@@ -1420,9 +1464,29 @@ def run(args):
     reporter = ProgressReporter(engine, enabled=not args.quiet)
     reporter.emit("starting", f"Launching {engine} peer")
     before = snapshot(target)
-    res = ENGINE_RUNNERS[engine](target, args.prompt, mode, model, effort,
-                                 caller, args.append, schema_text, resume_id,
-                                 args.timeout, as_json, reporter)
+    try:
+        res = ENGINE_RUNNERS[engine](target, args.prompt, mode, model, effort,
+                                     caller, args.append, schema_text, resume_id,
+                                     args.timeout, as_json, reporter)
+    except PeerTimeout as exc:
+        entry["last_attempt"] = {
+            "status": "timed_out",
+            "engine": engine,
+            "mode": mode,
+            "session_id": exc.session_id,
+            "at": time.time(),
+        }
+        if exc.session_id:
+            entry["last_session_id"] = exc.session_id
+            entry["last_model"] = model
+            entry["last_effort"] = effort if engine == "claude" else None
+            entry["last_mode"] = mode
+            entry["engine"] = engine
+        state[key] = entry
+        save_state(state)
+        hint = ("; resume it with -c" if exc.session_id else
+                "; no session id was observed, so start a fresh call without -c")
+        die(f"peer timed out after {exc.seconds}s{hint}", as_json=as_json)
     after = snapshot(target)
     files_changed, dirty_before = diff_snapshots(before, after)
 
@@ -1439,9 +1503,17 @@ def run(args):
         entry["last_session_id"] = session_id
         entry["last_model"] = res.get("model")
         entry["last_effort"] = res.get("effort")
+        entry["last_mode"] = mode
         entry["engine"] = engine
         entry["interactions"] = entry.get("interactions", 0) + 1
         entry["last_used_at"] = time.time()
+        entry["last_attempt"] = {
+            "status": "completed",
+            "engine": engine,
+            "mode": mode,
+            "session_id": session_id,
+            "at": entry["last_used_at"],
+        }
         state[key] = entry
         save_state(state)
 
@@ -1564,7 +1636,7 @@ def main():
     p.add_argument("--model")
     p.add_argument("--effort")
     p.add_argument("--schema")
-    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     p.add_argument("--text", action="store_true")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--append")
