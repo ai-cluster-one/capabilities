@@ -4228,12 +4228,28 @@ async def run_session(client):
                         Path(authority_context).unlink()
 
             if code == 4:
-                # The CLI's own policy gate, behind the check above: a capability
-                # disabled for the project refuses whoever asks.
-                log(f"voice: run_capability {capability} refused by policy (exit 4)")
+                # The check above is this daemon's own per-caller ACL, not the
+                # capability manager's gate, so a tool the project has not
+                # enabled still reaches here. Whichever gate fired — project,
+                # global, or the tool's own connection — the tool's message is
+                # the truth of the refusal and ours was a guess. That message is
+                # written to stderr before anything is emitted, so stderr is
+                # where the whole of it lives and stdout is usually empty.
+                refusal, refusal_cut = truncate_capability_output(
+                    err, voice_agent.CAPABILITY_OUTPUT_LIMIT)
+                body, body_cut = truncate_capability_output(
+                    out, voice_agent.CAPABILITY_OUTPUT_LIMIT)
+                log(f"voice: run_capability {capability} refused by policy "
+                    f"(exit 4) — {(err or out or '').strip()[:200] or 'no message'}")
                 return {"ok": False, "status": "refused_by_policy",
-                        "instruction": f"{capability} is not available to this project. "
-                                       "Say so plainly; do not try to work around it."}
+                        "exit_code": code, "stderr": refusal, "stdout": body,
+                        "truncated": refusal_cut or body_cut,
+                        "instruction": f"{capability} refused this itself, and that "
+                                       "refusal stands. Say what its message says. "
+                                       "If it names a grant only the caller can "
+                                       "make, ask for it plainly; never lift a "
+                                       "gate, change a setting or a connection, or "
+                                       "look for a way round."}
 
             body = out or ""
             truncated = len(body) > voice_agent.CAPABILITY_OUTPUT_LIMIT
