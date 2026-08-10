@@ -146,7 +146,7 @@ CONTRACT  (self-description an agent loads on demand; this capability has NO
   askproject doctor        Readiness — reports which engine CLIs are on PATH.
   askproject stub          One-line awareness text.
   askproject manifest      Machine-readable declaration (JSON).
-  askproject guide [topic] How-to guides — `capability-changes`.
+  askproject guide [topic] How-to guides — none ship; the menu is empty.
   askproject ids …         Project identifier store (list/get/set/rm).
   askproject refs          Project references menu.
   askproject connections   Connections report — empty; this capability has none.
@@ -172,9 +172,8 @@ SUMMARY = ("Bridge to a coding agent in ANOTHER project — spawn a headless pee
            "return its answer with cost, token, and files-changed traceability.")
 SCOPE = "user"      # credential scope: "project" | "user"
 CRED_KEYS: list = []   # no credentials — it drives the local `claude` CLI on PATH
-DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
-             "main/capabilities/askproject/guides/")
-TOPICS = ["capability-changes"]   # shipped guide topics
+DOCS_BASE = ""
+TOPICS: list = []   # shipped guide topics
 STATE = True        # session map lives in capabilities/askproject/state/ (or fallback)
 POST_INSTALL: list = []
 

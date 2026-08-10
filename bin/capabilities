@@ -4819,11 +4819,9 @@ Create a package only with `capabilities new <name> --source <id>` (add
 Replace every scaffold placeholder and implement domain declarations, doctor,
 and the smallest useful verb surface outside those fences.
 
-Acceptance is fixed: stage the intended files, run `capabilities source index
-<id> --staged`, commit, then prove the immutable result with `capabilities
-source verify <id> --ref HEAD`. `capabilities source release <id> --ref HEAD`
-owns publication and local reconciliation. There is no conformance override;
-free-form CLIs remain outside the manager.
+Acceptance is the release sequence, and `capabilities guide publishing` owns it
+end to end. There is no conformance override; free-form CLIs remain outside the
+manager.
 """,
         "repositories": f"""\
 # Capability source repositories
@@ -4874,31 +4872,101 @@ its fenced regions; agents never write them by hand. `capabilities source sync
 `source check` and installation reject missing or changed regions. No force or
 skip flag exists.
 """,
-        "dev": """\
+        "dev": f"""\
 # Isolated capability development
 
-Use `capabilities dev` when a consuming project needs to iterate on capability
-source before publication. `dev start` creates a dedicated git worktree and a
-session-scoped HOME, registry, PATH bin, config, state, data, cache, and logs.
-Attach a consumer with `--consumer` for an isolated consumer worktree; use
-`--consumer-live` only for a deliberate final read-only smoke test.
+The whole cycle for changing capability source, end to end: an isolated session,
+a delegated edit, conformance, review, publication, delivery.
 
-The loop is: `dev start`, edit only the returned source worktree, `dev install`
-changed packages, then run focused checks through `dev exec`. Parent environment
-is denied by default; `--inherit-env KEY` opts in one named value without putting
-the value on argv. `dev doctor` proves executable provenance and cleanup state.
+## The session
 
-The source checkout is integration-only and must be clean before `dev start` or
-publication. After consumer behavior is proven, stage the intended source
-changes, derive the catalogue with `source index --staged`, and create one clean
-commit. `dev finish <session>` passes that commit to the source-level release
-transaction and removes the worktrees only after publication, checkout sync,
-and local registry reconciliation all succeed.
+`capabilities dev start <name> --source <repo> [--consumer <repo>] [--session
+<session>]` creates a git worktree on branch `dev/<session>`, plus a
+session-scoped HOME, registry, PATH bin, config, state, data, cache, and logs:
 
-`dev stop` remains the non-publishing cleanup primitive for an empty, already
-integrated, or patch-equivalent session. `dev gc` applies that preservation rule
+    worktrees:  {DEV_DATA_ROOT}/<session>/
+    isolation:  {DEV_STATE_ROOT}/<session>/
+
+Attach a consumer with `--consumer` for an isolated consumer worktree;
+`--consumer-live` is for a deliberate final read-only smoke test. The source
+integration checkout is clean before `dev start`, and edits happen only in the
+returned worktree.
+
+The session's `capabilities` binary is a symlink onto that worktree's
+`bin/capabilities`, so a manager-side edit is live on the next session command.
+A capability package is a payload instead: refresh it with `dev install
+<session> <name>` after each source edit, then exercise it through `dev exec
+<session> -- <command>`, which runs foreground processes whose lifetime is that
+command's. Parent environment is denied by default; `--inherit-env KEY` opts in
+one named value while keeping it off argv. Prefer test credentials and
+session-specific ports or resource names when the capability talks to a live
+service: the session is process and state isolation, not a security sandbox.
+`dev doctor` proves executable provenance and cleanup state.
+
+## The edit is delegated
+
+The edit is authored by an agent booted with this repo's own context, so the
+doctrine is loaded at write time rather than checked afterwards. That is the
+requirement; the `askproject` capability shipped in this same repo is how it is
+met:
+
+    askproject <source-worktree> --act "<task>. Dev session id: <session>."
+
+Carry the session id in the prompt so the authoring agent drives its own
+`capabilities dev install <session> <name>` and `capabilities dev exec <session>
+-- <command>` checks against the behaviour it is changing.
+
+## Conformance inside the session
+
+A manager-side change — `bin/capabilities` and the authoring assets it emits —
+is gated by `capabilities selfcheck`. A capability package is gated by
+`capabilities audit <name>`, `capabilities sync-contract --check`, and
+`capabilities doctor`. This repo is public, so the `sanitize-project` skill runs
+before the commit.
+
+## Review reads the diff alone
+
+Review is a second `askproject` call on the same worktree, in read mode and in a
+fresh session rather than `-c`: a continued session carries the author's own
+rationalisations, and review needs a context that has seen only the diff and the
+doctrine.
+
+    askproject <source-worktree> "Review commit <sha> on dev/<session>."
+
+`askproject` keeps one session per target path, so that call ends the author's
+continuation: a correction goes back as a fresh `--act` call rather than `-c`.
+A substantive finding keeps the session — correct the prepared branch in place
+and hand it back only once the focused checks pass again.
+
+## Publication
+
+`<id>` is the source id this repo is registered under; `capabilities source
+list` names it, and `dev finish` resolves the same id from the session itself.
+Stage the intended files, then:
+
+    capabilities source index <id> --staged
+    git commit
+    capabilities dev finish <session>
+
+`capabilities guide publishing` owns the release semantics. `dev finish` hands
+the prepared commit to that same transaction and removes the worktrees once
+publication, checkout sync, and local registry reconciliation all succeed.
+
+`dev finish` advances the protected source branch itself, inside that
+transaction and without a separate human approval step. Human judgment belongs
+to the non-routine situation; routine publication is the transaction's own work.
+
+## Delivery
+
+The releasing machine self-updates inside the release transaction when the
+manager changed. Every other consumer runs `capabilities self-update` for the
+manager, and `capabilities update <name>` for a capability payload; `update`
+covers payloads, the manager has its own verb.
+
+`dev stop` is the non-publishing cleanup primitive for an empty, already
+integrated, or patch-equivalent session; `dev gc` applies that preservation rule
 to old sessions. Dirty, unpublished, remotely diverged, or partially released
-work is retained with a precise refusal rather than silently discarded.
+work is retained with a precise refusal.
 """,
     }
     if topic not in guides:

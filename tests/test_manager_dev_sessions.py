@@ -565,10 +565,10 @@ def test_dev_finish_reconciles_changed_installed_capability(tmp_path):
         "--session", "payload-release",
     ).stdout)
     worktree = Path(started["source_worktree"])
-    guide = worktree / "capabilities" / "askproject" / "guides" / "capability-changes.md"
-    marker = "\nRelease reconciliation fixture.\n"
-    guide.write_text(guide.read_text() + marker)
-    _git(worktree, "add", str(guide.relative_to(worktree)))
+    payload = worktree / "capabilities" / "askproject" / "tests" / "test_progress.py"
+    marker = "\n# Release reconciliation fixture.\n"
+    payload.write_text(payload.read_text() + marker)
+    _git(worktree, "add", str(payload.relative_to(worktree)))
     indexed = subprocess.run(
         [str(worktree / "bin" / "capabilities"),
          "source", "index", "official", "--staged"],
@@ -584,7 +584,7 @@ def test_dev_finish_reconciles_changed_installed_capability(tmp_path):
     assert finished["release"]["verification_profile"] == "capability"
     assert finished["release"]["installed_updates"][0]["name"] == "askproject"
     assert marker.strip() in (
-        registry / "guides" / "capability-changes.md"
+        registry / "tests" / "test_progress.py"
     ).read_text()
     meta = json.loads((registry / "meta.json").read_text())
     assert meta["source_commit"] == candidate
@@ -777,9 +777,9 @@ def test_pending_release_preserves_newer_local_installation(tmp_path):
 
     replacement = tmp_path / "replacement-askproject"
     shutil.copytree(source / "capabilities" / "askproject", replacement)
-    guide = replacement / "guides" / "capability-changes.md"
-    marker = "\nNewer local installation wins over pending release.\n"
-    guide.write_text(guide.read_text() + marker)
+    payload = replacement / "tests" / "test_progress.py"
+    marker = "\n# Newer local installation wins over pending release.\n"
+    payload.write_text(payload.read_text() + marker)
     _run(env, "install", "askproject", "--from", str(replacement))
     hook.unlink()
 
@@ -795,7 +795,7 @@ def test_pending_release_preserves_newer_local_installation(tmp_path):
         "reason": "local_installation_changed",
     }]
     assert registry.is_dir()
-    assert marker.strip() in (registry / "guides" / "capability-changes.md").read_text()
+    assert marker.strip() in (registry / "tests" / "test_progress.py").read_text()
 
 
 def test_pending_release_does_not_reinstall_explicitly_removed_payload(tmp_path):
@@ -814,9 +814,9 @@ def test_pending_release_does_not_reinstall_explicitly_removed_payload(tmp_path)
         "--session", "superseded-update",
     ).stdout)
     worktree = Path(started["source_worktree"])
-    guide = worktree / "capabilities" / "askproject" / "guides" / "capability-changes.md"
-    guide.write_text(guide.read_text() + "\nPending update fixture.\n")
-    _git(worktree, "add", str(guide.relative_to(worktree)))
+    payload = worktree / "capabilities" / "askproject" / "tests" / "test_progress.py"
+    payload.write_text(payload.read_text() + "\n# Pending update fixture.\n")
+    _git(worktree, "add", str(payload.relative_to(worktree)))
     indexed = subprocess.run(
         [str(worktree / "bin" / "capabilities"),
          "source", "index", "official", "--staged"],
