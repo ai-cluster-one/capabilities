@@ -52,6 +52,13 @@ TURN_JOIN_GAP_SECONDS = 4.0
 # anyone is mid-sentence. A project may set its own pace.
 DEFAULT_PROGRESS_INTERVAL = 10.0
 PROGRESS_CALLER_QUIET = 3.0
+# The model finishes generating a turn several times faster than the caller
+# hears it, so "generation done" is not a lull — the rest of the sentence is
+# still in the outbound buffer, and a note offered there starts a turn whose
+# interruption throws that remainder away mid-word. Progress waits until the
+# last frame has actually gone out, plus this much, so a note lands after the
+# caller's ear reaches the full stop rather than on the heel of it.
+PROGRESS_AGENT_QUIET = 1.0
 # A capability read answered inside the turn that asked for it. The ceiling is
 # not what a person will sit through in silence — it is that against the only
 # alternative, which is a worker taking a minute. These tools read over the
@@ -707,6 +714,7 @@ class VoiceCallSession:
         self._progress_interval = max(1.0, float(
             progress_interval or DEFAULT_PROGRESS_INTERVAL))
         self._caller_spoke_at = 0.0
+        self._agent_voiced_at = 0.0
 
     # --- media -------------------------------------------------------------
     def start_pump(self):
@@ -748,6 +756,7 @@ class VoiceCallSession:
                 payload = bytes(self._outbound[:AGENT_FRAME_BYTES])
                 del self._outbound[:AGENT_FRAME_BYTES]
                 self.agent_voiced_frames += 1
+                self._agent_voiced_at = time.monotonic()
             else:
                 payload = AGENT_SILENCE
             self.agent_frames += 1
@@ -1096,7 +1105,8 @@ class VoiceCallSession:
 
     async def _announce_progress(self):
         """Offer the latest progress at most once per interval, and only into a
-        genuine lull: the model silent, the caller silent, something new to say."""
+        genuine lull: the model done speaking and the caller done hearing it, the
+        caller silent, something new to say."""
         while True:
             await asyncio.sleep(1.0)
             if not self._task_runner.running:
@@ -1136,6 +1146,8 @@ class VoiceCallSession:
         if not self._model_idle.is_set():
             return None
         if now - self._caller_spoke_at < PROGRESS_CALLER_QUIET:
+            return None
+        if now - self._agent_voiced_at < PROGRESS_AGENT_QUIET:
             return None
         note = summarize_progress(self._progress_window)
         self._progress_window.clear()
