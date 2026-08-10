@@ -14,8 +14,10 @@ deployment next
 The default profile is `agent-box`: a long-running container image with Codex,
 Claude, ContextKit when the project uses it, and capability CLIs installed by
 the capabilities manager. Setup compiles deploy descriptors for capabilities
-explicitly enabled in project settings. Global inheritance, installed payloads,
-and existing service directories do not authorize runtime services.
+explicitly enabled in project settings. Descriptor-default services are embedded
+in the agent container and supervised there; an explicit `enabled` override keeps
+a capability as a separate Compose service. Global inheritance, installed
+payloads, and existing service directories do not authorize runtime services.
 
 `deployment setup --dry-run` shows which files would be written before changing
 the project.
@@ -25,11 +27,16 @@ The human-facing questions are intentionally simple:
 - What kind of thing is being deployed? Default: `agent-box`.
 - Where should it run? Default: `coolify`.
 - Which explicitly project-enabled capability services should run? Default:
-  descriptor policy plus `service_policy.auto_include`.
+  descriptor policy plus `service_policy.auto_include`, embedded for agent-box.
 
 The Telegram and automations setup flags remain compatibility shorthands. They
 write `enabled` or `disabled` overrides into `runtime.json`; `auto` leaves the
 generic descriptor policy in control.
+
+When services are embedded, setup generates `supervisord.conf`, installs
+Supervisor in the image, and makes the entrypoint run it as PID 1. The generated
+Codex installation uses the complete release package, including
+`codex-code-mode-host` and runtime resources.
 
 After setup, `deployment next` prints the checklist for the chosen target:
 which files were created, which secrets must be entered, local validation

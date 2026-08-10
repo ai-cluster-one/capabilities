@@ -183,6 +183,11 @@ def test_dockerfile_uses_public_installer(tmp_path: Path) -> None:
     assert "capabilities init --codex --claude" in dockerfile, \
         "Should initialize capabilities for both codex and claude"
 
+    # Current Codex releases require the complete runtime package, including
+    # the code-mode host sidecar; the legacy single-binary archive is incomplete.
+    assert "codex-package-${triple}.tar.gz" in dockerfile
+    assert "codex-code-mode-host" in dockerfile
+
     # Verify build order
     lines = dockerfile.split('\n')
     contextkit_install_idx = None

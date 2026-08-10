@@ -62,10 +62,14 @@ def _setup(root: Path, env: dict[str, str]) -> dict:
 def test_auto_discovers_only_explicit_project_services(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram", "automations"))
     result = _setup(root, env)
-    assert result["services"] == ["automations", "telegram"]
+    assert result["services"] == []
+    assert result["embedded_services"] == ["automations", "telegram"]
     runtime = json.loads((root / "deployment" / "runtime.json").read_text())
-    assert runtime["services"]["telegram"]["command"] == ["telegram", "service", "run"]
-    assert runtime["services"]["automations"]["restart"] == "unless-stopped"
+    assert runtime["service_policy"]["default_mode"] == "embedded"
+    assert runtime["services"]["agent"]["embedded_services"] == ["automations", "telegram"]
+    supervisor = (root / "supervisord.conf").read_text()
+    assert "command=automations service run" in supervisor
+    assert "command=telegram service run" in supervisor
 
 
 def test_explicit_disable_and_enable_overrides(tmp_path: Path) -> None:
@@ -116,6 +120,9 @@ def test_embedded_service_merges_contract_into_agent(tmp_path: Path) -> None:
     assert "project-telegram" not in compose
     assert 'TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"' in compose
     assert "telegram_state:/home/agent/.local/state/telegram" in compose
+    assert "command=telegram service run" in (root / "supervisord.conf").read_text()
+    assert "exec /usr/bin/supervisord -c /app/supervisord.conf" in (root / "entrypoint.sh").read_text()
+    assert "python3 supervisor" in (root / "Dockerfile").read_text()
 
 
 def test_runtime_capability_exclusions_only_trim_image_lock(tmp_path: Path) -> None:
@@ -170,7 +177,8 @@ def test_global_enable_is_not_service_authorization(tmp_path: Path) -> None:
 def test_slack_requires_bot_and_app_tokens(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("slack",))
     result = _setup(root, env)
-    assert result["services"] == ["slack"]
+    assert result["services"] == []
+    assert result["embedded_services"] == ["slack"]
     compose = (root / "docker-compose.yaml").read_text()
     env_example = (root / ".env.example").read_text()
     for key in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
@@ -185,7 +193,8 @@ def test_restart_no_is_rendered_as_a_yaml_string(tmp_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text())
     manifest["service"]["deploy"]["restart"] = "no"
     manifest_path.write_text(json.dumps(manifest) + "\n")
-    _setup(root, env)
+    proc = _run(root, env, "setup", "--provider", "manual", "--with-telegram", "yes", "--force")
+    assert proc.returncode == 0, proc.stderr
     assert 'restart: "no"' in (root / "docker-compose.yaml").read_text()
 
 
@@ -199,7 +208,17 @@ def test_optional_defaults_are_scoped_to_each_service(tmp_path: Path) -> None:
         )
         manifest_path.write_text(json.dumps(manifest) + "\n")
 
-    result = _setup(root, env)
+    init = _run(root, env, "init", "--provider", "manual", "--force")
+    assert init.returncode == 0, init.stderr
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["service_policy"]["capabilities"] = {
+        "telegram": "enabled", "automations": "enabled",
+    }
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    sync = _run(root, env, "sync")
+    assert sync.returncode == 0, sync.stderr
+    result = json.loads(sync.stdout)
     assert result["services"] == ["automations", "telegram"]
     compose = (root / "docker-compose.yaml").read_text()
     assert compose.count('SHARED_MODE: "${SHARED_MODE:-automations}"') == 1
@@ -227,7 +246,7 @@ def test_check_reports_closure_drift_without_writing(tmp_path: Path, path: str) 
     target = root / path
     if path.endswith("runtime.json"):
         data = json.loads(target.read_text())
-        data["services"]["telegram"]["command"] = ["wrong"]
+        data["services"]["agent"]["embedded_services"] = []
         target.write_text(json.dumps(data, indent=2) + "\n")
     else:
         target.write_text(target.read_text() + "\n# drift\n")
@@ -242,7 +261,8 @@ def test_check_reports_closure_drift_without_writing(tmp_path: Path, path: str) 
 
 def test_legacy_runtime_preserves_existing_service_on_migration(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
-    _setup(root, env)
+    proc = _run(root, env, "setup", "--provider", "manual", "--with-telegram", "yes", "--force")
+    assert proc.returncode == 0, proc.stderr
     runtime_path = root / "deployment" / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
     runtime.pop("service_policy")
@@ -328,6 +348,9 @@ def test_mixed_ownership_nested_layout_preserves_external_files_and_compose_sema
         },
         "compose_overlays": ["deployment/compose.local.yaml"],
         "container": {"agent_home": "/home/jess", "project_root": "/app"},
+    }
+    runtime["service_policy"]["capabilities"] = {
+        "telegram": "enabled", "automations": "enabled",
     }
     runtime["services"]["agent"].update({
         "role": "project-worker",

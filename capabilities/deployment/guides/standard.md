@@ -33,11 +33,15 @@ compiler for capability services: it discovers installed
 enablement and `runtime.json` service policy, and reconciles the runtime graph,
 lock, Compose, env example, Dockerfile, dockerignore, and entrypoint.
 
-`service_policy.auto_include` controls descriptor-default auto inclusion.
+`service_policy.auto_include` controls descriptor-default auto inclusion, and
+`service_policy.default_mode` selects `embedded` or `enabled` for those auto
+services. New `agent-box` setup defaults to `embedded`; existing runtimes that
+do not declare the field retain the previous `enabled` behavior.
 `service_policy.capabilities` accepts `enabled`, `embedded`, `disabled`, or
 `auto` per capability. `enabled` renders a separate Compose service;
 `embedded` merges the descriptor's environment and mounts into the agent
-service so a project-owned process supervisor can run it there; `disabled`
+service and, for managed agent-box artifacts, renders its command into a
+generated Supervisor configuration; `disabled`
 omits the service runtime while leaving the CLI available. An override cannot
 bypass the explicit project gate. Run
 `deployment sync --check` in CI; it performs no writes and reports structured
@@ -62,8 +66,8 @@ would be absent from the image.
 
 New setup uses root artifact paths, but runtime v1 can explicitly declare a
 custom compiler layout. `compose_file` selects the generated base Compose file;
-`compiler.artifacts` selects the Dockerfile, entrypoint, env example, and
-dockerignore paths; `compiler.compose_overlays` lists project-owned overlays;
+`compiler.artifacts` selects the Dockerfile, entrypoint, env example,
+dockerignore, and optional supervisor paths; `compiler.compose_overlays` lists project-owned overlays;
 and `compiler.container` resolves portable service mount targets:
 
 ```json
@@ -73,6 +77,7 @@ and `compiler.container` resolves portable service mount targets:
     "artifacts": {
       "dockerfile": {"path": "deployment/docker/Dockerfile", "ownership": "external"},
       "entrypoint": {"path": "deployment/docker/entrypoint.sh", "ownership": "external"},
+      "supervisor": {"path": "deployment/supervisor/supervisord.conf", "ownership": "external"},
       "env_example": {"path": ".env.example", "ownership": "external"},
       "dockerignore": {"path": ".dockerignore", "ownership": "external"}
     },
@@ -103,9 +108,10 @@ not used as a replacement.
 
 For an embedded descriptor, the same required/optional environment, defaults,
 and state mounts are reconciled into `services.agent`; its name is recorded in
-`services.agent.embedded_services`. Starting and supervising the embedded
-command remains project-owned because the generic compiler cannot assume one
-process supervisor.
+`services.agent.embedded_services`. Managed agent-box artifacts install
+Supervisor, render each descriptor command as one program, and start it from the
+entrypoint. If the Dockerfile, entrypoint, or supervisor artifact is declared
+`external`, its process-management implementation remains project-owned.
 
 Each runtime service may declare `environment_defaults`, a mapping from env key
 to string fallback. These project defaults take precedence over descriptor
@@ -141,6 +147,10 @@ Docker builds should bootstrap the capabilities manager from the selected
 line in `deployment/capabilities.lock`, initialize project contexts with
 `capabilities init`, and verify the capability set with `capabilities doctor` to
 ensure the lock is complete before proceeding.
+
+Generated agent-box images install Codex from the complete pinned release
+package rather than the legacy single-binary archive, so the CLI,
+`codex-code-mode-host`, and its runtime resources stay version-aligned.
 
 For ContextKit projects, Docker builds install ContextKit via the public
 installer (https://raw.githubusercontent.com/ai-cluster-one/context-kit/${CONTEXTKIT_REF}/install.sh),

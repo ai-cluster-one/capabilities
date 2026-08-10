@@ -27,9 +27,10 @@ USAGE
                    [--force] [--dry-run]
       Full bootstrap for a non-technical deployment path. Creates the deployment
       declarations plus Dockerfile, docker-compose.yaml, .dockerignore,
-      .env.example, and entrypoint.sh. Defaults are safe for an agent box: one
-      idle agent service plus descriptor-declared services from capabilities
-      explicitly enabled at project scope. The Telegram/automations flags are
+      .env.example, entrypoint.sh, and (when needed) supervisord.conf. Agent-box
+      setup embeds descriptor-default services from explicitly project-enabled
+      capabilities in one supervised container; `enabled` remains available for
+      separate Compose services. The Telegram/automations flags are
       compatibility shorthands for per-capability service policy. If --dry-run
       is passed, print the files that would be written.
 
@@ -96,7 +97,7 @@ FILES
       service-level required env, state volumes, runtime capability exclusions,
       capability lock path, and service_policy and compiler layout.
       compiler.artifacts declares the
-      Dockerfile, entrypoint, env example, and dockerignore paths;
+      Dockerfile, entrypoint, env example, dockerignore, and optional supervisor paths;
       compose_file declares the generated base Compose file;
       compiler.compose_overlays declares untouched project-owned overlays;
       compiler.container supplies agent_home and project_root for portable mounts;
@@ -908,9 +909,11 @@ def _service_policy(runtime: dict) -> tuple[dict, bool]:
     raw = runtime.get("service_policy")
     if isinstance(raw, dict):
         auto_include = raw.get("auto_include", True)
+        default_mode = raw.get("default_mode", "enabled")
         overrides = raw.get("capabilities", {})
         return {
             "auto_include": auto_include if isinstance(auto_include, bool) else True,
+            "default_mode": default_mode if default_mode in ("enabled", "embedded") else "enabled",
             "capabilities": dict(overrides) if isinstance(overrides, dict) else {},
         }, False
     # Legacy runtime files preserve explicitly listed capability services on first sync.
@@ -920,7 +923,7 @@ def _service_policy(runtime: dict) -> tuple[dict, bool]:
         for entry in services.values():
             if isinstance(entry, dict) and isinstance(entry.get("capability"), str):
                 overrides[entry["capability"]] = "enabled"
-    return {"auto_include": True, "capabilities": overrides}, True
+    return {"auto_include": True, "default_mode": "enabled", "capabilities": overrides}, True
 
 
 def _runtime_capability_excludes(runtime: dict) -> set[str]:
@@ -958,11 +961,10 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[
     for name, service in sorted(discovered.items()):
         mode = overrides.get(name, "auto")
         deploy = service["deploy"]
-        include = mode == "enabled" or (
-            mode == "auto" and policy["auto_include"]
-            and deploy.get("default_policy") == "auto"
-        )
-        if include:
+        if (mode == "auto" and policy["auto_include"]
+                and deploy.get("default_policy") == "auto"):
+            mode = policy["default_mode"]
+        if mode == "enabled":
             active[name] = service
         elif mode == "embedded":
             embedded[name] = service
@@ -997,8 +999,10 @@ def _compiler_config(runtime: dict) -> dict:
     artifacts = dict(defaults["artifacts"])
     raw_artifacts = raw.get("artifacts")
     if isinstance(raw_artifacts, dict):
-        for key in artifacts:
+        for key in (*artifacts, "supervisor"):
             value = raw_artifacts.get(key)
+            if key == "supervisor" and value is None:
+                continue
             path, ownership = _artifact_declaration(value)
             if _safe_relative_path(path) and ownership in ("managed", "external"):
                 artifacts[key] = (value if isinstance(value, str) else
@@ -1168,8 +1172,13 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
     return "\n".join(lines) + "\n"
 
 
-def _entrypoint_template(project_name: str) -> str:
+def _entrypoint_template(project_name: str, supervisor_config: str | None = None) -> str:
     identity = _slug(project_name)
+    default_command = (
+        f"exec /usr/bin/supervisord -c {shlex.quote(supervisor_config)}"
+        if supervisor_config else
+        "exec sleep infinity"
+    )
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
@@ -1207,12 +1216,12 @@ if [ "$#" -gt 0 ]; then
   exec "$@"
 fi
 
-exec sleep infinity
+{default_command}
 """
 
 
 def _dockerfile_template(has_contextkit: bool, compiler: dict,
-                         entrypoint_rel: str) -> str:
+                         entrypoint_rel: str, with_supervisor: bool = False) -> str:
     agent_home = compiler["container"]["agent_home"]
     project_root = compiler["container"]["project_root"]
     username = Path(agent_home).name
@@ -1248,11 +1257,12 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
             " && contextkit audit || { echo \"[build] ContextKit project setup failed\" >&2; exit 1; }\n"
         )
         capabilities_init_and_doctor = ""
+    supervisor_package = " supervisor" if with_supervisor else ""
     return f"""# Agent box: project brain + agent CLIs + capability CLIs.
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-        ca-certificates curl git openssh-client ripgrep file ffmpeg python3 \\
+        ca-certificates curl git openssh-client ripgrep file ffmpeg python3{supervisor_package} \\
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
@@ -1271,18 +1281,24 @@ RUN mkdir -p "$HOME/.local/bin" "$HOME/.local/state" "$HOME/.claude" "$HOME/.cod
 # Claude Code CLI. Auth/session state is persisted by the claude_state volume.
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
-# OpenAI Codex CLI. Auth/session state is persisted by the codex_state volume.
-ARG CODEX_REF=rust-v0.142.5
+# OpenAI Codex CLI. The complete package includes the code-mode host and runtime
+# resources required by current releases. Auth/session state is volume-backed.
+ARG CODEX_REF=rust-v0.147.0
 RUN set -eux; \\
     case "$(dpkg --print-architecture)" in \\
       amd64) triple=x86_64-unknown-linux-musl ;; \\
       arm64) triple=aarch64-unknown-linux-musl ;; \\
       *) echo "unsupported arch $(dpkg --print-architecture)" >&2; exit 1 ;; \\
     esac; \\
-    curl -fsSL "https://github.com/openai/codex/releases/download/${{CODEX_REF}}/codex-${{triple}}.tar.gz" -o /tmp/codex.tgz; \\
-    mkdir -p "$HOME/.local/bin"; tar -xzf /tmp/codex.tgz -C /tmp; \\
-    mv "$(find /tmp -maxdepth 1 -name 'codex-*-linux-musl' -type f | head -1)" "$HOME/.local/bin/codex"; \\
-    chmod +x "$HOME/.local/bin/codex"; rm -f /tmp/codex.tgz
+    release_dir="$HOME/.local/share/codex/${{CODEX_REF}}"; \\
+    curl -fsSL "https://github.com/openai/codex/releases/download/${{CODEX_REF}}/codex-package-${{triple}}.tar.gz" -o /tmp/codex-package.tgz; \\
+    mkdir -p "$release_dir" "$HOME/.local/bin"; \\
+    tar -xzf /tmp/codex-package.tgz -C "$release_dir"; \\
+    chmod +x "$release_dir/bin/codex" "$release_dir/bin/codex-code-mode-host"; \\
+    ln -sf "$release_dir/bin/codex" "$HOME/.local/bin/codex"; \\
+    ln -sf "$release_dir/bin/codex-code-mode-host" "$HOME/.local/bin/codex-code-mode-host"; \\
+    test -x "$HOME/.local/bin/codex" && test -x "$HOME/.local/bin/codex-code-mode-host"; \\
+    rm -f /tmp/codex-package.tgz
 
 RUN uv python install 3.11
 {contextkit_install}
@@ -1317,6 +1333,48 @@ RUN mkdir -p "$HOME/.local/state" "$HOME/.claude" "$HOME/.codex" {project_root}/
 {contextkit_build}
 ENTRYPOINT [{json.dumps(entrypoint_path)}]
 """
+
+
+def _supervisor_template(embedded: dict[str, dict], project_root: str) -> str:
+    sections = ["""[unix_http_server]
+file=/tmp/agent-box-supervisor.sock
+chmod=0700
+
+[supervisord]
+nodaemon=true
+logfile=/dev/null
+pidfile=/tmp/agent-box-supervisord.pid
+childlogdir=/tmp
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory=supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix:///tmp/agent-box-supervisor.sock"""]
+    for priority, (name, service) in enumerate(sorted(embedded.items()), 10):
+        deploy = service["deploy"]
+        restart = str(deploy.get("restart") or "unless-stopped")
+        autorestart = (
+            "false" if restart == "no" else
+            "unexpected" if restart == "on-failure" else
+            "true"
+        )
+        sections.append(f"""[program:{name}]
+command={shlex.join(deploy["command"])}
+directory={project_root}
+autostart=true
+autorestart={autorestart}
+startsecs=3
+startretries=100
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
+priority={priority}""")
+    return "\n\n".join(sections) + "\n"
 
 
 def _compose_template(project_name: str, runtime: dict,
@@ -1446,7 +1504,11 @@ def _runtime_template(profile: str, project_name: str) -> dict:
         "services": services,
         "volumes": volumes,
         "compiler": _compiler_config({}),
-        "service_policy": {"auto_include": True, "capabilities": {}},
+        "service_policy": {
+            "auto_include": True,
+            "default_mode": "embedded" if profile == "agent-box" else "enabled",
+            "capabilities": {},
+        },
         "capabilities": {"lockfile": "deployment/capabilities.lock"},
     }
 
@@ -1497,6 +1559,13 @@ def _compile_runtime(root: Path, runtime: dict,
                      active: dict[str, dict], embedded: dict[str, dict]) -> dict:
     compiled = dict(runtime)
     compiler = _compiler_config(runtime)
+    if embedded and "supervisor" not in compiler["artifacts"]:
+        managed = all(
+            _artifact_declaration(compiler["artifacts"][key])[1] == "managed"
+            for key in ("dockerfile", "entrypoint")
+        )
+        if managed:
+            compiler["artifacts"]["supervisor"] = "supervisord.conf"
     container = compiler["container"]
     base = _runtime_template(str(runtime.get("profile") or "agent-box"),
                              str(runtime.get("name") or root.name))
@@ -1546,6 +1615,10 @@ def _compile_runtime(root: Path, runtime: dict,
         services[name] = entry
         _register_descriptor_volumes(volumes, deploy, compiler)
     policy, _migrated = _service_policy(runtime)
+    serialized_policy = dict(policy)
+    raw_policy = runtime.get("service_policy")
+    if isinstance(raw_policy, dict) and "default_mode" not in raw_policy:
+        serialized_policy.pop("default_mode", None)
     capability_config = (dict(runtime.get("capabilities"))
                          if isinstance(runtime.get("capabilities"), dict) else {})
     capability_config.setdefault("lockfile", "deployment/capabilities.lock")
@@ -1555,7 +1628,7 @@ def _compile_runtime(root: Path, runtime: dict,
         "services": services,
         "volumes": volumes,
         "compiler": compiler,
-        "service_policy": policy,
+        "service_policy": serialized_policy,
         "capabilities": capability_config,
     })
     return compiled
@@ -1694,7 +1767,7 @@ def _sha(text: str | None) -> str | None:
 
 
 def _artifact_texts(root: Path, runtime: dict,
-                    active: dict[str, dict]) -> dict[Path, str]:
+                    active: dict[str, dict], embedded: dict[str, dict]) -> dict[Path, str]:
     has_contextkit = _has_contextkit(root)
     project_name = str(runtime.get("name") or root.name)
     compiler = _compiler_config(runtime)
@@ -1702,14 +1775,23 @@ def _artifact_texts(root: Path, runtime: dict,
     build_context = Path(os.path.relpath(root, paths["compose"].parent)).as_posix()
     dockerfile_rel = paths["dockerfile"].relative_to(root).as_posix()
     entrypoint_rel = paths["entrypoint"].relative_to(root).as_posix()
+    supervisor_path = paths.get("supervisor")
+    supervisor_config = None
+    if embedded and supervisor_path is not None:
+        supervisor_rel = supervisor_path.relative_to(root).as_posix()
+        supervisor_config = compiler["container"]["project_root"].rstrip("/") + "/" + supervisor_rel
     raw = {paths["compose"]: _compose_template(
         project_name, runtime, active, build_context, dockerfile_rel, has_contextkit)}
     candidates = {
         "dockerignore": _dockerignore_template(has_contextkit),
         "env_example": _env_example_template(runtime, active, has_contextkit),
-        "dockerfile": _dockerfile_template(has_contextkit, compiler, entrypoint_rel),
-        "entrypoint": _entrypoint_template(project_name),
+        "dockerfile": _dockerfile_template(
+            has_contextkit, compiler, entrypoint_rel, bool(supervisor_config)),
+        "entrypoint": _entrypoint_template(project_name, supervisor_config),
     }
+    if supervisor_path is not None:
+        candidates["supervisor"] = _supervisor_template(
+            embedded, compiler["container"]["project_root"])
     for key, text in candidates.items():
         if _artifact_ownership(runtime, key) == "managed":
             raw[paths[key]] = text
@@ -1738,7 +1820,7 @@ def _desired_state(root: Path, runtime: dict) -> tuple[dict, dict[Path, str],
         })
     compiled = _compile_runtime(root, runtime, active, embedded)
     findings.extend(_compiled_runtime_findings(compiled, active))
-    texts = _artifact_texts(root, compiled, active)
+    texts = _artifact_texts(root, compiled, active, embedded)
     texts[_runtime_path(root)] = _json_text(compiled)
     texts[root / "deployment" / "capabilities.lock"] = _lock_text(
         root, exclude=_runtime_capability_excludes(runtime))
@@ -1945,6 +2027,16 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                 elif ownership == "external" and not (root / str(artifact_path)).is_file():
                     findings.append({"severity": "error", "path": str(artifact_path),
                                      "message": f"external compiler artifact {key!r} does not exist"})
+            if "supervisor" in artifacts:
+                artifact_path, ownership = _artifact_declaration(artifacts["supervisor"])
+                if (not _safe_relative_path(artifact_path)
+                        or ownership not in ("managed", "external")):
+                    findings.append({"severity": "error", "path": _rel(root, path),
+                                     "message": ("compiler.artifacts.supervisor must be a safe path string or "
+                                                 "{path, ownership: managed|external}")})
+                elif ownership == "external" and not (root / str(artifact_path)).is_file():
+                    findings.append({"severity": "error", "path": str(artifact_path),
+                                     "message": "external compiler artifact 'supervisor' does not exist"})
         overlays = compiler_raw.get("compose_overlays", [])
         if (not isinstance(overlays, list)
                 or not all(_safe_relative_path(value) for value in overlays)):
@@ -2004,6 +2096,9 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
         if not isinstance(policy.get("auto_include", True), bool):
             findings.append({"severity": "error", "path": _rel(root, path),
                              "message": "service_policy.auto_include must be boolean"})
+        if policy.get("default_mode", "enabled") not in ("enabled", "embedded"):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": "service_policy.default_mode must be enabled|embedded"})
         overrides = policy.get("capabilities", {})
         if not isinstance(overrides, dict):
             findings.append({"severity": "error", "path": _rel(root, path),
@@ -2210,6 +2305,7 @@ def cmd_setup(args) -> None:
             overrides[name] = "disabled"
     preview = _sync(root, runtime, check=True)
     if args.dry_run:
+        present = set(preview["services"]) | set(preview["embedded_services"])
         _emit({
             "ok": not any(f.get("severity") == "error" for f in preview["findings"]),
             "dry_run": True,
@@ -2218,8 +2314,9 @@ def cmd_setup(args) -> None:
             "provider": args.provider,
             "target": target,
             "services": preview["services"],
-            "with_telegram": "telegram" in preview["services"],
-            "with_automations": "automations" in preview["services"],
+            "embedded_services": preview["embedded_services"],
+            "with_telegram": "telegram" in present,
+            "with_automations": "automations" in present,
             "would_write": [d["path"] for d in preview["drift"]],
             "findings": preview["findings"],
             "questions": _deployment_questions(),
@@ -2234,6 +2331,7 @@ def cmd_setup(args) -> None:
          "message": "service compilation failed before target write"}
     )
     conflicts = (not sync["ok"] or target_result["action"] in {"skipped", "error"})
+    present = set(sync["services"]) | set(sync["embedded_services"])
     _emit({
         "ok": not conflicts,
         "project": str(root),
@@ -2241,8 +2339,9 @@ def cmd_setup(args) -> None:
         "provider": args.provider,
         "target": target,
         "services": sync["services"],
-        "with_telegram": "telegram" in sync["services"],
-        "with_automations": "automations" in sync["services"],
+        "embedded_services": sync["embedded_services"],
+        "with_telegram": "telegram" in present,
+        "with_automations": "automations" in present,
         "written": sync["written"] + [target_result],
         "drift": sync["drift"],
         "findings": sync["findings"],
@@ -2293,7 +2392,9 @@ def _next_payload(root: Path, target_name: str | None) -> dict:
         _die(3, "not_found", "no deployment targets found", "run `deployment setup`")
     slug = _slug(str(runtime.get("name") or root.name))
     services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
-    with_telegram = "telegram" in services
+    agent = services.get("agent") if isinstance(services.get("agent"), dict) else {}
+    embedded = set(agent.get("embedded_services", []))
+    with_telegram = "telegram" in services or "telegram" in embedded
     required_env = set(runtime.get("required_env") or [])
     optional_env = set(runtime.get("optional_env") or [])
     for service in services.values():
@@ -2328,8 +2429,9 @@ def _next_payload(root: Path, target_name: str | None) -> dict:
         f"docker exec -it {slug}-agent claude login",
     ]
     if with_telegram:
+        container = "agent" if "telegram" in embedded else "telegram"
         first_run.append(
-            f"docker exec -it {slug}-telegram telegram login --connection {_telegram_connection(root)}"
+            f"docker exec -it {slug}-{container} telegram login --connection {_telegram_connection(root)}"
         )
     return {
         "project": str(root),

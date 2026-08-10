@@ -67,14 +67,16 @@ class DeploymentAutomationsTests(unittest.TestCase):
         result = self.setup()
         self.assertTrue(result["with_automations"])
         compose = (self.root / "docker-compose.yaml").read_text()
-        self.assertIn('command: ["automations", "service", "run"]', compose)
+        self.assertNotIn('command: ["automations", "service", "run"]', compose)
         self.assertIn("automations_state:/app/capabilities/automations/state", compose)
         runtime = json.loads((self.root / "deployment" / "runtime.json").read_text())
-        self.assertEqual(runtime["services"]["automations"]["capability"], "automations")
+        self.assertEqual(runtime["services"]["agent"]["embedded_services"], ["automations"])
         self.assertEqual(
             runtime["volumes"]["automations_state"]["mount"],
             "/app/capabilities/automations/state",
         )
+        supervisor = (self.root / "supervisord.conf").read_text()
+        self.assertIn("command=automations service run", supervisor)
         lock = (self.root / "deployment" / "capabilities.lock").read_text().splitlines()
         self.assertIn("automations", lock)
         env = (self.root / ".env.example").read_text()
@@ -100,6 +102,7 @@ class DeploymentAutomationsTests(unittest.TestCase):
         self.assertFalse(result["with_automations"])
         compose = (self.root / "docker-compose.yaml").read_text()
         self.assertNotIn('command: ["automations", "service", "run"]', compose)
+        self.assertFalse((self.root / "supervisord.conf").exists())
 
 
 if __name__ == "__main__":
