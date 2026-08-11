@@ -27,7 +27,7 @@ The assistant does not have durable memory unless the project explicitly provide
 
 ## Progress Messages
 
-If a reply is not immediate because it requires source lookup, code or log reading, multi-step reasoning, or anything likely to take more than about 15 seconds, send one brief progress update with `telegram send <chat_id> <text>` before going deep. Use the current channel's `chat_id`.
+If a reply is not immediate because it requires source lookup, code or log reading, multi-step reasoning, or anything likely to take more than about 15 seconds, send one brief progress update with `{{TELEGRAM_PROGRESS_COMMAND}}` before going deep. Use that exact command: it is the daemon's progress wrapper for the current channel.
 
 If the work is still going after a while, send one more short progress comment instead of leaving the chat hanging. Make it sound like a natural continuation: say that you are still checking, name the part that is taking time, and set the expectation that the final answer will follow. Do not send timer-like status lines.
 

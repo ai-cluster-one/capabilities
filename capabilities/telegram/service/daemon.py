@@ -2230,8 +2230,14 @@ def build_prompt(tail, state=None):
     state (time, channel/harness, participants + roles, active settings, context-window size,
     previous-turn token usage) + the live tail. State is assembled here and passed in, so the
     worker reads its situation from the context, not by inferring it from chat history."""
-    context = CONTEXT_FILE.read_text().strip() if CONTEXT_FILE.exists() else ""
     st = state or {}
+    context = CONTEXT_FILE.read_text().strip() if CONTEXT_FILE.exists() else ""
+    if st.get("chat_id") is not None:
+        progress_command = (
+            f'{WORKER_BIN / "telegram"} send {st["chat_id"]} "<one short line>"')
+        context = context.replace(
+            "{{TELEGRAM_PROGRESS_COMMAND}}", progress_command).replace(
+                "telegram send <chat_id> <text>", progress_command)
     channel_context = (st.get("channel_context") or "").strip()
     if channel_context:
         channel_context = "--- Channel-specific context ---\n" + channel_context + "\n\n"

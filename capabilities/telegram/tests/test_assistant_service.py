@@ -615,6 +615,65 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(current["in_reply_to"]["id"], 101)
             await self.stop_session(client, task)
 
+    async def test_forum_topic_progress_uses_the_prompted_wrapper_and_reply(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"aliases": ["Assistant"]},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            context_template = (
+                TELEGRAM_DIR / "service" / "templates" / "context.md").read_text()
+            daemon.CONTEXT_FILE.write_text(context_template.replace(
+                "{{TELEGRAM_PROGRESS_COMMAND}}", "telegram send <chat_id> <text>"))
+            daemon.save_register({})
+            captured = {}
+
+            def worker(_chat, tail, state=None, _procs=None):
+                captured["tail"] = tail
+                captured["state"] = state
+                captured["prompt"] = daemon.build_prompt(tail, state)
+                captured["env"] = daemon.worker_env(state)
+                sent = daemon.subprocess.run(
+                    [str(daemon.WORKER_BIN / "telegram"), "send", "-200",
+                     "checking this topic"],
+                    env=captured["env"], capture_output=True, text=True, check=False)
+                if sent.returncode:
+                    raise AssertionError(sent.stderr)
+                return successful_result("topic result")
+
+            daemon.WORKERS["stub"] = worker
+            request = Message(105, text="Assistant, check this topic")
+            request.mentioned = True
+            request.reply_to = SimpleNamespace(
+                forum_topic=True,
+                reply_to_top_id=10,
+                reply_to_msg_id=None,
+            )
+            client = ForumClient([request])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            event = Event(request, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: len(client.sent) == 2)
+
+            command = (
+                f'{daemon.WORKER_BIN / "telegram"} send -200 "<one short line>"')
+            self.assertIn(f"`{command}`", captured["prompt"])
+            self.assertNotIn("`telegram send <chat_id> <text>`", captured["prompt"])
+            daemon.CONTEXT_FILE.write_text(context_template)
+            self.assertIn(
+                f"`{command}`",
+                daemon.build_prompt(captured["tail"], captured["state"]),
+            )
+            self.assertEqual(captured["env"]["TELEGRAM_AUTHORIZED_TOPIC_ID"], "10")
+            self.assertCountEqual(
+                [(item["text"], item.get("reply_to")) for item in client.sent],
+                [("checking this topic", 105), ("topic result", 105)],
+            )
+            await self.stop_session(client, task)
+
     async def test_base_chat_catch_up_uses_topic_key_and_dedupes_later_passes(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings(sync_interval=0.02, sync_stale_after=0.2)
