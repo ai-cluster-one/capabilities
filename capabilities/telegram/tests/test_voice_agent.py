@@ -791,18 +791,23 @@ class StereoJoinTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PromptTests(unittest.TestCase):
-    def test_prompt_is_the_project_voice_file_then_the_history_tail(self):
+    def test_prompt_is_voice_file_then_time_then_history(self):
         with fake_runtime_modules():
             va = import_voice_agent()
             prompt = va.build_system_prompt(
                 "# Voice instructions\nSpeak briefly.\n",
-                "Caller: hello\nAssistant: hi")
+                "Caller: hello\nAssistant: hi",
+                now_line="The call is happening now: 2026-08-11 14:30 (Tuesday), "
+                         "timezone Europe/Tallinn.")
 
         self.assertTrue(prompt.startswith("# Voice instructions\nSpeak briefly."))
         self.assertLess(prompt.index("Speak briefly."), prompt.index("Caller: hello"))
         self.assertEqual(
             prompt,
             "# Voice instructions\nSpeak briefly.\n\n"
+            "--- Right now ---\n\n"
+            "The call is happening now: 2026-08-11 14:30 (Tuesday), "
+            "timezone Europe/Tallinn.\n\n"
             "--- Recent messages in this direct chat ---\n\n"
             "Older first. Each line is timestamped in the same zone as the "
             "current time above.\n\n"
@@ -815,6 +820,14 @@ class PromptTests(unittest.TestCase):
                              "Project prompt.")
             self.assertEqual(va.build_system_prompt("", ""), "")
             self.assertFalse(hasattr(va, "VOICE_PREAMBLE"))
+
+    def test_prompt_cannot_accept_project_context(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            with self.assertRaisesRegex(TypeError, "project_context"):
+                va.build_system_prompt(
+                    "Project prompt.", "Caller: hello",
+                    project_context="compiled ContextKit body")
 
     def test_the_prompt_can_be_set_after_the_call_is_answered(self):
         """Building it means reading the chat tail, which must happen after the

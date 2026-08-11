@@ -205,7 +205,6 @@ def _read_project_layout(reload_file=False):
         return {
             "project_root": str(PROJECT_ROOT.resolve()),
             "capabilities": str(PROJECT_CAPABILITIES_DIR.resolve()),
-            "compiled_context": None,
             "provider": "minimal",
         }
     try:
@@ -216,7 +215,7 @@ def _read_project_layout(reload_file=False):
         raise SettingsError("project layout must be a JSON object")
     allowed = {
         "project_root", "capabilities", "context", "routines", "assets",
-        "memory", "deployment", "compiled_context", "provider",
+        "memory", "deployment", "provider",
     }
     unknown = set(layout) - allowed
     if unknown:
@@ -242,19 +241,6 @@ def _read_project_layout(reload_file=False):
         result[key] = str(resolved)
     if Path(result.get("capabilities", "")).resolve() != PROJECT_CAPABILITIES_DIR.resolve():
         raise SettingsError("project_layout.capabilities does not match the resolved envelope")
-    compiled = layout.get("compiled_context")
-    if compiled is None:
-        result["compiled_context"] = None
-    else:
-        candidate = Path(str(compiled)).expanduser()
-        if not candidate.is_absolute():
-            raise SettingsError("project_layout.compiled_context must be absolute")
-        try:
-            resolved = candidate.resolve()
-            resolved.relative_to(PROJECT_ROOT.resolve())
-        except (OSError, ValueError) as exc:
-            raise SettingsError("project_layout.compiled_context is outside the project") from exc
-        result["compiled_context"] = str(resolved)
     return result
 
 # Per-instance channel toggle. Default on (opt-out) — set falsey on instances
@@ -2443,22 +2429,6 @@ def write_authority_context(authority, stem):
 
 
 CAPABILITY_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
-PROJECT_CONTEXT_TARGET = "codex"
-
-
-def resolve_project_context_path(target=PROJECT_CONTEXT_TARGET, timeout=30.0):
-    """Return the optional compiled context from the launcher-owned snapshot."""
-    del target, timeout
-    value = PROJECT_LAYOUT.get("compiled_context")
-    if not value:
-        return None
-    try:
-        path = Path(value).resolve()
-        path.relative_to(PROJECT_ROOT.resolve())
-    except (OSError, ValueError) as exc:
-        log(f"voice: invalid compiled project context snapshot — {exc}")
-        return None
-    return path if path.is_file() else None
 
 
 # What a call may open. An allowed list rather than a forbidden one: the project
@@ -2520,21 +2490,6 @@ def resolve_project_file(wanted):
     if path.suffix.lower() in PROJECT_READ_DENY_SUFFIXES:
         return None, "not_readable_here"
     return path, None
-
-
-def project_context_text():
-    """The compiled body, read fresh so an edit to the project reaches the next
-    call without restarting the daemon. Absent is not fatal: a call without it
-    is the call we had before, not a broken one."""
-    path = resolve_project_context_path()
-    if path is None:
-        return ""
-    try:
-        return path.read_text()
-    except OSError as exc:
-        log(f"voice: cannot read the compiled project context — "
-            f"{type(exc).__name__}: {exc}")
-        return ""
 
 
 def capability_allowed(authority, capability):
@@ -4656,14 +4611,10 @@ async def run_session(client):
                     caller_id, policy["history"], caller_name)
                 log(f"voice: chat tail for {caller_id} — {len(history)} chars in "
                     f"{time.monotonic() - tail_started:.1f}s")
-                body = project_context_text()
-                log(f"voice: project context {len(body)} chars into the call prompt"
-                    if body else "voice: no project context for this call")
                 session.set_system_instruction(voice_agent.build_system_prompt(
                     voice_context, history,
                     now_line=voice_agent.current_time_line(
-                        VOICE_TIMEZONE, VOICE_TIMEZONE_NAME),
-                    project_context=body))
+                        VOICE_TIMEZONE, VOICE_TIMEZONE_NAME)))
                 await session.start_agent()
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"[:500]

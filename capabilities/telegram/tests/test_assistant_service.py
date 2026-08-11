@@ -201,7 +201,6 @@ def import_daemon(tmp: Path, service_settings: dict, *,
         "assets": str(project / "assets"),
         "memory": str(project / "memory"),
         "deployment": str(project / "deployment"),
-        "compiled_context": None,
         "provider": "test",
     }
     try:
@@ -3326,26 +3325,14 @@ class VoiceProjectFileTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["status"], "not_found")
 
 
-class VoiceProjectContextTests(unittest.IsolatedAsyncioTestCase):
-    async def test_missing_compiled_context_never_invokes_contextkit(self):
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-            with mock.patch.object(daemon.subprocess, "run") as run:
-                self.assertIsNone(daemon.resolve_project_context_path())
-                self.assertEqual(daemon.project_context_text(), "")
-            run.assert_not_called()
+class VoicePromptIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_daemon_call_path_does_not_read_project_context(self):
+        source = DAEMON_PATH.read_text()
+        call_path = source.split("async def start_voice_call", 1)[1]
+        call_path = call_path.split("async def finish_voice_call", 1)[0]
 
-    async def test_compiled_context_comes_from_the_resolved_layout_snapshot(self):
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-            target = Path(td) / "project" / ".codex" / "generated" / "context.md"
-            target.parent.mkdir(parents=True)
-            target.write_text("compiled\n")
-            daemon.PROJECT_LAYOUT["compiled_context"] = str(target)
-            with mock.patch.object(daemon.subprocess, "run") as run:
-                self.assertEqual(daemon.resolve_project_context_path(), target.resolve())
-                self.assertEqual(daemon.project_context_text(), "compiled\n")
-            run.assert_not_called()
+        self.assertNotIn("project_context", call_path)
+        self.assertNotIn("compiled_context", source)
 
 
 if __name__ == "__main__":

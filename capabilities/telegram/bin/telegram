@@ -2296,11 +2296,6 @@ def _resolve_project_layout(root: Path) -> dict:
             candidate = (root / name).resolve()
             if candidate.exists():
                 layout[name] = str(candidate)
-    compiled = root / ".codex" / "generated" / "context.md"
-    if compiled.is_file():
-        layout["compiled_context"] = str(compiled.resolve())
-    else:
-        layout["compiled_context"] = None
     return layout
 
 
