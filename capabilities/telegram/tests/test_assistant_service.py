@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -366,6 +367,26 @@ class FakeClient:
         self.disconnected.set()
 
 
+class ForumClient(FakeClient):
+    def __init__(self, messages=(), *, fail_sends=0):
+        super().__init__(messages, fail_sends=fail_sends)
+        self.fetch_topics = []
+
+    async def get_messages(self, chat, limit=None, reply_to=None):
+        self.fetch_topics.append(reply_to)
+        messages = await super().get_messages(chat, limit=None)
+        if reply_to is not None:
+            messages = [
+                message for message in messages
+                if getattr(
+                    getattr(message, "reply_to", None),
+                    "reply_to_top_id",
+                    getattr(message, "reply_to_top_id", None),
+                ) == reply_to
+            ]
+        return messages[-limit:] if limit else messages
+
+
 def strip_html_tags(text):
     """Strip HTML tags to model Telethon's behavior: HTML sent with parse_mode='html'
     is stored as plain text with entity markers, not HTML tags."""
@@ -592,6 +613,388 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured[20]["state"]["channel_key"], "-200#topic:20")
             current = next(row for row in captured[10]["tail"] if row["id"] == 103)
             self.assertEqual(current["in_reply_to"]["id"], 101)
+            await self.stop_session(client, task)
+
+    async def test_base_chat_catch_up_uses_topic_key_and_dedupes_later_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=0.02, sync_stale_after=0.2)
+            service_settings["allowed_groups"] = {
+                "-200": {"aliases": ["Assistant"]},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({
+                "-200": {"last_processed_message_id": 999},
+                "-200#topic:10": {"last_processed_message_id": 0},
+            })
+
+            message = Message(105, text="Assistant, recover this")
+            message.mentioned = True
+            message.reply_to = SimpleNamespace(
+                forum_topic=True,
+                reply_to_top_id=10,
+                reply_to_msg_id=None,
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            dispatches = []
+
+            def capture(_chat, _tail, state=None, _procs=None):
+                dispatches.append(state)
+                entered.set()
+                release.wait(timeout=2)
+                return successful_result("recovered")
+
+            daemon.WORKERS["stub"] = capture
+            client = ForumClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(entered.is_set)
+
+            reg = daemon.load_register()
+            self.assertNotIn("105", reg["-200"].get("jobs", {}))
+            self.assertEqual(
+                reg["-200#topic:10"]["jobs"]["105"]["channel_key"],
+                "-200#topic:10",
+            )
+            self.assertEqual(dispatches[0]["channel_key"], "-200#topic:10")
+
+            release.set()
+            await wait_until(
+                lambda: daemon.load_register()["-200#topic:10"][
+                    "last_processed_message_id"] == 105)
+            fetches_after_dispatch = client.get_messages_calls
+            await wait_until(
+                lambda: client.get_messages_calls >= fetches_after_dispatch + 2)
+            self.assertEqual(len(dispatches), 1)
+            self.assertEqual(client.send_attempts, 1)
+            await self.stop_session(client, task)
+
+    async def test_base_chat_catch_up_honors_legacy_watermark(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=60)
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "agent_dialogue": {
+                        "max_turns": 2,
+                        "reset_on_human_message": True,
+                    },
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 105}})
+
+            message = Message(105, text="Assistant, already handled before upgrade")
+            message.mentioned = True
+            message.reply_to = SimpleNamespace(
+                forum_topic=True,
+                reply_to_top_id=10,
+                reply_to_msg_id=None,
+            )
+            dispatches = []
+            daemon.WORKERS["stub"] = lambda *_args, **_kwargs: dispatches.append(True)
+            client = ForumClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            self.assertEqual(dispatches, [])
+            self.assertEqual(client.send_attempts, 0)
+            self.assertNotIn("-200#topic:10", daemon.load_register())
+            await self.stop_session(client, task)
+
+    async def test_base_chat_catch_up_honors_legacy_queued_and_running_jobs(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=60)
+            service_settings["allowed_groups"] = {
+                "-200": {"aliases": ["Assistant"]},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            initial_register = {
+                "-200": {
+                    "last_processed_message_id": 0,
+                    "jobs": {
+                        "106": {"message_id": 106, "status": "queued"},
+                        "107": {"message_id": 107, "status": "running"},
+                    },
+                },
+                "-200#topic:10": {"last_processed_message_id": 0},
+                "-200#topic:20": {"last_processed_message_id": 0},
+            }
+            daemon.save_register(initial_register)
+            before_check = json.loads(json.dumps(initial_register))
+            self.assertTrue(daemon._catch_up_message_is_known(
+                initial_register, "-200#topic:10", "-200", 106))
+            self.assertTrue(daemon._catch_up_message_is_known(
+                initial_register, "-200#topic:20", "-200", 107))
+            self.assertEqual(initial_register, before_check)
+            daemon._has_pending_jobs = lambda _reg, _key: False
+
+            messages = []
+            for message_id, topic_id in ((106, 10), (107, 20)):
+                message = Message(message_id, text="Assistant, already queued")
+                message.mentioned = True
+                message.reply_to = SimpleNamespace(
+                    forum_topic=True,
+                    reply_to_top_id=topic_id,
+                    reply_to_msg_id=None,
+                )
+                messages.append(message)
+            client = ForumClient(messages)
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            register = daemon.load_register()
+            self.assertEqual(
+                register["-200#topic:10"]["last_processed_message_id"], 0)
+            self.assertEqual(
+                register["-200#topic:20"]["last_processed_message_id"], 0)
+            self.assertNotIn("106", register["-200#topic:10"].get("jobs", {}))
+            self.assertNotIn("107", register["-200#topic:20"].get("jobs", {}))
+            self.assertEqual(client.send_attempts, 0)
+            await self.stop_session(client, task)
+
+    async def test_periodic_known_human_replay_does_not_reset_newer_dialogue(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=0.02, sync_stale_after=0.2)
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "agent_dialogue": {
+                        "max_turns": 3,
+                        "reset_on_human_message": True,
+                    },
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            dialogue = {
+                "turns": 2,
+                "reset_message_id": 110,
+                "reset_at": "2026-08-11T12:00:00+00:00",
+            }
+            daemon.save_register({
+                "-200": {"last_processed_message_id": 0},
+                "-200#topic:10": {
+                    "last_processed_message_id": 105,
+                    "agent_dialogue": dialogue,
+                },
+            })
+            client = ForumClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            replay = Message(105, text="older human conversation")
+            replay.reply_to = SimpleNamespace(
+                forum_topic=True,
+                reply_to_top_id=10,
+                reply_to_msg_id=None,
+            )
+            client.messages.append(replay)
+            fetches = client.get_messages_calls
+            await wait_until(lambda: client.get_messages_calls >= fetches + 2)
+
+            current = daemon.load_register()["-200#topic:10"]["agent_dialogue"]
+            self.assertEqual(current, dialogue)
+            self.assertEqual(client.send_attempts, 0)
+            await self.stop_session(client, task)
+
+    async def test_topic_call_recording_catch_up_uses_base_chat_for_watcher(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=60)
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "call_recording": {"mode": "on_request"},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            daemon.configured_call_recording_groups = lambda: {
+                "auto": {}, "on_request": {},
+            }
+
+            message = Message(108, text="/record")
+            message.reply_to = SimpleNamespace(
+                forum_topic=True,
+                reply_to_top_id=10,
+                reply_to_msg_id=None,
+            )
+            client = ForumClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            requests = list(daemon.CALL_RECORDING_REQUEST_DIR.glob("*.json"))
+            self.assertEqual(len(requests), 1)
+            payload = json.loads(requests[0].read_text())
+            self.assertEqual(payload["chat_id"], "-200")
+            self.assertNotIn("topic", requests[0].name)
+            register = daemon.load_register()
+            self.assertEqual(
+                register["-200#topic:10"]["last_processed_message_id"], 108)
+            self.assertEqual(register["-200"]["last_processed_message_id"], 0)
+            self.assertEqual(client.send_attempts, 1)
+            await self.stop_session(client, task)
+
+    async def test_live_and_catch_up_share_topic_call_recording_reservation(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=60)
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "call_recording": {"mode": "on_request"},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            daemon.configured_call_recording_groups = lambda: {
+                "auto": {}, "on_request": {},
+            }
+
+            message = Message(109, text="/record")
+            message.reply_to = SimpleNamespace(
+                forum_topic=True,
+                reply_to_top_id=10,
+                reply_to_msg_id=None,
+            )
+            profile_started = asyncio.Event()
+            release_profile = asyncio.Event()
+            profile_calls = 0
+
+            async def delayed_sender():
+                nonlocal profile_calls
+                profile_calls += 1
+                if profile_calls == 1:
+                    profile_started.set()
+                    await release_profile.wait()
+                return SimpleNamespace(
+                    first_name="Test", last_name="User", username=None)
+
+            message.get_sender = delayed_sender
+            client = ForumClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await profile_started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            release_profile.set()
+            await client.started.wait()
+
+            requests = list(daemon.CALL_RECORDING_REQUEST_DIR.glob("*.json"))
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(
+                json.loads(requests[0].read_text())["chat_id"], "-200")
+            self.assertEqual(profile_calls, 1)
+            self.assertEqual(client.send_attempts, 1)
+            register = daemon.load_register()
+            topic = register["-200#topic:10"]
+            self.assertEqual(topic["last_processed_message_id"], 109)
+            self.assertEqual(topic.get("jobs", {}), {})
+            self.assertEqual(register["-200"]["last_processed_message_id"], 0)
+            await self.stop_session(client, task)
+
+    async def test_call_recording_ack_failure_does_not_leave_worker_job(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=60)
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "call_recording": {"mode": "on_request"},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(110, text="/record")
+            message.reply_to = SimpleNamespace(
+                forum_topic=True,
+                reply_to_top_id=10,
+                reply_to_msg_id=None,
+            )
+            client = ForumClient([message], fail_sends=1)
+
+            with self.assertRaisesRegex(RuntimeError, "simulated outbound failure"):
+                await daemon.run_session(client)
+
+            topic = daemon.load_register()["-200#topic:10"]
+            self.assertEqual(topic["last_processed_message_id"], 110)
+            self.assertEqual(topic.get("jobs", {}), {})
+            self.assertEqual(
+                len(list(daemon.CALL_RECORDING_REQUEST_DIR.glob("*.json"))), 1)
+
+    async def test_unaddressed_topic_catch_up_does_not_create_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=60)
+            service_settings["allowed_groups"] = {
+                "-200": {"aliases": ["Assistant"]},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(109, text="conversation for another participant")
+            message.reply_to = SimpleNamespace(
+                forum_topic=True,
+                reply_to_top_id=10,
+                reply_to_msg_id=None,
+            )
+            client = ForumClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            self.assertEqual(
+                daemon.load_register(),
+                {"-200": {"last_processed_message_id": 0}},
+            )
+            self.assertEqual(client.send_attempts, 0)
+            await self.stop_session(client, task)
+
+    async def test_periodic_base_chat_catch_up_arms_every_discovered_topic(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=0.02, sync_stale_after=0.2)
+            service_settings["allowed_groups"] = {
+                "-200": {"aliases": ["Assistant"]},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            client = ForumClient([])
+            dispatched = []
+
+            def capture(_chat, _tail, state=None, _procs=None):
+                dispatched.append(state["channel_key"])
+                return successful_result(f"reply for {state['channel_key']}")
+
+            daemon.WORKERS["stub"] = capture
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            for message_id, topic_id in ((106, 10), (107, 20)):
+                message = Message(message_id, text="Assistant, recover this topic")
+                message.mentioned = True
+                message.reply_to = SimpleNamespace(
+                    forum_topic=True,
+                    reply_to_top_id=topic_id,
+                    reply_to_msg_id=None,
+                )
+                client.messages.append(message)
+
+            await wait_until(lambda: len(dispatched) == 2)
+            await wait_until(
+                lambda: all(
+                    daemon.load_register().get(key, {}).get(
+                        "last_processed_message_id") == message_id
+                    for key, message_id in (
+                        ("-200#topic:10", 106),
+                        ("-200#topic:20", 107),
+                    )
+                )
+            )
+            self.assertEqual(set(dispatched), {
+                "-200#topic:10",
+                "-200#topic:20",
+            })
+            reg = daemon.load_register()
+            self.assertEqual(reg["-200#topic:10"]["last_processed_message_id"], 106)
+            self.assertEqual(reg["-200#topic:20"]["last_processed_message_id"], 107)
+            self.assertEqual(client.send_attempts, 2)
             await self.stop_session(client, task)
 
     async def test_agent_member_uses_explicit_address_and_top_level_responses(self):

@@ -1404,13 +1404,30 @@ def _has_pending_jobs(reg, key):
 
 def _message_is_known(reg, key, message_id):
     """True once a message is reserved as a job or covered by the channel watermark."""
-    if _job_id(message_id) in _job_map(reg, key):
+    row = reg.get(key)
+    if not isinstance(row, dict):
+        return False
+    jobs = row.get("jobs")
+    if isinstance(jobs, dict) and _job_id(message_id) in jobs:
         return True
     try:
-        watermark = int(_channel_row(reg, key).get("last_processed_message_id") or 0)
+        watermark = int(row.get("last_processed_message_id") or 0)
         return int(message_id) <= watermark
     except (TypeError, ValueError):
         return False
+
+
+def _catch_up_message_is_known(reg, key, legacy_key, message_id):
+    """Honor exact legacy jobs always, but its watermark only before topic state."""
+    if _message_is_known(reg, key, message_id):
+        return True
+    if key == legacy_key:
+        return False
+    legacy_row = reg.get(legacy_key)
+    legacy_jobs = legacy_row.get("jobs") if isinstance(legacy_row, dict) else None
+    if isinstance(legacy_jobs, dict) and _job_id(message_id) in legacy_jobs:
+        return True
+    return key not in reg and _message_is_known(reg, legacy_key, message_id)
 
 
 def _recover_incomplete_jobs(reg):
@@ -3000,28 +3017,37 @@ async def run_session(client):
             target = _message_topic_id(message)
         return target
 
-    async def handle_call_recording_request(key, message, group_policy, chat_ref):
+    async def handle_call_recording_request(
+            key, chat_id, message, group_policy, chat_ref):
         text = _message_text(message)
         if not _is_call_recording_request(text):
             return False
         mode = _call_recording_mode(group_policy)
         if mode == "disabled" and _command_name(text) != "/record":
             return False
-        profile = await _sender_profile(message, group_policy, direct=False)
-        if mode == "on_request":
-            request_path = queue_call_recording_request(key, message.id, profile)
-            reply = "Пробую присоединиться к активному звонку и начать запись."
-            log(f"{key}: call recording requested by {profile['id']} ({request_path.name})")
-        elif mode == "auto":
-            reply = "Для этой группы уже включена автоматическая запись звонков."
-            log(f"{key}: call recording request received; automatic mode is enabled")
-        else:
-            reply = "Запись звонков отключена в настройках этой группы."
-            log(f"{key}: call recording request denied; group mode is disabled")
-        row = reg.setdefault(key, {})
-        row["last_processed_message_id"] = max(
-            message.id, row.get("last_processed_message_id", 0))
-        save_register(reg)
+        job = reserve_job(
+            key, message, group_policy, False, "call-recording", chat_id=chat_id)
+        if job is None:
+            return True
+        try:
+            profile = await _sender_profile(message, group_policy, direct=False)
+            if mode == "on_request":
+                request_path = queue_call_recording_request(chat_id, message.id, profile)
+                reply = "Пробую присоединиться к активному звонку и начать запись."
+                log(f"{key}: call recording requested by {profile['id']} ({request_path.name})")
+            elif mode == "auto":
+                reply = "Для этой группы уже включена автоматическая запись звонков."
+                log(f"{key}: call recording request received; automatic mode is enabled")
+            else:
+                reply = "Запись звонков отключена в настройках этой группы."
+                log(f"{key}: call recording request denied; group mode is disabled")
+            mark_job_finished(key, job, "done")
+        except Exception:
+            jobs = _job_map(reg, key)
+            if jobs.get(_job_id(message.id)) is job:
+                jobs.pop(_job_id(message.id), None)
+                save_register(reg)
+            raise
         _, _ = await send_channel_message(
             chat_ref, reply, False,
             reply_to=thread_reply_target(message, profile["id"], group_policy, False))
@@ -3630,7 +3656,6 @@ async def run_session(client):
             _, group_policy = _group_policy(chat_id)
             if cid < 0 and group_policy is None:
                 continue
-            wm = reg.get(key, {}).get("last_processed_message_id", 0)
             try:
                 checked += 1
                 limit = channel_settings(reg, key)["tail_size"]
@@ -3647,7 +3672,8 @@ async def run_session(client):
                 if _is_tl_layer_error(e):
                     tl_failures += 1
                 continue
-            enqueued = 0
+            enqueued = {}
+            watermarks = {}
             for m in reversed(raw):
                 if topic_id is not None and _message_topic_id(m) != topic_id:
                     continue
@@ -3655,19 +3681,23 @@ async def run_session(client):
                     continue
                 if getattr(m, "action", None) is not None:
                     continue
-                if _message_is_known(reg, key, m.id):
+                message_key = _channel_key(chat_id, _message_topic_id(m))
+                if _catch_up_message_is_known(
+                        reg, message_key, chat_id, m.id):
                     continue
                 is_direct = group_policy is None
-                if group_policy is not None and _reset_agent_dialogue_for_human(
-                        reg, key, m, group_policy):
+                if (group_policy is not None and message_key in reg
+                        and _reset_agent_dialogue_for_human(
+                            reg, message_key, m, group_policy)):
                     save_register(reg)
-                    log(f"{key}: human msg={m.id} reset agent dialogue during catch-up")
+                    log(f"{message_key}: human msg={m.id} reset agent dialogue during catch-up")
                 addressed = False
                 if group_policy is not None:
                     addressed = await _message_addresses_me(m, me, group_policy)
                     is_ambient_voice = (not addressed
                                         and _is_telegram_voice_note(m)
-                                        and _voice_transcription_mode(group_policy, reg, key) == "auto")
+                                        and _voice_transcription_mode(
+                                            group_policy, reg, message_key) == "auto")
                     if not addressed and not is_ambient_voice:
                         continue
                 elif not _incoming_in_scope(m, group_policy):
@@ -3675,52 +3705,65 @@ async def run_session(client):
                 else:
                     is_ambient_voice = False
                 if group_policy is not None and await handle_call_recording_request(
-                        key, m, group_policy, ent):
+                        message_key, cid, m, group_policy, ent):
                     continue
                 if is_ambient_voice:
                     job = reserve_job(
-                        key, m, group_policy, is_direct,
+                        message_key, m, group_policy, is_direct,
                         f"catch-up/{reason}/ambient", chat_id=chat_id)
                     if job is None:
                         continue
                     profile = await _sender_profile(m, group_policy, direct=is_direct)
                     spoken = await echo_voice_message(
-                        m, ent, key, is_direct, group_policy, sender_name=profile["name"])
+                        m, ent, message_key, is_direct, group_policy,
+                        sender_name=profile["name"])
                     # If transcript names the assistant, finalize and dispatch
                     if spoken and spoken != "[голосовое — не удалось расшифровать]" and _text_names_me(spoken, me, group_policy):
                         if not admit_or_finish_agent_job(
-                                key, m, group_policy, job, f"catch-up/{reason}/ambient-addressed"):
+                                message_key, m, group_policy, job,
+                                f"catch-up/{reason}/ambient-addressed"):
                             continue
                         if await finalize_job(
-                                key, m, group_policy, is_direct, f"catch-up/{reason}/ambient-addressed", job,
+                                message_key, m, group_policy, is_direct,
+                                f"catch-up/{reason}/ambient-addressed", job,
                                 text_override=spoken):
-                            enqueued += 1
+                            watermarks.setdefault(
+                                message_key,
+                                reg.get(message_key, {}).get("last_processed_message_id", 0))
+                            enqueued[message_key] = enqueued.get(message_key, 0) + 1
                         continue
                     # Otherwise echo-only, no worker
-                    mark_job_finished(key, job, "done")
+                    mark_job_finished(message_key, job, "done")
                     continue
                 job = reserve_job(
-                    key, m, group_policy, is_direct,
+                    message_key, m, group_policy, is_direct,
                     f"catch-up/{reason}", chat_id=chat_id)
                 if job is None:
                     continue
                 if not admit_or_finish_agent_job(
-                        key, m, group_policy, job, f"catch-up/{reason}"):
+                        message_key, m, group_policy, job, f"catch-up/{reason}"):
                     continue
                 spoken = None
                 if _is_spoken_media(m):
                     profile = await _sender_profile(m, group_policy, direct=is_direct)
                     sender_name = None if is_direct else profile["name"]
                     spoken = await echo_voice_message(
-                        m, ent, key, is_direct, group_policy, sender_name=sender_name)
+                        m, ent, message_key, is_direct, group_policy,
+                        sender_name=sender_name)
                 if await finalize_job(
-                        key, m, group_policy, is_direct, f"catch-up/{reason}", job,
+                        message_key, m, group_policy, is_direct,
+                        f"catch-up/{reason}", job,
                         text_override=spoken):
-                    enqueued += 1
+                    watermarks.setdefault(
+                        message_key,
+                        reg.get(message_key, {}).get("last_processed_message_id", 0))
+                    enqueued[message_key] = enqueued.get(message_key, 0) + 1
             if enqueued:
-                total_enqueued += enqueued
-                log(f"{key}: catch-up/{reason} enqueued {enqueued} since watermark {wm}")
-                arm(key, ent)
+                total_enqueued += sum(enqueued.values())
+                for message_key, count in enqueued.items():
+                    log(f"{message_key}: catch-up/{reason} enqueued {count} "
+                        f"since watermark {watermarks[message_key]}")
+                    arm(message_key, ent)
         if tl_failures:
             raise SessionUnhealthy(
                 f"Telegram TL decode failed for {tl_failures}/{checked} catch-up chats")
@@ -3759,7 +3802,7 @@ async def run_session(client):
             log(f"{key}: already queued/done msg={event.message.id}")
             return
         if not is_direct and await handle_call_recording_request(
-                key, event.message, group_policy, chat_ref):
+                key, event.chat_id, event.message, group_policy, chat_ref):
             return
         if text.startswith("/"):                          # control path — act now
             profile = await _sender_profile(event.message, group_policy, direct=is_direct)
