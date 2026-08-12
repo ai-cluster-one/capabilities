@@ -183,6 +183,12 @@ COMMANDS
 GLOBAL OPTIONS
   --connection <id>   select a registry connection
   --judge <id>        select a judge for this run's semantic assertions
+  --text              run the call over text alone: the room carries no audio,
+                      the agent never synthesizes speech, and a turn ends when
+                      its text is complete. Several times faster and cheaper,
+                      and it proves nothing about the speech path — checks that
+                      need audio report as skipped. A scenario always describes
+                      the spoken call; only this flag downgrades a run.
   --key-env <KEY>     resolve the API key from a different env/cred KEY
   --api-url <URL>     override the base URL for this invocation
   --json              machine-readable output where a verb has a prose default
@@ -1179,10 +1185,19 @@ def _resolve_agent(ref: str) -> str:
     return value
 
 
-def platform_connect(agent_id: str) -> dict:
+def platform_connect(agent_id: str, text_only: bool = False) -> dict:
     """The ordinary WebRTC connect flow — the same endpoint the dashboard uses.
-    Public, so this is the one call that needs no credential."""
-    r = api("POST", f"/agents/{agent_id}/connect")
+    Public, so this is the one call that needs no credential.
+
+    `text_only` asks for a room carrying no audio in either direction: the
+    worker publishes no track and never reaches for speech synthesis, so a turn
+    ends when the text is complete rather than when it has finished being
+    spoken. That is several times faster, and it removes the speech path from
+    what the run can prove — which is why checks that depend on audio report as
+    skipped rather than quietly disappearing.
+    """
+    r = api("POST", f"/agents/{agent_id}/connect",
+            data={"text_only": True} if text_only else None)
     data = (r or {}).get("data") or {}
     for field in ("server_url", "room_name", "participant_token"):
         if not data.get(field):
@@ -1266,13 +1281,14 @@ class Observed:
     to automation run times only for the tool chain.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, text_only: bool = False) -> None:
         self.t0 = time.time()
         self.events: list = []          # {"kind", "t", ...} in arrival order
         self.audio_frames = 0
         self.audio_first_t: float | None = None
         self.agent_identity: str | None = None
         self.turn_signal: str | None = None   # "state" | "quiet" — how turns were bounded
+        self.text_only = text_only            # the room carried no audio at all
 
     def at(self) -> float:
         return round(time.time() - self.t0, 3)
@@ -1860,9 +1876,19 @@ class Checks:
         self.results.append({"check": name, "scope": scope, "ok": bool(ok),
                              "detail": detail})
 
+    def skip(self, name: str, detail: str, scope: str = "call") -> None:
+        """Record a check the run could not make, so a report never reads as
+        though it verified something this mode cannot observe."""
+        self.results.append({"check": name, "scope": scope, "ok": None,
+                             "skipped": True, "detail": detail})
+
     @property
     def failed(self) -> list:
-        return [r for r in self.results if not r["ok"]]
+        return [r for r in self.results if r["ok"] is False]
+
+    @property
+    def skipped(self) -> list:
+        return [r for r in self.results if r.get("skipped")]
 
     @property
     def ok(self) -> bool:
@@ -1981,9 +2007,22 @@ def evaluate(scenario: dict, obs: Observed, evidence: dict,
 
     call_expect = scenario.get("expect") or {}
 
+    # A worker or platform that predates the flag simply never sees it, and the
+    # call proceeds aloud. Without this the run would report mode=text while
+    # audio was flowing, and skip the very checks that would have caught it.
+    if obs.text_only and obs.audio_frames > 0:
+        checks.add(False, "text_only_honored",
+                   f"asked for a text-only room but {obs.audio_frames} audio "
+                   "frames arrived — the deployed worker or platform does not "
+                   "carry the flag yet")
+
     if call_expect.get("audio_observed"):
-        checks.add(obs.audio_frames > 0, "audio_observed",
-                   f"{obs.audio_frames} frames")
+        if obs.text_only:
+            checks.skip("audio_observed",
+                        "text-only run: the room carried no audio to observe")
+        else:
+            checks.add(obs.audio_frames > 0, "audio_observed",
+                       f"{obs.audio_frames} frames")
 
     if call_expect.get("assistant_turn_after_tool") and not tool_evidence:
         checks.add(False, "assistant_turn_after_tool", _NO_TOOL_EVIDENCE)
@@ -2103,6 +2142,7 @@ def build_report(scenario: dict, conn: dict, agent_id: str, conn_details: dict,
         "agent": agent_id,
         "connection": conn["id"],
         "judge": _STATE.get("judge"),
+        "mode": "text" if obs.text_only else "voice",
         "language": scenario.get("language"),
         "room": conn_details.get("room_name"),
         "call_id": evidence.get("call_id"),
@@ -2128,12 +2168,17 @@ def _write_report(report, destination: str) -> None:
 def _print_verdict(report: dict) -> None:
     verdict = report["verdict"]
     head = f"{verdict.upper():8} {report['scenario']}  agent={report['agent'][:8]}"
+    head += f"  mode={report.get('mode', 'voice')}"
     if report.get("call_id"):
         head += f"  call={report['call_id']}"
     sys.stdout.write(head + "\n")
     if not report.get("call_id"):
         sys.stdout.write(f"  warn  {_NO_TOOL_EVIDENCE}\n")
     for check in report["checks"]:
+        if check.get("skipped"):
+            detail = f" — {check['detail']}" if check["detail"] else ""
+            sys.stdout.write(f"  skip  {check['scope']} {check['check']}{detail}\n")
+            continue
         if check["ok"]:
             continue
         detail = f" — {check['detail']}" if check["detail"] else ""
@@ -2150,8 +2195,13 @@ def _print_verdict(report: dict) -> None:
 
 def _execute(scenario: dict, agent_ref: str | None, args) -> dict:
     agent_id = _resolve_agent(agent_ref or scenario.get("agent") or "")
-    conn_details = platform_connect(agent_id)
-    obs = Observed()
+    # A scenario always describes the real thing — a spoken call. --text
+    # downgrades this run to the text path for speed; the reverse is
+    # deliberately impossible, so voice coverage cannot erode as scenarios
+    # accumulate.
+    text_only = bool(getattr(args, "text", False))
+    conn_details = platform_connect(agent_id, text_only)
+    obs = Observed(text_only=text_only)
     try:
         asyncio.run(_drive_call(conn_details, scenario["turns"], obs,
                                 args.timeout, args.budget))
@@ -2332,6 +2382,7 @@ def cmd_doctor(args) -> None:
 def _add_common(parser) -> None:
     parser.add_argument("--connection")
     parser.add_argument("--judge")
+    parser.add_argument("--text", action="store_true")
     parser.add_argument("--key-env", dest="key_env")
     parser.add_argument("--api-url", dest="api_url")
     parser.add_argument("--json", action="store_true")
