@@ -97,6 +97,7 @@ SCENARIOS
     language: en
     turns:
       - say: "I would like to book an appointment."
+        pause_after_reply: 2       # optional extra silence before the next turn
         expect:
           tools_not_called: ["Availability Lookup"]
           reply_not_matches: "(?i)cannot help"
@@ -1405,6 +1406,11 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
             obs.add("turn_sent", turn=index)
             await _await_turn(agent_state, obs, turn_timeout, expect_speech=True,
                               turn=index)
+            pause = float(turn.get("pause_after_reply") or 0)
+            if pause > 0 and index < len(turns) - 1:
+                obs.add("turn_pause_started", turn=index, seconds=pause)
+                await asyncio.sleep(pause)
+                obs.add("turn_pause_complete", turn=index, seconds=pause)
     finally:
         for task in audio_tasks:
             task.cancel()
@@ -1581,6 +1587,12 @@ def load_scenario(path: Path) -> dict:
     for index, turn in enumerate(turns):
         if not isinstance(turn, dict) or not turn.get("say"):
             _die(6, "bad_scenario", f"{path}: turn {index} needs a `say`")
+        pause = turn.get("pause_after_reply", 0)
+        if (isinstance(pause, bool) or not isinstance(pause, (int, float))
+                or pause < 0 or pause > 30):
+            _die(6, "bad_scenario",
+                 f"{path}: turn {index} `pause_after_reply` must be a number "
+                 "from 0 to 30 seconds")
     data["_path"] = str(path)
     return data
 
