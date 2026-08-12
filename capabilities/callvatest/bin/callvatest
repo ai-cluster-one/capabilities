@@ -1303,6 +1303,8 @@ _QUIET_WINDOW_S = 3.0
 # its turn sends the next line into the middle of the agent's own, so idle has to
 # hold before a turn counts as over.
 _IDLE_SETTLE_S = 2.0
+_SHORT_ACK_SETTLE_S = 12.0
+_SHORT_ACK_MAX_WORDS = 4
 
 
 async def _drive_call(conn_details: dict, turns: list, obs: Observed,
@@ -1436,7 +1438,17 @@ async def _await_turn(agent_state: dict, obs: Observed, turn_timeout: float,
             now = time.time()
             if idle_since is None:
                 idle_since = now
-            elif now - idle_since >= _IDLE_SETTLE_S:
+            current_turn_started = started - obs.t0
+            current_text = [
+                e["text"] for e in obs.events
+                if e["kind"] == "agent_text" and e["t"] >= current_turn_started
+            ]
+            latest_words = (re.findall(r"\w+", current_text[-1], re.UNICODE)
+                            if current_text else [])
+            settle_window = (_SHORT_ACK_SETTLE_S
+                             if 0 < len(latest_words) <= _SHORT_ACK_MAX_WORDS
+                             else _IDLE_SETTLE_S)
+            if now - idle_since >= settle_window:
                 obs.turn_signal = obs.turn_signal or "state"
                 obs.add("turn_complete", signal="state", turn=turn)
                 return
@@ -1478,8 +1490,15 @@ def _iso_to_epoch(value: str | None) -> float | None:
 
 
 def gather_evidence(room_name: str, agent_id: str, obs: Observed,
-                    settle: float) -> dict:
-    """Resolve the call, then read back what the platform stored about it."""
+                    settle: float, wait_for_fields: list[str] | None = None) -> dict:
+    """Resolve the call, then read back what the platform stored about it.
+
+    A call reaches ``complete`` before its ended webhook has necessarily
+    written extracted outcome fields. When a scenario asserts post-call
+    fields, keep polling until those exact fields are present or the ordinary
+    settle deadline expires; otherwise a healthy webhook becomes a false red
+    run merely because the first terminal call read won the race.
+    """
     call_id = platform_find_call_id(room_name, agent_id,
                                     time.time() + CORRELATE_TIMEOUT_S)
     evidence: dict = {"call_id": call_id, "call": None, "transcript": None,
@@ -1489,9 +1508,15 @@ def gather_evidence(room_name: str, agent_id: str, obs: Observed,
 
     deadline = time.time() + settle
     call = None
+    wanted_fields = list(wait_for_fields or [])
     while time.time() < deadline:
         call = platform_get_call(call_id)
-        if call and call.get("status") in ("complete", "failed", "no answer"):
+        terminal = call and call.get("status") in ("complete", "failed", "no answer")
+        fields_ready = terminal and all(
+            field in call and call.get(field) is not None
+            for field in wanted_fields
+        )
+        if fields_ready:
             evidence["settled"] = True
             break
         time.sleep(2.0)
@@ -1955,6 +1980,15 @@ def evaluate(scenario: dict, obs: Observed, evidence: dict,
         for run in evidence["runs"]:
             if run["status"] != "success" or run["started_rel"] is None:
                 continue
+            # Started/ended lifecycle webhooks are platform bookkeeping, not
+            # conversation tools. In particular the ended webhook begins only
+            # after the participant has left, so requiring another assistant
+            # turn after it makes every otherwise healthy call fail.
+            args = run.get("args") or {}
+            if (args.get("type") in ("started", "ended")
+                    and isinstance(args.get("call"), dict)
+                    and isinstance(args.get("room"), dict)):
+                continue
             ended = run["started_rel"] + (run.get("duration_ms") or 0) / 1000.0
             if not obs.speech(since=ended):
                 missing.append(run["name"])
@@ -2110,8 +2144,11 @@ def _execute(scenario: dict, agent_ref: str | None, args) -> dict:
         asyncio.run(_drive_call(conn_details, scenario["turns"], obs,
                                 args.timeout, args.budget))
     finally:
+        post_fields = list(
+            ((scenario.get("expect") or {}).get("post_call") or {}).keys()
+        )
         evidence = gather_evidence(conn_details["room_name"], agent_id, obs,
-                                   SETTLE_TIMEOUT_S)
+                                   SETTLE_TIMEOUT_S, post_fields)
     checks = (evaluate(scenario, obs, evidence, getattr(args, "judge", None))
               if scenario.get("_assert", True) else None)
     return build_report(scenario, _STATE["conn"], agent_id, conn_details, obs,
