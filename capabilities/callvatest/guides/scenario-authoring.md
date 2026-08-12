@@ -39,6 +39,22 @@ to reproduce.
 Turns are cheap inside one scenario; scenarios are expensive. Prefer more turns
 in one call over more calls.
 
+## Reproduce a human conversational gap when it matters
+
+The harness already waits for the agent to finish its answer. When the timing
+itself is part of the production-shaped probe, add `pause_after_reply` to a turn
+to leave that many additional seconds of silence before the next caller line:
+
+```yaml
+turns:
+  - say: "Yes, please ask them to call me back."
+    pause_after_reply: 2
+  - say: "What time does the phone line open?"
+```
+
+Use it to avoid an unnaturally compressed hand-off, not to influence the model's
+reasoning: the model does not receive the elapsed silence as conversation text.
+
 ## Negative expectations carry half the value
 
 `tools_not_called` and `reply_not_matches` catch the failures that a positive
