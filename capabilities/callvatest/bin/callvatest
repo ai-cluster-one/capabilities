@@ -1,0 +1,2359 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+#     "livekit>=1.1,<2",
+#     "pyyaml>=6",
+# ]
+# ///
+"""callvatest — agent-first CLI that regression-tests a deployed CallVA voice agent.
+
+This tool is designed to be invoked by agents. Run `callvatest help` to load the
+full usage contract on demand — do not rely on memorised knowledge of its surface.
+
+It joins a real LiveKit room as a headless participant through the ordinary CallVA
+WebRTC connect flow, drives the conversation over text, and then asserts what the
+deployed agent actually did: the transcript it produced, the tools it called, the
+arguments it generated, the results it answered from, and the fields the platform
+stored after the call. There is no test-only runtime path — the agent under test
+loads its production configuration and calls its production tools, so a passing
+run is evidence about production behaviour.
+
+Placing a call costs money and creates a real call record. `run`, `suite`, and
+`probe` are therefore write verbs: a connection with "allow_write": false refuses
+them, and no flag lifts that gate.
+
+CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. Its values resolve by the cascade (first non-empty wins):
+    1. flags          --api-url (non-secret only; a secret never has a flag)
+    2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
+    3. user config    $XDG_CONFIG_HOME/callvatest/credentials.env
+    4. process env    CALLVA_API_KEY / CALLVA_API_URL
+  The key is only ever named, never passed on argv.
+    CALLVA_API_KEY=<CallVA API key>        secret — the tenant that owns the agent
+    CALLVA_API_URL=<base URL>              optional; default
+                                           https://api.callva.one/api/v1
+
+  A project that tests several CallVA tenants declares them in
+  <project>/capabilities/callvatest/connections.json:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "api_url": "https://api.example.com/api/v1",
+          "secret_env": "CALLVA_<ID>_API_KEY",
+          "allow_write": true
+        }
+      }
+    }
+  "secret_env" names the environment variable holding the key; naming a variable
+  the project already defines keeps one home for the secret. "allow_write": false
+  makes a connection observation-only — useful for pointing at a live tenant you
+  must not place calls into.
+
+  Selection: --connection <id>. Unflagged, the registry's "default" pointer
+  applies, else the sole entry; several entries without a pointer is refused.
+
+JUDGES
+  A `semantic` assertion is settled by a judge model, declared in a "judges"
+  block of the same connections file so one file holds every credential this
+  harness resolves:
+
+    "judges": {
+      "default": "haiku",
+      "connections": {
+        "haiku":   {"provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                    "secret_env": "ANTHROPIC_API_KEY"},
+        "gpt-oss": {"provider": "cerebras", "model": "gpt-oss-120b",
+                    "secret_env": "CEREBRAS_API_KEY"}
+      }
+    }
+
+  Providers are "anthropic" and "cerebras"; the model is named per judge, so a
+  backend is switched in the registry or per invocation with --judge <id>,
+  never in a scenario. Keys resolve by the same cascade as the API key and are
+  never passed on argv. The judge is asked at temperature 0 for a JSON verdict,
+  and it is resolved only when a scenario actually declares a `semantic` claim.
+
+  A judge runs after the call has ended, so its accuracy decides the choice and
+  its latency does not.
+
+SCENARIOS
+  Project-owned CallVA artefacts live under `callva/` in the project, by kind.
+  Scenarios are one kind:
+
+    <project>/callva/tests/<agent>/<language>/<scenario>.yaml
+
+  `run` and `suite` walk up from the working directory to find `callva/tests`.
+  --path overrides the search entirely.
+
+  A scenario is YAML:
+
+    id: earliest-slot
+    agent: <agent-label>          # ids label, or an agent uuid
+    language: en
+    turns:
+      - say: "I would like to book an appointment."
+        expect:
+          tools_not_called: ["Availability Lookup"]
+          reply_not_matches: "(?i)cannot help"
+      - say: "Tell me the earliest time you have."
+        expect:
+          tool_called: "Availability Lookup"
+          tool_args:
+            service_id: "<service-id>"
+          semantic: "The agent offers the earliest slot from the result."
+    expect:                       # evaluated once the call has settled
+      audio_observed: true
+      assistant_turn_after_tool: true
+      no_internal_ids: true
+      tool_call_count:
+        "Availability Lookup": 1
+      post_call:
+        status: completed
+
+  A tool is named by a case-insensitive substring of its automation name, or by
+  an automation uuid. Times, dates, and slots are never pinned as literals — they
+  are asserted against the tool result the agent actually received.
+
+  `post_call` reads the call record the platform stored once the call settled:
+  its own outcome fields, and any custom field the tenant defines on a call.
+  Each named field is compared as a string, so a scenario asserts the tenant's
+  own schema without this harness knowing it.
+
+  `semantic` states one claim in prose and hands it to a judge model together
+  with the tool results of that turn and what the agent said; a call-level
+  `semantic` is given the whole transcript and every run. Use it where the
+  medium defeats matching in code — an agent speaks "kell kümme", never 10:00,
+  and no regular expression will call that the same time. Everything structured
+  (which tool ran, its arguments, counts, leaked ids) stays deterministic: code
+  is exact, free, and never flickers. A judge that cannot answer fails the
+  check; it never passes it.
+
+COMMANDS
+  probe [--agent <id|label>] [--say TEXT ...] [--turns N]
+        One diagnostic call with no assertions: connect, join, drive the turns
+        given by --say, then print everything observed — transcript with
+        timings, agent state changes, audio frames, the resolved call id, tool
+        runs with their arguments, and tool results. This is the first thing to
+        run against a new agent, and the first thing to run when a scenario
+        fails for reasons the report does not explain.
+
+  run <scenario> [--agent <id|label>] [--report FILE]
+        Execute one scenario and print its verdict. Exit 1 when it fails.
+
+  suite [<path>] [--agent <id|label>] [--report FILE]
+        Execute every scenario under a path, sequentially. Exit 1 if any fails.
+
+  fixtures [<path>] [--judge <id>] [--all-judges] [--report FILE]
+        Judge the judge, without placing a call. Each fixture case freezes tool
+        results, what an agent said, a claim, and the verdict a competent judge
+        must reach; the run reports every disagreement. Exit 1 when any case
+        disagrees. Fixtures live in <project>/callva/judge/:
+
+          id: et-times
+          cases:
+            - claim: "Every time the agent speaks appears in the tool result."
+              results: ['{"earliest": "reede, 4. september 09:00"}']
+              said: "Kõige varasem vaba aeg on reedel kell üheksa."
+              expect: true
+
+        Half the cases must expect false, or the run cannot tell a judge that
+        reads from one that agrees with everything. --all-judges runs the whole
+        set past every declared judge, which is how backends are compared on
+        material that matters rather than on a benchmark.
+
+        `known_gap: true` marks a case every judge already fails — a measured
+        limit rather than a regression. It still runs and is still reported, but
+        it does not fail the run, because a set that is permanently red gates
+        nothing; the day a judge starts getting it right is reported too.
+
+  doctor
+        Per connection: prove the key resolves and reaches the API, and that the
+        LiveKit RTC stack imports. Names the agents the key can see, and asks
+        each declared judge to settle a trivial claim.
+
+  Contract verbs: help, doctor, connections, stub, manifest --json,
+  guide [<topic>], ids list|get|set|rm, refs.
+
+GLOBAL OPTIONS
+  --connection <id>   select a registry connection
+  --judge <id>        select a judge for this run's semantic assertions
+  --key-env <KEY>     resolve the API key from a different env/cred KEY
+  --api-url <URL>     override the base URL for this invocation
+  --json              machine-readable output where a verb has a prose default
+  --timeout <S>       per-turn timeout in seconds (default 45)
+  --budget <S>        whole-call budget in seconds (default 300)
+
+EXIT CODES
+  0 ok · 1 assertion failed · 2 credentials · 3 not found · 4 policy
+  5 upstream/transport · 6 invalid input · 7 timeout waiting on the agent
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+from typing import NoReturn
+
+import httpx
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_API_URL = "https://api.callva.one/api/v1"
+TIMEOUT = httpx.Timeout(60.0)
+MAX_RETRIES = 3
+
+TURN_TIMEOUT_S = 45.0        # how long one agent turn may take
+CALL_BUDGET_S = 300.0        # whole-call ceiling
+AGENT_JOIN_TIMEOUT_S = 30.0  # how long to wait for the worker to join the room
+SETTLE_TIMEOUT_S = 60.0      # how long to wait for the platform to settle the call
+CORRELATE_TIMEOUT_S = 30.0   # how long to wait for the call id to become known
+JUDGE_TIMEOUT_S = 60.0       # one judgement, off the call's critical path
+JUDGE_MAX_TOKENS = 1000      # a verdict is two fields; the room is for models that reason first
+
+# The two judge transports. A judge runs after the call has ended, so accuracy
+# decides the choice and latency does not; the model is named per judge in the
+# connections registry rather than pinned here.
+JUDGE_PROVIDERS = {
+    "anthropic": {"url": "https://api.anthropic.com/v1/messages",
+                  "key_env": "ANTHROPIC_API_KEY"},
+    "cerebras": {"url": "https://api.cerebras.ai/v1/chat/completions",
+                 "key_env": "CEREBRAS_API_KEY"},
+}
+
+# --- Capability declaration — one home for every contract fact ---------------
+
+NAME = "callvatest"
+SUMMARY = ("CallVA agent test harness — drives a deployed voice agent through a "
+           "real LiveKit room over text, then asserts the transcript, the tools "
+           "it called, the arguments it generated, the results it answered from, "
+           "and the fields stored after the call.")
+SCOPE = "project"   # credential scope: "project" | "user"
+CRED_KEYS = [
+    {"key": "CALLVA_API_KEY", "secret": True, "required": True,
+     "note": "External API key for the tenant that owns the agent under test"},
+    {"key": "CALLVA_API_URL", "secret": False, "required": False,
+     "note": "API base URL; default https://api.callva.one/api/v1"},
+    {"key": "ANTHROPIC_API_KEY", "secret": True, "required": False,
+     "note": "Judge key for an Anthropic-backed semantic assertion"},
+    {"key": "CEREBRAS_API_KEY", "secret": True, "required": False,
+     "note": "Judge key for a Cerebras-backed semantic assertion"},
+]
+WRITE_VERBS = {"run", "suite", "probe"}   # each places a real, billable call
+WRITE_DEFAULT = True    # calls land in a tenant the consumer owns
+DOCS_BASE = ""
+TOPICS: list = []
+STATE = False       # True when the capability writes session/cache state
+POST_INSTALL: list = []
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CONFIG_DIR = _CONFIG_HOME / "callvatest"
+CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# Holds the live client + resolved base URL, so handlers call api() freely.
+_STATE: dict = {}
+
+# >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+# --- Error reporting ---------------------------------------------------------
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+
+
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value)
+        if value and not value.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- Project / file plumbing -------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding capabilities/, legacy .capabilities/,
+    .contextkit/config.toml, .env(.local), or .git.
+    Markers are read from the filesystem alone: the root is what the envelope
+    location is resolved against, so resolving one cannot depend on the other.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / "capabilities" / "settings.json").is_file()
+                or (d / ".contextkit" / "config.toml").is_file()
+                or (d / ".capabilities").is_dir()
+                or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+
+_ENVELOPE_HOME: dict = {}
+
+
+def _validated_project_envelope(root: Path, raw, provider: str) -> Path:
+    """Validate the manager/context-owner answer without selecting a fallback."""
+    value = str(raw or "").strip()
+    if not value:
+        _die(6, "project_envelope_empty",
+             f"{provider} returned an empty capabilities envelope path")
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        _die(6, "project_envelope_relative",
+             f"{provider} returned a relative capabilities envelope path: {value!r}")
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        _die(6, "project_envelope_outside_project",
+             f"{provider} returned a capabilities envelope outside the project: {candidate}")
+    return resolved
+
+
+def _manager_project_envelope(root: Path) -> Path:
+    """Consume the capabilities manager's one authoritative project answer."""
+    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
+    if override:
+        return _validated_project_envelope(root, override, "environment handoff")
+
+    import subprocess
+
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(root)
+    manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip()
+    if not manager:
+        source_manager = Path(__file__).resolve().parents[3] / "bin" / "capabilities"
+        manager = str(source_manager) if source_manager.is_file() else "capabilities"
+    try:
+        proc = subprocess.run(
+            [manager, "path", "--json"], cwd=root, env=env,
+            capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        _die(6, "capabilities_manager_unavailable",
+             "the capabilities manager is required to resolve the project envelope",
+             "install or repair the `capabilities` command")
+    except subprocess.TimeoutExpired:
+        _die(6, "capabilities_path_timeout",
+             "the capabilities manager did not resolve the project envelope within 10 seconds")
+    except OSError as exc:
+        _die(6, "capabilities_manager_unavailable",
+             f"could not run the capabilities manager: {exc}")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        try:
+            error = json.loads(detail).get("error", {})
+        except (AttributeError, ValueError):
+            error = {}
+        _die(proc.returncode if proc.returncode in (3, 4, 5, 6) else 6,
+             str(error.get("code") or "capabilities_path_failed"),
+             str(error.get("message") or "the capabilities manager could not resolve the project envelope"),
+             str(error.get("hint") or detail or "run `capabilities path --json` for details"))
+    try:
+        answer = json.loads(proc.stdout)
+    except ValueError as exc:
+        _die(6, "capabilities_path_malformed",
+             f"the capabilities manager returned invalid JSON: {exc}")
+    if not isinstance(answer, dict):
+        _die(6, "capabilities_path_malformed",
+             "the capabilities manager path answer must be a JSON object")
+    manager_root = Path(str(answer.get("project_root") or ""))
+    if not manager_root.is_absolute() or manager_root.resolve() != root.resolve():
+        _die(6, "capabilities_project_mismatch",
+             "the capabilities manager resolved a different project root")
+    provider = str(answer.get("provider") or "capabilities manager")
+    return _validated_project_envelope(
+        root, answer.get("project_envelope"), provider)
+
+
+def _envelope_home(root: Path) -> Path:
+    """The project's envelope root, resolved once per invocation.
+
+    The capabilities manager owns project-envelope discovery, including any
+    delegation to ContextKit. Capability CLIs consume that answer and never
+    duplicate context-owner detection.
+    """
+    cached = _ENVELOPE_HOME.get(root)
+    if cached is not None:
+        return cached
+    home = _manager_project_envelope(root)
+    _ENVELOPE_HOME[root] = home
+    return home
+
+
+def _project_capabilities_dir(root: Path) -> Path:
+    """The active project envelope root.
+
+    The resolved envelope is canonical. A legacy `.capabilities/` remains
+    readable until `capabilities init` migrates it. If both exist, the canonical
+    tree wins once it carries settings.json; otherwise the legacy configured tree
+    remains active so merely creating an empty visible directory loses no gate.
+    """
+    current = _envelope_home(root)
+    legacy = root / ".capabilities"
+    if (current / "settings.json").is_file() or not legacy.is_dir():
+        return current
+    return legacy
+
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+
+
+def _auth_context() -> dict | None:
+    """Optional runtime authority envelope passed by an ingress/service.
+
+    Absence means the ordinary project gate is the whole policy. Presence means
+    a request-scoped authority layer exists and must fail closed before any
+    credential or network work happens.
+    """
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return None
+    try:
+        if raw.lstrip().startswith("{"):
+            data = json.loads(raw)
+        else:
+            data = json.loads(Path(raw).read_text())
+    except (OSError, ValueError) as e:
+        _die(4, "auth_context_unreadable",
+             "runtime authority context could not be read",
+             f"{raw}: {e}")
+    if not isinstance(data, dict):
+        _die(4, "auth_context_invalid",
+             "runtime authority context is not an object")
+    return data
+
+
+def _auth_capability_allowed(rule) -> bool:
+    if rule is True or rule == "*":
+        return True
+    if rule in (False, None):
+        return False
+    if isinstance(rule, dict):
+        if rule.get("deny") is True:
+            return False
+        if rule.get("enabled") is False or rule.get("allow") is False:
+            return False
+        return True
+    return False
+
+
+def _auth_gate() -> None:
+    ctx = _auth_context()
+    if ctx is None:
+        return
+    allowed = ctx.get("allowed_capabilities")
+    if allowed is None:
+        return
+    if allowed is True or allowed == "*":
+        return
+    if isinstance(allowed, list):
+        if NAME in allowed or "*" in allowed:
+            return
+    elif isinstance(allowed, dict):
+        if _auth_capability_allowed(allowed.get(NAME, allowed.get("*"))):
+            return
+    else:
+        _die(4, "auth_context_invalid",
+             "runtime authority context has invalid allowed_capabilities")
+    source = ctx.get("source") or "runtime"
+    role = ctx.get("sender_role") or ctx.get("role") or "unknown"
+    chat = ctx.get("chat_id") or "unknown"
+    _die(4, "capability_not_authorized",
+         f"{NAME} is not authorized for this {source} request",
+         f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
+
+
+def _policy_entry(path: Path):
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        _die(6, "bad_policy", f"cannot read capability policy {path}: {e}")
+    capabilities = data.get("capabilities") if isinstance(data, dict) else None
+    if not isinstance(capabilities, dict):
+        _die(6, "bad_policy", f"{path} is not a capability policy",
+             'expected {"capabilities": {"<name>": {"enabled": true}}}')
+    entry = capabilities.get(NAME)
+    if entry is not None and (not isinstance(entry, dict)
+                              or set(entry) != {"enabled"}
+                              or not isinstance(entry.get("enabled"), bool)):
+        _die(6, "bad_policy", f"invalid {NAME} policy entry in {path}",
+             'expected {"enabled": true|false}')
+    return entry
+
+
+def _project_enabled_explicitly() -> bool:
+    """True only for an explicit project enabled entry; global inheritance is
+    deliberately insufficient for project-owned service activation."""
+    root = _project_root()
+    if root is None:
+        return False
+    entry = _policy_entry(_project_capabilities_dir(root) / "settings.json")
+    return isinstance(entry, dict) and entry.get("enabled") is True
+
+
+def _require_project_enabled_for_service() -> Path:
+    root = _project_root()
+    if root is None or not _project_enabled_explicitly():
+        _die(4, "project_enable_required",
+             f"{NAME} service activation requires an explicit project enable",
+             f"ask the user, then run `capabilities enable {NAME} --project` "
+             "before service init/start/run")
+    return root
+
+
+def _gate() -> None:
+    """Project policy overrides global policy; absence inherits, and absence at
+    both scopes is default deny. Safe local discovery verbs remain available so
+    a disabled capability can be understood and configured before use.
+
+    If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
+    is stricter and runs first, before credentials or network calls.
+    """
+    _auth_gate()
+    verb = sys.argv[1] if len(sys.argv) > 1 else "help"
+    service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    service_contract = globals().get("SERVICE")
+    if isinstance(service_contract, dict) and verb == "service" \
+            and service_action in {"init", "start", "run"}:
+        _require_project_enabled_for_service()
+    if verb in {"help", "stub", "manifest", "connections"}:
+        return
+    root = _project_root()
+    project_file = (_project_capabilities_dir(root) / "settings.json") \
+        if root is not None else None
+    project_entry = _policy_entry(project_file) if project_file else None
+    global_file = _CONFIG_HOME / "capabilities" / "settings.json"
+    global_entry = _policy_entry(global_file)
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is True:
+        return
+    if isinstance(project_entry, dict) and project_entry.get("enabled") is False:
+        _die(4, "disabled",
+             f"{NAME} is disabled in this project ({project_file})",
+             f"ask the user whether to enable {NAME} for this project; if yes, "
+             f"run `capabilities enable {NAME} --project`")
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is True:
+        return
+    if isinstance(global_entry, dict) and global_entry.get("enabled") is False:
+        message = f"{NAME} is disabled globally ({global_file})"
+    else:
+        message = f"{NAME} is not enabled by project or global policy"
+    _die(4, "not_enabled", message,
+         f"ask the user whether to enable {NAME} only for this project or "
+         f"globally for every project; then run `capabilities enable {NAME} "
+         "--project` or `--global` exactly as requested")
+
+
+def _env_dir() -> Path | None:
+    """The capability's envelope dir in the project's active capabilities/."""
+    root = _project_root()
+    return (_project_capabilities_dir(root) / NAME) if root is not None else None
+
+
+def _state_dir() -> Path:
+    """State follows the scope of the credentials that minted it; project state
+    lands inside the envelope only where capabilities/ already exists."""
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if (envelope / "settings.json").is_file():
+                return envelope / NAME / "state"
+    return _STATE_HOME / NAME
+
+
+# --- Capability contract — the declaration surface --------------------------
+
+def _docs_base() -> str:
+    key = f"{NAME.upper()}_DOCS_BASE"
+    return (_project_env().get(key)
+            or _parse_env_file(CREDENTIALS_ENV).get(key)
+            or os.environ.get(key)
+            or DOCS_BASE)
+
+
+def _cmd_guide(argv: list[str]) -> None:
+    if not argv:
+        _emit(sorted(TOPICS)); return
+    topic = argv[0]
+    if topic not in TOPICS:
+        _die(3, "not_found", f"no guide topic {topic!r}",
+             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+    import urllib.error as _ue
+    import urllib.request as _ur
+    url = _docs_base().rstrip("/") + "/" + topic + ".md"
+    cache_dir = _STATE_HOME / NAME / "guides"
+    cache, etag_f = cache_dir / f"{topic}.md", cache_dir / f"{topic}.etag"
+    headers = {}
+    if cache.exists() and etag_f.exists():
+        headers["If-None-Match"] = etag_f.read_text().strip()
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10.0) as resp:
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text)
+            if resp.headers.get("etag"):
+                etag_f.write_text(resp.headers["etag"])
+            _emit(text); return
+    except _ue.HTTPError as e:
+        if e.code == 304 and cache.exists():
+            _emit(cache.read_text()); return
+        if e.code == 404:
+            _die(3, "not_found", f"guide {topic!r} missing upstream", url)
+        err = f"upstream returned {e.code}"
+    except _ue.URLError as e:
+        err = str(e.reason)
+    except OSError as e:
+        err = str(e)
+    if cache.exists():
+        sys.stderr.write(json.dumps(
+            {"warning": f"upstream unreachable; serving cached copy ({err})"},
+            ensure_ascii=False) + "\n")
+        _emit(cache.read_text()); return
+    _die(5, "network_error", f"could not fetch guide {topic!r}; no cache exists", url)
+
+
+def _render_ids_markdown(data: dict) -> str:
+    """Render the {label: {value, note}} envelope as the labelled markdown
+    list the manager's `capabilities ids <NAME>` also produces — one shared
+    format across the ids surface and the identifiers section of `help`."""
+    lines: list[str] = []
+    for label, entry in sorted(data.items()):
+        entry = entry if isinstance(entry, dict) else {"value": entry}
+        v = entry.get("value")
+        vs = f"`{v}`" if isinstance(v, str) else "`" + json.dumps(v, ensure_ascii=False) + "`"
+        line = f"- **{label}**: {vs}"
+        note = entry.get("note")
+        if note:
+            line += f" — {note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _identifiers_section() -> str:
+    """The Identifiers block appended to the bare top-level help — deterministic
+    first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
+    agent following the `<NAME> help` startup protocol loads the discovered
+    labels/values/notes into context at once. Empty when no project envelope
+    or nothing recorded (do not bloat help with an empty section)."""
+    envdir = _env_dir()
+    if envdir is None:
+        return ""
+    ids_file = envdir / "identifiers.json"
+    if not ids_file.exists():
+        return ""
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    header = (
+        "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
+        f"Structural lookups discovered for `{NAME}` in this project. Fetch a single\n"
+        f"raw value with `{NAME} ids get <label>`; the full envelope is also at\n"
+        f"`capabilities ids {NAME}`.\n\n"
+    )
+    return header + _render_ids_markdown(data) + "\n"
+
+
+def _cmd_help() -> None:
+    """Bare top-level help: the CLI's HELP body (module-level `HELP` if
+    defined, else the module docstring), then the project's Identifiers
+    section. Only fires when no extra args follow — per-verb help stays
+    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    g = globals()
+    text = g.get("HELP") or g.get("__doc__") or ""
+    if text.startswith("\n"):
+        text = text.lstrip("\n")
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    section = _identifiers_section()
+    if section:
+        sys.stdout.write(section)
+
+
+def _cmd_ids(argv: list[str]) -> None:
+    sub = argv[0] if argv else "list"
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    if sub == "list":
+        _emit(data); return
+    if sub == "get":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        _emit((data[argv[1]] or {}).get("value")); return
+    if sub == "set":
+        if len(argv) < 3:
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+        if envdir is None or not (envdir.parent / "settings.json").is_file():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+        label, raw = argv[1], argv[2]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        note = ""
+        if "--note" in argv:
+            ni = argv.index("--note")
+            if ni + 1 >= len(argv):
+                _die(6, "input", "--note needs a value")
+            note = argv[ni + 1]
+        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+        envdir.mkdir(parents=True, exist_ok=True)
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"set": label}); return
+    if sub == "rm":
+        if len(argv) < 2 or argv[1] not in data:
+            _die(3, "not_found", "unknown identifier label",
+                 f"`{NAME} ids list` shows the labels")
+        del data[argv[1]]
+        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _emit({"removed": argv[1]}); return
+    _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
+
+
+def _cmd_refs() -> None:
+    envdir = _env_dir()
+    refdir = (envdir / "reference") if envdir else None
+    out = []
+    if refdir and refdir.is_dir():
+        for md in sorted(refdir.glob("*.md")):
+            name = desc = None
+            try:
+                lines = md.read_text().splitlines()
+            except OSError:
+                continue
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:30]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip()
+            if name:
+                out.append({"name": name, "description": desc or "", "path": str(md)})
+    _emit(out)
+
+
+def _contract(argv: list[str]) -> None:
+    """Dispatch the contract verbs; domain verbs fall through to the CLI's own
+    parser. Runs after _gate(), before any credential is resolved.
+
+    `help` is a contract verb only when bare (no extra args) — the top-level
+    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
+    through to the CLI so per-verb help stays clean."""
+    cmd = argv[0] if argv else ""
+    if cmd == "stub":
+        _emit(f"{SUMMARY} Run `{NAME} help`.")
+    elif cmd == "manifest":
+        _emit({"name": NAME, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "state": STATE, "post_install": POST_INSTALL})
+    elif cmd == "guide":
+        _cmd_guide(argv[1:])
+    elif cmd == "ids":
+        _cmd_ids(argv[1:])
+    elif cmd == "refs":
+        _cmd_refs()
+    elif cmd == "connections":
+        _cmd_connections()
+    elif cmd == "help" and len(argv) == 1:
+        _cmd_help()
+    else:
+        return
+    sys.exit(0)
+
+# <<< contract: capability core <<<
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _connections_registry() -> tuple[dict | None, Path | None]:
+    """The connections envelope and its path: project envelope first, else the
+    user config home. First found wins, never merged. Every connection-bearing
+    capability requires a registry, even when it declares only one connection."""
+    envdir = _env_dir()
+    candidates = ([envdir / "connections.json"] if envdir else []) + \
+                 [_CONFIG_HOME / NAME / "connections.json"]
+    for reg_file in candidates:
+        if not reg_file.is_file():
+            continue
+        try:
+            raw = json.loads(reg_file.read_text())
+        except (ValueError, OSError) as e:
+            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
+        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
+                or not raw["connections"]:
+            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
+                 'expected {"default": "<id>", "connections": { ... }}')
+        return raw, reg_file
+    project_path = (envdir / "connections.json") if envdir else None
+    homes = ([str(project_path)] if project_path else []) + \
+            [str(_CONFIG_HOME / NAME / "connections.json")]
+    _die(6, "connections_required",
+         f"{NAME} requires an explicit connections registry",
+         "create one of: " + ", ".join(homes) +
+         '; expected {"default": "<id>", "connections": {"<id>": { ... }}}')
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. A connection's own
+    `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match)."""
+    if reg is None:
+        _die(6, "connections_required",
+             f"{NAME} requires an explicit connections registry")
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+# <<< contract: connections <<<
+
+
+# ---------------------------------------------------------------------------
+# Connections  (named, complete resolutions of the credential keys)
+# ---------------------------------------------------------------------------
+
+
+def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
+                api_url_flag: str | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection. Returns (conn, problem) — problem is an
+    error dict ({"exit", "code", "message", "hint"?}) instead of a die, so
+    doctor can report every connection rather than stopping at the first."""
+    if entry is None:   # declared entry without overrides — use the flat-key cascade
+        key_env = key_env_override or "CALLVA_API_KEY"
+        api_key = _resolve_env_key(key_env)[0]
+        if not api_key:
+            return None, {
+                "exit": 2, "code": "missing_api_key",
+                "message": f"{key_env} not found in a project .env, "
+                           f"{CREDENTIALS_ENV}, or the environment",
+                "hint": f"set {key_env} in a project .env(.local), "
+                        f"{CREDENTIALS_ENV}, or the environment — or declare a "
+                        f"connections registry (capabilities/{NAME}/connections.json)"}
+        base = (api_url_flag or _resolve_env_key("CALLVA_API_URL")[0]
+                or DEFAULT_API_URL)
+        return {"id": cid, "allow_write": WRITE_DEFAULT, "key_env": key_env,
+                "api_key": api_key, "base": base.rstrip("/")}, None
+    key_env = key_env_override or entry.get("secret_env")
+    if not key_env:
+        return None, {"exit": 6, "code": "no_secret_env",
+                      "message": f"connection {cid!r} is missing 'secret_env'"}
+    api_key = _resolve_env_key(key_env)[0]
+    if not api_key:
+        return None, {
+            "exit": 2, "code": "missing_secret",
+            "message": f"env var {key_env} (for connection {cid!r}) is unset",
+            "hint": f"set {key_env} in the project's .env / .env.local, "
+                    f"{CREDENTIALS_ENV}, or the environment"}
+    base = api_url_flag or entry.get("api_url") or DEFAULT_API_URL
+    return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "key_env": key_env, "api_key": api_key, "base": base.rstrip("/")}, None
+
+
+def _connections_report() -> dict:
+    """The resolution report — every connection, every value, its winning tier
+    and source, secrets masked. Local only: no network, no login attempt."""
+    reg, reg_path = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        keys = []
+        for k in CRED_KEYS:
+            value, tier, source = _resolve_env_key(k["key"])
+            keys.append(_key_report(k["key"], k["secret"], k["required"],
+                                    value, tier, source))
+        report["default"] = "default"
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        return report
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        value = entry.get("api_url")
+        keys.append(_key_report("api_url", False, False,
+                                str(value) if value is not None else None,
+                                "connection", reg_path))
+        secret_env = entry.get("secret_env")
+        if secret_env:
+            value, tier, source = _resolve_env_key(secret_env)
+            keys.append(_key_report(secret_env, True, True, value, tier, source))
+        else:
+            keys.append(_key_report("secret_env", False, True, None, None, None))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": keys}
+    return report
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+# ---------------------------------------------------------------------------
+# HTTP client
+# ---------------------------------------------------------------------------
+
+
+def _client(api_key: str, base_url: str) -> httpx.Client:
+    return httpx.Client(
+        base_url=base_url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=TIMEOUT,
+    )
+
+
+def _api_message(data) -> str | None:
+    """Best-effort human message from a CallVA error body."""
+    if isinstance(data, dict):
+        if data.get("message"):
+            return data["message"]
+        errs = data.get("errors")
+        if isinstance(errs, dict):
+            for v in errs.values():
+                if isinstance(v, list) and v:
+                    return str(v[0])
+                return str(v)
+        if isinstance(errs, list) and errs:
+            first = errs[0]
+            return first.get("message") if isinstance(first, dict) else str(first)
+    if isinstance(data, str) and data:
+        return data
+    return None
+
+
+def _map_4xx(status: int, data, path: str, allow_404: bool):
+    if allow_404 and status == 404:
+        return None
+    msg = _api_message(data) or f"HTTP {status}"
+    if status in (401, 403):
+        _die(2, "unauthorized", msg,
+             "the API key may be invalid or lack access to this resource", status=status)
+    if status == 404:
+        _die(3, "not_found", msg,
+             "verify the id exists and the key can see it", status=status)
+    if status in (400, 422):
+        _die(6, "invalid_request", msg, None, status=status)
+    _die(5, "api_error", msg, None, status=status)
+
+
+def _request(client: httpx.Client, method: str, path: str,
+             params: dict | None = None, json_body: dict | None = None,
+             allow_404: bool = False):
+    """Authenticated request with bounded, backed-off retries. Returns parsed JSON."""
+    clean = {k: v for k, v in (params or {}).items() if v is not None}
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, path, params=clean or None, json=json_body)
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "timeout", f"request timed out: {method} {path}",
+                 "the CallVA API was unresponsive")
+        except httpx.RequestError as e:
+            _die(5, "network_error", f"network error: {e}", "check connectivity")
+
+        last_status = resp.status_code
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", str(attempt * 1.5)))
+            if attempt < MAX_RETRIES:
+                time.sleep(retry_after)
+                continue
+            _die(5, "rate_limited", f"rate-limited after {MAX_RETRIES} attempts",
+                 "back off and retry later", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "server_error", f"CallVA returned {resp.status_code}",
+                 None, status=resp.status_code)
+
+        raw = resp.text
+        if not raw:
+            if resp.status_code >= 400:
+                return _map_4xx(resp.status_code, {}, path, allow_404)
+            return {"success": True}
+        try:
+            data = resp.json()
+        except ValueError:
+            if resp.status_code >= 400:
+                _map_4xx(resp.status_code, raw, path, allow_404)
+            _die(5, "invalid_response", f"non-JSON response from {method} {path}",
+                 status=resp.status_code)
+
+        if resp.status_code >= 400:
+            return _map_4xx(resp.status_code, data, path, allow_404)
+        return data
+
+    _die(5, "exhausted_retries", f"exhausted {MAX_RETRIES} attempts on {method} {path}",
+         status=last_status)
+
+
+def api(method, path, data=None, query=None, allow_404=False):
+    return _request(_STATE["client"], method, path,
+                    params=query, json_body=data, allow_404=allow_404)
+
+
+# ---------------------------------------------------------------------------
+# Platform surfaces — the seven calls this harness makes
+# ---------------------------------------------------------------------------
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _resolve_agent(ref: str) -> str:
+    """An agent uuid passes through; anything else is a label in this project's
+    identifiers envelope, so a scenario names an agent the way a human does."""
+    if _UUID_RE.match(ref or ""):
+        return ref
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    data: dict = {}
+    if ids_file and ids_file.exists():
+        try:
+            data = json.loads(ids_file.read_text())
+        except ValueError:
+            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    entry = data.get(ref)
+    value = (entry or {}).get("value") if isinstance(entry, dict) else entry
+    if not isinstance(value, str) or not _UUID_RE.match(value):
+        _die(3, "unknown_agent",
+             f"{ref!r} is neither an agent uuid nor a label in the identifiers envelope",
+             f"`{NAME} ids set {ref} <agent-uuid> --note 'agent under test'`")
+    return value
+
+
+def platform_connect(agent_id: str) -> dict:
+    """The ordinary WebRTC connect flow — the same endpoint the dashboard uses.
+    Public, so this is the one call that needs no credential."""
+    r = api("POST", f"/agents/{agent_id}/connect")
+    data = (r or {}).get("data") or {}
+    for field in ("server_url", "room_name", "participant_token"):
+        if not data.get(field):
+            _die(5, "bad_connect_response",
+                 f"connect response is missing {field}",
+                 "the agent may be inactive or LiveKit may be unconfigured for its tenant")
+    return data
+
+
+def platform_find_call_id(room_name: str, agent_id: str, deadline: float) -> str | None:
+    """Resolve the worker-minted call id from the room name we already know.
+
+    Webhook logs persist the full request payload, and the payload carries both
+    room and call. The first log to carry a call id is the config request, which
+    lands before the call begins — so this resolves even when a config fault
+    kills the call before any call record exists.
+    """
+    while time.time() < deadline:
+        r = api("GET", "/external/webhook-logs",
+                query={"per_page": 25, "agent_id": agent_id})
+        for row in (r or {}).get("data") or []:
+            if not row.get("related_call_id"):
+                continue
+            if row.get("agent_id") and row["agent_id"] != agent_id:
+                continue
+            detail = api("GET", f"/external/webhook-logs/{row['id']}", allow_404=True)
+            body = (detail or {}).get("data")
+            if not isinstance(body, dict):
+                body = detail if isinstance(detail, dict) else {}
+            payload = body.get("request_payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except ValueError:
+                    payload = None
+            if not isinstance(payload, dict):
+                continue
+            if ((payload.get("room") or {}).get("name")) == room_name:
+                return row["related_call_id"]
+        time.sleep(2.0)
+    return None
+
+
+def platform_get_call(call_id: str) -> dict | None:
+    r = api("GET", f"/external/calls/{call_id}", allow_404=True)
+    return (r or {}).get("data") if r else None
+
+
+def platform_get_transcript(call_id: str) -> dict | None:
+    r = api("GET", f"/external/calls/{call_id}/transcript", allow_404=True)
+    if not r:
+        return None
+    return r.get("data") if isinstance(r.get("data"), dict) else r
+
+
+def platform_get_runs(call_id: str) -> list:
+    r = api("GET", f"/external/calls/{call_id}/automation-runs",
+            query={"per_page": 100, "include_args": "true"}, allow_404=True)
+    rows = (r or {}).get("data") or []
+    return sorted(rows, key=lambda x: x.get("started_at") or "")
+
+
+def platform_get_run_result(automation_id: str, job_id: str):
+    r = api("GET", f"/external/automations/{automation_id}/runs/{job_id}",
+            allow_404=True)
+    if not isinstance(r, dict):
+        return None
+    return r.get("result", r.get("data", {}).get("result") if isinstance(r.get("data"), dict) else None)
+
+
+# ---------------------------------------------------------------------------
+# Observation — what the harness saw, with its own clock
+# ---------------------------------------------------------------------------
+
+
+class Observed:
+    """Everything the participant witnessed, timestamped by this process.
+
+    The stored transcript carries no per-message timestamps, so the harness
+    keeps its own: every ordering assertion is made against this clock, joined
+    to automation run times only for the tool chain.
+    """
+
+    def __init__(self) -> None:
+        self.t0 = time.time()
+        self.events: list = []          # {"kind", "t", ...} in arrival order
+        self.audio_frames = 0
+        self.audio_first_t: float | None = None
+        self.agent_identity: str | None = None
+        self.turn_signal: str | None = None   # "state" | "quiet" — how turns were bounded
+
+    def at(self) -> float:
+        return round(time.time() - self.t0, 3)
+
+    def add(self, kind: str, **fields) -> None:
+        self.events.append({"kind": kind, "t": self.at(), **fields})
+
+    def speech(self, since: float = 0.0) -> list:
+        return [e for e in self.events
+                if e["kind"] == "agent_text" and e["t"] >= since]
+
+    def said(self, since: float = 0.0) -> str:
+        return " ".join(e["text"] for e in self.speech(since)).strip()
+
+    def transcript(self) -> list:
+        return [{"role": e["kind"].replace("_text", ""), "t": e["t"], "text": e["text"]}
+                for e in self.events if e["kind"] in ("agent_text", "user_text")]
+
+
+# ---------------------------------------------------------------------------
+# The call — a headless participant driving one conversation
+# ---------------------------------------------------------------------------
+
+_WORKING_STATES = {"thinking", "speaking", "initializing"}
+_IDLE_STATES = {"listening", "idle"}
+_QUIET_WINDOW_S = 3.0
+# An agent that says "one moment" while a tool runs drops into `listening` for a
+# fraction of a second before it resumes work. Treating that blink as the end of
+# its turn sends the next line into the middle of the agent's own, so idle has to
+# hold before a turn counts as over.
+_IDLE_SETTLE_S = 2.0
+
+
+async def _drive_call(conn_details: dict, turns: list, obs: Observed,
+                      turn_timeout: float, budget: float) -> None:
+    """Join the room, let the greeting settle, then send each turn and wait for
+    the agent to finish answering it."""
+    import livekit.rtc as rtc
+
+    room = rtc.Room()
+    audio_tasks: list = []
+    agent_state: dict = {"value": None, "changed": asyncio.Event()}
+
+    def _note_state(value: str | None) -> None:
+        if value and value != agent_state["value"]:
+            agent_state["value"] = value
+            obs.add("agent_state", state=value)
+            agent_state["changed"].set()
+
+    async def _consume_text(reader, identity: str) -> None:
+        try:
+            text = await reader.read_all()
+        except Exception as e:                                  # noqa: BLE001
+            obs.add("error", where="text_stream", detail=str(e))
+            return
+        if not (text or "").strip():
+            return
+        kind = "agent_text" if identity == obs.agent_identity else "user_text"
+        obs.add(kind, text=text.strip(), identity=identity)
+
+    async def _consume_audio(track) -> None:
+        stream = rtc.AudioStream(track)
+        try:
+            async for _frame in stream:
+                obs.audio_frames += 1
+                if obs.audio_first_t is None:
+                    obs.audio_first_t = obs.at()
+                    obs.add("agent_audio")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                                  # noqa: BLE001
+            obs.add("error", where="audio_stream", detail=str(e))
+
+    def _on_text(reader, identity: str) -> None:
+        asyncio.create_task(_consume_text(reader, identity))
+
+    @room.on("participant_connected")
+    def _on_participant(participant) -> None:
+        if obs.agent_identity is None:
+            obs.agent_identity = participant.identity
+            obs.add("agent_joined", identity=participant.identity)
+        _note_state((participant.attributes or {}).get("lk.agent.state"))
+
+    @room.on("participant_attributes_changed")
+    def _on_attrs(changed: dict, participant) -> None:
+        if participant.identity == obs.agent_identity:
+            _note_state((changed or {}).get("lk.agent.state"))
+
+    @room.on("track_subscribed")
+    def _on_track(track, publication, participant) -> None:
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            obs.add("audio_track", identity=participant.identity)
+            audio_tasks.append(asyncio.create_task(_consume_audio(track)))
+
+    room.register_text_stream_handler("lk.transcription", _on_text)
+
+    try:
+        await room.connect(conn_details["server_url"], conn_details["participant_token"])
+        obs.add("connected", room=conn_details["room_name"],
+                identity=room.local_participant.identity)
+
+        # The worker is auto-dispatched, so it may already be in the room.
+        deadline = time.time() + AGENT_JOIN_TIMEOUT_S
+        while obs.agent_identity is None and time.time() < deadline:
+            for participant in room.remote_participants.values():
+                obs.agent_identity = participant.identity
+                obs.add("agent_joined", identity=participant.identity)
+                _note_state((participant.attributes or {}).get("lk.agent.state"))
+                break
+            if obs.agent_identity is None:
+                await asyncio.sleep(0.25)
+        if obs.agent_identity is None:
+            _die(7, "no_agent", "no agent participant joined the room",
+                 "the worker may not be running for this environment, or "
+                 "dispatch may be misconfigured")
+
+        # Let the greeting land before speaking over it.
+        await _await_turn(agent_state, obs, turn_timeout, expect_speech=True)
+
+        call_deadline = obs.t0 + budget
+        for index, turn in enumerate(turns):
+            if time.time() > call_deadline:
+                obs.add("budget_exhausted", turn=index)
+                break
+            said = turn["say"]
+            obs.add("user_text", text=said, identity=room.local_participant.identity,
+                    turn=index)
+            await room.local_participant.send_text(said, topic="lk.chat")
+            obs.add("turn_sent", turn=index)
+            await _await_turn(agent_state, obs, turn_timeout, expect_speech=True,
+                              turn=index)
+    finally:
+        for task in audio_tasks:
+            task.cancel()
+        try:
+            await room.disconnect()
+        except Exception:                                       # noqa: BLE001
+            pass
+        obs.add("disconnected")
+
+
+async def _await_turn(agent_state: dict, obs: Observed, turn_timeout: float,
+                      expect_speech: bool, turn: int | None = None) -> None:
+    """Wait for one agent turn to complete.
+
+    Preferred signal: the agent's own `lk.agent.state` attribute leaving an idle
+    state and returning to one, which survives a long tool chain. Fallback: a
+    quiet window after the last transcription, recorded as such so a report
+    never implies a stronger signal than the one that fired.
+    """
+    started = time.time()
+    deadline = started + turn_timeout
+    saw_work = False
+    idle_since: float | None = None
+
+    while time.time() < deadline:
+        state = agent_state["value"]
+        if state in _WORKING_STATES:
+            saw_work = True
+            idle_since = None
+        elif saw_work and state in _IDLE_STATES:
+            now = time.time()
+            if idle_since is None:
+                idle_since = now
+            elif now - idle_since >= _IDLE_SETTLE_S:
+                obs.turn_signal = obs.turn_signal or "state"
+                obs.add("turn_complete", signal="state", turn=turn)
+                return
+        agent_state["changed"].clear()
+        try:
+            await asyncio.wait_for(agent_state["changed"].wait(), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
+        if state is None:
+            # No state attribute at all: fall back to a quiet window.
+            last = max((e["t"] for e in obs.events
+                        if e["kind"] == "agent_text"), default=None)
+            if last is not None and (obs.at() - last) > _QUIET_WINDOW_S:
+                obs.turn_signal = obs.turn_signal or "quiet"
+                obs.add("turn_complete", signal="quiet", turn=turn)
+                return
+
+    obs.add("turn_timeout", turn=turn, waited=round(time.time() - started, 1))
+    if expect_speech:
+        _die(7, "turn_timeout",
+             f"the agent did not finish its turn within {turn_timeout:.0f}s",
+             "raise --timeout, or run `probe` to see where the turn stalls")
+
+
+# ---------------------------------------------------------------------------
+# Evidence — what the platform recorded about the call
+# ---------------------------------------------------------------------------
+
+
+def _iso_to_epoch(value: str | None) -> float | None:
+    if not value:
+        return None
+    text = value.replace("Z", "+00:00")
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def gather_evidence(room_name: str, agent_id: str, obs: Observed,
+                    settle: float) -> dict:
+    """Resolve the call, then read back what the platform stored about it."""
+    call_id = platform_find_call_id(room_name, agent_id,
+                                    time.time() + CORRELATE_TIMEOUT_S)
+    evidence: dict = {"call_id": call_id, "call": None, "transcript": None,
+                      "runs": [], "settled": False}
+    if not call_id:
+        return evidence
+
+    deadline = time.time() + settle
+    call = None
+    while time.time() < deadline:
+        call = platform_get_call(call_id)
+        if call and call.get("status") in ("complete", "failed", "no answer"):
+            evidence["settled"] = True
+            break
+        time.sleep(2.0)
+    evidence["call"] = call
+
+    transcript = platform_get_transcript(call_id)
+    evidence["transcript"] = transcript
+
+    runs = []
+    for row in platform_get_runs(call_id):
+        started = _iso_to_epoch(row.get("started_at"))
+        result = platform_get_run_result(row.get("automation_id"), row.get("id"))
+        runs.append({
+            "id": row.get("id"),
+            "automation_id": row.get("automation_id"),
+            "name": row.get("automation_name") or "",
+            "status": row.get("status"),
+            "duration_ms": row.get("duration_ms"),
+            "started_at": row.get("started_at"),
+            "started_rel": round(started - obs.t0, 3) if started else None,
+            "args": row.get("args") or {},
+            "result": result,
+        })
+    evidence["runs"] = runs
+    return evidence
+
+
+# ---------------------------------------------------------------------------
+# Scenarios
+# ---------------------------------------------------------------------------
+
+
+def _scenarios_root(explicit: str | None) -> Path:
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.exists():
+            _die(3, "not_found", f"no such path: {path}")
+        return path
+    here = Path.cwd().resolve()
+    for directory in [here, *here.parents]:
+        candidate = directory / "callva" / "tests"
+        if candidate.is_dir():
+            return candidate
+    _die(3, "no_scenarios",
+         "no callva/tests directory found from here upward",
+         "scenarios live in <project>/callva/tests/<agent>/<language>/, "
+         "or pass --path")
+
+
+def load_scenario(path: Path) -> dict:
+    import yaml
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception as e:                                      # noqa: BLE001
+        _die(6, "bad_scenario", f"{path}: {e}")
+    if not isinstance(data, dict):
+        _die(6, "bad_scenario", f"{path}: expected a mapping at the top level")
+    data.setdefault("id", path.stem)
+    turns = data.get("turns") or []
+    if not isinstance(turns, list) or not turns:
+        _die(6, "bad_scenario", f"{path}: needs at least one turn")
+    for index, turn in enumerate(turns):
+        if not isinstance(turn, dict) or not turn.get("say"):
+            _die(6, "bad_scenario", f"{path}: turn {index} needs a `say`")
+    data["_path"] = str(path)
+    return data
+
+
+def discover_scenarios(root: Path) -> list:
+    if root.is_file():
+        return [root]
+    found = sorted(p for p in root.rglob("*.y*ml") if p.is_file())
+    if not found:
+        _die(3, "no_scenarios", f"no scenario files under {root}")
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Judge — the assertion for claims only language can settle
+# ---------------------------------------------------------------------------
+
+# Structured evidence is judged by code: which tool ran, with which arguments,
+# how many times, in what order. A judge is for the other half — the agent
+# speaks a language, and "kell kümme" is the same time as 10:00 without any
+# regular expression being able to say so. It is given the tool results as
+# ground truth, what the agent said, and one claim to settle.
+
+_JUDGE_SYSTEM = (
+    "You judge one claim about a voice agent's behaviour.\n"
+    "You are given the results the agent's tools returned, what the agent said, "
+    "and the claim to check.\n"
+    "The tool results are the ground truth. The agent speaks, so numbers, times "
+    "and dates said as words match their structured form; wording, politeness "
+    "and word order never matter.\n"
+    "Judge only the claim. Answer with JSON and nothing else: "
+    '{"verdict": true, "reason": "<at most twelve words>"}. '
+    "verdict is true only when the claim clearly holds. Decide first, then state "
+    "the reason briefly; never reason at length inside the reason field."
+)
+
+_VERDICT_RE = re.compile(r'"verdict"\s*:\s*(true|false)', re.I)
+
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.S)
+
+
+class JudgeError(Exception):
+    """A judgement that could not be made. Never a pass: an unproven claim is
+    unproven whatever the reason, so the caller turns this into a loud failure."""
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + " …[truncated]"
+
+
+def _select_judge(wanted: str | None) -> dict:
+    """Materialize a judge from the `judges` block of the connections envelope:
+    flag → default pointer → sole entry. Its key resolves through the ordinary
+    cascade, so a judge is configured exactly the way a CallVA tenant is and no
+    secret ever reaches argv."""
+    reg, reg_path = _connections_registry()
+    block = (reg or {}).get("judges")
+    judges = (block or {}).get("connections") if isinstance(block, dict) else None
+    if not isinstance(judges, dict) or not judges:
+        raise JudgeError(
+            f"no judges are declared in {reg_path} — a semantic assertion needs "
+            '{"judges": {"default": "<id>", "connections": {"<id>": '
+            '{"provider": "anthropic|cerebras", "model": "<model>", '
+            '"secret_env": "<ENV VAR>"}}}}')
+    if wanted:
+        if wanted not in judges:
+            raise JudgeError(f"no judge named {wanted!r}; known: {', '.join(judges)}")
+        jid = wanted
+    elif block.get("default"):
+        jid = block["default"]
+        if jid not in judges:
+            raise JudgeError(f"judges default points to unknown judge {jid!r}; "
+                             f"known: {', '.join(judges)}")
+    elif len(judges) == 1:
+        jid = next(iter(judges))
+    else:
+        raise JudgeError(f"{len(judges)} judges and no default; pass --judge <id>")
+
+    entry = judges[jid] or {}
+    provider = entry.get("provider")
+    if provider not in JUDGE_PROVIDERS:
+        raise JudgeError(f"judge {jid!r} declares provider {provider!r}; "
+                         f"known: {', '.join(JUDGE_PROVIDERS)}")
+    model = entry.get("model")
+    if not model:
+        raise JudgeError(f"judge {jid!r} is missing 'model'")
+    key_env = entry.get("secret_env") or JUDGE_PROVIDERS[provider]["key_env"]
+    api_key = _resolve_env_key(key_env)[0]
+    if not api_key:
+        raise JudgeError(f"env var {key_env} (for judge {jid!r}) is unset — set it "
+                         f"in the project's .env / .env.local, {CREDENTIALS_ENV}, "
+                         f"or the environment")
+    return {"id": jid, "provider": provider, "model": model, "key_env": key_env,
+            "api_key": api_key, "url": JUDGE_PROVIDERS[provider]["url"]}
+
+
+def _judge_call(cfg: dict, user: str) -> str:
+    """One judgement over whichever transport the judge declares."""
+    if cfg["provider"] == "anthropic":
+        headers = {"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"}
+        body = {"model": cfg["model"], "max_tokens": JUDGE_MAX_TOKENS, "temperature": 0,
+                "system": _JUDGE_SYSTEM,
+                "messages": [{"role": "user", "content": user}]}
+    else:
+        headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+        body = {"model": cfg["model"], "max_tokens": JUDGE_MAX_TOKENS, "temperature": 0,
+                "messages": [{"role": "system", "content": _JUDGE_SYSTEM},
+                             {"role": "user", "content": user}]}
+    # A shared judge endpoint throttles, and a fixture set of a dozen claims
+    # walks straight into it. Backing off is the difference between a real
+    # disagreement and a queue.
+    resp = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = httpx.post(cfg["url"], json=body, headers=headers,
+                              timeout=JUDGE_TIMEOUT_S)
+        except httpx.RequestError as e:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            raise JudgeError(f"judge {cfg['id']} unreachable: {e}") from e
+        if resp.status_code in (429, 503) or resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(float(resp.headers.get("Retry-After", attempt * 2.0)))
+                continue
+        break
+    if resp is None or resp.status_code >= 400:
+        status = resp.status_code if resp is not None else "no response"
+        raise JudgeError(f"judge {cfg['id']} returned HTTP {status}: "
+                         f"{_clip(resp.text if resp is not None else '', 200)}")
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise JudgeError(f"judge {cfg['id']} returned non-JSON") from e
+    if cfg["provider"] == "anthropic":
+        return "".join(block.get("text", "")
+                       for block in (data.get("content") or [])
+                       if block.get("type") == "text")
+    choices = data.get("choices") or []
+    message = (choices[0] or {}).get("message") if choices else {}
+    return (message or {}).get("content") or ""
+
+
+def judge_claim(cfg: dict, claim: str, said: str, results: list) -> tuple[bool, str]:
+    """Settle one claim, returning the verdict and the judge's own reason."""
+    user = (
+        "=== RESULTS THE AGENT'S TOOLS RETURNED ===\n"
+        f"{_clip(chr(10).join(results) or '(no tool returned anything)', 6000)}\n\n"
+        "=== WHAT THE AGENT SAID ===\n"
+        f"{_clip(said or '(the agent said nothing)', 4000)}\n\n"
+        "=== CLAIM TO CHECK ===\n"
+        f"{claim}"
+    )
+    text = _judge_call(cfg, user)
+    match = _JSON_OBJECT_RE.search(text or "")
+    if match:
+        try:
+            answer = json.loads(match.group(0))
+            if isinstance(answer.get("verdict"), bool):
+                return answer["verdict"], _clip(str(answer.get("reason") or ""), 200)
+        except ValueError:
+            pass
+    # A model that rambles into its reason field can run out of tokens mid-string
+    # and leave the JSON unclosed. The verdict is the payload and the reason is
+    # commentary, so a verdict that is legible on its own is still an answer.
+    salvaged = _VERDICT_RE.search(text or "")
+    if salvaged:
+        return salvaged.group(1).lower() == "true", "(reason truncated)"
+    raise JudgeError(f"judge {cfg['id']} answered without a legible verdict: "
+                     f"{_clip(text, 200)}")
+
+
+def _fixtures_root(explicit: str | None) -> Path:
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.exists():
+            _die(3, "not_found", f"no such path: {path}")
+        return path
+    here = Path.cwd().resolve()
+    for directory in [here, *here.parents]:
+        candidate = directory / "callva" / "judge"
+        if candidate.is_dir():
+            return candidate
+    _die(3, "no_fixtures",
+         "no callva/judge directory found from here upward",
+         "judge fixtures live in <project>/callva/judge/, or pass a path")
+
+
+def load_fixture(path: Path) -> dict:
+    import yaml
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception as e:                                      # noqa: BLE001
+        _die(6, "bad_fixture", f"{path}: {e}")
+    if not isinstance(data, dict):
+        _die(6, "bad_fixture", f"{path}: expected a mapping at the top level")
+    cases = data.get("cases")
+    if not isinstance(cases, list) or not cases:
+        _die(6, "bad_fixture", f"{path}: needs at least one case")
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict) or not case.get("claim"):
+            _die(6, "bad_fixture", f"{path}: case {index} needs a `claim`")
+        if not isinstance(case.get("expect"), bool):
+            _die(6, "bad_fixture",
+                 f"{path}: case {index} needs `expect: true` or `expect: false`")
+    data.setdefault("id", path.stem)
+    data["_path"] = str(path)
+    return data
+
+
+def judge_fixtures(cfg: dict, files: list) -> list:
+    """Run every frozen case past one judge and record where it disagreed."""
+    results = []
+    for path in files:
+        fixture = load_fixture(Path(path))
+        for index, case in enumerate(fixture["cases"]):
+            entry = {"case": f"{fixture['id']}[{index}]",
+                     "expected": case["expect"], "note": case.get("note", ""),
+                     "known_gap": bool(case.get("known_gap"))}
+            try:
+                verdict, reason = judge_claim(
+                    cfg, case["claim"], case.get("said") or "",
+                    [str(r) for r in (case.get("results") or [])])
+                entry.update({"ok": verdict == case["expect"],
+                              "verdict": verdict, "reason": reason})
+            except JudgeError as e:
+                entry.update({"ok": False, "verdict": None, "reason": str(e)})
+            results.append(entry)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Assertions
+# ---------------------------------------------------------------------------
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+
+def _matches_tool(run: dict, wanted: str) -> bool:
+    if _UUID_RE.match(wanted or ""):
+        return run.get("automation_id") == wanted
+    return _norm(wanted) in _norm(run.get("name", ""))
+
+
+def _result_text(run: dict) -> str:
+    result = run.get("result")
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False)
+
+
+class Checks:
+    """Collects verdicts so one scenario reports every failure, not just the
+    first — a failing run should say everything it knows in one pass."""
+
+    def __init__(self) -> None:
+        self.results: list = []
+
+    def add(self, ok: bool, name: str, detail: str = "", scope: str = "call") -> None:
+        self.results.append({"check": name, "scope": scope, "ok": bool(ok),
+                             "detail": detail})
+
+    @property
+    def failed(self) -> list:
+        return [r for r in self.results if not r["ok"]]
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed
+
+
+def _turn_windows(obs: Observed, turns: list) -> list:
+    """Each turn owns the interval from its send to the next turn's send."""
+    sends = [e for e in obs.events if e["kind"] == "turn_sent"]
+    windows = []
+    for index in range(len(turns)):
+        start = next((e["t"] for e in sends if e.get("turn") == index), None)
+        if start is None:
+            windows.append(None)
+            continue
+        later = [e["t"] for e in sends if (e.get("turn") or 0) > index]
+        windows.append((start, min(later) if later else float("inf")))
+    return windows
+
+
+def _runs_in(evidence: dict, window) -> list:
+    if window is None:
+        return []
+    start, end = window
+    return [r for r in evidence["runs"]
+            if r["started_rel"] is not None and start <= r["started_rel"] < end]
+
+
+_NO_TOOL_EVIDENCE = "call never correlated — no tool evidence to judge against"
+
+
+def evaluate(scenario: dict, obs: Observed, evidence: dict,
+             judge_ref: str | None = None) -> Checks:
+    checks = Checks()
+    turns = scenario["turns"]
+    windows = _turn_windows(obs, turns)
+
+    # The judge is resolved once, and only when a scenario actually asks for
+    # one, so a suite of purely deterministic scenarios needs no judge key.
+    cell: dict = {}
+
+    def settle(claim: str, said: str, runs: list) -> tuple[bool, str]:
+        try:
+            if "cfg" not in cell:
+                cell["cfg"] = _select_judge(judge_ref)
+                _STATE["judge"] = {k: v for k, v in cell["cfg"].items()
+                                   if k in ("id", "provider", "model")}
+            return judge_claim(cell["cfg"], claim, said,
+                               [_result_text(r) for r in runs])
+        except JudgeError as e:
+            return False, str(e)
+
+    # A call the platform never correlated yields an empty run list, and that
+    # emptiness is ignorance rather than proof. Every check that reads the runs
+    # as evidence of absence would otherwise go silently green on a harness
+    # fault, so they fail loudly and say why instead.
+    tool_evidence = evidence.get("call_id") is not None
+
+    for index, turn in enumerate(turns):
+        expect = turn.get("expect") or {}
+        window = windows[index]
+        scope = f"turn[{index}]"
+        reply = obs.said(since=window[0]) if window else ""
+        runs = _runs_in(evidence, window)
+
+        for wanted in _as_list(expect.get("tool_called")):
+            hit = [r for r in runs if _matches_tool(r, wanted)]
+            if hit:
+                detail = f"{len(hit)} run(s)"
+            elif tool_evidence:
+                detail = "no matching automation run in this turn's window"
+            else:
+                detail = _NO_TOOL_EVIDENCE
+            checks.add(bool(hit), f"tool_called:{wanted}", detail, scope)
+
+        for unwanted in _as_list(expect.get("tools_not_called")):
+            if not tool_evidence:
+                checks.add(False, f"tools_not_called:{unwanted}",
+                           _NO_TOOL_EVIDENCE, scope)
+                continue
+            hit = [r for r in runs if _matches_tool(r, unwanted)]
+            checks.add(not hit, f"tools_not_called:{unwanted}",
+                       f"called {len(hit)} time(s)" if hit else "", scope)
+
+        wanted_args = expect.get("tool_args") or {}
+        if wanted_args:
+            matched = runs[-1] if runs else None
+            if matched is None:
+                checks.add(False, "tool_args", "no run to check arguments on", scope)
+            else:
+                for key, value in wanted_args.items():
+                    actual = matched["args"].get(key)
+                    checks.add(str(actual) == str(value), f"tool_args:{key}",
+                               f"expected {value!r}, got {actual!r}", scope)
+
+        for claim in _as_list(expect.get("semantic")):
+            if not tool_evidence:
+                checks.add(False, f"semantic:{_clip(claim, 60)}",
+                           _NO_TOOL_EVIDENCE, scope)
+                continue
+            ok, reason = settle(claim, reply, runs)
+            checks.add(ok, f"semantic:{_clip(claim, 60)}", reason, scope)
+
+        for needle in _as_list(expect.get("reply_contains")):
+            checks.add(_norm(needle) in _norm(reply), f"reply_contains:{needle}",
+                       "", scope)
+        for needle in _as_list(expect.get("reply_not_contains")):
+            checks.add(_norm(needle) not in _norm(reply),
+                       f"reply_not_contains:{needle}", "", scope)
+        for pattern in _as_list(expect.get("reply_matches")):
+            checks.add(bool(re.search(pattern, reply)), f"reply_matches:{pattern}",
+                       "", scope)
+        for pattern in _as_list(expect.get("reply_not_matches")):
+            checks.add(not re.search(pattern, reply),
+                       f"reply_not_matches:{pattern}", "", scope)
+
+    call_expect = scenario.get("expect") or {}
+
+    if call_expect.get("audio_observed"):
+        checks.add(obs.audio_frames > 0, "audio_observed",
+                   f"{obs.audio_frames} frames")
+
+    if call_expect.get("assistant_turn_after_tool") and not tool_evidence:
+        checks.add(False, "assistant_turn_after_tool", _NO_TOOL_EVIDENCE)
+    elif call_expect.get("assistant_turn_after_tool"):
+        missing = []
+        for run in evidence["runs"]:
+            if run["status"] != "success" or run["started_rel"] is None:
+                continue
+            ended = run["started_rel"] + (run.get("duration_ms") or 0) / 1000.0
+            if not obs.speech(since=ended):
+                missing.append(run["name"])
+        checks.add(not missing, "assistant_turn_after_tool",
+                   f"silent after: {', '.join(missing)}" if missing else "")
+
+    if call_expect.get("no_internal_ids") and not tool_evidence:
+        checks.add(False, "no_internal_ids", _NO_TOOL_EVIDENCE)
+    elif call_expect.get("no_internal_ids"):
+        spoken = _norm(" ".join(e["text"] for e in obs.speech()))
+        leaked = []
+        for run in evidence["runs"]:
+            for key, value in (run["args"] or {}).items():
+                if not key.endswith("_id") or not value or key == "call_id":
+                    continue
+                token = str(value)
+                if len(token) < 2:
+                    continue
+                if re.search(rf"(?<!\d){re.escape(token)}(?!\d)", spoken):
+                    leaked.append(f"{key}={token}")
+        checks.add(not leaked, "no_internal_ids",
+                   f"spoken: {', '.join(sorted(set(leaked)))}" if leaked else "")
+
+    for claim in _as_list(call_expect.get("semantic")):
+        if not tool_evidence:
+            checks.add(False, f"semantic:{_clip(claim, 60)}", _NO_TOOL_EVIDENCE)
+            continue
+        ok, reason = settle(claim, obs.said(), evidence["runs"])
+        checks.add(ok, f"semantic:{_clip(claim, 60)}", reason)
+
+    for wanted, count in (call_expect.get("tool_call_count") or {}).items():
+        if not tool_evidence:
+            checks.add(False, f"tool_call_count:{wanted}", _NO_TOOL_EVIDENCE)
+            continue
+        hit = [r for r in evidence["runs"] if _matches_tool(r, wanted)]
+        checks.add(len(hit) == int(count), f"tool_call_count:{wanted}",
+                   f"expected {count}, got {len(hit)}")
+
+    post = call_expect.get("post_call") or {}
+    if post:
+        call = evidence.get("call") or {}
+        if not call:
+            checks.add(False, "post_call", "no call record was found")
+        for field, value in post.items():
+            actual = call.get(field)
+            checks.add(str(actual) == str(value), f"post_call:{field}",
+                       f"expected {value!r}, got {actual!r}")
+
+    return checks
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+# A call record carries the platform's own outcome fields plus whatever custom
+# fields the tenant defined, so the report names only the first kind and takes
+# the rest from what the scenario asserted. That is what reading a `post_call`
+# failure needs, and it keeps one tenant's schema out of this harness.
+_CALL_OUTCOME_FIELDS = ("status", "result", "duration")
+
+
+def _post_call_view(scenario: dict, call: dict) -> dict:
+    asserted = (scenario.get("expect") or {}).get("post_call") or {}
+    keys = dict.fromkeys([*_CALL_OUTCOME_FIELDS, *asserted])
+    return {k: call[k] for k in keys if k in call}
+
+
+def build_report(scenario: dict, conn: dict, agent_id: str, conn_details: dict,
+                 obs: Observed, evidence: dict, checks: Checks | None,
+                 with_results: bool) -> dict:
+    """The machine-readable record of one run.
+
+    Tool results stay out by default — they carry whatever personal data the
+    caller gave. Their shape is reported instead, which is what an assertion
+    failure needs to be read; pass --with-results when debugging a specific
+    mismatch.
+    """
+    runs = []
+    for run in evidence["runs"]:
+        entry = {k: run[k] for k in ("name", "status", "duration_ms",
+                                     "started_at", "started_rel", "args")}
+        result = run.get("result")
+        if with_results:
+            entry["result"] = result
+        else:
+            entry["result_shape"] = (sorted(result.keys())
+                                     if isinstance(result, dict)
+                                     else type(result).__name__)
+        runs.append(entry)
+    return {
+        "scenario": scenario.get("id"),
+        "scenario_path": scenario.get("_path"),
+        "agent": agent_id,
+        "connection": conn["id"],
+        "judge": _STATE.get("judge"),
+        "language": scenario.get("language"),
+        "room": conn_details.get("room_name"),
+        "call_id": evidence.get("call_id"),
+        "call_settled": evidence.get("settled"),
+        "turn_signal": obs.turn_signal,
+        "audio_frames": obs.audio_frames,
+        "audio_first_t": obs.audio_first_t,
+        "transcript": obs.transcript(),
+        "events": obs.events,
+        "tool_runs": runs,
+        "post_call": _post_call_view(scenario, evidence.get("call") or {}),
+        "checks": checks.results if checks else [],
+        "verdict": ("pass" if checks.ok else "fail") if checks else "observed",
+    }
+
+
+def _write_report(report, destination: str) -> None:
+    path = Path(destination).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+
+
+def _print_verdict(report: dict) -> None:
+    verdict = report["verdict"]
+    head = f"{verdict.upper():8} {report['scenario']}  agent={report['agent'][:8]}"
+    if report.get("call_id"):
+        head += f"  call={report['call_id']}"
+    sys.stdout.write(head + "\n")
+    if not report.get("call_id"):
+        sys.stdout.write(f"  warn  {_NO_TOOL_EVIDENCE}\n")
+    for check in report["checks"]:
+        if check["ok"]:
+            continue
+        detail = f" — {check['detail']}" if check["detail"] else ""
+        sys.stdout.write(f"  fail  {check['scope']} {check['check']}{detail}\n")
+    tools = ", ".join(f"{r['name'].strip()}({r['status']})" for r in report["tool_runs"])
+    if tools:
+        sys.stdout.write(f"  tools: {tools}\n")
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def _execute(scenario: dict, agent_ref: str | None, args) -> dict:
+    agent_id = _resolve_agent(agent_ref or scenario.get("agent") or "")
+    conn_details = platform_connect(agent_id)
+    obs = Observed()
+    try:
+        asyncio.run(_drive_call(conn_details, scenario["turns"], obs,
+                                args.timeout, args.budget))
+    finally:
+        evidence = gather_evidence(conn_details["room_name"], agent_id, obs,
+                                   SETTLE_TIMEOUT_S)
+    checks = (evaluate(scenario, obs, evidence, getattr(args, "judge", None))
+              if scenario.get("_assert", True) else None)
+    return build_report(scenario, _STATE["conn"], agent_id, conn_details, obs,
+                        evidence, checks, getattr(args, "with_results", False))
+
+
+def cmd_probe(args) -> None:
+    says = args.say or ["Tere!"]
+    scenario = {"id": "probe", "turns": [{"say": s} for s in says],
+                "agent": args.agent, "_assert": False, "_path": None}
+    report = _execute(scenario, args.agent, args)
+    _emit(report)
+
+
+def cmd_run(args) -> None:
+    scenario = load_scenario(Path(args.scenario).expanduser())
+    report = _execute(scenario, args.agent, args)
+    if args.report:
+        _write_report(report, args.report)
+    if args.json:
+        _emit(report)
+    else:
+        _print_verdict(report)
+    sys.exit(0 if report["verdict"] == "pass" else 1)
+
+
+def cmd_suite(args) -> None:
+    root = _scenarios_root(args.path)
+    reports = []
+    for path in discover_scenarios(root):
+        scenario = load_scenario(path)
+        reports.append(_execute(scenario, args.agent, args))
+        if not args.json:
+            _print_verdict(reports[-1])
+    summary = {"root": str(root), "total": len(reports),
+               "passed": sum(1 for r in reports if r["verdict"] == "pass"),
+               "failed": sum(1 for r in reports if r["verdict"] == "fail"),
+               "runs": reports}
+    if args.report:
+        _write_report(summary, args.report)
+    if args.json:
+        _emit(summary)
+    else:
+        sys.stdout.write(f"\n{summary['passed']}/{summary['total']} passed\n")
+    sys.exit(0 if summary["failed"] == 0 else 1)
+
+
+def cmd_fixtures(args) -> None:
+    """Judge the judge. A semantic assertion is only worth what its judge is
+    worth, and a judge changes under you — a new model, an edited prompt, a
+    different backend. Frozen material with known verdicts is what catches that,
+    and it catches it without placing a call."""
+    root = _fixtures_root(args.path)
+    files = ([root] if root.is_file()
+             else sorted(p for p in root.rglob("*.y*ml") if p.is_file()))
+    if not files:
+        _die(3, "no_fixtures", f"no fixture files under {root}")
+
+    if args.all_judges:
+        reg, _ = _connections_registry()
+        wanted = list((((reg or {}).get("judges") or {}).get("connections") or {}))
+        if not wanted:
+            _die(6, "no_judges",
+                 "no judges are declared in the connections envelope")
+    else:
+        wanted = [args.judge]        # None resolves to the registry's default
+
+    out: dict = {"root": str(root), "judges": {}}
+    disagreed = 0
+    for jid in wanted:
+        try:
+            cfg = _select_judge(jid)
+        except JudgeError as e:
+            out["judges"][jid or "default"] = {"ok": False, "error": str(e)}
+            disagreed += 1
+            continue
+        results = judge_fixtures(cfg, files)
+        # A case marked `known_gap` records a limit already measured rather than
+        # a regression to catch. It still runs and is still reported — a gate
+        # that is permanently red gates nothing, and a gap that closes is news.
+        missed = [r for r in results if not r["ok"] and not r["known_gap"]]
+        gaps = [r for r in results if not r["ok"] and r["known_gap"]]
+        closed = [r for r in results if r["ok"] and r["known_gap"]]
+        disagreed += len(missed)
+        out["judges"][cfg["id"]] = {
+            "ok": not missed, "provider": cfg["provider"], "model": cfg["model"],
+            "cases": len(results), "agreed": len(results) - len(missed) - len(gaps),
+            "known_gaps": len(gaps), "gaps_closed": [r["case"] for r in closed],
+            "results": results}
+
+    if args.report:
+        _write_report(out, args.report)
+    if args.json:
+        _emit(out)
+    else:
+        for jid, block in out["judges"].items():
+            if block.get("error"):
+                sys.stdout.write(f"{'ERROR':8} {jid} — {block['error']}\n")
+                continue
+            verdict = "PASS" if block["ok"] else "FAIL"
+            tail = (f"  +{block['known_gaps']} known gap(s)"
+                    if block["known_gaps"] else "")
+            sys.stdout.write(f"{verdict:8} {jid}  {block['agreed']}/{block['cases']}"
+                             f"  ({block['model']}){tail}\n")
+            for r in block["results"]:
+                if r["ok"]:
+                    continue
+                mark = "gap " if r["known_gap"] else "fail"
+                sys.stdout.write(f"  {mark}  {r['case']}  expected {r['expected']}, "
+                                 f"got {r['verdict']} — {r['reason']}\n")
+            for case in block["gaps_closed"]:
+                sys.stdout.write(f"  note  {case}  known gap no longer misses\n")
+    sys.exit(0 if disagreed == 0 else 1)
+
+
+def cmd_doctor(args) -> None:
+    report = _connections_report()
+    _doctor_gate(report, args.connection)
+    out: dict = {"connections": {}}
+    try:
+        import livekit.rtc as rtc                              # noqa: F401
+        out["livekit_rtc"] = "importable"
+    except Exception as e:                                     # noqa: BLE001
+        out["livekit_rtc"] = f"unavailable: {e}"
+    reg, _ = _connections_registry()
+    conns = (reg or {}).get("connections") or {"default": None}
+    for cid, entry in conns.items():
+        if args.connection and cid != args.connection:
+            continue
+        conn, problem = _build_conn(cid, entry, args.key_env, args.api_url)
+        if problem:
+            out["connections"][cid] = {"ok": False, "error": problem["code"],
+                                       "message": problem["message"]}
+            continue
+        _STATE["client"] = _client(conn["api_key"], conn["base"])
+        _STATE["conn"] = conn
+        agents = api("GET", "/external/agents", query={"per_page": 5})
+        rows = (agents or {}).get("data") or []
+        out["connections"][cid] = {
+            "ok": True, "base": conn["base"], "allow_write": conn["allow_write"],
+            "agents_visible": len(rows),
+            "agents": [{"id": a.get("id"), "name": a.get("name")} for a in rows],
+        }
+
+    # Judges are optional, so their absence is reported rather than failed. Each
+    # declared one is proven by asking it to settle a trivial claim: a key that
+    # resolves says nothing about a model that answers.
+    reg_judges = ((reg or {}).get("judges") or {}).get("connections") or {}
+    if reg_judges:
+        out["judges"] = {}
+        for jid in reg_judges:
+            try:
+                cfg = _select_judge(jid)
+                verdict, reason = judge_claim(
+                    cfg, "The agent said the time ten o'clock.",
+                    "Kõige varasem vaba aeg on kell kümme.", ["10:00"])
+                out["judges"][jid] = {"ok": verdict, "provider": cfg["provider"],
+                                      "model": cfg["model"], "reason": reason}
+            except JudgeError as e:
+                out["judges"][jid] = {"ok": False, "error": str(e)}
+    _emit(out)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def _add_common(parser) -> None:
+    parser.add_argument("--connection")
+    parser.add_argument("--judge")
+    parser.add_argument("--key-env", dest="key_env")
+    parser.add_argument("--api-url", dest="api_url")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--timeout", type=float, default=TURN_TIMEOUT_S)
+    parser.add_argument("--budget", type=float, default=CALL_BUDGET_S)
+    parser.add_argument("--with-results", dest="with_results", action="store_true")
+
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    _contract(argv)
+
+    parser = argparse.ArgumentParser(prog=NAME, add_help=False)
+    parser.add_argument("-h", "--help", action="store_true", dest="want_help")
+    subparsers = parser.add_subparsers(dest="command")
+
+    probe = subparsers.add_parser("probe", add_help=False)
+    probe.add_argument("--agent")
+    probe.add_argument("--say", action="append")
+    probe.add_argument("--turns", type=int)
+    _add_common(probe)
+    probe.set_defaults(func=cmd_probe)
+
+    run = subparsers.add_parser("run", add_help=False)
+    run.add_argument("scenario")
+    run.add_argument("--agent")
+    run.add_argument("--report")
+    _add_common(run)
+    run.set_defaults(func=cmd_run)
+
+    suite = subparsers.add_parser("suite", add_help=False)
+    suite.add_argument("path", nargs="?")
+    suite.add_argument("--agent")
+    suite.add_argument("--path", dest="path_flag")
+    suite.add_argument("--report")
+    _add_common(suite)
+    suite.set_defaults(func=cmd_suite)
+
+    fixtures = subparsers.add_parser("fixtures", add_help=False)
+    fixtures.add_argument("path", nargs="?")
+    fixtures.add_argument("--all-judges", dest="all_judges", action="store_true")
+    fixtures.add_argument("--report")
+    _add_common(fixtures)
+    fixtures.set_defaults(func=cmd_fixtures)
+
+    doctor = subparsers.add_parser("doctor", add_help=False)
+    _add_common(doctor)
+    doctor.set_defaults(func=cmd_doctor)
+
+    args = parser.parse_args(argv)
+    if getattr(args, "want_help", False) or not getattr(args, "command", None):
+        _cmd_help()
+        return
+    if args.command == "suite":
+        args.path = args.path_flag or args.path
+
+    # `fixtures` judges the judge on frozen material: no room, no call, and so
+    # no CallVA credential to resolve.
+    if args.command not in ("doctor", "fixtures"):
+        reg, _ = _connections_registry()
+        cid, entry = _select_connection(reg, args.connection)
+        conn, problem = _build_conn(cid, entry, args.key_env, args.api_url)
+        if problem:
+            _die(problem["exit"], problem["code"], problem["message"],
+                 problem.get("hint"))
+        _write_gate(cid, conn["allow_write"], args.command)
+        _STATE["client"] = _client(conn["api_key"], conn["base"])
+        _STATE["conn"] = conn
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

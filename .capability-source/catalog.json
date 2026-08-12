@@ -20,6 +20,11 @@
       "payload_sha256": "a2e59be8d634fb20049cac22766ac9b811573854ecc857f7e7790d956686005f",
       "summary": "CallVA voice-AI platform CLI over the External API — read/create/update/delete agents, assets (prompts), calls, transcripts, recordings, call analytics, custom fields, webhook schedules, automations (Windmill scripts), webhook logs, variables, settings, projects, phone numbers, and providers."
     },
+    "callvatest": {
+      "path": "capabilities/callvatest",
+      "payload_sha256": "66c7d587902c5adc629ba4420a7d36902fb238e2c0c500110672471c1ff56023",
+      "summary": "CallVA agent test harness — drives a deployed voice agent through a real LiveKit room over text, then asserts the transcript, the tools it called, the arguments it generated, the results it answered from, and the fields stored after the call."
+    },
     "clickup": {
       "path": "capabilities/clickup",
       "payload_sha256": "d705fc6878cae35a1f379b554b277b0ecda668c4516177310d0b6771df1d0a00",
