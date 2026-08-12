@@ -252,8 +252,9 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {"run", "suite", "probe"}   # each places a real, billable call
 WRITE_DEFAULT = True    # calls land in a tenant the consumer owns
-DOCS_BASE = ""
-TOPICS: list = []
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/callvatest/guides/")
+TOPICS = ["judging", "scenario-authoring"]
 STATE = False       # True when the capability writes session/cache state
 POST_INSTALL: list = []
 
