@@ -20,9 +20,9 @@ stored after the call. There is no test-only runtime path — the agent under te
 loads its production configuration and calls its production tools, so a passing
 run is evidence about production behaviour.
 
-Placing a call costs money and creates a real call record. `run`, `suite`, and
-`probe` are therefore write verbs: a connection with "allow_write": false refuses
-them, and no flag lifts that gate.
+Placing a call costs money and creates a real call record. `run`, `suite`,
+`probe`, and `session start` are therefore write verbs: a connection with
+"allow_write": false refuses them, and no flag lifts that gate.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
@@ -180,6 +180,39 @@ COMMANDS
         LiveKit RTC stack imports. Names the agents the key can see, and asks
         each declared judge to settle a trivial claim.
 
+SESSIONS
+  A scenario is written before the call; a session is decided during it. One
+  call is held open across separate invocations, so the next line is chosen
+  after reading the reply to the last one — which is how a person, or an agent
+  acting as one, actually talks.
+
+  session start [--agent <id|label>] [--text]
+        Place a call and leave it open. Billable, exactly as `run` is: this is
+        the write verb of the four. It returns
+        {"session","room","agent","mode","log","greeting","turns"} — the id
+        every other session verb takes, and the greeting already spoken.
+
+  session say <id> "<line>" [--timeout <s>]
+        Send one caller line and wait for the agent to finish answering it.
+        Returns {"session","turn","reply","elapsed"}: `reply` is what the agent
+        said in that turn alone. A turn that times out is reported as an error
+        and leaves the call up, so the next line — or `end` — still works.
+
+  session end <id>
+        Hang up and report. Returns the same object `run` produces —
+        transcript, events, tool runs with their arguments, the resolved call
+        id, and the post-call record once it settles — with "verdict":
+        "observed", because a session asserts nothing.
+
+  session list
+        Every session this machine holds: id, agent, room, mode, turns so far,
+        age, whether its holder is alive, and whether it has ended.
+
+  The call lives in a holder process that `start` leaves behind, and each event
+  is written to <session>/log.jsonl the moment it happens. So if the call drops
+  or the holder dies, nothing is lost: `say` then refuses by naming the log, and
+  `end` still reports from it plus whatever the platform can still be asked.
+
   Contract verbs: help, doctor, connections, stub, manifest --json,
   guide [<topic>], ids list|get|set|rm, refs.
 
@@ -213,9 +246,12 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import io
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -281,12 +317,14 @@ CRED_KEYS = [
     {"key": "CEREBRAS_API_KEY", "secret": True, "required": False,
      "note": "Judge key for a Cerebras-backed semantic assertion"},
 ]
-WRITE_VERBS = {"run", "suite", "probe"}   # each places a real, billable call
+# Each places a real, billable call; the other session verbs drive one already
+# placed.
+WRITE_VERBS = {"run", "suite", "probe", "session start"}
 WRITE_DEFAULT = True    # calls land in a tenant the consumer owns
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/callvatest/guides/")
-TOPICS = ["judging", "scenario-authoring"]
-STATE = False       # True when the capability writes session/cache state
+TOPICS = ["judging", "scenario-authoring", "sessions"]
+STATE = True        # True when the capability writes session/cache state
 POST_INSTALL: list = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -1438,12 +1476,59 @@ class Observed:
         self.agent_identity: str | None = None
         self.turn_signal: str | None = None   # "state" | "quiet" — how turns were bounded
         self.text_only = text_only            # the room carried no audio at all
+        self.log = None                       # open sink; events stream to it as they arrive
+
+    @classmethod
+    def replay(cls, events: list, t0: float, text_only: bool) -> "Observed":
+        """The witness rebuilt from a log — what a holder left on disk.
+
+        The frame count was the holder's own tally and does not survive it, so
+        it is reported as unknown rather than as zero: a report may say what it
+        does not know, never something untrue.
+        """
+        obs = cls(text_only=text_only)
+        obs.t0 = t0
+        obs.events = events
+        obs.audio_frames = None
+        for event in events:
+            kind = event.get("kind")
+            if kind == "agent_joined":
+                obs.agent_identity = event.get("identity")
+            elif kind == "agent_audio" and obs.audio_first_t is None:
+                obs.audio_first_t = event.get("t")
+            elif kind == "turn_complete":
+                obs.turn_signal = obs.turn_signal or event.get("signal")
+        return obs
+
+    def open_log(self, path: Path) -> None:
+        """Stream every event to this file as it is recorded.
+
+        A held call outlives the invocation that reads any one reply, so the
+        record has to be on disk before anything asks for it: a call that
+        drops, or a holder that is killed, still leaves everything witnessed up
+        to that moment readable.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.log = path.open("a", encoding="utf-8")
+        for event in self.events:
+            self._flush(event)
+
+    def _flush(self, event: dict) -> None:
+        try:
+            self.log.write(json.dumps(event, ensure_ascii=False) + "\n")
+            self.log.flush()
+        except (OSError, ValueError):
+            # Losing the sink costs the record, never the call.
+            self.log = None
 
     def at(self) -> float:
         return round(time.time() - self.t0, 3)
 
     def add(self, kind: str, **fields) -> None:
-        self.events.append({"kind": kind, "t": self.at(), **fields})
+        event = {"kind": kind, "t": self.at(), **fields}
+        self.events.append(event)
+        if self.log is not None:
+            self._flush(event)
         _tr(f"obs.{kind}", **fields)
 
     def speech(self, since: float = 0.0, until: float = float("inf")) -> list:
@@ -1480,79 +1565,87 @@ _SHORT_ACK_MAX_WORDS = 4
 _POLL_S = 0.2
 
 
-async def _drive_call(conn_details: dict, turns: list, obs: Observed,
-                      turn_timeout: float, budget: float) -> None:
-    """Join the room, let the greeting settle, then send each turn and wait for
-    the agent to finish answering it."""
-    import livekit.rtc as rtc
+class _CallRoom:
+    """One joined room and everything watching it.
 
-    room = rtc.Room()
-    audio_tasks: list = []
-    # The waiter needs the agent's *transitions*, not the state it happens to be
-    # in when it looks. A whole turn can begin and end between two glances — in
-    # text mode the greeting routinely does, inside a millisecond — so the
-    # observer stamps each edge as it arrives and the waiter reads the stamps.
-    agent_state: dict = {"value": None, "work_at": None, "idle_at": None}
-    # A call that loses its room, or acquires a second caller, is over — and it
-    # has to say so. Left unsaid it surfaces as a turn timeout at best and a
-    # traceback at worst, both of which describe the harness rather than the
-    # agent. Handlers record the first fault; the drive loop raises it.
-    fault: dict = {}
-    closed: dict = {}        # the room went while turns remained
-    driving = {"on": True}   # false once the scenario is done and we tear down
+    Joining, adopting the worker, and taking a turn are the same work whether
+    the turns were written in advance or arrive one at a time, so they live
+    here once: a scenario run drives this to a fixed list, a held session
+    drives it a line at a time.
+    """
 
-    def _fault(code: str, message: str, hint: str, exit_code: int = 5) -> None:
-        if driving["on"] and not fault:
-            fault.update({"code": code, "message": message, "hint": hint,
-                          "exit": exit_code})
+    def __init__(self, conn_details: dict, obs: Observed,
+                 turn_timeout: float) -> None:
+        from livekit import rtc
 
-    def _raise_fault() -> None:
-        if fault:
-            _die(fault["exit"], fault["code"], fault["message"], fault["hint"])
+        self.rtc = rtc
+        self.conn_details = conn_details
+        self.obs = obs
+        self.turn_timeout = turn_timeout
+        self.room = rtc.Room()
+        self.audio_tasks: list = []
+        # The waiter needs the agent's *transitions*, not the state it happens to
+        # be in when it looks. A whole turn can begin and end between two glances
+        # — in text mode the greeting routinely does, inside a millisecond — so
+        # the observer stamps each edge as it arrives and the waiter reads the
+        # stamps.
+        self.agent_state: dict = {"value": None, "work_at": None, "idle_at": None}
+        # A call that loses its room, or acquires a second caller, is over — and
+        # it has to say so. Left unsaid it surfaces as a turn timeout at best and
+        # a traceback at worst, both of which describe the harness rather than
+        # the agent. Handlers record the first fault; the driver raises it.
+        self.fault: dict = {}
+        self.closed: dict = {}        # the room went while the call was wanted
+        self.driving = {"on": True}   # false once we are done and tear down
+        self._wire()
 
-    def _note_state(value: str | None) -> None:
-        if not value or value == agent_state["value"]:
+    def _fault(self, code: str, message: str, hint: str, exit_code: int = 5) -> None:
+        if self.driving["on"] and not self.fault:
+            self.fault.update({"code": code, "message": message, "hint": hint,
+                               "exit": exit_code})
+
+    def raise_fault(self) -> None:
+        if self.fault:
+            _die(self.fault["exit"], self.fault["code"], self.fault["message"],
+                 self.fault["hint"])
+
+    def _note_state(self, value: str | None) -> None:
+        if not value or value == self.agent_state["value"]:
             return
-        agent_state["value"] = value
+        self.agent_state["value"] = value
         now = time.time()
         if value in _WORKING_STATES:
-            agent_state["work_at"] = now
-            agent_state["idle_at"] = None
+            self.agent_state["work_at"] = now
+            self.agent_state["idle_at"] = None
         elif value in _IDLE_STATES:
-            agent_state["idle_at"] = now
-        obs.add("agent_state", state=value)
+            self.agent_state["idle_at"] = now
+        self.obs.add("agent_state", state=value)
 
-    async def _consume_text(reader, identity: str) -> None:
+    async def _consume_text(self, reader, identity: str) -> None:
         try:
             text = await reader.read_all()
         except Exception as e:                                  # noqa: BLE001
-            obs.add("error", where="text_stream", detail=str(e))
+            self.obs.add("error", where="text_stream", detail=str(e))
             return
         if not (text or "").strip():
             return
-        kind = "agent_text" if identity == obs.agent_identity else "user_text"
-        obs.add(kind, text=text.strip(), identity=identity)
+        kind = "agent_text" if identity == self.obs.agent_identity else "user_text"
+        self.obs.add(kind, text=text.strip(), identity=identity)
 
-    async def _consume_audio(track) -> None:
-        stream = rtc.AudioStream(track)
+    async def _consume_audio(self, track) -> None:
+        stream = self.rtc.AudioStream(track)
         try:
             async for _frame in stream:
-                obs.audio_frames += 1
-                if obs.audio_first_t is None:
-                    obs.audio_first_t = obs.at()
-                    obs.add("agent_audio")
+                self.obs.audio_frames += 1
+                if self.obs.audio_first_t is None:
+                    self.obs.audio_first_t = self.obs.at()
+                    self.obs.add("agent_audio")
         except asyncio.CancelledError:
             raise
         except Exception as e:                                  # noqa: BLE001
-            obs.add("error", where="audio_stream", detail=str(e))
+            self.obs.add("error", where="audio_stream", detail=str(e))
 
-    def _on_text(reader, identity: str) -> None:
-        _tr("stream.open", identity=identity,
-            topic=getattr(getattr(reader, "info", None), "topic", None),
-            attrs=getattr(getattr(reader, "info", None), "attributes", None))
-        asyncio.create_task(_consume_text(reader, identity))
-
-    def _is_agent(participant) -> bool:
+    def _is_agent(self, participant) -> bool:
         """The worker, told apart from anyone else who is in the room.
 
         A room is supposed to hold this participant and the agent, but nothing
@@ -1560,83 +1653,96 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
         the agent's speech to a stranger. Kind is the platform's own answer;
         the identity prefix is the fallback for a worker that reports none.
         """
-        if getattr(participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+        kind = getattr(participant, "kind", None)
+        if kind == self.rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
             return True
         return (participant.identity or "").startswith("agent-")
 
-    def _adopt(participant) -> bool:
-        if obs.agent_identity is not None or not _is_agent(participant):
+    def _adopt(self, participant) -> bool:
+        if self.obs.agent_identity is not None or not self._is_agent(participant):
             return False
-        obs.agent_identity = participant.identity
-        obs.add("agent_joined", identity=participant.identity)
-        _note_state((participant.attributes or {}).get("lk.agent.state"))
+        self.obs.agent_identity = participant.identity
+        self.obs.add("agent_joined", identity=participant.identity)
+        self._note_state((participant.attributes or {}).get("lk.agent.state"))
         return True
 
-    @room.on("participant_connected")
-    def _on_participant(participant) -> None:
-        if not _adopt(participant) and not _is_agent(participant):
-            obs.add("stranger_joined", identity=participant.identity)
-            _fault("room_shared",
-                   f"another caller joined this room: {participant.identity}",
-                   _SHARED_ROOM_HINT, 6)
-        elif participant.identity == obs.agent_identity:
-            _note_state((participant.attributes or {}).get("lk.agent.state"))
+    def _wire(self) -> None:
+        room, obs = self.room, self.obs
 
-    @room.on("participant_attributes_changed")
-    def _on_attrs(changed: dict, participant) -> None:
-        if participant.identity == obs.agent_identity:
-            _note_state((changed or {}).get("lk.agent.state"))
+        def _on_text(reader, identity: str) -> None:
+            _tr("stream.open", identity=identity,
+                topic=getattr(getattr(reader, "info", None), "topic", None),
+                attrs=getattr(getattr(reader, "info", None), "attributes", None))
+            asyncio.create_task(self._consume_text(reader, identity))
 
-    @room.on("track_subscribed")
-    def _on_track(track, publication, participant) -> None:
-        if track.kind == rtc.TrackKind.KIND_AUDIO:
-            obs.add("audio_track", identity=participant.identity)
-            audio_tasks.append(asyncio.create_task(_consume_audio(track)))
+        @room.on("participant_connected")
+        def _on_participant(participant) -> None:
+            if not self._adopt(participant) and not self._is_agent(participant):
+                obs.add("stranger_joined", identity=participant.identity)
+                self._fault("room_shared",
+                            f"another caller joined this room: {participant.identity}",
+                            _SHARED_ROOM_HINT, 6)
+            elif participant.identity == obs.agent_identity:
+                self._note_state((participant.attributes or {}).get("lk.agent.state"))
 
-    @room.on("connection_state_changed")
-    def _on_conn_state(state) -> None:
-        _tr("room.connection_state", state=str(state))
+        @room.on("participant_attributes_changed")
+        def _on_attrs(changed: dict, participant) -> None:
+            if participant.identity == obs.agent_identity:
+                self._note_state((changed or {}).get("lk.agent.state"))
 
-    @room.on("disconnected")
-    def _on_disconnected(reason=None) -> None:
-        _tr("room.disconnected", reason=str(reason))
-        if driving["on"] and not closed:
-            # Whoever closed it, the call is over. That is a fact about the
-            # call rather than a broken run, so it is recorded and the drive
-            # loop stops — the evidence already earned still gets judged.
-            closed["reason"] = reason
+        @room.on("track_subscribed")
+        def _on_track(track, publication, participant) -> None:
+            if track.kind == self.rtc.TrackKind.KIND_AUDIO:
+                obs.add("audio_track", identity=participant.identity)
+                self.audio_tasks.append(asyncio.create_task(self._consume_audio(track)))
 
-    @room.on("reconnecting")
-    def _on_reconnecting() -> None:
-        _tr("room.reconnecting")
+        @room.on("connection_state_changed")
+        def _on_conn_state(state) -> None:
+            _tr("room.connection_state", state=str(state))
 
-    @room.on("reconnected")
-    def _on_reconnected() -> None:
-        _tr("room.reconnected")
+        @room.on("disconnected")
+        def _on_disconnected(reason=None) -> None:
+            _tr("room.disconnected", reason=str(reason))
+            if self.driving["on"] and not self.closed:
+                # Whoever closed it, the call is over. That is a fact about the
+                # call rather than a broken run, so it is recorded and the
+                # driver stops — the evidence already earned still gets judged.
+                self.closed["reason"] = reason
 
-    @room.on("participant_disconnected")
-    def _on_participant_gone(participant) -> None:
-        _tr("room.participant_disconnected", identity=participant.identity)
+        @room.on("reconnecting")
+        def _on_reconnecting() -> None:
+            _tr("room.reconnecting")
 
-    @room.on("data_received")
-    def _on_data(packet) -> None:
-        _tr("room.data_received", topic=getattr(packet, "topic", None),
-            size=len(getattr(packet, "data", b"") or b""))
+        @room.on("reconnected")
+        def _on_reconnected() -> None:
+            _tr("room.reconnected")
 
-    room.register_text_stream_handler("lk.transcription", _on_text)
+        @room.on("participant_disconnected")
+        def _on_participant_gone(participant) -> None:
+            _tr("room.participant_disconnected", identity=participant.identity)
 
-    try:
-        _tr("connect.begin", url=conn_details["server_url"],
-            room=conn_details["room_name"])
-        await room.connect(conn_details["server_url"], conn_details["participant_token"])
-        obs.add("connected", room=conn_details["room_name"],
+        @room.on("data_received")
+        def _on_data(packet) -> None:
+            _tr("room.data_received", topic=getattr(packet, "topic", None),
+                size=len(getattr(packet, "data", b"") or b""))
+
+        room.register_text_stream_handler("lk.transcription", _on_text)
+
+    async def join(self) -> None:
+        """Connect, adopt the worker, and let its greeting land."""
+        room, obs = self.room, self.obs
+        _tr("connect.begin", url=self.conn_details["server_url"],
+            room=self.conn_details["room_name"])
+        await room.connect(self.conn_details["server_url"],
+                           self.conn_details["participant_token"])
+        obs.add("connected", room=self.conn_details["room_name"],
                 identity=room.local_participant.identity)
 
         # The worker is auto-dispatched, so it may already be in the room.
         deadline = time.time() + AGENT_JOIN_TIMEOUT_S
         while obs.agent_identity is None and time.time() < deadline:
             for participant in list(room.remote_participants.values()):
-                if _adopt(participant):
+                if self._adopt(participant):
                     break
             if obs.agent_identity is None:
                 await asyncio.sleep(0.25)
@@ -1650,7 +1756,7 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
         # assertion afterwards is made about a conversation neither of them
         # had. Say so plainly instead of letting it surface as a timeout.
         strangers = [p.identity for p in room.remote_participants.values()
-                     if not _is_agent(p)]
+                     if not self._is_agent(p)]
         if strangers:
             _die(6, "room_shared",
                  f"another caller is in this room: {', '.join(strangers)}",
@@ -1658,65 +1764,89 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
 
         # Let the greeting land before speaking over it. Anything the agent does
         # after we joined belongs to the greeting, so the window opens at t0.
-        await _await_turn(agent_state, obs, turn_timeout, expect_speech=True,
-                          since=obs.t0, fault=fault, closed=closed)
+        await self.await_turn(since=obs.t0)
 
+    async def send(self, said: str, turn: int | None = None) -> float | None:
+        """Deliver one caller line; the epoch it went, or None if the call ended
+        under it."""
+        room, obs = self.room, self.obs
+        obs.add("user_text", text=said, identity=room.local_participant.identity,
+                turn=turn)
+        _tr("send.begin", turn=turn, state=str(room.connection_state),
+            remote=list(room.remote_participants.keys()))
+        sent_at = time.time()
+        try:
+            info = await room.local_participant.send_text(said, topic="lk.chat")
+            _tr("send.ok", turn=turn,
+                elapsed=round(time.time() - sent_at, 3),
+                stream_id=getattr(info, "stream_id", None))
+        except Exception as e:                                  # noqa: BLE001
+            _tr("send.failed", turn=turn, error=repr(e),
+                elapsed=round(time.time() - sent_at, 3))
+            # Whatever closed the transport is the real story; a traceback out
+            # of the SDK is not an answer this tool is allowed to give.
+            self.raise_fault()
+            if self.closed:
+                return None
+            obs.add("send_failed", turn=turn, detail=str(e))
+            _die(5, "send_failed",
+                 f"turn {turn} could not be delivered to the agent: {e}",
+                 "the transport went while the call was running; `--trace` "
+                 "shows the last thing that happened before it did")
+        obs.add("turn_sent", turn=turn)
+        return sent_at
+
+    async def await_turn(self, since: float, turn: int | None = None,
+                         timeout: float | None = None) -> None:
+        await _await_turn(self.agent_state, self.obs,
+                          self.turn_timeout if timeout is None else timeout,
+                          expect_speech=True, since=since, turn=turn,
+                          fault=self.fault, closed=self.closed)
+
+    async def close(self) -> None:
+        # Our own teardown disconnects the room; past this point a fault is the
+        # expected end of the call rather than something that went wrong.
+        self.driving["on"] = False
+        for task in self.audio_tasks:
+            task.cancel()
+        try:
+            await self.room.disconnect()
+        except Exception:                                       # noqa: BLE001
+            pass
+        self.obs.add("disconnected")
+
+
+async def _drive_call(conn_details: dict, turns: list, obs: Observed,
+                      turn_timeout: float, budget: float) -> None:
+    """Join the room, let the greeting settle, then send each turn and wait for
+    the agent to finish answering it."""
+    call = _CallRoom(conn_details, obs, turn_timeout)
+    try:
+        await call.join()
         call_deadline = obs.t0 + budget
         for index, turn in enumerate(turns):
-            _raise_fault()
-            if closed:
-                obs.add("call_ended_early", reason=str(closed["reason"]),
+            call.raise_fault()
+            if call.closed:
+                obs.add("call_ended_early", reason=str(call.closed["reason"]),
                         after_turn=index - 1, turns_left=len(turns) - index)
                 break
             if time.time() > call_deadline:
                 obs.add("budget_exhausted", turn=index)
                 break
-            said = turn["say"]
-            obs.add("user_text", text=said, identity=room.local_participant.identity,
-                    turn=index)
-            _tr("send.begin", turn=index, state=str(room.connection_state),
-                remote=list(room.remote_participants.keys()))
-            sent_at = time.time()
-            try:
-                info = await room.local_participant.send_text(said, topic="lk.chat")
-                _tr("send.ok", turn=index,
-                    elapsed=round(time.time() - sent_at, 3),
-                    stream_id=getattr(info, "stream_id", None))
-            except Exception as e:                              # noqa: BLE001
-                _tr("send.failed", turn=index, error=repr(e),
-                    elapsed=round(time.time() - sent_at, 3))
-                # Whatever closed the transport is the real story; a traceback
-                # out of the SDK is not an answer this tool is allowed to give.
-                _raise_fault()
-                if closed:
-                    obs.add("call_ended_early", reason=str(closed["reason"]),
-                            after_turn=index - 1, turns_left=len(turns) - index)
-                    break
-                obs.add("send_failed", turn=index, detail=str(e))
-                _die(5, "send_failed",
-                     f"turn {index} could not be delivered to the agent: {e}",
-                     "the transport went while the call was running; `--trace` "
-                     "shows the last thing that happened before it did")
-            obs.add("turn_sent", turn=index)
-            await _await_turn(agent_state, obs, turn_timeout, expect_speech=True,
-                              since=sent_at, turn=index, fault=fault, closed=closed)
+            sent_at = await call.send(turn["say"], turn=index)
+            if sent_at is None:
+                obs.add("call_ended_early", reason=str(call.closed["reason"]),
+                        after_turn=index - 1, turns_left=len(turns) - index)
+                break
+            await call.await_turn(since=sent_at, turn=index)
             pause = float(turn.get("pause_after_reply") or 0)
             if pause > 0 and index < len(turns) - 1:
                 obs.add("turn_pause_started", turn=index, seconds=pause)
                 await asyncio.sleep(pause)
                 obs.add("turn_pause_complete", turn=index, seconds=pause)
-        _raise_fault()
+        call.raise_fault()
     finally:
-        # Our own teardown disconnects the room; past this point a fault is
-        # the expected end of the call rather than something that went wrong.
-        driving["on"] = False
-        for task in audio_tasks:
-            task.cancel()
-        try:
-            await room.disconnect()
-        except Exception:                                       # noqa: BLE001
-            pass
-        obs.add("disconnected")
+        await call.close()
 
 
 async def _await_turn(agent_state: dict, obs: Observed, turn_timeout: float,
@@ -2739,6 +2869,394 @@ def cmd_doctor(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sessions — one call held open across separate invocations
+# ---------------------------------------------------------------------------
+
+# A scenario is written before the call; a session is decided during it. The
+# room lives in one process's event loop and cannot survive it, so `start`
+# leaves a holder process behind that owns the call and answers over a unix
+# socket: `say` hands it a line and gets back what the agent said to it, `end`
+# tears the call down and reports on it.
+
+_SESSION_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]*$")
+# Connect, the worker's join, and the greeting — the holder's whole startup.
+SESSION_START_TIMEOUT_S = AGENT_JOIN_TIMEOUT_S + TURN_TIMEOUT_S + 60.0
+# Ending waits out the same settle a run does before it can report.
+SESSION_END_TIMEOUT_S = CORRELATE_TIMEOUT_S + SETTLE_TIMEOUT_S + 60.0
+SESSION_SLACK_S = 15.0       # the holder answers a turn; the client waits a little longer
+
+
+@contextlib.contextmanager
+def _captured_die():
+    """Turn a refusal into an answer.
+
+    `_die` is this tool's one way to refuse, and it ends the process. Inside a
+    holder that is the wrong end: one turn that times out must be reported to
+    whoever asked for it, and the call it belongs to must stay up so the
+    operator can still end it and keep its report. The envelope is caught as
+    written — the same code, message, and hint any other invocation prints.
+    """
+    buffer = io.StringIO()
+    real, box = sys.stderr, {}
+    sys.stderr = buffer
+    try:
+        yield box
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+        box.update({"exit": code, "error": _parse_die(buffer.getvalue())})
+    finally:
+        sys.stderr = real
+        real.write(buffer.getvalue())
+        real.flush()
+
+
+def _parse_die(text: str) -> dict:
+    for line in reversed(text.splitlines()):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("error"), dict):
+            return value["error"]
+    return {"code": "failed", "message": "the call ended without saying why"}
+
+
+def _sessions_root() -> Path:
+    return _state_dir() / "sessions"
+
+
+def _session_dir(sid: str) -> Path:
+    if not _SESSION_ID_RE.match(sid or ""):
+        _die(6, "bad_session_id", f"{sid!r} is not a session id")
+    return _sessions_root() / sid
+
+
+def _session_meta(sdir: Path) -> dict:
+    try:
+        return json.loads((sdir / "meta.json").read_text())
+    except (OSError, ValueError):
+        _die(3, "unknown_session", f"no live session record at {sdir}",
+             f"`{NAME} session list` names the sessions this machine holds")
+
+
+def _session_events(sdir: Path) -> list:
+    """The event stream as it stands on disk right now."""
+    events: list = []
+    try:
+        text = (sdir / "log.jsonl").read_text()
+    except OSError:
+        return events
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue        # a half-written last line: the holder died mid-flush
+    return events
+
+
+def _session_alive(meta: dict, sdir: Path) -> bool:
+    pid = meta.get("pid")
+    if not isinstance(pid, int) or not (sdir / "sock").exists():
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _session_ask(sdir: Path, request: dict, timeout: float,
+                 missing_ok: bool = False) -> dict | None:
+    """One request, one response, over the session's socket."""
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    buf = b""
+    try:
+        conn.connect(str(sdir / "sock"))
+        conn.sendall(json.dumps(request, ensure_ascii=False).encode() + b"\n")
+        while b"\n" not in buf:
+            block = conn.recv(65536)
+            if not block:
+                break
+            buf += block
+    except TimeoutError:
+        _die(7, "session_stalled",
+             f"the holder did not answer within {timeout:.0f}s",
+             f"what it witnessed is at {sdir / 'log.jsonl'}")
+    except OSError:
+        if missing_ok:
+            return None
+        _die(5, "session_gone",
+             "this session has no live holder — the call is over",
+             f"everything it witnessed is at {sdir / 'log.jsonl'}; "
+             f"`{NAME} session end {sdir.name}` still reports what it holds")
+    finally:
+        conn.close()
+    try:
+        response = json.loads(buf.decode())
+    except ValueError:
+        _die(5, "session_gone",
+             "the holder answered with nothing usable — the call is over",
+             f"everything it witnessed is at {sdir / 'log.jsonl'}")
+    if isinstance(response.get("error"), dict):
+        err = response["error"]
+        _die(response.get("exit") or 5, err.get("code") or "failed",
+             err.get("message") or "the holder refused", err.get("hint"))
+    return response
+
+
+def _session_report(meta: dict, obs: Observed, recovered: bool) -> dict:
+    """What a session amounts to, in the shape a run reports.
+
+    A session asserts nothing — the operator decided each line as it went — so
+    it reports observed rather than a verdict, and everything a run gathers
+    about the call afterwards is gathered the same way.
+    """
+    scenario = {"id": f"session:{meta['session']}", "_path": None, "_assert": False}
+    try:
+        evidence = gather_evidence(meta.get("room") or "", meta["agent"], obs,
+                                   SETTLE_TIMEOUT_S)
+    except BaseException as e:                                  # noqa: BLE001
+        # A session ends with a report or with nothing; the platform being
+        # unreachable must not cost the record the holder already wrote.
+        evidence = {"call_id": None, "call": None, "transcript": None,
+                    "runs": [], "settled": False, "error": repr(e)}
+    report = build_report(scenario, _STATE["conn"], meta["agent"],
+                          {"room_name": meta.get("room")}, obs, evidence,
+                          None, False)
+    report["session"] = meta["session"]
+    report["recovered"] = recovered
+    return report
+
+
+async def _serve_session(sdir: Path, meta: dict, call: _CallRoom,
+                         obs: Observed) -> None:
+    """Serve one request at a time until the session is told to end."""
+    state = {"turns": 0}
+    stop = asyncio.Event()
+    lock = asyncio.Lock()
+
+    def _status() -> dict:
+        return {"session": meta["session"], "room": meta["room"],
+                "agent": meta["agent"], "mode": meta["mode"],
+                "log": str(sdir / "log.jsonl"), "turns": state["turns"],
+                "greeting": obs.said()}
+
+    async def _say(request: dict) -> dict:
+        turn = state["turns"]
+        state["turns"] += 1
+        timeout = float(request.get("timeout") or call.turn_timeout)
+        sent_at = None
+        with _captured_die() as box:
+            sent_at = await call.send(request.get("text") or "", turn=turn)
+            if sent_at is None:
+                obs.add("call_ended_early", reason=str(call.closed.get("reason")),
+                        after_turn=turn - 1)
+                _die(5, "call_ended",
+                     "the call ended before the line could be delivered",
+                     f"`{NAME} session end {meta['session']}` reports what it holds")
+            await call.await_turn(since=sent_at, turn=turn, timeout=timeout)
+        if box:
+            return box
+        return {"session": meta["session"], "turn": turn,
+                "reply": obs.said(since=sent_at - obs.t0),
+                "elapsed": round(time.time() - sent_at, 3)}
+
+    async def _end() -> dict:
+        await call.close()
+        report = _session_report(meta, obs, recovered=False)
+        _write_report(report, str(sdir / "report.json"))
+        stop.set()
+        return report
+
+    async def _dispatch(request: dict) -> dict:
+        op = request.get("op")
+        if op == "say":
+            return await _say(request)
+        if op == "end":
+            return await _end()
+        if op == "status":
+            return _status()
+        return {"exit": 6, "error": {"code": "bad_request",
+                                     "message": f"unknown op {op!r}"}}
+
+    async def _client(reader, writer) -> None:
+        try:
+            line = await reader.readline()
+            try:
+                request = json.loads(line.decode() or "{}")
+            except ValueError:
+                request = {}
+            async with lock:
+                response = await _dispatch(request)
+            writer.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
+            await writer.drain()
+        finally:
+            writer.close()
+
+    sock_path = sdir / "sock"
+    sock_path.unlink(missing_ok=True)
+    server = await asyncio.start_unix_server(_client, path=str(sock_path))
+    os.chmod(sock_path, 0o600)
+    try:
+        await stop.wait()
+    finally:
+        server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def cmd_session_start(args) -> None:
+    """Place a call and leave it open. Billable, exactly as `run` is."""
+    agent_id = _resolve_agent(args.agent or "")
+    sid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
+    sdir = _session_dir(sid)
+    sdir.mkdir(parents=True, exist_ok=True)
+    os.chmod(sdir, 0o700)
+
+    script = str(Path(__file__).resolve())
+    cmd = [sys.executable, script, "session", "hold", sid, "--agent", agent_id,
+           "--timeout", str(args.timeout)]
+    for flag, value in (("--connection", args.connection),
+                        ("--api-url", args.api_url), ("--key-env", args.key_env)):
+        if value:
+            cmd += [flag, value]
+    if args.text:
+        cmd.append("--text")
+    if args.trace:
+        cmd.append("--trace")
+    # setsid: the holder owns the call, so it must outlive the invocation that
+    # asked for it. Its own stderr is kept beside the log — a holder that never
+    # comes up has to be readable somewhere.
+    with (sdir / "holder.err").open("ab") as err:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=err,
+                                stderr=err, start_new_session=True)
+
+    deadline = time.time() + SESSION_START_TIMEOUT_S
+    while time.time() < deadline:
+        if (sdir / "sock").exists():
+            _emit(_session_ask(sdir, {"op": "status"}, SESSION_SLACK_S))
+            return
+        failure = sdir / "error.json"
+        if failure.exists():
+            try:
+                box = json.loads(failure.read_text())
+            except (OSError, ValueError):
+                break
+            err = box.get("error") or {}
+            _die(box.get("exit") or 5, err.get("code") or "failed",
+                 err.get("message") or "the call did not start", err.get("hint"))
+        if proc.poll() is not None:
+            _die(5, "holder_died",
+                 f"the session holder exited ({proc.returncode}) before the "
+                 "call was up",
+                 f"its own output is at {sdir / 'holder.err'}")
+        time.sleep(0.2)
+    _die(7, "session_start_timeout",
+         f"the call was not up within {SESSION_START_TIMEOUT_S:.0f}s",
+         f"the holder's output is at {sdir / 'holder.err'}")
+
+
+def cmd_session_hold(args) -> None:
+    """The holder. Detached by `session start`; owns the call until told to end.
+
+    Internal: an operator drives a session through start/say/end, never this.
+    """
+    sdir = _session_dir(args.session)
+    if not sdir.is_dir():
+        _die(3, "unknown_session", f"no session directory at {sdir}")
+    text_only = bool(args.text)
+    obs = Observed(text_only=text_only)
+    obs.open_log(sdir / "log.jsonl")
+
+    # Only the startup is captured: past it the holder serves for as long as the
+    # operator keeps talking, and its stderr belongs on stderr as it happens.
+    with _captured_die() as box:
+        conn_details = platform_connect(args.agent, text_only)
+        meta = {"session": args.session, "agent": args.agent,
+                "connection": _STATE["conn"]["id"],
+                "mode": "text" if text_only else "voice",
+                "room": conn_details["room_name"],
+                "server_url": conn_details["server_url"],
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "t0": obs.t0, "pid": os.getpid()}
+        _write_report(meta, str(sdir / "meta.json"))
+    if not box:
+        box = asyncio.run(_hold_call(sdir, meta, conn_details, obs, args.timeout))
+    if box:
+        _write_report(box, str(sdir / "error.json"))
+        sys.exit(box.get("exit") or 1)
+
+
+async def _hold_call(sdir: Path, meta: dict, conn_details: dict, obs: Observed,
+                     turn_timeout: float) -> dict:
+    """Join, then serve. The envelope of a join that refused, else empty."""
+    call = _CallRoom(conn_details, obs, turn_timeout)
+    with _captured_die() as box:
+        await call.join()
+    if box:
+        await call.close()
+        return box
+    await _serve_session(sdir, meta, call, obs)
+    return {}
+
+
+def cmd_session_say(args) -> None:
+    sdir = _session_dir(args.session)
+    _session_meta(sdir)
+    response = _session_ask(sdir, {"op": "say", "text": args.text,
+                                   "timeout": args.timeout},
+                            args.timeout + SESSION_SLACK_S)
+    _emit(response)
+
+
+def cmd_session_end(args) -> None:
+    sdir = _session_dir(args.session)
+    meta = _session_meta(sdir)
+    response = _session_ask(sdir, {"op": "end"}, SESSION_END_TIMEOUT_S,
+                            missing_ok=True)
+    if response is not None:
+        _emit(response)
+        return
+    # The holder is gone — the call dropped, the process died, the machine
+    # slept. Everything it witnessed is already on disk, and the room name is
+    # enough to ask the platform for the rest.
+    (sdir / "sock").unlink(missing_ok=True)
+    obs = Observed.replay(_session_events(sdir),
+                          meta.get("t0") or _iso_to_epoch(meta.get("started_at"))
+                          or time.time(),
+                          meta.get("mode") == "text")
+    report = _session_report(meta, obs, recovered=True)
+    _write_report(report, str(sdir / "report.json"))
+    _emit(report)
+
+
+def cmd_session_list(args) -> None:
+    root = _sessions_root()
+    rows = []
+    for sdir in sorted(p for p in root.glob("*") if p.is_dir()):
+        try:
+            meta = json.loads((sdir / "meta.json").read_text())
+        except (OSError, ValueError):
+            continue        # a holder that died before it had a call to record
+        events = _session_events(sdir)
+        t0 = meta.get("t0") or _iso_to_epoch(meta.get("started_at")) or time.time()
+        rows.append({
+            "session": meta.get("session") or sdir.name,
+            "agent": meta.get("agent"), "room": meta.get("room"),
+            "mode": meta.get("mode"),
+            "turns": sum(1 for e in events if e.get("kind") == "turn_sent"),
+            "age": round(time.time() - t0, 1),
+            "alive": _session_alive(meta, sdir),
+            "ended": (sdir / "report.json").exists(),
+            "dir": str(sdir),
+        })
+    _emit({"root": str(root), "sessions": rows})
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -2799,10 +3317,29 @@ def main() -> None:
     _add_common(doctor)
     doctor.set_defaults(func=cmd_doctor)
 
+    session = subparsers.add_parser("session", add_help=False)
+    session_subs = session.add_subparsers(dest="session_command")
+    for name, func, positionals in (
+        ("start", cmd_session_start, []),
+        ("hold", cmd_session_hold, ["session"]),
+        ("say", cmd_session_say, ["session", "text"]),
+        ("end", cmd_session_end, ["session"]),
+        ("list", cmd_session_list, []),
+    ):
+        sub = session_subs.add_parser(name, add_help=False)
+        for positional in positionals:
+            sub.add_argument(positional)
+        sub.add_argument("--agent")
+        _add_common(sub)
+        sub.set_defaults(func=func)
+
     args = parser.parse_args(argv)
     if getattr(args, "want_help", False) or not getattr(args, "command", None):
         _cmd_help()
         return
+    if args.command == "session" and not getattr(args, "session_command", None):
+        _die(6, "usage", "session needs a subcommand",
+             "start | say <id> <line> | end <id> | list")
     if getattr(args, "trace", False):
         _trace_on()
     if args.command == "suite":
@@ -2817,7 +3354,14 @@ def main() -> None:
         if problem:
             _die(problem["exit"], problem["code"], problem["message"],
                  problem.get("hint"))
-        _write_gate(cid, conn["allow_write"], args.command)
+        # Only one session verb places a call; `hold` is the process that places
+        # it, so both answer to the same gate.
+        verb = args.command
+        if verb == "session":
+            verb = ("session start"
+                    if args.session_command in ("start", "hold")
+                    else f"session {args.session_command}")
+        _write_gate(cid, conn["allow_write"], verb)
         _STATE["client"] = _client(conn["api_key"], conn["base"])
         _STATE["conn"] = conn
 
