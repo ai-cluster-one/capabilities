@@ -1296,12 +1296,15 @@ class Observed:
     def add(self, kind: str, **fields) -> None:
         self.events.append({"kind": kind, "t": self.at(), **fields})
 
-    def speech(self, since: float = 0.0) -> list:
+    def speech(self, since: float = 0.0, until: float = float("inf")) -> list:
         return [e for e in self.events
-                if e["kind"] == "agent_text" and e["t"] >= since]
+                if (e["kind"] == "agent_text"
+                    and since <= e["t"] < until)]
 
-    def said(self, since: float = 0.0) -> str:
-        return " ".join(e["text"] for e in self.speech(since)).strip()
+    def said(self, since: float = 0.0, until: float = float("inf")) -> str:
+        return " ".join(
+            e["text"] for e in self.speech(since, until)
+        ).strip()
 
     def transcript(self) -> list:
         return [{"role": e["kind"].replace("_text", ""), "t": e["t"], "text": e["text"]}
@@ -1951,7 +1954,7 @@ def evaluate(scenario: dict, obs: Observed, evidence: dict,
         expect = turn.get("expect") or {}
         window = windows[index]
         scope = f"turn[{index}]"
-        reply = obs.said(since=window[0]) if window else ""
+        reply = obs.said(since=window[0], until=window[1]) if window else ""
         runs = _runs_in(evidence, window)
 
         for wanted in _as_list(expect.get("tool_called")):
