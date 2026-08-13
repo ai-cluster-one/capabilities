@@ -146,8 +146,11 @@ COMMANDS
   run <scenario> [--agent <id|label>] [--report FILE]
         Execute one scenario and print its verdict. Exit 1 when it fails.
 
-  suite [<path>] [--agent <id|label>] [--report FILE]
-        Execute every scenario under a path, sequentially. Exit 1 if any fails.
+  suite [<path>] [--agent <id|label>] [--jobs N] [--report FILE]
+        Execute every scenario under a path. Exit 1 if any fails. --jobs runs N
+        calls at once; connects are spaced so no two share a room, and reports
+        keep scenario order however the runs finish. A scenario that collapses
+        is counted as a failure and named, and the rest of the suite continues.
 
   fixtures [<path>] [--judge <id>] [--all-judges] [--report FILE]
         Judge the judge, without placing a call. Each fixture case freezes tool
@@ -194,14 +197,22 @@ GLOBAL OPTIONS
   --json              machine-readable output where a verb has a prose default
   --timeout <S>       per-turn timeout in seconds (default 45)
   --budget <S>        whole-call budget in seconds (default 300)
+  --trace             write the run's own instrument to stderr: every room
+                      lifecycle event, each send and its outcome, and the SDK's
+                      internals, on one clock. Reach for it when a run times out
+                      and the report cannot say why. Output on stdout is
+                      unaffected, so a report stays machine-readable.
 
 EXIT CODES
   0 ok · 1 assertion failed · 2 credentials · 3 not found · 4 policy
-  5 upstream/transport · 6 invalid input · 7 timeout waiting on the agent
+  5 upstream/transport · 6 room shared with another caller, or invalid input
+  7 timeout waiting on the agent
 """
 
 import argparse
 import asyncio
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -226,6 +237,19 @@ CALL_BUDGET_S = 300.0        # whole-call ceiling
 AGENT_JOIN_TIMEOUT_S = 30.0  # how long to wait for the worker to join the room
 SETTLE_TIMEOUT_S = 60.0      # how long to wait for the platform to settle the call
 CORRELATE_TIMEOUT_S = 30.0   # how long to wait for the call id to become known
+
+# The platform names a test room after the wall-clock second the connect was
+# requested, so two connects inside one second are handed the same room and two
+# conversations interleave in front of one agent. Runs are therefore let through
+# one at a time, spaced past that second, and the room each is given is claimed
+# against the others — because a shared room fails as a mystery timeout several
+# turns later, long after the evidence is gone.
+CONNECT_SPACING_S = 1.25     # least distance between two connect requests
+CONNECT_ATTEMPTS = 4         # fresh connects tried before a collision is fatal
+CONNECT_CLAIM_TTL_S = 1800   # how long a claimed room name is remembered
+_SHARED_ROOM_HINT = ("the platform names a room by the second the connect was "
+                     "requested, so two connects in the same second are handed "
+                     "the same one; space runs at least a second apart")
 JUDGE_TIMEOUT_S = 60.0       # one judgement, off the call's critical path
 JUDGE_MAX_TOKENS = 1000      # a verdict is two fields; the room is for models that reason first
 
@@ -272,6 +296,36 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 
 # Holds the live client + resolved base URL, so handlers call api() freely.
 _STATE: dict = {}
+
+# --- Trace ------------------------------------------------------------------
+# `--trace` turns the run into an instrument: every room lifecycle event, the
+# SDK's own internals, and the outcome of each send, stamped on one clock and
+# written to stderr so a report on stdout stays machine-readable.
+
+_TRACE = {"on": False, "t0": 0.0}
+
+
+def _trace_on() -> None:
+    import logging
+    _TRACE["on"] = True
+    _TRACE["t0"] = time.time()
+    os.environ["LIVEKIT_RTC_DEBUG"] = "1"
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d lk %(levelname)s %(message)s",
+                                           datefmt="%H:%M:%S"))
+    lk = logging.getLogger("livekit")
+    lk.setLevel(logging.DEBUG)
+    lk.addHandler(handler)
+    lk.propagate = False
+
+
+def _tr(event: str, **fields) -> None:
+    if not _TRACE["on"]:
+        return
+    at = time.time() - _TRACE["t0"]
+    detail = " ".join(f"{k}={v!r}" for k, v in fields.items())
+    sys.stderr.write(f"[{at:8.3f}] {event} {detail}\n")
+    sys.stderr.flush()
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -1185,6 +1239,87 @@ def _resolve_agent(ref: str) -> str:
     return value
 
 
+class _ConnectGate:
+    """Serialises connects across every process on this machine.
+
+    Parallelism here is separate processes, so the guard is a file lock. It is
+    held across the request, not merely before it, so the recorded moment is the
+    moment the platform saw — spacing measured against anything looser drifts on
+    network jitter and lets a collision back in.
+    """
+
+    def __init__(self, handle) -> None:
+        self._fh = handle
+
+    def _read(self) -> dict:
+        self._fh.seek(0)
+        raw = self._fh.read().strip()
+        try:
+            state = json.loads(raw) if raw else {}
+        except ValueError:
+            state = {}
+        return state if isinstance(state, dict) else {}
+
+    def _write(self, state: dict) -> None:
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(json.dumps(state))
+        self._fh.flush()
+
+    def space(self) -> None:
+        last = float(self._read().get("last") or 0.0)
+        wait = last + CONNECT_SPACING_S - time.time()
+        if wait > 0:
+            _tr("connect.spacing", wait=round(wait, 3))
+            time.sleep(wait)
+
+    def claim(self, room_name: str) -> bool:
+        """Record this room as taken. False when another run already holds it."""
+        state = self._read()
+        now = time.time()
+        rooms = {name: ts for name, ts in (state.get("rooms") or {}).items()
+                 if isinstance(ts, (int, float)) and now - ts < CONNECT_CLAIM_TTL_S}
+        taken = room_name in rooms
+        rooms[room_name] = now
+        self._write({"last": now, "rooms": rooms})
+        return not taken
+
+
+class _UngatedConnect:
+    """The gate's stand-in when the lock cannot be taken.
+
+    A lock file that will not open is a reason to lose the spacing, never a
+    reason to lose the run: the room each connect is handed is still checked
+    once the room is joined, so a collision is still reported rather than met.
+    """
+
+    def space(self) -> None:
+        return None
+
+    def claim(self, room_name: str) -> bool:
+        return True
+
+
+@contextlib.contextmanager
+def _connect_gate():
+    try:
+        path = _state_dir() / "connect.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+")                               # noqa: SIM115
+    except OSError as e:
+        _tr("connect.gate_unavailable", error=repr(e))
+        yield _UngatedConnect()
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield _ConnectGate(handle)
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def platform_connect(agent_id: str, text_only: bool = False) -> dict:
     """The ordinary WebRTC connect flow — the same endpoint the dashboard uses.
     Public, so this is the one call that needs no credential.
@@ -1195,16 +1330,30 @@ def platform_connect(agent_id: str, text_only: bool = False) -> dict:
     spoken. That is several times faster, and it removes the speech path from
     what the run can prove — which is why checks that depend on audio report as
     skipped rather than quietly disappearing.
+
+    The room a connect is given is claimed against every other run on this
+    machine, and a room already taken is abandoned for a fresh connect.
     """
-    r = api("POST", f"/agents/{agent_id}/connect",
-            data={"text_only": True} if text_only else None)
-    data = (r or {}).get("data") or {}
-    for field in ("server_url", "room_name", "participant_token"):
-        if not data.get(field):
-            _die(5, "bad_connect_response",
-                 f"connect response is missing {field}",
-                 "the agent may be inactive or LiveKit may be unconfigured for its tenant")
-    return data
+    with _connect_gate() as gate:
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            gate.space()
+            r = api("POST", f"/agents/{agent_id}/connect",
+                    data={"text_only": True} if text_only else None)
+            data = (r or {}).get("data") or {}
+            for field in ("server_url", "room_name", "participant_token"):
+                if not data.get(field):
+                    _die(5, "bad_connect_response",
+                         f"connect response is missing {field}",
+                         "the agent may be inactive or LiveKit may be "
+                         "unconfigured for its tenant")
+            if gate.claim(data["room_name"]):
+                return data
+            _tr("connect.room_taken", room=data["room_name"], attempt=attempt)
+    _die(5, "room_name_collision",
+         f"the platform handed out an already-claimed room {CONNECT_ATTEMPTS} "
+         "times in a row",
+         "runs are being started faster than the platform can name rooms "
+         "apart; start fewer at once")
 
 
 def platform_find_call_id(room_name: str, agent_id: str, deadline: float) -> str | None:
@@ -1295,6 +1444,7 @@ class Observed:
 
     def add(self, kind: str, **fields) -> None:
         self.events.append({"kind": kind, "t": self.at(), **fields})
+        _tr(f"obs.{kind}", **fields)
 
     def speech(self, since: float = 0.0, until: float = float("inf")) -> list:
         return [e for e in self.events
@@ -1325,6 +1475,9 @@ _QUIET_WINDOW_S = 3.0
 _IDLE_SETTLE_S = 2.0
 _SHORT_ACK_SETTLE_S = 12.0
 _SHORT_ACK_MAX_WORDS = 4
+# The waiter polls its own record rather than waking on an event: a transition
+# it slept through is still on the record, whereas a missed wake-up is gone.
+_POLL_S = 0.2
 
 
 async def _drive_call(conn_details: dict, turns: list, obs: Observed,
@@ -1335,13 +1488,39 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
 
     room = rtc.Room()
     audio_tasks: list = []
-    agent_state: dict = {"value": None, "changed": asyncio.Event()}
+    # The waiter needs the agent's *transitions*, not the state it happens to be
+    # in when it looks. A whole turn can begin and end between two glances — in
+    # text mode the greeting routinely does, inside a millisecond — so the
+    # observer stamps each edge as it arrives and the waiter reads the stamps.
+    agent_state: dict = {"value": None, "work_at": None, "idle_at": None}
+    # A call that loses its room, or acquires a second caller, is over — and it
+    # has to say so. Left unsaid it surfaces as a turn timeout at best and a
+    # traceback at worst, both of which describe the harness rather than the
+    # agent. Handlers record the first fault; the drive loop raises it.
+    fault: dict = {}
+    closed: dict = {}        # the room went while turns remained
+    driving = {"on": True}   # false once the scenario is done and we tear down
+
+    def _fault(code: str, message: str, hint: str, exit_code: int = 5) -> None:
+        if driving["on"] and not fault:
+            fault.update({"code": code, "message": message, "hint": hint,
+                          "exit": exit_code})
+
+    def _raise_fault() -> None:
+        if fault:
+            _die(fault["exit"], fault["code"], fault["message"], fault["hint"])
 
     def _note_state(value: str | None) -> None:
-        if value and value != agent_state["value"]:
-            agent_state["value"] = value
-            obs.add("agent_state", state=value)
-            agent_state["changed"].set()
+        if not value or value == agent_state["value"]:
+            return
+        agent_state["value"] = value
+        now = time.time()
+        if value in _WORKING_STATES:
+            agent_state["work_at"] = now
+            agent_state["idle_at"] = None
+        elif value in _IDLE_STATES:
+            agent_state["idle_at"] = now
+        obs.add("agent_state", state=value)
 
     async def _consume_text(reader, identity: str) -> None:
         try:
@@ -1368,14 +1547,40 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
             obs.add("error", where="audio_stream", detail=str(e))
 
     def _on_text(reader, identity: str) -> None:
+        _tr("stream.open", identity=identity,
+            topic=getattr(getattr(reader, "info", None), "topic", None),
+            attrs=getattr(getattr(reader, "info", None), "attributes", None))
         asyncio.create_task(_consume_text(reader, identity))
+
+    def _is_agent(participant) -> bool:
+        """The worker, told apart from anyone else who is in the room.
+
+        A room is supposed to hold this participant and the agent, but nothing
+        guarantees it, and adopting whoever arrived first silently attributes
+        the agent's speech to a stranger. Kind is the platform's own answer;
+        the identity prefix is the fallback for a worker that reports none.
+        """
+        if getattr(participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+            return True
+        return (participant.identity or "").startswith("agent-")
+
+    def _adopt(participant) -> bool:
+        if obs.agent_identity is not None or not _is_agent(participant):
+            return False
+        obs.agent_identity = participant.identity
+        obs.add("agent_joined", identity=participant.identity)
+        _note_state((participant.attributes or {}).get("lk.agent.state"))
+        return True
 
     @room.on("participant_connected")
     def _on_participant(participant) -> None:
-        if obs.agent_identity is None:
-            obs.agent_identity = participant.identity
-            obs.add("agent_joined", identity=participant.identity)
-        _note_state((participant.attributes or {}).get("lk.agent.state"))
+        if not _adopt(participant) and not _is_agent(participant):
+            obs.add("stranger_joined", identity=participant.identity)
+            _fault("room_shared",
+                   f"another caller joined this room: {participant.identity}",
+                   _SHARED_ROOM_HINT, 6)
+        elif participant.identity == obs.agent_identity:
+            _note_state((participant.attributes or {}).get("lk.agent.state"))
 
     @room.on("participant_attributes_changed")
     def _on_attrs(changed: dict, participant) -> None:
@@ -1388,9 +1593,41 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
             obs.add("audio_track", identity=participant.identity)
             audio_tasks.append(asyncio.create_task(_consume_audio(track)))
 
+    @room.on("connection_state_changed")
+    def _on_conn_state(state) -> None:
+        _tr("room.connection_state", state=str(state))
+
+    @room.on("disconnected")
+    def _on_disconnected(reason=None) -> None:
+        _tr("room.disconnected", reason=str(reason))
+        if driving["on"] and not closed:
+            # Whoever closed it, the call is over. That is a fact about the
+            # call rather than a broken run, so it is recorded and the drive
+            # loop stops — the evidence already earned still gets judged.
+            closed["reason"] = reason
+
+    @room.on("reconnecting")
+    def _on_reconnecting() -> None:
+        _tr("room.reconnecting")
+
+    @room.on("reconnected")
+    def _on_reconnected() -> None:
+        _tr("room.reconnected")
+
+    @room.on("participant_disconnected")
+    def _on_participant_gone(participant) -> None:
+        _tr("room.participant_disconnected", identity=participant.identity)
+
+    @room.on("data_received")
+    def _on_data(packet) -> None:
+        _tr("room.data_received", topic=getattr(packet, "topic", None),
+            size=len(getattr(packet, "data", b"") or b""))
+
     room.register_text_stream_handler("lk.transcription", _on_text)
 
     try:
+        _tr("connect.begin", url=conn_details["server_url"],
+            room=conn_details["room_name"])
         await room.connect(conn_details["server_url"], conn_details["participant_token"])
         obs.add("connected", room=conn_details["room_name"],
                 identity=room.local_participant.identity)
@@ -1398,11 +1635,9 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
         # The worker is auto-dispatched, so it may already be in the room.
         deadline = time.time() + AGENT_JOIN_TIMEOUT_S
         while obs.agent_identity is None and time.time() < deadline:
-            for participant in room.remote_participants.values():
-                obs.agent_identity = participant.identity
-                obs.add("agent_joined", identity=participant.identity)
-                _note_state((participant.attributes or {}).get("lk.agent.state"))
-                break
+            for participant in list(room.remote_participants.values()):
+                if _adopt(participant):
+                    break
             if obs.agent_identity is None:
                 await asyncio.sleep(0.25)
         if obs.agent_identity is None:
@@ -1410,27 +1645,71 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
                  "the worker may not be running for this environment, or "
                  "dispatch may be misconfigured")
 
-        # Let the greeting land before speaking over it.
-        await _await_turn(agent_state, obs, turn_timeout, expect_speech=True)
+        # A room this process did not get to itself is not a test — the other
+        # caller's lines and this one's reach the same agent, and every
+        # assertion afterwards is made about a conversation neither of them
+        # had. Say so plainly instead of letting it surface as a timeout.
+        strangers = [p.identity for p in room.remote_participants.values()
+                     if not _is_agent(p)]
+        if strangers:
+            _die(6, "room_shared",
+                 f"another caller is in this room: {', '.join(strangers)}",
+                 _SHARED_ROOM_HINT)
+
+        # Let the greeting land before speaking over it. Anything the agent does
+        # after we joined belongs to the greeting, so the window opens at t0.
+        await _await_turn(agent_state, obs, turn_timeout, expect_speech=True,
+                          since=obs.t0, fault=fault, closed=closed)
 
         call_deadline = obs.t0 + budget
         for index, turn in enumerate(turns):
+            _raise_fault()
+            if closed:
+                obs.add("call_ended_early", reason=str(closed["reason"]),
+                        after_turn=index - 1, turns_left=len(turns) - index)
+                break
             if time.time() > call_deadline:
                 obs.add("budget_exhausted", turn=index)
                 break
             said = turn["say"]
             obs.add("user_text", text=said, identity=room.local_participant.identity,
                     turn=index)
-            await room.local_participant.send_text(said, topic="lk.chat")
+            _tr("send.begin", turn=index, state=str(room.connection_state),
+                remote=list(room.remote_participants.keys()))
+            sent_at = time.time()
+            try:
+                info = await room.local_participant.send_text(said, topic="lk.chat")
+                _tr("send.ok", turn=index,
+                    elapsed=round(time.time() - sent_at, 3),
+                    stream_id=getattr(info, "stream_id", None))
+            except Exception as e:                              # noqa: BLE001
+                _tr("send.failed", turn=index, error=repr(e),
+                    elapsed=round(time.time() - sent_at, 3))
+                # Whatever closed the transport is the real story; a traceback
+                # out of the SDK is not an answer this tool is allowed to give.
+                _raise_fault()
+                if closed:
+                    obs.add("call_ended_early", reason=str(closed["reason"]),
+                            after_turn=index - 1, turns_left=len(turns) - index)
+                    break
+                obs.add("send_failed", turn=index, detail=str(e))
+                _die(5, "send_failed",
+                     f"turn {index} could not be delivered to the agent: {e}",
+                     "the transport went while the call was running; `--trace` "
+                     "shows the last thing that happened before it did")
             obs.add("turn_sent", turn=index)
             await _await_turn(agent_state, obs, turn_timeout, expect_speech=True,
-                              turn=index)
+                              since=sent_at, turn=index, fault=fault, closed=closed)
             pause = float(turn.get("pause_after_reply") or 0)
             if pause > 0 and index < len(turns) - 1:
                 obs.add("turn_pause_started", turn=index, seconds=pause)
                 await asyncio.sleep(pause)
                 obs.add("turn_pause_complete", turn=index, seconds=pause)
+        _raise_fault()
     finally:
+        # Our own teardown disconnects the room; past this point a fault is
+        # the expected end of the call rather than something that went wrong.
+        driving["on"] = False
         for task in audio_tasks:
             task.cancel()
         try:
@@ -1441,61 +1720,92 @@ async def _drive_call(conn_details: dict, turns: list, obs: Observed,
 
 
 async def _await_turn(agent_state: dict, obs: Observed, turn_timeout: float,
-                      expect_speech: bool, turn: int | None = None) -> None:
+                      expect_speech: bool, since: float, fault: dict,
+                      closed: dict, turn: int | None = None) -> None:
     """Wait for one agent turn to complete.
 
-    Preferred signal: the agent's own `lk.agent.state` attribute leaving an idle
-    state and returning to one, which survives a long tool chain. Fallback: a
-    quiet window after the last transcription, recorded as such so a report
-    never implies a stronger signal than the one that fired.
+    A turn is over when the agent has demonstrably taken it up and then gone
+    quiet. `since` is the epoch the turn opened — the moment the line was sent,
+    or the join for the greeting — and everything is judged against it, so a
+    turn that finished before this call was entered still counts as taken up.
+
+    Uptake is whichever arrives: the agent's `lk.agent.state` attribute entering
+    a working state, or the first speech of the turn. Both are recorded when
+    they happen rather than sampled here, because a text-mode turn can open and
+    close between two glances.
+
+    Completion is whichever fires: the state attribute settling back into idle,
+    or a quiet window after the last speech for agents that publish no state.
+    The signal that fired is recorded, so a report never implies a stronger one.
     """
     started = time.time()
     deadline = started + turn_timeout
-    saw_work = False
-    idle_since: float | None = None
+    since_rel = since - obs.t0
+
+    def _speech_since() -> list:
+        return [e for e in obs.events
+                if e["kind"] in ("agent_text", "agent_audio")
+                and e["t"] >= since_rel]
 
     while time.time() < deadline:
-        state = agent_state["value"]
-        if state in _WORKING_STATES:
-            saw_work = True
-            idle_since = None
-        elif saw_work and state in _IDLE_STATES:
-            now = time.time()
-            if idle_since is None:
-                idle_since = now
-            current_turn_started = started - obs.t0
-            current_text = [
-                e["text"] for e in obs.events
-                if e["kind"] == "agent_text" and e["t"] >= current_turn_started
-            ]
-            latest_words = (re.findall(r"\w+", current_text[-1], re.UNICODE)
-                            if current_text else [])
-            settle_window = (_SHORT_ACK_SETTLE_S
-                             if 0 < len(latest_words) <= _SHORT_ACK_MAX_WORDS
-                             else _IDLE_SETTLE_S)
-            if now - idle_since >= settle_window:
+        # A room that has gone will never finish this turn; waiting out the
+        # timeout only buries why.
+        if fault:
+            _die(fault["exit"], fault["code"], fault["message"], fault["hint"])
+        if closed:
+            obs.add("turn_cut_short", turn=turn, reason=str(closed["reason"]))
+            return
+        now = time.time()
+        work_at = agent_state["work_at"]
+        idle_at = agent_state["idle_at"]
+        speech = _speech_since()
+        # Did the agent take up *this* turn? An edge stamped before the turn
+        # opened belongs to the previous one and must not settle this wait.
+        worked = work_at is not None and work_at >= since
+        saw_work = worked or bool(speech)
+
+        if saw_work:
+            texts = [e["text"] for e in speech if e["kind"] == "agent_text"]
+            latest_words = (re.findall(r"\w+", texts[-1], re.UNICODE)
+                            if texts else [])
+            # An agent that says "one moment" while a tool runs drops into
+            # `listening` for a fraction of a second before it resumes work.
+            settle = (_SHORT_ACK_SETTLE_S
+                      if 0 < len(latest_words) <= _SHORT_ACK_MAX_WORDS
+                      else _IDLE_SETTLE_S)
+            quiet_for = now - obs.t0 - max(e["t"] for e in speech) if speech else None
+
+            # State signal: idle, and idle more recently than the last work.
+            if (idle_at is not None
+                    and (work_at is None or idle_at >= work_at)
+                    and now - idle_at >= settle
+                    and (quiet_for is None or quiet_for >= settle)):
                 obs.turn_signal = obs.turn_signal or "state"
                 obs.add("turn_complete", signal="state", turn=turn)
                 return
-        agent_state["changed"].clear()
-        try:
-            await asyncio.wait_for(agent_state["changed"].wait(), timeout=0.5)
-        except asyncio.TimeoutError:
-            pass
-        if state is None:
-            # No state attribute at all: fall back to a quiet window.
-            last = max((e["t"] for e in obs.events
-                        if e["kind"] == "agent_text"), default=None)
-            if last is not None and (obs.at() - last) > _QUIET_WINDOW_S:
+
+            # Quiet signal: no state attribute at all, so speech is all we have.
+            if (agent_state["value"] is None and quiet_for is not None
+                    and quiet_for > _QUIET_WINDOW_S):
                 obs.turn_signal = obs.turn_signal or "quiet"
                 obs.add("turn_complete", signal="quiet", turn=turn)
                 return
 
-    obs.add("turn_timeout", turn=turn, waited=round(time.time() - started, 1))
+        await asyncio.sleep(_POLL_S)
+
+    waited = round(time.time() - started, 1)
+    took_up = (agent_state["work_at"] is not None
+               and agent_state["work_at"] >= since) or bool(_speech_since())
+    obs.add("turn_timeout", turn=turn, waited=waited, took_up=took_up)
     if expect_speech:
         _die(7, "turn_timeout",
              f"the agent did not finish its turn within {turn_timeout:.0f}s",
-             "raise --timeout, or run `probe` to see where the turn stalls")
+             ("the agent never took the turn up — it produced no speech and "
+              "entered no working state after it was sent; check the worker is "
+              "healthy for this agent"
+              if not took_up else
+              "the agent started the turn and did not settle — raise --timeout, "
+              "or run `probe --trace` to see where it stalls"))
 
 
 # ---------------------------------------------------------------------------
@@ -1929,6 +2239,19 @@ def evaluate(scenario: dict, obs: Observed, evidence: dict,
     turns = scenario["turns"]
     windows = _turn_windows(obs, turns)
 
+    # A call the agent ended early is a finding about the agent, not a broken
+    # run: everything said before it hung up is real evidence and is still
+    # judged. The unsaid turns are named so the report cannot read as though
+    # the scenario was played out in full.
+    for event in obs.events:
+        if event["kind"] == "call_ended_early":
+            checks.add(False, "call_completed",
+                       f"the call ended after turn {event['after_turn'] + 1} of "
+                       f"{len(turns)} — the room closed (reason "
+                       f"{event['reason']}) with {event['turns_left']} turn(s) "
+                       "unsaid; the checks below cover only what was said",
+                       scope="run")
+
     # The judge is resolved once, and only when a scenario actually asks for
     # one, so a suite of purely deterministic scenarios needs no judge key.
     cell: dict = {}
@@ -2240,15 +2563,53 @@ def cmd_run(args) -> None:
     sys.exit(0 if report["verdict"] == "pass" else 1)
 
 
+def _errored_report(scenario: dict, error: BaseException) -> dict:
+    """A run that never reached a verdict, kept in the summary as a failure.
+
+    Under `--jobs` one scenario's collapse must not take the rest of the suite
+    with it, and it must not vanish either: the suite reports what it knows and
+    counts the run against the total.
+    """
+    detail = (error.args[0] if isinstance(error, SystemExit) and error.args
+              else repr(error))
+    return {"scenario": scenario.get("id") or "?", "agent": "?" * 8,
+            "verdict": "fail", "call_id": None, "tool_runs": [],
+            "checks": [{"scope": "run", "check": "completed", "ok": False,
+                        "skipped": False,
+                        "detail": f"the run did not finish ({detail}) — "
+                                  "its own error is on stderr above"}]}
+
+
 def cmd_suite(args) -> None:
     root = _scenarios_root(args.path)
-    reports = []
-    for path in discover_scenarios(root):
-        scenario = load_scenario(path)
-        reports.append(_execute(scenario, args.agent, args))
+    scenarios = [load_scenario(path) for path in discover_scenarios(root)]
+    jobs = max(1, int(getattr(args, "jobs", 1) or 1))
+
+    def _one(scenario: dict) -> dict:
+        try:
+            return _execute(scenario, args.agent, args)
+        except BaseException as e:                              # noqa: BLE001
+            # SystemExit included: `_die` ends a run, never the suite.
+            return _errored_report(scenario, e)
+
+    if jobs > 1 and len(scenarios) > 1:
+        # Connects are spaced by the gate in platform_connect, so the calls
+        # overlap but no two are handed the same room. Reports keep scenario
+        # order however the runs finish, so two suite runs read alike.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            reports = list(pool.map(_one, scenarios))
         if not args.json:
-            _print_verdict(reports[-1])
-    summary = {"root": str(root), "total": len(reports),
+            for report in reports:
+                _print_verdict(report)
+    else:
+        reports = []
+        for scenario in scenarios:
+            reports.append(_one(scenario))
+            if not args.json:
+                _print_verdict(reports[-1])
+
+    summary = {"root": str(root), "jobs": jobs, "total": len(reports),
                "passed": sum(1 for r in reports if r["verdict"] == "pass"),
                "failed": sum(1 for r in reports if r["verdict"] == "fail"),
                "runs": reports}
@@ -2386,6 +2747,7 @@ def _add_common(parser) -> None:
     parser.add_argument("--connection")
     parser.add_argument("--judge")
     parser.add_argument("--text", action="store_true")
+    parser.add_argument("--trace", action="store_true")
     parser.add_argument("--key-env", dest="key_env")
     parser.add_argument("--api-url", dest="api_url")
     parser.add_argument("--json", action="store_true")
@@ -2422,6 +2784,7 @@ def main() -> None:
     suite.add_argument("--agent")
     suite.add_argument("--path", dest="path_flag")
     suite.add_argument("--report")
+    suite.add_argument("--jobs", type=int, default=1)
     _add_common(suite)
     suite.set_defaults(func=cmd_suite)
 
@@ -2440,6 +2803,8 @@ def main() -> None:
     if getattr(args, "want_help", False) or not getattr(args, "command", None):
         _cmd_help()
         return
+    if getattr(args, "trace", False):
+        _trace_on()
     if args.command == "suite":
         args.path = args.path_flag or args.path
 
