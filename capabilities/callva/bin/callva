@@ -135,7 +135,7 @@ Commands (`-f key=value` is repeatable for list filters):
   field-groups update <id> --data JSON
   field-groups delete <id>
   field-groups reorder --data JSON
-  field-groups add-field <id> <field_id>
+  field-groups add-field <id> <field_id> [--position N]
   field-groups remove-field <id> <field_id>
   field-groups reorder-fields <id> --data JSON
   field-groups update-field <id> <field_id> --data JSON
@@ -1662,8 +1662,10 @@ def field_groups_reorder(args):
 
 
 def field_groups_add_field(args):
-    api("POST", f"/external/custom-field-groups/{args.id}/fields",
-        {"custom_field_id": args.field_id})
+    body = {"field_id": args.field_id}
+    if args.position is not None:
+        body["position"] = args.position
+    api("POST", f"/external/custom-field-groups/{args.id}/fields", body)
     return {"group": args.id, "added_field": args.field_id}
 
 
@@ -2266,6 +2268,8 @@ def build_parser():
     fg_af = fg_sub.add_parser("add-field", help="Add field to group")
     fg_af.add_argument("id", help="Group UUID")
     fg_af.add_argument("field_id", help="Custom field UUID to add")
+    fg_af.add_argument("--position", type=int, default=None,
+                       help="Slot within the group (default: append)")
     fg_rf = fg_sub.add_parser("remove-field", help="Remove field from group")
     fg_rf.add_argument("id", help="Group UUID")
     fg_rf.add_argument("field_id", help="Custom field UUID to remove")
