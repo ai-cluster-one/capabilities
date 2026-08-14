@@ -44,7 +44,8 @@ CONNECTIONS
         "<id>": {
           "api_url": "https://api.example.com/api/v1",
           "secret_env": "CALLVA_<ID>_API_KEY",
-          "allow_write": true
+          "allow_write": true,
+          "test_call_field": "test_call"
         }
       }
     }
@@ -52,6 +53,12 @@ CONNECTIONS
   the project already defines keeps one home for the secret. "allow_write": false
   makes a connection observation-only — useful for pointing at a live tenant you
   must not place calls into.
+
+  "test_call_field" names a boolean custom field on the tenant's calls, set to
+  true on every call this harness places. The platform stores a harness call
+  exactly like a caller's, so without it a tenant's own reporting counts the
+  testing as traffic. Declare it only where that field exists — `doctor` proves
+  it does. Absent, nothing is written.
 
   Selection: --connection <id>. Unflagged, the registry's "default" pointer
   applies, else the sole entry; several entries without a pointer is refused.
@@ -177,8 +184,9 @@ COMMANDS
 
   doctor
         Per connection: prove the key resolves and reaches the API, and that the
-        LiveKit RTC stack imports. Names the agents the key can see, and asks
-        each declared judge to settle a trivial claim.
+        LiveKit RTC stack imports. Names the agents the key can see, proves a
+        declared "test_call_field" exists on the tenant's calls, and asks each
+        declared judge to settle a trivial claim.
 
 SESSIONS
   A scenario is written before the call; a session is decided during it. One
@@ -1081,7 +1089,8 @@ def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
         base = (api_url_flag or _resolve_env_key("CALLVA_API_URL")[0]
                 or DEFAULT_API_URL)
         return {"id": cid, "allow_write": WRITE_DEFAULT, "key_env": key_env,
-                "api_key": api_key, "base": base.rstrip("/")}, None
+                "api_key": api_key, "base": base.rstrip("/"),
+                "test_call_field": None}, None
     key_env = key_env_override or entry.get("secret_env")
     if not key_env:
         return None, {"exit": 6, "code": "no_secret_env",
@@ -1095,7 +1104,8 @@ def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
                     f"{CREDENTIALS_ENV}, or the environment"}
     base = api_url_flag or entry.get("api_url") or DEFAULT_API_URL
     return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "key_env": key_env, "api_key": api_key, "base": base.rstrip("/")}, None
+            "key_env": key_env, "api_key": api_key, "base": base.rstrip("/"),
+            "test_call_field": (entry.get("test_call_field") or "").strip() or None}, None
 
 
 def _connections_report() -> dict:
@@ -1350,6 +1360,33 @@ def platform_get_runs(call_id: str) -> list:
             query={"per_page": 100, "include_args": "true"}, allow_404=True)
     rows = (r or {}).get("data") or []
     return sorted(rows, key=lambda x: x.get("started_at") or "")
+
+
+def platform_mark_test_call(call_id: str) -> dict | None:
+    """Flag the call this harness just drove, so a tenant's real traffic can be
+    read without it.
+
+    Every call the harness makes is indistinguishable from a caller's once it
+    is stored: same project, same agent, same webhooks, same extracted
+    outcomes. The tenant says which boolean custom field carries the
+    distinction (`test_call_field` on its connection); absent, nothing is
+    written and nothing is claimed. Failing to mark never changes a verdict —
+    the run already happened, and a flag that did not land is reported rather
+    than raised.
+    """
+    conn = _STATE.get("conn") or {}
+    field = conn.get("test_call_field")
+    if not field:
+        return None
+    if not conn.get("allow_write"):
+        return {"field": field, "ok": False, "error": "connection is read-only"}
+    try:
+        api("PATCH", f"/external/calls/{call_id}", data={field: True})
+    except SystemExit:
+        raise
+    except BaseException as e:                                  # noqa: BLE001
+        return {"field": field, "ok": False, "error": repr(e)}
+    return {"field": field, "ok": True}
 
 
 def platform_get_run_result(automation_id: str, job_id: str):
@@ -1879,7 +1916,7 @@ def gather_evidence(room_name: str, agent_id: str, obs: Observed,
     call_id = platform_find_call_id(room_name, agent_id,
                                     time.time() + CORRELATE_TIMEOUT_S)
     evidence: dict = {"call_id": call_id, "call": None, "transcript": None,
-                      "runs": [], "settled": False}
+                      "runs": [], "settled": False, "marked": None}
     if not call_id:
         return evidence
 
@@ -1898,6 +1935,7 @@ def gather_evidence(room_name: str, agent_id: str, obs: Observed,
             break
         time.sleep(2.0)
     evidence["call"] = call
+    evidence["marked"] = platform_mark_test_call(call_id)
 
     transcript = platform_get_transcript(call_id)
     evidence["transcript"] = transcript
@@ -2515,6 +2553,7 @@ def build_report(scenario: dict, conn: dict, agent_id: str, conn_details: dict,
         "room": conn_details.get("room_name"),
         "call_id": evidence.get("call_id"),
         "call_settled": evidence.get("settled"),
+        "marked": evidence.get("marked"),
         "turn_signal": obs.turn_signal,
         "audio_frames": obs.audio_frames,
         "audio_first_t": obs.audio_first_t,
@@ -2542,6 +2581,10 @@ def _print_verdict(report: dict) -> None:
     sys.stdout.write(head + "\n")
     if not report.get("call_id"):
         sys.stdout.write(f"  warn  {_NO_TOOL_EVIDENCE}\n")
+    marked = report.get("marked")
+    if marked and not marked.get("ok"):
+        sys.stdout.write(f"  warn  this call is not flagged as a test — "
+                         f"{marked['field']}: {marked['error']}\n")
     for check in report["checks"]:
         if check.get("skipped"):
             detail = f" — {check['detail']}" if check["detail"] else ""
@@ -2759,6 +2802,19 @@ def cmd_doctor(args) -> None:
             "agents_visible": len(rows),
             "agents": [{"id": a.get("id"), "name": a.get("name")} for a in rows],
         }
+        # A marking field is only worth declaring if the tenant really has it:
+        # a typo would otherwise surface one failed mark per run, long after
+        # the runs it was meant to label.
+        if conn["test_call_field"]:
+            fields = api("GET", "/external/custom-fields",
+                         query={"entity_type": "call"})
+            match = next((f for f in ((fields or {}).get("data") or [])
+                          if f.get("field_key") == conn["test_call_field"]), None)
+            out["connections"][cid]["test_call_field"] = {
+                "key": conn["test_call_field"],
+                "present": match is not None,
+                "type": (match or {}).get("field_type"),
+            }
 
     # Judges are optional, so their absence is reported rather than failed. Each
     # declared one is proven by asking it to settle a trivial claim: a key that
