@@ -1279,7 +1279,10 @@ def cmd_deploy(c, uuid: str, force: bool, tag: str | None):
         params["force"] = "true"
     if tag:
         params["tag"] = tag
-    return _request(c, "GET", "/deploy", params=params)
+    # POST, not GET: Coolify's GET /deploy is a shim that answers "this endpoint
+    # has changed to a POST request" (405). The ability probe above deliberately
+    # keeps using the GET shim, because it must not mutate anything.
+    return _request(c, "POST", "/deploy", params=params)
 
 
 def cmd_lifecycle(c, action: str, uuid: str, rtype: str):
