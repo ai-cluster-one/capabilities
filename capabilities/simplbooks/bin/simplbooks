@@ -1052,13 +1052,42 @@ Then re-run `simplbooks doctor` to confirm.
                                                 own-account SWIFT + supplier IBAN
                                                 or the bank rejects it.
 
-  simplbooks accounts list chart | cashbook [--limit N]
-                                                List accounts. `cashbook` is the
-                                                bank-like clearing accounts (Kassa /
-                                                bank accounts, used as --account-id);
-                                                `chart` is the full chart of accounts
-                                                (income 4xxx, expense 5xxx) referenced
-                                                by income/expense_account_id.
+  simplbooks accounts list chart | cashbook [--limit N] [--json]
+                                                List accounts. TWO id-spaces:
+                                                `cashbook` is the bank-like clearing
+                                                accounts (Kassa / bank accounts),
+                                                addressed by its ID (1-8) on every
+                                                --*-cashbook-id flag; `chart` is the
+                                                full chart of accounts (income 4xxx,
+                                                expense 5xxx), addressed by its CODE
+                                                on every --*-coa flag and `coa=` line
+                                                key. A value from the wrong space is
+                                                refused before anything is posted.
+                                                See `simplbooks guide id-spaces`.
+
+  simplbooks reports trial-balance --from YYYY-MM-DD --to YYYY-MM-DD
+        [--account TERM] [--all] [--json]
+                                                Käibeandmik — every account's
+                                                opening + closing balance over a
+                                                period. CLOSING is the balance AS
+                                                OF --to: the reconciliation
+                                                workhorse for a bank, a clearing
+                                                or any control account. The footer
+                                                sums closing debits vs credits and
+                                                reports the gap (0,00 = the books
+                                                balance; anything else is a
+                                                dangling leg).
+
+  simplbooks reports account-ledger <CODE> --from YYYY-MM-DD --to YYYY-MM-DD
+        [--json]
+                                                Pearaamat — one account's card:
+                                                opening balance, every entry that
+                                                touched it with a running saldo,
+                                                the period's debit/credit totals
+                                                and the closing balance. The
+                                                drill-down behind a trial-balance
+                                                figure. CODE is the chart code
+                                                (`accounts list chart`).
 
   simplbooks bank-transactions list
         [--direction in|out] [--status valid|invalid|warning|duplicate]
@@ -3187,7 +3216,12 @@ def accounts() -> None:
     """Chart-of-accounts + bank/clearing accounts."""
 
 
-def _accounts_listdata(http: httpx.Client, account: str, endpoint: str, limit: int) -> list[dict]:
+def _accounts_listdata(http: httpx.Client, account: str, endpoint: str, limit: int,
+                       *, active_only: bool = True, strict: bool = False) -> list[dict]:
+    """Fetch an account listing. Never truncates silently: DataTables reports how
+    many rows matched, so a short page is a fact we can see and say. `strict`
+    refuses a partial list outright — resolving an account against a truncated
+    chart would report a live account as unknown."""
     cols = [
         ("", "_select"),
         ("code", "code"),
@@ -3199,18 +3233,32 @@ def _accounts_listdata(http: httpx.Client, account: str, endpoint: str, limit: i
     ]
     data = datatables_payload(cols, order_col=1, length=limit, search="")
     data["order[0][dir]"] = "asc"
-    data["columns[3][search][value]"] = "=1"
-    data["show_only_active"] = "1"
+    if active_only:
+        data["columns[3][search][value]"] = "=1"
+        data["show_only_active"] = "1"
     http.headers["X-CSRF-Token"] = fetch_fresh_csrf(http, account)
     r = http.post(f"{BASE}/{account}/{endpoint}/listdata", data=data)
     if r.status_code != 200:
         raise click.ClickException(f"HTTP {r.status_code}: {r.text[:300]}")
-    return r.json().get("data", [])
+    payload = r.json()
+    rows = payload.get("data", [])
+    total = payload.get("recordsFiltered", payload.get("recordsTotal"))
+    if isinstance(total, int) and len(rows) < total:
+        message = (f"{endpoint}/listdata returned {len(rows)} of {total} accounts "
+                   f"(--limit {limit}).")
+        if strict:
+            raise click.ClickException(
+                message + " Refusing to resolve an account against a partial chart."
+            )
+        click.secho("⚠ " + message + " Raise --limit for the rest.", fg="yellow", err=True)
+    return rows
 
 
 @accounts.command("list")
 @click.argument("kind", type=click.Choice(list(ACCOUNT_KINDS.keys())), default="chart")
-@click.option("--limit", default=200, show_default=True, type=int)
+@click.option("--limit", default=1000, show_default=True, type=int,
+              help="Page size. The default covers the whole chart; a short page is "
+                   "reported on stderr, never dropped silently.")
 @click.option("--json", "as_json", is_flag=True)
 def accounts_list(kind: str, limit: int, as_json: bool) -> None:
     """List accounts: `cashbook` (bank-like clearing accounts) or `chart` (the
@@ -3221,6 +3269,8 @@ def accounts_list(kind: str, limit: int, as_json: bool) -> None:
         rows = _accounts_listdata(http, account, endpoint, limit)
 
     if as_json:
+        # --json on a list command is a machine contract: keys are added, never
+        # renamed or removed, so a consumer pinned to today's shape keeps parsing.
         click.echo(json.dumps(rows, indent=2, ensure_ascii=False))
         return
 
@@ -6260,6 +6310,7 @@ def payments_list(search, account_id, limit, as_json) -> None:
                 if strip_html(r.get("account_name")) == name
                 or str(r.get("account_id") or "") == str(account_id)]
     if as_json:
+        # MACHINE CONTRACT — additive only: keys are added, never renamed or removed.
         click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
         return
     click.secho(f"{len(rows)} returned", fg="cyan")
@@ -6351,6 +6402,7 @@ def incomings_list(search, account_id, limit, as_json) -> None:
                 if strip_html(r.get("account_name")) == name
                 or str(r.get("account_id") or "") == str(account_id)]
     if as_json:
+        # MACHINE CONTRACT — additive only: keys are added, never renamed or removed.
         click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
         return
     click.secho(f"{len(rows)} returned", fg="cyan")
@@ -7204,6 +7256,8 @@ def bt_list(direction, status, date_from, date_to, limit, as_json) -> None:
         )
     rows = [_bt_parse_form(f) for f in soup.find_all("form", class_="transaction-form")]
     if as_json:
+        # MACHINE CONTRACT — additive only: the bank reconciler parses these rows,
+        # so keys are added, never renamed or removed.
         click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
         return
 
