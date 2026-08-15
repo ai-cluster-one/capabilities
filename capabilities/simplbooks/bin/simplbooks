@@ -942,7 +942,7 @@ Then re-run `simplbooks doctor` to confirm.
                                                 pass change. Common use: set
                                                 per-client VAT defaults
                                                 (--sales-vat-type, --purchase-vat-type,
-                                                --expense-account) so future
+                                                --expense-coa) so future
                                                 invoices inherit them.
   simplbooks clients show <client_id> [--json]  One client's identity + writable
                                                 settings, read-through from the
@@ -962,7 +962,7 @@ Then re-run `simplbooks doctor` to confirm.
   simplbooks invoices create
         --client-id ID --description TEXT --price NUM
         [--tax-class ee-domestic|eu-reverse|non-eu]
-        [--vat-type-id ID] [--income-account-id ID] [--bank-account ID]
+        [--vat-type-id ID] [--income-coa CODE] --bank-cashbook-id ID
         [--number N] [--quantity N] [--unit U] [--date YYYY-MM-DD]
         [--due-days D] [--worker W] [--reference TEXT] [--creator ID]
         [--dry-run]
@@ -998,7 +998,7 @@ Then re-run `simplbooks doctor` to confirm.
   simplbooks purchases create
         --supplier-id ID --number STR
         --date YYYY-MM-DD
-        --line "acct=<id>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>"
+        --line "coa=<chart code>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>"
         [--line "..." ...]
         [--internal-number STR] [--due YYYY-MM-DD]
         [--vat-total AMT] [--rounding AMT]
@@ -1023,7 +1023,8 @@ Then re-run `simplbooks doctor` to confirm.
         [--number STR] [--internal-number STR]
         [--date YYYY-MM-DD] [--due YYYY-MM-DD]
         [--vat-total AMT] [--rounding AMT] [--reference TEXT]
-        [--add-line "acct=<id>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amt>"]
+        [--add-line "coa=<chart code>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amt>"]
+        [--set-line "<idx>:coa=<chart code>"]
         [--set "<field-name>=<value>"]
                                                 Edit an existing purchase
                                                 invoice. Scrapes the edit
@@ -1038,7 +1039,7 @@ Then re-run `simplbooks doctor` to confirm.
                                                 payments first.
 
   simplbooks purchases send-payment <purchase_id>
-        [--amount AMT] [--from-account ID] [--date DD.MM.YYYY]
+        [--amount AMT] [--from-cashbook-id ID] [--date DD.MM.YYYY]
         [--target <bank>]
                                                 Stage a purchase invoice as a
                                                 payment order to the bank.
@@ -1113,14 +1114,14 @@ Then re-run `simplbooks doctor` to confirm.
 
   simplbooks bank-transactions save <bt_id> --as incoming
         --client-id N [--invoice-id N ...]
-        [--account-id N] [--sum AMT] [--date YYYY-MM-DD] [--description T]
+        [--bank-cashbook-id N] [--sum AMT] [--date YYYY-MM-DD] [--description T]
                                                 Save inflow as a customer
                                                 payment, optionally bound to
                                                 one or more sales invoices.
 
   simplbooks bank-transactions save <bt_id> --as payment
         --client-id N [--purchase-id N ...]
-        [--account-id N] [--sum AMT] [--date YYYY-MM-DD] [--description T]
+        [--bank-cashbook-id N] [--sum AMT] [--date YYYY-MM-DD] [--description T]
         [--payment-object-type Purchase|ExpenseReport]
                                                 Save outflow as a supplier
                                                 payment, optionally bound to
@@ -1128,11 +1129,11 @@ Then re-run `simplbooks doctor` to confirm.
                                                 invoices.
 
   simplbooks bank-transactions save <bt_id> --as kanne
-        --counter-account COA-ID
+        --counter-coa CHART-CODE
         [--sum AMT] [--date YYYY-MM-DD] [--description T]
                                                 Save as a manual kanne
                                                 (financial_transaction). The
-                                                bank side (COA + direction)
+                                                bank side (account + direction)
                                                 is auto-derived from the BT
                                                 row; only the counter
                                                 account needs to be supplied.
@@ -1161,15 +1162,18 @@ Then re-run `simplbooks doctor` to confirm.
                                                 editing.
 
   simplbooks financial_transactions create --date YYYY-MM-DD [--note T]
-        --line 'side=debit|credit:account=<id>:sum=<amt>[:note=...]' ...
+        --line 'side=debit|credit:coa=<chart code>:sum=<amt>[:note=...]' ...
                                                 Create a balanced double-entry.
                                                 Debit total must equal credit
-                                                total. --line repeatable.
+                                                total. --line repeatable. BOTH
+                                                legs are chart-of-accounts legs,
+                                                named by CODE — a journal entry
+                                                has no cashbook leg.
 
   simplbooks financial_transactions update <id>
         [--date YYYY-MM-DD] [--note T]
-        [--set-line '<idx>:account=<id>[:debit=<amt>][:credit=<amt>][:note=T]']
-        [--add-line 'side=debit|credit:account=<id>:sum=<amt>[:note=...]']
+        [--set-line '<idx>:coa=<chart code>[:debit=<amt>][:credit=<amt>][:note=T]']
+        [--add-line 'side=debit|credit:coa=<chart code>:sum=<amt>[:note=...]']
         [--remove-line <idx>] [--attach PATH] [--set 'NAME=VALUE']
                                                 Edit a kanne in place. Scrapes
                                                 the edit form, patches, re-checks
@@ -1178,7 +1182,7 @@ Then re-run `simplbooks doctor` to confirm.
                                                 idx is the leg number from
                                                 `financial_transactions show`.
                                                 Headline use is reclassification:
-                                                  financial_transactions update 20046 --set-line '1:account=<account-id>'
+                                                  financial_transactions update 20046 --set-line '1:coa=<chart code>'
                                                 --attach uploads a source PDF.
 
   simplbooks financial_transactions delete <id> Delete a kanne by id.
@@ -1234,6 +1238,23 @@ Then re-run `simplbooks doctor` to confirm.
                                                 activation path otherwise); external
                                                 and effectively irreversible, so it
                                                 confirms before filing.
+
+═══ Account id-spaces ══════════════════════════════════════════════════════
+
+  Two disjoint id-spaces, one rule: which flag you use decides which one you
+  are in, and a value from the wrong space is refused before anything posts.
+
+  chart of accounts   addressed by CODE (four-to-five digits, >= 1010) on
+                      --income-coa / --expense-coa / --counter-coa /
+                      --trade-receivables-coa / --trade-creditors-coa and on
+                      every `coa=<code>` line key. Journal legs, invoice and
+                      purchase row accounts, client AR/AP/expense defaults.
+  cashbooks           addressed by ID (1-8) on --bank-cashbook-id /
+                      --from-cashbook-id. Incomings, payments, the own-bank
+                      account printed on a sales invoice.
+
+  Both listings: `simplbooks accounts list chart | cashbook`. Full rule and
+  command inventory: `simplbooks guide id-spaces`.
 
 ═══ Tax classes ════════════════════════════════════════════════════════════
 
@@ -1458,13 +1479,17 @@ def _cfg(key: str, override: str | None = None) -> str | None:
 
 
 def _bank_account(override: str | None = None) -> str:
-    """Resolve this account's own bank/cashbook id used on sales invoices from the
-    --bank-account flag. No id is baked in and there is no env fallback — it is an
-    account-specific chart row the caller supplies per invoice."""
+    """Resolve the own-bank account printed on a sales invoice (form field
+    `default_bank_account`) from --bank-cashbook-id.
+
+    This is a CASHBOOK id — a row of `accounts list cashbook`, not a chart-of-
+    accounts id or code. No id is baked in and there is no env fallback: which of
+    the company's own bank accounts an invoice asks to be paid into is a per-
+    invoice choice the caller makes."""
     if override and override.strip():
         return override.strip()
     raise click.ClickException(
-        "No bank account — pass --bank-account <id> "
+        "No bank account — pass --bank-cashbook-id <cashbook id> "
         "(find it with `simplbooks accounts list cashbook`)."
     )
 
@@ -1474,7 +1499,7 @@ def _resolve_tax(tax_class: str, vat_types: dict, vat_type: str | None = None,
     """Resolve (vat_type_id, income_account_id, vat_rate) for a regime against the
     account's LIVE vat_types map. The vat_type is the regime anchor (override with
     --vat-type-id) and the rate comes straight from the live map. The income
-    account resolves: --income-account-id > the live map's default. The override is
+    account resolves: --income-coa > the live map's default. The override is
     supplied per invoice by the caller (a books-policy choice, e.g. EU/export to a
     0% revenue row); no id is baked into the tool and there is no env fallback."""
     vt = str(vat_type or TAX_CLASSES[tax_class]["vat_type_id"])
@@ -1485,8 +1510,9 @@ def _resolve_tax(tax_class: str, vat_types: dict, vat_type: str | None = None,
     if not ia:
         raise click.ClickException(
             f"No income account for vat_type {vt} — the live vat_types map gave none "
-            f"and --income-account-id was not passed.\n"
-            f"  → pass --income-account-id <id> (find it with `simplbooks accounts list chart`)."
+            f"and --income-coa was not passed.\n"
+            f"  → pass --income-coa <chart code> (the CODE column of "
+            f"`simplbooks accounts list chart`)."
         )
     if rate is None:
         # The live map should always carry the rate; fall back to 0 only defensively.
@@ -2003,6 +2029,379 @@ def _refresh_clients_cache(search: str = "", limit: int = 200) -> tuple[list[dic
     CLIENTS_CACHE.write_text(json.dumps(rows, indent=2, ensure_ascii=False))
     return rows, payload.get("recordsTotal", len(rows))
 
+
+# ─── account id-spaces (chart CODES vs cashbook IDS) ────────────────────────
+#
+# SimpleBooks keeps two disjoint integer id-spaces for things it calls
+# "accounts", and the same real ledger carries a different number in each:
+#
+#   chart of accounts (COA)  internal ids 1..~252, each with a four-to-five
+#                            digit CODE. The only legal leg of a journal entry,
+#                            the account on an invoice/purchase row, a client's
+#                            AR/AP/expense default. The FORM FIELDS take the
+#                            internal id; the CLI's own flags take the code.
+#   cashbooks                ids 1..8 ("Pangakontod ja kassad"). The operational
+#                            handle a document attaches to — incomings, payments,
+#                            the own-bank field on a sales invoice.
+#
+# Every cashbook id is also a live COA id, so a cashbook id supplied where a COA
+# id belongs resolves to a real account and posts silently to the wrong ledger.
+# Two mechanisms make that unrepresentable:
+#
+#   1. LEXICAL — the agent-facing flags and line keys take the COA *code*
+#      (>= COA_CODE_MIN) on the chart side and the cashbook *id*
+#      (<= CASHBOOK_ID_MAX) on the cashbook side. The ranges are disjoint, so a
+#      value from the wrong space fails the parse before any lookup or request.
+#      The three-digit zone between them — where COA internal ids live — belongs
+#      to neither space and is refused everywhere.
+#   2. MEMBERSHIP — every account value in an outgoing form body is checked
+#      against its own space immediately before the POST, keyed on the FULL
+#      form-field path (`_validate_account_fields`). The leaf field name is
+#      overloaded: `income_account_id` is a COA id inside an invoice's Task rows
+#      and a cashbook id inside an Incoming/Payment, and `default_bank_account`
+#      is a cashbook field a chart-membership check would wrongly bless.
+#
+# Legacy flags and line keys keep taking the raw internal id — hidden from help,
+# existence-checked only, never refused merely for landing in the cashbook range
+# — so callers pinned to the old surface keep working unchanged.
+
+COA_CODE_MIN = 1010          # the lowest code any SimpleBooks chart of accounts uses
+CASHBOOK_ID_MAX = 99         # cashbook ids are one- or two-digit (1..8 on this account)
+ACCOUNT_LOOKUP_LIMIT = 5000  # one page, always the whole list — a partial chart is refused
+
+_CHART_INDEX: dict | None = None
+_CHART_INDEX_ALL: dict | None = None
+_CASHBOOK_INDEX: dict | None = None
+
+
+def _index_accounts(rows: list[dict]) -> dict:
+    """Index listdata account rows by code and by internal id.
+
+    A code that appears twice is recorded as ambiguous rather than resolved to
+    whichever row was seen first — the code is the CLI's addressing key, so a
+    collision has to be refused, not silently broken in the caller's favour."""
+    by_code: dict[str, dict] = {}
+    by_id: dict[str, dict] = {}
+    ambiguous: set[str] = set()
+    for row in rows:
+        rec = {
+            "id": str(row.get("id") or "").strip(),
+            "code": strip_html(row.get("code")),
+            "name": strip_html(row.get("name")),
+        }
+        if rec["id"]:
+            by_id[rec["id"]] = rec
+        if rec["code"]:
+            if rec["code"] in by_code:
+                ambiguous.add(rec["code"])
+            else:
+                by_code[rec["code"]] = rec
+    return {"by_code": by_code, "by_id": by_id, "ambiguous": ambiguous}
+
+
+def _chart_index() -> dict:
+    """The live ACTIVE chart of accounts, indexed by code and by internal id.
+
+    Fetched once per process: every write validates against it, so a run that
+    touches five accounts still pays for exactly one listdata call."""
+    global _CHART_INDEX
+    if _CHART_INDEX is None:
+        cookies, account = session_or_die()
+        with build_http(cookies, account, ajax=True) as http:
+            rows = _accounts_listdata(http, account, "financial_accounts",
+                                      ACCOUNT_LOOKUP_LIMIT, strict=True)
+        _CHART_INDEX = _index_accounts(rows)
+    return _CHART_INDEX
+
+
+def _chart_index_all() -> dict:
+    """The chart WITHOUT the active-only filter — diagnostic only, so a rejection
+    can say "inactive" where the account exists but is switched off, instead of
+    reporting every miss as unknown."""
+    global _CHART_INDEX_ALL
+    if _CHART_INDEX_ALL is None:
+        cookies, account = session_or_die()
+        with build_http(cookies, account, ajax=True) as http:
+            rows = _accounts_listdata(http, account, "financial_accounts",
+                                      ACCOUNT_LOOKUP_LIMIT, active_only=False)
+        _CHART_INDEX_ALL = _index_accounts(rows)
+    return _CHART_INDEX_ALL
+
+
+def _cashbook_index() -> dict:
+    """The live cashbook list ("Pangakontod ja kassad"), indexed by id."""
+    global _CASHBOOK_INDEX
+    if _CASHBOOK_INDEX is None:
+        cookies, account = session_or_die()
+        with build_http(cookies, account, ajax=True) as http:
+            rows = _accounts_listdata(http, account, "income_accounts",
+                                      ACCOUNT_LOOKUP_LIMIT, strict=True)
+        _CASHBOOK_INDEX = _index_accounts(rows)
+    return _CASHBOOK_INDEX
+
+
+def _parse_coa_code(value, label: str) -> str:
+    """Parse gate for a chart-of-accounts CODE — pure, so a value from the wrong
+    id-space is refused before any lookup and before any request leaves."""
+    s = str(value).strip()
+    if not re.fullmatch(r"\d+", s):
+        raise click.ClickException(
+            f"{label} takes a chart-of-accounts code — digits only, e.g. 1030 — got {value!r}."
+        )
+    if int(s) < COA_CODE_MIN:
+        raise click.ClickException(
+            f"{label} takes the chart-of-accounts CODE (>= {COA_CODE_MIN}), not an internal "
+            f"account id and not a cashbook id — got {s}.\n"
+            f"  → the CODE column of `simplbooks accounts list chart` (1030 Raha teel, "
+            f"1025 Swedbank pangakonto, …).\n"
+            f"  → cashbook ids 1-{CASHBOOK_ID_MAX} belong to the cashbook flags "
+            f"(`accounts list cashbook`), never here."
+        )
+    return s
+
+
+def _parse_cashbook_id(value, label: str) -> str:
+    """Parse gate for a cashbook id — pure, same contract as `_parse_coa_code`."""
+    s = str(value).strip()
+    if not re.fullmatch(r"\d+", s):
+        raise click.ClickException(
+            f"{label} takes a cashbook id — digits only, e.g. 3 — got {value!r}."
+        )
+    n = int(s)
+    if n < 1 or n > CASHBOOK_ID_MAX:
+        raise click.ClickException(
+            f"{label} takes a cashbook id (1-{CASHBOOK_ID_MAX}; `simplbooks accounts list "
+            f"cashbook` lists the live ones) — got {s}. A chart-of-accounts code or internal "
+            f"id is a different id-space and is never valid here."
+        )
+    return s
+
+
+def _coa_by_code(code: str, label: str) -> dict:
+    """Chart CODE → its live record {id, code, name}. Layer two of the gate: the
+    parse gate has already refused anything that isn't code-shaped; this proves
+    membership in the live chart and yields the internal id the form wants."""
+    index = _chart_index()
+    if str(code) in index["ambiguous"]:
+        raise click.ClickException(
+            f"{label}: account code {code} is carried by more than one chart account — "
+            f"the code cannot address one of them. Fix the duplicate in SimplBooks."
+        )
+    rec = index["by_code"].get(str(code))
+    if rec:
+        return rec
+    stale = _chart_index_all()["by_code"].get(str(code))
+    if stale:
+        raise click.ClickException(
+            f"{label}: account code {code} exists (internal id {stale['id']}, {stale['name']}) "
+            f"but is not in the ACTIVE chart — reactivate it in SimplBooks, or book elsewhere."
+        )
+    raise click.ClickException(
+        f"{label}: no account with code {code} in the chart of accounts. The lookup reads "
+        f"ACTIVE accounts only, so an inactive or renumbered account lands here too — check "
+        f"`simplbooks accounts list chart`."
+    )
+
+
+def _cashbook_by_id(cashbook_id, label: str) -> dict:
+    """Cashbook id → its live record {id, code, name}."""
+    rec = _cashbook_index()["by_id"].get(str(cashbook_id))
+    if rec:
+        return rec
+    live = ", ".join(sorted(_cashbook_index()["by_id"], key=lambda v: int(v)))
+    raise click.ClickException(
+        f"{label}: {cashbook_id} is not a live cashbook id (live ids: {live}). "
+        f"See `simplbooks accounts list cashbook`."
+    )
+
+
+def _opt_label(param) -> str:
+    return param.opts[0] if getattr(param, "opts", None) else f"--{param.name}"
+
+
+def _coa_code_cb(ctx, param, value):
+    """Click callback: gate a COA-code option at PARSE time — before the command
+    body runs, so nothing reaches the network on a wrong-space value."""
+    if value in (None, ""):
+        return value
+    return _parse_coa_code(value, _opt_label(param))
+
+
+def _cashbook_id_cb(ctx, param, value):
+    """Click callback: gate a cashbook-id option at parse time."""
+    if value in (None, ""):
+        return value
+    return _parse_cashbook_id(value, _opt_label(param))
+
+
+def _line_account_id(parts: dict, label: str,
+                     legacy_keys: tuple[str, ...] = ("acct", "account")) -> str | None:
+    """Resolve one `--line` / `--set-line` entry's account to the internal id the
+    form field takes.
+
+    `coa=<code>` is the typed form: parse-gated, then resolved against the live
+    chart. The legacy keys carry the raw internal id unchanged (existence-checked
+    later, at the pre-POST validation). Returns None when the entry names no
+    account at all."""
+    given = [k for k in ("coa", *legacy_keys) if k in parts]
+    if len(given) > 1:
+        raise click.ClickException(
+            f"{label}: pass only one account key, got {' and '.join(given)}."
+        )
+    if not given:
+        return None
+    key = given[0]
+    if key == "coa":
+        code = _parse_coa_code(parts[key], f"{label} coa=")
+        return _coa_by_code(code, f"{label} coa=")["id"]
+    return str(parts[key]).strip()
+
+
+def _one_account_flag(new_value, legacy_value, new_label: str, legacy_label: str) -> str | None:
+    """Resolve a renamed COA flag pair to the internal id the form field takes.
+
+    The visible flag carries the code; the hidden legacy flag carries the raw
+    internal id and is passed through untouched (item 5 of the remediation plan:
+    the legacy path is existence-validated, never range-rejected)."""
+    if new_value not in (None, "") and legacy_value not in (None, ""):
+        raise click.ClickException(
+            f"Pass either {new_label} (account code) or {legacy_label} (internal id), not both."
+        )
+    if new_value not in (None, ""):
+        return _coa_by_code(str(new_value), new_label)["id"]
+    if legacy_value not in (None, ""):
+        return str(legacy_value).strip()
+    return None
+
+
+def _one_cashbook_flag(new_value, legacy_value, new_label: str, legacy_label: str,
+                       *, required: bool = True) -> str | None:
+    """Resolve a renamed cashbook flag pair. Both spellings carry the same value —
+    a cashbook id — so this only picks one and reports a missing required id."""
+    if new_value not in (None, "") and legacy_value not in (None, ""):
+        raise click.ClickException(
+            f"Pass either {new_label} or {legacy_label}, not both."
+        )
+    value = new_value if new_value not in (None, "") else legacy_value
+    if value in (None, ""):
+        if required:
+            raise click.ClickException(
+                f"{new_label} is required — the cashbook the money moves through "
+                f"(`simplbooks accounts list cashbook`)."
+            )
+        return None
+    return str(value).strip()
+
+
+# Full form-field path → id-space. Keyed on the WHOLE path, never the leaf name:
+# `income_account_id` is a COA id inside an invoice's Task rows and a cashbook id
+# inside an Incoming/Payment, and `default_bank_account` is a cashbook field that
+# a chart-membership check would wrongly bless.
+_ACCOUNT_FIELD_SPACES: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"Task\[[^\]]+\]\[income_account_id\]"), "coa"),
+    (re.compile(r"data\[PurchaseRows\]\[[^\]]+\]\[PurchaseRow\]\[expense_account_id\]"), "coa"),
+    (re.compile(r"data\[FinancialTransactions\]\[[^\]]+\]\[financial_account_id\]"), "coa"),
+    (re.compile(r"data\[FinancialTransaction\]\[transactions\]\[[^\]]+\]\[financial_account_id\]"), "coa"),
+    (re.compile(r"data\[FinancialTransaction\]\[income_financial_account_id\]"), "coa"),
+    (re.compile(r"data\[Client\]\[trade_receivables_account_id\]"), "coa"),
+    (re.compile(r"data\[Client\]\[trade_creditors_account_id\]"), "coa"),
+    (re.compile(r"data\[Client\]\[expense_account_id\]"), "coa"),
+    (re.compile(r"data\[Incoming\]\[income_account_id\]"), "cashbook"),
+    (re.compile(r"data\[Payment\]\[income_account_id\]"), "cashbook"),
+    (re.compile(r"default_bank_account"), "cashbook"),
+    (re.compile(r"income_account_id"), "cashbook"),   # bare: purchases/send_payment
+)
+
+
+def _account_field_space(name: str) -> str | None:
+    """Which id-space a form field belongs to, by its full path. None = not an
+    account field."""
+    for pattern, space in _ACCOUNT_FIELD_SPACES:
+        if pattern.fullmatch(name):
+            return space
+    return None
+
+
+def _form_value(value) -> str:
+    """A form body carries plain strings (urlencoded) or multipart tuples."""
+    if isinstance(value, (tuple, list)):
+        payload = value[1] if len(value) > 1 else ""
+        return payload if isinstance(payload, str) else ""
+    return value if isinstance(value, str) else str(value)
+
+
+def _validate_account_fields(fields) -> list[dict]:
+    """Validate every account-carrying field of an outgoing form body against its
+    own id-space, and return what each one resolved to.
+
+    Runs immediately before the POST on every write path, so it covers the raw
+    `--set` / `--set-line` escape hatches and scraped round-trips as well as the
+    typed flags. The values seen here are what SimpleBooks stores: internal COA
+    ids on the chart side, cashbook ids on the cashbook side."""
+    pairs = fields.items() if isinstance(fields, dict) else fields
+    touched: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for name, raw in pairs:
+        space = _account_field_space(name)
+        if space is None:
+            continue
+        value = _form_value(raw).strip()
+        if value in ("", "0"):
+            continue                      # SB's "unset" for an optional account field
+        if (name, value) in seen:
+            continue
+        seen.add((name, value))
+        if not re.fullmatch(r"\d+", value):
+            raise click.ClickException(
+                f"{name} must carry an account id, got {value!r}."
+            )
+        if space == "coa":
+            rec = _chart_index()["by_id"].get(value)
+            if not rec:
+                stale = _chart_index_all()["by_id"].get(value)
+                if stale:
+                    raise click.ClickException(
+                        f"{name}: chart account id {value} ({stale['code']} {stale['name']}) is "
+                        f"not active — refusing to post to it."
+                    )
+                raise click.ClickException(
+                    f"{name}: {value} is not a live chart-of-accounts id. The lookup reads "
+                    f"ACTIVE accounts, so an inactive or deleted account lands here too. This "
+                    f"CLI addresses chart accounts by CODE — see `simplbooks accounts list chart`."
+                )
+        else:
+            rec = _cashbook_by_id(value, name)
+        touched.append({"field": name, "space": space, "id": rec["id"],
+                        "code": rec["code"], "name": rec["name"]})
+    return touched
+
+
+def _account_echo_lines(touched: list[dict]) -> list[str]:
+    """One line per account a write touched: code + name, not a bare id.
+
+    The twelve mis-posted payouts printed a clean success with nothing in it that
+    could have exposed "1030 Raha teel"; this is that line."""
+    out: list[str] = []
+    for t in touched:
+        if t["space"] == "coa":
+            out.append(f"{t['code']} {t['name']} (COA id {t['id']}) ← {t['field']}")
+        else:
+            out.append(f"cashbook {t['id']} {t['name']} ← {t['field']}")
+    return out
+
+
+def _echo_accounts(touched: list[dict]) -> None:
+    """Human-side echo of `_validate_account_fields`'s result. The JSON side is
+    `touched` itself — the same records, ready to serialize where a write verb
+    grows a --json mode."""
+    lines = _account_echo_lines(touched)
+    if not lines:
+        return
+    click.echo(f"  Accounts : {lines[0]}")
+    for line in lines[1:]:
+        click.echo(f"             {line}")
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 class _GatedCommand(click.Command):
@@ -2454,19 +2853,41 @@ def clients_show(client_id: int, as_json: bool) -> None:
 @click.option("--language")
 @click.option("--sales-vat-type", type=int, help="VAT type id applied by default to sales invoice lines.")
 @click.option("--purchase-vat-type", type=int, help="VAT type id applied by default to purchase invoice rows.")
-@click.option("--trade-receivables", type=int, help="AR account override (chart-of-accounts id).")
-@click.option("--trade-creditors", type=int, help="AP account override (chart-of-accounts id).")
-@click.option("--expense-account", type=int, help="Default expense account for purchase rows.")
+@click.option("--trade-receivables-coa", callback=_coa_code_cb,
+              help="AR account override — chart-of-accounts CODE (`accounts list chart`).")
+@click.option("--trade-creditors-coa", callback=_coa_code_cb,
+              help="AP account override — chart-of-accounts CODE.")
+@click.option("--expense-coa", callback=_coa_code_cb,
+              help="Default expense account for purchase rows — chart-of-accounts CODE.")
+# Legacy: raw internal ids. Bound but hidden — help is the surface an agent
+# composes from, so a visible legacy name would defeat the rename.
+@click.option("--trade-receivables", type=int, hidden=True)
+@click.option("--trade-creditors", type=int, hidden=True)
+@click.option("--expense-account", type=int, hidden=True)
 def clients_update(client_id, **overrides) -> None:
     """Update an existing client. Only the flags you pass are changed; everything else is preserved.
 
     Common use: set per-client VAT defaults so future invoices inherit them automatically.
 
-      simplbooks clients update 407 --purchase-vat-type 11 --expense-account <expense-account-id>
+      simplbooks clients update 407 --purchase-vat-type 11 --expense-coa 5060
       simplbooks clients update 389 --sales-vat-type 32 --vat-no EE123456789
     """
     cookies, account = session_or_die()
     overrides = {k: v for k, v in overrides.items() if v is not None}
+
+    # The three account fields take a chart CODE on the visible flag and the raw
+    # internal id on the hidden legacy one; both land on the same form field as
+    # the internal id SimpleBooks stores.
+    for new_key, legacy_key in (("trade_receivables_coa", "trade_receivables"),
+                                ("trade_creditors_coa", "trade_creditors"),
+                                ("expense_coa", "expense_account")):
+        resolved = _one_account_flag(
+            overrides.pop(new_key, None), overrides.get(legacy_key),
+            f"--{new_key.replace('_', '-')}", f"--{legacy_key.replace('_', '-')}",
+        )
+        if resolved is not None:
+            overrides[legacy_key] = resolved
+
     if not overrides:
         raise click.ClickException("Pass at least one --<field> flag to change.")
 
@@ -2518,6 +2939,7 @@ def clients_update(client_id, **overrides) -> None:
             if opt_key in overrides:
                 body[form_name] = str(overrides[opt_key])
 
+        touched = _validate_account_fields(body)
         body["_csrfToken"] = fetch_fresh_csrf(http, account, path=f"clients/edit/{client_id}")
         http.headers["Referer"] = f"{BASE}/{account}/clients/edit/{client_id}"
         http.headers["Origin"] = BASE
@@ -2529,6 +2951,7 @@ def clients_update(client_id, **overrides) -> None:
             click.secho(f"✓ Updated client {client_id}", fg="green", bold=True)
             for k, v in overrides.items():
                 click.echo(f"  {k:<22} = {v}")
+            _echo_accounts(touched)
             return
     fail = CONFIG_DIR / "last_update_failure.html"
     fail.write_text(r.text)
@@ -2821,8 +3244,10 @@ def _harvest_form_fields(soup: BeautifulSoup, html_text: str) -> list[tuple[str,
               help="If the invoice has bound payments/incomings (which lock editing), "
                    "unbind them, perform the edit, then re-bind. Use with caution.")
 @click.option("--add-line", "add_lines", multiple=True,
-              help="Append a Task line. Format: 'name=X:price=Y:vat=R:vat_type=ID:account=ID[:amount=N:unit=tk]'. "
-                   "Repeatable. For rounding: 'name=Ümardamine:price=-0,01:vat=0:vat_type=15:account=<income-account-id>'.")
+              help="Append a Task line. Format: "
+                   "'name=X:price=Y:vat=R:vat_type=ID:coa=<code>[:amount=N:unit=tk]'. "
+                   "Repeatable; `coa=` is the income account's chart CODE. For rounding: "
+                   "'name=Ümardamine:price=-0,01:vat=0:vat_type=15:coa=<code>'.")
 def invoices_update(invoice_id, additional_info, append_reference, new_number,
                     new_date, new_due, new_client_id, set_pairs, force_unbind,
                     add_lines) -> None:
@@ -2869,7 +3294,9 @@ def invoices_update(invoice_id, additional_info, append_reference, new_number,
             "data[Invoice][client_data_needs_update]": "1",
         })
 
-    # Parse --add-line entries into Task field-sets
+    # Parse --add-line entries into Task field-sets. The account arrives as
+    # `coa=<code>` (parse-gated, then resolved to the internal id the form takes)
+    # or, on the legacy path, as `account=<internal id>`.
     new_lines: list[dict] = []
     for raw in add_lines:
         parts: dict[str, str] = {}
@@ -2878,13 +3305,17 @@ def invoices_update(invoice_id, additional_info, append_reference, new_number,
                 continue
             k, v = kv.split("=", 1)
             parts[k.strip()] = v.strip()
+        acct = _line_account_id(parts, f"--add-line {raw!r}")
+        if acct is None:
+            raise click.ClickException(
+                f"--add-line needs an income account — pass coa=<chart code>: {raw!r}")
         try:
             new_lines.append({
                 "name": parts["name"],
                 "price": parts["price"],
                 "vat": parts.get("vat", "0"),
                 "vat_type_id": parts["vat_type"],
-                "account": parts["account"],
+                "account": acct,
                 "amount": parts.get("amount", "1"),
                 "unit": parts.get("unit", "tk"),
             })
@@ -2985,6 +3416,8 @@ def invoices_update(invoice_id, additional_info, append_reference, new_number,
             new_csrf = csrf_inp["value"]
             fields = [(n, new_csrf if n == "_csrfToken" else v) for n, v in fields]
 
+        touched = _validate_account_fields(fields)
+
         # POST as multipart (the form's enctype) — include an empty file part
         parts: list[tuple[str, tuple]] = [(n, (None, v)) for n, v in fields]
         # `Invoice[copy]` is the optional attachment slot on the form
@@ -3002,6 +3435,7 @@ def invoices_update(invoice_id, additional_info, append_reference, new_number,
             click.echo(f"  additional_info → {new_info!r}")
         for k, v in overrides.items():
             click.echo(f"  {k} → {v!r}")
+        _echo_accounts(touched)
         if needs_rebind:
             for kind, bid in saved_bindings:
                 _do_bind(kind, bid, [invoice_id])
@@ -3089,18 +3523,29 @@ def invoices_delete(invoice_id) -> None:
 @click.option("--date", "invoice_date", default=None, help="Invoice date YYYY-MM-DD. Defaults to today.")
 @click.option("--vat-type-id", "vat_type_id", default=None,
               help="Override the regime's sales vat_type_id (see `invoices meta`).")
-@click.option("--income-account-id", "income_account_id", default=None,
-              help="Override the income account (else read live from the vat_types map).")
-@click.option("--bank-account", "bank_account", default=None,
-              help="Own bank account id shown on the invoice (required; see `accounts list cashbook`).")
+@click.option("--income-coa", "income_coa", default=None, callback=_coa_code_cb,
+              help="Override the income account — chart-of-accounts CODE "
+                   "(else read live from the vat_types map).")
+@click.option("--bank-cashbook-id", "bank_cashbook_id", default=None, callback=_cashbook_id_cb,
+              help="Own bank account shown on the invoice — cashbook ID, required "
+                   "(`accounts list cashbook`).")
+# Legacy: raw internal id / raw cashbook id, bound but hidden.
+@click.option("--income-account-id", "income_account_id", default=None, hidden=True)
+@click.option("--bank-account", "bank_account", default=None, hidden=True)
 @click.option("--creator", default=None,
               help="Issuer user id (else the logged-in user, read from the form).")
 @click.option("--dry-run", is_flag=True,
               help="Resolve everything and print the payload WITHOUT creating the invoice.")
 def invoices_create(client_id, description, price, tax_class, number,
                     quantity, unit, due_days, worker, reference, invoice_date,
-                    vat_type_id, income_account_id, bank_account, creator, dry_run) -> None:
+                    vat_type_id, income_coa, bank_cashbook_id, income_account_id,
+                    bank_account, creator, dry_run) -> None:
     """Create a new invoice."""
+    income_account_id = _one_account_flag(
+        income_coa, income_account_id, "--income-coa", "--income-account-id")
+    bank_account = _one_cashbook_flag(
+        bank_cashbook_id, bank_account, "--bank-cashbook-id", "--bank-account",
+        required=False)
     cookies, account = session_or_die()
     cache = load_clients_cache()
     if str(client_id) not in cache:
@@ -3135,6 +3580,7 @@ def invoices_create(client_id, description, price, tax_class, number,
             invoice_date=parsed_date, vat_type=vat_type_id,
             income_account=income_account_id, bank_account=bank_account,
         )
+        touched = _validate_account_fields(fields)
         if dry_run:
             fmap = dict(fields)
             click.secho("DRY RUN — invoice NOT created. Resolved payload:", fg="yellow", bold=True)
@@ -3143,11 +3589,12 @@ def invoices_create(client_id, description, price, tax_class, number,
             click.echo(f"  Tax class     : {tax_class}")
             click.echo(f"  vat_type_id   : {fmap.get('Task[0][vat_type_id]')}")
             click.echo(f"  vat rate      : {fmap.get('Task[0][vat]')}")
-            click.echo(f"  income acct   : {fmap.get('Task[0][income_account_id]')}  (--income-account-id > live default)")
+            click.echo(f"  income acct   : {fmap.get('Task[0][income_account_id]')}  (--income-coa > live default)")
             click.echo(f"  bank account  : {fmap.get('default_bank_account')}")
             click.echo(f"  creator       : {fmap.get('creator')}  (--creator > logged-in user)")
             click.echo(f"  worker        : {fmap.get('Task[0][worker]')}")
             click.echo(f"  price/unit    : {fmap.get('Task[0][price_per_unit]')} × {fmap.get('Task[0][amount]')} {fmap.get('Task[0][unit]')}")
+            _echo_accounts(touched)
             return
         parts: list[tuple[str, tuple]] = [(n, (None, v)) for n, v in fields]
         parts.append(("copy", ("", b"", "application/octet-stream")))
@@ -3162,6 +3609,7 @@ def invoices_create(client_id, description, price, tax_class, number,
         click.echo(f"  Client : {client_row.get('name')} [{client_id}]")
         click.echo(f"  Date   : {invoice_date or 'today'}")
         click.echo(f"  Amount : {to_estonian_number(price)} EUR × {quantity} ({tax_class})")
+        _echo_accounts(touched)
         click.echo(f"  URL    : {BASE}/{account}/invoices/view/{inv_id}")
         return
     fail = CONFIG_DIR / "last_create_failure.html"
@@ -3261,8 +3709,14 @@ def _accounts_listdata(http: httpx.Client, account: str, endpoint: str, limit: i
                    "reported on stderr, never dropped silently.")
 @click.option("--json", "as_json", is_flag=True)
 def accounts_list(kind: str, limit: int, as_json: bool) -> None:
-    """List accounts: `cashbook` (bank-like clearing accounts) or `chart` (the
-    full chart of accounts — income 4xxx, expense 5xxx)."""
+    """List accounts: `cashbook` (bank-like clearing accounts, addressed by ID) or
+    `chart` (the full chart of accounts, addressed by CODE).
+
+    The CODE column is what this CLI's chart-side flags and `coa=` line keys take
+    (`--income-coa 4010`, `--counter-coa 1030`); the ID column is the internal id
+    SimpleBooks stores. The cashbook ID column is what the cashbook-side flags
+    take (`--bank-cashbook-id 3`). The two id-spaces are disjoint — see
+    `simplbooks guide id-spaces`."""
     cookies, account = session_or_die()
     endpoint = ACCOUNT_KINDS[kind]
     with build_http(cookies, account, ajax=True) as http:
@@ -4116,6 +4570,10 @@ def _submit_inline_closure(http: httpx.Client, account: str, period_dm: str,
         if debit == 0.0 and credit == 0.0:
             drop_keys.add(k)
 
+    # Deliberately NOT run through `_validate_account_fields`: every account on
+    # this body is one SimpleBooks itself computed into its own closure form, with
+    # no caller-supplied account anywhere, so the wrong-id-space defect cannot
+    # arise here — and a validation refusal would block a time-bound declaration.
     body: list[tuple[str, str]] = []
     for n, v in harvested:
         m = KANNE_LINE_RE.fullmatch(n)
@@ -4989,6 +5447,7 @@ def _purchase_update_created_integrity(
     _set_field(fields, "_csrfToken", fetch_fresh_csrf(http, account, path="purchases/add"))
     if rounding is not None:
         _set_field(fields, "data[Purchase][rounding]", to_estonian_number(rounding))
+    _validate_account_fields(fields)
 
     http.headers["Referer"] = f"{BASE}/{account}/purchases/edit/{purchase_id}"
     http.headers["Origin"] = BASE
@@ -5111,7 +5570,8 @@ def _ensure_created_purchase_integrity(
               help="Interpret each --line 'sum' as GROSS (VAT-inclusive) by default. "
                    "Pass --row-sum-net to interpret 'sum' as NET (VAT-exclusive) instead.")
 @click.option("--line", "lines_raw", multiple=True, required=True,
-              help="Repeatable. Format: acct=<account_id>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>")
+              help="Repeatable. Format: coa=<chart code>:vat_type=<id>:vat=<rate>:"
+                   "name=<desc>:sum=<amount>")
 @click.option("--attachment", "attachment_path", type=click.Path(exists=True, dir_okay=False), default=None,
               help="PDF / image of the source invoice to attach.")
 @click.option("--reference", default="",
@@ -5131,8 +5591,9 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
                     reference: str, comments: str, creator: str, dry_run: bool) -> None:
     """Create a purchase invoice (ostuarve), optionally attaching the source PDF.
 
-    Each --line is a colon-separated set of `key=value` pairs:
-      acct=<coa-id>:vat_type=34:vat=24:name=Office supplies:sum=82,18
+    Each --line is a colon-separated set of `key=value` pairs, where `coa` is the
+    expense account's chart-of-accounts CODE (`accounts list chart`):
+      coa=5060:vat_type=34:vat=24:name=Office supplies:sum=82,18
     """
     if currency_rate <= 0:
         raise click.ClickException(f"--rate must be a positive number, got {currency_rate}.")
@@ -5156,9 +5617,13 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
                 continue
             k, v = kv.split("=", 1)
             parts[k.strip()] = v.strip()
+        expense_account_id = _line_account_id(parts, f"--line {raw!r}")
+        if expense_account_id is None:
+            raise click.ClickException(
+                f"--line needs an expense account — pass coa=<chart code>: {raw!r}")
         try:
             lines.append({
-                "expense_account_id": parts["acct"],
+                "expense_account_id": expense_account_id,
                 "vat_type_id": parts["vat_type"],
                 "vat": parts.get("vat", "0"),
                 "name": parts["name"],
@@ -5227,6 +5692,7 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
             comments=comments,
             creator=creator,
         )
+        touched = _validate_account_fields(fields)
         if dry_run:
             fmap = dict(fields)
             interp = ("GROSS (VAT-inclusive); pass --row-sum-net to treat as net"
@@ -5271,6 +5737,7 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
                     f"-> EUR {to_estonian_number(fx_eur_total)}"
                 )
             click.echo(f"  Attach   : {attachment_path or '(none)'}")
+            _echo_accounts(touched)
             return
 
         http.headers["Referer"] = f"{BASE}/{account}/purchases/add"
@@ -5296,6 +5763,7 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
         click.echo(f"  Supplier : {supplier.get('name')} [{supplier_id}]")
         click.echo(f"  Date     : {invoice_date}")
         click.echo(f"  Lines    : {len(lines)}  VAT total: {vat_label}")
+        _echo_accounts(touched)
         if fx_doc_total is not None:
             click.echo(
                 f"  FX       : {fx_source_currency} "
@@ -5490,12 +5958,13 @@ def _purchase_remove_all_bindings(purchase_id: int) -> None:
               help='Replace the free-form payment note (the "Makse kirjeldus" field).')
 @click.option("--add-line", "add_lines", multiple=True,
               help="Append a new line. Same format as `purchases create --line`: "
-                   "acct=<id>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>[:amount=N][:unit=tk]")
+                   "coa=<chart code>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>"
+                   "[:amount=N][:unit=tk]")
 @click.option("--set-line", "set_lines", multiple=True,
               help="Edit an EXISTING line in place by its 1-based index (the order shown by "
-                   "`purchases show`). Format: '<idx>:acct=<id>[:vat_type=<id>][:vat=<rate>]"
+                   "`purchases show`). Format: '<idx>:coa=<chart code>[:vat_type=<id>][:vat=<rate>]"
                    "[:name=<desc>][:sum=<amt>][:amount=N][:unit=tk]'. Repeatable. "
-                   "Re-point an account: --set-line '1:acct=<coa-id>'.")
+                   "Re-point an account: --set-line '1:coa=5060'.")
 @click.option("--attach", "attach_path", type=click.Path(exists=True, dir_okay=False), default=None,
               help="Attach (set/replace) the source-document PDF/image on this purchase.")
 @click.option("--force-unbind/--no-force-unbind", default=False, show_default=True,
@@ -5523,13 +5992,13 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
 
       # Add a second line (e.g. an Ümardamine row when --rounding isn't enough).
       simplbooks purchases update 1731 \\
-        --add-line 'acct=<coa-id>:vat_type=15:vat=0:name=Ümardamine:sum=0,01'
+        --add-line 'coa=<chart code>:vat_type=15:vat=0:name=Ümardamine:sum=0,01'
 
       # Re-point an existing line's expense account (idx as shown by `purchases show`).
-      simplbooks purchases update 1763 --set-line '1:acct=<coa-id>'
+      simplbooks purchases update 1763 --set-line '1:coa=<chart code>'
 
       # Re-point the account, close the 1-cent VAT gap, and attach the source PDF in one call.
-      simplbooks purchases update 1763 --set-line '1:acct=<coa-id>' --vat-total 10,65 --attach invoice.pdf
+      simplbooks purchases update 1763 --set-line '1:coa=<chart code>' --vat-total 10,65 --attach invoice.pdf
 
       # Fix a PAID invoice (locked): unbind its payment, fix number+period+PDF, re-bind.
       simplbooks purchases update 1764 --force-unbind \\
@@ -5583,16 +6052,20 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
 
         for raw in add_lines:
             ln = _parse_kv_line(raw)
-            for required in ("acct", "vat_type", "name", "sum"):
+            for required in ("vat_type", "name", "sum"):
                 if required not in ln:
                     raise click.ClickException(f"--add-line missing required key '{required}': {raw!r}")
+            expense_account_id = _line_account_id(ln, f"--add-line {raw!r}")
+            if expense_account_id is None:
+                raise click.ClickException(
+                    f"--add-line needs an expense account — pass coa=<chart code>: {raw!r}")
             key = _random_row_key()
             fields += [
                 (f"data[PurchaseRows][{key}][PurchaseRow][id]", "0"),
                 (f"data[PurchaseRows][{key}][PurchaseRow][purchase_id]", str(purchase_id)),
                 (f"data[PurchaseRows][{key}][PurchaseRow][article_id]", "0"),
                 (f"data[PurchaseRows][{key}][PurchaseRow][is_inventory]", "0"),
-                (f"data[PurchaseRows][{key}][PurchaseRow][expense_account_id]", ln["acct"]),
+                (f"data[PurchaseRows][{key}][PurchaseRow][expense_account_id]", expense_account_id),
                 (f"data[PurchaseRows][{key}][PurchaseRow][code]", ""),
                 (f"data[PurchaseRows][{key}][PurchaseRow][name]", ln["name"]),
                 (f"data[PurchaseRows][{key}][PurchaseRow][vat_type_id]", ln["vat_type"]),
@@ -5608,8 +6081,7 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
         # user reads from `purchases show`, so --set-line '<idx>:…' targets the same row.
         if set_lines:
             ordered_keys = sorted(_row_index.keys())
-            alias = {"acct": "expense_account_id", "account": "expense_account_id",
-                     "vat_type": "vat_type_id"}
+            alias = {"vat_type": "vat_type_id"}
             for raw in set_lines:
                 head, _, rest = raw.partition(":")
                 try:
@@ -5625,7 +6097,16 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
                 if not attrs:
                     raise click.ClickException(f"--set-line {idx} has no field=value pairs: {raw!r}")
                 key = ordered_keys[idx - 1]
+                expense_account_id = _line_account_id(attrs, f"--set-line {raw!r}")
+                if expense_account_id is not None:
+                    _set_field(
+                        fields,
+                        f"data[PurchaseRows][{key}][PurchaseRow][expense_account_id]",
+                        expense_account_id,
+                    )
                 for k, v in attrs.items():
+                    if k in ("coa", "acct", "account"):
+                        continue          # handled above, in its own id-space
                     attr = alias.get(k, k)
                     if attr == "sum":
                         v = to_estonian_number(v)
@@ -5636,6 +6117,8 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
                 raise click.ClickException(f"--set must be NAME=VALUE: {raw!r}")
             k, v = raw.split("=", 1)
             _set_field(fields, k, v)
+
+        touched = _validate_account_fields(fields)
 
         http.headers["Referer"] = f"{BASE}/{account}/purchases/edit/{purchase_id}"
         http.headers["Origin"] = BASE
@@ -5688,6 +6171,7 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
             + "; ".join(verification_failures)
         )
     click.secho(f"✓ Updated purchase {purchase_id}", fg="green", bold=True)
+    _echo_accounts(touched)
     if set_lines:
         click.echo(f"  Edited line(s): {', '.join(r.split(':', 1)[0] for r in set_lines)}")
     if attach_path:
@@ -5714,13 +6198,16 @@ def purchases_delete(purchase_id) -> None:
 @click.argument("purchase_id", type=int)
 @click.option("--amount", default=None,
               help="Payment amount. Defaults to the invoice's pre-filled total.")
-@click.option("--from-account", "from_account", default=None,
-              help="Paying bank-cashbook id. Defaults to the invoice's pre-selected account.")
+@click.option("--from-cashbook-id", "from_cashbook_id", default=None, callback=_cashbook_id_cb,
+              help="Paying cashbook ID (`accounts list cashbook`). Defaults to the "
+                   "invoice's pre-selected account.")
+@click.option("--from-account", "from_account", default=None, hidden=True)
 @click.option("--date", "payment_date", default=None,
               help="Payment date dd.mm.yyyy. Defaults to today.")
 @click.option("--target", default=None,
               help="Bank integration target to push the order to (required).")
-def purchases_send_payment(purchase_id, amount, from_account, payment_date, target) -> None:
+def purchases_send_payment(purchase_id, amount, from_cashbook_id, from_account,
+                           payment_date, target) -> None:
     """Stage a purchase invoice as a payment order to the bank.
 
     Pushes the invoice to the configured bank integration. On success the
@@ -5742,6 +6229,9 @@ def purchases_send_payment(purchase_id, amount, from_account, payment_date, targ
         raise click.ClickException(
             "No bank target — pass --target <bank> (the bank integration to push the order to)."
         )
+    from_account = _one_cashbook_flag(
+        from_cashbook_id, from_account, "--from-cashbook-id", "--from-account",
+        required=False)
     target = target.strip()
     cookies, account = session_or_die()
     view_url = f"{BASE}/{account}/purchases/view/{purchase_id}"
@@ -5789,6 +6279,7 @@ def purchases_send_payment(purchase_id, amount, from_account, payment_date, targ
             ("payment_date", pay_date),
             ("_csrfToken", csrf),
         ]
+        touched = _validate_account_fields(fields)
         http.headers["Referer"] = view_url
         http.headers["Origin"] = BASE
         r = http.post(
@@ -5825,6 +6316,7 @@ def purchases_send_payment(purchase_id, amount, from_account, payment_date, targ
         click.echo(f"  amount   : {pay_amount}")
         click.echo(f"  from     : account {pay_account}")
         click.echo(f"  date     : {pay_date}")
+        _echo_accounts(touched)
         click.echo('  Invoice now "Pangas ootel" — confirm and sign in the bank\'s netbank.')
         return
 
@@ -5916,7 +6408,8 @@ def _money_fields(
 def _create_money(
     direction: str, client_id: int, account_id: int, sum_amount,
     date_str: str, description: str, object_type: str = "Purchase",
-) -> int:
+) -> tuple[int, list[dict]]:
+    """Create one Payment/Incoming. Returns (id, the accounts the write touched)."""
     cookies, account = session_or_die()
     cache = load_clients_cache()
     if str(client_id) not in cache:
@@ -5939,6 +6432,7 @@ def _create_money(
             income_account_id=account_id, sum_amount=sum_amount, date=dt,
             description=description, object_type=object_type,
         )
+        touched = _validate_account_fields(fields)
         http.headers["Referer"] = f"{BASE}/{account}/{form_path}"
         http.headers["Origin"] = BASE
         body = urlencode(fields)
@@ -5956,7 +6450,7 @@ def _create_money(
         raise click.ClickException(
             f"Create {direction} failed: HTTP {r.status_code} loc={loc!r}. Response → {fail}"
         )
-    return int(m.group(1))
+    return int(m.group(1)), touched
 
 
 def _resolve_cashbook_name(account_id: int) -> str:
@@ -5967,17 +6461,7 @@ def _resolve_cashbook_name(account_id: int) -> str:
     match on the resolved name. Raises when the id is not a live cashbook —
     otherwise the caller would silently see zero rows.
     """
-    cookies, account = session_or_die()
-    with build_http(cookies, account, ajax=True) as http:
-        rows = _accounts_listdata(http, account, "income_accounts", 500)
-    id_to_name = {str(r.get("id")): strip_html(r.get("name")) for r in rows}
-    name = id_to_name.get(str(account_id))
-    if not name:
-        raise click.ClickException(
-            f"--account-id {account_id} is not a cashbook. "
-            "See `simplbooks accounts list cashbook` for valid ids."
-        )
-    return name
+    return _cashbook_by_id(account_id, "cashbook filter")["name"]
 
 
 def _list_money(endpoint: str, search: str = "", limit: int = 200) -> list[dict]:
@@ -6298,11 +6782,17 @@ def payments() -> None:
 
 @payments.command("list")
 @click.option("--search", default="", help="Substring search across description / client / etc.")
-@click.option("--account-id", default=None, type=int, help="Filter (client-side) by bank/cashbook id.")
+@click.option("--bank-cashbook-id", "bank_cashbook_id", default=None, callback=_cashbook_id_cb,
+              help="Filter (client-side) by cashbook ID (`accounts list cashbook`).")
+@click.option("--account-id", default=None, type=int, hidden=True)
 @click.option("--limit", default=200, show_default=True, type=int)
 @click.option("--json", "as_json", is_flag=True)
-def payments_list(search, account_id, limit, as_json) -> None:
+def payments_list(search, bank_cashbook_id, account_id, limit, as_json) -> None:
     """List outgoing payments (server-side global search; client-side account filter)."""
+    if bank_cashbook_id and account_id is not None:
+        raise click.ClickException(
+            "Pass either --bank-cashbook-id or --account-id, not both.")
+    account_id = bank_cashbook_id if bank_cashbook_id else account_id
     rows = _list_money("payments", search=search, limit=limit)
     if account_id is not None:
         name = _resolve_cashbook_name(account_id)
@@ -6329,13 +6819,16 @@ def payments_list(search, account_id, limit, as_json) -> None:
 
 @payments.command("create")
 @click.option("--client-id", required=True, type=int, help="SB client id of the counter-party (supplier).")
-@click.option("--account-id", required=True, type=int, help="Bank/cashbook id (`accounts list cashbook` for ids).")
+@click.option("--bank-cashbook-id", "bank_cashbook_id", default=None, callback=_cashbook_id_cb,
+              help="Paying cashbook ID (`accounts list cashbook`). Required.")
+@click.option("--account-id", default=None, type=int, hidden=True)
 @click.option("--sum", "sum_amount", required=True, help="Amount, plain or Estonian decimal (e.g. 10 or 10,85).")
 @click.option("--date", "date_str", required=True, help="Payment date YYYY-MM-DD.")
 @click.option("--description", default="")
 @click.option("--object-type", type=click.Choice(["Purchase", "ExpenseReport"]),
               default="Purchase", show_default=True)
-def payments_create(client_id, account_id, sum_amount, date_str, description, object_type) -> None:
+def payments_create(client_id, bank_cashbook_id, account_id, sum_amount, date_str,
+                    description, object_type) -> None:
     """Create an outgoing payment (makse). Returns new payment id.
 
     A payment does NOT require a purchase invoice to exist — an unbound
@@ -6347,9 +6840,13 @@ def payments_create(client_id, account_id, sum_amount, date_str, description, ob
     `--object-type` selects the settlement target (Purchase default, or
     ExpenseReport).
     """
-    pid = _create_money("Payment", client_id, account_id, sum_amount, date_str, description, object_type)
+    account_id = _one_cashbook_flag(bank_cashbook_id, account_id,
+                                    "--bank-cashbook-id", "--account-id")
+    pid, touched = _create_money("Payment", client_id, account_id, sum_amount,
+                                 date_str, description, object_type)
     cookies, account = session_or_die()
     click.secho(f"✓ Created payment {pid}", fg="green", bold=True)
+    _echo_accounts(touched)
     click.echo(f"  URL: {BASE}/{account}/payments/view/{pid}")
 
 
@@ -6390,11 +6887,17 @@ def incomings() -> None:
 
 @incomings.command("list")
 @click.option("--search", default="", help="Substring search across description / client / etc.")
-@click.option("--account-id", default=None, type=int, help="Filter (client-side) by bank/cashbook id.")
+@click.option("--bank-cashbook-id", "bank_cashbook_id", default=None, callback=_cashbook_id_cb,
+              help="Filter (client-side) by cashbook ID (`accounts list cashbook`).")
+@click.option("--account-id", default=None, type=int, hidden=True)
 @click.option("--limit", default=200, show_default=True, type=int)
 @click.option("--json", "as_json", is_flag=True)
-def incomings_list(search, account_id, limit, as_json) -> None:
+def incomings_list(search, bank_cashbook_id, account_id, limit, as_json) -> None:
     """List incoming payments."""
+    if bank_cashbook_id and account_id is not None:
+        raise click.ClickException(
+            "Pass either --bank-cashbook-id or --account-id, not both.")
+    account_id = bank_cashbook_id if bank_cashbook_id else account_id
     rows = _list_money("incomings", search=search, limit=limit)
     if account_id is not None:
         name = _resolve_cashbook_name(account_id)
@@ -6421,15 +6924,22 @@ def incomings_list(search, account_id, limit, as_json) -> None:
 
 @incomings.command("create")
 @click.option("--client-id", required=True, type=int, help="SB client id of the customer.")
-@click.option("--account-id", required=True, type=int, help="Bank/cashbook id (`accounts list cashbook` for ids).")
+@click.option("--bank-cashbook-id", "bank_cashbook_id", default=None, callback=_cashbook_id_cb,
+              help="Receiving cashbook ID (`accounts list cashbook`). Required.")
+@click.option("--account-id", default=None, type=int, hidden=True)
 @click.option("--sum", "sum_amount", required=True, help="Amount.")
 @click.option("--date", "date_str", required=True, help="YYYY-MM-DD.")
 @click.option("--description", default="")
-def incomings_create(client_id, account_id, sum_amount, date_str, description) -> None:
+def incomings_create(client_id, bank_cashbook_id, account_id, sum_amount,
+                     date_str, description) -> None:
     """Create an incoming payment (laekumine). Returns new incoming id."""
-    iid = _create_money("Incoming", client_id, account_id, sum_amount, date_str, description)
+    account_id = _one_cashbook_flag(bank_cashbook_id, account_id,
+                                    "--bank-cashbook-id", "--account-id")
+    iid, touched = _create_money("Incoming", client_id, account_id, sum_amount,
+                                 date_str, description)
     cookies, account = session_or_die()
     click.secho(f"✓ Created incoming {iid}", fg="green", bold=True)
+    _echo_accounts(touched)
     click.echo(f"  URL: {BASE}/{account}/incomings/view/{iid}")
 
 
@@ -6467,15 +6977,12 @@ def _resolve_accounts(http: httpx.Client, account: str) -> dict[str, dict]:
     """Map financial_account_id (str) → {code, name} over the full kontoplaan.
 
     Used to render kanne legs with account names instead of bare ids. Missing
-    ids (e.g. an inactive account) fall back to the id at the call site.
+    ids (e.g. an inactive account) fall back to the id at the call site. Reads
+    the same process-level chart index the write-path validation uses, so a
+    command that both validates and renders fetches the chart once.
     """
-    out: dict[str, dict] = {}
-    for r in _accounts_listdata(http, account, "financial_accounts", limit=2000):
-        out[str(r.get("id"))] = {
-            "code": strip_html(r.get("code")),
-            "name": strip_html(r.get("name")),
-        }
-    return out
+    return {aid: {"code": rec["code"], "name": rec["name"]}
+            for aid, rec in _chart_index()["by_id"].items()}
 
 
 def _scrape_kanne_edit_form(
@@ -6603,20 +7110,22 @@ def kanne_list(search, date_from, date_to, limit, as_json) -> None:
 @click.option("--date", "date_str", required=True, help="Transaction date YYYY-MM-DD.")
 @click.option("--note", default="", help="Top-level kanne description.")
 @click.option("--line", "lines_raw", multiple=True, required=True,
-              help="Repeatable. Format: side=debit|credit:account=<id>:sum=<amount>[:note=...]")
+              help="Repeatable. Format: side=debit|credit:coa=<chart code>:sum=<amount>[:note=...]")
 def kanne_create(date_str, note, lines_raw) -> None:
     """Create a double-entry journal transaction.
 
     The sum of all `debit` lines must equal the sum of all `credit` lines.
 
-    Example — move 1 000,00 between two cashbooks (ids from `accounts list cashbook`):
+    BOTH legs are chart-of-accounts legs — a journal entry has no other kind. The
+    `coa` key is the account's four-to-five digit CODE from the CODE column of
+    `simplbooks accounts list chart`; cashbook ids are a different id-space and
+    are never valid here (`simplbooks guide id-spaces`).
+
+    Example — move 1 000,00 from the Kassa ledger to a bank ledger:
 
         simplbooks financial_transactions create --date 2026-01-02 --note 'Inter-account transfer' \\
-          --line 'side=debit:account=<id-a>:sum=1000,00:note=transfer' \\
-          --line 'side=credit:account=<id-b>:sum=1000,00:note=transfer'
-
-    The `account` is the financial_account id (`simplbooks accounts list cashbook`
-    for cashbook ids; full chart via `accounts list chart`).
+          --line 'side=debit:coa=1025:sum=1000,00:note=transfer' \\
+          --line 'side=credit:coa=1010:sum=1000,00:note=transfer'
     """
     cookies, account = session_or_die()
     dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -6631,10 +7140,14 @@ def kanne_create(date_str, note, lines_raw) -> None:
             parts[k.strip()] = v.strip()
         if parts.get("side") not in ("debit", "credit"):
             raise click.ClickException(f"--line side must be debit|credit: {raw!r}")
+        account_id = _line_account_id(parts, f"--line {raw!r}")
+        if account_id is None:
+            raise click.ClickException(
+                f"--line needs an account — pass coa=<chart code>: {raw!r}")
         try:
             rows.append({
                 "side": parts["side"],
-                "account_id": parts["account"],
+                "account_id": account_id,
                 "sum": parts["sum"],
                 "note": parts.get("note", ""),
             })
@@ -6681,6 +7194,7 @@ def kanne_create(date_str, note, lines_raw) -> None:
                 (f"data[FinancialTransactions][{key}][transaction_sum_credit]", (None, credit)),
             ]
         parts.append(("_csrfToken", (None, csrf)))
+        touched = _validate_account_fields(parts)
 
         http.headers["Referer"] = f"{BASE}/{account}/financial_transactions/create"
         http.headers["Origin"] = BASE
@@ -6698,6 +7212,7 @@ def kanne_create(date_str, note, lines_raw) -> None:
     click.secho(f"✓ Created kanne {kid}", fg="green", bold=True)
     click.echo(f"  Date  : {date_str}    Note: {note}")
     click.echo(f"  Lines : {len(rows)}    debit={debit_total:.2f}  credit={credit_total:.2f}")
+    _echo_accounts(touched)
     click.echo(f"  URL   : {BASE}/{account}/financial_transactions/view/{kid}")
 
 
@@ -6780,10 +7295,12 @@ def kanne_show(kanne_id, as_json) -> None:
 @click.option("--date", "date_str", default=None, help="Change transaction date (YYYY-MM-DD).")
 @click.option("--note", default=None, help="Replace the top-level transaction_note.")
 @click.option("--set-line", "set_lines", multiple=True,
-              help="Patch a leg in place. '<idx>:account=<id>[:debit=<amt>][:credit=<amt>][:note=<t>]'. "
+              help="Patch a leg in place. "
+                   "'<idx>:coa=<chart code>[:debit=<amt>][:credit=<amt>][:note=<t>]'. "
                    "idx is the leg number from `financial_transactions show`. Repeatable.")
 @click.option("--add-line", "add_lines", multiple=True,
-              help="Append a leg. 'side=debit|credit:account=<id>:sum=<amt>[:note=...]'. Repeatable.")
+              help="Append a leg. 'side=debit|credit:coa=<chart code>:sum=<amt>[:note=...]'. "
+                   "Repeatable.")
 @click.option("--remove-line", "remove_lines", multiple=True,
               help="Remove a leg by idx (from `financial_transactions show`). Repeatable.")
 @click.option("--attach", "attach_path", default=None,
@@ -6799,9 +7316,10 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
     re-validates that debit==credit, and re-POSTs. Leg ids are preserved, so
     the entry keeps its identity (no delete-and-recreate).
 
-    Headline use — reclassify a leg from one account to another:
+    Headline use — reclassify a leg from one account to another, naming the
+    target by its chart-of-accounts CODE (`accounts list chart`):
 
-        simplbooks financial_transactions update 20046 --set-line '1:account=<account-id>'
+        simplbooks financial_transactions update 20046 --set-line '1:coa=1025'
 
     Other edits:
 
@@ -6828,9 +7346,10 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
                     f"(see `financial_transactions show {kanne_id}`).")
             kv = _parse_kv_line(rest)
             base = f"data[FinancialTransactions][{idx}]"
-            if "account" in kv:
-                _set_field(fields, f"{base}[financial_account_id]", kv["account"])
-                lines[idx]["financial_account_id"] = kv["account"]
+            leg_account = _line_account_id(kv, f"--set-line {raw!r}")
+            if leg_account is not None:
+                _set_field(fields, f"{base}[financial_account_id]", leg_account)
+                lines[idx]["financial_account_id"] = leg_account
             if "note" in kv:
                 _set_field(fields, f"{base}[account_note]", kv["note"])
             if "debit" in kv:
@@ -6860,11 +7379,15 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
 
         for raw in add_lines:
             ln = _parse_kv_line(raw)
-            for req in ("side", "account", "sum"):
+            for req in ("side", "sum"):
                 if req not in ln:
                     raise click.ClickException(f"--add-line missing '{req}': {raw!r}")
             if ln["side"] not in ("debit", "credit"):
                 raise click.ClickException(f"--add-line side must be debit|credit: {raw!r}")
+            leg_account = _line_account_id(ln, f"--add-line {raw!r}")
+            if leg_account is None:
+                raise click.ClickException(
+                    f"--add-line needs an account — pass coa=<chart code>: {raw!r}")
             key = _random_row_key()
             debit = to_estonian_number(ln["sum"]) if ln["side"] == "debit" else "0,00"
             credit = to_estonian_number(ln["sum"]) if ln["side"] == "credit" else "0,00"
@@ -6874,14 +7397,14 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
                 (f"data[FinancialTransactions][{key}][initial_sum]", str(ln["sum"])),
                 (f"data[FinancialTransactions][{key}][showing_order]", str(len(lines))),
                 (f"data[FinancialTransactions][{key}][bank_row]", ""),
-                (f"data[FinancialTransactions][{key}][financial_account_id]", ln["account"]),
+                (f"data[FinancialTransactions][{key}][financial_account_id]", leg_account),
                 (f"data[FinancialTransactions][{key}][account_note]", ln.get("note", "")),
                 (f"data[FinancialTransactions][{key}][vat_percent]", "0"),
                 (f"data[FinancialTransactions][{key}][transaction_sum_debit]", debit),
                 (f"data[FinancialTransactions][{key}][transaction_sum_credit]", credit),
             ]
             lines[key] = {"transaction_sum_debit": debit, "transaction_sum_credit": credit,
-                          "financial_account_id": ln["account"]}
+                          "financial_account_id": leg_account}
 
         for raw in set_pairs:
             if "=" not in raw:
@@ -6897,6 +7420,8 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
             )
         if not lines:
             raise click.ClickException("Refusing to save a kanne with no legs.")
+
+        touched = _validate_account_fields(fields)
 
         csrf = fetch_fresh_csrf(http, account, path="financial_transactions/add")
         _set_field(fields, "_csrfToken", csrf)
@@ -6922,6 +7447,7 @@ def kanne_update(kanne_id, date_str, note, set_lines, add_lines, remove_lines,
             f"Kanne update failed: HTTP {r.status_code} loc={loc!r}. Response → {fail}")
     click.secho(f"✓ Updated kanne {kanne_id}", fg="green", bold=True)
     click.echo(f"  Balance: debit {debit:.2f}  credit {credit:.2f}")
+    _echo_accounts(touched)
     click.echo(f"  URL    : {BASE}/{account}/financial_transactions/view/{kanne_id}")
 
 
@@ -6965,11 +7491,13 @@ def kanne_delete(kanne_id) -> None:
 #                                                    data[<Variant>][...]
 #   POST /<acct>/bank_transactions/save_processed_data   (partial / WIP; not used)
 #
-# Two ID-spaces (ids differ per account — list them, never assume):
+# Two ID-spaces meet on this form (values differ per account — resolve them, never
+# assume). The account-surface section above owns the rule; this is where it lands:
 #   - cashbook ids  → `Incoming.income_account_id`, `Payment.income_account_id`.
-#     What `accounts list cashbook` returns.
-#   - chart-of-accounts ids → `FinancialTransaction.transactions[<rid>][financial_account_id]`.
-#     What `accounts list chart` returns. For the kanne variant only.
+#     Supplied as an id (--bank-cashbook-id), validated against the live cashbook list.
+#   - chart-of-accounts → `FinancialTransaction.transactions[<rid>][financial_account_id]`,
+#     for the kanne variant only. Supplied as a CODE (--counter-coa), resolved to the
+#     internal id the field takes. The bank leg comes from the worklist row itself.
 
 BT_BASE_PATH = "bank_transactions/process"
 
@@ -7528,11 +8056,14 @@ def _bt_recover_money_id(
               help="Sales invoice id to bind (repeatable; for --as incoming).")
 @click.option("--purchase-id", "purchase_ids", type=int, multiple=True,
               help="Purchase invoice id to bind (repeatable; for --as payment).")
-@click.option("--counter-account", type=int, default=None,
-              help="COA id of the offsetting account (for --as kanne).")
-@click.option("--account-id", type=int, default=None,
-              help="Bank cashbook id for incoming/payment (default: the one SB pre-selected, "
+@click.option("--counter-coa", "counter_coa", default=None, callback=_coa_code_cb,
+              help="Chart-of-accounts CODE of the offsetting account (for --as kanne).")
+@click.option("--bank-cashbook-id", "bank_cashbook_id", default=None, callback=_cashbook_id_cb,
+              help="Cashbook ID for incoming/payment (default: the one SB pre-selected, "
                    "usually the main bank cashbook).")
+# Legacy: raw COA internal id / raw cashbook id, bound but hidden.
+@click.option("--counter-account", type=int, default=None, hidden=True)
+@click.option("--account-id", type=int, default=None, hidden=True)
 @click.option("--sum", "sum_amount", default=None,
               help="Override amount. Defaults to the BT row's own sum.")
 @click.option("--date", "date_str", default=None,
@@ -7543,8 +8074,9 @@ def _bt_recover_money_id(
 @click.option("--payment-object-type", type=click.Choice(["Purchase", "ExpenseReport"]),
               default="Purchase", show_default=True,
               help="Only for --as payment: what the bound id refers to.")
-def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_account,
-             account_id, sum_amount, date_str, description, payment_object_type) -> None:
+def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_coa,
+            bank_cashbook_id, counter_account, account_id, sum_amount, date_str,
+            description, payment_object_type) -> None:
     """Save a worklist row as an incoming, payment, or kanne.
 
     Examples:
@@ -7557,10 +8089,15 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
       simplbooks bank-transactions save 6750 --as payment \\
         --client-id 368 --purchase-id 1685 --purchase-id 1686
 
-      # 3. Owner loan repayment (no invoice; offset to owner-loan account)
+      # 3. Owner loan repayment (no invoice; offset to the owner-loan account by CODE)
       simplbooks bank-transactions save 7062 --as kanne \\
-        --counter-account <coa-id> --description 'Omanikule laenu tagastamine'
+        --counter-coa <chart code> --description 'Omanikule laenu tagastamine'
     """
+    counter_account = _one_account_flag(
+        counter_coa, counter_account, "--counter-coa", "--counter-account")
+    account_id = _one_cashbook_flag(
+        bank_cashbook_id, account_id, "--bank-cashbook-id", "--account-id",
+        required=False)
     row, csrf, cookies, account = _bt_load_one(bt_id)
 
     # Sum / date defaults from the BT row itself.
@@ -7604,6 +8141,7 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
             sum_amount=effective_sum, date=dt, description=desc,
             object_type=payment_object_type,
         )
+        touched = _validate_account_fields(fields)
         r = _bt_post_save(cookies, account, fields)
         _bt_check_save_response(r, save_as)
         money_id = _bt_recover_money_id(
@@ -7615,7 +8153,7 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
                     fg="green", bold=True)
         click.echo(f"  Client    : {client_id}  ({strip_html(client.get('name', ''))})")
         click.echo(f"  Sum       : {effective_sum} EUR  on {effective_date}")
-        click.echo(f"  Bank acct : cashbook {cashbook_id}")
+        _echo_accounts(touched)
         if not bind_ids:
             return
         try:
@@ -7638,10 +8176,10 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
     # save_as == "kanne"
     if counter_account is None:
         raise click.ClickException(
-            "--counter-account is required for --as kanne. "
-            "It is the chart-of-accounts id of the offsetting side "
+            "--counter-coa is required for --as kanne. "
+            "It is the chart-of-accounts CODE of the offsetting side "
             "(e.g. owner-loan liability, internal-transfer counter-bank). "
-            "Use `simplbooks accounts list chart` to find it."
+            "Use `simplbooks accounts list chart` to find it — the CODE column."
         )
     bank_coa = row['income_financial_account_id']
     if not bank_coa:
@@ -7706,14 +8244,16 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_accoun
          sum_est if counter_side == "credit" else "0,00"),
     ]
     fields.append(("_csrfToken", csrf))
+    touched = _validate_account_fields(fields)
 
     r = _bt_post_save(cookies, account, fields)
     _bt_check_save_response(r, "kanne")
     click.secho(f"✓ Saved BT {bt_id} as kanne", fg="green", bold=True)
     click.echo(f"  Date       : {effective_date}")
     click.echo(f"  Note       : {note}")
-    click.echo(f"  Bank side  : COA {bank_coa} ({bank_side})  {effective_sum} EUR")
-    click.echo(f"  Counter    : COA {counter_account} ({counter_side})  {effective_sum} EUR")
+    click.echo(f"  Bank side  : {bank_side} {effective_sum} EUR")
+    click.echo(f"  Counter    : {counter_side} {effective_sum} EUR")
+    _echo_accounts(touched)
 
 
 def main() -> None:
