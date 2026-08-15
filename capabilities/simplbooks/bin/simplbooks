@@ -59,7 +59,7 @@ CRED_KEYS = [
      "note": "optional pin for the invoice line worker; else the logged-in user"},
 ]
 WRITE_VERBS = {"create", "update", "delete", "unbind", "bind", "send-payment", "save",
-               "submit", "amend", "regenerate"}
+               "submit", "amend", "regenerate", "import"}
 WRITE_DEFAULT = False    # writes create legal invoices / stage real bank payments;
                          # granted per connection, explicitly, via allow_write: true
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
@@ -1124,6 +1124,28 @@ Then re-run `simplbooks doctor` to confirm.
                                                 payment-processor payout
                                                 duplicates (already mirrored
                                                 as a kanne) or mis-imports.
+                                                One row at a time — there is no
+                                                bulk delete (see the source note
+                                                at delete_all: reviewing a
+                                                duplicate needs a bank archive id
+                                                SimpleBooks does not expose).
+
+  simplbooks bank-transactions import --from YYYY-MM-DD --to YYYY-MM-DD
+        --bank-cashbook-id N [--source NAME] [--apply] [--json]
+                                                Re-pull statement rows from the
+                                                linked bank into the worklist.
+                                                DRY RUN unless --apply: resolves
+                                                and validates everything, shows
+                                                the exact body, and reports the
+                                                rows already staged in the window.
+                                                What SimpleBooks keys duplicate-
+                                                marking on is UNVERIFIED, so
+                                                --apply measures it — before/after
+                                                snapshots, created and duplicate-
+                                                flagged counts. A re-import can
+                                                flood the worklist; rows that come
+                                                back `duplicate` are manual review,
+                                                never automated booking.
 
   simplbooks bank-transactions save <bt_id> --as incoming
         --client-id N [--invoice-id N ...]
@@ -2322,6 +2344,7 @@ _ACCOUNT_FIELD_SPACES: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"data\[Client\]\[expense_account_id\]"), "coa"),
     (re.compile(r"data\[Incoming\]\[income_account_id\]"), "cashbook"),
     (re.compile(r"data\[Payment\]\[income_account_id\]"), "cashbook"),
+    (re.compile(r"data\[income_account_id\]"), "cashbook"),   # bank_transactions/import_from_bank
     (re.compile(r"default_bank_account"), "cashbook"),
     (re.compile(r"income_account_id"), "cashbook"),   # bare: purchases/send_payment
 )
@@ -8212,6 +8235,306 @@ def bt_delete(bt_id) -> None:
             f"Delete failed: HTTP {r.status_code}. Response → {fail}"
         )
     click.secho(f"✓ Deleted bank transaction {bt_id}", fg="green")
+
+
+# ─── PSD2 re-import (bank_transactions/import_from_bank) ───────────────────
+#
+# PROVENANCE — re-verified against the live app, not a captured request:
+#   the form is rendered on /<acct>/dashboard, one per linked bank, inside the
+#   "bank-import" offcanvas as <form class="bank-import-form"
+#   action="/<acct>/bank_transactions/import_from_bank" method="post">.
+#   It is NOT on /bank_transactions/process, which is why earlier rounds could
+#   not find it. Its fields, read off the form itself:
+#     data[source]             hidden, one per bank tab (e.g. "swedbank")
+#     data[since]              dd.mm.yyyy  (Estonian, NOT ISO)
+#     data[until]              dd.mm.yyyy
+#     data[income_account_id]  <select> of the bank-linked CASHBOOK ids
+#     _csrfToken
+#   Everything this verb posts is scraped from that live form on each run, so a
+#   layout or parameter change fails loudly instead of posting a guessed body.
+#
+# DEDUPE SCOPE — UNVERIFIED. Whether SimpleBooks marks a re-imported row as a
+# duplicate against already-BOOKED documents or only against rows currently in
+# the worklist is unknown; this account has never produced a duplicate-status
+# row to observe. That is why the verb is dry-run by default and why --apply
+# measures the outcome instead of asserting it: the first real run reports the
+# before/after delta and answers the question empirically.
+
+BT_IMPORT_FORM_PAGE = "dashboard"
+BT_IMPORT_PATH = "bank_transactions/import_from_bank"
+
+
+def _bt_import_forms(http: httpx.Client, account: str) -> list[dict]:
+    """Every live PSD2 re-import form on the dashboard, one per linked bank."""
+    r = http.get(f"{BASE}/{account}/{BT_IMPORT_FORM_PAGE}")
+    if _session_stale(r):
+        auto_login_attempt(interactive=False)
+        creds = load_credentials()
+        http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
+        r = http.get(f"{BASE}/{account}/{BT_IMPORT_FORM_PAGE}")
+    if r.status_code != 200:
+        raise click.ClickException(
+            f"GET /{BT_IMPORT_FORM_PAGE} returned {r.status_code} — cannot read the "
+            f"bank re-import form."
+        )
+    soup = BeautifulSoup(r.text, "html.parser")
+    forms: list[dict] = []
+    for f in soup.find_all("form", class_="bank-import-form"):
+        action = f.get("action") or ""
+        if not action.endswith(BT_IMPORT_PATH):
+            continue
+        src = f.find("input", attrs={"name": "data[source]"})
+        csrf = f.find("input", attrs={"name": "_csrfToken"})
+        select = f.find("select", attrs={"name": "data[income_account_id]"})
+        options = [
+            {"cashbook_id": (o.get("value") or "").strip(),
+             "label": " ".join(o.get_text(" ", strip=True).split())}
+            for o in (select.find_all("option") if select else [])
+            if (o.get("value") or "").strip()
+        ]
+        forms.append({
+            "source": (src.get("value") or "").strip() if src else "",
+            "action": action,
+            "csrf": (csrf.get("value") or "") if csrf else "",
+            "cashbooks": options,
+        })
+    if not forms:
+        raise click.ClickException(
+            f"No bank re-import form on /{BT_IMPORT_FORM_PAGE}. Either no bank is "
+            f"linked to this SimpleBooks account, or the page layout changed — "
+            f"refusing to post a guessed payload to /{BT_IMPORT_PATH}."
+        )
+    return forms
+
+
+def _bt_iso_to_ee(value: str, label: str) -> str:
+    """YYYY-MM-DD → dd.mm.yyyy, the only shape the import form's datepicker takes."""
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:
+        raise click.ClickException(f"{label} must be YYYY-MM-DD — got {value!r}.")
+
+
+def _bt_worklist_snapshot() -> dict[int, dict]:
+    """The whole worklist, keyed by row id. Unfiltered on purpose: an import can
+    land rows outside the requested window, and a filtered snapshot would score
+    those as 'nothing happened'."""
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        soup = _bt_fetch_process_page(http, account, limit=1000)
+    return {row["id"]: row
+            for row in (_bt_parse_form(f)
+                        for f in soup.find_all("form", class_="transaction-form"))}
+
+
+def _bt_status_counts(rows) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    return dict(sorted(counts.items()))
+
+
+@bank_transactions.command("import")
+@click.option("--source", default=None,
+              help="Bank source to pull from (the form's data[source]). Defaults to "
+                   "the only one the account offers; required when there are several.")
+@click.option("--from", "date_from", required=True,
+              help="Start of the statement window, YYYY-MM-DD (inclusive).")
+@click.option("--to", "date_to", required=True,
+              help="End of the statement window, YYYY-MM-DD (inclusive).")
+@click.option("--bank-cashbook-id", "bank_cashbook_id", required=True,
+              callback=_cashbook_id_cb,
+              help="Cashbook ID the rows import into (`accounts list cashbook`). "
+                   "Must be one the bank link offers.")
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Actually run the import. Without it this is a dry run that "
+                   "posts nothing.")
+@click.option("--json", "as_json", is_flag=True)
+def bt_import(source, date_from, date_to, bank_cashbook_id, do_apply, as_json) -> None:
+    """Re-pull bank rows from the linked bank into the PSD2 worklist.
+
+    DRY RUN BY DEFAULT — without --apply nothing is posted; it resolves and
+    validates the whole request, shows the exact body it would send, and reports
+    the worklist rows already staged in the window that the import could collide
+    with.
+
+    What SimpleBooks keys duplicate-marking on is UNVERIFIED (see the source
+    comment): it may compare against booked documents or only against rows
+    still in the worklist. --apply therefore measures rather than asserts — it
+    snapshots the worklist before and after and reports what was created and
+    what came back flagged duplicate.
+
+    A re-import can flood the worklist. Rows that arrive flagged `duplicate` are
+    a manual review flow, never automated booking."""
+    since = _bt_iso_to_ee(date_from, "--from")
+    until = _bt_iso_to_ee(date_to, "--to")
+    if datetime.strptime(date_to, "%Y-%m-%d") < datetime.strptime(date_from, "%Y-%m-%d"):
+        raise click.ClickException("--to is before --from.")
+
+    cashbook = _cashbook_by_id(bank_cashbook_id, "--bank-cashbook-id")
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        forms = _bt_import_forms(http, account)
+
+    sources = [f["source"] for f in forms]
+    if source is None:
+        if len(forms) != 1:
+            raise click.ClickException(
+                f"--source is required — this account offers {', '.join(sources)}."
+            )
+        form = forms[0]
+    else:
+        matches = [f for f in forms if f["source"] == source]
+        if not matches:
+            raise click.ClickException(
+                f"--source {source!r} is not offered by this account (live: "
+                f"{', '.join(sources)})."
+            )
+        form = matches[0]
+
+    offered = {o["cashbook_id"] for o in form["cashbooks"]}
+    if str(bank_cashbook_id) not in offered:
+        listing = ", ".join(f"{o['cashbook_id']} ({o['label']})" for o in form["cashbooks"])
+        raise click.ClickException(
+            f"--bank-cashbook-id {bank_cashbook_id} ({cashbook['name']}) is a live "
+            f"cashbook but the {form['source']} bank link does not import into it. "
+            f"Offered: {listing}."
+        )
+
+    fields = [
+        ("data[source]", form["source"]),
+        ("data[since]", since),
+        ("data[until]", until),
+        ("data[income_account_id]", str(bank_cashbook_id)),
+        ("_csrfToken", form["csrf"]),
+    ]
+    touched = _validate_account_fields(fields)
+
+    before = _bt_worklist_snapshot()
+    in_window = [row for row in before.values() if date_from <= row["date"] <= date_to]
+
+    plan = {
+        "source": form["source"],
+        "since": date_from,
+        "until": date_to,
+        "cashbook_id": int(bank_cashbook_id),
+        "cashbook_name": cashbook["name"],
+        "endpoint": f"{BASE}/{account}/{BT_IMPORT_PATH}",
+        "form_page": f"{BASE}/{account}/{BT_IMPORT_FORM_PAGE}",
+        "accounts_touched": touched,
+        "worklist_before": {
+            "total": len(before),
+            "in_window": len(in_window),
+            "in_window_by_status": _bt_status_counts(in_window),
+        },
+        "applied": bool(do_apply),
+        "dedupe_scope": "unverified — measured by the --apply delta, never assumed",
+    }
+
+    if not do_apply:
+        plan["would_post"] = [(k, v) for k, v in fields if k != "_csrfToken"]
+        if as_json:
+            click.echo(json.dumps(plan, indent=2, ensure_ascii=False))
+            return
+        click.secho("DRY RUN — nothing posted.", fg="yellow", bold=True)
+        click.echo(f"  Would POST  : {plan['endpoint']}")
+        for k, v in plan["would_post"]:
+            click.echo(f"                {k} = {v}")
+        _echo_accounts(touched)
+        click.echo(f"  Worklist    : {len(before)} row(s) staged now; "
+                   f"{len(in_window)} inside {date_from}..{date_to}"
+                   + (f" ({_bt_status_counts(in_window)})" if in_window else ""))
+        click.echo("  Dedupe      : SimpleBooks' duplicate-marking scope is UNVERIFIED "
+                   "on this account.")
+        click.echo("                Re-run with --apply to import and get the measured "
+                   "created / duplicate-flagged counts.")
+        return
+
+    with build_http(cookies, account) as http:
+        http.headers["Referer"] = f"{BASE}/{account}/{BT_IMPORT_FORM_PAGE}"
+        http.headers["Origin"] = BASE
+        r = http.post(
+            f"{BASE}/{account}/{BT_IMPORT_PATH}",
+            content=urlencode(fields),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    if r.status_code not in (200, 302):
+        fail = CONFIG_DIR / "last_bank_import_failure.html"
+        fail.write_text(r.text)
+        raise click.ClickException(
+            f"Import failed: HTTP {r.status_code}. Response → {fail}"
+        )
+
+    after = _bt_worklist_snapshot()
+    created = [after[i] for i in sorted(set(after) - set(before))]
+    flipped = [after[i] for i in sorted(set(after) & set(before))
+               if after[i]["status"] != before[i]["status"]]
+    result = {
+        **plan,
+        "created": {
+            "count": len(created),
+            "by_status": _bt_status_counts(created),
+            "ids": [row["id"] for row in created],
+        },
+        "existing_rows_restatused": [
+            {"id": row["id"], "from": before[row["id"]]["status"], "to": row["status"]}
+            for row in flipped
+        ],
+        "worklist_after": {"total": len(after)},
+    }
+    # The empirical answer to the open question: a duplicate-flagged NEW row means
+    # SimpleBooks compares beyond the worklist (the movement was already booked);
+    # duplicates only where a worklist row already existed means the narrow scope.
+    dup_created = result["created"]["by_status"].get("duplicate", 0)
+    result["dedupe_observation"] = (
+        f"{dup_created} of {len(created)} newly imported row(s) came back flagged "
+        f"duplicate; {len(flipped)} pre-existing row(s) changed status."
+    )
+
+    if as_json:
+        click.echo(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    click.secho(f"✓ Imported from {form['source']} {date_from}..{date_to}", fg="green")
+    _echo_accounts(touched)
+    click.echo(f"  Created     : {len(created)} row(s) {result['created']['by_status'] or ''}")
+    if created:
+        click.echo(f"  New ids     : {', '.join(str(row['id']) for row in created)}")
+    if flipped:
+        click.echo("  Re-statused :")
+        for row in result["existing_rows_restatused"]:
+            click.echo(f"                {row['id']}: {row['from']} → {row['to']}")
+    click.echo(f"  Worklist    : {len(before)} → {len(after)} row(s)")
+    click.echo(f"  Dedupe      : {result['dedupe_observation']}")
+
+
+# ─── bulk delete by selection (bank_transactions/delete_all) ───────────────
+#
+# NOT SHIPPED — deliberately, and the reason is a hard prerequisite that the
+# live app cannot satisfy today.
+#
+# The endpoint exists and is understood: the /bank_transactions/process page
+# fires POST /<acct>/bank_transactions/delete_all with `selection` set to one of
+# `all` | `duplicate` | `invalid` plus `_csrfToken` (SB.Confirm → a hidden form
+# submit; the CSRF pattern is the one `bt_delete` already uses). Only `duplicate`
+# and `invalid` would ever be exposed — never `all`.
+#
+# The gate that is unmet: reviewing a duplicate before deleting it requires the
+# bank ARCHIVE ID on the row, because the statement legitimately carries
+# byte-identical same-day rows (two identical card charges of 17,23 on 26.01,
+# both correctly booked) that nothing else distinguishes. SimpleBooks does not
+# expose it. Verified read-only against the live account:
+#   - the worklist row's <form> carries only data-id / data-date / data-sum, and
+#     its only own field is data[BankTransaction][id];
+#   - none of the object templates (financial_transaction / payment / payout /
+#     taxes_payout) carry an archive field, and transaction_note holds the bank's
+#     free text (card mask, merchant, FX), not an archive reference;
+#   - there is no per-row page — /bank_transactions/view|edit/<id> all 404;
+#   - the FinancialTransaction model does have `import_archive_hash`, but it is
+#     empty on the add form and on saved bank-derived entries, and it is not
+#     rendered on the worklist at all.
+# Without a distinguishing key, a bulk delete cannot be reviewed row by row, so
+# it stays unexposed and duplicates are worked one at a time through
+# `bank-transactions delete <id>`.
 
 
 def _bt_money_save_fields(
