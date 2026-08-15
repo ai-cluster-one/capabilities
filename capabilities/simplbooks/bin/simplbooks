@@ -881,6 +881,13 @@ possible. The exact next step depends on the error message:
     If credentials.env has SIMPLBOOKS_EMAIL + SIMPLBOOKS_PASSWORD, the CLI
     re-authenticates by itself. No agent action needed on most expiries.
 
+    SimpleBooks keeps ONE live session per account: a login on another host,
+    or in a browser, expires this host's cookie. Every read (GET) recovers
+    from that by itself when EMAIL + PASSWORD are present — which is why a
+    scheduled job and an interactive session share one account without
+    fighting over it. A write landing on an expired session fails instead of
+    retrying; re-run it.
+
     If SimpleBooks returns a PIN gate (new IP/device), `simplbooks login`
     will save the pending state and stop. Ask the user:
 
@@ -1824,7 +1831,67 @@ def account_hash_from_url(url: str) -> str:
 
 # ─── HTTP helpers ───────────────────────────────────────────────────────────
 
-def build_http(cookies: dict, account: str, ajax: bool = False) -> httpx.Client:
+def _session_stale(r: httpx.Response) -> bool:
+    """True when a response says the session is gone instead of answering.
+
+    SimpleBooks signals an expired session two ways, both observed live:
+      • a redirect to the SSO login host (no usable cookie at all), and
+      • a redirect back to the SAME url — the silent re-handshake SB emits when
+        the app cookie no longer matches its SSO session.
+    A hard 401 counts too.
+
+    A redirect to a DIFFERENT in-app path is a business outcome, never an
+    expiry: a payment-locked purchase bounces edit → view, a deleted record
+    bounces to its list. Those pass through untouched so their callers keep
+    reading the Location themselves.
+    """
+    if r.status_code == 401:
+        return True
+    if not r.is_redirect:
+        return False
+    requested = str(r.request.url)
+    loc = urljoin(requested, r.headers.get("location", ""))
+    if "accounts/login" in loc or urlparse(loc).netloc == urlparse(LOGIN_URL).netloc:
+        return True
+    return loc.rstrip("/") == requested.rstrip("/")
+
+
+class SessionClient(httpx.Client):
+    """An httpx client whose GETs survive a session expiry.
+
+    SimpleBooks keeps ONE live session per account, so a login anywhere else —
+    the deployed box, a laptop, a browser tab — expires this host's cookie. Every
+    GET therefore flows through this one recovery point instead of each read path
+    remembering to handle it: on an expiry signal, re-authenticate with the stored
+    EMAIL + PASSWORD, re-seat the refreshed cookies on this live client, and
+    replay the request exactly once. Still stale after that → AuthError naming the
+    cURL fallback.
+
+    GET ONLY, deliberately. SimpleBooks is a CakePHP app where a 302 after a POST
+    is the normal SUCCESS redirect, so a blanket retry-on-redirect would misread a
+    completed write and could post it twice. POST keeps httpx's behaviour
+    untouched; a write that lands on an expired session fails loudly.
+    """
+
+    def get(self, url, **kwargs) -> httpx.Response:  # type: ignore[override]
+        r = super().get(url, **kwargs)
+        if not _session_stale(r):
+            return r
+        # auto_login_attempt raises AuthError when it can't recover (no
+        # credentials, PIN gate) — that propagates as exit 2.
+        auto_login_attempt(interactive=False)
+        creds = load_credentials()
+        self.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
+        r = super().get(url, **kwargs)   # exactly once — never a loop
+        if _session_stale(r):
+            raise AuthError(
+                f"Session still invalid after auto-login (HTTP {r.status_code}).\n"
+                "  → fallback: simplbooks refresh /path/to/fresh-curl.txt"
+            )
+        return r
+
+
+def build_http(cookies: dict, account: str, ajax: bool = False) -> SessionClient:
     # SimpleBooks redirects same-origin GETs that include an Origin header.
     # Browsers omit Origin on same-origin GETs, so we do too. AJAX/POST gets it back.
     headers = {
@@ -1838,31 +1905,13 @@ def build_http(cookies: dict, account: str, ajax: bool = False) -> httpx.Client:
         headers["Origin"] = BASE
     else:
         headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    return httpx.Client(cookies=cookies, headers=headers, follow_redirects=False, timeout=30)
-
-
-def _session_stale(r: httpx.Response) -> bool:
-    """SSO redirect (301/302, caught by is_redirect) or a hard 401 — session expired, a re-login retry is warranted."""
-    return r.is_redirect or r.status_code == 401
+    return SessionClient(cookies=cookies, headers=headers, follow_redirects=False, timeout=30)
 
 
 def fetch_add_page(http: httpx.Client, account: str, path: str = "invoices/add") -> str:
-    """GET an add-form page, recovering once via auto-login if the session is
-    stale. Returns the page HTML — callers extract csrf / vat_types / creator."""
+    """GET an add-form page. Returns the page HTML — callers extract csrf /
+    vat_types / creator. Session recovery is the client's job (SessionClient)."""
     r = http.get(f"{BASE}/{account}/{path}")
-    if _session_stale(r):
-        # Session is stale. Try auto-login + retry once with refreshed cookies.
-        # auto_login_attempt raises AuthError if it can't recover — that propagates.
-        auto_login_attempt(interactive=False)
-        creds = load_credentials()
-        new_cookies = parse_cookie_string(creds["SIMPLBOOKS_COOKIE"])
-        http.cookies = httpx.Cookies(new_cookies)
-        r = http.get(f"{BASE}/{account}/{path}")
-        if _session_stale(r):
-            raise AuthError(
-                f"Session still invalid after auto-login (HTTP {r.status_code}).\n"
-                "  → fallback: simplbooks refresh /path/to/fresh-curl.txt"
-            )
     if r.status_code != 200:
         raise click.ClickException(f"GET /{path} returned {r.status_code}")
     return r.text
@@ -2485,20 +2534,10 @@ def cmd_doctor() -> None:
     click.echo(f"cookies          : {len(cookies)} ({', '.join(sorted(cookies)[:5])}{'…' if len(cookies)>5 else ''})")
 
     with build_http(cookies, account) as http:
+        # An expired cookie recovers inside the client (it announces the
+        # re-login on stderr); an unrecoverable one raises AuthError → exit 2.
         r = http.get(f"{BASE}/{account}/invoices/add")
         click.echo(f"GET /invoices/add: HTTP {r.status_code}")
-        if _session_stale(r):
-            click.secho(f"⚠ session expired (HTTP {r.status_code})", fg="yellow")
-            # auto_login_attempt raises AuthError on failure → click handles exit 2.
-            auto_login_attempt(interactive=False)
-            cookies, account = session_or_die()
-            http.cookies = httpx.Cookies(cookies)
-            r = http.get(f"{BASE}/{account}/invoices/add")
-            click.echo(f"after auto-login : HTTP {r.status_code}")
-            if _session_stale(r):
-                click.secho("✗ session still invalid after auto-login", fg="red")
-                click.echo("  → fallback: simplbooks refresh /path/to/fresh-curl.txt")
-                sys.exit(2)
         if r.status_code != 200:
             click.secho(f"✗ unexpected status {r.status_code}", fg="red")
             sys.exit(1)
@@ -3803,11 +3842,6 @@ def _cashbook_linked_coa_id(http: httpx.Client, account: str, cashbook_id: str) 
     cashbook carries no link. The option's label is ignored — the value is the
     only thing that addresses a row."""
     r = http.get(f"{BASE}/{account}/income_accounts/edit/{cashbook_id}")
-    if _session_stale(r):
-        auto_login_attempt(interactive=False)
-        creds = load_credentials()
-        http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
-        r = http.get(f"{BASE}/{account}/income_accounts/edit/{cashbook_id}")
     if r.status_code != 200:
         raise click.ClickException(
             f"GET /income_accounts/edit/{cashbook_id} returned {r.status_code} — "
@@ -4003,11 +4037,10 @@ def _report_export_data(http: httpx.Client, account: str, endpoint: str,
     for GET (scrape _csrfToken + report[id]) and POST, so the token matches the
     CSRF cookie."""
     url = f"{BASE}/{account}/financial_reports/{endpoint}"
-    page = http.get(url)
+    page = http.get(url)   # SessionClient recovers an expired session here
     if page.status_code != 200:
         raise click.ClickException(
-            f"GET financial_reports/{endpoint}: HTTP {page.status_code} "
-            "(session stale? run `simplbooks doctor`).")
+            f"GET financial_reports/{endpoint}: HTTP {page.status_code}")
     soup = BeautifulSoup(page.text, "html.parser")
     csrf = soup.find("input", {"name": "_csrfToken"})
     if not csrf or not csrf.get("value"):
@@ -4637,11 +4670,6 @@ def _vatstatement_page_html(http: httpx.Client, account: str, period_from: str) 
     omitting period_to is what makes SB treat the visit as a period switch."""
     url = f"{BASE}/{account}/financial_reports/vatstatement"
     r = http.get(url)
-    if _session_stale(r):
-        auto_login_attempt(interactive=False)
-        creds = load_credentials()
-        http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
-        r = http.get(url)
     if r.status_code != 200:
         raise click.ClickException(f"GET vatstatement returned {r.status_code}")
     soup = BeautifulSoup(r.text, "html.parser")
@@ -6164,11 +6192,6 @@ def _scrape_purchase_edit_form(http: httpx.Client, account: str, purchase_id: in
     - `csrf` is the freshly-scraped token.
     """
     r = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
-    if _session_stale(r):
-        auto_login_attempt(interactive=False)
-        creds = load_credentials()
-        http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
-        r = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
     if r.status_code != 200:
         raise click.ClickException(f"GET /purchases/edit/{purchase_id} returned {r.status_code}")
     soup = BeautifulSoup(r.text, "html.parser")
@@ -7346,11 +7369,6 @@ def _scrape_kanne_edit_form(
     - `csrf`       — the form's token (re-scrape from /add before POST to be safe).
     """
     r = http.get(f"{BASE}/{account}/financial_transactions/edit/{kanne_id}")
-    if _session_stale(r):
-        auto_login_attempt(interactive=False)
-        creds = load_credentials()
-        http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
-        r = http.get(f"{BASE}/{account}/financial_transactions/edit/{kanne_id}")
     if r.status_code != 200:
         raise click.ClickException(
             f"GET /financial_transactions/edit/{kanne_id} returned {r.status_code} "
@@ -8062,11 +8080,6 @@ def _bt_fetch_process_page(http: httpx.Client, account: str, *, limit: int = 200
         params.append(("filters[date_to]", date_to))
     qs = urlencode(params)
     r = http.get(f"{BASE}/{account}/{BT_BASE_PATH}?{qs}")
-    if _session_stale(r):
-        auto_login_attempt(interactive=False)
-        creds = load_credentials()
-        http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
-        r = http.get(f"{BASE}/{account}/{BT_BASE_PATH}?{qs}")
     if r.status_code != 200:
         raise click.ClickException(f"GET /bank_transactions/process returned {r.status_code}")
     return BeautifulSoup(r.text, "html.parser")
@@ -8267,11 +8280,6 @@ BT_IMPORT_PATH = "bank_transactions/import_from_bank"
 def _bt_import_forms(http: httpx.Client, account: str) -> list[dict]:
     """Every live PSD2 re-import form on the dashboard, one per linked bank."""
     r = http.get(f"{BASE}/{account}/{BT_IMPORT_FORM_PAGE}")
-    if _session_stale(r):
-        auto_login_attempt(interactive=False)
-        creds = load_credentials()
-        http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
-        r = http.get(f"{BASE}/{account}/{BT_IMPORT_FORM_PAGE}")
     if r.status_code != 200:
         raise click.ClickException(
             f"GET /{BT_IMPORT_FORM_PAGE} returned {r.status_code} — cannot read the "
