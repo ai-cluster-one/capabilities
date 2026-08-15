@@ -1066,6 +1066,19 @@ Then re-run `simplbooks doctor` to confirm.
                                                 refused before anything is posted.
                                                 See `simplbooks guide id-spaces`.
 
+  simplbooks accounts ledgers [--refresh] [--json]
+                                                The JOIN between the two spaces,
+                                                derived live from each cashbook's
+                                                own edit form (never name-matched,
+                                                never declared): one row per
+                                                cashbook with the chart account it
+                                                posts to and that account's CODE,
+                                                plus what each cashbook id resolves
+                                                to if handed to a chart-side field.
+                                                The discovery point for "which
+                                                number addresses this ledger".
+                                                Cached; --refresh re-derives.
+
   simplbooks reports trial-balance --from YYYY-MM-DD --to YYYY-MM-DD
         [--account TERM] [--all] [--json]
                                                 Käibeandmik — every account's
@@ -1253,8 +1266,9 @@ Then re-run `simplbooks doctor` to confirm.
                       --from-cashbook-id. Incomings, payments, the own-bank
                       account printed on a sales invoice.
 
-  Both listings: `simplbooks accounts list chart | cashbook`. Full rule and
-  command inventory: `simplbooks guide id-spaces`.
+  Both listings: `simplbooks accounts list chart | cashbook`; the join between
+  them, derived: `simplbooks accounts ledgers`. Full rule and command
+  inventory: `simplbooks guide id-spaces`.
 
 ═══ Tax classes ════════════════════════════════════════════════════════════
 
@@ -3738,6 +3752,182 @@ def accounts_list(kind: str, limit: int, as_json: bool) -> None:
             f"{strip_html(row.get('name'))[:60]:<60}  "
             f"{strip_html(row.get('active'))[:5]}"
         )
+
+
+# ─── the merged ledger surface (cashbook ⇄ chart, derived) ─────────────────
+#
+# The join between the two id-spaces is LIVE DATA, never a declaration. The
+# cashbook edit form carries it: `data[IncomeAccount][financial_account_id]`
+# is a <select> whose SELECTED option's value is the chart account's internal
+# id. Reading it for every cashbook yields the complete pairing.
+#
+# Name-matching the two listings is not a join and is never used, not even as
+# a fallback: cashbook "Swedbank" matches three chart rows and "Tasaarveldus"
+# matches none. Only the form's own link resolves it.
+
+LEDGER_MAP_FILE = "ledger_map.json"
+_CASHBOOK_COA_FIELD = "data[IncomeAccount][financial_account_id]"
+
+
+def _ledger_map_cache_path() -> Path:
+    return _state_dir() / LEDGER_MAP_FILE
+
+
+def _cashbook_linked_coa_id(http: httpx.Client, account: str, cashbook_id: str) -> str | None:
+    """The chart account one cashbook posts to, read off its own edit form.
+
+    Returns the chart account's INTERNAL id (the option value), or None when the
+    cashbook carries no link. The option's label is ignored — the value is the
+    only thing that addresses a row."""
+    r = http.get(f"{BASE}/{account}/income_accounts/edit/{cashbook_id}")
+    if _session_stale(r):
+        auto_login_attempt(interactive=False)
+        creds = load_credentials()
+        http.cookies = httpx.Cookies(parse_cookie_string(creds["SIMPLBOOKS_COOKIE"]))
+        r = http.get(f"{BASE}/{account}/income_accounts/edit/{cashbook_id}")
+    if r.status_code != 200:
+        raise click.ClickException(
+            f"GET /income_accounts/edit/{cashbook_id} returned {r.status_code} — "
+            f"cannot derive the cashbook → chart link."
+        )
+    soup = BeautifulSoup(r.text, "html.parser")
+    select = soup.find("select", attrs={"name": _CASHBOOK_COA_FIELD})
+    if select is None:
+        raise click.ClickException(
+            f"No {_CASHBOOK_COA_FIELD} field on /income_accounts/edit/{cashbook_id} — "
+            f"the form layout changed. Refusing to guess the link."
+        )
+    for opt in select.find_all("option"):
+        if opt.get("selected") is not None and (opt.get("value") or "").strip():
+            return opt["value"].strip()
+    return None
+
+
+def _derive_ledger_map() -> dict:
+    """Derive the full cashbook ⇄ chart pairing plus the id-space overlap.
+
+    Costs one cashbook listdata call, one chart listdata call and one form read
+    per cashbook — which is why the result is cached."""
+    cashbooks = _cashbook_index()["by_id"]
+    chart_active = _chart_index()["by_id"]
+    chart_all = _chart_index_all()["by_id"]
+    cookies, account = session_or_die()
+
+    ledgers: list[dict] = []
+    with build_http(cookies, account) as http:
+        for cid in sorted(cashbooks, key=lambda v: int(v)):
+            coa_id = _cashbook_linked_coa_id(http, account, cid)
+            rec = chart_active.get(coa_id or "") or chart_all.get(coa_id or "")
+            ledgers.append({
+                "cashbook_id": int(cid),
+                "cashbook_name": cashbooks[cid]["name"],
+                "coa_id": int(coa_id) if (coa_id or "").isdigit() else None,
+                "coa_code": rec["code"] if rec else None,
+                "coa_name": rec["name"] if rec else None,
+                "coa_active": bool(rec and coa_id in chart_active),
+            })
+
+    # The overlap, stated rather than implied: what each cashbook id resolves to
+    # when it is (wrongly) handed to a chart-side field.
+    by_cashbook = {row["cashbook_id"]: row for row in ledgers}
+    collisions: list[dict] = []
+    for value in sorted(by_cashbook):
+        rec = chart_active.get(str(value)) or chart_all.get(str(value))
+        row = by_cashbook[value]
+        collisions.append({
+            "value": value,
+            "cashbook_name": row["cashbook_name"],
+            "coa_id": int(rec["id"]) if rec else None,
+            "coa_code": rec["code"] if rec else None,
+            "coa_name": rec["name"] if rec else None,
+            "same_ledger": bool(rec and row["coa_id"] is not None
+                                and int(rec["id"]) == row["coa_id"]),
+        })
+
+    return {
+        "account": account,
+        "derived_at": datetime.now().isoformat(timespec="seconds"),
+        "source": (f"income_accounts/edit/<cashbook id> → {_CASHBOOK_COA_FIELD} "
+                   f"(selected option), joined to financial_accounts by internal id"),
+        "ledgers": ledgers,
+        "coa_id_collisions": collisions,
+    }
+
+
+def _load_ledger_map(refresh: bool = False) -> tuple[dict, bool]:
+    """(map, from_cache). The cache is keyed on the account hash, so a different
+    SimpleBooks account never reads another's pairing."""
+    path = _ledger_map_cache_path()
+    if not refresh and path.is_file():
+        try:
+            cached = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            cached = None
+        if isinstance(cached, dict) and cached.get("ledgers"):
+            _, account = session_or_die()
+            if cached.get("account") == account:
+                return cached, True
+    data = _derive_ledger_map()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    return data, False
+
+
+@accounts.command("ledgers")
+@click.option("--refresh", is_flag=True,
+              help="Re-derive from SimpleBooks instead of reading the cached map.")
+@click.option("--json", "as_json", is_flag=True)
+def accounts_ledgers(refresh: bool, as_json: bool) -> None:
+    """The cashbook ⇄ chart-of-accounts join, derived live — the discovery point
+    for "which number addresses this ledger".
+
+    One row per cashbook: its cashbook ID, the chart account it posts to, and
+    that account's CODE. The pairing is read off each cashbook's own edit form,
+    never matched by name and never declared anywhere.
+
+    Read it to look an account up; do not rely on having read it. The typed
+    flags and the pre-POST validator hold whether or not you did."""
+    data, from_cache = _load_ledger_map(refresh=refresh)
+
+    if as_json:
+        # MACHINE CONTRACT — additive only.
+        click.echo(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+
+    click.secho("ledgers — cashbook ⇄ chart of accounts, derived from the live forms",
+                fg="cyan")
+    click.echo(f"  derived {data['derived_at']}"
+               f"{' (cached — --refresh to re-read)' if from_cache else ''}")
+    click.echo()
+    click.secho(f"{'CASHBOOK':<32}  {'CHART ACCOUNT':<44}", bold=True)
+    click.secho(f"{'ID':>3}  {'NAME':<27}  {'CODE':<6}  {'ID':>4}  {'NAME':<30}", bold=True)
+    for row in data["ledgers"]:
+        click.echo(
+            f"{row['cashbook_id']:>3}  "
+            f"{(row['cashbook_name'] or '?')[:27]:<27}  "
+            f"{(row['coa_code'] or '—'):<6}  "
+            f"{(str(row['coa_id']) if row['coa_id'] is not None else '—'):>4}  "
+            f"{(row['coa_name'] or 'not linked to any chart account')[:30]:<30}"
+            + ("" if row["coa_active"] or row["coa_id"] is None else "  [INACTIVE]")
+        )
+
+    click.echo()
+    click.secho("The two spaces overlap. Handed to a chart-side field, a cashbook id "
+                "resolves to:", bold=True)
+    for c in data["coa_id_collisions"]:
+        if c["coa_code"] is None:
+            verdict = click.style("no chart account — refused", fg="green")
+        elif c["same_ledger"]:
+            verdict = click.style("same ledger — coincidence, not a rule", fg="yellow")
+        else:
+            verdict = click.style("WRONG LEDGER — posts silently", fg="red")
+        click.echo(f"  {c['value']}  (cashbook {c['cashbook_name']})"
+                   f"{'':<{max(0, 24 - len(c['cashbook_name'] or ''))}}"
+                   f"→ {(c['coa_code'] or '—')} {(c['coa_name'] or '')[:28]:<28}  {verdict}")
+    click.echo()
+    click.echo("  Chart-side flags take the CODE column (>= 1010); cashbook-side flags "
+               "take the cashbook ID.")
+    click.echo("  Full inventory: `simplbooks guide id-spaces`.")
 
 
 # ─── financial reports (read-only: trial balance / balances at a date) ──────
