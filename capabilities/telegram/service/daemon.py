@@ -528,6 +528,11 @@ LOG_FILE = SERVICE_STATE_DIR / "daemon.log"
 HEALTH_FILE = SERVICE_STATE_DIR / "health.json"
 PROGRESS_DIR = SERVICE_STATE_DIR / "progress"
 WORKER_SESSION_DIR = SERVICE_STATE_DIR / "worker-sessions"
+# The worker session each caller is carrying, by caller. Deliberately not under
+# worker-sessions/, which holds copies of the Telegram account session — a
+# different thing entirely, and one that is auth material where this is a bare
+# id pointing at a codex rollout.
+LANES_FILE = SERVICE_STATE_DIR / "lanes.json"
 AUTHORITY_DIR = SERVICE_STATE_DIR / "authority"
 CALL_RECORDING_REQUEST_DIR = SERVICE_STATE_DIR / "call-recording-requests"
 PROJECT_LAYOUT_FILE = SERVICE_STATE_DIR / "project-layout.json"
@@ -1512,11 +1517,14 @@ def voice_agent_settings():
     cfg = dict(_as_mapping(_as_mapping(DEFAULTS.get("workers")).get(worker)))
     cfg.update(_as_mapping(_as_mapping(VOICE_AGENT_DEFAULTS.get("workers")).get(worker)))
     cfg = {k: _default_as_none(v) for k, v in cfg.items()}
+    session_mode = str(_as_mapping(VOICE_AGENT_DEFAULTS.get("session")).get("mode")
+                       or "carry").strip().lower()
     return {
         "worker": worker,
         "worker_settings": cfg,
         "model": cfg.get("model"),
         "worker_timeout": DEFAULTS.get("worker_timeout", 90),
+        "session_mode": session_mode,
         **_worker_flags(worker, cfg),
     }
 
@@ -1596,6 +1604,42 @@ def _shell_stage(command):
     if head in SHELL_STAGES:
         return SHELL_STAGES[head]
     return f"asking {head} to {verb}" if verb else f"running {head}"
+
+
+def codex_thread_started(line):
+    """The thread id out of a `thread.started` event, None for any other line.
+
+    Read live from the output pump rather than from the run's final stdout,
+    because the runs whose classification matters most are the ones that never
+    produce final stdout: a worker that is killed or times out is reported by its
+    stderr alone. Whether the thread ever opened is what separates a resume that
+    executed nothing — safe to run again — from a turn that may already have done
+    half of what it was asked.
+    """
+    try:
+        event = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(event, dict) and event.get("type") == "thread.started":
+        return event.get("thread_id")
+    return None
+
+
+def codex_context_compacted(line):
+    """True when the event says codex just summarized the thread to fit.
+
+    A session nobody ever resets eventually fills its context window, and codex
+    handles that by itself. What it cannot promise is that the summary keeps the
+    instructions the session was opened with — so the one thing the daemon has to
+    know is that it happened."""
+    try:
+        event = json.loads(line)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(event, dict):
+        return False
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    return (item.get("type") or item.get("item_type")) == "context_compaction"
 
 
 def codex_event_stage(line):
@@ -2211,12 +2255,35 @@ def _channel_context_from_policy(policy):
     return "\n\n".join(parts).strip()
 
 
+def resumed_prompt(st):
+    """The next turn inside a thread the worker is already holding.
+
+    Everything the full prompt establishes — the soft gate, who is on the other
+    end, the active settings, how to report progress — that thread already
+    carries. Restating it every turn would grow the thread for nothing and invite
+    the model to re-argue instructions it has already accepted, which is most of
+    what resuming was meant to avoid. Only what has actually moved on since the
+    last turn is worth sending: the clock, and the new request."""
+    req = st.get("current_request") or {}
+    lines = []
+    if st.get("now"):
+        lines.append(f"Time: {st['now']}")
+    if req.get("delivery"):
+        lines.append(f"Delivery: {req['delivery']}")
+    if lines:
+        lines.append("")
+    lines.append(req.get("text") or "")
+    return "\n".join(lines)
+
+
 def build_prompt(tail, state=None):
     """Assemble the worker prompt: soft-gate context (context.md) + the daemon-resolved channel
     state (time, channel/harness, participants + roles, active settings, context-window size,
     previous-turn token usage) + the live tail. State is assembled here and passed in, so the
     worker reads its situation from the context, not by inferring it from chat history."""
     st = state or {}
+    if st.get("resume_session") and not st.get("resume_reanchor"):
+        return resumed_prompt(st)
     context = CONTEXT_FILE.read_text().strip() if CONTEXT_FILE.exists() else ""
     if st.get("chat_id") is not None:
         progress_command = (
@@ -2696,6 +2763,9 @@ def worker_claude(chat, tail, state=None, procs=None):
     boundary is the soft-gate in context.md, not a permission gate."""
     cmd = ["claude", "-p", build_prompt(tail, state), "--output-format", "json",
            "--dangerously-skip-permissions"]
+    resume_session = (state or {}).get("resume_session")
+    if resume_session:
+        cmd += ["--resume", str(resume_session)]
     model = ((state or {}).get("settings") or {}).get("model")
     if model:
         cmd += ["--model", model]
@@ -2805,13 +2875,25 @@ def discover_codex_images(thread_id):
 def worker_codex(chat, tail, state=None, procs=None):
     """Headless `codex exec`. Full access (bypass
     approvals+sandbox) mirrors the claude worker's; --skip-git-repo-check because /app is not
-    a git repo. The final message comes from -o; --json carries usage metadata on stdout."""
+    a git repo. The final message comes from -o; --json carries usage metadata on stdout.
+
+    With `resume_session` the run continues that thread instead of opening one.
+    The `resume` subcommand takes the same flags with a single exception: it has
+    no --color, and passing it exits before the model is ever reached. With --json
+    on a pipe there is nothing to colourise anyway."""
     fd, out = tempfile.mkstemp(prefix="tg-codex-", suffix=".txt")
     os.close(fd)
     try:
-        cmd = ["codex", "exec", build_prompt(tail, state),
-               "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-               "--json", "--color", "never", "-o", out]
+        resume_session = (state or {}).get("resume_session")
+        if resume_session:
+            cmd = ["codex", "exec", "resume", str(resume_session),
+                   build_prompt(tail, state),
+                   "--dangerously-bypass-approvals-and-sandbox",
+                   "--skip-git-repo-check", "--json", "-o", out]
+        else:
+            cmd = ["codex", "exec", build_prompt(tail, state),
+                   "--dangerously-bypass-approvals-and-sandbox",
+                   "--skip-git-repo-check", "--json", "--color", "never", "-o", out]
         model = ((state or {}).get("settings") or {}).get("model")
         if model:
             cmd += ["-m", model]
@@ -2846,6 +2928,188 @@ def worker_codex(chat, tail, state=None, procs=None):
 
 
 WORKERS = {"stub": worker_stub, "claude": worker_claude, "codex": worker_codex}
+
+
+class WorkerLane:
+    """The worker session a caller keeps, and the decisions about it.
+
+    A caller rarely wants one thing. The next task builds on what the last one
+    found, and a fresh worker thread each time throws that away: the caller waits
+    on the line through the same connection, the same lookup, the same id, before
+    anything new can begin. A lane remembers the thread a task ran in and offers
+    it to the next one — across calls, not only within one, so hanging up and
+    ringing back lands in the conversation that was already going.
+
+    Nothing expires it. Not an age, not a turn count, not a restart. Codex
+    summarizes a thread by itself once it fills its context window, so length
+    takes care of itself, and the only way to a new session is asking for one.
+
+    It keeps state and decides; it never runs anything. Execution stays with the
+    caller, which owns the process, its timeout and its cancellation — so a lane
+    can be reasoned about, and tested, without a daemon around it.
+    """
+
+    def __init__(self):
+        self.session_id = None
+        self.turns = 0
+        # Set when the worker reports summarizing the thread to fit. The next
+        # turn then re-states the operating context in full: compaction is free
+        # to summarize away the instructions the session was opened with, and a
+        # thread meant to live forever cannot be left drifting from them.
+        self.needs_reanchor = False
+        # One row per session this call touched, for the call's own metadata.
+        # The carried-over session is seeded in as the first row.
+        self.sessions = []
+
+    def classify(self, harness, resumed, thread_started):
+        """What a failed attempt means for the session.
+
+        The whole discriminator is whether a thread ever opened. A resume that
+        never opened one executed nothing, so the same task can be run again in a
+        fresh session and the caller need never know. Anything else may already
+        have created a record, sent a message, or moved money, and running it a
+        second time would do that twice.
+
+        The harness matters because only codex reports the event: claude's output
+        arrives as one object at the end and there is no live signal at all, so
+        every claude failure is treated as the dangerous kind. That is the
+        conservative reading, and it costs nothing — a retry is a convenience,
+        never a correctness requirement."""
+        if resumed and harness == "codex" and not thread_started:
+            return "session_lost"
+        return "task_failed"
+
+    def refresh(self, record):
+        """Take up whatever session is on record now.
+
+        Read before every task rather than once when the call is answered. A task
+        from the previous call can finish and pin its session seconds after the
+        next call is already up — which is precisely when someone hangs up and
+        rings straight back to carry on. A lane fixed at pickup would not see it,
+        and the caller would get a worker that knows nothing about what they were
+        just talking about."""
+        session_id = (record or {}).get("session_id")
+        if not session_id or str(session_id) == self.session_id:
+            return
+        self.session_id = str(session_id)
+        self.turns = int(record.get("turns") or 0)
+        self.needs_reanchor = bool(record.get("needs_reanchor"))
+        if not self.sessions or self.sessions[-1]["session_id"] != self.session_id:
+            self.sessions.append({"session_id": self.session_id,
+                                  "turns": self.turns, "closed": None})
+
+    def open(self, session_id):
+        """Take the thread the moment the worker reports opening it.
+
+        Recorded when the work starts, not when it finishes. Between those two
+        there is half a minute of real work, and a caller who rings back inside
+        that window would otherwise find nothing on record and get a second
+        thread that knows nothing — which is the gap this whole thing exists to
+        close. A turn that then fails clears the record again, so what survives a
+        failure is still nothing."""
+        if not session_id or str(session_id) == self.session_id:
+            return
+        self.session_id = str(session_id)
+        self.turns = 0
+        self.sessions.append(
+            {"session_id": self.session_id, "turns": 0, "closed": None})
+
+    def pin(self, session_id):
+        """Count the turn that finished, on the session it ran in.
+
+        The thread was already taken by `open` when the worker started; this only
+        records that a turn on it completed. Called on a normal worker return and
+        on no other path, so the count says how many turns actually landed."""
+        session_id = str(session_id) if session_id else None
+        if not session_id:
+            return
+        if session_id != self.session_id:
+            self.session_id = session_id
+            self.turns = 0
+        self.turns += 1
+        if not self.sessions or self.sessions[-1]["session_id"] != session_id:
+            self.sessions.append(
+                {"session_id": session_id, "turns": 0, "closed": None})
+        self.sessions[-1]["turns"] = self.turns
+
+    def clear(self, reason):
+        """Let go of the session, naming what ended it.
+
+        Every path that stops trusting the thread comes through here, so the
+        reason reaches the log and the call's metadata rather than being guessed
+        at afterwards."""
+        if self.session_id is not None and self.sessions:
+            self.sessions[-1]["closed"] = reason
+        self.session_id = None
+        self.turns = 0
+        self.needs_reanchor = False
+
+
+_LANES_LOCK = threading.Lock()
+
+
+def _read_lanes():
+    if not LANES_FILE.exists():
+        return {}
+    try:
+        stored = json.loads(LANES_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return stored if isinstance(stored, dict) else {}
+
+
+def load_lane(caller_id):
+    """The lane this caller left behind, or an empty one.
+
+    Read from disk rather than from memory, so a session outlives the call it was
+    opened in — and the daemon that opened it. What is stored is a codex thread
+    id, not the conversation: that lives in codex's own rollout, which is why a
+    restart or a reboot changes nothing here."""
+    lane = WorkerLane()
+    record = _read_lanes().get(str(caller_id))
+    if not isinstance(record, dict) or not record.get("session_id"):
+        return lane
+    lane.session_id = str(record["session_id"])
+    lane.turns = int(record.get("turns") or 0)
+    lane.needs_reanchor = bool(record.get("needs_reanchor"))
+    lane.sessions.append({"session_id": lane.session_id, "turns": lane.turns,
+                          "closed": None})
+    return lane
+
+
+def save_lane(caller_id, lane):
+    """Write the carried session back, or drop the entry once there is none.
+
+    Read and write are one critical section, and the file lands by rename. One
+    caller's entry is written from the asyncio side when a turn settles and from
+    the worker's output pump the moment a thread opens — different threads, one
+    file holding every caller — so an unguarded read-modify-write could drop
+    another caller's session while carrying this one."""
+    key = str(caller_id)
+    with _LANES_LOCK:
+        lanes = _read_lanes()
+        if lane is None or not lane.session_id:
+            lanes.pop(key, None)
+        else:
+            lanes[key] = {"session_id": lane.session_id, "turns": lane.turns,
+                          "needs_reanchor": lane.needs_reanchor,
+                          "updated_at": iso_utc()}
+        SERVICE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = LANES_FILE.with_name(
+            f".{LANES_FILE.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(lanes, indent=2, ensure_ascii=False))
+        os.replace(temporary, LANES_FILE)
+
+
+def forget_lanes():
+    """Drop every carried session. This is what `/reload` means by a new start:
+    the one deliberate way to a fresh thread, since nothing else ends one."""
+    with _LANES_LOCK:
+        carried = len([row for row in _read_lanes().values()
+                       if isinstance(row, dict) and row.get("session_id")])
+        with contextlib.suppress(OSError):
+            LANES_FILE.unlink()
+    return carried
 
 
 class NotAuthorized(Exception):
@@ -3776,8 +4040,17 @@ async def run_session(client):
                 reply = stop_running(key)
             elif cmd == "/reload":
                 result = reload_runtime_settings()
-                reply = ("ok, settings reloaded without disconnecting"
-                         if result["ok"] else f"nope: {result['error']}")
+                if result["ok"]:
+                    # Nothing else ever ends a carried worker session, so this is
+                    # the one deliberate way to start a conversation over.
+                    dropped = forget_lanes()
+                    reply = "ok, settings reloaded without disconnecting"
+                    if dropped:
+                        reply += "; next call starts a new worker session"
+                        log(f"{key}: /reload dropped {dropped} carried "
+                            "worker session(s)")
+                else:
+                    reply = f"nope: {result['error']}"
             else:
                 reply = handle_command(reg, key, text)
             row = reg.setdefault(key, {})
@@ -4050,11 +4323,16 @@ async def run_session(client):
             "metadata_path": None,
             "metadata": None,
             "started_at": None,
+            "lane": None,
             "starting": False,
             "finishing": False,
         }
 
         voice_task_counter = {"n": 0}
+        # Voice tasks in flight, by caller. Kept here rather than on a call,
+        # because a task outlives the call that started it: two workers on one
+        # carried session would be two processes writing one codex rollout.
+        voice_tasks_running = {}
 
         def voice_call_busy():
             return active_voice_call["starting"] or active_voice_call["session"] is not None
@@ -4085,93 +4363,188 @@ async def run_session(client):
                         on_progress(note, "worker")
 
         async def run_voice_task(caller_id, caller_name, text,
-                                 delivery=VOICE_TASK_DELIVERY, on_progress=None):
+                                 delivery=VOICE_TASK_DELIVERY, on_progress=None,
+                                 lane=None):
             """One task the caller asked for mid-call, run by the project's own
             worker — the same machinery a message runs, under the authority the
-            same user's messages resolve to."""
+            same user's messages resolve to.
+
+            Returns the worker's whole result, not just its reply. What the worker
+            reports about itself — the session it ran in above all — is the
+            daemon's business, and each caller decides for itself how much of it
+            may cross into the conversation.
+
+            With a `lane`, the session a finished turn ran in is kept for the rest
+            of the call. Without one — the post-call summary takes this path — every
+            run stands alone, which is what a summary wants."""
             s = voice_agent_settings()
             key = str(caller_id)
-            voice_task_counter["n"] += 1
-            task_id = f"voice-{int(time.time())}-{voice_task_counter['n']}"
-            worker_text = text
-            if on_progress is not None:
-                worker_text = voice_task_preamble(
-                    caller_id, VOICE_PROGRESS_INTERVAL) + text
-            job = voice_task_job(caller_id, caller_name, worker_text, task_id)
-            authority = _authority_policy_for(job, None, True)
-            proc_key = f"{key}#voice-{task_id}"
-            authority_context = None
-            worker_session = None
-            cancel_event = threading.Event()
-            progress_task = None
 
-            def _offer_stage(line):
-                """Called from the worker's output pump, one JSONL event at a time."""
-                stage = codex_event_stage(line)
-                if stage:
-                    on_progress(stage, "stream")
+            async def attempt(resume_session, seen):
+                """One worker run, from its own clean slate.
 
-            PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-            progress_outbox = PROGRESS_DIR / f"{_safe_file_part(key)}-{task_id}.jsonl"
-            with contextlib.suppress(OSError):
-                progress_outbox.unlink()
-            try:
-                worker_session = prepare_worker_session(key, task_id)
-                if authority is not None:
-                    authority_context = write_authority_context(
-                        authority, f"{key}-{task_id}")
-                state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
-                         "chat_type": "private", "chat_name": None,
-                         "harness": s["worker"],
-                         "participants": [{"name": job["sender_name"],
-                                           "role": job["sender_role"]}],
-                         "settings": s, "messages": 0, "history_chars": 0,
-                         "current_request": {
-                             "message_id": task_id,
-                             "sender_id": key,
-                             "sender_name": job["sender_name"],
-                             "sender_role": job["sender_role"],
-                             "kind": job["kind"],
-                             "text": worker_text,
-                             "reply_to": None,
-                             "delivery": delivery,
-                         },
-                         "authority": authority,
-                         "authority_context": authority_context,
-                         "progress_outbox": str(progress_outbox),
-                         "on_worker_line": (_offer_stage if on_progress is not None
-                                            else None),
-                         "worker_session": worker_session,
-                         "cancel_event": cancel_event,
-                         "proc_key": proc_key}
-                log(f"voice: task {task_id} dispatched worker={s['worker']} "
-                    f"model={s['model'] or 'default'} authority={_authority_summary(authority)}")
+                Everything a second attempt must not inherit is built here rather
+                than shared: its own task id, process key, cancellation flag and
+                Telegram session copy. A retry that reused the cancellation would
+                be refused before it started, and one that reused the process key
+                would leave /stop unable to say which run it was killing."""
+                voice_task_counter["n"] += 1
+                task_id = f"voice-{int(time.time())}-{voice_task_counter['n']}"
+                worker_text = text
                 if on_progress is not None:
-                    progress_task = asyncio.create_task(
-                        tail_voice_progress(progress_outbox, on_progress))
-                loop = asyncio.get_running_loop()
-                future = loop.run_in_executor(
-                    None, WORKERS[s["worker"]], key, [], state, procs)
-                done, _ = await asyncio.wait({future}, timeout=float(s["worker_timeout"]))
-                if not done:
-                    await terminate_worker(
-                        proc_key, future, cancel_event,
-                        f"voice task timeout after {s['worker_timeout']}s")
-                    raise RuntimeError(
-                        f"{s['worker']} worker timed out after {s['worker_timeout']}s")
-                return (await future)["reply"]
-            finally:
-                if progress_task is not None:
-                    progress_task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await progress_task
+                    worker_text = voice_task_preamble(
+                        caller_id, VOICE_PROGRESS_INTERVAL) + text
+                job = voice_task_job(caller_id, caller_name, worker_text, task_id)
+                authority = _authority_policy_for(job, None, True)
+                proc_key = f"{key}#voice-{task_id}"
+                authority_context = None
+                worker_session = None
+                cancel_event = threading.Event()
+                progress_task = None
+
+                def _offer_stage(line):
+                    """Called from the worker's output pump, one JSONL event at a time."""
+                    thread_id = codex_thread_started(line)
+                    if thread_id and not seen["thread_id"]:
+                        seen["thread_id"] = thread_id
+                        if lane is not None:
+                            # Written here, seconds into the run, rather than on
+                            # the way out: the whole point is that there is no
+                            # moment where a caller ringing back finds nothing.
+                            lane.open(thread_id)
+                            save_lane(caller_id, lane)
+                    if codex_context_compacted(line):
+                        seen["compacted"] = True
+                    stage = codex_event_stage(line)
+                    if stage:
+                        on_progress(stage, "stream")
+
+                PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+                progress_outbox = PROGRESS_DIR / f"{_safe_file_part(key)}-{task_id}.jsonl"
                 with contextlib.suppress(OSError):
                     progress_outbox.unlink()
-                cleanup_worker_session(worker_session)
-                if authority_context:
+                try:
+                    worker_session = prepare_worker_session(key, task_id)
+                    if authority is not None:
+                        authority_context = write_authority_context(
+                            authority, f"{key}-{task_id}")
+                    state = {"now": now_display(), "chat_id": key, "connection": CONNECTION,
+                             "chat_type": "private", "chat_name": None,
+                             "harness": s["worker"],
+                             "participants": [{"name": job["sender_name"],
+                                               "role": job["sender_role"]}],
+                             "settings": s, "messages": 0, "history_chars": 0,
+                             "current_request": {
+                                 "message_id": task_id,
+                                 "sender_id": key,
+                                 "sender_name": job["sender_name"],
+                                 "sender_role": job["sender_role"],
+                                 "kind": job["kind"],
+                                 "text": worker_text,
+                                 "reply_to": None,
+                                 "delivery": delivery,
+                             },
+                             "authority": authority,
+                             "authority_context": authority_context,
+                             "progress_outbox": str(progress_outbox),
+                             "on_worker_line": (_offer_stage if on_progress is not None
+                                                else None),
+                             "worker_session": worker_session,
+                             "resume_session": resume_session,
+                             "resume_reanchor": reanchor,
+                             "cancel_event": cancel_event,
+                             "proc_key": proc_key}
+                    log(f"voice: task {task_id} dispatched worker={s['worker']} "
+                        f"model={s['model'] or 'default'} "
+                        f"session={resume_session or 'new'} "
+                        f"authority={_authority_summary(authority)}")
+                    if on_progress is not None:
+                        progress_task = asyncio.create_task(
+                            tail_voice_progress(progress_outbox, on_progress))
+                    loop = asyncio.get_running_loop()
+                    future = loop.run_in_executor(
+                        None, WORKERS[s["worker"]], key, [], state, procs)
+                    done, _ = await asyncio.wait({future},
+                                                 timeout=float(s["worker_timeout"]))
+                    if not done:
+                        await terminate_worker(
+                            proc_key, future, cancel_event,
+                            f"voice task timeout after {s['worker_timeout']}s")
+                        raise RuntimeError(
+                            f"{s['worker']} worker timed out after {s['worker_timeout']}s")
+                    return await future
+                finally:
+                    if progress_task is not None:
+                        progress_task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await progress_task
                     with contextlib.suppress(OSError):
-                        Path(authority_context).unlink()
-                release_worker_proc(proc_key)
+                        progress_outbox.unlink()
+                    cleanup_worker_session(worker_session)
+                    if authority_context:
+                        with contextlib.suppress(OSError):
+                            Path(authority_context).unlink()
+                    release_worker_proc(proc_key)
+
+            # Resuming is only safe while the event stream is being watched: the
+            # live `thread.started` is what separates a session that never opened
+            # from a turn that half-ran, and without it every failure would look
+            # retryable. No watcher, no resume — the coupling is real, so it is
+            # spelled out here rather than left for a later caller to trip over.
+            watching = lane is not None and on_progress is not None
+            if watching:
+                lane.refresh(_read_lanes().get(str(caller_id)))
+                voice_tasks_running[key] = voice_tasks_running.get(key, 0) + 1
+            resume_session = lane.session_id if watching else None
+            reanchor = bool(lane.needs_reanchor) if watching else False
+            try:
+                while True:
+                    # Per attempt, never per call. A cell that outlived one task
+                    # would report the previous task's thread as this one's, so a
+                    # session that was lost would read as one that half-ran, and
+                    # the recovery this exists for would quietly never happen.
+                    seen = {"thread_id": None, "compacted": False}
+                    try:
+                        result = await attempt(resume_session, seen)
+                    except asyncio.CancelledError:
+                        # Read before the rest: a task killed early looks exactly
+                        # like a session that never opened, and mistaking one for
+                        # the other would re-run work the caller walked away from.
+                        if lane is not None:
+                            lane.clear("cancelled")
+                            save_lane(caller_id, lane)
+                        raise
+                    except Exception:
+                        if lane is None:
+                            raise
+                        verdict = lane.classify(s["worker"], bool(resume_session),
+                                                bool(seen["thread_id"]))
+                        lane.clear(verdict)
+                        save_lane(caller_id, lane)
+                        if verdict != "session_lost":
+                            raise
+                        log(f"voice: session {resume_session} could not be resumed "
+                            "— running the task again in a new one")
+                        # The retry runs fresh, so a second failure can only
+                        # classify as task_failed and raise. One extra run at
+                        # most, bounded by the shape rather than by a counter.
+                        resume_session = None
+                        reanchor = False
+                        continue
+                    if lane is not None:
+                        lane.pin((result.get("meta") or {}).get("session_id"))
+                        # Set when this turn compacted, cleared when it did not —
+                        # so a thread that summarized itself re-states its context
+                        # on the next turn, whether that turn comes later in this
+                        # call or in a call days from now.
+                        lane.needs_reanchor = bool(seen["compacted"])
+                        save_lane(caller_id, lane)
+                    return result
+            finally:
+                if watching:
+                    voice_tasks_running[key] = voice_tasks_running.get(key, 1) - 1
+                    if voice_tasks_running[key] <= 0:
+                        voice_tasks_running.pop(key, None)
 
         async def run_voice_capability(caller_id, caller_name, capability, args):
             """One capability read for the caller, answered inside the turn that
@@ -4368,7 +4741,7 @@ async def run_session(client):
                 record["error"] = "empty_transcript"
                 return None
             try:
-                text = await run_voice_task(
+                result = await run_voice_task(
                     caller_id, caller_name,
                     VOICE_SUMMARY_TASK + body,
                     delivery=VOICE_SUMMARY_DELIVERY)
@@ -4376,7 +4749,7 @@ async def run_session(client):
                 record.update({"status": "failed", "error": _short_error(exc)})
                 log(f"voice: call summary failed — {_short_error(exc)}")
                 return None
-            text = str(text or "").strip()
+            text = str(result.get("reply") or "").strip()
             if not text:
                 record.update({"status": "failed", "error": "empty_reply"})
                 log("voice: call summary came back empty")
@@ -4531,11 +4904,32 @@ async def run_session(client):
             def note_task_progress(note, source="stream"):
                 session.note_progress(note, source)
 
+            # `fresh` removes the lane rather than disabling it: with nothing to
+            # carry a session, every task runs on its own exactly as it did
+            # before any of this existed.
+            lane = (load_lane(caller_id)
+                    if voice_agent_settings()["session_mode"] == "carry"
+                    else None)
+            if lane is not None and lane.session_id:
+                log(f"voice: carrying session {lane.session_id} "
+                    f"({lane.turns} turn(s)) into this call")
+
+            async def run_call_task(text):
+                """The runner deals in spoken answers, so it is handed one and
+                nothing else. A completion is serialized whole into the model's
+                next prompt, so anything the worker reports about itself has to
+                stop here — on this side of the boundary — rather than rely on
+                every later caller remembering not to pass it on."""
+                result = await run_voice_task(caller_id, caller_name, text,
+                                              on_progress=note_task_progress,
+                                              lane=lane)
+                return result["reply"]
+
             task_runner = voice_agent.VoiceTaskRunner(
-                lambda text: run_voice_task(caller_id, caller_name, text,
-                                            on_progress=note_task_progress),
+                run_call_task,
                 lambda completion: deliver_voice_task_result(caller_id, completion),
                 log=log,
+                elsewhere=lambda: voice_tasks_running.get(str(caller_id), 0) > 0,
             )
             session = voice_agent.VoiceCallSession(
                 calls,
@@ -4579,6 +4973,7 @@ async def run_session(client):
                 "metadata_path": metadata_path,
                 "metadata": metadata,
                 "started_at": started_at,
+                "lane": lane,
                 "finishing": False,
             })
             try:
@@ -4635,7 +5030,7 @@ async def run_session(client):
                     "session": None, "caller_id": None, "caller_name": None,
                     "record": False, "output": None, "caller_pcm": None,
                     "agent_pcm": None, "metadata_path": None, "metadata": None,
-                    "started_at": None, "finishing": False,
+                    "started_at": None, "lane": None, "finishing": False,
                 })
                 return
             metadata.update({
@@ -4675,6 +5070,10 @@ async def run_session(client):
             metadata = active_voice_call["metadata"]
             metadata_path = active_voice_call["metadata_path"]
             started_at = active_voice_call["started_at"]
+            # Read out with the rest, well before the reset below clears it: the
+            # metadata this feeds is written afterwards, and a lane read then
+            # would always be gone.
+            lane = active_voice_call["lane"]
 
             summary = await session.stop()
             tracks = session.tracks
@@ -4684,9 +5083,13 @@ async def run_session(client):
                 "session": None, "caller_id": None, "caller_name": None,
                 "record": False, "output": None, "caller_pcm": None,
                 "agent_pcm": None, "metadata_path": None, "metadata": None,
-                "started_at": None, "finishing": False,
+                "started_at": None, "lane": None, "finishing": False,
             })
 
+            # The call ending is not the session ending — that is the whole point
+            # of carrying one. It is also not this lane's last word: a task that
+            # outlived the call is still holding it and may yet pin a turn onto
+            # it, so clearing here would reset a count that is still being kept.
             wall_duration = (datetime.now(timezone.utc) - started_at).total_seconds()
             transcript = summary["transcript"]
             metadata["voice_agent"].update({
@@ -4699,6 +5102,10 @@ async def run_session(client):
                 "agent_voiced_seconds": summary["agent_voiced_seconds"],
                 "messages_sent": summary["messages_sent"],
                 "tasks": summary["tasks"],
+                # What the model never sees: which session each stretch of the
+                # call ran in, and what ended it. When continuity misbehaves this
+                # is the only place that says so.
+                "worker_sessions": lane.sessions if lane is not None else [],
                 "transcript": transcript,
                 "transcript_text": voice_agent.transcript_text(
                     transcript, ASSISTANT_NAME, caller_name),

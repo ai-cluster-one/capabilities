@@ -3335,5 +3335,307 @@ class VoicePromptIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("compiled_context", source)
 
 
+class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
+    """A call keeps the worker session its last finished task ran in, so the
+    next task builds on what that one found instead of rediscovering it."""
+
+    def captured_codex(self, daemon, state, stdout=None):
+        """Run the codex worker against a recorded command line."""
+        seen = {}
+        stdout = stdout or "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ])
+
+        def record(proc_key, cmd, procs, **kwargs):
+            seen["cmd"] = cmd
+            return (0, stdout, "")
+
+        with mock.patch.object(daemon, "run_worker_proc", side_effect=record):
+            result = daemon.worker_codex("123", [], state, {})
+        return seen["cmd"], result
+
+    async def test_a_resumed_run_continues_the_thread_without_color(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            cmd, _ = self.captured_codex(daemon, {"resume_session": "thread-1"})
+
+            self.assertEqual(cmd[:4], ["codex", "exec", "resume", "thread-1"])
+            # `resume` has no --color at all: passing it exits before the model
+            # is ever reached, and the run would look like a session that could
+            # not be opened.
+            self.assertNotIn("--color", cmd)
+            for flag in ("--json", "-o", "--skip-git-repo-check",
+                         "--dangerously-bypass-approvals-and-sandbox"):
+                self.assertIn(flag, cmd)
+
+    async def test_a_fresh_run_is_left_exactly_as_it_was(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            cmd, _ = self.captured_codex(daemon, {})
+
+            self.assertEqual(cmd[:2], ["codex", "exec"])
+            self.assertNotIn("resume", cmd)
+            self.assertEqual(cmd[cmd.index("--color") + 1], "never")
+
+    async def test_claude_is_told_which_session_to_resume(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            seen = {}
+
+            def record(proc_key, cmd, procs, **kwargs):
+                seen["cmd"] = cmd
+                return (0, json.dumps({"result": "done", "usage": {},
+                                       "session_id": "abc"}), "")
+
+            with mock.patch.object(daemon, "run_worker_proc", side_effect=record):
+                daemon.worker_claude("123", [], {"resume_session": "abc"}, {})
+
+            self.assertEqual(seen["cmd"][seen["cmd"].index("--resume") + 1], "abc")
+
+    async def test_a_resumed_prompt_carries_the_request_and_nothing_settled(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            state = {"resume_session": "thread-1", "now": "Monday",
+                     "chat_id": "123", "harness": "codex",
+                     "settings": {"worker": "codex"},
+                     "participants": [{"name": "Owner", "role": "owner"}],
+                     "current_request": {"text": "and now file it",
+                                         "delivery": "spoken"}}
+            prompt = daemon.build_prompt([], state)
+
+            self.assertIn("and now file it", prompt)
+            self.assertIn("Monday", prompt)
+            # The thread already holds all of this; restating it every turn is
+            # what resuming was meant to stop paying for.
+            self.assertNotIn("Channel state", prompt)
+            self.assertNotIn("Owner", prompt)
+            self.assertNotIn("Conversation", prompt)
+
+    async def test_only_a_thread_start_event_yields_a_thread_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertEqual(daemon.codex_thread_started(json.dumps(
+                {"type": "thread.started", "thread_id": "thread-9"})), "thread-9")
+            self.assertIsNone(daemon.codex_thread_started(json.dumps(
+                {"type": "turn.completed"})))
+            self.assertIsNone(daemon.codex_thread_started("not json at all"))
+
+    async def test_a_lane_adopts_a_session_and_counts_its_turns(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            lane = daemon.WorkerLane()
+
+            self.assertIsNone(lane.session_id)
+            lane.pin("thread-1")
+            self.assertEqual(lane.session_id, "thread-1")
+            lane.pin("thread-1")
+            self.assertEqual(lane.turns, 2)
+            # A turn that never finished reports nothing, and nothing is adopted.
+            lane.pin(None)
+            self.assertEqual(lane.turns, 2)
+            self.assertEqual(len(lane.sessions), 1)
+
+    async def test_a_session_outlives_the_call_that_opened_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            lane = daemon.load_lane(777)
+            self.assertIsNone(lane.session_id)
+            lane.pin("thread-1")
+            lane.pin("thread-1")
+            daemon.save_lane(777, lane)
+
+            # A later call — a later daemon, even — picks it back up.
+            carried = daemon.load_lane(777)
+            self.assertEqual(carried.session_id, "thread-1")
+            self.assertEqual(carried.turns, 2)
+            # Seeded as the call's first row, so the metadata reads continuously.
+            self.assertEqual(carried.sessions[0]["session_id"], "thread-1")
+            # Somebody else's calls are their own.
+            self.assertIsNone(daemon.load_lane(999).session_id)
+
+    async def test_a_session_pinned_after_the_next_call_started_is_still_picked_up(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            # The call is answered with nothing on record yet.
+            lane = daemon.load_lane(777)
+            self.assertIsNone(lane.session_id)
+
+            # The previous call's task finishes a moment later and pins its own.
+            straggler = daemon.WorkerLane()
+            straggler.pin("thread-1")
+            straggler.pin("thread-1")
+            daemon.save_lane(777, straggler)
+
+            # This call's next task reads the file again and carries on there,
+            # instead of opening a thread that knows nothing.
+            lane.refresh(daemon._read_lanes().get("777"))
+            self.assertEqual(lane.session_id, "thread-1")
+            self.assertEqual(lane.turns, 2)
+            self.assertEqual(lane.sessions[-1]["session_id"], "thread-1")
+
+    async def test_a_session_is_on_record_from_the_moment_it_opens(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            lane = daemon.load_lane(777)
+
+            # The worker has only just reported opening the thread; the work
+            # itself will take another half minute.
+            lane.open("thread-1")
+            daemon.save_lane(777, lane)
+
+            # A call arriving inside that window already finds it.
+            self.assertEqual(daemon.load_lane(777).session_id, "thread-1")
+            self.assertEqual(lane.turns, 0)
+
+            # Completing the turn counts it without opening anything new.
+            lane.pin("thread-1")
+            self.assertEqual(lane.turns, 1)
+            self.assertEqual(len(lane.sessions), 1)
+
+            # A turn that fails instead takes the record back down with it.
+            lane.clear("task_failed")
+            daemon.save_lane(777, lane)
+            self.assertIsNone(daemon.load_lane(777).session_id)
+
+    async def test_a_lost_session_stops_being_carried(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            lane = daemon.load_lane(777)
+            lane.pin("thread-1")
+            daemon.save_lane(777, lane)
+            lane.clear("session_lost")
+            daemon.save_lane(777, lane)
+
+            self.assertIsNone(daemon.load_lane(777).session_id)
+
+    async def test_reload_is_the_one_way_to_a_new_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            lane = daemon.load_lane(777)
+            lane.pin("thread-1")
+            daemon.save_lane(777, lane)
+
+            self.assertEqual(daemon.forget_lanes(), 1)
+            self.assertIsNone(daemon.load_lane(777).session_id)
+            # Nothing carried is not an error, it is just nothing to drop.
+            self.assertEqual(daemon.forget_lanes(), 0)
+
+    async def test_a_compacted_thread_restates_its_context_next_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertTrue(daemon.codex_context_compacted(json.dumps(
+                {"type": "item.completed",
+                 "item": {"type": "context_compaction"}})))
+            self.assertFalse(daemon.codex_context_compacted(json.dumps(
+                {"type": "item.completed", "item": {"type": "agent_message"}})))
+
+            # Re-anchoring survives the call it happened in, so a thread that
+            # summarized itself at hangup still restates itself when rung back.
+            lane = daemon.load_lane(777)
+            lane.pin("thread-1")
+            lane.needs_reanchor = True
+            daemon.save_lane(777, lane)
+            self.assertTrue(daemon.load_lane(777).needs_reanchor)
+
+            state = {"resume_session": "thread-1", "resume_reanchor": True,
+                     "now": "Monday", "chat_id": "123", "harness": "codex",
+                     "settings": {"worker": "codex"},
+                     "participants": [{"name": "Owner", "role": "owner"}],
+                     "current_request": {"text": "carry on", "delivery": "spoken"}}
+            self.assertIn("Channel state", daemon.build_prompt([], state))
+
+    async def test_only_a_resume_that_opened_nothing_may_be_run_again(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            lane = daemon.WorkerLane()
+
+            self.assertEqual(
+                lane.classify("codex", resumed=True, thread_started=False),
+                "session_lost")
+            # The thread opened, so the task may already have done half of what
+            # it was asked. Running it again would do that half twice.
+            self.assertEqual(
+                lane.classify("codex", resumed=True, thread_started=True),
+                "task_failed")
+            self.assertEqual(
+                lane.classify("codex", resumed=False, thread_started=False),
+                "task_failed")
+            # Claude reports no thread event ever, so it can never be told apart.
+            self.assertEqual(
+                lane.classify("claude", resumed=True, thread_started=False),
+                "task_failed")
+
+    async def test_nothing_but_a_failure_ever_ends_a_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            lane = daemon.WorkerLane()
+
+            # No ceiling, no clock, no generation to drift out of: a hundred
+            # turns later it is still the same thread. Codex summarizes it for
+            # itself when the context window fills.
+            for _ in range(100):
+                lane.pin("thread-1")
+
+            self.assertEqual(lane.session_id, "thread-1")
+            self.assertEqual(lane.turns, 100)
+            self.assertEqual(len(lane.sessions), 1)
+
+    async def test_each_session_a_call_used_is_kept_with_its_ending(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            lane = daemon.WorkerLane()
+
+            lane.pin("thread-1")
+            lane.clear("session_lost")
+            lane.pin("thread-2")
+            lane.clear("call_ended")
+
+            self.assertEqual(
+                [(row["session_id"], row["turns"], row["closed"])
+                 for row in lane.sessions],
+                [("thread-1", 1, "session_lost"), ("thread-2", 1, "call_ended")])
+
+    async def test_the_schema_admits_only_the_two_session_modes(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            base = {"connection": "test", "assistant_name": "Assistant",
+                    "direct_messages": {"mode": "anyone",
+                                        "default_role": "direct_user"},
+                    "allowed_users": {}, "allowed_groups": {}}
+            root = Path(td)
+
+            def validated(session):
+                return daemon.validate_settings(
+                    {**base, "defaults": {"voice_agent": {"session": session}}},
+                    root, root)
+
+            validated({"mode": "carry"})
+            validated({"mode": "fresh"})
+            with self.assertRaisesRegex(Exception, "must be one of"):
+                validated({"mode": "sometimes"})
+            with self.assertRaisesRegex(Exception, "unsupported property"):
+                validated({"lifetime": 5})
+
+    async def test_fresh_mode_is_the_way_back_to_one_session_per_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.assertEqual(daemon.voice_agent_settings()["session_mode"],
+                             "carry")
+
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td),
+                settings(voice_agent={"session": {"mode": "fresh"}}))
+            self.assertEqual(daemon.voice_agent_settings()["session_mode"],
+                             "fresh")
+
+
 if __name__ == "__main__":
     unittest.main()

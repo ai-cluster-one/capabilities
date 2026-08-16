@@ -351,6 +351,25 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tools", without)
         self.assertEqual(va.AGENT_TASK_TOOL["name"], "agent_task")
 
+    async def test_work_still_running_from_an_earlier_call_holds_the_next_one(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            busy = {"elsewhere": True}
+            runner = va.VoiceTaskRunner(
+                lambda text: self.answer("done"), self.fail_delivery,
+                log=lambda *_: None, elsewhere=lambda: busy["elsewhere"])
+
+            refused = runner.start("look the thing up")
+            self.assertFalse(refused["ok"])
+            self.assertEqual(refused["status"], "busy_from_earlier_call")
+            self.assertEqual(runner.running, 0)
+
+            # Two workers on one carried session would be two processes writing
+            # one codex rollout, so holding is the point — once the earlier work
+            # is done, this starts normally.
+            busy["elsewhere"] = False
+            self.assertTrue(runner.start("look the thing up")["ok"])
+
     async def test_a_finished_task_is_announced_only_between_turns(self):
         with fake_runtime_modules(), fake_genai_types():
             va = import_voice_agent()

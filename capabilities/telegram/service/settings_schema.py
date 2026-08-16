@@ -12,6 +12,7 @@ DIRECT_MODES = {"allowed_users", "anyone", "all", "open", "public"}
 VOICE_MODES = {"disabled", "enabled", "auto", "on"}
 VOICE_TOOLS = {"agent_task", "send_to_chat", "run_capability",
                "read_project_file", "reload_service"}
+VOICE_SESSION_MODES = {"carry", "fresh"}
 TRANSCRIPTION_MODES = {"disabled", "auto"}
 CALL_GROUP_MODES = {
     "disabled", "off", "none", "auto", "automatic", "on_request",
@@ -227,16 +228,33 @@ def _voice_tools(value, path):
         _boolean(value[name], f"{path}.{name}")
 
 
+def _voice_session(value, path):
+    """Whether a caller keeps one worker session or gets a new one every time.
+
+    `carry` keeps the session a finished task ran in and offers it to the next
+    task and the next call, so a follow-up builds on what was already found
+    instead of paying for the same lookups again. Nothing expires it; `/reload`
+    is the way to a new one. `fresh` gives every task its own session — the way
+    out if continuity ever proves worse than the rediscovery it replaces."""
+    value = _object(value, path)
+    _unknown(value, {"mode"}, path)
+    if "mode" in value:
+        _enum(value["mode"], VOICE_SESSION_MODES, f"{path}.mode")
+
+
 def _voice_agent(value, path, *, defaults=False, project_root=None, service_dir=None):
     value = _object(value, path)
     allowed = {"worker", "workers", "model", "voice", "greeting", "history", "tools"}
     if defaults:
-        allowed.update({"timezone", "progress_interval", "recording_caption", "prompt_file"})
+        allowed.update({"timezone", "progress_interval", "recording_caption",
+                        "prompt_file", "session"})
     else:
         allowed.add("mode")
     _unknown(value, allowed, path)
     if "tools" in value:
         _voice_tools(value["tools"], f"{path}.tools")
+    if "session" in value:
+        _voice_session(value["session"], f"{path}.session")
     if "mode" in value:
         _enum(value["mode"], VOICE_MODES, f"{path}.mode")
     if "worker" in value:

@@ -387,9 +387,13 @@ class VoiceTaskRunner:
     caller asked for is never dropped because they hung up first.
     """
 
-    def __init__(self, run_task, deliver, *, log=print):
+    def __init__(self, run_task, deliver, *, log=print, elsewhere=None):
         self._run_task = run_task
         self._deliver = deliver
+        # Work started on an earlier call can still be running: a task outlives
+        # the call that asked for it. `elsewhere` answers whether any is, so the
+        # one-at-a-time rule holds across calls and not merely within one.
+        self._elsewhere = elsewhere
         self.limit = TASKS_PER_CALL
         self.completions = asyncio.Queue()
         self._jobs = {}
@@ -423,6 +427,14 @@ class VoiceTaskRunner:
                                    "time. Do NOT start this one. Tell the caller you "
                                    "will do it once the current one is done, and wait "
                                    "for that result before calling this tool again."}
+        if self._elsewhere is not None and self._elsewhere():
+            return {"ok": False, "status": "busy_from_earlier_call",
+                    "running": self.running, "limit": self.limit,
+                    "instruction": "Work the caller asked for on an earlier call is "
+                                   "still running, and only one runs at a time. Do NOT "
+                                   "start this one. Tell the caller that what they "
+                                   "asked for before is still going and you will do "
+                                   "this next, then wait for that result."}
         self._sequence += 1
         job_id = f"task-{self._sequence}"
         self._signatures[signature] = job_id
