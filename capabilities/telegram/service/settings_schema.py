@@ -285,7 +285,7 @@ def _overlay(value, path, project_root, service_dir):
 def _participant(value, path, project_root, service_dir, *, member=False):
     value = _object(value, path)
     allowed = {
-        "name", "username", "role", "control", "authority",
+        "name", "username", "role", "may_address", "control", "authority",
         "allowed_capabilities", "capabilities", "context", "context_file",
         "call_recording", "voice_agent",
     }
@@ -295,6 +295,8 @@ def _participant(value, path, project_root, service_dir, *, member=False):
     for key in ("name", "username", "role"):
         if key in value:
             _string(value[key], f"{path}.{key}", nonempty=True)
+    if "may_address" in value:
+        _boolean(value["may_address"], f"{path}.may_address")
     if "kind" in value:
         _enum(value["kind"], {"human", "agent"}, f"{path}.kind")
     if "address_aliases" in value:

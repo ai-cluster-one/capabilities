@@ -1204,6 +1204,361 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(client.sent[2].get("reply_to"))
             await self.stop_session(client, task)
 
+    async def test_may_address_is_a_boolean_on_users_and_members(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_users"] = {
+                "888": {"name": "Muted", "may_address": False},
+            }
+            service_settings["allowed_groups"] = {
+                "-200": {"members": {"888": {"name": "Muted", "may_address": True}}},
+            }
+            daemon = import_daemon(Path(td), service_settings)
+
+            self.assertIs(daemon.ALLOWED["888"]["may_address"], False)
+
+            invalid = settings()
+            invalid["allowed_groups"] = {
+                "-200": {"members": {"888": {"may_address": "no"}}},
+            }
+            daemon.SETTINGS_FILE.write_text(json.dumps(invalid) + "\n")
+            result = daemon.reload_runtime_settings()
+
+            self.assertFalse(result["ok"])
+            self.assertIn(
+                "settings.allowed_groups.-200.members.888.may_address: must be a boolean",
+                result["error"],
+            )
+
+    async def test_muted_member_mention_dispatches_nothing_but_stays_in_the_tail(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "members": {"888": {"name": "Muted", "may_address": False}},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            muted = Message(201, text="Assistant, answer me")
+            muted.sender_id = 888
+            muted.mentioned = True
+            caller = Message(202, text="Assistant, answer me")
+            caller.mentioned = True
+            client = FakeClient([muted])
+            captured = {}
+
+            def capture(_chat, tail, state=None, _procs=None):
+                captured["tail"] = tail
+                captured["state"] = state
+                return successful_result("ok")
+
+            daemon.WORKERS["stub"] = capture
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            muted_event = Event(muted, chat_id=-200)
+            muted_event.is_private = False
+            await client.handler(muted_event)
+            await asyncio.sleep(0.02)
+
+            self.assertEqual(client.send_attempts, 0)
+            self.assertEqual(daemon.load_register()["-200"],
+                             {"last_processed_message_id": 0})
+
+            client.messages.append(caller)
+            caller_event = Event(caller, chat_id=-200)
+            caller_event.is_private = False
+            await client.handler(caller_event)
+            await wait_until(lambda: "tail" in captured)
+
+            self.assertIn(201, [row["id"] for row in captured["tail"]])
+            self.assertIn("Muted",
+                          [p["name"] for p in captured["state"]["participants"]])
+            await self.stop_session(client, task)
+
+    async def test_muted_agent_peer_cannot_address_the_assistant(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "members": {
+                        "4242": {
+                            "name": "Peer",
+                            "kind": "agent",
+                            "may_address": False,
+                        },
+                    },
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            daemon.WORKERS["stub"] = lambda *_args: successful_result("ok")
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            message = Message(203, text="Assistant, continue")
+            message.sender_id = 4242
+            message.mentioned = True
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await asyncio.sleep(0.02)
+
+            self.assertEqual(client.send_attempts, 0)
+            await self.stop_session(client, task)
+
+    async def test_muted_member_stays_silent_where_no_reference_is_required(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "require_reference": False,
+                    "members": {"888": {"name": "Muted", "may_address": False}},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            daemon.WORKERS["stub"] = lambda *_args: successful_result("ok")
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            muted = Message(204, text="just talking")
+            muted.sender_id = 888
+            muted.mentioned = False
+            muted_event = Event(muted, chat_id=-200)
+            muted_event.is_private = False
+            await client.handler(muted_event)
+            await asyncio.sleep(0.02)
+            self.assertEqual(client.send_attempts, 0)
+
+            other = Message(205, text="just talking")
+            other.mentioned = False
+            other_event = Event(other, chat_id=-200)
+            other_event.is_private = False
+            await client.handler(other_event)
+            await wait_until(lambda: len(client.sent) == 1)
+            await self.stop_session(client, task)
+
+    async def test_muted_member_record_request_is_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=60)
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "call_recording": {"mode": "on_request"},
+                    "members": {"888": {"name": "Muted", "may_address": False}},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            daemon.configured_call_recording_groups = lambda: {
+                "auto": {}, "on_request": {},
+            }
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            message = Message(206, text="/record")
+            message.sender_id = 888
+            message.mentioned = False
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await asyncio.sleep(0.02)
+
+            self.assertEqual(
+                list(daemon.CALL_RECORDING_REQUEST_DIR.glob("*.json")), [])
+            self.assertEqual(client.send_attempts, 0)
+            self.assertEqual(daemon.load_register()["-200"],
+                             {"last_processed_message_id": 0})
+            await self.stop_session(client, task)
+
+    async def test_muted_member_control_command_is_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "members": {"888": {"name": "Muted", "may_address": False}},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            muted = Message(207, text="/status")
+            muted.sender_id = 888
+            muted.mentioned = True
+            muted_event = Event(muted, chat_id=-200)
+            muted_event.is_private = False
+            await client.handler(muted_event)
+            await asyncio.sleep(0.02)
+            self.assertEqual(client.send_attempts, 0)
+
+            other = Message(208, text="/status")
+            other.mentioned = True
+            other_event = Event(other, chat_id=-200)
+            other_event.is_private = False
+            await client.handler(other_event)
+            await wait_until(lambda: len(client.sent) == 1)
+            await self.stop_session(client, task)
+
+    async def test_muted_member_ambient_voice_is_transcribed_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "voice_transcription": {"mode": "auto"},
+                    "members": {"888": {"name": "Muted", "may_address": False}},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(209, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+            client = FakeClient([message])
+            transcriptions = []
+            daemon.deepgram_transcribe = (
+                lambda audio, mime: transcriptions.append((audio, mime))
+                or "Hey Assistant, what is the plan?")
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(
+                lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 209)
+
+            self.assertEqual(len(transcriptions), 1)
+            self.assertEqual(client.send_attempts, 1)
+            self.assertIn("Hey Assistant", client.sent[0]["text"])
+            self.assertEqual(daemon.load_register()["-200"]["jobs"], {})
+            await self.stop_session(client, task)
+
+    async def test_group_member_entry_restores_a_globally_muted_sender(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_users"] = {
+                "888": {"name": "Muted", "may_address": False},
+            }
+            service_settings["allowed_groups"] = {
+                "-200": {"aliases": ["Assistant"]},
+                "-300": {
+                    "aliases": ["Assistant"],
+                    "members": {"888": {"name": "Muted", "may_address": True}},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({
+                "-200": {"last_processed_message_id": 0},
+                "-300": {"last_processed_message_id": 0},
+            })
+            daemon.WORKERS["stub"] = lambda *_args: successful_result("ok")
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            silenced = Message(210, text="Assistant, answer me")
+            silenced.sender_id = 888
+            silenced.mentioned = True
+            silenced_event = Event(silenced, chat_id=-200)
+            silenced_event.is_private = False
+            await client.handler(silenced_event)
+            await asyncio.sleep(0.02)
+            self.assertEqual(client.send_attempts, 0)
+
+            restored = Message(211, text="Assistant, answer me")
+            restored.sender_id = 888
+            restored.mentioned = True
+            restored_event = Event(restored, chat_id=-300)
+            restored_event.is_private = False
+            await client.handler(restored_event)
+            await wait_until(lambda: len(client.sent) == 1)
+            await self.stop_session(client, task)
+
+    async def test_catch_up_replay_dispatches_only_for_a_sender_who_may_address(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=60)
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "aliases": ["Assistant"],
+                    "members": {"888": {"name": "Muted", "may_address": False}},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 300}})
+
+            muted = Message(302, text="Assistant, answer me")
+            muted.sender_id = 888
+            muted.mentioned = True
+            caller = Message(301, text="Assistant, answer me")
+            caller.mentioned = True
+            dispatched = []
+
+            def capture(_chat, _tail, state=None, _procs=None):
+                dispatched.append(state["current_request"]["message_id"])
+                return successful_result("ok")
+
+            daemon.WORKERS["stub"] = capture
+            # The replay walks the fetched tail in reverse, so listing the muted
+            # note last has catch-up weigh it before any watermark moves.
+            client = FakeClient([caller, muted])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(
+                lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 301)
+
+            self.assertEqual(dispatched, [301])
+            self.assertEqual(client.send_attempts, 1)
+            self.assertEqual(daemon.load_register()["-200"]["jobs"], {})
+            await self.stop_session(client, task)
+
+    async def test_catch_up_ambient_voice_from_a_muted_sender_echoes_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(sync_interval=60)
+            service_settings["allowed_groups"] = {
+                "-200": {
+                    "voice_transcription": {"mode": "auto"},
+                    "members": {"888": {"name": "Muted", "may_address": False}},
+                },
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(303, voice=True)
+            message.sender_id = 888
+            message.mentioned = False
+            dispatched = []
+            daemon.WORKERS["stub"] = (
+                lambda *_args: dispatched.append(True) or successful_result("ok"))
+            transcriptions = []
+            daemon.deepgram_transcribe = (
+                lambda audio, mime: transcriptions.append((audio, mime))
+                or "Hey Assistant, what is the plan?")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(
+                lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 303)
+
+            self.assertEqual(len(transcriptions), 1)
+            self.assertEqual(client.send_attempts, 1)
+            self.assertIn("Hey Assistant", client.sent[0]["text"])
+            self.assertEqual(dispatched, [])
+            self.assertEqual(daemon.load_register()["-200"]["jobs"], {})
+            await self.stop_session(client, task)
+
     async def test_reload_replaces_live_policy_without_reimporting_the_daemon(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings(sync_interval=20)

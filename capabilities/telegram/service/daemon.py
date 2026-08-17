@@ -856,6 +856,19 @@ def _is_agent_member(sender_id, group_policy):
     return str(_member_policy(sender_id, group_policy).get("kind") or "").strip().lower() == "agent"
 
 
+def _may_address(sender_id, group_policy):
+    """Whether this sender may invoke the assistant in this group.
+
+    The group member entry wins over the global `allowed_users` default, so a
+    person silenced everywhere can be handed the assistant back in one room.
+    Reading a muted sender's messages is untouched: only invocation is closed.
+    """
+    member = _member_policy(sender_id, group_policy)
+    if "may_address" in member:
+        return member["may_address"] is not False
+    return _as_mapping(ALLOWED.get(str(sender_id))).get("may_address") is not False
+
+
 def _agent_dialogue_policy(group_policy):
     policy = _as_mapping(_as_mapping(group_policy).get("agent_dialogue"))
     try:
@@ -1188,6 +1201,8 @@ async def _reply_is_to_me(message, me):
 
 
 async def _message_addresses_me(message, me, policy):
+    if not _may_address(getattr(message, "sender_id", None), policy):
+        return False
     agent_sender = _is_agent_member(getattr(message, "sender_id", None), policy)
     if (policy or {}).get("require_reference") is False and not agent_sender:
         return True
@@ -3943,7 +3958,9 @@ async def run_session(client):
                         m, ent, message_key, is_direct, group_policy,
                         sender_name=profile["name"])
                     # If transcript names the assistant, finalize and dispatch
-                    if spoken and spoken != "[голосовое — не удалось расшифровать]" and _text_names_me(spoken, me, group_policy):
+                    if (spoken and spoken != "[голосовое — не удалось расшифровать]"
+                            and _text_names_me(spoken, me, group_policy)
+                            and _may_address(m.sender_id, group_policy)):
                         if not admit_or_finish_agent_job(
                                 message_key, m, group_policy, job,
                                 f"catch-up/{reason}/ambient-addressed"):
@@ -4075,7 +4092,9 @@ async def run_session(client):
                 event.message, chat_ref, key, is_direct, group_policy,
                 sender_name=profile["name"])
             # If transcript names the assistant, dispatch as an addressed request
-            if spoken and spoken != "[голосовое — не удалось расшифровать]" and _text_names_me(spoken, me, group_policy):
+            if (spoken and spoken != "[голосовое — не удалось расшифровать]"
+                    and _text_names_me(spoken, me, group_policy)
+                    and _may_address(event.message.sender_id, group_policy)):
                 if not admit_or_finish_agent_job(
                         key, event.message, group_policy, job, "live/ambient-addressed"):
                     return
