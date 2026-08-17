@@ -32,7 +32,7 @@
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "49a45674a107a5cd02e0f69d2d35e48ffc0a5e80d2be8240ad2a889ff6b7cbd1",
+      "payload_sha256": "3e8c9522ddfa3b04d3956f43b0e25f634c922ef1d8de4459182f7f88b854d3a8",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
@@ -127,7 +127,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "ce171c18ee11b4fec19bf0831f664af67746804f8e71971d21a4b9378446b37a",
+      "payload_sha256": "6f62856bf02fadabf783c455d654ad6605793925b7d93fb84384d8c2da68436d",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {

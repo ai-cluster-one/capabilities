@@ -409,8 +409,16 @@ def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
                 "42": {
                     "api_id": 12345,
                     "allow_write": True,
+                    "expected_account_id": 42,
                 },
             },
+        }) + "\n")
+        control_dir = tmp / "state" / "telegram" / "42" / "control"
+        control_dir.mkdir(parents=True)
+        (control_dir / "ownership-v1.json").write_text(json.dumps({
+            "schema": "telegram.ownership.v1",
+            "account_id": 42,
+            "protocol_version": 1,
         }) + "\n")
         _write_fake_telethon(fake_telethon)
         _write_fake_pytgcalls(tmp / "fake")
@@ -421,6 +429,8 @@ def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
             "XDG_STATE_HOME": str(tmp / "state"),
             "PYTHONPATH": str(tmp / "fake") + os.pathsep + env.get("PYTHONPATH", ""),
             "TELEGRAM_API_HASH": "test-hash",
+            "TELEGRAM_EXPECTED_ACCOUNT_ID": "42",
+            "TELEGRAM_ACCOUNT_CONTROL_DIR": str(control_dir),
             "TELEGRAM_SERVICE_CONNECTION": "42",
             "TELEGRAM_SERVICE_CONNECTIONS_FILE": str(connections),
             "TELEGRAM_SERVICE_CONTEXT": str(service_dir / "context.md"),
@@ -433,6 +443,7 @@ def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
             }),
             "TELEGRAM_SERVICE_SETTINGS": str(service_dir / "settings.json"),
             "TELEGRAM_SERVICE_STATE_DIR": str(state_dir),
+            "TELEGRAM_SERVICE_LAUNCH_NONCE": "test-launch-nonce",
         })
         with log_file.open("w", encoding="utf-8") as log:
             proc = subprocess.Popen(

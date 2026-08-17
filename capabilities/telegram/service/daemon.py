@@ -38,6 +38,7 @@ per-channel /set overrides.
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import html
 import json
 import logging
@@ -491,7 +492,7 @@ def _select_connection(data):
 CONNECTIONS, CONN_FILE = _connections_envelope()
 CONNECTION, CONNECTION_ENTRY = _select_connection(CONNECTIONS)
 try:
-    EXPECTED_ACCOUNT_ID = int(CONNECTION)
+    EXPECTED_ACCOUNT_ID = int((CONNECTION_ENTRY or {}).get("expected_account_id"))
     if EXPECTED_ACCOUNT_ID <= 0:
         raise ValueError
 except (TypeError, ValueError):
@@ -522,7 +523,13 @@ def _service_state_dir():
 
 SERVICE_STATE_DIR = _service_state_dir()
 REGISTER = SERVICE_STATE_DIR / "register.json"
-LOCK_FILE = SERVICE_STATE_DIR / "daemon.lock"
+EXPECTED_CONTROL_DIR = STATE_HOME / "telegram" / str(EXPECTED_ACCOUNT_ID) / "control"
+CONTROL_DIR = Path(os.environ.get("TELEGRAM_ACCOUNT_CONTROL_DIR") or EXPECTED_CONTROL_DIR).expanduser()
+if CONTROL_DIR.resolve() != EXPECTED_CONTROL_DIR.resolve():
+    sys.exit(f"account control dir mismatch: expected {EXPECTED_CONTROL_DIR}, got {CONTROL_DIR}")
+LOCK_FILE = CONTROL_DIR / "daemon.lock"
+OWNER_FILE = CONTROL_DIR / "owner.json"
+OWNERSHIP_FILE = CONTROL_DIR / "ownership-v1.json"
 PID_FILE = SERVICE_STATE_DIR / "daemon.pid"
 LOG_FILE = SERVICE_STATE_DIR / "daemon.log"
 HEALTH_FILE = SERVICE_STATE_DIR / "health.json"
@@ -536,6 +543,13 @@ LANES_FILE = SERVICE_STATE_DIR / "lanes.json"
 AUTHORITY_DIR = SERVICE_STATE_DIR / "authority"
 CALL_RECORDING_REQUEST_DIR = SERVICE_STATE_DIR / "call-recording-requests"
 PROJECT_LAYOUT_FILE = SERVICE_STATE_DIR / "project-layout.json"
+STATE_SCHEMA_FILE = SERVICE_STATE_DIR / "state-schema.json"
+SERVICE_STATE_VERSION = 1
+LAUNCH_NONCE = os.environ.get("TELEGRAM_SERVICE_LAUNCH_NONCE") or ""
+SERVICE_MODE = os.environ.get("TELEGRAM_SERVICE_MODE") or "canonical"
+DEV_SESSION_ID = os.environ.get("TELEGRAM_SERVICE_DEV_SESSION") or None
+_CLI_BUNDLE_RAW = os.environ.get("TELEGRAM_REAL_TELEGRAM") or ""
+CLI_BUNDLE_PATH = Path(_CLI_BUNDLE_RAW).expanduser() if _CLI_BUNDLE_RAW else None
 
 
 def now():
@@ -563,6 +577,7 @@ def write_health(state=None, **updates):
         "sync_interval_seconds": SYNC_INTERVAL,
         "stale_after_seconds": SYNC_STALE_AFTER,
         "telethon_version": getattr(telethon, "__version__", None),
+        **_owner_provenance(),
         **updates,
     })
     if state is not None:
@@ -571,6 +586,74 @@ def write_health(state=None, **updates):
     temp = HEALTH_FILE.with_name(f".{HEALTH_FILE.name}.{os.getpid()}.tmp")
     temp.write_text(json.dumps(health, indent=2, ensure_ascii=False) + "\n")
     os.replace(temp, HEALTH_FILE)
+
+
+def _atomic_json(path, value):
+    """Atomically replace one continuity or ownership JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False,
+                                    sort_keys=True) + "\n")
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def _file_sha256(path):
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _owner_provenance():
+    """Describe the actual launched bundle and state without secret values."""
+    return {
+        "schema": "telegram.daemon-owner.v1",
+        "launch_nonce": LAUNCH_NONCE,
+        "pid": os.getpid(),
+        "daemon_path": str(Path(__file__).resolve()),
+        "cli_bundle_path": str(CLI_BUNDLE_PATH.resolve()) if CLI_BUNDLE_PATH else None,
+        "payload_sha256": _file_sha256(Path(__file__).resolve()),
+        "mode": SERVICE_MODE,
+        "dev_session_id": DEV_SESSION_ID,
+        "project_root": str(PROJECT_ROOT.resolve()),
+        "connection": CONNECTION,
+        "account_id": EXPECTED_ACCOUNT_ID,
+        "auth_session_path": str(SESSION.resolve()),
+        "service_state_path": str(SERVICE_STATE_DIR.resolve()),
+        "health_file": str(HEALTH_FILE.resolve()),
+    }
+
+
+def _require_hardened_state():
+    """Validate cutover and exact state version before opening Telegram."""
+    marker = None
+    try:
+        marker = json.loads(OWNERSHIP_FILE.read_text())
+    except (OSError, ValueError):
+        pass
+    if (not isinstance(marker, dict)
+            or marker.get("schema") != "telegram.ownership.v1"
+            or marker.get("account_id") != EXPECTED_ACCOUNT_ID
+            or marker.get("protocol_version") != 1):
+        sys.exit(f"ownership migration required: {OWNERSHIP_FILE}")
+    state_marker = None
+    try:
+        state_marker = json.loads(STATE_SCHEMA_FILE.read_text())
+    except FileNotFoundError:
+        _atomic_json(STATE_SCHEMA_FILE, {
+            "schema": "telegram.service-state.v1", "version": 1,
+            "adopted_at": now(),
+        })
+        state_marker = {"schema": "telegram.service-state.v1", "version": 1}
+    except (OSError, ValueError):
+        pass
+    if (not isinstance(state_marker, dict)
+            or state_marker.get("schema") != "telegram.service-state.v1"
+            or state_marker.get("version") != SERVICE_STATE_VERSION):
+        sys.exit(f"service state version mismatch: {STATE_SCHEMA_FILE}")
+    if not LAUNCH_NONCE:
+        sys.exit("service launch nonce is required")
 
 
 def reload_runtime_settings():
@@ -645,8 +728,10 @@ def _is_tl_layer_error(exc):
 
 
 def acquire_daemon_lock():
-    SERVICE_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    handle = LOCK_FILE.open("w")
+    CONTROL_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    CONTROL_DIR.chmod(0o700)
+    handle = LOCK_FILE.open("a+")
+    LOCK_FILE.chmod(0o600)
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -1342,8 +1427,8 @@ def load_register():
 
 
 def save_register(reg):
-    SERVICE_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    REGISTER.write_text(json.dumps(reg, indent=2, ensure_ascii=False))
+    """Commit the watermark register atomically so crashes retain the prior file."""
+    _atomic_json(REGISTER, reg)
 
 
 def _channel_row(reg, key):
@@ -5882,12 +5967,15 @@ async def main():
             return
         if EXPECTED_ACCOUNT_ID is None:
             sys.exit(
-                f"Telegram connection {CONNECTION!r} is a legacy label, not an account ID; "
-                f"run `telegram login --connection {CONNECTION}` to discover the account ID, "
-                "then rename the connections.json key/default")
+                f"Telegram connection {CONNECTION!r} has no positive expected_account_id")
         api_id, api_hash = resolve_creds()
         CONNECTION_STATE_DIR.mkdir(parents=True, exist_ok=True)   # telethon opens the session sqlite here;
+        SERVICE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _require_hardened_state()
         lock_handle = acquire_daemon_lock()
+        _atomic_json(OWNER_FILE, {
+            **_owner_provenance(), "started_at": now(),
+        })
         backoff = 2                                 # the connection-namespace dir may not exist yet (fresh volume)
         PID_FILE.write_text(f"{os.getpid()}\n")
         wrote_pid = True
@@ -5942,9 +6030,12 @@ async def main():
                 if PID_FILE.read_text().strip() == str(os.getpid()):
                     PID_FILE.unlink()
         if lock_handle is not None:
-            with contextlib.suppress(OSError):
-                if LOCK_FILE.read_text().strip() == str(os.getpid()):
-                    LOCK_FILE.unlink()
+            with contextlib.suppress(Exception):
+                owner = json.loads(OWNER_FILE.read_text())
+                if (isinstance(owner, dict)
+                        and owner.get("launch_nonce") == LAUNCH_NONCE
+                        and owner.get("pid") == os.getpid()):
+                    OWNER_FILE.unlink()
             with contextlib.suppress(Exception):
                 fcntl.flock(lock_handle, fcntl.LOCK_UN)
             with contextlib.suppress(Exception):

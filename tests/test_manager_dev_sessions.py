@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -104,7 +105,15 @@ def _release_source_repo(tmp_path: Path) -> tuple[Path, Path]:
         json.dumps({"capabilities": {}}) + "\n"
     )
     (source / "README.md").write_text("release fixture\n")
-    index_env = _env(tmp_path / "release-index")
+    index_env = _env(tmp_path)
+    _git(source, "remote", "add", "origin",
+         "https://github.com/ai-cluster-one/capabilities.git")
+    registered = subprocess.run(
+        [str(source / "bin" / "capabilities"), "source", "register-checkout", "official"],
+        cwd=source, env=index_env, text=True, capture_output=True, timeout=300,
+        check=False,
+    )
+    assert registered.returncode == 0, registered.stderr
     indexed = subprocess.run(
         [str(source / "bin" / "capabilities"), "source", "index", "official"],
         cwd=source, env=index_env, text=True, capture_output=True, timeout=300,
@@ -115,7 +124,7 @@ def _release_source_repo(tmp_path: Path) -> tuple[Path, Path]:
     remote = tmp_path / "release-remote.git"
     remote.mkdir()
     _git(remote, "init", "--bare", "--initial-branch", "main")
-    _git(source, "remote", "add", "origin", str(remote))
+    _git(source, "remote", "set-url", "origin", str(remote))
     _git(source, "push", "-u", "origin", "main")
     return source, remote
 
@@ -172,12 +181,95 @@ def _start(
             "deployment",
             "--source",
             str(source),
-            "--consumer",
+            "--project",
             str(consumer),
             "--session",
             session,
+            "--allow-parallel",
         ).stdout
     )
+
+
+def test_dev_start_implicitly_attaches_the_calling_project_and_writes_v2(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    result = subprocess.run(
+        [str(MANAGER), "dev", "start", "deployment",
+         "--source", str(source), "--session", "implicit-project"],
+        cwd=consumer, env=env, text=True, capture_output=True, timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    started = json.loads(result.stdout)
+    state_file = (Path(env["XDG_STATE_HOME"]) / "capabilities" / "dev" /
+                  "implicit-project" / "session.json")
+    state = json.loads(state_file.read_text())
+    assert state["schema"] == "capabilities.dev.session.v2"
+    assert state["project"]["path"] == str(consumer)
+    assert "consumer" not in state
+    assert not (Path(env["XDG_DATA_HOME"]) / "capabilities" / "dev" /
+                "implicit-project" / "consumer").exists()
+    _run(env, "dev", "stop", "implicit-project")
+
+
+def test_legacy_session_is_reported_and_preserved(tmp_path):
+    env = _env(tmp_path)
+    state = Path(env["XDG_STATE_HOME"]) / "capabilities" / "dev" / "legacy"
+    data = Path(env["XDG_DATA_HOME"]) / "capabilities" / "dev" / "legacy"
+    state.mkdir(parents=True)
+    data.mkdir(parents=True)
+    (state / "session.json").write_text(json.dumps({
+        "schema": "capabilities.dev.session.v1", "id": "legacy",
+        "source": {"worktree": str(data / "source")},
+        "consumer": {"worktree": str(data / "consumer")},
+    }) + "\n")
+    listed = json.loads(_run(env, "dev", "list").stdout)
+    legacy = next(row for row in listed["sessions"] if row["id"] == "legacy")
+    assert legacy["legacy"] is True
+    refused = _run(env, "dev", "stop", "legacy", check=False)
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "legacy_dev_session"
+    assert state.is_dir() and data.is_dir()
+
+
+def test_dev_start_refuses_overlapping_detached_worktree(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    detached = tmp_path / "detached-source"
+    _git(source, "worktree", "add", "--detach", str(detached), "main")
+    script = detached / "capabilities" / "deployment" / "bin" / "deployment"
+    script.write_text(script.read_text() + "\n# detached work\n")
+
+    refused = _run(
+        env, "dev", "start", "deployment", "--source", str(source),
+        "--project", str(consumer), "--session", "detached-overlap",
+        "--allow-parallel", check=False,
+    )
+    assert refused.returncode == 6
+    error = _error(refused)
+    assert error["code"] == "dev_overlap"
+    assert "detached-worktree" in error["hint"]
+
+
+def test_dev_start_refuses_unfinished_or_malformed_release_state(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    key = hashlib.sha256(f"{source.resolve()}\0main".encode()).hexdigest()[:20]
+    release_state = (Path(env["XDG_STATE_HOME"]) / "capabilities" /
+                     "releases" / f"{key}.json")
+    release_state.parent.mkdir(parents=True)
+    release_state.write_text("not-json\n")
+
+    refused = _run(
+        env, "dev", "start", "deployment", "--source", str(source),
+        "--project", str(consumer), "--session", "release-overlap",
+        check=False,
+    )
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "release_in_progress"
 
 
 def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path):
@@ -189,10 +281,9 @@ def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path
 
     started = _start(env, source, consumer)
     source_worktree = Path(started["source_worktree"])
-    consumer_worktree = Path(started["consumer_worktree"])
     assert source_worktree != source
-    assert consumer_worktree != consumer
-    assert not (consumer_worktree / ".env").exists()
+    assert started["attached_project"] == str(consumer)
+    assert (consumer / ".env").exists()
     assert _git(source, "rev-parse", "HEAD").stdout.strip() == source_head
     assert _git(consumer, "rev-parse", "HEAD").stdout.strip() == consumer_head
 
@@ -245,8 +336,8 @@ def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path
             probe,
         ).stdout
     )
-    assert inherited["cwd"] == str(consumer_worktree)
-    assert inherited["project_dir"] == str(consumer_worktree)
+    assert inherited["cwd"] == str(source_worktree)
+    assert inherited["project_dir"] is None
     assert inherited["secret"] == "only-when-named"
 
     managed = _run(
@@ -275,7 +366,7 @@ def test_dev_session_isolates_worktrees_environment_and_untracked_files(tmp_path
     stopped = json.loads(_run(env, "dev", "stop", "deployment-test").stdout)
     assert stopped == {"removed": True, "session": "deployment-test"}
     assert not source_worktree.exists()
-    assert not consumer_worktree.exists()
+    assert consumer.is_dir()
     assert not _git(
         source,
         "show-ref",
@@ -339,6 +430,29 @@ def test_dev_install_uses_session_registry_and_refuses_canonical_fallback(tmp_pa
     _run(env, "dev", "stop", "deployment-test")
 
 
+def test_dev_run_executes_only_the_session_payload_against_attached_project(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    connections = consumer / "capabilities" / "deployment" / "connections.json"
+    connections.parent.mkdir(parents=True)
+    connections.write_text(json.dumps({
+        "default": "fixture", "connections": {"fixture": {}}
+    }) + "\n")
+    env = _env(tmp_path)
+    started = _start(env, source, consumer)
+    _run(env, "dev", "install", "deployment-test", "deployment")
+    result = _run(
+        env, "dev", "run", "deployment-test", "deployment",
+        "--project-only", "--", "help")
+    assert "deployment" in result.stdout.lower()
+    diagnostic = json.loads(result.stderr.splitlines()[-1])["dev_run"]
+    assert diagnostic["mode"] == "project"
+    assert diagnostic["attached_project"] == str(consumer)
+    assert diagnostic["selected_connection"] is None
+    assert diagnostic["payload"].startswith(started["isolated"]["registry"])
+    _run(env, "dev", "stop", "deployment-test")
+
+
 def test_dev_stop_preserves_dirty_and_unmerged_work_then_allows_merged_cleanup(
     tmp_path,
 ):
@@ -370,12 +484,10 @@ def test_dev_stop_preserves_dirty_and_unmerged_work_then_allows_merged_cleanup(
     assert (source / "development.txt").read_text() == "uncommitted\n"
 
 
-def test_dev_start_preflights_both_repositories_before_creating_worktrees(tmp_path):
+def test_dev_start_rejects_obsolete_consumer_worktree_flag(tmp_path):
     source = _source_repo(tmp_path)
     consumer = _consumer_repo(tmp_path)
     env = _env(tmp_path)
-    _git(consumer, "branch", "dev/deployment-test-consumer")
-
     refused = _run(
         env,
         "dev",
@@ -390,7 +502,7 @@ def test_dev_start_preflights_both_repositories_before_creating_worktrees(tmp_pa
         check=False,
     )
     assert refused.returncode == 6
-    assert _error(refused)["code"] == "branch_exists"
+    assert _error(refused)["code"] == "obsolete_dev_option"
     assert (
         _git(
             source,
@@ -486,7 +598,7 @@ def test_dev_start_refuses_dirty_integration_checkout(tmp_path):
         env,
         "dev", "start", "askproject",
         "--source", str(source),
-        "--consumer", str(consumer),
+        "--project", str(consumer),
         "--session", "dirty-source",
         check=False,
     )
@@ -502,7 +614,7 @@ def test_dev_finish_releases_commit_syncs_checkout_and_removes_session(tmp_path)
         env,
         "dev", "start", "askproject",
         "--source", str(source),
-        "--consumer", str(consumer),
+        "--project", str(consumer),
         "--session", "finish-release",
     ).stdout)
     worktree = Path(started["source_worktree"])
@@ -533,7 +645,7 @@ def test_dev_finish_refuses_dirty_main_before_publication(tmp_path):
         env,
         "dev", "start", "askproject",
         "--source", str(source),
-        "--consumer", str(consumer),
+        "--project", str(consumer),
         "--session", "blocked-release",
     ).stdout)
     worktree = Path(started["source_worktree"])
@@ -561,7 +673,7 @@ def test_dev_finish_reconciles_changed_installed_capability(tmp_path):
         env,
         "dev", "start", "askproject",
         "--source", str(source),
-        "--consumer", str(consumer),
+        "--project", str(consumer),
         "--session", "payload-release",
     ).stdout)
     worktree = Path(started["source_worktree"])
@@ -603,7 +715,7 @@ def test_dev_finish_removes_deleted_installed_capability_and_resumes(tmp_path):
         env,
         "dev", "start", "askproject",
         "--source", str(source),
-        "--consumer", str(consumer),
+        "--project", str(consumer),
         "--session", "payload-removal",
     ).stdout)
     worktree = Path(started["source_worktree"])
@@ -660,7 +772,7 @@ def test_dev_finish_refuses_remote_race_without_touching_session(tmp_path):
         env,
         "dev", "start", "askproject",
         "--source", str(source),
-        "--consumer", str(consumer),
+        "--project", str(consumer),
         "--session", "remote-race",
     ).stdout)
     worktree = Path(started["source_worktree"])
@@ -690,7 +802,7 @@ def test_dev_finish_resumes_after_remote_integrity_gate(tmp_path):
         env,
         "dev", "start", "askproject",
         "--source", str(source),
-        "--consumer", str(consumer),
+        "--project", str(consumer),
         "--session", "pending-gate",
     ).stdout)
     worktree = Path(started["source_worktree"])
@@ -744,7 +856,7 @@ def test_pending_release_preserves_newer_local_installation(tmp_path):
         env,
         "dev", "start", "askproject",
         "--source", str(source),
-        "--consumer", str(consumer),
+        "--project", str(consumer),
         "--session", "superseded-removal",
     ).stdout)
     worktree = Path(started["source_worktree"])
@@ -810,7 +922,7 @@ def test_pending_release_does_not_reinstall_explicitly_removed_payload(tmp_path)
         env,
         "dev", "start", "askproject",
         "--source", str(source),
-        "--consumer", str(consumer),
+        "--project", str(consumer),
         "--session", "superseded-update",
     ).stdout)
     worktree = Path(started["source_worktree"])

@@ -23,8 +23,8 @@ Agent startup protocol (this is a STATEFUL CLI — it holds a login session):
      reuse it with no prompt.
   3. A healthy `telegram doctor` (exit 0) means ready to work.
 
-Configuration requires explicit account-ID-keyed connections, including the
-one-account case. The selected connection's app credentials and session resolve by the
+Configuration requires explicit connections with a positive
+`expected_account_id`, including the one-account case. The selected connection's app credentials and session resolve by the
 cascade (first non-empty wins): the `--session` flag
 (session path only) > a project .env(.local) > ~/.config/telegram/credentials.env
 > the process environment. Secrets (TELEGRAM_API_HASH, DEEPGRAM_API_KEY) have no
@@ -37,19 +37,19 @@ first found wins. Each entry names its app id literally and its app hash by
 env-key indirection, and owns a per-connection session:
 
   {
-    "default": "8200881535",
+    "default": "marvin",
     "connections": {
-      "8200881535": { "name": "Marvin AI", "username": "marvin_kz",
+      "marvin": { "name": "Marvin AI", "username": "marvin_kz",
+                       "expected_account_id": 8200881535,
                        "api_id": 1234567, "secret_env": "TELEGRAM_API_HASH",
                        "allow_write": true }
     }
   }
 
-The registry key is the Telegram user/account ID, not the API application id.
-Legacy labels may be used only for one discovery login: `telegram login
---connection <label>` reports the actual ID and the required explicit registry
-migration. Doctor, service start, and normal operations refuse legacy labels or
-a session whose actual account differs from the key.
+Every live connection declares the positive Telegram user/account ID in
+`expected_account_id`; it is distinct from the API application `api_id` and
+need not equal the registry label. Discovery login may run before this binding;
+doctor, service and live takeover refuse an absent or mismatched identity.
 
 The write gate: outbound sends and reactions leave the system, so they are off
 unless a connection grants them. Grant them with
@@ -115,12 +115,19 @@ Commands:
   telegram service init [--connection ID] [--force]
                                                Create project-local service settings
                                                and context templates.
+  telegram service migrate-ownership --connection ID
+            --confirm-all-legacy-daemons-stopped
+                                               One-time fail-closed cutover to
+                                               account-global daemon ownership.
   telegram service doctor|run|start|reload|stop|status|logs
                                                Manage the bundled Telegram assistant
                                                service for this project. The engine
                                                runs from the installed capability
                                                bundle; the project stores only
                                                capabilities/telegram/service config.
+                                               Status follows the account-global
+                                               owner record and reports actual code,
+                                               project and state provenance.
 
 Chat references:
   <chat> can be @username, a phone (+1555…), a numeric id, or a chat title
@@ -169,10 +176,13 @@ import argparse
 import asyncio
 import contextlib
 import getpass
+import hashlib
 import io
 import importlib.util
 import json
 import os
+import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -216,11 +226,13 @@ DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/telegram/guides/")
 TOPICS = ["assistant-service", "message-storage"]   # shipped guide topics
 STATE = True       # True when the capability writes session/cache state
+SERVICE_STATE_VERSION = 1
 POST_INSTALL: list = []
 SERVICE = {
     "name": "assistant",
     "summary": "Project-local Telegram assistant daemon using the bundled service engine.",
-    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
+    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs",
+              "migrate-ownership"],
     "config": "capabilities/telegram/service",
     "state": "<connection-state>/service",
     "deploy": {
@@ -1042,7 +1054,8 @@ def _build_cfg(cid: str, entry: dict | None,
                       "message": f"api id for connection {cid!r} must be an integer",
                       "hint": "copy the numeric App api_id from my.telegram.org/apps"}
     try:
-        expected_account_id = int(cid)
+        expected_raw = entry.get("expected_account_id") if isinstance(entry, dict) else None
+        expected_account_id = int(expected_raw)
         if expected_account_id <= 0:
             raise ValueError
     except (TypeError, ValueError):
@@ -1055,10 +1068,10 @@ def _build_cfg(cid: str, entry: dict | None,
 def _require_account_connection(cfg: dict, *, allow_discovery: bool = False) -> None:
     if cfg.get("expected_account_id") is not None or allow_discovery:
         return
-    _die(6, "legacy_connection_id",
-         f"Telegram connection {cfg['id']!r} is a legacy label, not an account ID",
+    _die(6, "expected_account_required",
+         f"Telegram connection {cfg['id']!r} has no positive expected_account_id",
          f"run `telegram login --connection {cfg['id']}` to discover the account ID, "
-         "then rename the connections.json key/default and restart the service")
+         "then bind expected_account_id in connections.json")
 
 
 def _load_config(wanted: str | None, session_flag: str | None,
@@ -1201,7 +1214,7 @@ async def _require_auth(client: TelegramClient) -> None:
         await client.disconnect()
         _die(2, "account_identity_mismatch",
              f"Telegram session account mismatch: expected {expected}, got {me.id}",
-             "use the session owned by the configured account or correct the registry key")
+             "use the session owned by the configured account or correct expected_account_id")
 
 
 def _parse_since(since: str | None) -> datetime | None:
@@ -1243,7 +1256,7 @@ async def _check_connection(cfg: dict) -> dict:
                 "expected_account_id": expected,
                 "actual_account_id": int(me.id),
                 "actual_account": entity_label(me),
-                "hint": "use the session owned by the configured account or correct the registry key",
+                "hint": "use the session owned by the configured account or correct expected_account_id",
             }
         return {"ok": True, "reachable": True,
                 "account": entity_label(me), "id": me.id,
@@ -1288,9 +1301,9 @@ def cmd_doctor(wanted: str | None) -> None:
                 res = {
                     "ok": False,
                     "category": 6,
-                    "error": f"legacy connection label {cid!r} is not a Telegram account ID",
+                    "error": f"connection {cid!r} has no positive expected_account_id",
                     "hint": (f"run `telegram login --connection {cid}` to discover the account ID, "
-                             "then rename the registry key/default"),
+                             "then bind expected_account_id"),
                 }
             else:
                 res = asyncio.run(_check_connection(cfg))
@@ -1307,16 +1320,16 @@ def _login_result(cfg: dict, me, **extra) -> dict:
     out = {"ok": True, "connection": cfg["id"],
            "logged_in_as": entity_label(me), "id": me.id, **extra}
     if cfg.get("expected_account_id") is None:
-        out["migration"] = {
-            "from": cfg["id"],
-            "to": str(me.id),
-            "instruction": ("rename this connections.json key to the discovered account ID "
-                            "and update default; name/username remain display metadata"),
+        out["identity_binding"] = {
+            "connection": cfg["id"],
+            "expected_account_id": int(me.id),
+            "instruction": ("set expected_account_id on this connection; "
+                            "name/username remain display metadata"),
         }
     elif int(me.id) != cfg["expected_account_id"]:
         _die(2, "account_identity_mismatch",
              f"Telegram session account mismatch: expected {cfg['expected_account_id']}, got {me.id}",
-             "use the session owned by the configured account or correct the registry key")
+             "use the session owned by the configured account or correct expected_account_id")
     return out
 
 
@@ -2178,7 +2191,8 @@ def _manifest_payload() -> dict:
     payload = {"name": NAME, "summary": SUMMARY,
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
                "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
-               "state": STATE, "post_install": POST_INSTALL}
+               "state": STATE, "post_install": POST_INSTALL,
+               "service_state_version": SERVICE_STATE_VERSION}
     if SERVICE:
         payload["service"] = SERVICE
     return payload
@@ -2425,6 +2439,140 @@ def _service_state_dir(root: Path, connection_flag: str | None,
     }
 
 
+def _atomic_json(path: Path, value: dict) -> None:
+    """Write user-only service control/state JSON by atomic replacement."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2,
+                                    sort_keys=True) + "\n")
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def _service_account_id(cfg: dict) -> int:
+    """Require the positive account binding used by every live service path."""
+    value = cfg.get("expected_account_id")
+    if not isinstance(value, int) or value <= 0:
+        _die(6, "expected_account_required",
+             f"connection {cfg.get('id')!r} has no positive expected_account_id",
+             "bind the account identity in connections.json before service or live mode")
+    return value
+
+
+def _service_control_paths(account_id: int) -> dict[str, Path]:
+    """Return the non-overrideable account-global ownership control paths."""
+    control = _STATE_HOME / "telegram" / str(account_id) / "control"
+    return {
+        "control": control,
+        "daemon_lock": control / "daemon.lock",
+        "transition_lock": control / "transition.lock",
+        "owner": control / "owner.json",
+        "takeover": control / "takeover.json",
+        "ownership": control / "ownership-v1.json",
+    }
+
+
+def _service_state_schema(path: Path, *, adopt: bool) -> int:
+    """Read exact runtime-state version; marker-less legacy state is version 1."""
+    marker = path / "state-schema.json"
+    raw = _json_file(marker)
+    if raw is None and not marker.exists():
+        if adopt:
+            _atomic_json(marker, {
+                "schema": "telegram.service-state.v1", "version": 1,
+                "adopted_at": datetime.now(timezone.utc).isoformat(),
+            })
+        return 1
+    if (not isinstance(raw, dict)
+            or raw.get("schema") != "telegram.service-state.v1"
+            or not isinstance(raw.get("version"), int)
+            or raw["version"] <= 0):
+        _die(6, "service_state_schema_invalid", f"invalid state schema marker: {marker}")
+    return raw["version"]
+
+
+def _require_ownership_marker(account_id: int) -> dict:
+    """Require the explicit one-time cutover before hardened ownership starts."""
+    paths = _service_control_paths(account_id)
+    raw = _json_file(paths["ownership"])
+    if (not isinstance(raw, dict)
+            or raw.get("schema") != "telegram.ownership.v1"
+            or raw.get("account_id") != account_id
+            or raw.get("protocol_version") != 1):
+        _die(6, "ownership_migration_required",
+             f"account {account_id} has not completed ownership-v1 cutover",
+             "run `telegram service migrate-ownership --connection ID "
+             "--confirm-all-legacy-daemons-stopped`")
+    return raw
+
+
+def _telegram_daemon_processes() -> list[dict]:
+    """Enumerate current-user Telegram daemon processes for ownership cutover."""
+    proc = subprocess.run(["ps", "-axo", "uid=,pid=,command="],
+                          capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        _die(6, "process_scan_failed", "cannot enumerate Telegram daemon processes",
+             proc.stderr.strip() or None)
+    found = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            uid, pid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        command = parts[2]
+        if uid == os.getuid() and pid != os.getpid() and "telegram/service/daemon.py" in command:
+            found.append({"pid": pid, "command": command})
+    return found
+
+
+def cmd_service_migrate_ownership(connection_flag: str | None,
+                                  confirmed: bool) -> dict:
+    """Create ownership-v1 after explicit confirmation and two clean scans."""
+    if not confirmed:
+        _die(6, "confirmation_required",
+             "ownership migration requires --confirm-all-legacy-daemons-stopped")
+    root = _service_project_root()
+    wanted = _service_wanted_connection(root, connection_flag)
+    cfg = _load_config(wanted, None)
+    account_id = _service_account_id(cfg)
+    global_lock_path = _STATE_HOME / "telegram" / "ownership-migration.lock"
+    global_lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    global_lock = global_lock_path.open("a+")
+    global_lock_path.chmod(0o600)
+    import fcntl
+    fcntl.flock(global_lock, fcntl.LOCK_EX)
+    processes = _telegram_daemon_processes()
+    if processes:
+        _die(6, "legacy_daemon_running", "a Telegram service daemon is still running",
+             json.dumps(processes, sort_keys=True))
+    paths = _service_control_paths(account_id)
+    paths["control"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    with paths["transition_lock"].open("a+") as lock:
+        paths["transition_lock"].chmod(0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        processes = _telegram_daemon_processes()
+        if processes:
+            _die(6, "legacy_daemon_running",
+                 "a Telegram service daemon appeared during migration",
+                 json.dumps(processes, sort_keys=True))
+        marker = {
+            "schema": "telegram.ownership.v1", "protocol_version": 1,
+            "account_id": account_id, "connection": cfg["id"],
+            "payload": str(Path(__file__).resolve()),
+            "payload_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "manager": str(Path(shutil.which("capabilities") or "capabilities").expanduser()),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _atomic_json(paths["ownership"], marker)
+    global_lock.close()
+    return {"migrated": True, "account_id": account_id,
+            "marker": str(paths["ownership"])}
+
+
 def _read_pid(path: Path) -> int | None:
     try:
         return int(path.read_text().strip())
@@ -2482,6 +2630,7 @@ def _service_runtime_health(path: Path, running: bool) -> dict:
 
 
 def cmd_service_status(connection_flag: str | None, session_flag: str | None) -> dict:
+    """Report the actual account-global owner and its recorded health paths."""
     root = _service_project_root()
     envelope = _project_capabilities_dir(root).resolve()
     initialized = _service_settings_path(root).exists() and _service_context_path(root).exists()
@@ -2489,13 +2638,44 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
     pid = _read_pid(paths["pid"])
     running = _pid_alive(pid)
     health = _service_runtime_health(paths["health"], running)
+    reg, _ = _connections_registry()
+    _selected, entry = _select_connection(reg, cid)
+    try:
+        account_id = int((entry or {}).get("expected_account_id"))
+        if account_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        account_id = None
+    control = _service_control_paths(account_id) if account_id else None
+    owner = _json_file(control["owner"]) if control else None
+    actual_health = health
+    owner_running = running
+    if isinstance(owner, dict):
+        owner_pid = owner.get("pid")
+        owner_running = _pid_alive(owner_pid if isinstance(owner_pid, int) else None)
+        owner_health_path = Path(str(owner.get("health_file") or ""))
+        if owner_health_path.is_file():
+            actual_health = _service_runtime_health(owner_health_path, owner_running)
+    expectation_mismatches = []
+    if isinstance(owner, dict):
+        if owner.get("project_root") != str(root):
+            expectation_mismatches.append("project")
+        if owner.get("connection") != cid:
+            expectation_mismatches.append("connection")
+        if owner.get("service_state_path") != str(paths["state"]):
+            expectation_mismatches.append("service_state")
     return {
         "initialized": initialized,
-        "running": running,
-        "healthy": health["healthy"],
-        "pid": pid if running else None,
+        "running": owner_running,
+        "healthy": actual_health["healthy"],
+        "pid": owner.get("pid") if isinstance(owner, dict) and owner_running else (
+            pid if running else None),
         "stale_pid": bool(pid and not running),
-        "health": health,
+        "health": actual_health,
+        "expected_account_id": account_id,
+        "owner": owner,
+        "expectation_mismatches": expectation_mismatches,
+        "control_dir": str(control["control"]) if control else None,
         "connection": cid,
         "project": str(root),
         "project_envelope": str(envelope),
@@ -2525,7 +2705,9 @@ def _require_service_initialized(root: Path) -> None:
              + ", ".join(missing))
 
 
-def _service_env(root: Path, connection_id: str) -> dict:
+def _service_env(root: Path, cfg: dict, paths: dict[str, Path],
+                 *, launch_nonce: str | None = None) -> dict:
+    """Build complete launch provenance, including non-overrideable ownership."""
     env = dict(os.environ)
     envelope = _project_capabilities_dir(root).resolve()
     layout = _resolve_project_layout(root)
@@ -2535,7 +2717,17 @@ def _service_env(root: Path, connection_id: str) -> dict:
     env["TELEGRAM_SERVICE_SETTINGS"] = str(_service_settings_path(root))
     env["TELEGRAM_SERVICE_CONTEXT"] = str(_service_context_path(root))
     env["TELEGRAM_SERVICE_VOICE_CONTEXT"] = str(_service_voice_context_path(root))
-    env["TELEGRAM_SERVICE_CONNECTION"] = connection_id
+    account_id = _service_account_id(cfg)
+    control = _service_control_paths(account_id)
+    env["TELEGRAM_SERVICE_CONNECTION"] = cfg["id"]
+    env["TELEGRAM_EXPECTED_ACCOUNT_ID"] = str(account_id)
+    env["TELEGRAM_ACCOUNT_CONTROL_DIR"] = str(control["control"])
+    env["TELEGRAM_SERVICE_STATE_PATH"] = str(paths["state"])
+    env["TELEGRAM_SERVICE_HEALTH_FILE"] = str(paths["health"])
+    env["TELEGRAM_SERVICE_LAUNCH_NONCE"] = launch_nonce or secrets.token_hex(24)
+    env["TELEGRAM_SERVICE_MODE"] = os.environ.get("CAPABILITIES_DEV_SESSION") and "development" or "canonical"
+    if os.environ.get("CAPABILITIES_DEV_SESSION"):
+        env["TELEGRAM_SERVICE_DEV_SESSION"] = os.environ["CAPABILITIES_DEV_SESSION"]
     env["TELEGRAM_SERVICE_PROJECT_LAYOUT"] = json.dumps(
         layout, ensure_ascii=False, sort_keys=True)
     env["TELEGRAM_REAL_TELEGRAM"] = str(Path(__file__).resolve())
@@ -2543,6 +2735,8 @@ def _service_env(root: Path, connection_id: str) -> dict:
 
 
 def _service_start_result(connection_flag: str | None, session_flag: str | None) -> dict:
+    """Start only after cutover/version checks and wait for matching provenance."""
+    import signal
     import subprocess
     import time
 
@@ -2551,9 +2745,20 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
     _validate_service_settings(root)
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
+    account_id = _service_account_id(cfg)
+    control = _service_control_paths(account_id)
+    _require_ownership_marker(account_id)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
     status = cmd_service_status(cfg["id"], session_flag)
     if status["running"]:
+        if not isinstance(status.get("owner"), dict):
+            _die(6, "legacy_daemon_running",
+                 "a running Telegram daemon has no account-global provenance",
+                 "stop it with its current CLI before hardened restart")
+        if status.get("expectation_mismatches"):
+            _die(6, "service_owned_elsewhere",
+                 f"account {account_id} is owned by different service inputs",
+                 json.dumps(status["owner"], sort_keys=True))
         status["already_running"] = True
         return status
     daemon = _service_daemon()
@@ -2561,35 +2766,102 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
         _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",
              "reinstall/update telegram from a bundled source directory")
     cid, paths = _service_state_dir(root, cfg["id"], session_flag)
+    disk_version = _service_state_schema(paths["state"], adopt=True)
+    if disk_version != SERVICE_STATE_VERSION:
+        _die(6, "service_state_version_mismatch",
+             f"state version {disk_version} != payload version {SERVICE_STATE_VERSION}")
+    lease = _json_file(control["takeover"])
+    dev_session = os.environ.get("CAPABILITIES_DEV_SESSION")
+    matching_dev_start = (isinstance(lease, dict)
+                          and lease.get("session_id") == dev_session
+                          and lease.get("state") == "dev_starting")
+    matching_restore = (isinstance(lease, dict) and not dev_session
+                        and lease.get("state") == "canonical_restarting")
+    if (isinstance(lease, dict) and lease.get("state") != "restored"
+            and not matching_dev_start and not matching_restore):
+        _die(6, "takeover_active",
+             f"account {account_id} has an active development takeover",
+             str(control["takeover"]))
     paths["state"].mkdir(parents=True, exist_ok=True)
     _write_project_layout(paths["state"] / "project-layout.json",
                           _resolve_project_layout(root))
+    launch_nonce = secrets.token_hex(24)
     with paths["log"].open("a", encoding="utf-8") as log:
         proc = subprocess.Popen(
-            [str(daemon)], cwd=str(root), env=_service_env(root, cid),
+            [str(daemon)], cwd=str(root),
+            env=_service_env(root, cfg, paths, launch_nonce=launch_nonce),
             stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
     paths["pid"].write_text(f"{proc.pid}\n")
-    time.sleep(0.4)
-    if proc.poll() is not None:
+    deadline = time.time() + 15
+    out = None
+    while time.time() < deadline and proc.poll() is None:
+        candidate = cmd_service_status(cid, session_flag)
+        owner = candidate.get("owner")
+        if (isinstance(owner, dict)
+                and owner.get("launch_nonce") == launch_nonce
+                and owner.get("pid") == proc.pid):
+            out = candidate
+            break
+        time.sleep(0.2)
+    if proc.poll() is not None or out is None:
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGTERM)
         paths["pid"].unlink(missing_ok=True)
         tail = []
         if paths["log"].exists():
             tail = paths["log"].read_text(errors="replace").splitlines()[-20:]
-        _die(5, "service_start_failed", f"telegram service exited with {proc.returncode}",
+        _die(5, "service_start_failed",
+             (f"telegram service exited with {proc.returncode}"
+              if proc.poll() is not None else
+              "telegram service did not publish ownership provenance"),
              "\n".join(tail[-8:]) or "check credentials, service settings, and log file")
-    out = cmd_service_status(cid, session_flag)
     out["started"] = True
     return out
 
 
 def _service_stop_result(connection_flag: str | None, session_flag: str | None,
                          timeout: float, force: bool) -> dict:
+    """Signal only a proven owner and require its graceful stop acknowledgement."""
     import signal
     import time
 
     root = _service_project_root()
     cid, paths = _service_state_dir(root, connection_flag, session_flag)
-    pid = _read_pid(paths["pid"])
+    reg, _ = _connections_registry()
+    _selected, entry = _select_connection(reg, cid)
+    try:
+        account_id = int((entry or {}).get("expected_account_id"))
+    except (TypeError, ValueError):
+        _die(6, "expected_account_required",
+             f"connection {cid!r} has no positive expected_account_id")
+    control = _service_control_paths(account_id)
+    owner = _json_file(control["owner"])
+    expected_stop_health = None
+    if isinstance(owner, dict):
+        if owner.get("project_root") != str(root) or owner.get("connection") != cid:
+            _die(6, "service_owned_elsewhere",
+                 f"account {account_id} is owned by another project or connection",
+                 json.dumps(owner, sort_keys=True))
+        health_path = Path(str(owner.get("health_file") or ""))
+        health = _json_file(health_path)
+        if (not isinstance(health, dict)
+                or health.get("launch_nonce") != owner.get("launch_nonce")
+                or health.get("pid") != owner.get("pid")):
+            _die(6, "service_provenance_mismatch",
+                 "owner and health provenance do not match; refusing to signal a PID")
+        pid = owner.get("pid") if isinstance(owner.get("pid"), int) else None
+        expected_stop_health = {
+            "path": health_path,
+            "launch_nonce": owner.get("launch_nonce"),
+            "pid": owner.get("pid"),
+        }
+    else:
+        pid = _read_pid(paths["pid"])
+        if _pid_alive(pid):
+            _die(6, "legacy_daemon_running",
+                 "PID file names a live daemon without account-global provenance",
+                 "stop it with the bundle that launched it; this CLI will not signal an unproven PID")
     if not _pid_alive(pid):
         if paths["pid"].exists():
             paths["pid"].unlink(missing_ok=True)
@@ -2611,6 +2883,20 @@ def _service_stop_result(connection_flag: str | None, session_flag: str | None,
     while time.time() < deadline:
         if not _pid_alive(pid):
             paths["pid"].unlink(missing_ok=True)
+            if isinstance(owner, dict) and control["owner"].exists():
+                _die(5, "service_stop_unacknowledged",
+                     "daemon exited without removing its matching owner record",
+                     str(control["owner"]))
+            if expected_stop_health is not None:
+                stopped_health = _json_file(expected_stop_health["path"])
+                if (not isinstance(stopped_health, dict)
+                        or stopped_health.get("state") != "stopped"
+                        or stopped_health.get("launch_nonce") !=
+                            expected_stop_health["launch_nonce"]
+                        or stopped_health.get("pid") != expected_stop_health["pid"]):
+                    _die(5, "service_stop_unacknowledged",
+                         "daemon exited without publishing matching stopped health",
+                         str(expected_stop_health["path"]))
             return {"stopped": True, "running": False, "connection": cid,
                     "pid": pid, "pid_file": str(paths["pid"])}
         time.sleep(0.2)
@@ -2717,12 +3003,19 @@ def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> No
     _validate_service_settings(root)
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
+    account_id = _service_account_id(cfg)
+    _require_ownership_marker(account_id)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
     daemon = _service_daemon()
     if not daemon.is_file():
         _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",
              "reinstall/update telegram from a bundled source directory")
-    os.execvpe(str(daemon), [str(daemon)], _service_env(root, cfg["id"]))
+    _cid, paths = _service_state_dir(root, cfg["id"], session_flag)
+    disk_version = _service_state_schema(paths["state"], adopt=True)
+    if disk_version != SERVICE_STATE_VERSION:
+        _die(6, "service_state_version_mismatch",
+             f"state version {disk_version} != payload version {SERVICE_STATE_VERSION}")
+    os.execvpe(str(daemon), [str(daemon)], _service_env(root, cfg, paths))
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -2833,6 +3126,11 @@ def main() -> None:
     logs.add_argument("--tail", type=int, default=80)
     svc.add_parser("doctor", help="local service readiness check")
     svc.add_parser("run", help="run the assistant service in the foreground")
+    migrate = svc.add_parser(
+        "migrate-ownership",
+        help="one-time cutover to account-global daemon ownership")
+    migrate.add_argument("--confirm-all-legacy-daemons-stopped",
+                         action="store_true")
 
     # `--connection <id>` selects a connection; `--session <PATH>` overrides the
     # session-file path. Both are global, accepted anywhere on the line (extracted
@@ -2886,6 +3184,9 @@ def main() -> None:
             _emit(cmd_service_doctor(connection_flag, session_flag))
         elif args.service_cmd == "run":
             cmd_service_run(connection_flag, session_flag)
+        elif args.service_cmd == "migrate-ownership":
+            _emit(cmd_service_migrate_ownership(
+                connection_flag, args.confirm_all_legacy_daemons_stopped))
         return
 
     cfg = _load_config(

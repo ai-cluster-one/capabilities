@@ -417,6 +417,35 @@ def successful_result(reply="done"):
 
 
 class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_register_replace_failure_keeps_previous_complete_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            original = {"test": {"last_processed_message_id": 7}}
+            daemon.save_register(original)
+            with mock.patch.object(daemon.os, "replace", side_effect=OSError("power loss")):
+                with self.assertRaisesRegex(OSError, "power loss"):
+                    daemon.save_register({"test": {"last_processed_message_id": 8}})
+            self.assertEqual(daemon.load_register(), original)
+
+    async def test_hardened_state_adopts_only_version_one_and_requires_cutover(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(),
+                connection_extra={"expected_account_id": 123456})
+            daemon.LAUNCH_NONCE = "test-launch-nonce"
+            daemon._atomic_json(daemon.OWNERSHIP_FILE, {
+                "schema": "telegram.ownership.v1",
+                "protocol_version": 1,
+                "account_id": daemon.EXPECTED_ACCOUNT_ID,
+            })
+            daemon._require_hardened_state()
+            marker = json.loads(daemon.STATE_SCHEMA_FILE.read_text())
+            self.assertEqual(marker["version"], 1)
+            marker["version"] = 2
+            daemon._atomic_json(daemon.STATE_SCHEMA_FILE, marker)
+            with self.assertRaisesRegex(SystemExit, "version mismatch"):
+                daemon._require_hardened_state()
+
     async def stop_session(self, client, task):
         client.disconnected.set()
         await asyncio.wait_for(task, timeout=5)

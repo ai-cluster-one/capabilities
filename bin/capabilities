@@ -93,6 +93,9 @@ MACHINE VERBS
   source clone ID GIT_URL [--ref REF]
         Clone an existing source into the canonical editable workspace and
         register it for authoring on this machine.
+  source register-checkout official
+        Register this exact primary official checkout for consumer-originated
+        development. Must be invoked as ./bin/capabilities from that checkout.
   source list | path ID | refresh [ID] | sync ID | check ID | remove ID
         Inspect sources, resolve the one editable path, refresh remote caches,
         verify every capability and generated catalogue, or unregister a source.
@@ -110,19 +113,28 @@ MACHINE VERBS
         installed changed payloads, and update the manager when it changed.
 
 DEVELOPMENT VERBS
-  dev start <name> --source PATH [--consumer PATH | --consumer-live PATH]
-            [--ref REF] [--consumer-ref REF] [--session ID]
-        Create a persistent development session: an isolated source worktree,
-        optional isolated consumer worktree, registry, PATH bin, HOME, config,
-        state, data, cache, and logs. No daemon is started and the canonical
-        registry/PATH are not changed.
+  dev start <name> [--project PATH | --no-project] [--source ID-OR-PATH]
+            [--session ID] [--allow-parallel]
+        Create one isolated source worktree and attach the existing consumer
+        checkout when run from it. The project is recorded but never owned,
+        branched, cleaned or removed by the manager.
   dev install <session> <name> [<name> ...]
         Audit and install capabilities from the session source worktree into
         its isolated registry. Re-run after source edits to refresh payloads.
-  dev exec <session> [--cwd source|consumer] [--inherit-env KEY ...] -- <command>
+  dev exec <session> [--cwd source] [--inherit-env KEY ...] -- <command>
         Execute one foreground command inside the session environment. Output
         and exit status are passed through. Parent env is denied by default;
         named keys may be inherited without putting values on argv.
+  dev run <session> <capability> [--project-only] -- [<arg> ...]
+        Run exactly one session-installed capability against the attached live
+        project through a mode-0700, per-invocation selected-input projection.
+  dev check <session>
+        Derive validation scope from the recorded base across committed,
+        staged, unstaged and untracked changes without editing source or index.
+  dev live start|status|stop <session> telegram
+  dev live recover <session> telegram --restore-canonical
+        Borrow one account's real Telegram state under a durable exclusive
+        lease; recovery is explicit and always targets the recorded canonical state.
   dev doctor <session> | dev list
         Inspect provenance, worktrees, isolation paths, installed payloads, and
         cleanup readiness. Source dirtiness is visible development state, not
@@ -132,9 +144,9 @@ DEVELOPMENT VERBS
         patch-equivalent to commits on its recorded base ref. Dirty or
         unpublished worktrees are preserved and refused.
   dev finish <session>
-        Require a clean prepared commit and clean consumer worktree, release it
-        through the source-level transaction, then remove the session. All
-        publication logic remains owned by `source release`.
+        Require a clean prepared commit, release it through the existing
+        source transaction, then remove only manager-owned session paths. The
+        attached project is never cleaned, committed, published or removed.
   dev gc [--older-than 7d]
         Apply the same safe cleanup rule to old sessions; unsafe sessions are
         reported and retained.
@@ -229,10 +241,12 @@ I/O CONTRACT
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import io
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -241,6 +255,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NoReturn
 
@@ -260,13 +275,17 @@ SOURCE_CACHE_ROOT = _CACHE_HOME / "capabilities" / "sources"
 OFFICIAL_SOURCE_ID = "official"
 OFFICIAL_GIT_URL = "https://github.com/ai-cluster-one/capabilities.git"
 RESERVED_CAPABILITY_NAMES = {"sources"}
-DEV_SESSION_SCHEMA = "capabilities.dev.session.v1"
+DEV_SESSION_SCHEMA = "capabilities.dev.session.v2"
+LEGACY_DEV_SESSION_SCHEMA = "capabilities.dev.session.v1"
 DEV_STATE_ROOT = _STATE_HOME / "capabilities" / "dev"
 DEV_DATA_ROOT = _DATA_HOME / "capabilities" / "dev"
+MANAGER_MUTATION_LOCK = _STATE_HOME / "capabilities" / "manager-mutation.lock"
+_MANAGER_MUTATION_DEPTH = 0
 DEV_MANAGED_ENV_KEYS = {
     "HOME", "PATH", "CAPABILITIES_HOME", "CAPABILITIES_BIN",
     "CAPABILITIES_DEV_SESSION", "CAPABILITIES_DEV_SOURCE",
-    "CAPABILITIES_DEV_CONSUMER", "CLAUDE_PROJECT_DIR", "UV_CACHE_DIR",
+    "CAPABILITIES_DEV_SOURCE_ID",
+    "CAPABILITIES_DEV_PROJECT", "CLAUDE_PROJECT_DIR", "UV_CACHE_DIR",
     "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
 }
 
@@ -504,6 +523,57 @@ def _write_json(path: Path, value) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     tmp.replace(path)
+
+
+def _active_takeover_leases() -> list[dict]:
+    """Scan account-global control roots for nonterminal durable takeovers."""
+    root = _STATE_HOME / "telegram"
+    leases = []
+    if not root.is_dir():
+        return leases
+    for path in sorted(root.glob("*/control/takeover.json")):
+        raw = _read_json(path)
+        if not isinstance(raw, dict):
+            leases.append({"path": str(path), "damaged": True})
+        elif raw.get("state") != "restored":
+            leases.append({**raw, "path": str(path)})
+    return leases
+
+
+def _assert_payload_mutable(name: str, session_id: str | None = None) -> None:
+    """Freeze payload bytes referenced by any nonterminal takeover lease."""
+    blockers = [lease for lease in _active_takeover_leases()
+                if (lease.get("damaged") or lease.get("capability") == name)
+                and (lease.get("damaged") or session_id is None
+                     or lease.get("session_id") == session_id)]
+    if blockers:
+        _die(6, "takeover_payload_frozen",
+             f"{name} payload is frozen by an active live takeover",
+             json.dumps(blockers, sort_keys=True))
+
+
+def _assert_session_without_takeover(session_id: str) -> None:
+    """Retain session work while any matching durable lease is nonterminal."""
+    blockers = [lease for lease in _active_takeover_leases()
+                if lease.get("damaged") or lease.get("session_id") == session_id]
+    if blockers:
+        _die(6, "takeover_active", f"dev session {session_id} has an active live takeover",
+             json.dumps(blockers, sort_keys=True))
+
+
+@contextmanager
+def _manager_mutation_guard():
+    """Serialize manager writers and refuse cross-version lease mutation."""
+    MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with MANAGER_MUTATION_LOCK.open("a+") as handle:
+        MANAGER_MUTATION_LOCK.chmod(0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        leases = _active_takeover_leases()
+        if leases:
+            _die(6, "takeover_manager_frozen",
+                 "manager mutation is blocked while a live takeover is active",
+                 json.dumps(leases, sort_keys=True))
+        yield
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -905,6 +975,10 @@ def _validate_manifest(name: str, manifest) -> list[str]:
             if not isinstance(step, dict) or "cmd" not in step:
                 problems.append(f"post_install entry malformed: {step!r}")
     service = manifest.get("service")
+    if name == "telegram":
+        state_version = manifest.get("service_state_version")
+        if not isinstance(state_version, int) or state_version <= 0:
+            problems.append("service_state_version must be a positive integer")
     if service is not None:
         if not isinstance(service, dict):
             problems.append("service is not an object")
@@ -1131,20 +1205,29 @@ def _prepare_payload(name: str, content: bytes, bundle_dir: Path | None,
 
 def _activate_payload(name: str, stage: Path) -> Path:
     """Atomically replace one registry entry, restoring the old copy on error."""
-    reg = _registry_dir(name)
-    backup = CAP_HOME / f".{name}-previous"
-    if backup.exists():
-        shutil.rmtree(backup)
-    if reg.exists():
-        reg.rename(backup)
-    try:
-        stage.rename(reg)
-    except BaseException:
-        if backup.exists() and not reg.exists():
-            backup.rename(reg)
-        raise
-    shutil.rmtree(backup, ignore_errors=True)
-    return reg / name
+    def activate() -> Path:
+        _assert_payload_mutable(name, os.environ.get("CAPABILITIES_DEV_SESSION"))
+        reg = _registry_dir(name)
+        backup = CAP_HOME / f".{name}-previous"
+        if backup.exists():
+            shutil.rmtree(backup)
+        if reg.exists():
+            reg.rename(backup)
+        try:
+            stage.rename(reg)
+        except BaseException:
+            if backup.exists() and not reg.exists():
+                backup.rename(reg)
+            raise
+        shutil.rmtree(backup, ignore_errors=True)
+        return reg / name
+    if _MANAGER_MUTATION_DEPTH:
+        return activate()
+    MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with MANAGER_MUTATION_LOCK.open("a+") as mutation:
+        MANAGER_MUTATION_LOCK.chmod(0o600)
+        fcntl.flock(mutation, fcntl.LOCK_EX)
+        return activate()
 
 
 def _payload_sha256(reg: Path) -> str:
@@ -1216,6 +1299,7 @@ def _scaffold_credentials(name: str, manifest: dict) -> list[str]:
 def cmd_install(name: str, from_ref: str | None, source_id: str | None,
                 yes: bool) -> None:
     _reject_reserved_capability_name(name)
+    _assert_payload_mutable(name)
     provenance = {}
     if source_id:
         if from_ref:
@@ -1260,15 +1344,20 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
 
 def cmd_uninstall(name: str, purge_credentials: bool) -> None:
     _reject_reserved_capability_name(name)
+    _assert_payload_mutable(name)
     reg = _registry_dir(name)
     if not reg.is_dir():
         _die(3, "not_found", f"{name} is not installed")
-    link = _bin_dir() / name
-    removed_link = False
-    if link.is_symlink():
-        link.unlink()
-        removed_link = True
-    shutil.rmtree(reg)
+    MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with MANAGER_MUTATION_LOCK.open("a+") as mutation:
+        fcntl.flock(mutation, fcntl.LOCK_EX)
+        _assert_payload_mutable(name)
+        link = _bin_dir() / name
+        removed_link = False
+        if link.is_symlink():
+            link.unlink()
+            removed_link = True
+        shutil.rmtree(reg)
     _regen_skills()
     result = {"uninstalled": name, "symlink_removed": removed_link}
     cred_file = _CONFIG_HOME / name / "credentials.env"
@@ -1289,6 +1378,7 @@ def cmd_update(name: str | None) -> None:
         _die(3, "not_found", f"{name} is not installed")
     results = []
     for n in targets:
+        _assert_payload_mutable(n)
         meta = _read_json(_registry_dir(n) / "meta.json") or {}
         source_id = meta.get("source_id")
         provenance = {}
@@ -1353,26 +1443,39 @@ def cmd_self_update() -> None:
     discoverable verb rather than a remembered curl one-liner. Idempotent:
     a no-op (with "already current") when the installed bytes match canonical.
     """
-    url = f"{SOURCE}/bin/capabilities"
-    try:
-        resp = httpx.get(url, follow_redirects=True, timeout=30.0)
-    except httpx.HTTPError as e:
-        _die(5, "network_error", f"fetch failed: {e}", url)
-    if resp.status_code != 200:
-        _die(5, "server_error", f"fetch returned {resp.status_code}", url)
-    content = resp.content
-    assets: dict[str, bytes] = {}
-    for rel in _AUTHORING_ASSETS:
-        asset_url = f"{SOURCE}/{rel}"
+    with _manager_mutation_guard():
+        checkout_result = None
+        checkout = _marked_checkout(Path.cwd())
+        if (checkout is not None and checkout == _REPO_ROOT.resolve()
+                and _source_id_for_repo(checkout) == OFFICIAL_SOURCE_ID):
+            identity = _git_checkout_identity(checkout)
+            common = Path(identity["git_common_dir"])
+            if common.parent.resolve() == checkout:
+                checkout_result = cmd_source_register_checkout(
+                    OFFICIAL_SOURCE_ID, emit_result=False)
+        url = f"{SOURCE}/bin/capabilities"
         try:
-            asset_resp = httpx.get(asset_url, follow_redirects=True, timeout=30.0)
+            resp = httpx.get(url, follow_redirects=True, timeout=30.0)
         except httpx.HTTPError as e:
-            _die(5, "network_error", f"authoring asset fetch failed: {e}", asset_url)
-        if asset_resp.status_code != 200:
-            _die(5, "server_error",
-                 f"authoring asset fetch returned {asset_resp.status_code}", asset_url)
-        assets[rel] = asset_resp.content
-    _emit(_activate_manager_release(content, assets, url))
+            _die(5, "network_error", f"fetch failed: {e}", url)
+        if resp.status_code != 200:
+            _die(5, "server_error", f"fetch returned {resp.status_code}", url)
+        content = resp.content
+        assets: dict[str, bytes] = {}
+        for rel in _AUTHORING_ASSETS:
+            asset_url = f"{SOURCE}/{rel}"
+            try:
+                asset_resp = httpx.get(asset_url, follow_redirects=True, timeout=30.0)
+            except httpx.HTTPError as e:
+                _die(5, "network_error", f"authoring asset fetch failed: {e}", asset_url)
+            if asset_resp.status_code != 200:
+                _die(5, "server_error",
+                     f"authoring asset fetch returned {asset_resp.status_code}", asset_url)
+            assets[rel] = asset_resp.content
+        result = _activate_manager_release(content, assets, url)
+        if checkout_result is not None:
+            result["official_checkout"] = checkout_result
+        _emit(result)
 
 
 def cmd_list() -> None:
@@ -1473,6 +1576,10 @@ def _dev_data_dir(session_id: str) -> Path:
 def _dev_session(session_id: str) -> dict:
     path = _dev_state_dir(session_id) / "session.json"
     data = _read_json(path)
+    if isinstance(data, dict) and data.get("schema") == LEGACY_DEV_SESSION_SCHEMA:
+        _die(6, "legacy_dev_session",
+             f"dev session {session_id} uses unsupported schema v1",
+             f"preserved state={path.parent}; data={_dev_data_dir(session_id)}")
     if not isinstance(data, dict) or data.get("schema") != DEV_SESSION_SCHEMA:
         _die(3, "dev_session_not_found", f"unknown dev session: {session_id}",
              "run `capabilities dev list`")
@@ -1515,16 +1622,239 @@ def _dev_rollback_worktree(repo: Path, target: Path, branch: str) -> None:
         pass
 
 
-def cmd_dev_start(name: str, source_ref: str, consumer_ref: str | None,
-                  consumer_live_ref: str | None, git_ref: str,
-                  consumer_git_ref: str, requested_session: str | None) -> None:
+def _dev_resolve_source(source_ref: str | None) -> tuple[str, Path, str]:
+    """Resolve the requested source without searching arbitrary directories."""
+    if source_ref is None or source_ref == OFFICIAL_SOURCE_ID:
+        binding = _official_checkout_binding()
+        assert binding is not None
+        return OFFICIAL_SOURCE_ID, Path(binding["path"]), str(binding["branch"])
+    candidate = Path(source_ref).expanduser()
+    if candidate.exists():
+        repo = _dev_require_repo(str(candidate), "source")
+        marker = _read_json(repo / "capabilities.repo.json")
+        if not isinstance(marker, dict) or marker.get("kind") != "capability-source":
+            _die(6, "not_capability_source",
+                 f"source is missing a valid capabilities.repo.json: {repo}")
+        source_id = _source_id_for_repo(repo) or f"path-{hashlib.sha256(str(repo).encode()).hexdigest()[:12]}"
+        branch = _git_checkout_identity(repo).get("branch") or "main"
+        return source_id, repo, str(branch)
+    _validate_source_id(source_ref)
+    entry = _source_entry(source_ref)
+    if entry.get("kind") != "workspace":
+        _die(6, "not_editable", f"source {source_ref!r} is not an editable workspace")
+    repo = _dev_require_repo(str(_source_root(source_ref)), "source")
+    return source_ref, repo, str(entry.get("ref") or "main")
+
+
+def _dev_attach_project(project_ref: str | None, no_project: bool) -> dict | None:
+    """Record, but never create or own, an attached consumer checkout."""
+    if project_ref and no_project:
+        _die(6, "input", "dev start accepts --project or --no-project, not both")
+    if no_project:
+        return None
+    if project_ref is None:
+        marked = _marked_checkout(Path.cwd())
+        if marked is not None:
+            _die(6, "project_selection_required",
+                 "implicit project attachment is forbidden in a capability-source checkout",
+                 "pass --project PATH or --no-project")
+        project_ref = str(Path.cwd())
+    repo = _dev_require_repo(project_ref, "attached project")
+    identity = _git_checkout_identity(repo)
+    return {
+        "path": str(repo),
+        "git_common_dir": identity["git_common_dir"],
+        "starting_branch": identity.get("branch"),
+        "starting_commit": identity["commit"],
+    }
+
+
+def _dev_project(session: dict, required: bool = True) -> Path | None:
+    """Revalidate the recorded attached checkout before project execution."""
+    project = session.get("project")
+    if not isinstance(project, dict):
+        if required:
+            _die(6, "dev_project_required",
+                 f"dev session {session['id']} has no attached project")
+        return None
+    path = Path(str(project.get("path") or "")).expanduser().resolve()
+    if not path.is_dir():
+        _die(6, "dev_project_moved", f"attached project is missing: {path}")
+    identity = _git_checkout_identity(path)
+    if identity["path"] != str(path) or identity["git_common_dir"] != project.get("git_common_dir"):
+        _die(6, "dev_project_replaced",
+             f"attached project identity changed at {path}")
+    return path
+
+
+def _dev_worktree_entries(repo: Path) -> list[dict]:
+    """Parse Git's complete porcelain inventory, including detached trees."""
+    proc = _dev_git(repo, "worktree", "list", "--porcelain")
+    if proc.returncode != 0:
+        _die(6, "git_failed", f"cannot enumerate worktrees for {repo}", proc.stderr.strip())
+    entries: list[dict] = []
+    current: dict = {}
+    for line in [*proc.stdout.splitlines(), ""]:
+        if not line:
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value or True
+    return entries
+
+
+def _dev_worktree_map(repo: Path) -> dict[str, dict]:
+    """Return branch-attached worktrees keyed by their full branch ref."""
+    return {str(item.get("branch")): item for item in _dev_worktree_entries(repo)
+            if item.get("branch")}
+
+
+def _dev_candidate_scope(repo: Path, branch: str, base_ref: str,
+                         worktree: Path | None) -> tuple[str, set[str], list[str]]:
+    """Classify committed and working-tree paths; ambiguity is always shared."""
+    merge = _dev_git(repo, "merge-base", base_ref, branch)
+    if merge.returncode != 0:
+        return "unknown", set(), []
+    paths_proc = _dev_git(repo, "diff", "--name-only", merge.stdout.strip(), branch)
+    if paths_proc.returncode != 0:
+        return "unknown", set(), []
+    paths = set(filter(None, paths_proc.stdout.splitlines()))
+    if worktree is not None:
+        status = _dev_git(worktree, "status", "--porcelain=v1", "--untracked-files=all")
+        if status.returncode != 0:
+            return "unknown", set(), sorted(paths)
+        for line in status.stdout.splitlines():
+            raw = line[3:]
+            if " -> " in raw:
+                raw = raw.split(" -> ", 1)[1]
+            paths.add(raw.strip('"'))
+    manager_changed, packages = _source_change_scope(sorted(paths))
+    if manager_changed or any(not (path.startswith("capabilities/") or
+                                   path == ".capability-source/catalog.json")
+                              for path in paths):
+        return "shared", packages, sorted(paths)
+    return "package", packages, sorted(paths)
+
+
+def _dev_existing_overlaps(repo: Path, capability: str, project: dict | None,
+                           base_ref: str, allow_parallel: bool) -> list[dict]:
+    """Discover managed and unmanaged dev work before creating another branch."""
+    common = _git_checkout_identity(repo)["git_common_dir"]
+    managed: dict[str, dict] = {}
+    live_by_session = {
+        str(lease.get("session_id")): lease for lease in _active_takeover_leases()
+        if lease.get("session_id")
+    }
+    for summary in _dev_session_summaries():
+        if summary.get("schema") != DEV_SESSION_SCHEMA:
+            continue
+        raw = _read_json(_dev_state_dir(summary["id"]) / "session.json")
+        if isinstance(raw, dict) and raw.get("source", {}).get("git_common_dir") == common:
+            managed[str(raw.get("source", {}).get("branch"))] = raw
+    worktree_entries = _dev_worktree_entries(repo)
+    worktrees = {str(item.get("branch")): item for item in worktree_entries
+                 if item.get("branch")}
+    requested_base = _dev_git_value(
+        repo, "rev-parse", "--verify", f"{base_ref}^{{commit}}")
+    refs = _dev_git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/dev/*")
+    if refs.returncode != 0:
+        _die(6, "git_failed", "cannot enumerate local dev branches", refs.stderr.strip())
+    blockers: list[dict] = []
+    seen_branches: set[str] = set()
+    for branch in sorted(filter(None, refs.stdout.splitlines())):
+        seen_branches.add(branch)
+        refname = f"refs/heads/{branch}"
+        item = worktrees.get(refname)
+        worktree = Path(str(item["worktree"])).resolve() if item and item.get("worktree") else None
+        session = managed.get(branch)
+        if session is not None:
+            same_capability = session.get("capability") == capability
+            same_project = (session.get("project") or {}).get("git_common_dir") == (
+                project or {}).get("git_common_dir")
+            if same_capability:
+                live_takeover = session.get("id") in live_by_session
+                blockers.append({
+                    "kind": "managed", "session": session["id"], "branch": branch,
+                    "worktree": str(worktree) if worktree else None,
+                    "scope": "same-capability", "same_project": same_project,
+                    "existing_base_commit": session.get("source", {}).get("base_commit"),
+                    "requested_base_commit": requested_base,
+                    "live_takeover": live_takeover,
+                    "continuations": [
+                        f"capabilities dev doctor {session['id']}",
+                        f"capabilities dev check {session['id']}",
+                        f"capabilities dev finish {session['id']}",
+                        f"capabilities dev stop {session['id']}",
+                    ],
+                    "overrideable": allow_parallel and not live_takeover,
+                })
+                continue
+        scope, packages, paths = _dev_candidate_scope(repo, branch, base_ref, worktree)
+        if scope in ("unknown", "shared") or capability in packages:
+            blockers.append({
+                "kind": "managed" if session else "unmanaged", "branch": branch,
+                "worktree": str(worktree) if worktree else None, "scope": scope,
+                "packages": sorted(packages), "paths": paths, "overrideable": False,
+                "requested_base_commit": requested_base,
+            })
+    primary = repo.resolve()
+    for item in worktree_entries:
+        if not item.get("detached") or not item.get("worktree"):
+            continue
+        worktree = Path(str(item["worktree"])).resolve()
+        if worktree == primary:
+            continue
+        head = str(item.get("HEAD") or "")
+        if not head:
+            scope, packages, paths = "unknown", set(), []
+        else:
+            scope, packages, paths = _dev_candidate_scope(
+                repo, head, base_ref, worktree)
+        if scope in ("unknown", "shared") or capability in packages:
+            blockers.append({
+                "kind": "detached-worktree", "head": head or None,
+                "worktree": str(worktree), "scope": scope,
+                "packages": sorted(packages), "paths": paths,
+                "requested_base_commit": requested_base,
+                "overrideable": False,
+            })
+    for branch, damaged in managed.items():
+        if branch not in seen_branches:
+            blockers.append({
+                "kind": "damaged-managed", "session": damaged.get("id"),
+                "branch": branch, "scope": "unknown", "overrideable": False,
+            })
+    managed_ids = {str(session.get("id")) for session in managed.values()}
+    for lease in _active_takeover_leases():
+        if lease.get("damaged"):
+            blockers.append({
+                "kind": "damaged-live-takeover", "lease": lease.get("path"),
+                "scope": "unknown", "overrideable": False,
+            })
+    for live_session, lease in sorted(live_by_session.items()):
+        if live_session not in managed_ids and lease.get("capability") == capability:
+            blockers.append({
+                "kind": "orphaned-live-takeover", "session": live_session,
+                "lease": lease.get("path"), "scope": "unknown",
+                "overrideable": False,
+            })
+    hard = [item for item in blockers if not item.get("overrideable")]
+    if hard:
+        _die(6, "dev_overlap",
+             f"existing capability work overlaps {capability!r}",
+             json.dumps(hard, sort_keys=True))
+    return blockers
+
+
+def cmd_dev_start(name: str, source_ref: str | None, project_ref: str | None,
+                  no_project: bool, requested_session: str | None,
+                  allow_parallel: bool) -> None:
+    """Create one schema-v2 source worktree and optionally attach a live project."""
     _reject_reserved_capability_name(name)
-    if consumer_ref and consumer_live_ref:
-        _die(6, "input", "dev start accepts --consumer or --consumer-live, not both")
-    source_repo = _dev_require_repo(source_ref, "source")
-    if not (source_repo / "capabilities.repo.json").is_file():
-        _die(6, "not_capability_source",
-             f"source is missing capabilities.repo.json: {source_repo}")
+    source_id, source_repo, git_ref = _dev_resolve_source(source_ref)
+    attached = _dev_attach_project(project_ref, no_project)
     source_status = _dev_git(source_repo, "status", "--porcelain")
     if source_status.returncode != 0:
         _die(
@@ -1553,29 +1883,20 @@ def cmd_dev_start(name: str, source_ref: str, consumer_ref: str | None,
     source_branch = f"dev/{session_id}"
     source_worktree = data_dir / "source"
 
-    consumer_repo: Path | None = None
-    consumer_worktree: Path | None = None
-    consumer_branch: str | None = None
-    consumer_base: str | None = None
-    consumer_live = False
-    if consumer_ref:
-        consumer_repo = _dev_require_repo(consumer_ref, "consumer")
-        consumer_worktree = data_dir / "consumer"
-        consumer_branch = f"dev/{session_id}-consumer"
-    elif consumer_live_ref:
-        consumer_repo = _dev_require_repo(consumer_live_ref, "live consumer")
-        consumer_worktree = consumer_repo
-        consumer_live = True
-
-    # Resolve both bases and reject branch conflicts before mutating either repo.
+    # Resolve the base and discover all overlapping managed or manual work first.
     _dev_git_value(source_repo, "rev-parse", "--verify", f"{git_ref}^{{commit}}")
+    release_state = _release_state_path(source_repo, git_ref)
+    if release_state.exists():
+        state = _read_json(release_state)
+        detail = json.dumps(state, sort_keys=True) if isinstance(state, dict) \
+            else "release state is unreadable or malformed"
+        _die(6, "release_in_progress",
+             f"an unfinished release blocks new dev sessions for {source_repo}:{git_ref}",
+             f"{release_state}: {detail}")
     if _dev_branch_exists(source_repo, source_branch):
         _die(6, "branch_exists", f"dev branch already exists: {source_branch}")
-    if consumer_repo and consumer_branch:
-        _dev_git_value(
-            consumer_repo, "rev-parse", "--verify", f"{consumer_git_ref}^{{commit}}")
-        if _dev_branch_exists(consumer_repo, consumer_branch):
-            _die(6, "branch_exists", f"dev branch already exists: {consumer_branch}")
+    overlaps = _dev_existing_overlaps(
+        source_repo, name, attached, git_ref, allow_parallel)
 
     paths = {
         "home": state_dir / "home",
@@ -1588,17 +1909,12 @@ def cmd_dev_start(name: str, source_ref: str, consumer_ref: str | None,
         "logs": state_dir / "logs",
     }
     source_created = False
-    consumer_created = False
     try:
         state_dir.mkdir(parents=True)
         data_dir.mkdir(parents=True)
         source_base = _dev_add_worktree(
             source_repo, source_worktree, source_branch, git_ref)
         source_created = True
-        if consumer_repo and consumer_worktree and consumer_branch:
-            consumer_base = _dev_add_worktree(
-                consumer_repo, consumer_worktree, consumer_branch, consumer_git_ref)
-            consumer_created = True
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
         manager_link = paths["bin"] / "capabilities"
@@ -1609,20 +1925,17 @@ def cmd_dev_start(name: str, source_ref: str, consumer_ref: str | None,
             "capability": name,
             "created_at": int(time.time()),
             "source": {
-                "repo": str(source_repo), "worktree": str(source_worktree),
+                "id": source_id, "repo": str(source_repo),
+                "git_common_dir": _git_checkout_identity(source_repo)["git_common_dir"],
+                "worktree": str(source_worktree),
                 "branch": source_branch, "ref": git_ref, "base_commit": source_base,
             },
-            "consumer": ({
-                "repo": str(consumer_repo), "worktree": str(consumer_worktree),
-                "branch": consumer_branch, "ref": consumer_git_ref,
-                "base_commit": consumer_base, "live": consumer_live,
-            } if consumer_worktree else None),
+            "project": attached,
             "paths": {key: str(value) for key, value in paths.items()},
+            "installed_payloads": {},
         }
         _write_json(state_dir / "session.json", session)
     except BaseException:
-        if consumer_created and consumer_repo and consumer_worktree and consumer_branch:
-            _dev_rollback_worktree(consumer_repo, consumer_worktree, consumer_branch)
         if source_created:
             _dev_rollback_worktree(source_repo, source_worktree, source_branch)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -1632,7 +1945,8 @@ def cmd_dev_start(name: str, source_ref: str, consumer_ref: str | None,
         "ok": True, "session": session_id,
         "source_worktree": str(source_worktree),
         "source_branch": source_branch,
-        "consumer_worktree": str(consumer_worktree) if consumer_worktree else None,
+        "attached_project": attached["path"] if attached else None,
+        "parallel_overrides": overlaps,
         "isolated": {key: str(paths[key]) for key in
                      ("registry", "bin", "config", "state", "data", "cache",
                       "home", "logs")},
@@ -1663,13 +1977,10 @@ def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
         "XDG_CACHE_HOME": paths["cache"],
         "CAPABILITIES_DEV_SESSION": session["id"],
         "CAPABILITIES_DEV_SOURCE": session["source"]["worktree"],
+        "CAPABILITIES_DEV_SOURCE_ID": session["source"]["id"],
         "PATH": paths["bin"] + os.pathsep + os.environ.get("PATH", os.defpath),
         "UV_CACHE_DIR": str(Path(paths["cache"]) / "uv"),
     })
-    consumer = session.get("consumer")
-    if isinstance(consumer, dict):
-        env["CLAUDE_PROJECT_DIR"] = consumer["worktree"]
-        env["CAPABILITIES_DEV_CONSUMER"] = consumer["worktree"]
     for key in inherit or []:
         if not _dev_safe_env_key(key):
             _die(6, "bad_env_key", f"invalid inherited env key: {key!r}")
@@ -1683,19 +1994,19 @@ def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
 
 
 def _dev_cwd(session: dict, requested: str | None) -> Path:
-    choice = requested or ("consumer" if session.get("consumer") else "source")
+    choice = requested or "source"
     if choice == "source":
         return Path(session["source"]["worktree"])
-    if choice == "consumer" and isinstance(session.get("consumer"), dict):
-        return Path(session["consumer"]["worktree"])
     _die(6, "bad_dev_cwd", f"dev session has no cwd target {choice!r}",
-         "use --cwd source, or attach a consumer at dev start")
+         "dev exec is hermetic; use --cwd source or `dev run` for the attached project")
 
 
 def cmd_dev_install(session_id: str, names: list[str]) -> None:
     if not names:
         _die(6, "input", "dev install needs at least one capability name")
     session = _dev_session(session_id)
+    for name in names:
+        _assert_payload_mutable(name, session_id)
     env = _dev_env(session)
     manager = Path(session["paths"]["bin"]) / "capabilities"
     cwd = _dev_cwd(session, None)
@@ -1714,6 +2025,14 @@ def cmd_dev_install(session_id: str, names: list[str]) -> None:
             installed.append(json.loads(proc.stdout))
         except ValueError:
             installed.append({"name": name, "output": proc.stdout.strip()})
+        payload = Path(session["paths"]["registry"]) / name
+        session.setdefault("installed_payloads", {})[name] = {
+            "path": str(payload),
+            "payload_sha256": _payload_sha256(payload),
+            "executable": str(payload / name),
+            "installed_at": int(time.time()),
+        }
+    _write_json(_dev_state_dir(session_id) / "session.json", session)
     _emit({
         "ok": True, "session": session_id, "installed": installed,
         "next_commands": [
@@ -1751,6 +2070,752 @@ def cmd_dev_exec(session_id: str, command: list[str], cwd_choice: str | None,
     except OSError as exc:
         _die(6, "exec_failed", f"cannot execute dev command: {name}", str(exc))
     sys.exit(proc.returncode)
+
+
+def _dev_changed_paths(session: dict) -> tuple[str, str, list[str]]:
+    """Return base, head and committed/staged/unstaged/untracked changed paths."""
+    source = session["source"]
+    worktree = Path(source["worktree"])
+    base = str(source.get("base_commit") or "")
+    valid = _dev_git(worktree, "cat-file", "-e", f"{base}^{{commit}}")
+    if not base or valid.returncode != 0:
+        _die(6, "dev_base_invalid",
+             f"session {session['id']} has a missing or invalid recorded base",
+             "preserve the worktree and explicitly rehome the session")
+    head = _dev_git_value(worktree, "rev-parse", "HEAD")
+    paths = set(_dev_git_value(worktree, "diff", "--name-only", base, "HEAD").splitlines())
+    paths.update(_dev_git_value(worktree, "diff", "--name-only", "--cached").splitlines())
+    paths.update(_dev_git_value(worktree, "diff", "--name-only").splitlines())
+    untracked = _dev_git_value(
+        worktree, "ls-files", "--others", "--exclude-standard").splitlines()
+    paths.update(untracked)
+    return base, head, sorted(filter(None, paths))
+
+
+def cmd_dev_check(session_id: str) -> None:
+    """Validate exactly the manager/package scope changed since session base.
+
+    Source and index are read-only. A selected payload may be refreshed only in
+    the isolated registry. Publication readiness additionally requires a clean,
+    immutable descendant commit with a current generated catalogue.
+    """
+    session = _dev_session(session_id)
+    base, head, changed = _dev_changed_paths(session)
+    manager_changed, packages = _source_change_scope(changed)
+    source_root = Path(session["source"]["worktree"])
+    audit_scope = ({path.name for path in (source_root / "capabilities").iterdir()
+                    if path.is_dir()} if manager_changed else set(packages))
+    existing = sorted(name for name in audit_scope
+                      if (source_root / "capabilities" / name / "bin" / name).is_file())
+    deleted = sorted(packages - set(existing))
+    failures: dict[str, list[str]] = {}
+    audited: list[str] = []
+    manager = Path(session["paths"]["bin"]) / "capabilities"
+    if manager_changed:
+        proc = subprocess.run(
+            [str(manager), "selfcheck"], cwd=source_root, env=_dev_env(session),
+            capture_output=True, text=True, timeout=600, check=False)
+        if proc.returncode != 0:
+            failures.setdefault("manager", []).append(
+                proc.stderr.strip() or proc.stdout.strip() or f"selfcheck exited {proc.returncode}")
+    for name in existing:
+        try:
+            _assert_payload_mutable(name, session_id)
+            refresh = subprocess.run(
+                [str(manager), "install", name, "--from", str(source_root)],
+                cwd=source_root, env=_dev_env(session), capture_output=True,
+                text=True, timeout=300, check=False)
+            if refresh.returncode != 0:
+                failures.setdefault(name, []).append(
+                    refresh.stderr.strip() or refresh.stdout.strip()
+                    or f"isolated refresh exited {refresh.returncode}")
+            else:
+                payload_root = Path(session["paths"]["registry"]) / name
+                session.setdefault("installed_payloads", {})[name] = {
+                    "path": str(payload_root),
+                    "payload_sha256": _payload_sha256(payload_root),
+                    "executable": str(payload_root / name),
+                    "installed_at": int(time.time()),
+                }
+                _write_json(_dev_state_dir(session_id) / "session.json", session)
+        except SystemExit:
+            failures.setdefault(name, []).append("isolated payload refresh is frozen")
+        proc = subprocess.run(
+            [str(manager), "audit", name, "--from", str(source_root)],
+            cwd=source_root, env=_dev_env(session), capture_output=True,
+            text=True, timeout=300, check=False)
+        audited.append(name)
+        if proc.returncode != 0:
+            failures.setdefault(name, []).append(
+                proc.stderr.strip() or proc.stdout.strip() or f"audit exited {proc.returncode}")
+    status = _dev_git_value(source_root, "status", "--porcelain")
+    staged_paths = _dev_git_value(source_root, "diff", "--name-only", "--cached").splitlines()
+    staged_manager, staged_packages = _source_change_scope(staged_paths)
+    if staged_manager or staged_packages:
+        staged_tree = _dev_git_value(source_root, "write-tree")
+        staged_report = _source_snapshot_report(
+            source_root, staged_tree, manager_selfcheck=staged_manager,
+            audit_names=set(staged_packages))
+        if "catalog" in staged_report["failures"]:
+            source_id = session["source"].get("id") or OFFICIAL_SOURCE_ID
+            failures.setdefault("catalog", []).append(
+                "staged catalogue is stale; run exactly: "
+                f"cd {shlex.quote(str(source_root))} && "
+                f"./bin/capabilities source index {shlex.quote(str(source_id))} --staged")
+    descendant = _dev_git(source_root, "merge-base", "--is-ancestor", base, head).returncode == 0
+    publication_ready = not status and head != base and descendant
+    immutable = None
+    if publication_ready:
+        immutable = _source_snapshot_report(
+            source_root, head, manager_selfcheck=manager_changed,
+            audit_names=set(existing))
+        if not immutable["ok"]:
+            failures.setdefault("immutable_tree", []).append(
+                json.dumps({"contract": immutable["contract"],
+                            "failures": immutable["failures"]}, sort_keys=True))
+            publication_ready = False
+    result = {
+        "session": session_id,
+        "base": base,
+        "head": head,
+        "scope_basis": "recorded-base+head+index+worktree+untracked",
+        "changed_paths": changed,
+        "manager_changed": manager_changed,
+        "selected_packages": sorted(packages),
+        "audited_packages": audited,
+        "deleted_packages": deleted,
+        "working_tree_clean": not bool(status),
+        "publication_ready": publication_ready and not failures,
+        "failures": failures,
+        "ok": not failures,
+    }
+    _emit(result)
+    if failures:
+        sys.exit(7)
+
+
+def _dev_connection_selector(args: list[str]) -> str | None:
+    """Read standard connection selectors without altering child arguments."""
+    found: list[str] = []
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value == "--connection":
+            if index + 1 >= len(args):
+                _die(6, "input", "--connection needs a value")
+            found.append(args[index + 1])
+            index += 2
+            continue
+        if value.startswith("--connection="):
+            found.append(value.split("=", 1)[1])
+        index += 1
+    if len(set(found)) > 1:
+        _die(6, "conflicting_connection", "multiple conflicting connection selectors")
+    return found[0] if found else None
+
+
+def _dev_select_connection(registry: dict, wanted: str | None) -> tuple[str, dict]:
+    """Apply the shared flag/default/sole-entry selection contract."""
+    conns = registry.get("connections")
+    if not isinstance(conns, dict) or not conns:
+        _die(6, "bad_config", "connections registry has no connections")
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted] if isinstance(conns[wanted], dict) else {}
+        matches = [(cid, entry) for cid, entry in conns.items()
+                   if isinstance(entry, dict)
+                   and str(entry.get("address") or "").lower() == wanted.lower()]
+        if len(matches) == 1:
+            return matches[0]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}")
+    default = registry.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}")
+        entry = conns[default]
+        return default, entry if isinstance(entry, dict) else {}
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        entry = conns[cid]
+        return cid, entry if isinstance(entry, dict) else {}
+    _die(6, "ambiguous_connection",
+         "registry has multiple connections and no default; pass --connection ID")
+
+
+def _dev_redact(text: str, secrets: list[str]) -> str:
+    """Replace exact known secret values before forwarding child output."""
+    for secret in sorted(set(filter(None, secrets)), key=len, reverse=True):
+        text = text.replace(secret, "[REDACTED]")
+    return text
+
+
+def cmd_dev_run(session_id: str, capability: str, args: list[str],
+                project_only: bool) -> None:
+    """Run one verified session payload with a short-lived selected-cap projection."""
+    session = _dev_session(session_id)
+    project = _dev_project(session)
+    assert project is not None
+    payload = (session.get("installed_payloads") or {}).get(capability)
+    if not isinstance(payload, dict):
+        _die(6, "dev_capability_not_installed",
+             f"{capability} is not installed in dev session {session_id}",
+             f"run `capabilities dev install {session_id} {capability}`")
+    registry = Path(session["paths"]["registry"]) / capability
+    executable = registry / capability
+    if not executable.is_file() or executable.resolve() != Path(payload["executable"]).resolve():
+        _die(6, "dev_payload_invalid", f"session payload is missing or escaped: {executable}")
+    if _payload_sha256(registry) != payload.get("payload_sha256"):
+        _die(6, "dev_payload_drift", f"session payload changed after install: {capability}")
+    manifest = _read_json(registry / "manifest.json")
+    if not isinstance(manifest, dict):
+        _die(6, "dev_manifest_missing", f"session payload has no manifest: {capability}")
+
+    envelope = _project_capabilities_dir(project)
+    project_gate = _load_gate_file(envelope / "settings.json").get("capabilities", {}).get(capability)
+    global_gate = None if project_only else _load_gate_file(GLOBAL_GATE_FILE).get("capabilities", {}).get(capability)
+    effective, gate_tier = _effective_gate_state(project_gate, global_gate)
+    if effective != "enabled":
+        _die(4, "disabled", f"{capability} is disabled for attached project {project}")
+
+    project_registry = envelope / capability / "connections.json"
+    user_registry = _CONFIG_HOME / capability / "connections.json"
+    registry_data = None
+    registry_tier = None
+    registry_path = None
+    if project_registry.is_file():
+        registry_data, registry_tier, registry_path = (
+            _read_json(project_registry), "project", project_registry)
+    elif not project_only and user_registry.is_file():
+        registry_data, registry_tier, registry_path = (
+            _read_json(user_registry), "user", user_registry)
+    selected_id = None
+    selected_entry: dict = {}
+    credentials = manifest.get("credentials") or {}
+    try:
+        connection_bearing = "contract: connections" in executable.read_text()
+    except OSError:
+        connection_bearing = registry_data is not None
+    if connection_bearing:
+        if not isinstance(registry_data, dict):
+            _die(6, "connections_required",
+                 f"{capability} requires a project connection registry"
+                 if project_only else f"{capability} requires a connection registry")
+        selected_id, selected_entry = _dev_select_connection(
+            registry_data, _dev_connection_selector(args))
+
+    project_values = _project_env(project)
+    user_values = {} if project_only else _parse_env_file(
+        _CONFIG_HOME / capability / "credentials.env")
+    child_values: dict[str, str] = {}
+    value_tiers: dict[str, str] = {}
+    secrets: list[str] = []
+    for spec in credentials.get("keys") or []:
+        if not isinstance(spec, dict) or not isinstance(spec.get("key"), str):
+            continue
+        key = spec["key"]
+        if project_values.get(key):
+            value, tier = project_values[key], "project"
+        elif user_values.get(key):
+            value, tier = user_values[key], "user"
+        elif os.environ.get(key):
+            value, tier = os.environ[key], "process"
+        else:
+            continue
+        child_values[key] = value
+        value_tiers[key] = tier
+        if spec.get("secret"):
+            secrets.append(value)
+    for field, raw_key in selected_entry.items():
+        if not field.endswith("_env") or not isinstance(raw_key, str) \
+                or not _dev_safe_env_key(raw_key):
+            continue
+        value = project_values.get(raw_key) or user_values.get(raw_key) or os.environ.get(raw_key)
+        if value:
+            child_values[raw_key] = value
+            value_tiers[raw_key] = (
+                "project" if project_values.get(raw_key) else
+                "user" if user_values.get(raw_key) else "process")
+            secrets.append(value)
+
+    projection_parent = Path(tempfile.mkdtemp(prefix="capabilities-dev-run-"))
+    projection_parent.chmod(0o700)
+    try:
+        config = projection_parent / "config"
+        config.mkdir(mode=0o700)
+        if gate_tier == "global":
+            _write_json(config / "capabilities" / "settings.json",
+                        {"capabilities": {capability: global_gate}})
+        if registry_tier == "user":
+            _write_json(config / capability / "connections.json", registry_data)
+        env = _dev_env(session)
+        env.update(child_values)
+        env.update({
+            "XDG_CONFIG_HOME": str(config),
+            "CLAUDE_PROJECT_DIR": str(project),
+            "CAPABILITIES_PROJECT_ENVELOPE": str(envelope),
+            "CAPABILITIES_DEV_PROJECT": str(project),
+            "CAPABILITIES_DEV_EXECUTION": "project",
+        })
+        proc = subprocess.run(
+            [str(executable), *args], cwd=project, env=env,
+            capture_output=True, text=True, check=False)
+        diagnostic = {
+            "mode": "project", "session": session_id, "capability": capability,
+            "payload": str(executable), "attached_project": str(project),
+            "selected_connection": selected_id,
+            "policy_tier": gate_tier, "connection_tier": registry_tier,
+            "value_tiers": value_tiers,
+        }
+        sys.stderr.write(json.dumps({"dev_run": diagnostic}, sort_keys=True) + "\n")
+        sys.stdout.write(_dev_redact(proc.stdout, secrets))
+        sys.stderr.write(_dev_redact(proc.stderr, secrets))
+        sys.exit(proc.returncode)
+    finally:
+        shutil.rmtree(projection_parent, ignore_errors=True)
+
+
+def _dev_live_lease_for_session(session_id: str) -> dict | None:
+    """Return exactly one active Telegram lease for a session, fail on ambiguity."""
+    matches = [lease for lease in _active_takeover_leases()
+               if lease.get("session_id") == session_id]
+    if len(matches) > 1:
+        _die(6, "takeover_ambiguous",
+             f"multiple live leases claim dev session {session_id}",
+             json.dumps(matches, sort_keys=True))
+    return matches[0] if matches else None
+
+
+def _dev_live_inputs(session: dict) -> dict:
+    """Resolve Telegram live policy, connection, state and process-only inputs."""
+    project = _dev_project(session)
+    assert project is not None
+    envelope = _project_capabilities_dir(project)
+    gate = _load_gate_file(envelope / "settings.json").get("capabilities", {}).get("telegram")
+    if not isinstance(gate, dict) or gate.get("enabled") is not True:
+        _die(4, "service_project_enable_required",
+             "Telegram live mode requires explicit project enable")
+    project_registry = envelope / "telegram" / "connections.json"
+    user_registry = _CONFIG_HOME / "telegram" / "connections.json"
+    if project_registry.is_file():
+        registry, tier, registry_path = _read_json(project_registry), "project", project_registry
+    elif user_registry.is_file():
+        registry, tier, registry_path = _read_json(user_registry), "user", user_registry
+    else:
+        _die(6, "connections_required", "Telegram live mode requires a connection registry")
+    if not isinstance(registry, dict):
+        _die(6, "bad_config", f"invalid Telegram connections registry: {registry_path}")
+    settings = _read_json(envelope / "telegram" / "service" / "settings.json") or {}
+    wanted = str(settings.get("connection")) if settings.get("connection") else None
+    connection, entry = _dev_select_connection(registry, wanted)
+    if not bool(entry.get("allow_write", False)):
+        _die(4, "connection_read_only",
+             f"Telegram connection {connection!r} does not allow writes")
+    try:
+        account_id = int(entry.get("expected_account_id"))
+        if account_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        _die(6, "expected_account_required",
+             f"Telegram connection {connection!r} needs a positive expected_account_id")
+    session_path = Path(str(entry.get("session") or
+                            (_STATE_HOME / "telegram" / connection / "session"))).expanduser()
+    if not session_path.is_absolute():
+        session_path = project / session_path
+    project_values = _project_env(project)
+    state_value = project_values.get("TELEGRAM_SERVICE_STATE_DIR")
+    state_path = Path(state_value).expanduser() if state_value else session_path.parent / "service"
+    if not state_path.is_absolute():
+        state_path = project / state_path
+    user_values = _parse_env_file(_CONFIG_HOME / "telegram" / "credentials.env")
+    manifest = _read_json(Path(session["paths"]["registry"]) / "telegram" / "manifest.json")
+    if not isinstance(manifest, dict):
+        _die(6, "dev_manifest_missing", "session Telegram payload has no manifest")
+    values: dict[str, str] = {}
+    secrets_list: list[str] = []
+    for spec in (manifest.get("credentials") or {}).get("keys") or []:
+        if not isinstance(spec, dict) or not isinstance(spec.get("key"), str):
+            continue
+        key = spec["key"]
+        value = project_values.get(key) or user_values.get(key) or os.environ.get(key)
+        if value:
+            values[key] = value
+            if spec.get("secret"):
+                secrets_list.append(value)
+    for field, raw_key in entry.items():
+        if not field.endswith("_env") or not isinstance(raw_key, str) \
+                or not _dev_safe_env_key(raw_key):
+            continue
+        value = project_values.get(raw_key) or user_values.get(raw_key) or os.environ.get(raw_key)
+        if value:
+            values[raw_key] = value
+            secrets_list.append(value)
+    if state_value:
+        values["TELEGRAM_SERVICE_STATE_DIR"] = state_value
+    return {
+        "project": project, "envelope": envelope, "registry": registry,
+        "registry_tier": tier, "connection": connection, "entry": entry,
+        "account_id": account_id, "session_path": session_path,
+        "state_path": state_path.resolve(), "values": values,
+        "secrets": secrets_list, "manifest": manifest,
+    }
+
+
+def _dev_live_env(session: dict, inputs: dict,
+                  projection: Path) -> tuple[dict[str, str], Path]:
+    """Create the lease-owned non-secret config projection for one live daemon."""
+    if projection.exists():
+        _die(6, "live_projection_exists", f"live projection already exists: {projection}")
+    projection.mkdir(parents=True, mode=0o700)
+    projection.chmod(0o700)
+    config = projection / "config"
+    config.mkdir(mode=0o700)
+    if inputs["registry_tier"] == "user":
+        _write_json(config / "telegram" / "connections.json", inputs["registry"])
+    env = _dev_env(session)
+    env.update(inputs["values"])
+    env.update({
+        "XDG_CONFIG_HOME": str(config),
+        "XDG_STATE_HOME": str(_STATE_HOME),
+        "CLAUDE_PROJECT_DIR": str(inputs["project"]),
+        "CAPABILITIES_PROJECT_ENVELOPE": str(inputs["envelope"]),
+        "CAPABILITIES_DEV_PROJECT": str(inputs["project"]),
+    })
+    return env, projection
+
+
+def _dev_live_command(executable: Path, args: list[str], project: Path,
+                      env: dict[str, str], secrets_list: list[str]) -> dict:
+    """Run a Telegram control command and parse its redacted JSON result."""
+    proc = subprocess.run([str(executable), *args], cwd=project, env=env,
+                          capture_output=True, text=True, timeout=60, check=False)
+    stdout = _dev_redact(proc.stdout, secrets_list)
+    stderr = _dev_redact(proc.stderr, secrets_list)
+    if proc.returncode != 0:
+        _die(proc.returncode, "telegram_live_command_failed",
+             f"Telegram control command failed: {' '.join(args)}",
+             stderr.strip() or stdout.strip() or None)
+    try:
+        return json.loads(stdout)
+    except ValueError:
+        _die(6, "telegram_live_output_invalid",
+             "Telegram control command did not return JSON", stdout.strip())
+
+
+def _dev_live_transition(path: Path, lease: dict, state: str, **updates) -> dict:
+    """Durably advance one lease before/after its corresponding process action."""
+    lease.update(updates)
+    lease["state"] = state
+    lease["transition"] = int(lease.get("transition") or 0) + 1
+    lease["updated_at"] = int(time.time())
+    _write_json(path, lease)
+    path.chmod(0o600)
+    return lease
+
+
+def _dev_pid_alive(pid: object) -> bool:
+    """Return whether a positive PID still names a process we may inspect."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _dev_live_reconcile_owner(lease: dict) -> None:
+    """Prove or retire the lease's owner record without guessing at a PID."""
+    lease_path = Path(str(lease["path"]))
+    control = lease_path.parent
+    owner_path = control / "owner.json"
+    owner = _read_json(owner_path)
+    if owner is None:
+        if owner_path.exists():
+            _die(6, "owner_record_malformed",
+                 f"Telegram owner record is unreadable: {owner_path}")
+        return
+    if not isinstance(owner, dict):
+        _die(6, "owner_record_malformed",
+             f"Telegram owner record is invalid: {owner_path}")
+    recorded = lease.get("development_owner")
+    if isinstance(recorded, dict):
+        identity_fields = (
+            "launch_nonce", "pid", "mode", "dev_session_id", "project_root",
+            "connection", "account_id", "cli_bundle_path",
+        )
+        matches = all(owner.get(key) == recorded.get(key) for key in identity_fields)
+    elif owner.get("mode") == "development":
+        # A crash can occur after the daemon publishes ownership but before the
+        # lease records development_owner.  The remaining immutable provenance
+        # still proves which dev payload and session created the process.
+        matches = (
+            owner.get("dev_session_id") == lease.get("session_id")
+            and owner.get("project_root") == lease.get("project")
+            and owner.get("connection") == lease.get("connection")
+            and owner.get("account_id") == lease.get("account_id")
+            and owner.get("cli_bundle_path") == lease.get("development_executable")
+            and isinstance(owner.get("launch_nonce"), str)
+            and bool(owner.get("launch_nonce"))
+            and isinstance(owner.get("pid"), int)
+        )
+    else:
+        previous = lease.get("previous_owner")
+        matches = isinstance(previous, dict) and all(
+            owner.get(key) == previous.get(key)
+            for key in ("launch_nonce", "pid", "mode", "project_root",
+                        "connection", "account_id", "cli_bundle_path")
+        )
+    if not matches:
+        _die(6, "takeover_owner_mismatch",
+             "current Telegram owner does not match the durable takeover lease",
+             json.dumps(owner, sort_keys=True))
+    if _dev_pid_alive(owner.get("pid")):
+        return
+    daemon_lock = (control / "daemon.lock").open("a+")
+    (control / "daemon.lock").chmod(0o600)
+    try:
+        try:
+            fcntl.flock(daemon_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _die(6, "takeover_owner_uncertain",
+                 "owner PID is absent but the account daemon lock is still held")
+        current = _read_json(owner_path)
+        if current != owner:
+            _die(6, "takeover_owner_changed",
+                 "Telegram ownership changed during recovery")
+        owner_path.unlink(missing_ok=True)
+    finally:
+        daemon_lock.close()
+
+
+def cmd_dev_live_start(session_id: str, adapter: str) -> None:
+    """Take exclusive live ownership of one Telegram account for a dev payload."""
+    if adapter != "telegram":
+        _die(6, "live_adapter_unsupported", "only the telegram live adapter exists")
+    session = _dev_session(session_id)
+    payload = (session.get("installed_payloads") or {}).get("telegram")
+    if not isinstance(payload, dict):
+        _die(6, "dev_capability_not_installed",
+             f"telegram is not installed in dev session {session_id}")
+    if _dev_live_lease_for_session(session_id):
+        _die(6, "takeover_active", f"session {session_id} already has a live takeover")
+    inputs = _dev_live_inputs(session)
+    account = inputs["account_id"]
+    control = _STATE_HOME / "telegram" / str(account) / "control"
+    projection_path = control / f"projection-{session_id}"
+    lease_path = control / "takeover.json"
+    ownership = _read_json(control / "ownership-v1.json")
+    if (not isinstance(ownership, dict) or ownership.get("account_id") != account
+            or ownership.get("protocol_version") != 1):
+        _die(6, "ownership_migration_required",
+             f"account {account} has not completed ownership-v1 cutover")
+    if lease_path.exists():
+        _die(6, "takeover_active", f"account {account} already has a takeover lease",
+             str(lease_path))
+    canonical = _script_path("telegram")
+    canonical_manifest = _read_json(_registry_dir("telegram") / "manifest.json")
+    if not canonical.is_file() or not isinstance(canonical_manifest, dict):
+        _die(6, "canonical_telegram_missing", "canonical Telegram payload is unavailable")
+    versions = [canonical_manifest.get("service_state_version"),
+                inputs["manifest"].get("service_state_version")]
+    marker = _read_json(inputs["state_path"] / "state-schema.json")
+    disk_version = 1 if marker is None and not (inputs["state_path"] / "state-schema.json").exists() \
+        else (marker or {}).get("version")
+    if any(not isinstance(value, int) or value <= 0 for value in [*versions, disk_version]) \
+            or versions[0] != versions[1] or versions[0] != disk_version:
+        _die(6, "service_state_version_mismatch",
+             f"disk/canonical/development versions differ: {disk_version}/{versions[0]}/{versions[1]}")
+
+    canonical_env = dict(os.environ)
+    canonical_env["CLAUDE_PROJECT_DIR"] = str(inputs["project"])
+    canonical_env["CAPABILITIES_PROJECT_ENVELOPE"] = str(inputs["envelope"])
+    canonical_status = _dev_live_command(
+        canonical, ["service", "status", "--connection", inputs["connection"]],
+        inputs["project"], canonical_env, inputs["secrets"])
+    owner = canonical_status.get("owner")
+    if isinstance(owner, dict) and owner.get("project_root") != str(inputs["project"]):
+        _die(6, "account_owned_elsewhere",
+             f"Telegram account {account} is owned by another project",
+             json.dumps(owner, sort_keys=True))
+
+    control.mkdir(parents=True, exist_ok=True)
+    control.chmod(0o700)
+    mutation = MANAGER_MUTATION_LOCK.open("a+")
+    fcntl.flock(mutation, fcntl.LOCK_EX)
+    transition = (control / "transition.lock").open("a+")
+    (control / "transition.lock").chmod(0o600)
+    fcntl.flock(transition, fcntl.LOCK_EX)
+    try:
+        same_account = [active for active in _active_takeover_leases()
+                        if active.get("account_id") == account]
+        if same_account:
+            _die(6, "takeover_active",
+                 f"Telegram account {account} already has an active takeover",
+                 json.dumps(same_account, sort_keys=True))
+        if (_payload_sha256(Path(payload["path"])) != payload["payload_sha256"]
+                or not Path(payload["executable"]).is_file()):
+            _die(6, "dev_payload_drift",
+                 "development Telegram payload changed before lease creation")
+        locked_canonical_manifest = _read_json(_registry_dir("telegram") / "manifest.json")
+        if ((locked_canonical_manifest or {}).get("service_state_version")
+                != disk_version):
+            _die(6, "service_state_version_mismatch",
+                 "canonical Telegram version changed before lease creation")
+        lease = {
+            "schema": "capabilities.dev.live.telegram.v1",
+            "capability": "telegram", "session_id": session_id,
+            "account_id": account, "connection": inputs["connection"],
+            "project": str(inputs["project"]),
+            "project_git_common_dir": session["project"]["git_common_dir"],
+            "state_path": str(inputs["state_path"]),
+            "auth_session_path": str(inputs["session_path"]),
+            "canonical_executable": str(canonical),
+            "canonical_payload_sha256": _payload_sha256(_registry_dir("telegram")),
+            "development_executable": payload["executable"],
+            "development_payload_sha256": payload["payload_sha256"],
+            "service_state_version": disk_version,
+            "projection_path": str(projection_path),
+            "restart_canonical": bool(canonical_status.get("running")),
+            "previous_owner": owner,
+            "transition": 0,
+        }
+        _dev_live_transition(lease_path, lease, "prepared")
+    finally:
+        mutation.close()
+
+    if lease["restart_canonical"]:
+        _dev_live_transition(lease_path, lease, "canonical_stopping")
+        _dev_live_command(
+            canonical, ["service", "stop", "--connection", inputs["connection"]],
+            inputs["project"], canonical_env, inputs["secrets"])
+    _dev_live_transition(lease_path, lease, "dev_starting")
+    dev_env, projection = _dev_live_env(session, inputs, projection_path)
+    dev_status = _dev_live_command(
+        Path(payload["executable"]),
+        ["service", "start", "--connection", inputs["connection"]],
+        inputs["project"], dev_env, inputs["secrets"])
+    deadline = time.time() + 30
+    while not dev_status.get("healthy") and time.time() < deadline:
+        time.sleep(0.5)
+        dev_status = _dev_live_command(
+            Path(payload["executable"]),
+            ["service", "status", "--connection", inputs["connection"]],
+            inputs["project"], dev_env, inputs["secrets"])
+    owner = dev_status.get("owner")
+    if (not isinstance(owner, dict) or owner.get("mode") != "development"
+            or owner.get("dev_session_id") != session_id):
+        _die(5, "development_owner_unproven",
+             "development daemon did not publish matching ownership provenance")
+    if not dev_status.get("healthy"):
+        _die(5, "development_daemon_unhealthy",
+             "development Telegram daemon did not prove healthy update synchronization",
+             f"recover with `capabilities dev live recover {session_id} telegram --restore-canonical`")
+    _dev_live_transition(lease_path, lease, "dev_running",
+                         development_owner=owner)
+    _emit({"session": session_id, "adapter": adapter, "lease": lease,
+           "status": dev_status, "ok": True})
+
+
+def cmd_dev_live_status(session_id: str, adapter: str) -> None:
+    """Report durable lease and owner state without starting or stopping processes."""
+    if adapter != "telegram":
+        _die(6, "live_adapter_unsupported", "only the telegram live adapter exists")
+    lease = _dev_live_lease_for_session(session_id)
+    if lease is None:
+        _emit({"session": session_id, "adapter": adapter, "active": False})
+        return
+    owner_path = Path(lease["path"]).parent / "owner.json"
+    owner = _read_json(owner_path)
+    _emit({"session": session_id, "adapter": adapter, "active": True,
+           "lease": lease, "owner": owner,
+           "continuation": f"capabilities dev live recover {session_id} telegram --restore-canonical"})
+
+
+def cmd_dev_live_recover(session_id: str, adapter: str,
+                         restore_canonical: bool) -> None:
+    """Idempotently restore the recorded canonical state, even without session v2."""
+    if adapter != "telegram" or not restore_canonical:
+        _die(6, "input", "recovery requires telegram --restore-canonical")
+    lease = _dev_live_lease_for_session(session_id)
+    if lease is None:
+        _die(3, "takeover_not_found", f"no active takeover for session {session_id}")
+    control = Path(str(lease["path"])).parent
+    transition_path = control / "transition.lock"
+    transition = transition_path.open("a+")
+    transition_path.chmod(0o600)
+    fcntl.flock(transition, fcntl.LOCK_EX)
+    try:
+        _dev_live_recover_locked(session_id, adapter, lease)
+    finally:
+        transition.close()
+
+
+def _dev_live_recover_locked(session_id: str, adapter: str, lease: dict) -> None:
+    """Perform restoration while holding the account transition lock."""
+    lease_path = Path(lease["path"])
+    project = Path(str(lease.get("project") or "")).resolve()
+    if not project.is_dir() or _git_checkout_identity(project)["git_common_dir"] != \
+            lease.get("project_git_common_dir"):
+        _die(6, "dev_project_replaced", f"recorded takeover project is invalid: {project}")
+    canonical = Path(str(lease.get("canonical_executable") or ""))
+    if (not canonical.is_file()
+            or _payload_sha256(canonical.parent) != lease.get("canonical_payload_sha256")):
+        _die(6, "canonical_payload_drift", "canonical Telegram payload changed during takeover")
+    development = Path(str(lease.get("development_executable") or ""))
+    if (not development.is_file()
+            or _payload_sha256(development.parent) != lease.get("development_payload_sha256")):
+        _die(6, "development_payload_drift",
+             "development Telegram payload changed during takeover")
+    state_marker_path = Path(str(lease.get("state_path"))) / "state-schema.json"
+    state_marker = _read_json(state_marker_path)
+    state_version = 1 if state_marker is None and not state_marker_path.exists() \
+        else (state_marker or {}).get("version")
+    canonical_manifest = _read_json(canonical.parent / "manifest.json")
+    canonical_version = (canonical_manifest or {}).get("service_state_version")
+    if (state_version != lease.get("service_state_version")
+            or canonical_version != lease.get("service_state_version")):
+        _die(6, "service_state_version_mismatch",
+             "state or canonical payload version changed during takeover")
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(project)
+    envelope = _project_capabilities_dir(project)
+    env["CAPABILITIES_PROJECT_ENVELOPE"] = str(envelope)
+    connection = str(lease["connection"])
+    secrets_list: list[str] = []
+    _dev_live_reconcile_owner(lease)
+    _dev_live_transition(lease_path, lease, "dev_stopping")
+    _dev_live_command(canonical, ["service", "stop", "--connection", connection],
+                      project, env, secrets_list)
+    if lease.get("restart_canonical"):
+        _dev_live_transition(lease_path, lease, "canonical_restarting")
+        status = _dev_live_command(
+            canonical, ["service", "start", "--connection", connection],
+            project, env, secrets_list)
+        deadline = time.time() + 30
+        while not status.get("healthy") and time.time() < deadline:
+            time.sleep(0.5)
+            status = _dev_live_command(
+                canonical, ["service", "status", "--connection", connection],
+                project, env, secrets_list)
+        owner = status.get("owner")
+        if (not isinstance(owner, dict) or owner.get("mode") != "canonical"):
+            _die(5, "canonical_restart_unproven",
+                 "canonical Telegram daemon did not publish matching provenance")
+        if not status.get("healthy"):
+            _die(5, "canonical_restart_unhealthy",
+                 "canonical Telegram daemon restarted but is not synchronizing updates",
+                 str(lease_path))
+    else:
+        status = {"running": False}
+    _dev_live_transition(lease_path, lease, "restored")
+    projection = Path(str(lease.get("projection_path") or ""))
+    if projection.is_dir() and projection.parent == lease_path.parent:
+        shutil.rmtree(projection)
+    lease_path.unlink()
+    _emit({"session": session_id, "adapter": adapter, "restored": True,
+           "canonical": status})
 
 
 def _dev_git_status(worktree: Path) -> tuple[str | None, str | None]:
@@ -1792,11 +2857,6 @@ def _dev_cleanup_problems(session: dict) -> list[str]:
     source_problem = _dev_worktree_cleanup_problem(session["source"])
     if source_problem:
         problems.append(source_problem)
-    consumer = session.get("consumer")
-    if isinstance(consumer, dict):
-        consumer_problem = _dev_worktree_cleanup_problem(consumer)
-        if consumer_problem:
-            problems.append(consumer_problem)
     return problems
 
 
@@ -1814,26 +2874,53 @@ def cmd_dev_doctor(session_id: str) -> None:
     installed = []
     registry = Path(session["paths"]["registry"])
     bindir = Path(session["paths"]["bin"])
+    recorded_payloads = session.get("installed_payloads") or {}
     if registry.is_dir():
         for path in sorted(registry.iterdir()):
             if path.name.startswith(".") or not (path / path.name).is_file():
                 continue
             link = bindir / path.name
-            ok = link.is_symlink() and link.resolve() == (path / path.name).resolve()
-            installed.append({"name": path.name, "executable": str(link), "ok": ok})
+            recorded = recorded_payloads.get(path.name)
+            current_hash = _payload_sha256(path)
+            ok = (link.is_symlink()
+                  and link.resolve() == (path / path.name).resolve()
+                  and isinstance(recorded, dict)
+                  and recorded.get("path") == str(path)
+                  and recorded.get("payload_sha256") == current_hash)
+            installed.append({
+                "name": path.name, "executable": str(link), "ok": ok,
+                "payload_sha256": current_hash,
+                "recorded_payload_sha256": (recorded or {}).get("payload_sha256")
+                if isinstance(recorded, dict) else None,
+            })
             if not ok:
-                findings.append(f"{path.name} dev symlink is missing or misdirected")
-    consumer = session.get("consumer")
-    consumer_status = None
-    if isinstance(consumer, dict) and not consumer.get("live"):
-        consumer_status, consumer_error = _dev_git_status(Path(consumer["worktree"]))
-        if consumer_error:
-            findings.append(consumer_error)
+                findings.append(
+                    f"{path.name} dev payload hash/path/symlink no longer matches session state")
+    present = {item["name"] for item in installed}
+    for name in sorted(set(recorded_payloads) - present):
+        findings.append(f"{name} recorded dev payload is missing from the isolated registry")
+    project = session.get("project")
+    project_state = None
+    if isinstance(project, dict):
+        try:
+            project_path = _dev_project(session)
+            assert project_path is not None
+            identity = _git_checkout_identity(project_path)
+            project_state = {
+                **project,
+                "current_branch": identity.get("branch"),
+                "current_commit": identity["commit"],
+                "dirty": bool(_dev_git_value(project_path, "status", "--porcelain")),
+            }
+        except SystemExit:
+            findings.append(f"attached project identity is invalid: {project.get('path')}")
+    release_path = _release_state_path(
+        Path(source["repo"]), str(source.get("ref") or "main"))
+    release_raw = _read_json(release_path) if release_path.exists() else None
     _emit({
         "ok": not findings, "session": session_id,
         "source": {**source, "dirty": bool(source_status)},
-        "consumer": ({**consumer, "dirty": bool(consumer_status)}
-                     if isinstance(consumer, dict) else None),
+        "project": project_state,
         "environment": {
             "registry": session["paths"]["registry"],
             "bin": session["paths"]["bin"],
@@ -1845,6 +2932,11 @@ def cmd_dev_doctor(session_id: str) -> None:
             "logs": session["paths"]["logs"],
         },
         "installed": installed,
+        "live_takeover": _dev_live_lease_for_session(session_id),
+        "release_state": ({
+            "path": str(release_path), "valid": isinstance(release_raw, dict),
+            "state": release_raw if isinstance(release_raw, dict) else None,
+        } if release_path.exists() else None),
         "cleanup_ready": not _dev_cleanup_problems(session),
         "cleanup_problems": _dev_cleanup_problems(session),
         "findings": findings,
@@ -1854,6 +2946,7 @@ def cmd_dev_doctor(session_id: str) -> None:
 
 
 def cmd_dev_finish(session_id: str) -> None:
+    _assert_session_without_takeover(session_id)
     session = _dev_session(session_id)
     source = session["source"]
     source_worktree = Path(source["worktree"])
@@ -1867,21 +2960,11 @@ def cmd_dev_finish(session_id: str) -> None:
             f"dev source worktree has uncommitted changes: {source_worktree}",
             "prepare one clean commit before finishing the session",
         )
-    consumer = session.get("consumer")
-    if isinstance(consumer, dict):
-        consumer_problem = _dev_worktree_cleanup_problem(consumer)
-        if consumer_problem:
-            _die(
-                6,
-                "dev_consumer_unfinished",
-                "consumer worktree is not cleanup-ready",
-                consumer_problem,
-            )
     repo = Path(source["repo"])
     candidate = _dev_git_value(source_worktree, "rev-parse", "HEAD")
     if candidate == source.get("base_commit"):
         _die(6, "dev_no_change", f"dev session {session_id} has no prepared commit")
-    source_id = _source_id_for_repo(repo)
+    source_id = source.get("id") or _source_id_for_repo(repo)
     release = _source_release(
         repo,
         source_id,
@@ -1911,13 +2994,61 @@ def _dev_session_summaries() -> list[dict]:
         return sessions
     for path in sorted(DEV_STATE_ROOT.iterdir()):
         data = _read_json(path / "session.json") if path.is_dir() else None
-        if not isinstance(data, dict) or data.get("schema") != DEV_SESSION_SCHEMA:
+        if not isinstance(data, dict):
+            if path.is_dir():
+                sessions.append({
+                    "id": path.name, "schema": None, "damaged": True,
+                    "preserved_state": str(path),
+                    "preserved_data": str(_dev_data_dir(path.name)),
+                })
             continue
+        if data.get("schema") == LEGACY_DEV_SESSION_SCHEMA:
+            sessions.append({
+                "id": data.get("id") or path.name,
+                "schema": LEGACY_DEV_SESSION_SCHEMA,
+                "legacy": True,
+                "preserved_state": str(path),
+                "preserved_data": str(_dev_data_dir(path.name)),
+                "source_worktree": data.get("source", {}).get("worktree"),
+                "consumer_worktree": (data.get("consumer") or {}).get("worktree"),
+            })
+            continue
+        if data.get("schema") != DEV_SESSION_SCHEMA:
+            sessions.append({
+                "id": data.get("id") or path.name, "schema": data.get("schema"),
+                "damaged": True, "preserved_state": str(path),
+                "preserved_data": str(_dev_data_dir(path.name)),
+            })
+            continue
+        source = data.get("source") or {}
+        release_path = _release_state_path(
+            Path(str(source.get("repo") or ".")), str(source.get("ref") or "main"))
+        release = None
+        if release_path.exists():
+            raw_release = _read_json(release_path)
+            release = {
+                "path": str(release_path),
+                "valid": isinstance(raw_release, dict),
+                "state": raw_release if isinstance(raw_release, dict) else None,
+            }
+        payloads_ok = True
+        for payload in (data.get("installed_payloads") or {}).values():
+            if not isinstance(payload, dict):
+                payloads_ok = False
+                break
+            payload_path = Path(str(payload.get("path") or ""))
+            if (not payload_path.is_dir()
+                    or _payload_sha256(payload_path) != payload.get("payload_sha256")):
+                payloads_ok = False
+                break
         sessions.append({
             "id": data["id"], "capability": data.get("capability"),
+            "schema": data.get("schema"),
             "created_at": data.get("created_at"),
             "source_worktree": data.get("source", {}).get("worktree"),
-            "consumer_worktree": (data.get("consumer") or {}).get("worktree"),
+            "attached_project": (data.get("project") or {}).get("path"),
+            "installed_payloads_ok": payloads_ok,
+            "release_state": release,
             "cleanup_ready": not _dev_cleanup_problems(data),
             "cleanup_problems": _dev_cleanup_problems(data),
         })
@@ -1925,7 +3056,48 @@ def _dev_session_summaries() -> list[dict]:
 
 
 def cmd_dev_list() -> None:
-    _emit({"sessions": _dev_session_summaries(),
+    """Report schema-v2, legacy/damaged state, Git work and orphaned leases."""
+    sessions = _dev_session_summaries()
+    work: list[dict] = []
+    binding = _official_checkout_binding(required=False)
+    if binding is not None and binding.get("valid") is not False:
+        repo = Path(binding["path"])
+        worktree_entries = _dev_worktree_entries(repo)
+        worktrees = {str(item.get("branch")): item for item in worktree_entries
+                     if item.get("branch")}
+        refs = _dev_git(repo, "for-each-ref", "--format=%(refname:short)",
+                        "refs/heads/dev/*")
+        if refs.returncode == 0:
+            for branch in sorted(filter(None, refs.stdout.splitlines())):
+                item = worktrees.get(f"refs/heads/{branch}")
+                worktree = Path(str(item["worktree"])).resolve() \
+                    if item and item.get("worktree") else None
+                scope, packages, paths = _dev_candidate_scope(
+                    repo, branch, str(binding["branch"]), worktree)
+                work.append({
+                    "branch": branch,
+                    "worktree": str(worktree) if worktree else None,
+                    "scope": scope, "packages": sorted(packages), "paths": paths,
+                })
+        for item in worktree_entries:
+            if not item.get("detached") or not item.get("worktree"):
+                continue
+            worktree = Path(str(item["worktree"])).resolve()
+            if worktree == repo.resolve():
+                continue
+            head = str(item.get("HEAD") or "")
+            if head:
+                scope, packages, paths = _dev_candidate_scope(
+                    repo, head, str(binding["branch"]), worktree)
+            else:
+                scope, packages, paths = "unknown", set(), []
+            work.append({
+                "branch": None, "detached": True, "head": head or None,
+                "worktree": str(worktree), "scope": scope,
+                "packages": sorted(packages), "paths": paths,
+            })
+    _emit({"sessions": sessions, "git_work": work,
+           "active_live_leases": _active_takeover_leases(),
            "state_root": str(DEV_STATE_ROOT), "data_root": str(DEV_DATA_ROOT)})
 
 
@@ -1955,29 +3127,37 @@ def _dev_assert_owned_path(path: Path, root: Path) -> None:
 
 
 def _dev_stop(session_id: str, emit_result: bool) -> dict:
+    MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    mutation = MANAGER_MUTATION_LOCK.open("a+")
+    fcntl.flock(mutation, fcntl.LOCK_EX)
+    active = [lease for lease in _active_takeover_leases()
+              if lease.get("session_id") == session_id]
+    if active:
+        if emit_result:
+            _assert_session_without_takeover(session_id)
+        mutation.close()
+        return {"session": session_id, "removed": False,
+                "problems": ["active live takeover"]}
     session = _dev_session(session_id)
     state_dir = _dev_state_dir(session_id)
     data_dir = _dev_data_dir(session_id)
     _dev_assert_owned_path(state_dir, DEV_STATE_ROOT)
     _dev_assert_owned_path(data_dir, DEV_DATA_ROOT)
     _dev_assert_owned_path(Path(session["source"]["worktree"]), data_dir)
-    consumer = session.get("consumer")
-    if isinstance(consumer, dict) and not consumer.get("live"):
-        _dev_assert_owned_path(Path(consumer["worktree"]), data_dir)
     problems = _dev_cleanup_problems(session)
     if problems:
         if emit_result:
             _die(6, "dev_cleanup_refused", f"dev session {session_id} is not removable",
                  "; ".join(problems))
+        mutation.close()
         return {"session": session_id, "removed": False, "problems": problems}
-    if isinstance(consumer, dict):
-        _dev_remove_worktree(consumer)
     _dev_remove_worktree(session["source"])
     if data_dir.exists():
         shutil.rmtree(data_dir)
     if state_dir.exists():
         shutil.rmtree(state_dir)
     result = {"session": session_id, "removed": True}
+    mutation.close()
     if emit_result:
         _emit(result)
     return result
@@ -3220,6 +4400,176 @@ def _sources_config() -> dict:
     return raw
 
 
+def _git_checkout_identity(repo: Path) -> dict:
+    """Return stable repository identity plus the exact current worktree root.
+
+    The common directory groups linked worktrees.  The top-level path remains
+    intentionally separate because authoring commands also require binary
+    identity with the worktree under the caller's feet.
+    """
+    top = _dev_git_value(repo, "rev-parse", "--show-toplevel")
+    common = _dev_git_value(repo, "rev-parse", "--git-common-dir")
+    top_path = Path(top).resolve()
+    common_path = Path(common)
+    if not common_path.is_absolute():
+        common_path = (top_path / common_path).resolve()
+    else:
+        common_path = common_path.resolve()
+    branch_proc = _dev_git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    commit_proc = _dev_git(repo, "rev-parse", "--verify", "HEAD^{commit}")
+    return {
+        "path": str(top_path),
+        "git_common_dir": str(common_path),
+        "branch": branch_proc.stdout.strip() if branch_proc.returncode == 0 else None,
+        "commit": commit_proc.stdout.strip() if commit_proc.returncode == 0 else None,
+    }
+
+
+def _marked_checkout(path: Path) -> Path | None:
+    """Resolve a cwd to a marked capability-source checkout, or return None."""
+    probe = _dev_git(path, "rev-parse", "--show-toplevel")
+    if probe.returncode != 0:
+        return None
+    root = Path(probe.stdout.strip()).resolve()
+    marker = _read_json(root / "capabilities.repo.json")
+    return root if isinstance(marker, dict) and marker.get("kind") == "capability-source" else None
+
+
+def _official_checkout_binding(required: bool = True) -> dict | None:
+    """Load and revalidate the single durable official integration checkout.
+
+    No filesystem search is performed.  Missing, moved, linked-worktree or
+    identity-drifted bindings fail before a dev session can be created.
+    """
+    raw = _sources_config().get("official_checkout")
+    hint = (
+        "from the clean primary checkout run "
+        "`./bin/capabilities source register-checkout official`"
+    )
+    if not isinstance(raw, dict):
+        if required:
+            _die(6, "official_checkout_unregistered",
+                 "the official integration checkout is not registered", hint)
+        return None
+    path_value = raw.get("path")
+    common_value = raw.get("git_common_dir")
+    branch_value = raw.get("branch")
+    if not all(isinstance(value, str) and value for value in
+               (path_value, common_value, branch_value)):
+        if not required:
+            return {**raw, "valid": False, "problem": "malformed binding"}
+        _die(6, "official_checkout_invalid",
+             "the official checkout binding is malformed", hint)
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_dir() or _marked_checkout(path) != path:
+        if not required:
+            return {**raw, "valid": False, "problem": "checkout unavailable"}
+        _die(6, "official_checkout_stale",
+             f"the registered official checkout is unavailable: {path}", hint)
+    identity = _git_checkout_identity(path)
+    common = Path(identity["git_common_dir"])
+    remote = _dev_git(path, "remote", "get-url", "origin")
+    # For the primary worktree the common Git directory belongs directly to
+    # that worktree. Linked worktrees share it but have a different top level.
+    if (identity["git_common_dir"] != str(Path(common_value).expanduser().resolve())
+            or common.parent.resolve() != path
+            or identity.get("branch") != branch_value
+            or remote.returncode != 0
+            or _normal_git_url(remote.stdout) != _normal_git_url(OFFICIAL_GIT_URL)):
+        if not required:
+            return {**raw, "valid": False, "problem": "checkout identity drift"}
+        _die(6, "official_checkout_stale",
+             f"the official checkout binding no longer matches {path}", hint)
+    return {**raw, **identity, "valid": True}
+
+
+def cmd_source_register_checkout(source_id: str, *, emit_result: bool = True) -> dict:
+    """Register this exact primary official checkout after fail-closed checks."""
+    if source_id != OFFICIAL_SOURCE_ID:
+        _die(6, "input", "register-checkout currently supports only official")
+    cwd_root = _marked_checkout(Path.cwd())
+    manager_root = _REPO_ROOT.resolve()
+    if cwd_root is None:
+        _die(6, "not_capability_source",
+             "run register-checkout from the official capability-source checkout")
+    if cwd_root != manager_root:
+        _die(6, "manager_checkout_mismatch",
+             f"the running manager belongs to {manager_root}, not {cwd_root}",
+             "run `./bin/capabilities source register-checkout official`")
+    identity = _git_checkout_identity(cwd_root)
+    common = Path(identity["git_common_dir"])
+    if common.parent.resolve() != cwd_root:
+        _die(6, "primary_checkout_required",
+             f"cannot register linked worktree {cwd_root}",
+             "run the command from the primary integration checkout")
+    remote = _dev_git(cwd_root, "remote", "get-url", "origin")
+    if remote.returncode != 0 or _normal_git_url(remote.stdout) != _normal_git_url(OFFICIAL_GIT_URL):
+        _die(6, "official_identity_mismatch",
+             f"checkout origin is not the official source: {cwd_root}")
+    branch = identity.get("branch")
+    if branch != "main":
+        _die(6, "publication_branch_required",
+             f"the official integration checkout must be on publication branch 'main', got {branch!r}")
+    cfg = _sources_config()
+    previous = cfg.get("official_checkout")
+    if isinstance(previous, dict):
+        old_path = Path(str(previous.get("path") or "")).expanduser().resolve()
+        old_common = Path(str(previous.get("git_common_dir") or "")).expanduser().resolve()
+        if old_path != cwd_root and old_common != common and old_path.exists():
+            _die(6, "official_checkout_conflict",
+                 f"another official checkout is already registered: {old_path}",
+                 "remove the conflicting binding deliberately before registering another checkout")
+    binding = {
+        "path": str(cwd_root),
+        "git_common_dir": str(common),
+        "branch": branch,
+        "registered_at": int(time.time()),
+    }
+    cfg["official_checkout"] = binding
+    _write_json(SOURCES_FILE, cfg)
+    result = {"registered": OFFICIAL_SOURCE_ID, "checkout": binding}
+    if emit_result:
+        _emit(result)
+    return result
+
+
+def _guard_source_checkout(source_id: str, operation: str,
+                           locator: bool = False) -> Path | None:
+    """Fuse a guarded source operation to cwd and, for official, its manager.
+
+    Custom workspace locators may run outside a source checkout. All other
+    guarded calls require an exact registered/linked worktree identity. Official
+    calls additionally require the running manager to live in that exact tree.
+    """
+    cwd_root = _marked_checkout(Path.cwd())
+    if locator and source_id != OFFICIAL_SOURCE_ID and cwd_root is None:
+        return None
+    if cwd_root is None:
+        _die(6, "authoring_checkout_required",
+             f"{operation} must run from the requested source checkout")
+    requested = _source_id_for_repo(cwd_root)
+    if requested != source_id:
+        _die(6, "source_checkout_mismatch",
+             f"cwd checkout {cwd_root} identifies as {requested!r}, not {source_id!r}")
+    if source_id == OFFICIAL_SOURCE_ID:
+        manager_root = _REPO_ROOT.resolve()
+        if manager_root != cwd_root:
+            _die(6, "manager_checkout_mismatch",
+                 f"cwd checkout is {cwd_root}, but the running manager belongs to {manager_root}",
+                 "run the checkout's `./bin/capabilities`, use `capabilities dev exec`, "
+                 "or publish with `capabilities dev finish`")
+    else:
+        entry = _source_entry(source_id)
+        if entry.get("kind") != "workspace":
+            _die(6, "not_editable", f"source {source_id!r} is not editable")
+        expected = _git_checkout_identity(_source_root(source_id))["git_common_dir"]
+        actual = _git_checkout_identity(cwd_root)["git_common_dir"]
+        if actual != expected:
+            _die(6, "source_checkout_mismatch",
+                 f"cwd checkout {cwd_root} is not linked to source {source_id!r}")
+    return cwd_root
+
+
 def _source_entry(source_id: str) -> dict:
     if source_id == OFFICIAL_SOURCE_ID:
         return {"kind": "git", "url": OFFICIAL_GIT_URL, "ref": "main",
@@ -3282,7 +4632,10 @@ def _source_root(source_id: str) -> Path:
 
 
 def _source_author_root(source_id: str) -> Path:
-    """Editable root for a registered workspace or the official repo checkout."""
+    """Return the editable root selected by an already-applied identity fuse."""
+    cwd_root = _marked_checkout(Path.cwd())
+    if cwd_root is not None and _source_id_for_repo(cwd_root) == source_id:
+        return cwd_root
     if source_id == OFFICIAL_SOURCE_ID and \
             (_REPO_ROOT / "capabilities.repo.json").is_file():
         return _REPO_ROOT
@@ -3528,9 +4881,11 @@ def cmd_source_clone(source_id: str, url: str, ref: str) -> None:
 
 
 def cmd_source_list() -> None:
+    binding = _official_checkout_binding(required=False)
     entries = [{"id": OFFICIAL_SOURCE_ID, "kind": "git",
                 "url": OFFICIAL_GIT_URL, "ref": "main", "builtin": True,
-                "cached": _source_cache(OFFICIAL_SOURCE_ID).is_dir()}]
+                "cached": _source_cache(OFFICIAL_SOURCE_ID).is_dir(),
+                "checkout": binding}]
     for source_id, entry in sorted((_sources_config().get("sources") or {}).items()):
         root = _source_root(source_id)
         entries.append({"id": source_id, **entry, "available": root.is_dir()})
@@ -3539,6 +4894,37 @@ def cmd_source_list() -> None:
 
 
 def cmd_source_path(source_id: str) -> None:
+    if source_id == OFFICIAL_SOURCE_ID and _marked_checkout(Path.cwd()) is None:
+        binding = _official_checkout_binding(required=False)
+        hint = (f"registered integration checkout: {binding['path']}; run its "
+                "`./bin/capabilities source path official` or `capabilities dev list`"
+                if binding else
+                "register it with `./bin/capabilities source register-checkout official`")
+        _die(6, "official_checkout_manager_required",
+             "source path official is available only through its matching checkout manager",
+             hint)
+    _guard_source_checkout(source_id, "source path", locator=True)
+    if source_id == OFFICIAL_SOURCE_ID:
+        if (os.environ.get("CAPABILITIES_DEV_SOURCE_ID") == OFFICIAL_SOURCE_ID
+                and _REPO_ROOT.resolve() == _marked_checkout(Path.cwd())):
+            _emit({"source": source_id, "path": str(_REPO_ROOT.resolve()),
+                   "dev_session": os.environ.get("CAPABILITIES_DEV_SESSION")})
+            return
+        binding = _official_checkout_binding(required=False)
+        if binding is None:
+            _die(6, "official_checkout_unregistered",
+                 "the official integration checkout is not registered",
+                 "run `./bin/capabilities source register-checkout official` from it")
+        if binding.get("valid") is False:
+            _die(6, "official_checkout_stale",
+                 f"official checkout binding is stale: {binding.get('problem')}",
+                 "rerun `./bin/capabilities source register-checkout official` from the primary checkout")
+        if _REPO_ROOT.resolve() != Path(binding["path"]).resolve():
+            _die(6, "manager_checkout_mismatch",
+                 f"source path official requires the manager from {binding['path']}",
+                 "run that checkout's `./bin/capabilities source path official` or `capabilities dev list`")
+        _emit({"source": source_id, "path": binding["path"]})
+        return
     entry = _source_entry(source_id)
     if entry.get("kind") != "workspace":
         _die(6, "not_editable", f"source {source_id!r} is a remote cache, not an editable workspace",
@@ -3760,6 +5146,7 @@ def _source_change_scope(changed_paths: list[str]) -> tuple[bool, set[str]]:
 
 
 def cmd_source_index(source_id: str, staged: bool = False) -> None:
+    _guard_source_checkout(source_id, "source index")
     root = _source_author_root(source_id)
     if not root.is_dir():
         _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
@@ -3867,6 +5254,7 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
 
 
 def cmd_source_check(source_id: str) -> None:
+    _guard_source_checkout(source_id, "source check")
     root = _source_author_root(source_id)
     if not root.is_dir():
         _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
@@ -3886,6 +5274,7 @@ def cmd_source_check(source_id: str) -> None:
 
 
 def cmd_source_verify(source_id: str, git_ref: str) -> None:
+    _guard_source_checkout(source_id, "source verify")
     root = _source_author_root(source_id)
     if not root.is_dir():
         _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
@@ -3917,6 +5306,17 @@ def _normal_git_url(value: str | None) -> str:
 
 
 def _source_id_for_repo(repo: Path) -> str | None:
+    dev_source_id = os.environ.get("CAPABILITIES_DEV_SOURCE_ID")
+    dev_source_path = os.environ.get("CAPABILITIES_DEV_SOURCE")
+    if (dev_source_id and dev_source_path
+            and Path(dev_source_path).expanduser().resolve() == repo.resolve()):
+        return dev_source_id
+    identity = _git_checkout_identity(repo)
+    binding = _sources_config().get("official_checkout")
+    if (isinstance(binding, dict)
+            and identity["git_common_dir"] == str(
+                Path(str(binding.get("git_common_dir") or "")).expanduser().resolve())):
+        return OFFICIAL_SOURCE_ID
     remote = _dev_git(repo, "remote", "get-url", "origin")
     remote_url = remote.stdout.strip() if remote.returncode == 0 else None
     if _normal_git_url(remote_url) == _normal_git_url(OFFICIAL_GIT_URL):
@@ -3924,7 +5324,8 @@ def _source_id_for_repo(repo: Path) -> str | None:
     for source_id, entry in sorted((_sources_config().get("sources") or {}).items()):
         if entry.get("kind") == "workspace":
             configured = Path(entry.get("path") or _source_workspace(source_id)).expanduser()
-            if configured.resolve() == repo.resolve():
+            if configured.is_dir() and _git_checkout_identity(configured)[
+                    "git_common_dir"] == identity["git_common_dir"]:
                 return source_id
         if _normal_git_url(entry.get("url")) == _normal_git_url(remote_url):
             return source_id
@@ -4027,15 +5428,25 @@ def _activate_released_capability(
 
 def _remove_released_capability(name: str) -> dict:
     """Idempotently retire one installed payload; credentials remain local."""
-    reg = _registry_dir(name)
-    link = _bin_dir() / name
-    removed_link = False
-    if link.is_symlink():
-        link.unlink()
-        removed_link = True
-    removed_registry = reg.is_dir()
-    if removed_registry:
-        shutil.rmtree(reg)
+    def remove() -> tuple[Path, Path, bool, bool]:
+        _assert_payload_mutable(name)
+        reg = _registry_dir(name)
+        link = _bin_dir() / name
+        removed_link = False
+        if link.is_symlink():
+            link.unlink()
+            removed_link = True
+        removed_registry = reg.is_dir()
+        if removed_registry:
+            shutil.rmtree(reg)
+        return reg, link, removed_link, removed_registry
+    if _MANAGER_MUTATION_DEPTH:
+        reg, link, removed_link, removed_registry = remove()
+    else:
+        MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        with MANAGER_MUTATION_LOCK.open("a+") as mutation:
+            fcntl.flock(mutation, fcntl.LOCK_EX)
+            reg, link, removed_link, removed_registry = remove()
     result = {
         "name": name,
         "action": "remove",
@@ -4057,6 +5468,7 @@ def _source_release(
     branch: str,
     expected_base: str | None = None,
 ) -> dict:
+    global _MANAGER_MUTATION_DEPTH
     repo = repo.resolve()
     if _dev_git_value(repo, "status", "--porcelain"):
         _die(
@@ -4126,6 +5538,21 @@ def _source_release(
     ).splitlines()
     manager_changed, changed_capability_names = _source_change_scope(changed_paths)
     changed_capabilities = sorted(changed_capability_names)
+    for changed_name in changed_capabilities:
+        _assert_payload_mutable(changed_name)
+    manager_lock = None
+    if manager_changed or "telegram" in changed_capabilities:
+        MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        manager_lock = MANAGER_MUTATION_LOCK.open("a+")
+        MANAGER_MUTATION_LOCK.chmod(0o600)
+        fcntl.flock(manager_lock, fcntl.LOCK_EX)
+        leases = _active_takeover_leases()
+        if manager_changed and leases:
+            manager_lock.close()
+            _die(6, "takeover_manager_frozen",
+                 "manager-changing release is blocked by an active takeover",
+                 json.dumps(leases, sort_keys=True))
+        _MANAGER_MUTATION_DEPTH += 1
     report = _source_snapshot_report(
         repo,
         candidate,
@@ -4336,7 +5763,7 @@ def _source_release(
             cleanup_ref.stderr.strip() or cleanup_ref.stdout.strip() or str(state_path),
         )
     state_path.unlink(missing_ok=True)
-    return {
+    result = {
         "source": source_id or str(repo),
         "branch": branch,
         "base_commit": base_commit,
@@ -4355,10 +5782,21 @@ def _source_release(
         "manager_update": manager_update,
         "ok": True,
     }
+    if manager_lock is not None:
+        _MANAGER_MUTATION_DEPTH -= 1
+        manager_lock.close()
+    return result
 
 
 def cmd_source_release(source_id: str, git_ref: str) -> None:
-    root = _source_author_root(source_id)
+    root = _guard_source_checkout(source_id, "source release")
+    assert root is not None
+    if source_id == OFFICIAL_SOURCE_ID:
+        binding = _official_checkout_binding()
+        if root != Path(binding["path"]).resolve():
+            _die(6, "integration_checkout_required",
+                 f"direct official release requires {binding['path']}",
+                 "publish a dev worktree with `capabilities dev finish <session>`")
     entry = _source_entry(source_id)
     branch = str(entry.get("ref") or "main")
     _emit(_source_release(root, source_id, git_ref, branch))
@@ -4518,6 +5956,7 @@ def cmd_new_capability(name: str, source_id: str, core_only: bool) -> None:
         _die(6, "bad_name", f"invalid capability name {name!r}",
              "use lowercase letters, digits, and hyphens; start with a letter")
     _reject_reserved_capability_name(name)
+    _guard_source_checkout(source_id, "new")
     entry = _source_entry(source_id)
     official_checkout = source_id == OFFICIAL_SOURCE_ID and \
         (_REPO_ROOT / "capabilities.repo.json").is_file()
@@ -4546,6 +5985,7 @@ def cmd_new_capability(name: str, source_id: str, core_only: bool) -> None:
 
 
 def cmd_source_sync(source_id: str) -> None:
+    _guard_source_checkout(source_id, "source sync")
     entry = _source_entry(source_id)
     official_checkout = source_id == OFFICIAL_SOURCE_ID and \
         (_REPO_ROOT / "capabilities.repo.json").is_file()
@@ -4833,11 +6273,12 @@ unless the project's context owner answers otherwise). Only the editable source 
 git authoring workspace. Never commit from the cache, registry, or project
 envelope. `capabilities source path <id>` returns the exact editable path.
 
-The manager owns `{SOURCES_FILE}`. Its shape is
-`{{"sources": {{"<id>": {{"kind": "git", "url": "<git-url>", "ref":
-"main"}}}}}}`; use `source init`, `source clone`, `source add`, and `source
-remove` instead of editing it. `source list` is the supported inspection
-surface. A source repository is recognized by `capabilities.repo.json`, its
+The manager owns `{SOURCES_FILE}`. Alongside `sources`, it records the one
+official integration checkout path, Git common-dir identity and publication
+branch. Register or repair that binding from the primary checkout with
+`./bin/capabilities source register-checkout official`; never edit it by hand.
+Use `source init`, `source clone`, `source add`, and `source remove` for custom
+entries. `source list` is the supported inspection surface. A source repository is recognized by `capabilities.repo.json`, its
 vendored `contract/`, and generated `.capability-source/catalog.json`.
 """,
         "publishing": """\
@@ -4857,6 +6298,11 @@ release resumes the same target commit; a different target is refused until that
 release is resolved. The manager never creates the commit because scope and
 message remain author judgment.
 
+`capabilities dev finish <session>` calls this same transaction with the
+session's recorded base. If the remote integrity gate has not accepted the
+candidate it returns `release_pending`, preserves the session and does not
+long-poll CI. Rerun the identical finish command after the gate settles.
+
 Consumers attach the published repository with `capabilities source add <id>
 <git-url> [--ref <ref>]`, inspect it with `capabilities search --source <id>`,
 and install explicitly with `capabilities install <name> --source <id>`.
@@ -4875,98 +6321,54 @@ skip flag exists.
         "dev": f"""\
 # Isolated capability development
 
-The whole cycle for changing capability source, end to end: an isolated session,
-a delegated edit, conformance, review, publication, delivery.
+Start where the defect was discovered, in the real consuming project:
 
-## The session
+    capabilities dev start <name>
 
-`capabilities dev start <name> --source <repo> [--consumer <repo>] [--session
-<session>]` creates a git worktree on branch `dev/<session>`, plus a
-session-scoped HOME, registry, PATH bin, config, state, data, cache, and logs:
+The registered official integration checkout supplies one managed source
+worktree at `{DEV_DATA_ROOT}/<session>/source`. The current project is attached
+in place: no consumer worktree is created, and the manager never cleans,
+commits, publishes or removes it. From a source checkout pass `--project PATH`
+or `--no-project`; custom sources use `--source ID-OR-PATH`.
 
-    worktrees:  {DEV_DATA_ROOT}/<session>/
-    isolation:  {DEV_STATE_ROOT}/<session>/
+Edit only the returned source worktree. `dev exec <session> -- <command>` is the
+hermetic lane: isolated HOME/registry/XDG roots and no ambient credentials.
+Refresh packages with `dev install <session> <name>`. `dev run <session> <name>
+-- <args>` is the attached-project lane: it executes exactly the session payload
+with project policy/config and a temporary selected-capability user fallback;
+`--project-only` disables that fallback. Secrets stay in the child environment
+and known values are redacted from forwarded output.
 
-Attach a consumer with `--consumer` for an isolated consumer worktree;
-`--consumer-live` is for a deliberate final read-only smoke test. The source
-integration checkout is clean before `dev start`, and edits happen only in the
-returned worktree.
+Telegram live service testing is explicit:
 
-The session's `capabilities` binary is a symlink onto that worktree's
-`bin/capabilities`, so a manager-side edit is live on the next session command.
-A capability package is a payload instead: refresh it with `dev install
-<session> <name>` after each source edit, then exercise it through `dev exec
-<session> -- <command>`, which runs foreground processes whose lifetime is that
-command's. Parent environment is denied by default; `--inherit-env KEY` opts in
-one named value while keeping it off argv. Prefer test credentials and
-session-specific ports or resource names when the capability talks to a live
-service: the session is process and state isolation, not a security sandbox.
-`dev doctor` proves executable provenance and cleanup state.
+    capabilities dev live start <session> telegram
+    capabilities dev live status <session> telegram
+    capabilities dev live stop <session> telegram
 
-## The edit is delegated
+It borrows the real account state under one durable account-scoped lease. It
+does not copy or merge auth sessions or watermarks. A stale transition is
+fail-closed and restored with `capabilities dev live recover <session> telegram
+--restore-canonical`.
 
-The edit is authored by an agent booted with this repo's own context, so the
-doctrine is loaded at write time rather than checked afterwards. That is the
-requirement; the `askproject` capability shipped in this same repo is how it is
-met:
+`dev start`, `dev list`, `dev doctor`, `dev check` and `dev finish` rediscover
+managed and manual Git work on demand. Same-package work refuses by default;
+`--allow-parallel` applies only to a known same-capability overlap, never shared
+or unknown scope. No project reminder or ContextKit state is created.
 
-    askproject <source-worktree> --act "<task>. Dev session id: <session>."
+Before publication, derive checks from the recorded base rather than current
+worktree cleanliness:
 
-Carry the session id in the prompt so the authoring agent drives its own
-`capabilities dev install <session> <name>` and `capabilities dev exec <session>
--- <command>` checks against the behaviour it is changing.
-
-## Conformance inside the session
-
-A manager-side change — `bin/capabilities` and the authoring assets it emits —
-is gated by `capabilities selfcheck`. A capability package is gated by
-`capabilities audit <name>`, `capabilities sync-contract --check`, and
-`capabilities doctor`. This repo is public, so the `sanitize-project` skill runs
-before the commit.
-
-## Review reads the diff alone
-
-Review is a second `askproject` call on the same worktree, in read mode and in a
-fresh session rather than `-c`: a continued session carries the author's own
-rationalisations, and review needs a context that has seen only the diff and the
-doctrine.
-
-    askproject <source-worktree> "Review commit <sha> on dev/<session>."
-
-`askproject` keeps one session per target path, so that call ends the author's
-continuation: a correction goes back as a fresh `--act` call rather than `-c`.
-A substantive finding keeps the session — correct the prepared branch in place
-and hand it back only once the focused checks pass again.
-
-## Publication
-
-`<id>` is the source id this repo is registered under; `capabilities source
-list` names it, and `dev finish` resolves the same id from the session itself.
-Stage the intended files, then:
-
-    capabilities source index <id> --staged
+    capabilities dev check <session>
+    ./bin/capabilities source index <id> --staged
     git commit
+    capabilities dev check <session>
     capabilities dev finish <session>
 
-`capabilities guide publishing` owns the release semantics. `dev finish` hands
-the prepared commit to that same transaction and removes the worktrees once
-publication, checkout sync, and local registry reconciliation all succeed.
-
-`dev finish` advances the protected source branch itself, inside that
-transaction and without a separate human approval step. Human judgment belongs
-to the non-routine situation; routine publication is the transaction's own work.
-
-## Delivery
-
-The releasing machine self-updates inside the release transaction when the
-manager changed. Every other consumer runs `capabilities self-update` for the
-manager, and `capabilities update <name>` for a capability payload; `update`
-covers payloads, the manager has its own verb.
-
-`dev stop` is the non-publishing cleanup primitive for an empty, already
-integrated, or patch-equivalent session; `dev gc` applies that preservation rule
-to old sessions. Dirty, unpublished, remotely diverged, or partially released
-work is retained with a precise refusal.
+`dev finish` uses the existing source-release transaction. A `release_pending`
+result preserves the session; wait for the integrity gate and rerun the same
+command to resume the same candidate. Cleanup occurs only after publication,
+checkout reconciliation and local payload reconciliation succeed. `dev stop`
+and `dev gc` retain dirty, unpublished, damaged, live or divergent work.
 """,
     }
     if topic not in guides:
@@ -5257,7 +6659,7 @@ def main() -> None:
         if not rest:
             _die(
                 6, "input",
-                "dev needs a subcommand: start, install, exec, doctor, list, finish, stop, or gc",
+                "dev needs a subcommand: start, install, exec, run, check, live, doctor, list, finish, stop, or gc",
             )
         sub, dev_args = rest[0], rest[1:]
 
@@ -5285,13 +6687,17 @@ def main() -> None:
         if sub == "start":
             if len(dev_args) < 1 or dev_args[0].startswith("--"):
                 _die(6, "input", "dev start needs a primary capability name")
-            source_ref = dev_opt("--source")
-            if not source_ref:
-                _die(6, "input", "dev start needs --source PATH")
+            obsolete = [flag_name for flag_name in
+                        ("--consumer", "--consumer-live", "--consumer-ref", "--ref")
+                        if flag_name in dev_args]
+            if obsolete:
+                _die(6, "obsolete_dev_option",
+                     f"legacy dev start option is no longer supported: {obsolete[0]}",
+                     "use --project PATH to attach the existing checkout")
             cmd_dev_start(
-                dev_args[0], source_ref, dev_opt("--consumer"),
-                dev_opt("--consumer-live"), dev_opt("--ref") or "main",
-                dev_opt("--consumer-ref") or "HEAD", dev_opt("--session"))
+                dev_args[0], dev_opt("--source"), dev_opt("--project"),
+                "--no-project" in dev_args, dev_opt("--session"),
+                "--allow-parallel" in dev_args)
         elif sub == "install":
             values = [value for value in dev_args if not value.startswith("--")]
             if len(values) < 2:
@@ -5306,6 +6712,35 @@ def main() -> None:
                 _die(6, "input", "dev exec needs a session id")
             cmd_dev_exec(controls[0], command, dev_opt("--cwd", controls),
                          dev_opts("--inherit-env", controls))
+        elif sub == "run":
+            if "--" not in dev_args:
+                _die(6, "input", "dev run needs -- before capability arguments")
+            divider = dev_args.index("--")
+            controls, child_args = dev_args[:divider], dev_args[divider + 1:]
+            values = [value for value in controls if not value.startswith("--")]
+            if len(values) != 2:
+                _die(6, "input", "dev run needs a session and capability")
+            cmd_dev_run(values[0], values[1], child_args,
+                        "--project-only" in controls)
+        elif sub == "check":
+            if len(dev_args) != 1 or dev_args[0].startswith("--"):
+                _die(6, "input", "dev check needs exactly one session id")
+            cmd_dev_check(dev_args[0])
+        elif sub == "live":
+            if len(dev_args) < 3:
+                _die(6, "input", "dev live needs an action, session, and adapter")
+            action, live_session, adapter = dev_args[:3]
+            if action == "start":
+                cmd_dev_live_start(live_session, adapter)
+            elif action == "status":
+                cmd_dev_live_status(live_session, adapter)
+            elif action == "stop":
+                cmd_dev_live_recover(live_session, adapter, True)
+            elif action == "recover":
+                cmd_dev_live_recover(
+                    live_session, adapter, "--restore-canonical" in dev_args[3:])
+            else:
+                _die(6, "input", f"unknown dev live action: {action}")
         elif sub == "doctor":
             if not dev_args:
                 _die(6, "input", "dev doctor needs a session id")
@@ -5358,6 +6793,10 @@ def main() -> None:
             if len(pos) < 3:
                 _die(6, "input", "source clone needs an id and git URL")
             cmd_source_clone(pos[1], pos[2], opt("--ref") or "main")
+        elif sub == "register-checkout":
+            if len(pos) < 2:
+                _die(6, "input", "source register-checkout needs an id")
+            cmd_source_register_checkout(pos[1])
         elif sub == "list":
             cmd_source_list()
         elif sub == "path":

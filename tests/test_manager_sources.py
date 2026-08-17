@@ -26,8 +26,24 @@ def _env(tmp_path: Path) -> dict[str, str]:
 
 
 def _run(env: dict[str, str], *args: str, check: bool = True):
+    cwd = REPO
+    config_path = Path(env["XDG_CONFIG_HOME"]) / "capabilities" / "sources.json"
+    config = json.loads(config_path.read_text()) if config_path.is_file() else {"sources": {}}
+    source_id = None
+    if args and args[0] == "new" and "--source" in args:
+        source_id = args[args.index("--source") + 1]
+    elif len(args) >= 3 and args[:2] in (
+            ("source", "index"), ("source", "check"),
+            ("source", "verify"), ("source", "sync")):
+        source_id = args[2]
+    if source_id:
+        entry = (config.get("sources") or {}).get(source_id) or {}
+        if entry.get("path"):
+            cwd = Path(entry["path"])
+    elif len(args) >= 3 and args[:2] == ("source", "path"):
+        cwd = Path(env["CAPABILITIES_HOME"]).parent
     result = subprocess.run(
-        [str(MANAGER), *args], cwd=REPO, env=env, text=True,
+        [str(MANAGER), *args], cwd=cwd, env=env, text=True,
         capture_output=True, timeout=120,
     )
     if check and result.returncode != 0:
@@ -69,6 +85,25 @@ def test_manager_and_generated_scaffold_each_have_one_pep723_block(tmp_path):
         env, "new", "demo", "--source", "personal").stdout)
     generated = Path(created["executable"]).read_text()
     assert generated.splitlines().count("# /// script") == 1
+
+
+def test_custom_authoring_refuses_a_different_marked_checkout(tmp_path):
+    env = _env(tmp_path)
+    initialized = json.loads(_run(env, "source", "init", "personal").stdout)
+    workspace = Path(initialized["path"])
+    refused = subprocess.run(
+        [str(MANAGER), "new", "demo", "--source", "personal"],
+        cwd=REPO, env=env, text=True, capture_output=True, timeout=120,
+        check=False,
+    )
+    assert refused.returncode == 6
+    assert json.loads(refused.stderr)["error"]["code"] == "source_checkout_mismatch"
+    created = json.loads(subprocess.run(
+        [str(MANAGER), "new", "demo", "--source", "personal"],
+        cwd=workspace, env=env, text=True, capture_output=True, timeout=120,
+        check=True,
+    ).stdout)
+    assert Path(created["path"]).parent == workspace / "capabilities"
 
 
 def test_authoring_workspace_is_canonical_and_install_is_strict(tmp_path):

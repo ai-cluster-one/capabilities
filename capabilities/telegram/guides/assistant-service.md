@@ -14,13 +14,13 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
 
    ```sh
    capabilities init
-   capabilities enable telegram
+   capabilities enable telegram --project
    telegram service init
    ```
 
 3. Edit `capabilities/telegram/service/settings.json`:
 
-   - Set `connection` to the Telegram account ID or rely on the account-ID default in `capabilities/telegram/connections.json`.
+   - Set `connection` to the registry label whose entry carries the intended positive `expected_account_id`, or rely on the registry default.
    - Add `allowed_users` and `allowed_groups`.
    - Add optional per-channel `context_file` or short inline `context` entries when a chat needs its own soft prompt overlay.
    - Review `control.roles`: this hard gate limits who may run service control commands such as `/set`, `/reload`, and `/stop`.
@@ -34,11 +34,12 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
 
    ```json
    {
-     "default": "8200881535",
-     "connections": {
-       "8200881535": {
+    "default": "marvin",
+    "connections": {
+      "marvin": {
          "name": "Assistant",
          "username": "assistant_username",
+         "expected_account_id": 8200881535,
          "api_id": 123456,
          "secret_env": "TELEGRAM_API_HASH",
          "allow_write": true
@@ -47,27 +48,34 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
    }
    ```
 
-   The connection key (`8200881535`) is the stable Telegram user/account ID;
-   `api_id` is the separate Telegram API application ID. `name` and `username`
-   are display metadata. For an existing labelled key such as `assistant`, run
-   `telegram login --connection assistant` once: the result reports the actual
-   account ID and an explicit rename/default migration. Labels are never
-   silently reinterpreted as identities.
+   `expected_account_id` is the stable Telegram user/account ID; `api_id` is
+   the separate Telegram API application ID. The registry key may remain a
+   descriptive label. Run `telegram login --connection <label>` to discover
+   the account ID, then bind it explicitly before service or live operation.
 
 5. Authenticate and check readiness:
 
    ```sh
-   telegram login --connection 8200881535
-   telegram doctor --connection 8200881535
-   telegram service doctor --connection 8200881535
+   telegram login --connection marvin
+   telegram doctor --connection marvin
+   telegram service doctor --connection marvin
    ```
 
-6. Start and inspect the service:
+6. Stop every legacy Telegram daemon for the current user and perform the
+   one-time ownership cutover. The command scans all current-user processes and
+   refuses while any old daemon is still observable:
 
    ```sh
-   telegram service start --connection 8200881535
-   telegram service status --connection 8200881535
-   telegram service logs --connection 8200881535 --tail 80
+   telegram service migrate-ownership --connection marvin \
+     --confirm-all-legacy-daemons-stopped
+   ```
+
+7. Start and inspect the service:
+
+   ```sh
+   telegram service start --connection marvin
+   telegram service status --connection marvin
+   telegram service logs --connection marvin --tail 80
    ```
 
 Use `telegram service stop` or foreground `run` for supervisor-managed processes. On macOS/local dev, `start` uses a background process with a PID file under the connection's service state directory.
@@ -98,11 +106,31 @@ $XDG_STATE_HOME/telegram/8200881535/service/progress/
 $XDG_STATE_HOME/telegram/8200881535/service/worker-sessions/
 $XDG_STATE_HOME/telegram/8200881535/service/daemon.log
 $XDG_STATE_HOME/telegram/8200881535/service/daemon.pid
+$XDG_STATE_HOME/telegram/8200881535/service/state-schema.json
+$XDG_STATE_HOME/telegram/8200881535/control/ownership-v1.json
+$XDG_STATE_HOME/telegram/8200881535/control/daemon.lock
+$XDG_STATE_HOME/telegram/8200881535/control/owner.json
+$XDG_STATE_HOME/telegram/8200881535/control/takeover.json
 $XDG_STATE_HOME/telegram/8200881535/calls/recordings/<timestamp>-<chat>-call-<id>.ogg
 $XDG_STATE_HOME/telegram/8200881535/calls/recordings/<timestamp>-<chat>-call-<id>.json
 ```
 
-The auth session and service runtime files are separate. Worker session copies let `telegram download` run inside workers without contending on the daemon's Telethon SQLite session.
+The auth session and service runtime files are separate. `TELEGRAM_SERVICE_STATE_DIR`
+may relocate runtime files, but never the account-global `control/` directory.
+`owner.json` names the actual bundle, launch nonce, project, connection, auth
+session, state and health paths. The exact positive `service_state_version` in
+the canonical payload, development payload and `state-schema.json` must agree;
+live takeover never migrates or downgrades state. Marker-less pre-feature state
+is version 1 and receives only an atomic version-1 marker from compatible code.
+
+For a managed development session, use `capabilities dev live start <session>
+telegram`. The manager stops only a matching canonical owner, launches the
+session payload against the same auth session and watermark register, and keeps
+a durable `takeover.json` transition lease. `dev live stop` restores the
+recorded canonical state. After interruption, `dev live status` is read-only and
+`capabilities dev live recover <session> telegram --restore-canonical` performs
+the explicit fail-closed restoration. Auth and register files are never copied
+or merged.
 
 ## Behavior
 

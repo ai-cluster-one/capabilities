@@ -14,6 +14,7 @@ import pytest
 _coolify_path = Path(__file__).parent.parent / "bin" / "coolify"
 _code = _coolify_path.read_text()
 coolify_module = types.ModuleType("coolify_management")
+coolify_module.__file__ = str(_coolify_path)
 exec(_code, coolify_module.__dict__)
 sys.modules["coolify_management"] = coolify_module
 
