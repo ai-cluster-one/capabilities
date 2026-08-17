@@ -30,7 +30,7 @@ tier; a core-only capability has no archetype because it has no connection.
 
 WHAT EACH CAPABILITY MUST DEFINE *ABOVE* THE FENCES (the vendored blocks read
 these module-level names; they are the only coupling):
-    core:        NAME, SUMMARY, SCOPE, DOCS_BASE, TOPICS, STATE,
+    core:        NAME, SUMMARY, SCOPE, DOCS_BASE, STATE,
                  POST_INSTALL, _CONFIG_HOME, _STATE_HOME
     connections: CREDENTIALS_ENV, CRED_KEYS, WRITE_VERBS, WRITE_DEFAULT
     plus the stdlib imports the helpers use: os, sys, json, Path, NoReturn.
@@ -419,13 +419,55 @@ def _docs_base() -> str:
             or DOCS_BASE)
 
 
+def _guide_dir() -> Path:
+    executable = Path(__file__).resolve()
+    bundle = (executable.parent.parent
+              if executable.parent.name == "bin" else executable.parent)
+    return bundle / "guides"
+
+
+def _guide_menu() -> list[dict[str, str]]:
+    menu = []
+    guide_dir = _guide_dir()
+    files = sorted(guide_dir.glob("*.md")) if guide_dir.is_dir() else []
+    for path in files:
+        lines = path.read_text().splitlines()
+        title = ""
+        title_index = -1
+        for index, line in enumerate(lines):
+            if line.startswith("# "):
+                title = line[2:].strip()
+                title_index = index
+                break
+        paragraph = []
+        for line in lines[title_index + 1:]:
+            stripped = line.strip()
+            if not stripped:
+                if paragraph:
+                    break
+                continue
+            if stripped.startswith("#"):
+                break
+            paragraph.append(stripped)
+        topic = path.stem
+        menu.append({
+            "topic": topic,
+            "title": title,
+            "preview": " ".join(paragraph),
+            "command": f"{NAME} guide {topic}",
+        })
+    return menu
+
+
 def _cmd_guide(argv: list[str]) -> None:
+    menu = _guide_menu()
     if not argv:
-        _emit(sorted(TOPICS)); return
+        _emit(menu); return
     topic = argv[0]
-    if topic not in TOPICS:
+    topics = {entry["topic"] for entry in menu}
+    if topic not in topics:
         _die(3, "not_found", f"no guide topic {topic!r}",
-             f"topics: {', '.join(sorted(TOPICS)) or 'none shipped'}")
+             f"run `{NAME} guide` to list available guides")
     import urllib.error as _ue
     import urllib.request as _ur
     url = _docs_base().rstrip("/") + "/" + topic + ".md"
@@ -607,7 +649,8 @@ def _contract(argv: list[str]) -> None:
     elif cmd == "manifest":
         _emit({"name": NAME, "summary": SUMMARY,
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
-               "docs": {"base": DOCS_BASE, "topics": sorted(TOPICS)},
+               "docs": {"base": DOCS_BASE,
+                        "topics": [entry["topic"] for entry in _guide_menu()]},
                "state": STATE, "post_install": POST_INSTALL})
     elif cmd == "guide":
         _cmd_guide(argv[1:])

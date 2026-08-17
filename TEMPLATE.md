@@ -30,7 +30,7 @@ Two questions place any piece of knowledge, and crossing them leaves no blurry m
 
 |  | The product — read and consumed | The meta — how to author it |
 |---|---|---|
-| **Framework** — every capability | *(none — the framework is meta)* | the doctrine, this template, [SHEBANG.md](SHEBANG.md); the authoring procedures the manager emits (`capabilities new` / `conform` / `groom`) |
+| **Framework** — every capability | *(none — the framework is meta)* | the doctrine, this template, [SHEBANG.md](SHEBANG.md); the manager guides surfaced by `capabilities guide [topic]` |
 | **Capability** — this tool, every project | the CLI + `<name> help`; the `stub` line | the **guide** — `<name> guide [topic]`, fetched live (DOCTRINE rule 14) |
 | **Project** — only here | connections + identifiers (values), references (model), routines (procedure) | *— empty: authoring guidance is never project-specific —* |
 
@@ -43,7 +43,7 @@ The project-meta cell is empty on purpose: authoring guidance never varies by pr
 | The script | `bin/<name>` upstream → registry copy at `~/.capabilities/<name>/<name>`, symlinked onto `PATH` | capability | the executable contract: domain verbs + the contract verbs |
 | The bundle *(opt)* | files beside `bin/<name>` upstream → copied under `~/.capabilities/<name>/` on source-directory install | capability | helper assets, templates, or service engines used by the executable; never copied into consuming projects |
 | The declaration | verbs on the script — `stub`, `manifest --json` — snapshotted by the manager at install | capability | the one-line awareness text; the machine-readable manifest (name, summary, credential scope and keys, docs base, state flag, optional service metadata) |
-| Guides *(opt)* | `guides/<topic>.md` beside the script upstream, surfaced by `<name> guide` fetched live | capability | consumer-neutral *how to author X with this tool* docs (DOCTRINE rule 14); present only when the tool has authoring depth |
+| Guides *(opt)* | `guides/<topic>.md` beside the script upstream, listed with title/preview by `<name> guide` and fetched live by topic | capability | consumer-neutral *how to author X with this tool* docs (DOCTRINE rule 14); present only when the tool has authoring depth |
 | Connections | project `capabilities/<name>/connections.json`, else global `$XDG_CONFIG_HOME/<name>/connections.json` — standard envelope (`default` pointer + `connections` map), entry interior capability-owned | project / user | explicitly named endpoints and identities: per-connection non-secret wiring, secrets by env-key indirection, the write gate (`allow_write`) |
 | Service config *(opt)* | `capabilities/<name>/service/` | project | project-local policy/context for a bundled service; `init`/`start`/`run` require explicit project enable, while the engine code runs from the installed bundle and its provider-neutral deployment contract, when present, is declared at `manifest.service.deploy` |
 | Identifiers | `capabilities/<name>/identifiers.json` — CLI-managed envelope, written by `<name> ids set` and rendered by `capabilities ids <name>` | project | the non-secret structural values the CLI **discovered**: ids, labels, classifications, breadcrumbs |

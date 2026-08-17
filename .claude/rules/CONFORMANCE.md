@@ -7,10 +7,10 @@ change to a capability or the shared contract:
 - `capabilities sync-contract --check` — the vendored shared regions against `contract/preamble.py`.
 - `capabilities doctor` — registry, snapshots, gate, and gitignore guard in agreement.
 
-An unmet clause is a violation to fix, not to note. Authoring runs through the
-manager's emitted procedures — `capabilities new`, `conform <ref>`,
-`groom <name>` — which keep the judgment with the agent and the steps in one
-home. `capabilities help` is the full surface.
+An unmet clause is a violation to fix, not to note. Framework-level authoring
+and review workflows live in the manager's on-demand guide surface; start with
+`capabilities guide` and load the relevant topic. `capabilities help` is the
+full executable surface.
 
 Those checks prove a capability obeys the manager. `capabilities selfcheck`
 proves the inward half — that the manager obeys the doctrine and the repo is

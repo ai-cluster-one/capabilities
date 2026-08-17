@@ -59,7 +59,20 @@ def test_guide_menu_surfaces_shipped_service_guide(tmp_path):
     project = _project(tmp_path)
     proc = _run([str(SCRIPT), "guide"], _env(tmp_path, project), project)
     assert proc.returncode == 0
-    assert json.loads(proc.stdout) == ["service"]
+    assert json.loads(proc.stdout) == [
+        {
+            "topic": "service",
+            "title": "Slack service",
+            "preview": (
+                "The optional Slack service receives Socket Mode events and applies "
+                "three independent decisions: admission, answer-versus-relay routing, "
+                "and per-role capability authority. Run `slack help` for the lifecycle "
+                "command surface and "
+                "credential scopes; this guide explains the operating model."
+            ),
+            "command": "slack guide service",
+        }
+    ]
 
 
 def test_service_start_obeys_write_gate_before_credentials_or_network(tmp_path):
@@ -138,6 +151,8 @@ def test_manager_installs_the_complete_slack_bundle(tmp_path):
     assert (installed / "service" / "daemon.py").is_file()
     assert (installed / "service" / "validation.py").is_file()
     assert (installed / "guides" / "service.md").is_file()
+    assert (installed / "slack").is_file()
+    assert not (installed / "bin" / "slack").exists()
     manifest = json.loads((installed / "manifest.json").read_text())
     assert manifest["service"]["name"] == "assistant"
 
@@ -159,16 +174,13 @@ def test_audit_rejects_service_directory_missing_from_manifest(tmp_path):
     assert any("service/ ships" in failure for failure in failures)
 
 
-def test_audit_rejects_guide_files_missing_from_topics(tmp_path):
+def test_audit_rejects_guide_without_preview(tmp_path):
     bundle = tmp_path / "slack"
     shutil.copytree(BUNDLE, bundle)
-    script = bundle / "bin" / "slack"
-    script.write_text(
-        script.read_text().replace('TOPICS = ["service"]', "TOPICS = []", 1)
-    )
+    (bundle / "guides" / "service.md").write_text("# Slack service\n")
     proc = _run(
         [str(MANAGER), "audit", "slack", "--from", str(bundle)], dict(os.environ), REPO
     )
     assert proc.returncode == 7
     failures = json.loads(proc.stdout)["failures"]
-    assert any("guide files do not match" in failure for failure in failures)
+    assert any("incomplete menu entry" in failure for failure in failures)

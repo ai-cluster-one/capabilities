@@ -219,16 +219,15 @@ VERIFICATION VERBS
         a deliberate break, every standing rule names an enforcement the manager
         actually has, and every doc link resolves. Exit 0 whole, 7 otherwise.
 
-AUTHORING VERBS (emit agent-executable instructions; judgment stays with the agent)
-  new [<name> --source ID [--core-only]]
-                   With no name, emit the authoring procedure. With a name,
-                   create a canonical capability skeleton in that source;
-                   generated contract regions are stamped by the manager.
-  guide <authoring|repositories|publishing|contract|dev>
-                   Manager-bundled offline guidance for custom sources.
-  conform <ref>    The procedure for bringing an existing script to the contract.
-  groom <name>     The procedure for reviewing an installed capability.
-  sanitize <name>  The procedure for reviewing this project's envelope for <name>.
+AUTHORING
+  new <name> --source ID [--core-only]
+        Create a canonical capability skeleton in that source; generated
+        contract regions are stamped by the manager.
+  guide [<topic>]
+        Without a topic, list manager guides with their titles, previews, and
+        exact read commands. With a topic, print that guide's Markdown body.
+        Start here for capability authoring, repositories, contract work,
+        development, review, sanitizing, and publishing.
 
 I/O CONTRACT
   Success: JSON on stdout, except the documented Markdown renderers
@@ -344,6 +343,14 @@ _AUTHORING_ASSETS = (
     "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md", "ROUTINES.md",
     "contract/preamble.py",
 )
+_MANAGER_GUIDE_TOPICS = (
+    "authoring", "conforming", "contract", "dev", "grooming", "publishing",
+    "repositories", "sanitizing",
+)
+_MANAGER_RUNTIME_ASSETS = tuple(
+    f"guides/{topic}.md" for topic in _MANAGER_GUIDE_TOPICS
+)
+_MANAGER_RELEASE_ASSETS = _AUTHORING_ASSETS + _MANAGER_RUNTIME_ASSETS
 
 # ---------------------------------------------------------------- I/O contract
 
@@ -364,6 +371,38 @@ def _die(exit_code: int, code: str, message: str, hint: str | None = None) -> No
 
 def _warn(message: str) -> None:
     sys.stderr.write(json.dumps({"warning": message}, ensure_ascii=False) + "\n")
+
+
+def _guide_menu(guide_dir: Path, command: str) -> list[dict[str, str]]:
+    menu = []
+    files = sorted(guide_dir.glob("*.md")) if guide_dir.is_dir() else []
+    for path in files:
+        lines = path.read_text().splitlines()
+        title = ""
+        title_index = -1
+        for index, line in enumerate(lines):
+            if line.startswith("# "):
+                title = line[2:].strip()
+                title_index = index
+                break
+        paragraph = []
+        for line in lines[title_index + 1:]:
+            stripped = line.strip()
+            if not stripped:
+                if paragraph:
+                    break
+                continue
+            if stripped.startswith("#"):
+                break
+            paragraph.append(stripped)
+        topic = path.stem
+        menu.append({
+            "topic": topic,
+            "title": title,
+            "preview": " ".join(paragraph),
+            "command": f"{command} guide {topic}",
+        })
+    return menu
 
 # ---------------------------------------------------------------- shared shape
 
@@ -961,8 +1000,12 @@ def _validate_manifest(name: str, manifest) -> list[str]:
     if isinstance(docs, dict):
         if not isinstance(docs.get("base", ""), str):
             problems.append("docs.base is not a string")
-        if not isinstance(docs.get("topics", []), list):
+        topics = docs.get("topics", [])
+        if not isinstance(topics, list):
             problems.append("docs.topics is not a list")
+        elif (not all(isinstance(topic, str) and topic for topic in topics)
+              or topics != sorted(set(topics))):
+            problems.append("docs.topics must be sorted unique non-empty strings")
     else:
         problems.append("docs is not an object")
     if not isinstance(manifest.get("state"), bool):
@@ -1163,7 +1206,12 @@ def _install_payload(name: str, content: bytes, bundle_dir: Path | None,
     reg = registry
     reg.mkdir(parents=True, exist_ok=True)
     if bundle_dir is not None:
+        source_script = _bundle_script(bundle_dir, name)
         shutil.copytree(bundle_dir, reg, dirs_exist_ok=True, ignore=_bundle_ignore)
+        if source_script is not None:
+            copied_script = reg / source_script.relative_to(bundle_dir)
+            if copied_script != reg / name:
+                copied_script.unlink(missing_ok=True)
     script = reg / name
     script.write_bytes(content)
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -1173,6 +1221,15 @@ def _install_payload(name: str, content: bytes, bundle_dir: Path | None,
 def _validate_installed_payload(name: str, manifest: dict,
                                 registry: Path | None = None) -> None:
     reg = registry or _registry_dir(name)
+    topics = set((manifest.get("docs") or {}).get("topics") or [])
+    guide_dir = reg / "guides"
+    shipped = ({path.stem for path in guide_dir.glob("*.md")}
+               if guide_dir.is_dir() else set())
+    if topics != shipped:
+        _die(6, "guide_bundle_incomplete",
+             f"{name}: installed guide files do not match manifest topics",
+             f"files={sorted(shipped)}, manifest={sorted(topics)}; "
+             "install the full bundle")
     if manifest.get("service") is not None and not (reg / "service").is_dir():
         _die(6, "service_bundle_missing",
              f"{name}: manifest declares a service but service/ was not installed",
@@ -1430,7 +1487,7 @@ def _activate_manager_release(
         "sha256_after": after,
         "symlink": str(link),
         "source": source,
-        "authoring_assets": sorted(assets),
+        "manager_assets": sorted(assets),
     }
 
 
@@ -1462,7 +1519,7 @@ def cmd_self_update() -> None:
             _die(5, "server_error", f"fetch returned {resp.status_code}", url)
         content = resp.content
         assets: dict[str, bytes] = {}
-        for rel in _AUTHORING_ASSETS:
+        for rel in _MANAGER_RELEASE_ASSETS:
             asset_url = f"{SOURCE}/{rel}"
             try:
                 asset_resp = httpx.get(asset_url, follow_redirects=True, timeout=30.0)
@@ -3760,7 +3817,7 @@ verbs:
 - `<name> doctor` — proves credentials, reachability, identity, per connection
 - `<name> connections` — where every value resolves from (tier, source,
   secrets masked) — local only, no network
-- `<name> guide [<topic>]` — its how-to guides, fetched live
+- `<name> guide [<topic>]` — its guide menu with previews / one live guide
 - `<name> ids list|get|set|rm` — the project's identifiers envelope
 - `<name> refs` — the project's reference files for it
 
@@ -3771,6 +3828,8 @@ Manager surface: `capabilities list` (what is installed and gated where),
 <name>` (render a capability's project identifiers), `capabilities doctor` /
 `capabilities audit <name>` (verify), `capabilities context --fragment`
 (render the manager-owned project block), `capabilities help` (full contract).
+`capabilities guide` lists the manager's own authoring, development, review,
+and publishing guides with previews; `capabilities guide <topic>` reads one.
 Custom managed source code lives only under
 `~/.capabilities/sources/<source-id>/`: create it with `capabilities source init
 <id>`, create packages with `capabilities new <name> --source <id>`, and run
@@ -4338,23 +4397,39 @@ def _audit_script(name: str, script: Path) -> list[str]:
             _check_connections({"a", "b"}, "registry", expect_default="a")
             conn_file.unlink()
 
-        # guide menu agrees with the manifest
+        # guide menu has one exact shape and agrees with the manifest
         if manifest is not None:
             topics = (manifest.get("docs") or {}).get("topics") or []
             rc, out, errs = _run_script(script, ["guide"], cwd=sandbox, env=genv)
-            if topics:
-                if rc != 0:
-                    failures.append(f"guide: exit {rc}")
-                else:
-                    for t in topics:
-                        if t not in out:
-                            failures.append(f"guide: declared topic {t!r} missing from menu")
-            elif rc == 0 and out.strip() not in ("[]", ""):
+            if rc != 0:
+                failures.append(f"guide: exit {rc}")
+            else:
                 try:
-                    if json.loads(out):
-                        failures.append("guide: menu non-empty but manifest declares no topics")
+                    menu = json.loads(out)
                 except ValueError:
-                    failures.append("guide: menu non-empty but manifest declares no topics")
+                    failures.append("guide: menu is not JSON")
+                else:
+                    if not isinstance(menu, list):
+                        failures.append("guide: menu is not a JSON list")
+                    else:
+                        expected_keys = {"topic", "title", "preview", "command"}
+                        for entry in menu:
+                            if not isinstance(entry, dict) or set(entry) != expected_keys:
+                                failures.append(f"guide: malformed menu entry {entry!r}")
+                                continue
+                            topic = entry.get("topic")
+                            if (not isinstance(topic, str) or not topic
+                                    or not isinstance(entry.get("title"), str)
+                                    or not entry["title"].strip()
+                                    or not isinstance(entry.get("preview"), str)
+                                    or not entry["preview"].strip()
+                                    or entry.get("command") != f"{name} guide {topic}"):
+                                failures.append(f"guide: incomplete menu entry {entry!r}")
+                        menu_topics = [entry.get("topic") for entry in menu
+                                       if isinstance(entry, dict)]
+                        if menu_topics != topics:
+                            failures.append(
+                                f"guide: menu topics {menu_topics!r} != manifest {topics!r}")
     return failures
 
 
@@ -5134,7 +5209,7 @@ def _source_snapshot_report(
 
 def _source_change_scope(changed_paths: list[str]) -> tuple[bool, set[str]]:
     manager_changed = any(
-        path == "bin/capabilities" or path in _AUTHORING_ASSETS
+        path == "bin/capabilities" or path in _MANAGER_RELEASE_ASSETS
         for path in changed_paths
     )
     changed_capabilities = {
@@ -5740,7 +5815,7 @@ def _source_release(
     if manager_changed and source_id == OFFICIAL_SOURCE_ID:
         assets = {
             rel: (repo / rel).read_bytes()
-            for rel in _AUTHORING_ASSETS
+            for rel in _MANAGER_RELEASE_ASSETS
         }
         manager_update = _activate_manager_release(
             (repo / "bin" / "capabilities").read_bytes(),
@@ -5909,7 +5984,6 @@ CRED_KEYS = []  # Add credential declarations; never put secret values here.
 WRITE_VERBS = set()
 WRITE_DEFAULT = True
 DOCS_BASE = ""
-TOPICS: list[str] = []
 STATE = False
 POST_INSTALL: list[dict] = []
 
@@ -6193,6 +6267,7 @@ def _selfcheck_doclinks() -> list[str]:
     docs = [_ASSET_ROOT / n for n in
             ("DOCTRINE.md", "SHEBANG.md", "TEMPLATE.md", "ROUTINES.md", "README.md")]
     docs += sorted((_ASSET_ROOT / ".claude" / "rules").glob("*.md"))
+    docs += sorted((_ASSET_ROOT / "guides").glob("*.md"))
     for doc in docs:
         if not doc.is_file():
             continue
@@ -6237,6 +6312,16 @@ def cmd_selfcheck() -> None:
         findings += _selfcheck_negatives(canonical, source_root)
     findings += _selfcheck_doctrine()
     findings += _selfcheck_doclinks()
+    manager_menu = _guide_menu(_ASSET_ROOT / "guides", "capabilities")
+    manager_topics = [entry["topic"] for entry in manager_menu]
+    if manager_topics != list(_MANAGER_GUIDE_TOPICS):
+        findings.append(
+            f"manager-guides: topics {manager_topics!r} != "
+            f"{list(_MANAGER_GUIDE_TOPICS)!r}")
+    for entry in manager_menu:
+        if not entry["title"].strip() or not entry["preview"].strip():
+            findings.append(
+                f"manager-guides: {entry['topic']} needs an H1 and preview paragraph")
 
     _emit({"ok": not findings, "checks": sorted(_AUDIT_CHECKS), "findings": findings})
     if findings:
@@ -6244,376 +6329,36 @@ def cmd_selfcheck() -> None:
 
 # ---------------------------------------------------------------- authoring
 
-def _manager_guide(topic: str) -> str:
-    guides = {
-        "authoring": f"""\
-# Authoring a managed capability
+def _manager_guides_dir() -> Path:
+    return _ASSET_ROOT / "guides"
 
-Create a source with `capabilities source init <id> [--remote <git-url>]`.
-Its one editable checkout always lives at `{SOURCE_WORKSPACE_ROOT}/<id>`; ask
-the manager for the concrete path with `capabilities source path <id>`.
 
-Create a package only with `capabilities new <name> --source <id>` (add
-`--core-only` only when it genuinely has no connections). The manager writes
-`capabilities/<name>/bin/<name>` and stamps the generated contract fences.
-Replace every scaffold placeholder and implement domain declarations, doctor,
-and the smallest useful verb surface outside those fences.
-
-Acceptance is the release sequence, and `capabilities guide publishing` owns it
-end to end. There is no conformance override; free-form CLIs remain outside the
-manager.
-""",
-        "repositories": f"""\
-# Capability source repositories
-
-Editable source: `{SOURCE_WORKSPACE_ROOT}/<id>`. Remote read-only cache:
-`{SOURCE_CACHE_ROOT}/<id>`. Installed payload: `{CAP_HOME}/<name>`. Project
-configuration: `<name>/` inside the project envelope (`<project>/capabilities/`
-unless the project's context owner answers otherwise). Only the editable source is a
-git authoring workspace. Never commit from the cache, registry, or project
-envelope. `capabilities source path <id>` returns the exact editable path.
-
-The manager owns `{SOURCES_FILE}`. Alongside `sources`, it records the one
-official integration checkout path, Git common-dir identity and publication
-branch. Register or repair that binding from the primary checkout with
-`./bin/capabilities source register-checkout official`; never edit it by hand.
-Use `source init`, `source clone`, `source add`, and `source remove` for custom
-entries. `source list` is the supported inspection surface. A source repository is recognized by `capabilities.repo.json`, its
-vendored `contract/`, and generated `.capability-source/catalog.json`.
-""",
-        "publishing": """\
-# Publishing a capability source
-
-The release unit is an immutable Git commit. Stage the intended source changes,
-then run `capabilities source index <id> --staged`; the generated catalogue is
-derived from and added to that same Git index. Commit intentionally and prove
-the result with `capabilities source verify <id> --ref HEAD`.
-
-`capabilities source release <id> --ref HEAD` is the one publication boundary.
-It accepts only a verified fast-forward from a clean integration checkout,
-publishes a temporary candidate ref for the remote integrity check, advances the
-protected source branch, synchronizes that checkout, and reconciles locally
-installed changed payloads. The operation is idempotent: a pending or interrupted
-release resumes the same target commit; a different target is refused until that
-release is resolved. The manager never creates the commit because scope and
-message remain author judgment.
-
-`capabilities dev finish <session>` calls this same transaction with the
-session's recorded base. If the remote integrity gate has not accepted the
-candidate it returns `release_pending`, preserves the session and does not
-long-poll CI. Rerun the identical finish command after the gate settles.
-
-Consumers attach the published repository with `capabilities source add <id>
-<git-url> [--ref <ref>]`, inspect it with `capabilities search --source <id>`,
-and install explicitly with `capabilities install <name> --source <id>`.
-Unqualified installs always mean the official catalogue, so custom sources
-cannot shadow it.
-""",
-        "contract": """\
-# Generated capability contract
-
-`contract/preamble.py` is vendored by `source init`. `capabilities new` stamps
-its fenced regions; agents never write them by hand. `capabilities source sync
-<id>` deterministically updates the authoring kit and every existing generated region.
-`source check` and installation reject missing or changed regions. No force or
-skip flag exists.
-""",
-        "dev": f"""\
-# Isolated capability development
-
-Start where the defect was discovered, in the real consuming project:
-
-    capabilities dev start <name>
-
-The registered official integration checkout supplies one managed source
-worktree at `{DEV_DATA_ROOT}/<session>/source`. The current project is attached
-in place: no consumer worktree is created, and the manager never cleans,
-commits, publishes or removes it. From a source checkout pass `--project PATH`
-or `--no-project`; custom sources use `--source ID-OR-PATH`.
-
-Edit only the returned source worktree. `dev exec <session> -- <command>` is the
-hermetic lane: isolated HOME/registry/XDG roots and no ambient credentials.
-Refresh packages with `dev install <session> <name>`. `dev run <session> <name>
--- <args>` is the attached-project lane: it executes exactly the session payload
-with project policy/config and a temporary selected-capability user fallback;
-`--project-only` disables that fallback. Secrets stay in the child environment
-and known values are redacted from forwarded output.
-
-Telegram live service testing is explicit:
-
-    capabilities dev live start <session> telegram
-    capabilities dev live status <session> telegram
-    capabilities dev live stop <session> telegram
-
-It borrows the real account state under one durable account-scoped lease. It
-does not copy or merge auth sessions or watermarks. A stale transition is
-fail-closed and restored with `capabilities dev live recover <session> telegram
---restore-canonical`.
-
-`dev start`, `dev list`, `dev doctor`, `dev check` and `dev finish` rediscover
-managed and manual Git work on demand. Same-package work refuses by default;
-`--allow-parallel` applies only to a known same-capability overlap, never shared
-or unknown scope. No project reminder or ContextKit state is created.
-
-Before publication, derive checks from the recorded base rather than current
-worktree cleanliness:
-
-    capabilities dev check <session>
-    ./bin/capabilities source index <id> --staged
-    git commit
-    capabilities dev check <session>
-    capabilities dev finish <session>
-
-`dev finish` uses the existing source-release transaction. A `release_pending`
-result preserves the session; wait for the integrity gate and rerun the same
-command to resume the same candidate. Cleanup occurs only after publication,
-checkout reconciliation and local payload reconciliation succeed. `dev stop`
-and `dev gc` retain dirty, unpublished, damaged, live or divergent work.
-""",
-    }
-    if topic not in guides:
+def _manager_guide(topic: str | None) -> str | list[dict[str, str]]:
+    menu = _guide_menu(_manager_guides_dir(), "capabilities")
+    observed = [entry["topic"] for entry in menu]
+    if observed != list(_MANAGER_GUIDE_TOPICS):
+        _die(5, "manager_assets_missing",
+             f"manager guide set is incomplete: found {observed!r}",
+             "run `capabilities self-update` to restore manager assets")
+    incomplete = [entry["topic"] for entry in menu
+                  if not entry["title"].strip() or not entry["preview"].strip()]
+    if incomplete:
+        _die(5, "manager_assets_invalid",
+             f"manager guides need an H1 and preview paragraph: {incomplete!r}",
+             "run `capabilities self-update` to restore manager assets")
+    if topic is None:
+        return menu
+    topics = {entry["topic"] for entry in menu}
+    if topic not in topics:
         _die(3, "not_found", f"unknown manager guide {topic!r}",
-             "topics: " + ", ".join(sorted(guides)))
-    return guides[topic]
+             "run `capabilities guide` to list available guides")
+    try:
+        return (_manager_guides_dir() / f"{topic}.md").read_text()
+    except OSError as exc:
+        _die(5, "manager_assets_missing",
+             f"cannot read manager guide {topic!r}: {exc}",
+             "run `capabilities self-update` to restore manager assets")
 
-
-def _instructions_new() -> str:
-    return f"""\
-# Create a capability — agent procedure
-
-The unit you are building is a managed source bundle under the canonical
-workspace `{SOURCE_WORKSPACE_ROOT}/<source-id>/capabilities/<name>/`. Start with
-`capabilities source init <source-id>`; its vendored SHEBANG.md and AUTHORING.md
-are the source-local specification.
-
-## 1. Discover, then gate honestly
-
-Establish: the system to reach; the two or three operations that matter
-(smallest useful surface); the auth shape (token, login session, OAuth,
-none); where it will be used. Then gate:
-
-- Ordered steps consuming existing tools → a routine, not a capability.
-- Light instructions → a skill or prompt.
-- One-off → no packaging at all.
-- A system to reach + a small verb surface + credentials → a capability.
-
-Say no plainly when it is not a capability.
-
-## 2. Shape before code
-
-- Surface: the smallest set of domain verbs; which of them mutate the remote
-  system (WRITE_VERBS — the per-connection write gate refuses these), and
-  what silence means (WRITE_DEFAULT — False when a write leaves the system:
-  messages a human, sends mail, moves money).
-- Credentials: keys, which are secret, and the scope — `project` (service /
-  tenant tools, the default) or `user` (personal-account tools only).
-- State: does it mint sessions or caches? Then `STATE = True` and state
-  lands per the state-resolution rules, keyed per connection.
-- I/O: JSON on stdout, the error envelope on stderr, the exit-code taxonomy.
-
-## 3. Create, then edit only the owned surface
-
-Run `capabilities new <name> --source <source-id>`. The manager creates the
-bundle and stamps the credential cascade, gates, I/O helpers, and contract verbs
-inside generated fences. Never copy or edit those regions manually. Edit the
-declaration constants and domain implementation outside the fences: the smallest
-useful verbs, a real doctor round-trip, resilient transport, and agent-first help.
-No consumer identity is baked in — placeholders in examples, values from the
-cascade.
-
-## 4. Verify mechanically, then by judgment
-
-- Stage intended files and run `capabilities source index <source-id> --staged`.
-- Commit, then run `capabilities source verify <source-id> --ref HEAD`.
-- Smoke-test: `doctor` against the real service; one read verb; one write
-  verb if any.
-- Judgment pass: is each verb worth its place? Is the help written for an
-  agent? Anything the tool answers that a doc restates?
-
-## 5. Install
-
-`capabilities install <name> --source <source-id>`, then `capabilities enable
-<name>` in the consuming project. Installation reruns full audit in staging and
-atomically activates the payload. Record deliberate domain-level departures in
-the capability's own deviations file; the generated contract has no override.
-"""
-
-
-def _instructions_conform(ref: str) -> str:
-    return f"""\
-# Conform `{ref}` to the capability contract — agent procedure
-
-Bring an existing script to the contract without changing what its domain
-verbs do. The spec is SHEBANG.md in the capability repo — read it first.
-
-## 1. Read the script; map the gap
-
-Check for each, in this order:
-
-- Declaration constants: NAME, SUMMARY, SCOPE, CRED_KEYS,
-  WRITE_VERBS, WRITE_DEFAULT, DOCS_BASE, TOPICS, STATE, POST_INSTALL — one
-  home each, top of script.
-- `_project_root()` + `_gate()` called before any verb dispatch; exit 4 with
-  the `disabled` envelope; fail-open on unreadable gate.
-- Contract verbs: help, doctor, connections, stub, manifest --json, guide,
-  ids (list/get/set/rm), refs. Render stub/manifest from the constants.
-- Credential cascade in SHEBANG order; secrets have no flags; scripts never
-  write credentials.env.
-- Connections: `--connection <id>` on every domain verb, the registry
-  (project capabilities/<name>/connections.json, else the user config
-  home's) selected per SHEBANG order, the write gate (entry allow_write,
-  else WRITE_DEFAULT; read-only → write verbs exit 4, nothing lifts it),
-  `connections` reporting resolution with secrets masked, no network.
-- State: minted sessions/caches move to the state dir (project scope:
-  capabilities/<name>/state/ where the envelope exists, else
-  $XDG_STATE_HOME/<name>/; user scope: $XDG_STATE_HOME/<name>/).
-- I/O: `_emit`/`_die` envelope; exit-code taxonomy incl. 4; codes 7+ stated
-  in help.
-- Identity-free: no consumer names, tenants, or real values in code or help.
-
-## 2. Edit
-
-Make the changes; keep domain verbs byte-compatible (same args, same
-output). A deliberate departure is recorded in the capability's own
-deviations file, never silently.
-
-## 3. Verify
-
-- `capabilities audit {ref} --from <path>` until it passes.
-- `<name> doctor` against the real service.
-- Run one representative domain verb and compare output to the pre-edit
-  behaviour.
-"""
-
-
-def _instructions_groom(name: str) -> str:
-    installed = name in _installed()
-    state = "installed" if installed else "NOT installed on this machine"
-    return f"""\
-# Groom `{name}` ({state}) — agent procedure
-
-A periodic review of one capability: drift, dead weight, sharpening.
-
-## 1. Mechanical pass
-
-- `capabilities audit {name}` — fix what fails.
-- `capabilities doctor` — registry/symlink/snapshot drift for this entry.
-- `{name} doctor` — does it still prove identity against the live service?
-
-## 2. Judgment pass
-
-- Read the deviations file first; recorded deviations are deliberate.
-- Help text: still the single source of truth? Anything stale, anything a
-  doc restates that the tool answers?
-- Verb surface: any verb unused in practice? Any common operation that
-  needs two calls and deserves one?
-- Guides: do declared topics still match upstream files? Anything learned
-  repeatedly in sessions that belongs in a guide?
-- Identifiers/references in consuming projects: still non-secret, still
-  provenance-split (chosen → connections.json, discovered → identifiers.json)?
-  Connections registries: no secret in an entry, default pointer names a real
-  entry, read-only entries still correct?
-
-## 3. Close
-
-Apply fixes, update the capability's guides upstream if topics changed,
-re-run `capabilities audit {name}`, and `capabilities update {name}` so
-snapshots refresh.
-"""
-
-
-def _instructions_sanitize(name: str) -> str:
-    installed = name in _installed()
-    state = "installed" if installed else "NOT installed on this machine"
-    return f"""\
-# Sanitize `{name}`'s project envelope ({state}) — agent procedure
-
-A content review of the `{name}` project envelope in the *current* consuming
-project — semantics, placement, ambiguity. The scope split, in one line each:
-
-- `capabilities audit {name}` — mechanical contract conformance of the script.
-- `capabilities groom {name}` — periodic review of the installed capability
-  (the machine side).
-- `capabilities sanitize {name}` — the envelope-side content review (this
-  procedure): every file the project holds under the `{name}` capability's
-  envelope, judged as prose.
-
-The manager judges nothing here; you do, inside the consuming project.
-
-## 1. Inventory through the capability's own surface
-
-Discover what to review by asking the tool — never by asserting paths:
-
-- `{name} refs` — the reference envelope (name, description, path per file).
-- `{name} ids list` — the identifiers the CLI has discovered here.
-- `{name} connections` — the connections declared, with secrets masked.
-
-An empty envelope is **conformant-empty**, not a finding. Do not invent
-content to fill a slot; a project that has not accrued a reference yet has
-no reference to review.
-
-## 2. Walk the checks
-
-For each file the inventory named, walk the list below. Each check names the
-doctrine rule it enforces — read the rule at the source (`DOCTRINE.md`)
-before deciding a finding stands.
-
-1. **Name/description ↔ body** *(TEMPLATE.md's reference envelope).*  For
-   every reference, the front-matter `description` is load-bearing — it is
-   how an agent decides to load the body. A body that outgrew or shrank from
-   its description is a finding; fix by tightening the description or
-   splitting the body into siblings.
-
-2. **The identifiers/reference split** *(rule 4, rule 11).*  Both directions:
-   a structural lookup value (an id, code, label, classification) buried in
-   reference prose belongs in `identifiers.json`; a treatment or usage
-   narrative sitting in an identifiers note belongs in a reference. A
-   reference holds the model, not the values; an identifier holds the
-   value, not the narrative.
-
-3. **Domain ownership and consumer identity** *(rule 9, rule 10).*  Facts in
-   this envelope that belong to a **sibling capability's** envelope (source-
-   vs consumer-side domain), to the **consuming project's own files** (its
-   identity, restated), or to **no one** (dead or already-resolved notes).
-   Each finding names the correct home.
-
-4. **One fact, one home + affirmative framing** *(rule 1, rule 12).*
-   Duplication or contradiction across the envelope's files; prose that
-   defines by negation, by history ("formerly", "moved from"), or by a
-   neighbour's behaviour ("unlike X"). Restate affirmatively; consolidate
-   the duplicate to one home the others reference by role.
-
-5. **Pointer direction** *(rule 7, rule 8).*  An asset that names its
-   consumer (a routine, a workflow, a caller upstream) is a violation — the
-   asset describes itself; consumers point down to it. Hard literal links
-   between reference files across capability boundaries are a violation
-   too — resolve through the capability's own `refs`/`ids` surface.
-
-6. **Model vs procedure** *(rule 11).*  A step-by-step task recipe inside a
-   reference belongs in the consuming project's routines; the reference
-   keeps the model (mapping, treatment, taxonomy) the routine names by role.
-
-7. **WIP hygiene.**  Resolved items, fix-it lists, and to-dos living in a
-   reference belong on the consuming project's task system, not in the
-   envelope. The reference is for the durable model, not the open queue.
-
-## 3. Report, then fix on the project's terms
-
-Emit findings as a list. For each: **the file**, **the quoted fragment**,
-**the rule** it violates, and **the proposed move or fix**. Group by file
-so the reader sees each home once.
-
-Apply only what the consuming project's own norms allow — some fixes cross
-into project files this envelope does not own (a routine, a task list, a
-sibling capability's envelope); those are proposals for the project's
-maintainer, not this procedure's edits.
-
-## 4. Close
-
-- Re-run `{name} refs` to confirm the envelope still parses.
-- Refresh the generated context so the session sees the sharpened envelope:
-  `capabilities context --claude` (or `--codex`, per host).
-"""
 
 # ---------------------------------------------------------------- main
 
@@ -6882,32 +6627,15 @@ def main() -> None:
         cmd_selfcheck()
     elif cmd == "new":
         if not pos:
-            _emit(_instructions_new())
-        else:
-            source_id = opt("--source")
-            if not source_id:
-                _die(6, "input", "new <name> needs --source ID",
-                     "create a canonical workspace with `capabilities source init <id>`")
-            cmd_new_capability(pos[0], source_id, flag("--core-only"))
+            _die(6, "input", "new needs a capability name",
+                 "run `capabilities guide authoring` for the authoring workflow")
+        source_id = opt("--source")
+        if not source_id:
+            _die(6, "input", "new <name> needs --source ID",
+                 "create a canonical workspace with `capabilities source init <id>`")
+        cmd_new_capability(pos[0], source_id, flag("--core-only"))
     elif cmd == "guide":
-        if not pos:
-            _die(
-                6, "input",
-                "guide needs a topic: authoring, repositories, publishing, contract, or dev",
-            )
-        _emit(_manager_guide(pos[0]))
-    elif cmd == "conform":
-        if not pos:
-            _die(6, "input", "conform needs a capability name or path")
-        _emit(_instructions_conform(pos[0]))
-    elif cmd == "groom":
-        if not pos:
-            _die(6, "input", "groom needs a capability name")
-        _emit(_instructions_groom(pos[0]))
-    elif cmd == "sanitize":
-        if not pos:
-            _die(6, "input", "sanitize needs a capability name")
-        _emit(_instructions_sanitize(pos[0]))
+        _emit(_manager_guide(pos[0] if pos else None))
     else:
         _die(6, "input", f"unknown command: {cmd}", "run `capabilities help`")
 

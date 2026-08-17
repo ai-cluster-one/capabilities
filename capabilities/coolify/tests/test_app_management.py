@@ -289,4 +289,6 @@ def test_help_and_manifest_declare_new_surface():
     assert "--health-check-start-period" in help_text
     assert "--watch-paths" in help_text
     assert "--auto-deploy-enabled / --no-auto-deploy-enabled" in help_text
-    assert coolify_module.TOPICS == ["headless-apps"]
+    assert [entry["topic"] for entry in coolify_module._guide_menu()] == [
+        "headless-apps"
+    ]

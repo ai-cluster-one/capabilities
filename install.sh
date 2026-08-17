@@ -56,7 +56,10 @@ tmp="$(mktemp)"
 assets_tmp="$(mktemp -d)"
 trap 'rm -f "$tmp"; rm -rf "$assets_tmp"' EXIT
 curl -fsSL "$REPO/bin/capabilities" -o "$tmp" || err "fetch failed: $REPO/bin/capabilities"
-for asset in SHEBANG.md DOCTRINE.md TEMPLATE.md SOURCES.md ROUTINES.md contract/preamble.py; do
+for asset in SHEBANG.md DOCTRINE.md TEMPLATE.md SOURCES.md ROUTINES.md \
+  contract/preamble.py guides/authoring.md guides/conforming.md \
+  guides/contract.md guides/dev.md guides/grooming.md guides/publishing.md \
+  guides/repositories.md guides/sanitizing.md; do
     mkdir -p "$assets_tmp/$(dirname "$asset")"
     curl -fsSL "$REPO/$asset" -o "$assets_tmp/$asset" || err "fetch failed: $REPO/$asset"
 done
@@ -108,7 +111,10 @@ with lock_path.open("a+") as lock:
     temporary.chmod(0o755)
     os.replace(temporary, manager)
     for rel in ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
-                "ROUTINES.md", "contract/preamble.py"):
+                "ROUTINES.md", "contract/preamble.py", "guides/authoring.md",
+                "guides/conforming.md", "guides/contract.md", "guides/dev.md",
+                "guides/grooming.md", "guides/publishing.md",
+                "guides/repositories.md", "guides/sanitizing.md"):
         target = manager.parent / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         staged_target = target.with_name(target.name + ".bootstrap-tmp")

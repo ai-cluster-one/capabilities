@@ -31,11 +31,11 @@ Every script implements the same contract verbs alongside its domain verbs. This
 | `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no network. |
 | `stub` | The one-line awareness text. |
 | `manifest --json` | The machine-readable declaration (schema below). |
-| `guide` / `guide <topic>` | The menu of upstream guides / one guide's body, fetched live from the docs base. |
+| `guide` / `guide <topic>` | The shipped guide menu with previews / one guide's body, fetched live from the docs base. |
 | `ids list\|get\|set\|rm` | The project identifiers envelope, managed. |
 | `refs` | The menu of the project's reference files, from front-matter. |
 
-The declaration facts feed the contract from **constants at the top of the script** — one home each. Every contract verb renders from these, so the verbs cannot disagree with one another:
+The declaration facts feed the contract from **constants at the top of the script** — one home each. Guide topics are the exception: their one home is the set of shipped Markdown filenames. Contract verbs render from these sources so they cannot disagree with one another:
 
 ```python
 NAME = "asana"
@@ -47,7 +47,6 @@ CRED_KEYS = [
 WRITE_VERBS = {"create", "comment", "complete"}   # domain verbs that mutate the remote system
 WRITE_DEFAULT = True    # a connection's allow_write when its entry is silent; False when writes leave the system
 DOCS_BASE = "https://raw.githubusercontent.com/<org>/capabilities/main/capabilities/asana/guides/"
-TOPICS = ["authoring", "boards"]    # [] when no guides ship; DOCS_BASE "" likewise
 STATE = False       # True when the capability writes session/cache state
 POST_INSTALL = []   # [{"cmd": …, "note": …}] steps the manager offers at install
 SERVICE = None      # or {"name", "summary", "verbs", ...} when a bundled service ships
@@ -130,7 +129,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `credentials.scope` | `project` or `user` — where the secret lives (see [the credential cascade](#the-credential-cascade)). |
 | `credentials.keys[]` | Every key the cascade resolves: `key`, `secret`, `required`, `note`. Install scaffolding and `doctor`'s remediation both derive from this list. |
 | `docs.base` | The upstream guides base URL; `""` when no guides ship. Overridable through the cascade as `<NAME>_DOCS_BASE`, so storage can move without touching the contract. |
-| `docs.topics` | The shipped topic list; `[]` when no guides ship. |
+| `docs.topics` | The sorted stems of the shipped `guides/*.md` files; `[]` when no guides ship. |
 | `state` | `true` declares the capability writes session/cache state (see [state](#state)). |
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
 | `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
@@ -145,7 +144,28 @@ install; capabilities without `service` or without `service.deploy` remain valid
 
 ## Guides
 
-`<name> guide` prints the topic menu (from `TOPICS`); `<name> guide <topic>` prints one guide's body. The script is the **door** to the docs, never the storage: the topic list is computed from what the capability ships so it cannot drift, and a body resolves **live** against the declared base so an upstream edit reaches every consumer at once.
+`<name> guide` prints a JSON list derived from the shipped `guides/*.md` files;
+`<name> guide <topic>` prints one guide's body. Every menu entry has exactly
+`topic`, `title`, `preview`, and `command`: the filename stem supplies the topic,
+the first H1 supplies the title, the first prose paragraph supplies the preview,
+and the CLI constructs the read command. No front matter or separately maintained
+topic list exists. A capability with guides therefore ships the full bundle.
+
+The script is the **door** to the docs, never the authoritative storage: the
+menu is computed from what the capability ships so it cannot drift, and a body
+resolves **live** against the declared base so an upstream edit reaches every
+consumer at once.
+
+```json
+[
+  {
+    "topic": "boards",
+    "title": "Working with Asana boards",
+    "preview": "How this capability discovers sections and moves tasks between them.",
+    "command": "asana guide boards"
+  }
+]
+```
 
 Resolution order, per topic:
 

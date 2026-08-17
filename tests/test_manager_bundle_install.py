@@ -398,6 +398,8 @@ def test_install_from_source_script_installs_bundle() -> None:
 
         _run_manager(["install", "telegram", "--from", str(TELEGRAM_SCRIPT)], env)
 
+        assert (cap_home / "telegram" / "telegram").is_file()
+        assert not (cap_home / "telegram" / "bin" / "telegram").exists()
         assert (cap_home / "telegram" / "service" / "templates" / "settings.json").is_file()
         meta = json.loads((cap_home / "telegram" / "meta.json").read_text())
         assert meta["source_type"] == "directory"
@@ -423,6 +425,8 @@ def test_update_migrates_script_source_to_bundle() -> None:
 
         _run_manager(["update", "telegram"], env)
 
+        assert (cap_home / "telegram" / "telegram").is_file()
+        assert not (cap_home / "telegram" / "bin" / "telegram").exists()
         assert (cap_home / "telegram" / "service" / "templates" / "settings.json").is_file()
         meta = json.loads((cap_home / "telegram" / "meta.json").read_text())
         assert meta["source_type"] == "directory"
