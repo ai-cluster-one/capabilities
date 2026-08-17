@@ -16,18 +16,22 @@ HOME/registry/XDG roots. Refresh capability payloads with `dev install
 <session> <name>`. `dev run <session> <name> -- <args>` runs the exact session
 payload against the attached project.
 
-Before publication, derive checks from the recorded base:
+Prepare the candidate without hiding validation inside lifecycle commands:
 
 ```sh
-capabilities dev check <session>
 ./bin/capabilities source index <id> --staged
+capabilities dev check <session>  # optional local feedback
 git commit
-capabilities dev check <session>
 capabilities dev finish <session>
 ```
 
-`dev finish` uses the source-release transaction. A `release_pending` result
-preserves the session; run the same command after the integrity gate settles.
+`dev check` derives the manager/package scope from the recorded base and runs
+each selected direct validator once. It is not a release prerequisite: the
+authoritative validation is the GitHub check for the exact candidate commit.
+
+`dev finish` uses the source-release transaction without repeating source
+audit. A `release_pending` result preserves the session; run the same command
+after the integrity gate settles.
 Cleanup occurs after publication, checkout reconciliation, and local payload
 reconciliation succeed.
 

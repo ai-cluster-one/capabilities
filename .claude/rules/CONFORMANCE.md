@@ -13,12 +13,12 @@ and review workflows live in the manager's on-demand guide surface; start with
 full executable surface.
 
 Those checks prove a capability obeys the manager. `capabilities selfcheck`
-proves the inward half — that the manager obeys the doctrine and the repo is
-whole: the enforcer parses, every capability audits clean, both audit branches
-(core-only and connection-bearing) have a living green example and fire on a
-deliberate break, every standing rule names an enforcement the manager actually
-performs, and every doc link resolves. Run it after touching `DOCTRINE.md`,
-`contract/preamble.py`, the audit, or any `bin/<name>`. The binding it enforces:
+proves the inward half — that the manager and audit engine obey the doctrine:
+the enforcer parses, both audit branches have a living green example and fire
+on a deliberate break, every standing rule names an enforcement the manager
+actually performs, and every doc link resolves. Fleet audit is selected
+directly by `dev check` or `source verify`, never nested in selfcheck. Run it
+after touching `DOCTRINE.md`, `contract/preamble.py`, or the audit. The binding:
 a rule the manager asserts but does not check is itself a violation — fix the
 enforcer, never soften the rule to match a silent gap.
 

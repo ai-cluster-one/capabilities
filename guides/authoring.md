@@ -40,5 +40,6 @@ values through the standard configuration surfaces.
 ## Verify and release
 
 Stage the intended files and run `capabilities source index <id> --staged`.
-Commit the result, verify it with `capabilities source verify <id> --ref HEAD`,
-and follow `capabilities guide publishing` for the release transaction.
+Run `capabilities dev check <session>` when local validation feedback is useful,
+commit the result, and follow `capabilities guide publishing` for the release
+transaction. The candidate CI performs the authoritative immutable verification.

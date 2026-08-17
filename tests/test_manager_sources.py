@@ -168,7 +168,8 @@ def test_authoring_workspace_is_canonical_and_install_is_strict(tmp_path):
         "# --- Error reporting", "# hand-edited generated region"))
     rejected = _run(env, "install", "demo", "--from", str(script), check=False)
     assert rejected.returncode == 7
-    assert json.loads(rejected.stderr.splitlines()[-1])["error"]["code"] == "audit_failed"
+    assert json.loads(rejected.stderr.splitlines()[-1])["error"]["code"] == \
+        "install_validation_failed"
     assert installed_script.read_bytes() == before
     synced = json.loads(_run(env, "source", "sync", "personal").stdout)
     assert synced["stamped"] == [{
@@ -321,20 +322,38 @@ def test_staged_index_is_commit_exact_and_verify_rejects_worktree_hashes(tmp_pat
         env, "source", "index", "personal", "--staged").stdout)
     assert indexed["basis"] == "staged"
     assert indexed["staged"] is True
-    _commit(workspace, "Initial valid source")
+    initial_commit = _commit(workspace, "Initial valid source")
     assert json.loads(_run(
         env, "source", "verify", "personal", "--ref", "HEAD").stdout)["ok"] is True
 
+    audit_marker = tmp_path / "source-index-ran-audit"
+    marker_hook = '''if os.environ.get("SOURCE_INDEX_AUDIT_MARKER") and sys.argv[1:] == ["refs"]:
+    Path(os.environ["SOURCE_INDEX_AUDIT_MARKER"]).write_text("audit executed\\n")
+
+
+'''
     staged_text = script.read_text().replace(
-        "Test readiness uses", "Staged readiness uses")
+        "Test readiness uses", "Staged readiness uses").replace(
+        'if __name__ == "__main__":',
+        marker_hook + 'if __name__ == "__main__":',
+    )
     script.write_text(staged_text)
     _git(workspace, "add", str(script.relative_to(workspace)))
     script.write_text(staged_text + "\n# unstaged working-tree noise\n")
-    _run(env, "source", "index", "personal", "--staged")
+    index_env = dict(env)
+    index_env["SOURCE_INDEX_AUDIT_MARKER"] = str(audit_marker)
+    _run(index_env, "source", "index", "personal", "--staged")
+    assert not audit_marker.exists()
     committed = _commit(workspace, "Index the staged tree")
     verified = json.loads(_run(
-        env, "source", "verify", "personal", "--ref", committed).stdout)
+        env,
+        "source", "verify", "personal",
+        "--ref", committed,
+        "--base", initial_commit,
+    ).stdout)
     assert verified["ok"] is True
+    assert verified["manager_checked"] is False
+    assert verified["audited_capabilities"] == ["demo"]
     committed_script = _git(
         workspace, "show", f"{committed}:capabilities/demo/bin/demo"
     ).stdout
@@ -380,7 +399,7 @@ def test_staged_index_uses_editorial_profile_for_docs_only_change(tmp_path):
     initial = json.loads(_run(
         env, "source", "index", "personal", "--staged").stdout)
     assert initial["verification_profile"] == "manager"
-    _commit(workspace, "Initial valid source")
+    initial_commit = _commit(workspace, "Initial valid source")
 
     authoring = workspace / "AUTHORING.md"
     authoring.write_text(authoring.read_text() + "\nEditorial clarification.\n")
@@ -400,3 +419,14 @@ def test_staged_index_uses_editorial_profile_for_docs_only_change(tmp_path):
     assert not marker.exists()
     repaired = json.loads(catalog_path.read_text())
     assert repaired["capabilities"]["demo"]["summary"] == original_summary
+    candidate = _commit(workspace, "Editorial source change")
+    verified = json.loads(_run(
+        editorial_env,
+        "source", "verify", "personal",
+        "--ref", candidate,
+        "--base", initial_commit,
+    ).stdout)
+    assert verified["ok"] is True
+    assert verified["manager_checked"] is False
+    assert verified["audited_capabilities"] == []
+    assert not marker.exists()

@@ -430,6 +430,43 @@ def test_dev_install_uses_session_registry_and_refuses_canonical_fallback(tmp_pa
     _run(env, "dev", "stop", "deployment-test")
 
 
+def test_dev_check_runs_one_direct_audit_without_installing(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer, session="single-audit")
+    worktree = Path(started["source_worktree"])
+    script = worktree / "capabilities" / "deployment" / "bin" / "deployment"
+    marker = tmp_path / "audit-invocations"
+    hook = (
+        "if sys.argv[1:]:\n"
+        f'    Path({str(marker)!r}).open("a").write(" ".join(sys.argv[1:]) + "\\n")\n\n\n'
+    )
+    script.write_text(script.read_text().replace(
+        'if __name__ == "__main__":',
+        hook + 'if __name__ == "__main__":',
+    ))
+
+    checked = json.loads(_run(env, "dev", "check", "single-audit").stdout)
+    assert checked["audited_packages"] == ["deployment"]
+    dev_invocations = marker.read_text().splitlines()
+
+    marker.unlink()
+    _run(env, "audit", "deployment", "--from", str(script))
+    direct_invocations = marker.read_text().splitlines()
+    assert dev_invocations == direct_invocations
+
+    session_file = (
+        Path(env["XDG_STATE_HOME"])
+        / "capabilities"
+        / "dev"
+        / "single-audit"
+        / "session.json"
+    )
+    session = json.loads(session_file.read_text())
+    assert session.get("installed_payloads") in (None, {})
+
+
 def test_dev_run_executes_only_the_session_payload_against_attached_project(tmp_path):
     source = _source_repo(tmp_path)
     consumer = _consumer_repo(tmp_path)

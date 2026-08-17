@@ -98,15 +98,17 @@ MACHINE VERBS
         development. Must be invoked as ./bin/capabilities from that checkout.
   source list | path ID | refresh [ID] | sync ID | check ID | remove ID
         Inspect sources, resolve the one editable path, refresh remote caches,
-        verify every capability and generated catalogue, or unregister a source.
+        compare declarations, payload hashes and the generated catalogue, or
+        unregister a source. Authoring audit stays explicit.
         Removing never deletes an editable workspace.
   source index ID [--staged]
-        Rebuild the generated catalogue after clean audits. --staged derives it
+        Deterministically rebuild the generated catalogue. --staged derives it
         from the Git index and stages the result, so ignored, unstaged, and
-        temporary files cannot influence the candidate commit.
-  source verify ID --ref REF
-        Verify an immutable Git tree: source contract, every capability audit,
-        and the checked-in catalogue. This is the publication/CI invariant.
+        temporary files cannot influence the candidate commit. It never audits.
+  source verify ID --ref REF [--base REF]
+        Verify one immutable Git tree. With --base, derive the direct manager and
+        capability checks from the diff; without it, use the full safe fallback.
+        Each selected capability is audited once. This is the publication/CI invariant.
   source release ID --ref REF
         Publish one already-committed, verified descendant of the clean source
         checkout's tracked branch; fast-forward the checkout, reconcile locally
@@ -119,8 +121,8 @@ DEVELOPMENT VERBS
         checkout when run from it. The project is recorded but never owned,
         branched, cleaned or removed by the manager.
   dev install <session> <name> [<name> ...]
-        Audit and install capabilities from the session source worktree into
-        its isolated registry. Re-run after source edits to refresh payloads.
+        Structurally validate and install capabilities from the session source
+        worktree into its isolated registry. Re-run after source edits to refresh payloads.
   dev exec <session> [--cwd source] [--inherit-env KEY ...] -- <command>
         Execute one foreground command inside the session environment. Output
         and exit status are passed through. Parent env is denied by default;
@@ -130,7 +132,8 @@ DEVELOPMENT VERBS
         project through a mode-0700, per-invocation selected-input projection.
   dev check <session>
         Derive validation scope from the recorded base across committed,
-        staged, unstaged and untracked changes without editing source or index.
+        staged, unstaged and untracked changes, then run each selected direct
+        validator once without editing source or index.
   dev live start|status|stop <session> telegram
   dev live recover <session> telegram --restore-canonical
         Borrow one account's real Telegram state under a durable exclusive
@@ -214,10 +217,11 @@ VERIFICATION VERBS
         --check reports drift and exits 7 without writing.
   selfcheck
         Prove the repo's own wholeness (the inward companion to audit): the
-        enforcer parses, every capability audits clean, both audit branches
-        (core-only / connection-bearing) have a living green example and fire on
-        a deliberate break, every standing rule names an enforcement the manager
-        actually has, and every doc link resolves. Exit 0 whole, 7 otherwise.
+        enforcer parses, both audit branches (core-only / connection-bearing)
+        have a living green example and fire on a deliberate break, every standing
+        rule names an enforcement the manager has, and every doc link resolves.
+        Fleet capability audit remains a direct dev/source check.
+        Exit 0 whole, 7 otherwise.
 
 AUTHORING
   new <name> --source ID [--core-only]
@@ -1239,16 +1243,25 @@ def _validate_installed_payload(name: str, manifest: dict,
 
 def _prepare_payload(name: str, content: bytes, bundle_dir: Path | None,
                      temp_root: Path | None, source: str) -> tuple[Path, dict]:
-    """Build and fully audit a candidate away from the live registry."""
+    """Build and structurally validate a candidate away from the live registry.
+
+    Authoring audit is an explicit command. Installation proves only the
+    invariants introduced at this boundary: generated-contract integrity,
+    declaration snapshots, and complete bundle layout.
+    """
     _require_authoring_assets()
     CAP_HOME.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{name}-stage-", dir=CAP_HOME))
     try:
         script = _install_payload(name, content, bundle_dir, stage)
-        failures = _audit_script(name, script)
-        if failures:
-            _die(7, "audit_failed", f"{name} from {source} fails capability audit",
-                 "; ".join(failures))
+        drift = _contract_drift(script.read_text(), _canonical_regions())
+        if drift:
+            _die(
+                7,
+                "install_validation_failed",
+                f"{name} from {source} has generated contract drift",
+                "; ".join(drift),
+            )
         manifest = _snapshot(name, script, stage)
         _validate_installed_payload(name, manifest, stage)
         return stage, manifest
@@ -2150,19 +2163,12 @@ def _dev_changed_paths(session: dict) -> tuple[str, str, list[str]]:
 
 
 def cmd_dev_check(session_id: str) -> None:
-    """Validate exactly the manager/package scope changed since session base.
-
-    Source and index are read-only. A selected payload may be refreshed only in
-    the isolated registry. Publication readiness additionally requires a clean,
-    immutable descendant commit with a current generated catalogue.
-    """
+    """Run each direct validator once for the scope changed since session base."""
     session = _dev_session(session_id)
     base, head, changed = _dev_changed_paths(session)
-    manager_changed, packages = _source_change_scope(changed)
     source_root = Path(session["source"]["worktree"])
-    audit_scope = ({path.name for path in (source_root / "capabilities").iterdir()
-                    if path.is_dir()} if manager_changed else set(packages))
-    existing = sorted(name for name in audit_scope
+    manager_changed, packages = _source_validation_scope(source_root, changed)
+    existing = sorted(name for name in packages
                       if (source_root / "capabilities" / name / "bin" / name).is_file())
     deleted = sorted(packages - set(existing))
     failures: dict[str, list[str]] = {}
@@ -2176,27 +2182,6 @@ def cmd_dev_check(session_id: str) -> None:
             failures.setdefault("manager", []).append(
                 proc.stderr.strip() or proc.stdout.strip() or f"selfcheck exited {proc.returncode}")
     for name in existing:
-        try:
-            _assert_payload_mutable(name, session_id)
-            refresh = subprocess.run(
-                [str(manager), "install", name, "--from", str(source_root)],
-                cwd=source_root, env=_dev_env(session), capture_output=True,
-                text=True, timeout=300, check=False)
-            if refresh.returncode != 0:
-                failures.setdefault(name, []).append(
-                    refresh.stderr.strip() or refresh.stdout.strip()
-                    or f"isolated refresh exited {refresh.returncode}")
-            else:
-                payload_root = Path(session["paths"]["registry"]) / name
-                session.setdefault("installed_payloads", {})[name] = {
-                    "path": str(payload_root),
-                    "payload_sha256": _payload_sha256(payload_root),
-                    "executable": str(payload_root / name),
-                    "installed_at": int(time.time()),
-                }
-                _write_json(_dev_state_dir(session_id) / "session.json", session)
-        except SystemExit:
-            failures.setdefault(name, []).append("isolated payload refresh is frozen")
         proc = subprocess.run(
             [str(manager), "audit", name, "--from", str(source_root)],
             cwd=source_root, env=_dev_env(session), capture_output=True,
@@ -2211,8 +2196,13 @@ def cmd_dev_check(session_id: str) -> None:
     if staged_manager or staged_packages:
         staged_tree = _dev_git_value(source_root, "write-tree")
         staged_report = _source_snapshot_report(
-            source_root, staged_tree, manager_selfcheck=staged_manager,
-            audit_names=set(staged_packages))
+            source_root,
+            staged_tree,
+            manager_selfcheck=False,
+            audit_names=set(staged_packages),
+            catalog_baseline=_catalog_at_ref(source_root, head),
+            audit=False,
+        )
         if "catalog" in staged_report["failures"]:
             source_id = session["source"].get("id") or OFFICIAL_SOURCE_ID
             failures.setdefault("catalog", []).append(
@@ -2224,8 +2214,13 @@ def cmd_dev_check(session_id: str) -> None:
     immutable = None
     if publication_ready:
         immutable = _source_snapshot_report(
-            source_root, head, manager_selfcheck=manager_changed,
-            audit_names=set(existing))
+            source_root,
+            head,
+            manager_selfcheck=False,
+            audit_names=set(existing),
+            catalog_baseline=_catalog_at_ref(source_root, base),
+            audit=False,
+        )
         if not immutable["ok"]:
             failures.setdefault("immutable_tree", []).append(
                 json.dumps({"contract": immutable["contract"],
@@ -4141,7 +4136,9 @@ def cmd_sync_contract(check_only: bool) -> None:
 
 # ---------------------------------------------------------------- audit
 
-def _audit_script(name: str, script: Path) -> list[str]:
+def _audit_script(
+    name: str, script: Path, manifest_result: list[dict] | None = None
+) -> list[str]:
     failures: list[str] = []
     env = _snapshot_env()
     # Source/isolated audit sandboxes may intentionally omit the manager from
@@ -4218,6 +4215,9 @@ def _audit_script(name: str, script: Path) -> list[str]:
         if declared_service is not None and not service_dir.is_dir():
             failures.append(
                 "manifest: manifest.service is declared but service/ is absent from the bundle")
+    if manifest is not None and manifest_result is not None:
+        manifest_result.append(manifest)
+
     if "Replace this scaffold check with" in script_text:
         failures.append("doctor: scaffold readiness placeholder remains")
 
@@ -5049,18 +5049,20 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
         if not script.is_file():
             failures[name] = [f"missing canonical executable capabilities/{name}/bin/{name}"]
             continue
-        problems = _audit_script(name, script) if audit else []
-        rc, out, err = _run_script(script, ["manifest", "--json"])
-        manifest = None
-        if rc == 0:
-            try:
-                manifest = json.loads(out)
-            except ValueError:
-                problems.append("manifest: not JSON")
-        else:
-            problems.append(f"manifest: exit {rc}: {err.strip()}")
-        if manifest is not None:
-            problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
+        manifests: list[dict] = []
+        problems = _audit_script(name, script, manifests) if audit else []
+        manifest = manifests[0] if manifests else None
+        if not audit:
+            rc, out, err = _run_script(script, ["manifest", "--json"])
+            if rc == 0:
+                try:
+                    manifest = json.loads(out)
+                except ValueError:
+                    problems.append("manifest: not JSON")
+            else:
+                problems.append(f"manifest: exit {rc}: {err.strip()}")
+            if manifest is not None:
+                problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
         if problems:
             failures[name] = sorted(set(problems))
             continue
@@ -5073,12 +5075,14 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
 
 
 def _catalog_payload_scoped(
-    root: Path, audit_names: set[str], current: object
+    root: Path, audit_names: set[str], current: object, *, audit: bool = True
 ) -> tuple[dict, dict[str, list[str]]]:
-    """Rebuild all hashes while executing only changed capability contracts.
+    """Rebuild all hashes while loading declarations only for changed packages.
 
     Unchanged summaries come from the previously verified catalogue. Their
     payload bytes are still re-hashed, so the candidate cannot conceal drift.
+    Audit remains explicit: callers choose whether this is a verification or
+    deterministic catalogue-generation pass.
     """
     cap_root = root / "capabilities"
     listed = current.get("capabilities") if isinstance(current, dict) else {}
@@ -5094,18 +5098,20 @@ def _catalog_payload_scoped(
             failures[name] = [f"missing canonical executable capabilities/{name}/bin/{name}"]
             continue
         if name in audit_names:
-            problems = _audit_script(name, script)
-            rc, out, err = _run_script(script, ["manifest", "--json"])
-            manifest = None
-            if rc == 0:
-                try:
-                    manifest = json.loads(out)
-                except ValueError:
-                    problems.append("manifest: not JSON")
-            else:
-                problems.append(f"manifest: exit {rc}: {err.strip()}")
-            if manifest is not None:
-                problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
+            manifests: list[dict] = []
+            problems = _audit_script(name, script, manifests) if audit else []
+            manifest = manifests[0] if manifests else None
+            if not audit:
+                rc, out, err = _run_script(script, ["manifest", "--json"])
+                if rc == 0:
+                    try:
+                        manifest = json.loads(out)
+                    except ValueError:
+                        problems.append("manifest: not JSON")
+                else:
+                    problems.append(f"manifest: exit {rc}: {err.strip()}")
+                if manifest is not None:
+                    problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
             if problems:
                 failures[name] = sorted(set(problems))
                 continue
@@ -5147,6 +5153,7 @@ def _source_snapshot_report(
     manager_selfcheck: bool = False,
     audit_names: set[str] | None = None,
     catalog_baseline: object | None = None,
+    audit: bool = True,
 ) -> dict:
     """Evaluate one immutable Git tree without reading its working tree."""
     tree = _dev_git_value(root, "rev-parse", "--verify", f"{git_ref}^{{tree}}")
@@ -5176,12 +5183,13 @@ def _source_snapshot_report(
         current = _read_json(snapshot / ".capability-source" / "catalog.json")
         contract_failures = _source_contract_failures(snapshot)
         expected, failures = (
-            _catalog_payload(snapshot, audit=True)
+            _catalog_payload(snapshot, audit=audit)
             if audit_names is None
             else _catalog_payload_scoped(
                 snapshot,
                 audit_names,
                 current if catalog_baseline is None else catalog_baseline,
+                audit=audit,
             )
         )
         manager = snapshot / "bin" / "capabilities"
@@ -5220,6 +5228,39 @@ def _source_change_scope(changed_paths: list[str]) -> tuple[bool, set[str]]:
     return manager_changed, changed_capabilities
 
 
+def _source_validation_scope(root: Path, changed_paths: list[str]) -> tuple[bool, set[str]]:
+    """Select direct validation targets without running any validator.
+
+    Package-local changes stay local. A canonical contract or manager-code
+    change gets the conservative fleet fallback because either can change the
+    meaning of every capability contract. Manager documentation/assets do not.
+    """
+    manager_changed, packages = _source_change_scope(changed_paths)
+    broad_change = any(path in {
+        "bin/capabilities",
+        "contract/preamble.py",
+        "contract/contract.json",
+    } for path in changed_paths)
+    if broad_change:
+        cap_root = root / "capabilities"
+        packages = {
+            path.name for path in cap_root.iterdir()
+            if path.is_dir() and (path / "bin" / path.name).is_file()
+        } if cap_root.is_dir() else set()
+    return manager_changed, packages
+
+
+def _catalog_at_ref(root: Path, git_ref: str) -> dict:
+    raw = _dev_git(root, "show", f"{git_ref}:.capability-source/catalog.json")
+    if raw.returncode != 0:
+        return {"capabilities": {}}
+    try:
+        parsed = json.loads(raw.stdout)
+    except ValueError:
+        return {"capabilities": {}}
+    return parsed if isinstance(parsed, dict) else {"capabilities": {}}
+
+
 def cmd_source_index(source_id: str, staged: bool = False) -> None:
     _guard_source_checkout(source_id, "source index")
     root = _source_author_root(source_id)
@@ -5253,9 +5294,10 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
         report = _source_snapshot_report(
             root,
             tree,
-            manager_selfcheck=manager_changed,
+            manager_selfcheck=False,
             audit_names=changed_capabilities,
             catalog_baseline=catalog_baseline,
+            audit=False,
         )
         # A stale catalogue is the reason index exists, so it is not a blocker
         # while deriving the replacement. Contract or capability failures are.
@@ -5284,28 +5326,31 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
                 added.stderr.strip() or added.stdout.strip() or None,
             )
         final_tree = _dev_git_value(root, "write-tree")
-        verified = _source_snapshot_report(
-            root,
-            final_tree,
-            manager_selfcheck=manager_changed,
-            audit_names=changed_capabilities,
-            catalog_baseline=catalog_baseline,
+        staged_catalog = _dev_git(
+            root, "show", ":.capability-source/catalog.json"
         )
-        if not verified["ok"]:
+        try:
+            staged_value = json.loads(staged_catalog.stdout) \
+                if staged_catalog.returncode == 0 else None
+        except ValueError:
+            staged_value = None
+        if staged_value != report["expected"]:
             _emit({
                 "source": source_id,
                 "basis": "staged",
                 "tree": final_tree,
                 "ok": False,
-                "contract": verified["contract"],
-                "failures": verified["failures"],
+                "contract": [],
+                "failures": {
+                    "catalog": ["staged catalogue differs from generated output"]
+                },
             })
             sys.exit(7)
         _emit({
             "source": source_id,
             "basis": "staged",
             "tree": final_tree,
-            "indexed": sorted(verified["expected"]["capabilities"]),
+            "indexed": sorted(report["expected"]["capabilities"]),
             "catalog": str(path),
             "staged": True,
             "verification_profile": (
@@ -5317,7 +5362,7 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
         })
         return
     contract_failures = _source_contract_failures(root)
-    catalog, failures = _catalog_payload(root, audit=True)
+    catalog, failures = _catalog_payload(root, audit=False)
     if contract_failures or failures:
         _emit({"source": source_id, "ok": False,
                "contract": contract_failures, "failures": failures})
@@ -5335,7 +5380,7 @@ def cmd_source_check(source_id: str) -> None:
         _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
              f"run `capabilities source refresh {source_id}`")
     contract_failures = _source_contract_failures(root)
-    expected, failures = _catalog_payload(root, audit=True)
+    expected, failures = _catalog_payload(root, audit=False)
     current = _read_json(root / ".capability-source" / "catalog.json")
     if current != expected:
         failures.setdefault("catalog", []).append(
@@ -5348,20 +5393,48 @@ def cmd_source_check(source_id: str) -> None:
         sys.exit(7)
 
 
-def cmd_source_verify(source_id: str, git_ref: str) -> None:
+def cmd_source_verify(source_id: str, git_ref: str, base_ref: str | None) -> None:
     _guard_source_checkout(source_id, "source verify")
     root = _source_author_root(source_id)
     if not root.is_dir():
         _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
              f"run `capabilities source refresh {source_id}`")
     commit = _dev_git_value(root, "rev-parse", "--verify", f"{git_ref}^{{commit}}")
-    report = _source_snapshot_report(root, commit, manager_selfcheck=True)
+    if base_ref:
+        base = _dev_git_value(root, "rev-parse", "--verify", f"{base_ref}^{{commit}}")
+        changed_paths = _dev_git_value(
+            root, "diff", "--name-only", base, commit
+        ).splitlines()
+        manager_changed, audit_names = _source_validation_scope(root, changed_paths)
+        catalog_baseline = _catalog_at_ref(root, base)
+    else:
+        base = None
+        changed_paths = _dev_git_value(
+            root, "ls-tree", "-r", "--name-only", commit
+        ).splitlines()
+        manager_changed = True
+        audit_names = None
+        catalog_baseline = None
+    report = _source_snapshot_report(
+        root,
+        commit,
+        manager_selfcheck=manager_changed,
+        audit_names=audit_names,
+        catalog_baseline=catalog_baseline,
+        audit=True,
+    )
     _emit({
         "source": source_id,
         "root": str(root),
         "ref": git_ref,
         "commit": commit,
+        "base": base,
         "tree": report["tree"],
+        "manager_checked": manager_changed,
+        "audited_capabilities": (
+            sorted(report["expected"]["capabilities"])
+            if audit_names is None else sorted(audit_names)
+        ),
         "ok": report["ok"],
         "contract": report["contract"],
         "failures": report["failures"],
@@ -5631,8 +5704,10 @@ def _source_release(
     report = _source_snapshot_report(
         repo,
         candidate,
-        manager_selfcheck=manager_changed,
+        manager_selfcheck=False,
         audit_names=set(changed_capabilities),
+        catalog_baseline=_catalog_at_ref(repo, base_commit),
+        audit=False,
     )
     if not report["ok"]:
         _emit({
@@ -6282,10 +6357,12 @@ def _selfcheck_doclinks() -> list[str]:
 
 
 def cmd_selfcheck() -> None:
-    """Prove the repo's own wholeness: the enforcer parses, every capability
-    audits clean (zero drift), both audit branches have a living green example and
-    fire on a deliberate break, every standing rule names an enforcement the
-    manager actually has, and every doc link resolves. Exit 0 whole, 7 otherwise."""
+    """Prove manager and audit-engine wholeness without auditing the fleet.
+
+    Capability audit is a direct operation selected by dev/source verification.
+    Selfcheck owns manager syntax, deliberate audit-engine probes, doctrine,
+    guide assets, and documentation links only.
+    """
     import ast as _ast
     findings: list[str] = []
 
@@ -6302,13 +6379,6 @@ def cmd_selfcheck() -> None:
             "source: no complete capability source tree; run "
             "`capabilities source refresh official` and retry")
     else:
-        for capdir in sorted(
-                p for p in (source_root / "capabilities").iterdir() if p.is_dir()):
-            script = capdir / "bin" / capdir.name
-            if not script.is_file():
-                continue
-            for fail in _audit_script(capdir.name, script):
-                findings.append(f"audit: {capdir.name}: {fail}")
         findings += _selfcheck_negatives(canonical, source_root)
     findings += _selfcheck_doctrine()
     findings += _selfcheck_doclinks()
@@ -6564,7 +6634,7 @@ def main() -> None:
             git_ref = opt("--ref")
             if not git_ref:
                 _die(6, "input", "source verify needs --ref REF")
-            cmd_source_verify(pos[1], git_ref)
+            cmd_source_verify(pos[1], git_ref, opt("--base"))
         elif sub == "release":
             if len(pos) < 2:
                 _die(6, "input", "source release needs an id")

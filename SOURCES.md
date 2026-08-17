@@ -57,8 +57,9 @@ generated contract regions. Never edit those fenced regions by hand.
 
 The release unit is a prepared Git commit. Run `capabilities guide publishing`
 for the live staged-index, immutable verification, and release transaction.
-The manager leaves commit scope and message to the author, then owns validation,
-publication, checkout synchronization, and local installed-payload reconciliation.
+The manager leaves commit scope and message to the author, then owns publication,
+checkout synchronization, and local installed-payload reconciliation. Validation
+is explicit locally and authoritative in the integrity check for the exact SHA.
 
 ## Consume a source
 
@@ -73,8 +74,9 @@ capabilities install my-service --source personal
 Remote repositories use the caller's existing git/SSH authentication. The
 manager stores no GitHub token. `search` reads the checked-in generated catalog
 and never executes capability code. Installation independently checks the
-catalog hash and runs the full capability audit in staging before atomically
-replacing an installed payload.
+catalog hash, generated-contract integrity, declaration snapshots, and bundle
+layout before atomically replacing an installed payload. Authoring audit is an
+explicit source/development operation.
 
 To author an existing source on another machine, clone it into the same
 canonical workspace shape instead of editing the manager cache:
