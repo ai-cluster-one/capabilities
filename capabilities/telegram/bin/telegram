@@ -2734,6 +2734,35 @@ def _service_env(root: Path, cfg: dict, paths: dict[str, Path],
     return env
 
 
+def _service_owner_matches_launch(owner: object, *, launch_nonce: str,
+                                  daemon: Path, root: Path, cfg: dict,
+                                  paths: dict[str, Path],
+                                  dev_session: str | None) -> bool:
+    """Prove the daemon child launched through a possibly multi-process runner.
+
+    PEP 723 runners may retain a wrapper PID and execute Python in a child, so
+    process identity comes from the unguessable launch nonce plus the complete
+    owner provenance rather than equality with ``Popen.pid``.
+    """
+    if not isinstance(owner, dict):
+        return False
+    pid = owner.get("pid")
+    expected_mode = "development" if dev_session else "canonical"
+    return bool(
+        isinstance(pid, int) and _pid_alive(pid)
+        and owner.get("launch_nonce") == launch_nonce
+        and owner.get("daemon_path") == str(daemon.resolve())
+        and owner.get("cli_bundle_path") == str(Path(__file__).resolve())
+        and owner.get("mode") == expected_mode
+        and owner.get("dev_session_id") == dev_session
+        and owner.get("project_root") == str(root.resolve())
+        and owner.get("connection") == cfg["id"]
+        and owner.get("account_id") == _service_account_id(cfg)
+        and owner.get("service_state_path") == str(paths["state"].resolve())
+        and owner.get("health_file") == str(paths["health"].resolve())
+    )
+
+
 def _service_start_result(connection_flag: str | None, session_flag: str | None) -> dict:
     """Start only after cutover/version checks and wait for matching provenance."""
     import signal
@@ -2797,9 +2826,9 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
     while time.time() < deadline and proc.poll() is None:
         candidate = cmd_service_status(cid, session_flag)
         owner = candidate.get("owner")
-        if (isinstance(owner, dict)
-                and owner.get("launch_nonce") == launch_nonce
-                and owner.get("pid") == proc.pid):
+        if _service_owner_matches_launch(
+                owner, launch_nonce=launch_nonce, daemon=daemon, root=root,
+                cfg=cfg, paths=paths, dev_session=dev_session):
             out = candidate
             break
         time.sleep(0.2)

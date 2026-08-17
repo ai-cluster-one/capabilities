@@ -6,6 +6,7 @@ Run with: python3 tests/test_manager_bundle_install.py
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import io
@@ -31,6 +32,51 @@ TELEGRAM_WORKER = TELEGRAM_BUNDLE / "service" / "worker-bin" / "telegram"
 MAILBOX_SCRIPT = REPO / "capabilities" / "mailbox" / "bin" / "mailbox"
 GEMINITALK_SCRIPT = REPO / "capabilities" / "geminitalk" / "bin" / "geminitalk"
 GEMINITALK_BASE = REPO / "capabilities" / "geminitalk" / "prompts" / "base.md"
+
+
+def test_telegram_service_start_proves_runner_child_by_nonce_and_provenance(
+    tmp_path: Path,
+) -> None:
+    """A PEP runner's Popen PID may differ from the actual daemon child PID."""
+    tree = ast.parse(TELEGRAM_SCRIPT.read_text())
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_service_owner_matches_launch"
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+    namespace = {
+        "Path": Path,
+        "__file__": str(TELEGRAM_SCRIPT),
+        "_pid_alive": lambda pid: pid == 202,
+        "_service_account_id": lambda cfg: cfg["expected_account_id"],
+    }
+    exec(compile(module, str(TELEGRAM_SCRIPT), "exec"), namespace)
+
+    root = tmp_path / "project"
+    daemon = TELEGRAM_DAEMON.resolve()
+    state = tmp_path / "state"
+    health = state / "health.json"
+    root.mkdir()
+    state.mkdir()
+    cfg = {"id": "marvin", "expected_account_id": 42}
+    owner = {
+        "pid": 202,
+        "launch_nonce": "nonce",
+        "daemon_path": str(daemon),
+        "cli_bundle_path": str(TELEGRAM_SCRIPT.resolve()),
+        "mode": "canonical",
+        "dev_session_id": None,
+        "project_root": str(root.resolve()),
+        "connection": "marvin",
+        "account_id": 42,
+        "service_state_path": str(state.resolve()),
+        "health_file": str(health.resolve()),
+    }
+    assert namespace["_service_owner_matches_launch"](
+        owner, launch_nonce="nonce", daemon=daemon, root=root, cfg=cfg,
+        paths={"state": state, "health": health}, dev_session=None,
+    )
 
 
 def _ensure_project_envelope(project: Path) -> Path:
