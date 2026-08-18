@@ -643,6 +643,51 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(current["in_reply_to"]["id"], 101)
             await self.stop_session(client, task)
 
+    async def test_general_topic_reply_chain_stays_on_the_base_channel(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {"-200": {"aliases": ["Assistant"]}}
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({})
+
+            # A forum's general topic leaves forum_topic unset and carries
+            # reply_to_top_id with the root of a plain reply chain.
+            def in_general(message_id, text, reply_to=None, chain_root=None):
+                message = Message(message_id, text=text)
+                message.mentioned = "Assistant" in text
+                if reply_to is not None:
+                    message.reply_to = SimpleNamespace(
+                        forum_topic=False,
+                        reply_to_top_id=chain_root,
+                        reply_to_msg_id=reply_to,
+                    )
+                message.reply_to_msg_id = reply_to
+                return message
+
+            root = in_general(201, "general context")
+            answer = in_general(202, "an earlier answer", reply_to=201)
+            request = in_general(
+                203, "Assistant, answer here", reply_to=202, chain_root=201)
+            client = FakeClient([root, answer, request])
+            captured = {}
+
+            def capture(_chat, tail, state=None, _procs=None):
+                captured["state"] = state
+                return successful_result("answered in general")
+
+            daemon.WORKERS["stub"] = capture
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(request, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: "state" in captured)
+
+            self.assertIsNone(captured["state"]["topic_id"])
+            self.assertEqual(captured["state"]["channel_key"], "-200")
+            await self.stop_session(client, task)
+
     async def test_forum_topic_progress_uses_the_prompted_wrapper_and_reply(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()

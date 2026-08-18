@@ -2216,6 +2216,16 @@ CHANNEL_TOPIC_MARKER = "#topic:"
 def _message_topic_id(message):
     """Canonical forum-topic root id, or None for ordinary chat messages."""
     reply = getattr(message, "reply_to", None)
+    # Telegram marks every message inside a forum topic with forum_topic. The
+    # general topic leaves the flag unset and carries reply_to_top_id with the
+    # root of a plain reply chain, so the flag alone separates a topic from an
+    # ordinary threaded conversation.
+    is_topic = bool(
+        getattr(message, "forum_topic", False)
+        or getattr(reply, "forum_topic", False)
+    )
+    if not is_topic:
+        return None
     for value in (
         getattr(message, "reply_to_top_id", None),
         getattr(reply, "reply_to_top_id", None),
@@ -2226,14 +2236,8 @@ def _message_topic_id(message):
                 return int(value)
         except (TypeError, ValueError):
             pass
-    is_topic = bool(
-        getattr(message, "forum_topic", False)
-        or getattr(reply, "forum_topic", False)
-    )
-    if not is_topic:
-        return None
-    # Telegram's general topic and a topic's root service message may expose
-    # only reply_to_msg_id / the message id rather than reply_to_top_id.
+    # A topic's root service message and a direct post into a topic expose only
+    # reply_to_msg_id / the message id rather than reply_to_top_id.
     for value in (
         getattr(message, "reply_to_msg_id", None),
         getattr(reply, "reply_to_msg_id", None),
