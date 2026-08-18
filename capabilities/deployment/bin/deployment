@@ -1995,6 +1995,15 @@ def _launchd_environment(runtime: dict, name: str, search_path: str) -> dict:
     return environment
 
 
+def _launchd_program(command: list[str]) -> list[str]:
+    """launchd resolves the program itself, against its own minimal PATH, and
+    never against the job's environment - so a bare command name fails to spawn
+    with EX_CONFIG. The executable is resolved here instead; PATH still travels
+    with the job, for the workers the service spawns in turn."""
+    resolved = shutil.which(command[0]) if command else None
+    return [resolved or command[0], *command[1:]]
+
+
 def _launchd_plist(root: Path, runtime: dict, name: str, service: dict,
                    search_path: str) -> str:
     deploy = service["deploy"]
@@ -2002,7 +2011,7 @@ def _launchd_plist(root: Path, runtime: dict, name: str, service: dict,
     agents_dir = _host_agents_dir(root, runtime)
     body: dict = {
         "Label": f"{prefix}.{name}",
-        "ProgramArguments": list(deploy["command"]),
+        "ProgramArguments": _launchd_program(list(deploy["command"])),
         "WorkingDirectory": str(root),
         "EnvironmentVariables": _launchd_environment(runtime, name, search_path),
         "RunAtLoad": True,
@@ -2047,6 +2056,13 @@ def _host_artifact_texts(root: Path, runtime: dict,
         [service["deploy"]["command"] for service in services.values()])
     texts: dict[Path, str] = {}
     for name, service in sorted(services.items()):
+        command = service["deploy"]["command"]
+        if command and not shutil.which(command[0]):
+            findings.append({
+                "severity": "error", "path": "deployment/runtime.json",
+                "message": f"service {name!r} runs {command[0]!r}, which is not "
+                           "on PATH here; launchd needs it resolved at compile "
+                           "time"})
         path = agents_dir / f"{_host_label_prefix(runtime, root)}.{name}.plist"
         texts[path] = _mark_generated(
             path, _launchd_plist(root, runtime, name, service, search_path))

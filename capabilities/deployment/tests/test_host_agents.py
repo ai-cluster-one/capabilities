@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -81,7 +82,10 @@ def test_every_enabled_service_becomes_one_agent(tmp_path: Path) -> None:
     assert sorted(agents) == ["project.automations.plist", "project.telegram.plist"]
     telegram = agents["project.telegram.plist"]
     assert telegram["Label"] == "project.telegram"
-    assert telegram["ProgramArguments"] == ["telegram", "service", "run"]
+    # launchd resolves the program against its own PATH, so it is compiled in.
+    assert Path(telegram["ProgramArguments"][0]).is_absolute()
+    assert Path(telegram["ProgramArguments"][0]).name == "telegram"
+    assert telegram["ProgramArguments"][1:] == ["service", "run"]
     assert telegram["WorkingDirectory"] == str(root)
     assert telegram["RunAtLoad"] is True
 
@@ -234,3 +238,17 @@ def test_agent_logs_land_in_a_directory_that_exists(tmp_path: Path) -> None:
     for key in ("StandardOutPath", "StandardErrorPath"):
         assert Path(agent[key]).parent == root / "deployment" / "launchd"
         assert Path(agent[key]).parent.is_dir()
+
+
+def test_a_command_missing_from_this_machine_is_refused(tmp_path: Path) -> None:
+    root, env = _host_project(tmp_path, ("telegram",))
+    telegram = shutil.which("telegram")
+    assert telegram, "the test needs telegram installed to hide it"
+    hidden = str(Path(telegram).parent)
+    stripped = {**env, "PATH": ":".join(
+        entry for entry in env["PATH"].split(":") if entry != hidden)}
+    proc = _run(root, stripped, "sync")
+    assert proc.returncode == 6, proc.stdout
+    report = json.loads(proc.stdout)
+    assert any("not on PATH here" in finding["message"]
+               for finding in report["findings"])
