@@ -2745,7 +2745,9 @@ def _host_next_payload(root: Path, runtime: dict, target_name: str | None) -> di
     labels = [f"{prefix}.{name}" for name in services]
     apply_steps = [
         "Stop any copy of these services you started by hand, so launchd does "
-        f"not end up beside one: {', '.join(f'`{name} service stop`' for name in services) or 'none declared'}.",
+        f"not end up beside one: {', '.join(f'`{name} service stop`' for name in services) or 'none declared'}."
+        " That verb reaches a daemon it started itself; once launchd owns one,"
+        " the switch below is launchctl.",
         f"Link the compiled agents into `{library}`:",
         *[f"`ln -sf {agents_dir / f'{label}.plist'} {library / f'{label}.plist'}`"
           for label in labels],
@@ -2772,7 +2774,8 @@ def _host_next_payload(root: Path, runtime: dict, target_name: str | None) -> di
                           + ["deployment doctor"],
         "manual_control": {
             "restart": [f"launchctl kickstart -k gui/$UID/{label}" for label in labels],
-            "stop": [f"{name} service stop" for name in services],
+            "stop": [f"launchctl kill TERM gui/$UID/{label}" for label in labels],
+            "start": [f"launchctl kickstart gui/$UID/{label}" for label in labels],
             "remove": [f"launchctl bootout gui/$UID/{label}" for label in labels],
         },
         "with_telegram": "telegram" in services,
@@ -2908,6 +2911,7 @@ def _next_markdown(payload: dict) -> str:
         lines += ["", "## 7. Manual Control", "",
                   "Restart:", "", "```sh", *control["restart"], "```",
                   "", "Stop, and stay stopped:", "", "```sh", *control["stop"], "```",
+                  "", "Start again:", "", "```sh", *control["start"], "```",
                   "", "Remove from launchd:", "", "```sh", *control["remove"], "```"]
     lines.append("")
     return "\n".join(lines)

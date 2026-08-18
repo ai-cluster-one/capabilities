@@ -189,7 +189,10 @@ def test_next_hands_over_launchctl_and_keeps_manual_control(tmp_path: Path) -> N
     assert any("service stop" in step for step in payload["provider_steps"])
     control = payload["manual_control"]
     assert control["restart"] == ["launchctl kickstart -k gui/$UID/project.telegram"]
-    assert control["stop"] == ["telegram service stop"]
+    # launchctl is the switch for a job launchd owns; `service stop` only
+    # reaches a daemon the capability started itself.
+    assert control["stop"] == ["launchctl kill TERM gui/$UID/project.telegram"]
+    assert control["start"] == ["launchctl kickstart gui/$UID/project.telegram"]
     assert control["remove"] == ["launchctl bootout gui/$UID/project.telegram"]
 
 

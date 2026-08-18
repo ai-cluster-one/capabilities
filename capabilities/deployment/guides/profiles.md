@@ -92,11 +92,27 @@ other generated artifact, so a hand-tweak surfaces instead of quietly diverging.
 link the compiled agent into `~/Library/LaunchAgents`, then
 `launchctl bootstrap gui/$UID <plist>`.
 
-Afterwards the controls are plain launchctl. `launchctl kickstart -k
-gui/$UID/<label>` restarts one. `launchctl print gui/$UID/<label>` reports its
-pid and last exit status. `launchctl bootout gui/$UID/<label>` removes it
-entirely. Stopping a service the way you always would - `<capability> service
-stop` - leaves it stopped.
+Afterwards the controls are plain launchctl, and they are the ones to reach
+for. `launchctl kickstart -k gui/$UID/<label>` restarts a job, `launchctl kill
+TERM gui/$UID/<label>` stops it and leaves it stopped, `launchctl kickstart
+gui/$UID/<label>` starts it again, `launchctl print gui/$UID/<label>` reports
+its pid and last exit status, and `launchctl bootout gui/$UID/<label>` removes
+it entirely.
+
+`<capability> service stop` is a different thing and it is worth knowing which
+you are holding. That verb reaches a daemon the capability started itself, by
+the record it wrote when it did. A `service run` under a supervisor writes no
+such record - the supervisor is what owns the process - so on some capabilities
+the verb finds nothing and reports it, truthfully, as already stopped while
+launchd keeps the service running. Where a capability's `run` does register
+itself, the verb works and launchd honours it.
+
+That it is honoured at all rests on the service exiting zero when asked to
+stop. A process killed by a signal it does not handle looks like a crash to
+launchd, and a crash is what `KeepAlive` exists to undo - so a service that
+ignored SIGTERM would be restarted out from under whoever stopped it. Both
+paths above end in a clean exit for a service that shuts down on SIGTERM, which
+is what a `service run` written for a supervisor already does.
 
 `deployment doctor` reads that state back: it reports each declared agent as
 installed or not, loaded or not, so a service that was compiled and never
