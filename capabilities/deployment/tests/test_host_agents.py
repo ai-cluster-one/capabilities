@@ -189,3 +189,38 @@ def test_a_host_runtime_with_nothing_enabled_is_idle_not_invalid(tmp_path: Path)
     report = json.loads(proc.stdout)
     assert report["ok"]
     assert report["host_agents"] == []
+
+
+def test_a_host_runtime_declares_no_image_layout(tmp_path: Path) -> None:
+    root, env = _host_project(tmp_path, ("telegram",))
+    _sync(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    # A host runtime is complete without the sections an image needs.
+    assert set(runtime["compiler"]) == {"host"}
+    assert runtime["compiler"]["host"]["supervisor"] == "launchd"
+
+    runtime["compiler"]["container"] = {"agent_home": "/home/agent",
+                                        "project_root": "/app"}
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    proc = _run(root, env, "sync", "--check")
+    report = json.loads(proc.stdout)
+    assert any("ignored by this profile" in finding["message"]
+               for finding in report["findings"])
+    # Sync strips it back out rather than carrying an image layout forward.
+    _sync(root, env)
+    assert set(json.loads(runtime_path.read_text())["compiler"]) == {"host"}
+
+
+def test_an_unknown_host_supervisor_is_refused(tmp_path: Path) -> None:
+    root, env = _host_project(tmp_path, ("telegram",))
+    _sync(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["compiler"]["host"]["supervisor"] = "systemd"
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    proc = _run(root, env, "doctor")
+    assert proc.returncode == 6
+    report = json.loads(proc.stdout)
+    assert any("compiler.host.supervisor" in finding["message"]
+               for finding in report["findings"])

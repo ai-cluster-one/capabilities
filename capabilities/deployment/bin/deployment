@@ -1572,7 +1572,8 @@ def _runtime_template(profile: str, project_name: str) -> dict:
         "optional_env": [],
         "services": services,
         "volumes": volumes,
-        "compiler": _compiler_config({}),
+        "compiler": ({"host": _compiler_config({})["host"]}
+                     if profile in HOST_PROFILES else _compiler_config({})),
         "service_policy": {
             "auto_include": True,
             "default_mode": "embedded" if profile == "agent-box" else "enabled",
@@ -1711,6 +1712,9 @@ def _compile_runtime(root: Path, runtime: dict,
     })
     if host:
         compiled.pop("compose_file", None)
+        # Serializing the image layout back into a host runtime would re-add
+        # exactly the sections this profile ignores.
+        compiled["compiler"] = {"host": compiler["host"]}
     else:
         compiled["compose_file"] = runtime.get("compose_file") or "docker-compose.yaml"
     return compiled
@@ -2296,6 +2300,28 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
     elif not isinstance(compiler_raw, dict):
         findings.append({"severity": "error", "path": _rel(root, path),
                          "message": "compiler must be an object"})
+    elif data.get("profile") in HOST_PROFILES:
+        host = compiler_raw.get("host")
+        if host is not None and not isinstance(host, dict):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": "compiler.host must be an object"})
+        elif isinstance(host, dict):
+            if host.get("supervisor", "launchd") not in HOST_SUPERVISORS:
+                findings.append({"severity": "error", "path": _rel(root, path),
+                                 "message": "compiler.host.supervisor must be one of "
+                                            f"{', '.join(HOST_SUPERVISORS)}"})
+            if not _safe_relative_path(host.get("agents_dir", "deployment/launchd")):
+                findings.append({"severity": "error", "path": _rel(root, path),
+                                 "message": "compiler.host.agents_dir must be a safe project-relative path"})
+            prefix = host.get("label_prefix", "x")
+            if not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", prefix):
+                findings.append({"severity": "error", "path": _rel(root, path),
+                                 "message": "compiler.host.label_prefix must be a launchd-safe label"})
+        for key in ("artifacts", "container", "compose_overlays", "build_args"):
+            if compiler_raw.get(key):
+                findings.append({
+                    "severity": "warning", "path": _rel(root, path),
+                    "message": f"compiler.{key} describes an image and is ignored by this profile"})
     else:
         artifacts = compiler_raw.get("artifacts")
         if not isinstance(artifacts, dict):
