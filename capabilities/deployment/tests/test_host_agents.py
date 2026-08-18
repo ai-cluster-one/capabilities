@@ -113,9 +113,28 @@ def test_the_agent_carries_a_path_because_launchd_supplies_none(tmp_path: Path) 
     root, env = _host_project(tmp_path, ("telegram",))
     _sync(root, env)
     environment = _agents(root)["project.telegram.plist"]["EnvironmentVariables"]
-    assert environment["PATH"].split(":")[-6:] == [
-        "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
-        "/usr/sbin", "/sbin"]
+    entries = environment["PATH"].split(":")
+
+    telegram_dir = str(Path(shutil.which("telegram")).parent)
+    assert entries[0] == str(Path(telegram_dir).resolve())
+    # The whole proven PATH follows, so the workers a service spawns are found
+    # too, and every entry is a real directory rather than a hopeful guess.
+    assert {"/usr/bin", "/bin"} <= set(entries)
+    assert all(Path(entry).is_dir() for entry in entries)
+    assert len(entries) == len(set(entries))
+
+
+def test_a_per_session_shim_is_recorded_as_its_stable_target(tmp_path: Path) -> None:
+    root, env = _host_project(tmp_path, ("telegram",))
+    stable = tmp_path / "toolchain" / "v1" / "bin"
+    stable.mkdir(parents=True)
+    shim = tmp_path / "shim"
+    shim.symlink_to(tmp_path / "toolchain" / "v1")
+    _sync(root, {**env, "PATH": f"{shim / 'bin'}:{env['PATH']}"})
+    entries = _agents(root)["project.telegram.plist"][
+        "EnvironmentVariables"]["PATH"].split(":")
+    assert str(stable.resolve()) in entries
+    assert str(shim / "bin") not in entries
 
 
 def test_no_secret_is_written_into_an_agent(tmp_path: Path) -> None:

@@ -55,10 +55,22 @@ compiled agent carries only `PATH` and the non-secret defaults from
 into it.
 
 **PATH is compiled in.** launchd hands a job a bare environment - no login
-shell runs, so nothing a profile would have exported is present. The directory
-each declared command resolves from *on the machine that ran sync* is written
-into the agent, ahead of the system locations. This is one of the reasons a
-compiled agent is machine-local.
+shell runs, so nothing a profile would have exported is present. A service
+needs more than its own executable: it spawns workers and reaches other tools,
+and a PATH holding only the service commands would start cleanly and then fail
+on the first thing it shells out to. So the PATH that was demonstrably working
+- the one belonging to the shell that ran sync - is captured whole, behind the
+directories the declared commands resolve from.
+
+Each entry is resolved through symlinks on the way in, which matters for
+version managers: a per-session shim directory disappears with the shell that
+created it, while the installation directory it points at does not. Entries
+that are not directories are dropped rather than written out as hopeful
+guesses.
+
+Compile from a shell where the services actually run, and recompile when the
+toolchain moves. This is the main reason a compiled agent belongs to one
+machine.
 
 **State stays where the capability put it.** A container profile maps declared
 mounts into volumes. A host profile maps nothing: each capability already owns

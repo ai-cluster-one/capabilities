@@ -1920,24 +1920,37 @@ def _launchd_search_path(commands: list[list[str]]) -> str:
     """PATH for an agent launchd starts.
 
     launchd hands a job a bare environment: no login shell runs, so nothing a
-    profile would have put on PATH is there. The directory each declared
-    command actually resolves from on this machine is therefore compiled in,
-    ahead of the system locations."""
+    profile would have put on PATH is there. A service needs more than its own
+    executable - it spawns workers, reads its project through other tools - so
+    the PATH that was proven to work, the compiling shell's, is captured whole,
+    behind the directories the declared commands resolve from.
+
+    Each entry is resolved through symlinks, which collapses a per-session shim
+    onto the stable installation directory it points at; a shim's own path
+    disappears with the shell that made it."""
     entries: list[str] = []
     for command in commands:
         resolved = shutil.which(command[0]) if command else None
         if resolved:
-            # The symlink's own directory is what belongs on PATH, not the
-            # registry payload it points into.
             entries.append(str(Path(resolved).parent))
+    entries += os.environ.get("PATH", "").split(os.pathsep)
     entries += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
                 "/usr/sbin", "/sbin"]
     seen, ordered = set(), []
     for entry in entries:
-        if entry not in seen:
-            seen.add(entry)
-            ordered.append(entry)
-    return ":".join(ordered)
+        if not entry:
+            continue
+        try:
+            candidate = Path(entry)
+            if not candidate.is_dir():
+                continue
+            resolved_entry = str(candidate.resolve())
+        except OSError:
+            continue
+        if resolved_entry not in seen:
+            seen.add(resolved_entry)
+            ordered.append(resolved_entry)
+    return os.pathsep.join(ordered)
 
 
 def _plist_escape(value: str) -> str:
