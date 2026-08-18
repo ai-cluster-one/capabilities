@@ -37,7 +37,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "ce614d0dede8f796bb48ff12e22ae9d3ff04680208b008784844379087dbfb98",
+      "payload_sha256": "b483199a187ca5617920fc79cfefc945e11ef9dc3f22522d1ab9a0df9235d363",
       "summary": "Project deployment standard - declare runtime services, target providers, references, and capability locks without depending on any one deployment adapter."
     },
     "directo": {

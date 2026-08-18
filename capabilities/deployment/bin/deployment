@@ -2013,8 +2013,10 @@ def _launchd_plist(root: Path, runtime: dict, name: str, service: dict,
     body.update({
         "ThrottleInterval": 10,
         "ProcessType": "Background",
-        "StandardOutPath": str(agents_dir / "logs" / f"{name}.out.log"),
-        "StandardErrorPath": str(agents_dir / "logs" / f"{name}.err.log"),
+        # launchd opens these itself and creates no directory to hold them, so
+        # they sit beside the agents, in the one directory sync guarantees.
+        "StandardOutPath": str(agents_dir / f"{name}.out.log"),
+        "StandardErrorPath": str(agents_dir / f"{name}.err.log"),
     })
     lines = ['<?xml version="1.0" encoding="UTF-8"?>',
              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '

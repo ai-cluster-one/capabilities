@@ -224,3 +224,13 @@ def test_an_unknown_host_supervisor_is_refused(tmp_path: Path) -> None:
     report = json.loads(proc.stdout)
     assert any("compiler.host.supervisor" in finding["message"]
                for finding in report["findings"])
+
+
+def test_agent_logs_land_in_a_directory_that_exists(tmp_path: Path) -> None:
+    root, env = _host_project(tmp_path, ("telegram",))
+    _sync(root, env)
+    agent = _agents(root)["project.telegram.plist"]
+    # launchd creates no directory for these, so they belong beside the agents.
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        assert Path(agent[key]).parent == root / "deployment" / "launchd"
+        assert Path(agent[key]).parent.is_dir()
