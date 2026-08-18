@@ -399,7 +399,7 @@ def test_install_from_source_script_installs_bundle() -> None:
         _run_manager(["install", "telegram", "--from", str(TELEGRAM_SCRIPT)], env)
 
         assert (cap_home / "telegram" / "telegram").is_file()
-        assert not (cap_home / "telegram" / "bin" / "telegram").exists()
+        assert not (cap_home / "telegram" / "bin").exists()
         assert (cap_home / "telegram" / "service" / "templates" / "settings.json").is_file()
         meta = json.loads((cap_home / "telegram" / "meta.json").read_text())
         assert meta["source_type"] == "directory"
@@ -426,12 +426,25 @@ def test_update_migrates_script_source_to_bundle() -> None:
         _run_manager(["update", "telegram"], env)
 
         assert (cap_home / "telegram" / "telegram").is_file()
-        assert not (cap_home / "telegram" / "bin" / "telegram").exists()
+        assert not (cap_home / "telegram" / "bin").exists()
         assert (cap_home / "telegram" / "service" / "templates" / "settings.json").is_file()
         meta = json.loads((cap_home / "telegram" / "meta.json").read_text())
         assert meta["source_type"] == "directory"
         assert meta["source"] == str(TELEGRAM_BUNDLE)
         _run_service_init(bin_dir, env, tmp / "project-update")
+
+
+def test_install_keeps_nonempty_source_bin_directory() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env, cap_home, _bin_dir = _env(tmp)
+
+        _run_manager(["install", "geminitalk", "--from", str(GEMINITALK_SCRIPT)], env)
+
+        reg = cap_home / "geminitalk"
+        assert (reg / "geminitalk").is_file()
+        assert not (reg / "bin" / "geminitalk").exists()
+        assert (reg / "bin" / "geminitalk-audio.swift").is_file()
 
 
 def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
@@ -964,6 +977,7 @@ if __name__ == "__main__":
     tests = [
         ("install from source script installs bundle", test_install_from_source_script_installs_bundle),
         ("update migrates script source to bundle", test_update_migrates_script_source_to_bundle),
+        ("install keeps nonempty source bin directory", test_install_keeps_nonempty_source_bin_directory),
         ("telegram daemon sigterm stops without traceback", test_telegram_daemon_sigterm_stops_without_traceback),
         ("auth context denies unlisted capability", test_capability_auth_context_denies_unlisted_capability),
         ("telegram worker wrapper limits current chat scope", test_telegram_worker_wrapper_limits_current_chat_scope),

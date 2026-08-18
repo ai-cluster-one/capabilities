@@ -1215,7 +1215,10 @@ def _install_payload(name: str, content: bytes, bundle_dir: Path | None,
         if source_script is not None:
             copied_script = reg / source_script.relative_to(bundle_dir)
             if copied_script != reg / name:
+                script_dir = copied_script.parent
                 copied_script.unlink(missing_ok=True)
+                if script_dir != reg and not any(script_dir.iterdir()):
+                    script_dir.rmdir()
     script = reg / name
     script.write_bytes(content)
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
