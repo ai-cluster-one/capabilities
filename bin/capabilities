@@ -321,6 +321,21 @@ DEFAULT_CONTEXT_PROMPT = (
     "store secrets, prose, workflows, volatile run results, or one-off record "
     "ids here."
 )
+SERVICE_SUPERVISION_CAPABILITY = "deployment"
+# A deliberate exception to "pointers flow down, an asset never names its
+# consumer". Someone who installs the manager and one service capability has
+# no way to discover that keeping that service running has a standard answer
+# at all, and the question arrives the moment the daemon does. So the answer is
+# named beside every declared service.
+#
+# It stays an exception rather than a habit because of how it is written: one
+# manager-owned string rendered next to each service, never a sentence copied
+# into a capability, and a route rather than a restatement - what supervision
+# is and how it works stays entirely with the capability named here.
+SERVICE_SUPERVISION_POINTER = (
+    "  Keeping it running - on this machine or on a server - is the "
+    f"`{SERVICE_SUPERVISION_CAPABILITY}` capability's domain: "
+)
 CAPABILITIES_CONTEXT_INTRO = (
     "Capabilities are self-contained CLIs installed on PATH and "
     "managed by `capabilities`. Use `capabilities list` to inspect the installed "
@@ -3574,6 +3589,10 @@ def _compose_context(root: Path) -> str:
             if verb_hint:
                 line += f" (verbs: {verb_hint})"
             bullet.append(line)
+            bullet.append(SERVICE_SUPERVISION_POINTER + (
+                f"start at `{SERVICE_SUPERVISION_CAPABILITY} help`."
+                if _registry_dir(SERVICE_SUPERVISION_CAPABILITY).is_dir()
+                else "it is not installed here."))
         refs = []
         refdir = envdir / "reference"
         if refdir.is_dir():
