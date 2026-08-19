@@ -3,10 +3,16 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "telethon==1.43.2",
-#     "py-tgcalls==2.3.3",
+#     "py-tgcalls==3.0.0.dev4",
+#     "ntgcalls==3.0.0b16",
 #     "google-genai>=1.36.0",
 # ]
 # ///
+# The 3.x line is what carries conference calls: joining one needs
+# CallConfig(conference=<invite message id>), which 2.x does not accept.
+# ntgcalls is pinned explicitly because inbound audio arrives only from b15 on
+# (ntgcalls#52), and because b16 is the first build whose signalling path this
+# capability rebinds — see bind_signalling_to_client_loop.
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
 
@@ -58,7 +64,8 @@ from pathlib import Path
 
 import telethon
 from telethon import TelegramClient, events
-from telethon.tl.types import MessageActionConferenceCall, MessageActionInviteToGroupCall, MessageService, UpdateNewMessage
+from telethon.tl.functions.phone import GetGroupCallChainBlocksRequest
+from telethon.tl.types import InputGroupCallInviteMessage, MessageActionConferenceCall, MessageActionInviteToGroupCall, MessageService, UpdateNewMessage
 
 import pytgcalls
 from pytgcalls import PyTgCalls, filters
@@ -71,11 +78,13 @@ from pytgcalls.types import (
     MediaStream,
     RecordStream,
 )
+from pytgcalls.types import UpdatedGroupCallParticipant
 from pytgcalls.types.raw import AudioParameters
 
 # Import shared call recording helpers (same directory)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from call_recording_helpers import (
+    bind_signalling_to_client_loop,
     finalize_mp3_capture,
     iso_utc,
     send_recording_to_chat,
@@ -90,6 +99,16 @@ logging.getLogger("telethon").setLevel(logging.CRITICAL)
 HERE = Path(__file__).resolve().parent
 WORKER_BIN = HERE / "worker-bin"
 CALL_RECORDER_BIN = HERE / "call_recorder.py"
+# How long a conference invite is given to grow the first block of its chain,
+# and how often that chain is read while waiting.
+CONFERENCE_CHAIN_TIMEOUT = 15.0
+CONFERENCE_CHAIN_INTERVAL = 0.5
+# How long a conference capture may stand still before the call counts as over,
+# and how often its size is checked.
+CAPTURE_STALL_TIMEOUT = 8.0
+CAPTURE_STALL_INTERVAL = 1.0
+# When to re-ask who is in a conference, as seconds after the join.
+CONFERENCE_AUDIO_MAP_RETRIES = (2.0, 3.0, 5.0, 10.0)
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
@@ -558,6 +577,23 @@ def now():
 
 def log(msg):
     print(f"[{now()}] {msg}", flush=True)
+
+
+class _TelethonWarnings(logging.Handler):
+    """Surface what Telethon retries over.
+
+    Telethon retries a request through server errors and reports only the
+    attempt count once it gives up, so the error class that actually came back
+    lives in a warning nothing was reading."""
+
+    def emit(self, record):
+        with contextlib.suppress(Exception):
+            log(f"telethon: {record.getMessage()}")
+
+
+_telethon_log = logging.getLogger("telethon")
+_telethon_log.setLevel(logging.WARNING)
+_telethon_log.addHandler(_TelethonWarnings())
 
 
 def write_health(state=None, **updates):
@@ -4324,6 +4360,100 @@ async def run_session(client):
             return (STATE_HOME / "telegram" / CONNECTION / "calls" / "recordings"
                     / f"{timestamp}-{mode}-{caller_id}.ogg")
 
+        library_last_block = calls._app._bind_client.get_conference_last_block
+
+        async def conference_last_block(chat_id: int, invite_msg_id=None):
+            """Wait for the last block of a conference's chain to exist.
+
+            Joining an E2EE conference means deriving a block from the chain the
+            other participants already signed. The invite arrives before that
+            chain has anything in it — a conference grown out of a running 1:1
+            call is still being built when its service message lands — and the
+            library reads the chain exactly once, then reads an empty answer as
+            a request to create a new conference and invite the caller into it.
+            Reading until a block appears is what makes the join reachable.
+
+            Only a read made against an invite is corrected here. The library
+            asks for this chain on its own path too, without an invite, and
+            answers that from the cached call — forcing an invite request there
+            costs a direct call its answer, because the failure retries beneath
+            it outlive the window to pick the call up."""
+            if not invite_msg_id:
+                return await library_last_block(chat_id, invite_msg_id)
+            deadline = time.monotonic() + CONFERENCE_CHAIN_TIMEOUT
+            reads = 0
+            while True:
+                reads += 1
+                result = await client(GetGroupCallChainBlocksRequest(
+                    call=InputGroupCallInviteMessage(msg_id=invite_msg_id),
+                    sub_chain_id=0, offset=-1, limit=1))
+                updates = list(getattr(result, "updates", []) or [])
+                blocks = [b for u in updates
+                          for b in getattr(u, "blocks", None) or []]
+                if blocks:
+                    log(f"call: conference chain for invite {invite_msg_id} — "
+                        f"block of {len(blocks[-1])} bytes after {reads} read(s)")
+                    return blocks[-1]
+                if time.monotonic() >= deadline:
+                    log(f"call: conference chain for invite {invite_msg_id} — "
+                        f"still empty after {reads} read(s)")
+                    return None
+                await asyncio.sleep(CONFERENCE_CHAIN_INTERVAL)
+
+        # The join runs inside the library, so the corrected reader has to be the
+        # one it calls.
+        calls._app._bind_client.get_conference_last_block = conference_last_block
+
+        async def require_conference_chain(caller_id: int, invite_msg_id: int):
+            """Refuse a conference whose chain has no block to build on, so the
+            library's "create a conference instead" fallback stays unreachable."""
+            try:
+                block = await conference_last_block(caller_id, invite_msg_id)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"conference chain unreadable for invite {invite_msg_id} — "
+                    f"{type(exc).__name__}: {exc}") from exc
+            if not block:
+                raise RuntimeError(
+                    f"conference chain empty for invite {invite_msg_id}")
+            log(f"call: conference chain readable — last block {len(block)} bytes")
+
+        async def refresh_conference_audio_map(chat_id: int, reason: str):
+            """Rebuild the participant-to-audio-stream map for a live call.
+
+            The map is built once, when the media layer asks who is in the call,
+            from a participant list cached for an hour. The participant-update
+            handler refreshes camera and screen sources only — audio is never
+            remapped — so anyone whose stream was not in that first snapshot is
+            never decoded and never reaches the recording. Dropping the cached
+            participants and asking again is what puts them back."""
+            try:
+                cache = calls._app._bind_client._cache
+                cache._call_participants_cache.pop(chat_id)
+            except Exception as exc:
+                log(f"call: audio map — participant cache not cleared "
+                    f"({type(exc).__name__}: {exc})")
+            try:
+                await calls._handle_request_participants(chat_id)
+                log(f"call: conference audio map refreshed ({reason})")
+            except Exception as exc:
+                log(f"call: conference audio map refresh failed ({reason}) — "
+                    f"{type(exc).__name__}: {exc}")
+
+        async def settle_conference_audio_map(chat_id: int):
+            """Re-ask a few times over the first seconds of a conference.
+
+            A participant who is still being admitted when the join completes
+            carries no stream to map yet."""
+            elapsed = 0.0
+            for delay in CONFERENCE_AUDIO_MAP_RETRIES:
+                await asyncio.sleep(delay)
+                elapsed += delay
+                if active_recording["caller_id"] != chat_id:
+                    return
+                await refresh_conference_audio_map(
+                    chat_id, f"+{elapsed:g}s after join")
+
         async def record_call(caller_id: int, mode: str, call_config: CallConfig):
             output = recording_output(caller_id, mode)
             capture = output.with_suffix(".mp3")
@@ -4381,13 +4511,21 @@ async def run_session(client):
             })
 
             try:
+                if mode == "conference":
+                    await require_conference_chain(caller_id, call_config.conference)
                 await calls.record(caller_id, RecordStream(capture), config=call_config)
                 metadata["status"] = "recording"
                 metadata["recording_started_at"] = iso_utc()
                 write_metadata(metadata_path, metadata)
                 log(f"call: recording {mode} from {caller_id} to {output}")
+                asyncio.create_task(watch_capture_stall(caller_id, capture))
+                if mode == "conference":
+                    asyncio.create_task(settle_conference_audio_map(caller_id))
             except Exception as exc:
-                log(f"call: failed to start {mode} recording from {caller_id}: {exc}")
+                # A media connection that never reached CONNECTED is reported as
+                # an argument-less exception, so the type carries the message.
+                log(f"call: failed to start {mode} recording from {caller_id}: "
+                    f"{type(exc).__name__}: {exc}")
                 metadata.update({
                     "status": "join_failed",
                     "stop_reason": "join_failed",
@@ -5325,16 +5463,18 @@ async def run_session(client):
                 return
             await start_call_recording(caller_id, "p2p", CallConfig(timeout=60))
 
-        @calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))
-        async def call_ended(_call_client: PyTgCalls, update: ChatUpdate):
-            if active_voice_call["caller_id"] == update.chat_id:
-                await finish_voice_call("call_closed")
-                await flush_call_summary()
-                return
-            if active_recording["caller_id"] != update.chat_id:
-                return
+        async def finalize_call_recording(stop_reason: str = "call_closed"):
+            """Close the active p2p or conference recording and deliver it.
 
-            caller_id = update.chat_id
+            A conference is not chat-bound and announces neither its start nor
+            its end through the chat-update stream, so this is reached from the
+            capture watchdog as well as from the call-ended handler."""
+            caller_id = active_recording["caller_id"]
+            if caller_id is None:
+                return
+            if stop_reason != "call_closed":
+                with contextlib.suppress(Exception):
+                    await calls.leave_call(caller_id)
             output = active_recording["output"]
             capture = active_recording["capture"]
             metadata_path = active_recording["metadata_path"]
@@ -5342,7 +5482,7 @@ async def run_session(client):
             started_at = active_recording["started_at"]
             mode = active_recording["mode"]
 
-            log(f"call: ended from {caller_id}")
+            log(f"call: ended from {caller_id} ({stop_reason})")
 
             # Clear active state immediately
             active_recording.update({
@@ -5364,7 +5504,8 @@ async def run_session(client):
             recording_ended_at = iso_utc()
             wall_duration = (datetime.now(timezone.utc) - started_at).total_seconds()
 
-            finalized = await finalize_mp3_capture(capture, output)
+            finalized = await finalize_mp3_capture(
+                capture, output, keep_source=mode == "conference")
             status = "complete" if finalized["status"] == "complete" else "conversion_failed"
             media_duration = finalized.get("duration_seconds") or wall_duration
 
@@ -5373,7 +5514,7 @@ async def run_session(client):
                 "recording_ended_at": recording_ended_at,
                 "duration_seconds": media_duration,
                 "wall_duration_seconds": round(wall_duration, 3),
-                "stop_reason": "call_closed",
+                "stop_reason": stop_reason,
             })
             metadata["audio"]["bytes"] = finalized["output_bytes"]
             metadata["audio"]["settled"] = finalized["status"] == "complete"
@@ -5420,6 +5561,75 @@ async def run_session(client):
                     log(f"call: recording conversion failed — {finalized['error']}")
                 else:
                     log(f"call: recording complete, delivery disabled")
+
+        @calls.on_update()
+        async def log_call_update(_call_client: PyTgCalls, update):
+            """Name every update the library emits during a live recording.
+
+            What ends a call is not always announced through a handler we
+            listen for — being dropped from a conference reaches us as nothing
+            at all — so while a recording is open, everything gets named."""
+            if active_recording["caller_id"] is None and \
+                    active_voice_call["caller_id"] is None:
+                return
+            status = getattr(update, "status", None)
+            blocks = getattr(update, "blocks", None)
+            detail = "" if blocks is None else f" blocks={[len(b) for b in blocks]}"
+            log(f"call-update: {type(update).__name__}"
+                f"{'' if status is None else ' ' + str(status)} "
+                f"chat_id={getattr(update, 'chat_id', None)}{detail}")
+
+        @calls.on_update()
+        async def conference_participants_changed(_call_client: PyTgCalls, update):
+            """Remap audio whenever the roster of a live conference moves."""
+            if not isinstance(update, UpdatedGroupCallParticipant):
+                return
+            if active_recording["caller_id"] != update.chat_id:
+                return
+            if active_recording["mode"] != "conference":
+                return
+            await refresh_conference_audio_map(
+                update.chat_id, "participant update")
+
+        @calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))
+        async def call_ended(_call_client: PyTgCalls, update: ChatUpdate):
+            if active_voice_call["caller_id"] == update.chat_id:
+                await finish_voice_call("call_closed")
+                await flush_call_summary()
+                return
+            if active_recording["caller_id"] != update.chat_id:
+                return
+            await finalize_call_recording("call_closed")
+
+        async def watch_capture_stall(caller_id: int, capture: Path):
+            """Close a conference recording once its capture stops growing.
+
+            A normal hangup arrives as a chat update, but being removed from a
+            conference emits nothing at all. The MP3 encoder writes continuously
+            while the call is up — silence included — so a file that stops
+            growing is the call being over, and it is the only end signal a
+            kicked conference gives us."""
+            still = 0.0
+            last_size = -1
+            joined_at = time.monotonic()
+            first_frames = False
+            while active_recording["caller_id"] == caller_id:
+                await asyncio.sleep(CAPTURE_STALL_INTERVAL)
+                size = capture.stat().st_size if capture.exists() else 0
+                if size and not first_frames:
+                    first_frames = True
+                    log(f"call: first frames written "
+                        f"{time.monotonic() - joined_at:.1f}s after the join")
+                if size != last_size:
+                    last_size = size
+                    still = 0.0
+                    continue
+                still += CAPTURE_STALL_INTERVAL
+                if still >= CAPTURE_STALL_TIMEOUT and size > 0:
+                    log(f"call: capture stopped growing for {still:.0f}s "
+                        f"at {size} bytes — closing the recording")
+                    await finalize_call_recording("capture_stalled")
+                    return
 
         @client.on(events.Raw)
         async def conference_invite(event):
@@ -5820,6 +6030,7 @@ async def run_session(client):
     if calls is not None:
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
+        bind_signalling_to_client_loop(calls, log)
         features = []
         if has_p2p_recording:
             features.append(f"p2p(allowed_callers={sorted(allowed_callers)})")

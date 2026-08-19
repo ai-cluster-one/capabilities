@@ -30,6 +30,7 @@ import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from ntgcalls import VIDEO_ROTATION_0
 from pytgcalls.exceptions import NotInCallError
 from pytgcalls.types import Device, Frame
 
@@ -824,7 +825,13 @@ class VoiceCallSession:
                     self._chat_id,
                     Device.MICROPHONE,
                     payload,
-                    Frame.Info(capture_time=int(time.time() * 1000)),
+                    # rotation defaults to int 0, but send_frame passes it
+                    # straight into ntgcalls.FrameData, which wants the enum —
+                    # without this every outbound audio frame raises TypeError.
+                    Frame.Info(
+                        capture_time=int(time.time() * 1000),
+                        rotation=VIDEO_ROTATION_0,
+                    ),
                 )
             except NotInCallError:
                 return
