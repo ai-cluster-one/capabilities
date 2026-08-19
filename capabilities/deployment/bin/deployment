@@ -159,9 +159,9 @@ from typing import NoReturn
 
 
 NAME = "deployment"
-SUMMARY = ("Project deployment standard - declare runtime services, target "
-           "providers, references, and capability locks without depending on "
-           "any one deployment adapter.")
+SUMMARY = ("Project deployment standard - declare the services a project runs, "
+           "compile them into a container image or into supervised processes "
+           "on the machine itself, and describe the targets they deploy to.")
 SCOPE = "project"
 CRED_KEYS: list = []
 WRITE_VERBS = {"init", "freeze", "setup", "scaffold", "sync"}

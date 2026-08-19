@@ -37,8 +37,8 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "7f090401f05ee945c00d720adae7df75538be3fb16b835af8c38acfeb6c7f07a",
-      "summary": "Project deployment standard - declare runtime services, target providers, references, and capability locks without depending on any one deployment adapter."
+      "payload_sha256": "812225534776e87add5b0769f94f891b804785bcae695f27f59e5da270e22e90",
+      "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into supervised processes on the machine itself, and describe the targets they deploy to."
     },
     "directo": {
       "path": "capabilities/directo",
