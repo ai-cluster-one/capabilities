@@ -44,8 +44,12 @@ async def probe_audio_duration(path: Path) -> float | None:
     return duration if duration > 0 else None
 
 
-async def finalize_mp3_capture(capture: Path, output: Path) -> dict:
-    """Convert a closed built-in MP3 capture to the final OGG/Opus artifact."""
+async def finalize_mp3_capture(capture: Path, output: Path,
+                               keep_source: bool = False) -> dict:
+    """Convert a closed built-in MP3 capture to the final OGG/Opus artifact.
+
+    keep_source leaves the MP3 where it was written, so what the capture
+    actually received can be told apart from what the conversion made of it."""
     result = {
         "status": "failed",
         "error": None,
@@ -101,10 +105,11 @@ async def finalize_mp3_capture(capture: Path, output: Path) -> dict:
         "output_bytes": output.stat().st_size,
         "duration_seconds": await probe_audio_duration(output),
     })
-    try:
-        capture.unlink()
-    except OSError as exc:
-        result["cleanup_error"] = f"{type(exc).__name__}: {exc}"[:500]
+    if not keep_source:
+        try:
+            capture.unlink()
+        except OSError as exc:
+            result["cleanup_error"] = f"{type(exc).__name__}: {exc}"[:500]
     result["source_retained"] = capture.exists()
     return result
 
@@ -295,3 +300,77 @@ async def send_recording_to_chat(
                 attempts=attempt,
             )
         return
+
+
+def bind_signalling_to_client_loop(calls, log=None) -> str:
+    """Route ntgcalls' signalling callbacks back onto the MTProto client's loop.
+
+    py-tgcalls 3.x hands `MtProtoClient.send_signaling` straight to
+    `run_coroutine_threadsafe`, but `sync.wrap()` has already replaced that
+    method with a synchronous wrapper, so the expression runs the request
+    instead of building a coroutine. Called from ntgcalls' worker thread the
+    wrapper drives it on an event loop of its own and the client refuses it,
+    which drops every outbound ICE candidate and ends the call in TIMEOUT ten
+    seconds later. `on_outbound_block` carries the same defect on the
+    conference path.
+
+    Submitted upstream as pytgcalls/pytgcalls#334. This returns "native" and
+    changes nothing once a release carries that fix, so it can be deleted the
+    moment the pin moves past it.
+
+    Must be called after `calls.start()`, which installs the originals.
+    """
+    if hasattr(calls, '_emit_signaling_data'):
+        return 'native'
+
+    binding = getattr(calls, '_binding', None)
+    loop = getattr(calls, 'loop', None)
+    app = getattr(calls, '_app', None)
+    if binding is None or loop is None or app is None:
+        if log:
+            log('call: signalling rebind unavailable — unexpected library shape')
+        return 'unavailable'
+
+    def _schedule(coro, what: str):
+        def _report(fut):
+            try:
+                exc = fut.exception()
+            except Exception:
+                return
+            if exc is not None and log:
+                log(f'call: {what} failed — {type(exc).__name__}: {exc}')
+
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        future.add_done_callback(_report)
+        return future
+
+    async def _send_signalling(chat_id, data):
+        await app.send_signaling(chat_id, data)
+
+    async def _send_outbound_block(chat_id, block):
+        await app.send_conference_call_broadcast(chat_id, block)
+
+    bound = []
+    if hasattr(binding, 'on_signaling_data'):
+        binding.on_signaling_data(
+            lambda chat_id, data: _schedule(
+                _send_signalling(chat_id, data), 'signalling send',
+            ),
+        )
+        bound.append('signalling')
+    if hasattr(binding, 'on_outbound_block'):
+        binding.on_outbound_block(
+            lambda chat_id, block: _schedule(
+                _send_outbound_block(chat_id, block), 'outbound block send',
+            ),
+        )
+        bound.append('outbound-block')
+
+    if not bound:
+        if log:
+            log('call: signalling rebind unavailable — no known callbacks')
+        return 'unavailable'
+    if log:
+        log(f"call: signalling rebound onto the client loop ({', '.join(bound)}) "
+            f'— workaround for pytgcalls/pytgcalls#334')
+    return 'patched'
