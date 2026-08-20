@@ -1422,6 +1422,11 @@ async def _reply_is_to_me(message, me):
 
 
 async def _message_addresses_me(message, me, policy):
+    # A tagged answer is addressed to a live session, not to this daemon. It
+    # beats every other signal — reply, mention, name — because those are how
+    # agents write to each other and none of them says who consumes the answer.
+    if _marker_line(_message_text(message), NO_REPLY_MARKER):
+        return False
     if not _may_address(getattr(message, "sender_id", None), policy):
         return False
     agent_sender = _is_agent_member(getattr(message, "sender_id", None), policy)
@@ -2366,6 +2371,14 @@ def _reply_to_message_id(message):
 
 CHANNEL_TOPIC_MARKER = "#topic:"
 GENERAL_TOPIC_ID = 1
+# Two agents share one room, and each side runs a daemon that answers on its
+# own. A request tagged EXTERNAL says its answer is consumed by a live session
+# rather than by the peer's daemon, so the daemon stamps NO_REPLY on everything
+# it sends for that request and the peer's daemon stays out of the exchange.
+# The daemon decides both, never the model: a convention the worker has to
+# remember is a convention that gets forgotten mid-conversation.
+EXTERNAL_REQUEST_MARKER = "#external"
+NO_REPLY_MARKER = "#noreply"
 
 
 def _message_topic_id(message):
@@ -2425,6 +2438,24 @@ def _general_topic_id(message):
     if _as_mapping(_as_mapping(policy).get("topics")):
         return GENERAL_TOPIC_ID
     return None
+
+
+def _marker_line(text, marker):
+    """Whether a message carries a protocol tag, which is its last line alone.
+
+    Position is what separates the tag from a conversation about it. Agents
+    discuss these tokens — this repository's own guide names them — and an
+    inline match would let a message explaining the protocol silence the daemon
+    it explains.
+    """
+    lines = [line.strip() for line in str(text or "").strip().splitlines()]
+    return bool(lines) and lines[-1] == marker
+
+
+def _with_marker(text, marker):
+    """One outgoing message with its tag on the last line of its own."""
+    body = str(text or "").rstrip()
+    return f"{body}\n\n{marker}" if body else marker
 
 
 def _message_topic_title(message):
@@ -3551,20 +3582,24 @@ async def run_session(client):
     def proc_key_for(chat_key, job):
         return f"{chat_key}:{job.get('message_id')}"
 
-    def message_chunks(text):
-        """Split outbound text without exceeding Telegram's message length limit."""
+    def message_chunks(text, reserve=0):
+        """Split outbound text without exceeding Telegram's message length limit.
+
+        `reserve` holds back room for a tag appended to every chunk afterwards.
+        """
         text = str(text)
-        if len(text) <= TELEGRAM_MESSAGE_LIMIT:
+        limit = max(1, TELEGRAM_MESSAGE_LIMIT - reserve)
+        if len(text) <= limit:
             return [text]
 
         chunks = []
-        while len(text) > TELEGRAM_MESSAGE_LIMIT:
+        while len(text) > limit:
             boundary = max(
-                text.rfind("\n", 0, TELEGRAM_MESSAGE_LIMIT + 1),
-                text.rfind(" ", 0, TELEGRAM_MESSAGE_LIMIT + 1),
+                text.rfind("\n", 0, limit + 1),
+                text.rfind(" ", 0, limit + 1),
             )
             if boundary <= 0:
-                boundary = TELEGRAM_MESSAGE_LIMIT
+                boundary = limit
             else:
                 boundary += 1  # Keep the whitespace with the preceding chunk.
             chunks.append(text[:boundary])
@@ -3573,19 +3608,23 @@ async def run_session(client):
         return chunks
 
     async def send_channel_message(ent_id, text, is_direct, reply_to=None,
-                                   force_reply=False, **kwargs):
+                                   force_reply=False, mark=None, **kwargs):
         """One path for every message the service sends, so chunking at
         Telegram's length limit happens once. A direct chat is a single thread,
         so a `reply_to` meant for a group's addressed message is dropped there —
-        unless `force_reply` says the reply relationship is itself the point."""
+        unless `force_reply` says the reply relationship is itself the point.
+
+        `mark` tags every chunk rather than the last one: a peer daemon reads
+        each message on its own, and an untagged tail chunk would wake it."""
         sent = None
         sent_ids = []
         threaded = reply_to is not None and (force_reply or not is_direct)
-        for chunk in message_chunks(text):
+        for chunk in message_chunks(text, reserve=len(mark) + 2 if mark else 0):
+            body = _with_marker(chunk, mark) if mark else chunk
             if threaded:
-                sent = await client.send_message(ent_id, chunk, reply_to=reply_to, **kwargs)
+                sent = await client.send_message(ent_id, body, reply_to=reply_to, **kwargs)
             else:
-                sent = await client.send_message(ent_id, chunk, **kwargs)
+                sent = await client.send_message(ent_id, body, **kwargs)
             sent_ids.append(sent.id)
         return sent, sent_ids
 
@@ -3631,7 +3670,8 @@ async def run_session(client):
             reply_to=thread_reply_target(message, profile["id"], group_policy, False))
         return True
 
-    async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset):
+    async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset,
+                             mark=None):
         path = Path(outbox)
         if not path.exists():
             return offset
@@ -3650,19 +3690,24 @@ async def run_session(client):
             text = str(item.get("text") or "").strip()
             if not text or text in ("-", ".", "..."):
                 continue
-            _, _ = await send_channel_message(ent_id, text, is_direct, reply_to=None if is_direct else reply_to)
+            _, _ = await send_channel_message(
+                ent_id, text, is_direct,
+                reply_to=None if is_direct else reply_to, mark=mark)
             log(f"{key}: progress job msg={reply_to or 'direct'} «{text[:80]}»")
         return offset
 
-    async def pump_progress(key, outbox, ent_id, is_direct, reply_to, stop_event):
+    async def pump_progress(key, outbox, ent_id, is_direct, reply_to, stop_event,
+                            mark=None):
         offset = 0
         while not stop_event.is_set():
-            offset = await drain_progress(key, outbox, ent_id, is_direct, reply_to, offset)
+            offset = await drain_progress(
+                key, outbox, ent_id, is_direct, reply_to, offset, mark=mark)
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=1)
             except asyncio.TimeoutError:
                 pass
-        await drain_progress(key, outbox, ent_id, is_direct, reply_to, offset)
+        await drain_progress(
+            key, outbox, ent_id, is_direct, reply_to, offset, mark=mark)
 
     def reserve_job(key, message, group_policy, is_direct, reason, chat_id=None):
         """Persist ownership of a message before any transcription or other await.
@@ -3683,6 +3728,11 @@ async def run_session(client):
             "message_id": message.id,
             "chat_id": str(chat_id if chat_id is not None else _channel_identity(key)[0]),
             "channel_key": key,
+            # Recorded on the job rather than re-read at delivery: the job is
+            # what survives a restart or a retry, and the answer owes the tag
+            # even when it is produced by a later attempt.
+            "external_request": _marker_line(_message_text(message),
+                                             EXTERNAL_REQUEST_MARKER),
             "topic_id": _message_topic_id(message),
             "topic_title": _message_topic_title(message),
             "sender_id": sender_id,
@@ -3935,6 +3985,10 @@ async def run_session(client):
                      "cancel_event": cancel_event,
                      "project_dir": project_dir,
                      "proc_key": proc_key}
+            # Everything this job sends carries the tag, not only the final
+            # answer: a progress line or an error notice naming the peer would
+            # wake the daemon this exchange is trying to keep out of it.
+            answer_mark = NO_REPLY_MARKER if job.get("external_request") else None
             routed = "" if project_dir == PROJECT_ROOT else f" project={project_dir}"
             log(f"{key}: dispatch job msg={job.get('message_id')} tail={s['tail_size']} "
                 f"worker={s['worker']} model={s['model'] or 'default'} msgs={len(tail)}{routed}")
@@ -3942,7 +3996,7 @@ async def run_session(client):
             progress_stop = asyncio.Event()
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
-                              delivery_reply_id, progress_stop))
+                              delivery_reply_id, progress_stop, mark=answer_mark))
             future = loop.run_in_executor(None, WORKERS[s["worker"]], key, tail, state, procs)
             async with client.action(ent_id, "typing"):
                 done, _ = await asyncio.wait({future}, timeout=float(s["worker_timeout"]))
@@ -3966,24 +4020,29 @@ async def run_session(client):
             
             if images:
                 try:
-                    if len(reply) <= 1024:
+                    caption = (_with_marker(reply, answer_mark)
+                               if answer_mark else reply)
+                    if len(caption) <= 1024:
                         sent = await client.send_file(
-                            ent_id, images, caption=reply,
+                            ent_id, images, caption=caption,
                             reply_to=delivery_reply_id)
                     else:
                         sent = await client.send_file(
                             ent_id, images, reply_to=delivery_reply_id)
                         _, _ = await send_channel_message(
-                            ent_id, reply, is_direct, reply_to=delivery_reply_id)
+                            ent_id, reply, is_direct, reply_to=delivery_reply_id,
+                            mark=answer_mark)
                     image_count = len(images) if isinstance(images, list) else 1
                     log(f"{key}: sent {image_count} image(s) with reply job msg={job.get('message_id')}")
                 except Exception as send_err:
                     log(f"{key}: image send failed, delivering text only: {send_err}")
                     sent, _ = await send_channel_message(
-                        ent_id, reply, is_direct, reply_to=delivery_reply_id)
+                        ent_id, reply, is_direct, reply_to=delivery_reply_id,
+                        mark=answer_mark)
             else:
                 sent, _ = await send_channel_message(
-                    ent_id, reply, is_direct, reply_to=delivery_reply_id)
+                    ent_id, reply, is_direct, reply_to=delivery_reply_id,
+                    mark=answer_mark)
             
             tok = meta.get("tokens", {})
             cost = f" ${meta['cost_usd']:.4f}" if meta.get("cost_usd") else ""
@@ -4055,8 +4114,8 @@ async def run_session(client):
             if not is_direct and reply_to is None and job.get("topic_id") is not None:
                 reply_to = int(job["topic_id"])
             _, _ = await send_channel_message(
-                ent_id, notice, is_direct,
-                reply_to=reply_to)
+                ent_id, notice, is_direct, reply_to=reply_to,
+                mark=NO_REPLY_MARKER if job.get("external_request") else None)
         except Exception as se:
             log(f"{key}: failed to send error notice: {se}")
         mark_job_finished(key, job, "error", error=error)
@@ -4383,7 +4442,14 @@ async def run_session(client):
             log(f"{raw_key}: human msg={event.message.id} reset agent dialogue")
         access = await _event_access(event, me, reg)          # gate 1: the door
         if not access:
-            log(f"{event.chat_id}: ignored {_message_kind(event.message)} from {event.sender_id}")
+            # A tagged message is the common reason to ignore one here, and the
+            # tag is easy to put on a request by mistake. Say so, or the silence
+            # that follows looks like the daemon missing the message.
+            reason = (" (carries " + NO_REPLY_MARKER + ")"
+                      if _marker_line(_message_text(event.message), NO_REPLY_MARKER)
+                      else "")
+            log(f"{event.chat_id}: ignored {_message_kind(event.message)} "
+                f"from {event.sender_id}{reason}")
             return
         if getattr(event.message, "action", None) is not None:
             return

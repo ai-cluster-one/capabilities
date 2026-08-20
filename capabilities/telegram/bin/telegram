@@ -86,7 +86,7 @@ Commands:
                                                Read messages from a chat.
   telegram search <chat> <query> [--limit N] [--json]
                                                Search messages inside a chat.
-  telegram send <chat> <text> [--reply-to MSG_ID | --topic TOPIC_ID]
+  telegram send <chat> <text> [--reply-to MSG_ID | --topic TOPIC_ID] [--external]
                                                Send a message. In a forum, a
                                                message lands in the topic named
                                                by --topic (its root message id)
@@ -1584,8 +1584,26 @@ def _reply_target(reply_to: int | None, topic: int | None) -> int | None:
     return reply_to if reply_to is not None else topic
 
 
+EXTERNAL_REQUEST_MARKER = "#external"
+
+
+def _external_request(text: str) -> str:
+    """Append the tag that asks the answering assistant to stay off the wire.
+
+    An assistant daemon answering a tagged request marks everything it sends,
+    and a peer daemon reading a marked message leaves it alone — the answer is
+    for whoever asked, which is a live session rather than the other daemon.
+    The tag is the message's last line alone, so prose naming it is prose.
+    """
+    body = str(text or "").rstrip()
+    if body.splitlines() and body.splitlines()[-1].strip() == EXTERNAL_REQUEST_MARKER:
+        return body
+    return f"{body}\n\n{EXTERNAL_REQUEST_MARKER}" if body else EXTERNAL_REQUEST_MARKER
+
+
 async def cmd_send(cfg, chat: str, text: str, reply_to: int | None = None,
-                   topic: int | None = None) -> dict:
+                   topic: int | None = None, external: bool = False) -> dict:
+    text = _external_request(text) if external else text
     target = _reply_target(reply_to, topic)
     client = make_client(cfg)
     await _require_auth(client)
@@ -1597,7 +1615,8 @@ async def cmd_send(cfg, chat: str, text: str, reply_to: int | None = None,
 
 async def cmd_send_media(cfg, chat: str, path: str, caption: str | None,
                          reply_to: int | None, force_document: bool,
-                         topic: int | None = None) -> dict:
+                         topic: int | None = None, external: bool = False) -> dict:
+    caption = _external_request(caption) if external else caption
     target = _reply_target(reply_to, topic)
     media = Path(path).expanduser()
     if not media.is_file():
@@ -3137,6 +3156,9 @@ def main() -> None:
     pn.add_argument("--reply-to", type=int, help="message id to reply to")
     pn.add_argument("--topic", type=int,
                     help="forum topic root message id to post into")
+    pn.add_argument("--external", action="store_true",
+                    help="ask the answering assistant to tag its reply so no "
+                         "peer daemon answers it")
 
     pm = sub.add_parser("send-media", help="send a local media file")
     pm.add_argument("chat")
@@ -3147,6 +3169,9 @@ def main() -> None:
                     help="forum topic root message id to post into")
     pm.add_argument("--force-document", action="store_true",
                     help="upload images as documents instead of photos")
+    pm.add_argument("--external", action="store_true",
+                    help="ask the answering assistant to tag its reply so no "
+                         "peer daemon answers it")
 
     prx = sub.add_parser("react", help="add emoji reactions to a message")
     prx.add_argument("chat")
@@ -3291,11 +3316,12 @@ def main() -> None:
             _emit(asyncio.run(cmd_search(cfg, args.chat, args.query, args.limit, args.json)))
         elif args.cmd == "send":
             _emit(asyncio.run(cmd_send(
-                cfg, args.chat, args.text, args.reply_to, args.topic)))
+                cfg, args.chat, args.text, args.reply_to, args.topic,
+                args.external)))
         elif args.cmd == "send-media":
             _emit(asyncio.run(cmd_send_media(
                 cfg, args.chat, args.path, args.caption, args.reply_to,
-                args.force_document, args.topic,
+                args.force_document, args.topic, args.external,
             )))
         elif args.cmd == "react":
             _emit(asyncio.run(cmd_react(cfg, args.chat, args.msgid, args.emojis)))

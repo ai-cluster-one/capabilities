@@ -4444,5 +4444,85 @@ class GeneralTopicTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reg["-200"]["last_processed_message_id"], 4242)
 
 
+class AgentMarkerTests(unittest.IsolatedAsyncioTestCase):
+    """Two daemons share a room. A request tagged #external says its answer is
+    consumed by a live session, and the daemon — not the model — stamps
+    #noreply on everything it sends for that request."""
+
+    def sender(self, text):
+        return SimpleNamespace(id=500, chat_id=-200, sender_id=777, text=text,
+                               raw_text=text, message=text, mentioned=False,
+                               reply_to=None)
+
+    async def policy(self, td, **group):
+        service_settings = settings()
+        service_settings["allowed_groups"] = {"-200": group or {"name": "room"}}
+        return import_daemon(Path(td), service_settings)
+
+    async def test_a_tagged_answer_is_never_an_invitation(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = await self.policy(td)
+            _, policy = daemon._group_policy(-200)
+            me = SimpleNamespace(id=1, username="assistant", first_name="Assistant")
+
+            named = self.sender("Assistant, here is what I found")
+            tagged = self.sender("Assistant, here is what I found\n\n#noreply")
+
+            self.assertTrue(await daemon._message_addresses_me(named, me, policy))
+            self.assertFalse(await daemon._message_addresses_me(tagged, me, policy))
+
+    async def test_the_tag_counts_only_as_the_last_line_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = await self.policy(td)
+            _, policy = daemon._group_policy(-200)
+            me = SimpleNamespace(id=1, username="assistant", first_name="Assistant")
+
+            # Agents discuss this protocol, and a message about the tag must not
+            # be silenced by the tag it is about.
+            about = self.sender("Assistant, the #noreply tag goes on its own line")
+            trailing = self.sender("Assistant, see below\n#noreply extra words")
+
+            self.assertTrue(await daemon._message_addresses_me(about, me, policy))
+            self.assertTrue(await daemon._message_addresses_me(trailing, me, policy))
+
+    async def test_a_request_records_what_its_answer_owes(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = await self.policy(td)
+
+            self.assertTrue(daemon._marker_line("ask\n\n#external", "#external"))
+            self.assertFalse(daemon._marker_line("about #external tags", "#external"))
+            self.assertEqual(daemon._with_marker("body", "#noreply"),
+                             "body\n\n#noreply")
+
+    async def test_every_chunk_carries_the_tag(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = await self.policy(td)
+            limit = daemon.TELEGRAM_MESSAGE_LIMIT
+
+            # A peer daemon reads each message on its own, so an untagged tail
+            # chunk would wake it.
+            reserve = len("#noreply") + 2
+            chunks = [daemon._with_marker(chunk, "#noreply")
+                      for chunk in _chunks("x " * limit, limit - reserve)]
+
+            self.assertGreater(len(chunks), 1)
+            for chunk in chunks:
+                self.assertTrue(chunk.endswith("#noreply"))
+                self.assertLessEqual(len(chunk), limit)
+
+
+def _chunks(text, limit):
+    """The daemon's split rule, mirrored for a test that cannot reach into the
+    client closure where it lives."""
+    out = []
+    while len(text) > limit:
+        boundary = max(text.rfind("\n", 0, limit + 1), text.rfind(" ", 0, limit + 1))
+        boundary = limit if boundary <= 0 else boundary + 1
+        out.append(text[:boundary])
+        text = text[boundary:]
+    out.append(text)
+    return out
+
+
 if __name__ == "__main__":
     unittest.main()

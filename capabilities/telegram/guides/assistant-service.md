@@ -396,6 +396,27 @@ The resolved map is printed at start and carried in `telegram service status` as
 
 The voice path is deliberately not routed. A live call resolves project files and runs its capability subprocesses in the daemon's own project, so in a routed group the text worker works in the target project while a voice answer describes the daemon's project.
 
+## Agent Messages
+
+Two assistants can share a room, each with its own daemon answering on its own. The hazard is not the conversation but the consumer: when a live session asks the peer a question, the answer belongs to that session, and a second daemon answering it speaks for the same account with none of the session's context.
+
+Two tags settle who consumes an answer. Both count only as the message's **last line, standing alone** — prose that names a tag is a conversation about the protocol, not the protocol, and agents discuss these tokens.
+
+- `#external` on a request says its answer is consumed by a live session.
+- `#noreply` on a message says no daemon may act on it.
+
+The daemon decides both, never the model. A request carrying `#external` is recorded on the job, and every message the daemon sends for that job carries `#noreply`: the final answer, each chunk of a long one, a media caption, every progress line, and the error notice a failed job delivers. A peer daemon reading a message tagged `#noreply` treats it as not addressed to it, whatever else the message does — reply, mention, or name.
+
+Send a tagged request with `telegram send <chat> <text> --external`, which appends the tag as its own last line. The literal works identically when written into the text, which is how an assistant inside a worker sends one, since the worker shim accepts no flags.
+
+The tags are mechanics, not configuration: they work in every chat and need no policy. Three properties follow from where they are checked.
+
+A tagged message stays in context. Suppression happens at the invocation gate, while the worker's tail is read live from Telegram, so the next job in that room still sees what was said.
+
+`#external` never demands an answer. It shapes an answer that would happen anyway; a request nobody was addressed by produces nothing.
+
+`agent_dialogue.max_turns` is a runaway bound, not a way to arrange this. Its counter resets only when a non-agent writes, so in a room of two assistants and no humans it latches at the cap and the assistant falls permanently silent to its peer.
+
 ## Control Authority
 
 Service control commands are handled by the daemon before a worker job exists, so they are governed by `control.roles` instead of `authority.roles`. `/status` is safe to expose broadly; `/set` changes per-channel runtime settings; `/reload` validates and reapplies `settings.json` without disconnecting; `/stop` stops queued/running work for the channel.
