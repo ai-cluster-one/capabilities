@@ -20,6 +20,7 @@ CALL_GROUP_MODES = {
 }
 CALL_USER_MODES = {"disabled", "off", "enabled", "auto", "on"}
 CONTROL_COMMANDS = {"status", "set", "reload", "stop", "help", "*"}
+CONTEXT_MODES = {"extend", "exclusive"}
 
 
 def _fail(path, message):
@@ -125,7 +126,8 @@ def _topics(value, path, project_root, service_dir):
         except (TypeError, ValueError):
             _fail(entry_path, "topic key must be a positive forum topic ID")
         entry = _object(entry, entry_path)
-        _unknown(entry, {"project", "context", "context_file"}, entry_path)
+        _unknown(entry, {"project", "context", "context_file", "context_mode"},
+                 entry_path)
         if "project" in entry:
             _route_project(entry["project"], f"{entry_path}.project")
         _overlay(entry, entry_path, project_root, service_dir)
@@ -319,6 +321,8 @@ def _overlay(value, path, project_root, service_dir):
     if "context_file" in value:
         _safe_service_path(value["context_file"], f"{path}.context_file",
                            project_root, service_dir)
+    if "context_mode" in value:
+        _enum(value["context_mode"], CONTEXT_MODES, f"{path}.context_mode")
 
 
 def _participant(value, path, project_root, service_dir, *, member=False):
@@ -326,7 +330,7 @@ def _participant(value, path, project_root, service_dir, *, member=False):
     allowed = {
         "name", "username", "role", "may_address", "control", "authority",
         "allowed_capabilities", "capabilities", "context", "context_file",
-        "call_recording", "voice_agent", "project",
+        "context_mode", "call_recording", "voice_agent", "project",
     }
     if member:
         allowed.update({"kind", "address_aliases"})
@@ -365,7 +369,7 @@ def _group(value, path, project_root, service_dir):
         "require_reference", "members", "agent_dialogue", "worker_timeout",
         "voice_transcription", "call_recording", "control", "authority",
         "allowed_capabilities", "capabilities", "context", "context_file",
-        "project", "topics",
+        "context_mode", "project", "topics",
     }
     _unknown(value, allowed, path)
     for key in ("name", "role", "member_role"):

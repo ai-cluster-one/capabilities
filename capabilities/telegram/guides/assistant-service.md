@@ -86,9 +86,9 @@ The accepted schema is deliberately finite:
 
 - Top level: `connection`, `assistant_name`, `direct_messages`, `allowed_users`, `allowed_groups`, `control`, `authority`, and `defaults`.
 - `direct_messages`: `mode` and `default_role`.
-- User/member policy: display `name`/`username`, `role`, `may_address`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `project`, `call_recording`, and `voice_agent`; group members additionally accept `kind` and `address_aliases`.
-- Group policy: `name`, `role`/`member_role`, `aliases`/`address_aliases`/`mentions`, `require_reference`, `members`, `agent_dialogue`, `worker_timeout`, `voice_transcription`, `call_recording`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `project`, and `topics`.
-- `topics`: keyed by forum topic ID, each entry accepting `project`, `context`, and `context_file`. A topic carries no authority tier: it inherits its group's rights and can neither narrow nor widen them.
+- User/member policy: display `name`/`username`, `role`, `may_address`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `context_mode`, `project`, `call_recording`, and `voice_agent`; group members additionally accept `kind` and `address_aliases`.
+- Group policy: `name`, `role`/`member_role`, `aliases`/`address_aliases`/`mentions`, `require_reference`, `members`, `agent_dialogue`, `worker_timeout`, `voice_transcription`, `call_recording`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `context_mode`, `project`, and `topics`.
+- `topics`: keyed by forum topic ID, each entry accepting `project`, `context`, `context_file`, and `context_mode`. A topic carries no authority tier: it inherits its group's rights and can neither narrow nor widen them.
 - Defaults: `assistant_name`, `tail_size`, `sync_interval`, `sync_stale_after`, `debounce`, `worker_timeout`, `progress_after`, `max_parallel_jobs`, `max_attempts`, `group_aliases`, `worker`, `workers`, and `voice_agent`.
 - Worker policy: `model`; Claude also accepts `effort`; Codex accepts `reasoning_effort` and `service_tier`. Voice defaults accept `worker`, `workers`, `model`, `voice`, `greeting`, `history`, `timezone`, `progress_interval`, `recording_caption`, and `prompt_file`.
 - Control policies contain `commands`; authority policies contain `allowed_capabilities` or `capabilities`. Capability rules accept booleans/`*`, verb lists, or `allow`/`deny`/`enabled`/`scope`/`verbs` objects.
@@ -327,6 +327,33 @@ A forum topic may add its own overlay under its group's `topics` map, and a dire
 
 The prompt order is: global `context.md`, channel context overlay, daemon channel state, current request, then the recent conversation tail. Channel context is a soft behavior layer only; access control still belongs to `control.roles` and tool access still belongs to `authority.roles`.
 
+### Exclusive channel prose
+
+`context_mode` decides whether a level's prose joins what came before it or stands alone. It accepts `extend`, the default, and `exclusive`, and it may be declared on a group, on a topic entry, and on a direct sender.
+
+Exclusivity cuts every layer above the level that declares it, and never a layer below. A topic set to `exclusive` answers with its own prose alone — the room's overlay and the global `context.md` both drop away. A group set to `exclusive` drops `context.md` while its topics still add their own lines on top of the room's.
+
+```json
+{
+  "allowed_groups": {
+    "-100123": {
+      "context": "House rules for this room.",
+      "topics": {
+        "12": {
+          "project": "~/dev/storefront-api",
+          "context": "You are the API service assistant. Answer only about this service.",
+          "context_mode": "exclusive"
+        }
+      }
+    }
+  }
+}
+```
+
+An exclusive channel takes over everything `context.md` was saying: who the assistant is, how it is addressed, how it introduces itself, how it treats history, and when to report progress. Write those into the channel's own prose, or the channel will not have them.
+
+What exclusivity never removes is the daemon-resolved state that a worker needs to answer at all — the channel and its id, participants and roles, active settings, tool authority, delivery, and the progress command for this request. The progress command is a fact about the request rather than prose, so it is stated in the channel state block whenever the prose does not already name it, and prose naming it in either spelling is rewritten to the real command wherever that prose came from.
+
 ## Worker Project Routing
 
 A chat, a forum topic, or a direct sender can name the project its worker runs in with a `project` property. Resolution order is topic, then chat, then direct sender, then the daemon's own project — the daemon's project is the row that results when nothing matched, not a privileged default.
@@ -356,6 +383,14 @@ The daemon does not resolve the target project; it stops asserting its own. The 
 Routing changes which rights the worker has, not only where it runs. The target project's capability gate governs the routed worker, so a capability must be enabled there — `capabilities enable <name> --project` inside that project, or `--global` for every project — before the worker can call it. Replies and progress are unaffected: `telegram send` from a worker is intercepted by the worker shim and delivered by the daemon's own client, so it never depends on the worker's directory or on the target project's policy.
 
 A route is judged twice. Its shape is checked when settings load: a string, absolute after expansion, and inside `$HOME`. Its reachability is checked when a message arrives: the target must exist, be a directory, and carry a project marker (`capabilities/settings.json`, `.contextkit/config.toml`, `.capabilities`, `.env`, `.env.local`, or `.git`). A target that fails at dispatch fails that one request and says so in the chat, because a neighbouring repository that was renamed must not stop the daemon that serves every other channel.
+
+### General
+
+Telegram lists a forum's General as topic `1`, but marks nothing on the wire: General messages carry no forum-topic flag and arrive looking like ordinary chat messages. A chat that declares a `topics` map has asked for its rooms to be addressable by name, so General resolves to topic `1` there and can be routed and given prose like any other room. A chat that declares no map keeps General on the bare chat key, where a plain group's messages belong and where a reply chain must not become a topic of its own.
+
+Declare `topics` only on a forum group. On a plain group the map would key its messages on a topic Telegram never made, and history reads for that key ask for the replies of a non-topic.
+
+The first reload after a chat gains a `topics` map moves that chat's existing register row onto the General key, so catch-up resumes where it stopped instead of replaying the room.
 
 The resolved map is printed at start and carried in `telegram service status` as `routes`, and it is refreshed on every settings reload. A route that points at a directory which exists and is a project, but the wrong one, runs there silently; reading the map once is the mitigation.
 

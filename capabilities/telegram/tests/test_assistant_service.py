@@ -4248,14 +4248,15 @@ class ChatProjectRoutingTests(unittest.IsolatedAsyncioTestCase):
             daemon = import_daemon(Path(td), service_settings)
             _, group_policy = daemon._group_policy(-200)
 
-            context = daemon._channel_context(
+            context, exclusive = daemon._channel_context(
                 [group_policy, daemon._topic_policy(group_policy, 7)])
 
             self.assertEqual(context, "room prose\n\ntopic prose")
+            self.assertFalse(exclusive)
             self.assertEqual(
                 daemon._channel_context(
                     [group_policy, daemon._topic_policy(group_policy, 9)]),
-                "room prose")
+                ("room prose", False))
 
     async def test_a_direct_sender_receives_the_prose_written_for_them(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4265,7 +4266,7 @@ class ChatProjectRoutingTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 daemon._channel_context([daemon.ALLOWED.get("42"), {}]),
-                "direct prose")
+                ("direct prose", False))
 
     async def test_the_route_map_names_every_configured_scope(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4285,6 +4286,162 @@ class ChatProjectRoutingTests(unittest.IsolatedAsyncioTestCase):
                 {"scope": "group -200 topic 7", "project": str(lane)},
                 {"scope": "direct 42", "project": str(mine)},
             ])
+
+
+class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
+    """A room and a topic each own their prose. A level that declares itself
+    exclusive answers with that prose alone, and the daemon-resolved state it
+    needs to answer at all is never part of the bargain."""
+
+    def group(self, **policy):
+        service_settings = settings()
+        service_settings["allowed_groups"] = {"-200": policy}
+        return service_settings
+
+    async def test_a_topic_that_claims_its_lane_drops_the_room(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.group(
+                context="room prose",
+                topics={"7": {"context": "lane prose", "context_mode": "exclusive"},
+                        "9": {"context": "quiet lane"}}))
+            _, policy = daemon._group_policy(-200)
+
+            claimed = daemon._channel_context(
+                [policy, daemon._topic_policy(policy, 7)])
+            inherited = daemon._channel_context(
+                [policy, daemon._topic_policy(policy, 9)])
+
+            self.assertEqual(claimed, ("lane prose", True))
+            self.assertEqual(inherited, ("room prose\n\nquiet lane", False))
+
+    async def test_an_exclusive_room_still_lets_its_topics_speak(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.group(
+                context="room prose", context_mode="exclusive",
+                topics={"7": {"context": "lane prose"}}))
+            _, policy = daemon._group_policy(-200)
+
+            # Exclusivity cuts what is above the level that declared it, never
+            # what is below: the room drops the service context, the topic still
+            # adds its own line.
+            self.assertEqual(
+                daemon._channel_context([policy, daemon._topic_policy(policy, 7)]),
+                ("room prose\n\nlane prose", True))
+
+    async def test_an_exclusive_prompt_answers_without_the_service_context(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            state = {"chat_id": 5, "channel_context": "lane prose"}
+
+            extend = daemon.build_prompt([], state)
+            exclusive = daemon.build_prompt([], {**state, "context_exclusive": True})
+
+            self.assertIn("test context", extend)
+            self.assertNotIn("test context", exclusive)
+            self.assertIn("lane prose", exclusive)
+
+    async def test_the_progress_channel_survives_an_exclusive_prompt(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            command = f'{daemon.WORKER_BIN / "telegram"} send 5'
+
+            for state in ({"chat_id": 5},
+                          {"chat_id": 5, "context_exclusive": True,
+                           "channel_context": "lane prose"}):
+                # The command names the channel this request answers on, so it
+                # is a fact the daemon resolves rather than prose a channel can
+                # forget to carry.
+                self.assertIn(command, daemon.build_prompt([], state))
+
+    async def test_prose_naming_the_progress_command_is_rewritten_wherever_it_sits(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            shim = str(daemon.WORKER_BIN / "telegram")
+
+            prompt = daemon.build_prompt([], {
+                "chat_id": 5, "context_exclusive": True,
+                "channel_context": "Report with telegram send <chat_id> <text> first."})
+
+            self.assertIn(f"Report with {shim} send 5", prompt)
+            self.assertNotIn("<chat_id>", prompt)
+
+    async def test_the_schema_admits_only_the_two_context_modes(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td)
+            base = {"connection": "test", "assistant_name": "Assistant",
+                    "direct_messages": {"mode": "anyone",
+                                        "default_role": "direct_user"},
+                    "allowed_users": {}, "allowed_groups": {}}
+
+            def validated(policy):
+                return daemon.validate_settings(
+                    {**base, "allowed_groups": {"-200": policy}}, root, root)
+
+            validated({"context_mode": "extend"})
+            validated({"topics": {"7": {"context_mode": "exclusive"}}})
+            with self.assertRaisesRegex(Exception, "must be one of"):
+                validated({"context_mode": "only"})
+            with self.assertRaisesRegex(Exception, "must be one of"):
+                validated({"topics": {"7": {"context_mode": "only"}}})
+
+
+class GeneralTopicTests(unittest.IsolatedAsyncioTestCase):
+    """Telegram lists General as topic 1, but marks nothing on the wire. A chat
+    that named its rooms gets General among them; a chat that named none keeps
+    it where it has always been."""
+
+    def message(self, chat_id):
+        return SimpleNamespace(id=500, chat_id=chat_id, reply_to=None)
+
+    async def test_general_is_addressable_once_a_chat_names_its_rooms(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"topics": {"1": {"context": "general prose"}}},
+                "-300": {"name": "no map"}}
+            daemon = import_daemon(Path(td), service_settings)
+
+            self.assertEqual(
+                daemon._message_topic_id(self.message(-200)), 1)
+            # Without a map General stays on the bare chat key, which is where a
+            # plain group's messages belong and where a reply chain must not
+            # become a topic of its own.
+            self.assertIsNone(daemon._message_topic_id(self.message(-300)))
+
+    async def test_a_real_topic_still_wins_over_the_general_synthesis(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"topics": {"1": {}, "7": {}}}}
+            daemon = import_daemon(Path(td), service_settings)
+            inside = SimpleNamespace(
+                id=500, chat_id=-200, forum_topic=True,
+                reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=7))
+
+            self.assertEqual(daemon._message_topic_id(inside), 7)
+
+    async def test_generals_watermark_follows_it_onto_the_topic_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {"-200": {"topics": {"1": {}}}}
+            daemon = import_daemon(Path(td), service_settings)
+            reg = {"-200": {"last_processed_message_id": 4242}}
+
+            self.assertTrue(daemon.migrate_register(reg))
+
+            general = daemon._channel_key(-200, 1)
+            self.assertEqual(reg[general]["last_processed_message_id"], 4242)
+            self.assertNotIn("-200", reg)
+
+    async def test_a_chat_without_a_map_keeps_its_register_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            reg = {"-200": {"last_processed_message_id": 4242}}
+
+            daemon.migrate_register(reg)
+
+            self.assertEqual(reg["-200"]["last_processed_message_id"], 4242)
 
 
 if __name__ == "__main__":

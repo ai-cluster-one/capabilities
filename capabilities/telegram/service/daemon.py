@@ -1701,8 +1701,26 @@ def _active_worker(row):
 
 
 def migrate_register(reg):
-    """Migrate old per-channel settings.model into workers.<active>.model."""
+    """Migrate old per-channel settings.model into workers.<active>.model, and
+    carry a forum General row onto the topic id it now keys on."""
     changed = False
+    for key in list(reg.keys()):
+        # General moved off the bare chat key the moment its chat declared a
+        # topics map. Without the move, catch-up would find no watermark and
+        # replay the room from wherever the tail begins.
+        try:
+            chat_id, topic_id = _channel_identity(key)
+        except (TypeError, ValueError):
+            continue
+        if topic_id is not None:
+            continue
+        _, policy = _group_policy(chat_id)
+        if not _as_mapping(_as_mapping(policy).get("topics")):
+            continue
+        general = _channel_key(chat_id, GENERAL_TOPIC_ID)
+        if general not in reg:
+            reg[general] = reg.pop(key)
+            changed = True
     for row in reg.values():
         if not isinstance(row, dict):
             continue
@@ -2347,6 +2365,7 @@ def _reply_to_message_id(message):
 
 
 CHANNEL_TOPIC_MARKER = "#topic:"
+GENERAL_TOPIC_ID = 1
 
 
 def _message_topic_id(message):
@@ -2361,7 +2380,7 @@ def _message_topic_id(message):
         or getattr(reply, "forum_topic", False)
     )
     if not is_topic:
-        return None
+        return _general_topic_id(message)
     for value in (
         getattr(message, "reply_to_top_id", None),
         getattr(reply, "reply_to_top_id", None),
@@ -2384,6 +2403,27 @@ def _message_topic_id(message):
                 return int(value)
         except (TypeError, ValueError):
             pass
+    return None
+
+
+def _general_topic_id(message):
+    """General as a topic id, for a chat that asked for its rooms by name.
+
+    Telegram lists General as topic 1, but the wire marks nothing: its messages
+    carry no forum_topic flag and arrive looking like ordinary chat messages.
+    A chat that declared a topics map asked for its rooms to be addressable, and
+    General is one of them — without this it is the only room in a forum that can
+    be neither routed nor given its own prose.
+
+    A chat that declared no map keeps General on the bare chat key, which is
+    where it has always lived and where a plain group's messages belong.
+    """
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id is None:
+        return None
+    _, policy = _group_policy(chat_id)
+    if _as_mapping(_as_mapping(policy).get("topics")):
+        return GENERAL_TOPIC_ID
     return None
 
 
@@ -2495,12 +2535,30 @@ def _channel_context_from_policy(policy):
     return "\n\n".join(parts).strip()
 
 
+def _context_mode(policy):
+    return str(_as_mapping(policy).get("context_mode") or "extend").strip().lower()
+
+
 def _channel_context(policies):
-    """Channel prose in the order it was authored: the room first, the topic
-    after it. A topic adds what is specific to its lane rather than replacing
-    what the room already said."""
-    parts = [_channel_context_from_policy(policy) for policy in policies]
-    return "\n\n".join(part for part in parts if part).strip()
+    """Channel prose in the order it was authored, and whether it stands alone.
+
+    The room speaks first and the topic after it, so a topic adds what is
+    specific to its lane rather than restating the room. A level that declares
+    itself exclusive cuts every layer above it — the room's prose and the
+    service context with it — because a lane that has to be told the room's
+    rules is not the lane the author asked for. It never cuts below itself: a
+    room that claims its own prose still lets its topics add theirs.
+    """
+    parts = []
+    exclusive = False
+    for policy in policies:
+        if _context_mode(policy) == "exclusive":
+            parts = []
+            exclusive = True
+        text = _channel_context_from_policy(policy)
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts).strip(), exclusive
 
 
 def resumed_prompt(st):
@@ -2532,14 +2590,21 @@ def build_prompt(tail, state=None):
     st = state or {}
     if st.get("resume_session") and not st.get("resume_reanchor"):
         return resumed_prompt(st)
-    context = CONTEXT_FILE.read_text().strip() if CONTEXT_FILE.exists() else ""
+    # An exclusive channel answers with its own prose alone. The service context
+    # goes with the room's, which is the point of the mode and the cost of it.
+    context = ("" if st.get("context_exclusive")
+               else (CONTEXT_FILE.read_text().strip() if CONTEXT_FILE.exists() else ""))
+    channel_context = (st.get("channel_context") or "").strip()
+    progress_command = None
     if st.get("chat_id") is not None:
         progress_command = (
             f'{WORKER_BIN / "telegram"} send {st["chat_id"]} "<one short line>"')
-        context = context.replace(
-            "{{TELEGRAM_PROGRESS_COMMAND}}", progress_command).replace(
+        # Prose that names the progress command in either spelling is rewritten
+        # to the shim path, wherever the prose came from.
+        context, channel_context = (
+            text.replace("{{TELEGRAM_PROGRESS_COMMAND}}", progress_command).replace(
                 "telegram send <chat_id> <text>", progress_command)
-    channel_context = (st.get("channel_context") or "").strip()
+            for text in (context, channel_context))
     if channel_context:
         channel_context = "--- Channel-specific context ---\n" + channel_context + "\n\n"
     lines = []
@@ -2596,6 +2661,11 @@ def build_prompt(tail, state=None):
     if pu:
         lines.append(f"Previous turn (rough context scale): input ~{pu.get('input')} tok., "
                      f"output {pu.get('output')} tok.")
+    if progress_command and progress_command not in context \
+            and progress_command not in channel_context:
+        lines.append(
+            f"Progress: for work longer than about 15 seconds, send one short line "
+            f"with {progress_command} before going deep.")
     block = ("--- Channel state ---\n" + "\n".join(lines) + "\n\n") if lines else ""
     request_block = ""
     if req:
@@ -3835,7 +3905,7 @@ async def run_session(client):
             route_value, route_label = _route_for(job, group_policy, is_direct)
             project_dir = (_route_target(route_value, route_label)
                            if route_value else PROJECT_ROOT)
-            channel_context = _channel_context([
+            channel_context, context_exclusive = _channel_context([
                 _as_mapping(ALLOWED.get(str(job.get("sender_id")))) if is_direct
                 else group_policy,
                 _topic_policy(group_policy, job.get("topic_id")),
@@ -3853,6 +3923,7 @@ async def run_session(client):
                      "messages": len(tail),
                      "history_chars": sum(len(m["text"]) for m in tail),
                      "channel_context": channel_context,
+                     "context_exclusive": context_exclusive,
                      "prev_usage": reg.get(key, {}).get("last_usage"),
                      "current_request": current_request,
                      "agent_dialogue": _agent_dialogue_snapshot(reg, key, group_policy),
