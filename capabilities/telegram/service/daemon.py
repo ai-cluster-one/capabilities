@@ -596,6 +596,46 @@ _telethon_log.setLevel(logging.WARNING)
 _telethon_log.addHandler(_TelethonWarnings())
 
 
+class _MediaStackLog(logging.Handler):
+    """Surface what the media stack says about a call.
+
+    Importing pytgcalls raises the `ntgcalls` logger from NOTSET to CRITICAL,
+    so the one layer that knows why a call dropped is silent by default. That
+    is why a conference which evicts this account leaves nothing behind: the
+    Telegram-side updates simply stop, no exception is raised, and the
+    transport never gets to say what it saw.
+
+    Consecutive duplicates are collapsed rather than rate-limited. The native
+    layer repeats one condition instead of emitting many distinct ones, and a
+    cap that drops by volume would eventually drop the single line worth
+    having.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._last = None
+        self._repeats = 0
+
+    def emit(self, record):
+        with contextlib.suppress(Exception):
+            message = record.getMessage()
+            if message == self._last:
+                self._repeats += 1
+                return
+            if self._repeats:
+                log(f"call-media: previous line repeated {self._repeats}x")
+                self._repeats = 0
+            self._last = message
+            log(f"call-media[{record.levelname.lower()}]: {message}")
+
+
+# Claimed after the import that muted it, never before: the mute is the import
+# itself, so an earlier level is simply overwritten.
+_media_log = logging.getLogger("ntgcalls")
+_media_log.setLevel(logging.DEBUG)
+_media_log.addHandler(_MediaStackLog())
+
+
 def write_health(state=None, **updates):
     """Atomically publish update-stream liveness for `telegram service status`."""
     health = {}

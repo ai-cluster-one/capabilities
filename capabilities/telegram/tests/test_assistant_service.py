@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -4522,6 +4523,40 @@ def _chunks(text, limit):
         text = text[boundary:]
     out.append(text)
     return out
+
+
+class MediaStackLogTests(unittest.IsolatedAsyncioTestCase):
+    """The media stack silences itself on import, which is why a call that
+    drops leaves nothing behind. The daemon claims that logger back."""
+
+    async def test_the_media_logger_is_audible_and_routed(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            media = logging.getLogger("ntgcalls")
+
+            self.assertLessEqual(media.level, logging.DEBUG)
+            self.assertNotEqual(media.level, logging.NOTSET)
+            self.assertTrue(any(isinstance(h, daemon._MediaStackLog)
+                                for h in media.handlers))
+
+    async def test_a_repeated_condition_is_collapsed_not_dropped(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            handler = daemon._MediaStackLog()
+
+            def record(message):
+                return logging.LogRecord("ntgcalls", logging.DEBUG, __file__, 0,
+                                         message, None, None)
+
+            for _ in range(3):
+                handler.emit(record("connection lost"))
+            handler.emit(record("something else"))
+
+            lines = [line for line in daemon._test_logs if "call-media" in line]
+            self.assertEqual(len(lines), 3)
+            self.assertIn("connection lost", lines[0])
+            self.assertIn("repeated 2x", lines[1])
+            self.assertIn("something else", lines[2])
 
 
 if __name__ == "__main__":
