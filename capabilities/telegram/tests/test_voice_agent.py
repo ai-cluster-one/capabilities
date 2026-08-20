@@ -40,7 +40,8 @@ def fake_runtime_modules():
     """voice_agent only needs the pytgcalls names it sends frames with."""
     saved = {name: sys.modules.get(name)
              for name in ("pytgcalls", "pytgcalls.exceptions", "pytgcalls.types",
-                          "telethon", "telethon.tl", "telethon.tl.types")}
+                          "ntgcalls", "telethon", "telethon.tl",
+                          "telethon.tl.types")}
 
     pytgcalls = types.ModuleType("pytgcalls")
     exceptions = types.ModuleType("pytgcalls.exceptions")
@@ -63,6 +64,11 @@ def fake_runtime_modules():
     pytgcalls_types.Device = Device
     pytgcalls_types.Frame = Frame
 
+    # The 3.x line sends frames with an explicit rotation enum, so the frame
+    # sender imports one name from the compiled binding.
+    ntgcalls = types.ModuleType("ntgcalls")
+    ntgcalls.VIDEO_ROTATION_0 = 0
+
     telethon = types.ModuleType("telethon")
     telethon.TelegramClient = DummyType
     telethon_tl = types.ModuleType("telethon.tl")
@@ -74,6 +80,7 @@ def fake_runtime_modules():
         "pytgcalls": pytgcalls,
         "pytgcalls.exceptions": exceptions,
         "pytgcalls.types": pytgcalls_types,
+        "ntgcalls": ntgcalls,
         "telethon": telethon,
         "telethon.tl": telethon_tl,
         "telethon.tl.types": telethon_tl_types,

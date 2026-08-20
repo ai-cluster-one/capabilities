@@ -86,13 +86,14 @@ The accepted schema is deliberately finite:
 
 - Top level: `connection`, `assistant_name`, `direct_messages`, `allowed_users`, `allowed_groups`, `control`, `authority`, and `defaults`.
 - `direct_messages`: `mode` and `default_role`.
-- User/member policy: display `name`/`username`, `role`, `may_address`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `call_recording`, and `voice_agent`; group members additionally accept `kind` and `address_aliases`.
-- Group policy: `name`, `role`/`member_role`, `aliases`/`address_aliases`/`mentions`, `require_reference`, `members`, `agent_dialogue`, `worker_timeout`, `voice_transcription`, `call_recording`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), and `context`/`context_file`.
+- User/member policy: display `name`/`username`, `role`, `may_address`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `project`, `call_recording`, and `voice_agent`; group members additionally accept `kind` and `address_aliases`.
+- Group policy: `name`, `role`/`member_role`, `aliases`/`address_aliases`/`mentions`, `require_reference`, `members`, `agent_dialogue`, `worker_timeout`, `voice_transcription`, `call_recording`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `project`, and `topics`.
+- `topics`: keyed by forum topic ID, each entry accepting `project`, `context`, and `context_file`. A topic carries no authority tier: it inherits its group's rights and can neither narrow nor widen them.
 - Defaults: `assistant_name`, `tail_size`, `sync_interval`, `sync_stale_after`, `debounce`, `worker_timeout`, `progress_after`, `max_parallel_jobs`, `max_attempts`, `group_aliases`, `worker`, `workers`, and `voice_agent`.
 - Worker policy: `model`; Claude also accepts `effort`; Codex accepts `reasoning_effort` and `service_tier`. Voice defaults accept `worker`, `workers`, `model`, `voice`, `greeting`, `history`, `timezone`, `progress_interval`, `recording_caption`, and `prompt_file`.
 - Control policies contain `commands`; authority policies contain `allowed_capabilities` or `capabilities`. Capability rules accept booleans/`*`, verb lists, or `allow`/`deny`/`enabled`/`scope`/`verbs` objects.
 
-IDs must have the correct sign (users positive, groups negative), paths must resolve inside the Telegram service directory, and numeric settings use the bounds named by `/set help` or the shipped template. There is no permissive/legacy mode and no support for a `project` routing property.
+IDs must have the correct sign (users positive, groups negative, topics positive), context paths must resolve inside the Telegram service directory, and numeric settings use the bounds named by `/set help` or the shipped template. A `project` route is checked for shape at load and for reachability at dispatch, as described under Worker Project Routing. There is no permissive/legacy mode.
 
 ## State Layout
 
@@ -322,7 +323,43 @@ The global soft prompt lives in `capabilities/telegram/service/context.md`. Grou
 }
 ```
 
+A forum topic may add its own overlay under its group's `topics` map, and a direct sender may add one on their `allowed_users` entry. Topic prose follows room prose rather than replacing it, so a topic says what is specific to its lane while the room keeps saying what is true everywhere in it.
+
 The prompt order is: global `context.md`, channel context overlay, daemon channel state, current request, then the recent conversation tail. Channel context is a soft behavior layer only; access control still belongs to `control.roles` and tool access still belongs to `authority.roles`.
+
+## Worker Project Routing
+
+A chat, a forum topic, or a direct sender can name the project its worker runs in with a `project` property. Resolution order is topic, then chat, then direct sender, then the daemon's own project — the daemon's project is the row that results when nothing matched, not a privileged default.
+
+```json
+{
+  "allowed_groups": {
+    "-100123": {
+      "name": "Storefront",
+      "project": "~/dev/storefront",
+      "topics": {
+        "12": {
+          "project": "~/dev/storefront-api",
+          "context": "This topic is the API service. Work there, not in the web app."
+        }
+      }
+    }
+  },
+  "allowed_users": {
+    "42": {"name": "Owner", "project": "~/dev/notes"}
+  }
+}
+```
+
+The daemon does not resolve the target project; it stops asserting its own. The service launcher pins `CAPABILITIES_PROJECT_ENVELOPE` to the daemon's project, and a capability CLI invoked with that variable pointing outside its resolved project exits 6. A routed worker therefore has that pin removed and receives `CLAUDE_PROJECT_DIR` naming the target, which every capability CLI reads before it falls back to the working directory.
+
+Routing changes which rights the worker has, not only where it runs. The target project's capability gate governs the routed worker, so a capability must be enabled there — `capabilities enable <name> --project` inside that project, or `--global` for every project — before the worker can call it. Replies and progress are unaffected: `telegram send` from a worker is intercepted by the worker shim and delivered by the daemon's own client, so it never depends on the worker's directory or on the target project's policy.
+
+A route is judged twice. Its shape is checked when settings load: a string, absolute after expansion, and inside `$HOME`. Its reachability is checked when a message arrives: the target must exist, be a directory, and carry a project marker (`capabilities/settings.json`, `.contextkit/config.toml`, `.capabilities`, `.env`, `.env.local`, or `.git`). A target that fails at dispatch fails that one request and says so in the chat, because a neighbouring repository that was renamed must not stop the daemon that serves every other channel.
+
+The resolved map is printed at start and carried in `telegram service status` as `routes`, and it is refreshed on every settings reload. A route that points at a directory which exists and is a project, but the wrong one, runs there silently; reading the map once is the mitigation.
+
+The voice path is deliberately not routed. A live call resolves project files and runs its capability subprocesses in the daemon's own project, so in a routed group the text worker works in the target project while a voice answer describes the daemon's project.
 
 ## Control Authority
 

@@ -727,6 +727,7 @@ def reload_runtime_settings():
         }
     _publish_runtime_settings(runtime)
     SETTINGS_GENERATION += 1
+    routes = _route_map()
     write_health(
         settings_reload_attempts=SETTINGS_RELOAD_ATTEMPTS,
         settings_reload_attempted_at=attempted_at,
@@ -735,9 +736,10 @@ def reload_runtime_settings():
         settings_reloaded_at=attempted_at,
         sync_interval_seconds=SYNC_INTERVAL,
         stale_after_seconds=SYNC_STALE_AFTER,
+        routes=routes,
     )
     log(f"settings reloaded: generation={SETTINGS_GENERATION} "
-        f"attempt={SETTINGS_RELOAD_ATTEMPTS}")
+        f"attempt={SETTINGS_RELOAD_ATTEMPTS} routes={len(routes)}")
     return {
         "ok": True,
         "status": "reloaded",
@@ -1222,6 +1224,104 @@ def _group_policy(chat_id):
         if policy is True:
             return key, {}
     return None, None
+
+
+class RouteUnavailable(RuntimeError):
+    """A configured route names a directory that cannot serve this request."""
+
+
+ROUTE_PROJECT_MARKERS = (
+    ("capabilities", "settings.json"), (".contextkit", "config.toml"),
+    (".capabilities",), (".env",), (".env.local",), (".git",),
+)
+
+
+def _looks_like_project(root):
+    """The marker set every capability CLI walks up looking for.
+
+    A target carrying none of them is not a project: the capability contract
+    would climb past it, resolve some parent instead, and the worker would run
+    against a project nobody named.
+    """
+    return any(root.joinpath(*marker).exists() for marker in ROUTE_PROJECT_MARKERS)
+
+
+def _route_target(raw, label):
+    """Resolve one configured route into a usable worker directory.
+
+    Judged at dispatch rather than at settings load, because a settings failure
+    exits the process: a neighbouring repository that was renamed would
+    otherwise stop the daemon that serves every other channel. Here it costs
+    the one request that names it.
+    """
+    candidate = Path(str(raw)).expanduser()
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise RouteUnavailable(
+            f"{label} points at {candidate}, which does not exist") from exc
+    if not resolved.is_dir():
+        raise RouteUnavailable(f"{label} points at {resolved}, which is not a directory")
+    if not _looks_like_project(resolved):
+        markers = ", ".join("/".join(marker) for marker in ROUTE_PROJECT_MARKERS)
+        raise RouteUnavailable(
+            f"{label} points at {resolved}, which carries no project marker ({markers})")
+    return resolved
+
+
+def _topic_policy(group_policy, topic_id):
+    """The entry a forum topic contributes to its group's policy."""
+    if topic_id is None:
+        return {}
+    topics = _as_mapping(_as_mapping(group_policy).get("topics"))
+    return _as_mapping(topics.get(str(topic_id)))
+
+
+def _route_for(job, group_policy, is_direct):
+    """The configured route for one request: topic, then chat, then direct user.
+
+    Returns the raw settings value and the settings path that supplied it, so a
+    refusal can name where the route was written. Nothing configured leaves the
+    daemon's own project standing, which is the last row of this order rather
+    than a privileged default.
+    """
+    policy = _as_mapping(group_policy)
+    chat_id = job.get("chat_id")
+    topic = _topic_policy(group_policy, job.get("topic_id"))
+    if topic.get("project"):
+        return topic["project"], f"allowed_groups.{chat_id}.topics.{job.get('topic_id')}.project"
+    if policy.get("project"):
+        return policy["project"], f"allowed_groups.{chat_id}.project"
+    if is_direct:
+        sender = _as_mapping(ALLOWED.get(str(job.get("sender_id"))))
+        if sender.get("project"):
+            return sender["project"], f"allowed_users.{job.get('sender_id')}.project"
+    return None, None
+
+
+def _route_map():
+    """Every route the settings declare, in one readable answer.
+
+    Reachability is deliberately absent: this says where channels are pointed,
+    and a route that cannot serve a request says so in the chat that asked.
+    """
+    routes = []
+    for chat_id, raw in ALLOWED_GROUPS.items():
+        policy = _as_mapping(raw) if isinstance(raw, dict) else {}
+        if policy.get("project"):
+            routes.append({"scope": f"group {chat_id}",
+                           "project": str(policy["project"])})
+        for topic_id, entry in _as_mapping(policy.get("topics")).items():
+            entry = _as_mapping(entry)
+            if entry.get("project"):
+                routes.append({"scope": f"group {chat_id} topic {topic_id}",
+                               "project": str(entry["project"])})
+    for user_id, raw in ALLOWED.items():
+        policy = _as_mapping(raw)
+        if policy.get("project"):
+            routes.append({"scope": f"direct {user_id}",
+                           "project": str(policy["project"])})
+    return routes
 
 
 def _group_aliases(policy):
@@ -2395,6 +2495,14 @@ def _channel_context_from_policy(policy):
     return "\n\n".join(parts).strip()
 
 
+def _channel_context(policies):
+    """Channel prose in the order it was authored: the room first, the topic
+    after it. A topic adds what is specific to its lane rather than replacing
+    what the room already said."""
+    parts = [_channel_context_from_policy(policy) for policy in policies]
+    return "\n\n".join(part for part in parts if part).strip()
+
+
 def resumed_prompt(st):
     """The next turn inside a thread the worker is already holding.
 
@@ -2584,9 +2692,33 @@ def cleanup_worker_session(worker_session):
             Path(worker_session + suffix).unlink()
 
 
+WORKER_ENV_DROP = ("TELEGRAM_SERVICE_LAUNCH_NONCE", "SSH_AUTH_SOCK")
+WORKER_ENV_DROP_PREFIXES = ("CLAUDE_CODE_", "CLAUDECODE", "VSCODE_")
+WORKER_ENV_DROP_WHEN_ROUTED = (
+    "CAPABILITIES_PROJECT_ENVELOPE", "TELEGRAM_SERVICE_PROJECT_ROOT",
+    "TELEGRAM_SERVICE_PROJECT_ENVELOPE", "TELEGRAM_SERVICE_PROJECT_LAYOUT",
+)
+
+
 def worker_env(state=None):
     st = state or {}
     env = os.environ.copy()
+    # The launch nonce is the daemon's proof of ownership and the agent-channel
+    # keys are a way into another editor session; neither has business in a
+    # child. The forwarded ssh agent is a credential the worker never asked for.
+    for name in WORKER_ENV_DROP:
+        env.pop(name, None)
+    for name in [key for key in env if key.startswith(WORKER_ENV_DROP_PREFIXES)]:
+        env.pop(name, None)
+    project_dir = st.get("project_dir")
+    if project_dir is not None and Path(project_dir) != PROJECT_ROOT:
+        # The launcher pins this daemon's own envelope, and a capability invoked
+        # with it pointing outside its resolved project exits 6. Dropping the pin
+        # and naming the target is the entire binding: every capability CLI
+        # resolves its project from CLAUDE_PROJECT_DIR before it falls back to cwd.
+        for name in WORKER_ENV_DROP_WHEN_ROUTED:
+            env.pop(name, None)
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
     real_telegram = env.get("TELEGRAM_REAL_TELEGRAM") or shutil.which("telegram")
     if real_telegram:
         env["TELEGRAM_REAL_TELEGRAM"] = real_telegram
@@ -2863,19 +2995,21 @@ def _stream_worker_proc(proc, on_line):
     return "".join(collected["out"]), "".join(collected["err"])
 
 
-def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None):
+def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None,
+                    cwd=None):
     """Run a worker subprocess in its own process group (start_new_session) and register it in
     the caller's `procs` map until the async job finalizes, so /stop can SIGKILL the whole group —
     claude/codex spawn children, so killing the group, not just the lone parent, is what stops
     the run. Returns (returncode, stdout, stderr); a killed run comes back with a negative
     returncode, which the caller raises on like any nonzero exit. With `on_line`, stdout is
     handed over line by line while the run is still going, for a caller that cannot wait for
-    the end of it."""
+    the end of it. `cwd` is the routed project for this request; without one the run
+    happens in the daemon's own project."""
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("worker cancelled before process start")
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, start_new_session=True,
-                            cwd=str(PROJECT_ROOT), env=env)
+                            cwd=str(cwd or PROJECT_ROOT), env=env)
     procs[chat] = proc
     # Cancellation can race with Popen. Register first, then honor a cancellation
     # that arrived while the process was being created so no late process escapes.
@@ -2915,7 +3049,8 @@ def worker_claude(chat, tail, state=None, procs=None):
     proc_key = ((state or {}).get("proc_key") or chat)
     rc, out, err = run_worker_proc(
         proc_key, cmd, procs, env=worker_env(state),
-        cancel_event=(state or {}).get("cancel_event"))
+        cancel_event=(state or {}).get("cancel_event"),
+        cwd=(state or {}).get("project_dir"))
     if rc != 0:
         detail = (err.strip() or out.strip() or f"exit {rc}")[:500]
         raise RuntimeError(f"claude worker failed: {detail}")
@@ -3046,6 +3181,7 @@ def worker_codex(chat, tail, state=None, procs=None):
         proc_key = ((state or {}).get("proc_key") or chat)
         rc, stdout_txt, err = run_worker_proc(
             proc_key, cmd, procs, env=worker_env(state),
+            cwd=(state or {}).get("project_dir"),
             cancel_event=(state or {}).get("cancel_event"),
             on_line=(state or {}).get("on_worker_line"))
         if rc != 0:
@@ -3297,6 +3433,13 @@ async def run_session(client):
     log(f"direct messages: mode={DIRECT_MESSAGE_MODE}; default_role={DIRECT_DEFAULT_ROLE}")
     log(f"allowed: {allowed_labels}")
     log(f"allowed groups: {allowed_group_labels}; group aliases: {list(DEFAULT_GROUP_ALIASES)}")
+    routes = _route_map()
+    if routes:
+        log("worker routes: " + "; ".join(
+            f"{route['scope']} -> {route['project']}" for route in routes))
+    else:
+        log(f"worker routes: none; every channel runs in {PROJECT_ROOT}")
+    write_health(routes=routes)
 
     reg = load_register()
     if migrate_register(reg):
@@ -3689,7 +3832,14 @@ async def run_session(client):
                 progress_outbox.unlink()
             worker_session = prepare_worker_session(key, job.get("message_id"))
             authority = _authority_policy_for(job, group_policy, is_direct)
-            channel_context = _channel_context_from_policy(group_policy)
+            route_value, route_label = _route_for(job, group_policy, is_direct)
+            project_dir = (_route_target(route_value, route_label)
+                           if route_value else PROJECT_ROOT)
+            channel_context = _channel_context([
+                _as_mapping(ALLOWED.get(str(job.get("sender_id")))) if is_direct
+                else group_policy,
+                _topic_policy(group_policy, job.get("topic_id")),
+            ])
             if authority is not None:
                 authority_context = write_authority_context(
                     authority, f"{key}-{job.get('message_id')}")
@@ -3712,9 +3862,11 @@ async def run_session(client):
                      "progress_outbox": str(progress_outbox),
                      "worker_session": worker_session,
                      "cancel_event": cancel_event,
+                     "project_dir": project_dir,
                      "proc_key": proc_key}
+            routed = "" if project_dir == PROJECT_ROOT else f" project={project_dir}"
             log(f"{key}: dispatch job msg={job.get('message_id')} tail={s['tail_size']} "
-                f"worker={s['worker']} model={s['model'] or 'default'} msgs={len(tail)}")
+                f"worker={s['worker']} model={s['model'] or 'default'} msgs={len(tail)}{routed}")
             loop = asyncio.get_running_loop()
             progress_stop = asyncio.Event()
             progress_task = asyncio.create_task(
@@ -3777,6 +3929,10 @@ async def run_session(client):
                 retry_job(key, job, e)
                 log(f"{key}: worker timed out during session close; job requeued")
                 return
+            await fail_job(key, ent_id, job, is_direct, participants, e)
+            return
+        except RouteUnavailable as e:
+            log(f"{key}: route unavailable for job msg={job.get('message_id')}: {e}")
             await fail_job(key, ent_id, job, is_direct, participants, e)
             return
         except asyncio.CancelledError:

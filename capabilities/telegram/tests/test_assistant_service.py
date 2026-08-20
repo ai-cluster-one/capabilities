@@ -74,10 +74,22 @@ class _Placeholder:
 
 class DocumentAttributeAudio(_Placeholder): pass
 class DocumentAttributeFilename(_Placeholder): pass
+class InputGroupCallInviteMessage(_Placeholder): pass
 class MessageActionConferenceCall(_Placeholder): pass
 class MessageActionInviteToGroupCall(_Placeholder): pass
 class MessageService(_Placeholder): pass
 class UpdateNewMessage(_Placeholder): pass
+""".lstrip()
+    )
+    functions = tl / "functions"
+    functions.mkdir()
+    (functions / "__init__.py").write_text("")
+    (functions / "phone.py").write_text(
+        """
+class GetGroupCallChainBlocksRequest:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.__dict__.update(kwargs)
 """.lstrip()
     )
     errors = package / "errors"
@@ -147,6 +159,7 @@ class MediaStream(_Placeholder):
         REQUIRED = 1
         IGNORE = 2
 class RecordStream(_Placeholder): pass
+class UpdatedGroupCallParticipant(_Placeholder): pass
 """.lstrip()
     )
     (types_pkg / "raw.py").write_text(
@@ -157,6 +170,7 @@ class AudioParameters:
         self.channels = channels
 """.lstrip()
     )
+    (root / "ntgcalls.py").write_text("VIDEO_ROTATION_0 = 0\n")
 
 
 def import_daemon(tmp: Path, service_settings: dict, *,
@@ -185,10 +199,12 @@ def import_daemon(tmp: Path, service_settings: dict, *,
     write_fake_telethon(fake_root)
     write_fake_pytgcalls(fake_root)
 
-    stubbed = ("telethon", "telethon.tl", "telethon.tl.types", "telethon.errors",
-               "telethon.errors.common", "pytgcalls", "pytgcalls.filters",
-               "pytgcalls.exceptions", "pytgcalls.types", "pytgcalls.types.raw",
-               "call_recording_helpers", "voice_agent")
+    stubbed = ("telethon", "telethon.tl", "telethon.tl.types",
+               "telethon.tl.functions", "telethon.tl.functions.phone",
+               "telethon.errors", "telethon.errors.common", "pytgcalls",
+               "pytgcalls.filters", "pytgcalls.exceptions", "pytgcalls.types",
+               "pytgcalls.types.raw", "ntgcalls", "call_recording_helpers",
+               "voice_agent")
 
     old_env = dict(os.environ)
     old_path = list(sys.path)
@@ -1676,14 +1692,14 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             daemon = import_daemon(Path(td), service_settings)
             updated = settings(sync_interval=7)
             updated["assistant_name"] = "Must not publish"
-            updated["allowed_groups"] = {"-200": {"project": "/tmp/other"}}
+            updated["allowed_groups"] = {"-200": {"purpose": "not a property"}}
             daemon.SETTINGS_FILE.write_text(json.dumps(updated) + "\n")
 
             result = daemon.reload_runtime_settings()
 
             self.assertFalse(result["ok"])
             self.assertIn(
-                "settings.allowed_groups.-200.project: unsupported property",
+                "settings.allowed_groups.-200.purpose: unsupported property",
                 result["error"],
             )
             self.assertEqual(daemon.ASSISTANT_NAME, "Stable")
@@ -4064,6 +4080,211 @@ class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
                 settings(voice_agent={"session": {"mode": "fresh"}}))
             self.assertEqual(daemon.voice_agent_settings()["session_mode"],
                              "fresh")
+
+
+class ChatProjectRoutingTests(unittest.IsolatedAsyncioTestCase):
+    """A chat, a forum topic or a direct sender can name the project its worker
+    runs in. The daemon does not resolve that project; it stops asserting its
+    own, because every capability CLI reads CLAUDE_PROJECT_DIR before cwd."""
+
+    def target(self, td, name="projectB", marker=".git"):
+        """A route target inside the test home, carrying a project marker."""
+        root = Path(td) / "home" / name
+        root.mkdir(parents=True)
+        (root / marker).mkdir()
+        return root
+
+    def routed_settings(self, target, **groups):
+        service_settings = settings()
+        service_settings["allowed_groups"] = groups
+        return service_settings
+
+    async def test_the_schema_accepts_a_route_on_every_tier(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = self.target(td)
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"project": str(target),
+                         "topics": {"7": {"project": str(target),
+                                          "context": "topic prose"}}}}
+            service_settings["allowed_users"] = {"42": {"project": str(target)}}
+
+            daemon = import_daemon(Path(td), service_settings)
+
+            self.assertEqual(daemon.ALLOWED_GROUPS["-200"]["project"], str(target))
+            self.assertEqual(daemon.ALLOWED["42"]["project"], str(target))
+
+    async def test_a_route_is_refused_at_load_by_its_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            base = {"connection": "test", "assistant_name": "Assistant",
+                    "direct_messages": {"mode": "anyone",
+                                        "default_role": "direct_user"},
+                    "allowed_users": {}, "allowed_groups": {}}
+            root = Path(td)
+
+            def validated(project):
+                with mock.patch.dict(os.environ, {"HOME": str(root)}):
+                    return daemon.validate_settings(
+                        {**base, "allowed_groups": {"-200": {"project": project}}},
+                        root, root)
+
+            validated(str(root / "somewhere"))
+            with self.assertRaisesRegex(Exception, "must be an absolute path"):
+                validated("../elsewhere")
+            with self.assertRaisesRegex(Exception, "must be a path inside"):
+                validated("/opt/elsewhere")
+
+    async def test_a_topic_entry_carries_a_route_and_prose_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td)
+            base = {"connection": "test", "assistant_name": "Assistant",
+                    "direct_messages": {"mode": "anyone",
+                                        "default_role": "direct_user"},
+                    "allowed_users": {}, "allowed_groups": {}}
+
+            def validated(topics):
+                with mock.patch.dict(os.environ, {"HOME": str(root)}):
+                    return daemon.validate_settings(
+                        {**base, "allowed_groups": {"-200": {"topics": topics}}},
+                        root, root)
+
+            validated({"7": {"project": str(root / "p"), "context": "prose"}})
+            with self.assertRaisesRegex(Exception, "unsupported property"):
+                validated({"7": {"authority": {}}})
+            with self.assertRaisesRegex(Exception, "positive forum topic ID"):
+                validated({"0": {"context": "prose"}})
+
+    async def test_route_resolution_reads_topic_then_chat_then_direct_sender(self):
+        with tempfile.TemporaryDirectory() as td:
+            room = self.target(td, "room")
+            lane = self.target(td, "lane")
+            mine = self.target(td, "mine")
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"project": str(room),
+                         "topics": {"7": {"project": str(lane)}}}}
+            service_settings["allowed_users"] = {"42": {"project": str(mine)}}
+            daemon = import_daemon(Path(td), service_settings)
+            _, group_policy = daemon._group_policy(-200)
+
+            topic_job = {"chat_id": -200, "topic_id": 7, "sender_id": 42}
+            chat_job = {"chat_id": -200, "topic_id": 9, "sender_id": 42}
+            direct_job = {"chat_id": 42, "sender_id": 42}
+
+            self.assertEqual(daemon._route_for(topic_job, group_policy, False)[0],
+                             str(lane))
+            self.assertEqual(daemon._route_for(chat_job, group_policy, False)[0],
+                             str(room))
+            self.assertEqual(daemon._route_for(direct_job, None, True)[0],
+                             str(mine))
+            self.assertEqual(daemon._route_for({"chat_id": -1}, None, False),
+                             (None, None))
+
+    async def test_a_route_target_is_judged_at_dispatch_not_at_load(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            good = self.target(td)
+            bare = Path(td) / "home" / "bare"
+            bare.mkdir(parents=True)
+
+            # Resolved before it is judged, so a link is judged by where it
+            # lands rather than by how it was spelled.
+            self.assertEqual(daemon._route_target(str(good), "label"),
+                             good.resolve())
+            with self.assertRaisesRegex(daemon.RouteUnavailable, "does not exist"):
+                daemon._route_target(str(Path(td) / "home" / "gone"), "label")
+            with self.assertRaisesRegex(daemon.RouteUnavailable, "no project marker"):
+                daemon._route_target(str(bare), "label")
+
+    async def test_a_routed_worker_is_told_where_it_is_and_loses_the_pin(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            target = self.target(td)
+            pinned = {
+                "CAPABILITIES_PROJECT_ENVELOPE": "/home/project/capabilities",
+                "TELEGRAM_SERVICE_PROJECT_ROOT": "/home/project",
+                "TELEGRAM_SERVICE_PROJECT_ENVELOPE": "/home/project/capabilities",
+                "TELEGRAM_SERVICE_PROJECT_LAYOUT": "{}",
+            }
+
+            with mock.patch.dict(os.environ, pinned):
+                routed = daemon.worker_env({"project_dir": target})
+                home = daemon.worker_env({"project_dir": daemon.PROJECT_ROOT})
+
+            self.assertEqual(routed["CLAUDE_PROJECT_DIR"], str(target))
+            for name in pinned:
+                self.assertNotIn(name, routed)
+            # The home route is the row that results when nothing matched, and
+            # it must stay exactly as the launcher handed it over.
+            self.assertEqual(home["CAPABILITIES_PROJECT_ENVELOPE"],
+                             pinned["CAPABILITIES_PROJECT_ENVELOPE"])
+            self.assertNotIn("CLAUDE_PROJECT_DIR", home)
+
+    async def test_a_worker_never_inherits_the_nonce_or_an_agent_channel(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            leaked = {
+                "TELEGRAM_SERVICE_LAUNCH_NONCE": "ownership-proof",
+                "SSH_AUTH_SOCK": "/private/tmp/ssh",
+                "CLAUDE_CODE_MESSAGING_TOKEN": "token",
+                "CLAUDECODE": "1",
+                "VSCODE_IPC_HOOK": "/private/tmp/vscode",
+            }
+
+            with mock.patch.dict(os.environ, leaked):
+                env = daemon.worker_env({})
+
+            for name in leaked:
+                self.assertNotIn(name, env)
+
+    async def test_topic_prose_follows_room_prose(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"context": "room prose",
+                         "topics": {"7": {"context": "topic prose"}}}}
+            daemon = import_daemon(Path(td), service_settings)
+            _, group_policy = daemon._group_policy(-200)
+
+            context = daemon._channel_context(
+                [group_policy, daemon._topic_policy(group_policy, 7)])
+
+            self.assertEqual(context, "room prose\n\ntopic prose")
+            self.assertEqual(
+                daemon._channel_context(
+                    [group_policy, daemon._topic_policy(group_policy, 9)]),
+                "room prose")
+
+    async def test_a_direct_sender_receives_the_prose_written_for_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_users"] = {"42": {"context": "direct prose"}}
+            daemon = import_daemon(Path(td), service_settings)
+
+            self.assertEqual(
+                daemon._channel_context([daemon.ALLOWED.get("42"), {}]),
+                "direct prose")
+
+    async def test_the_route_map_names_every_configured_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            room = self.target(td, "room")
+            lane = self.target(td, "lane")
+            mine = self.target(td, "mine")
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"project": str(room),
+                         "topics": {"7": {"project": str(lane)}}},
+                "-300": True}
+            service_settings["allowed_users"] = {"42": {"project": str(mine)}}
+            daemon = import_daemon(Path(td), service_settings)
+
+            self.assertEqual(daemon._route_map(), [
+                {"scope": "group -200", "project": str(room)},
+                {"scope": "group -200 topic 7", "project": str(lane)},
+                {"scope": "direct 42", "project": str(mine)},
+            ])
 
 
 if __name__ == "__main__":

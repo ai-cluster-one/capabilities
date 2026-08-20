@@ -92,6 +92,45 @@ def _safe_service_path(value, path, project_root, service_dir):
         _fail(path, "must resolve inside the Telegram service directory")
 
 
+def _route_project(value, path):
+    """A worker route target, judged by its shape alone.
+
+    Existence is deliberately not asserted here. A settings failure exits the
+    daemon, so a neighbouring project that was renamed or unmounted would stop
+    the service for every other channel. The dispatch check owns that failure
+    and spends it on the one request that names the route.
+    """
+    _string(value, path, nonempty=True)
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        _fail(path, "must be an absolute path, or start with ~")
+    home = Path.home()
+    if home not in candidate.parents:
+        _fail(path, f"must be a path inside {home}")
+
+
+def _topics(value, path, project_root, service_dir):
+    """Per-topic overrides inside one group policy.
+
+    A topic carries where its work runs and what prose precedes it. It carries
+    no authority tier: a topic inherits its group's rights and cannot narrow or
+    widen them.
+    """
+    value = _object(value, path)
+    for topic_id, entry in value.items():
+        entry_path = f"{path}.{topic_id}"
+        try:
+            if int(topic_id) <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            _fail(entry_path, "topic key must be a positive forum topic ID")
+        entry = _object(entry, entry_path)
+        _unknown(entry, {"project", "context", "context_file"}, entry_path)
+        if "project" in entry:
+            _route_project(entry["project"], f"{entry_path}.project")
+        _overlay(entry, entry_path, project_root, service_dir)
+
+
 def _worker_rule(value, path, worker):
     value = _object(value, path)
     allowed = {"model"}
@@ -287,7 +326,7 @@ def _participant(value, path, project_root, service_dir, *, member=False):
     allowed = {
         "name", "username", "role", "may_address", "control", "authority",
         "allowed_capabilities", "capabilities", "context", "context_file",
-        "call_recording", "voice_agent",
+        "call_recording", "voice_agent", "project",
     }
     if member:
         allowed.update({"kind", "address_aliases"})
@@ -312,6 +351,8 @@ def _participant(value, path, project_root, service_dir, *, member=False):
         _call_recording(value["call_recording"], f"{path}.call_recording", group=False)
     if "voice_agent" in value:
         _voice_agent(value["voice_agent"], f"{path}.voice_agent")
+    if "project" in value:
+        _route_project(value["project"], f"{path}.project")
     _overlay(value, path, project_root, service_dir)
 
 
@@ -324,6 +365,7 @@ def _group(value, path, project_root, service_dir):
         "require_reference", "members", "agent_dialogue", "worker_timeout",
         "voice_transcription", "call_recording", "control", "authority",
         "allowed_capabilities", "capabilities", "context", "context_file",
+        "project", "topics",
     }
     _unknown(value, allowed, path)
     for key in ("name", "role", "member_role"):
@@ -369,6 +411,10 @@ def _group(value, path, project_root, service_dir):
     for key in ("allowed_capabilities", "capabilities"):
         if key in value:
             _capabilities(value[key], f"{path}.{key}")
+    if "project" in value:
+        _route_project(value["project"], f"{path}.project")
+    if "topics" in value:
+        _topics(value["topics"], f"{path}.topics", project_root, service_dir)
     _overlay(value, path, project_root, service_dir)
 
 
