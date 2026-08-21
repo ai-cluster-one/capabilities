@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -20,10 +21,44 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 ACTIVE_STATUSES = ("pending", "starting", "running")
 FINAL_STATUSES = ("succeeded", "failed", "canceled", "interrupted", "skipped")
 ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+AGENT_ENGINES = ("claude", "codex")
+AGENT_MODES = ("read", "write")
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+AGENT_KEYS = frozenset(
+    {"engine", "model", "effort", "mode", "timeout_seconds", "service_tier"}
+)
+
+# Shipped profiles name Claude's rolling aliases, which keep pointing at the
+# newest model of each tier, so the capability carries no model id that ages.
+# A Codex profile names a concrete model and is therefore declared by the
+# project rather than shipped here.
+BUILTIN_AGENTS: dict[str, dict[str, Any]] = {
+    "sonnet": {"engine": "claude", "model": "sonnet", "effort": "high",
+               "mode": "read", "timeout_seconds": 600.0, "service_tier": None},
+    "opus": {"engine": "claude", "model": "opus", "effort": "high",
+             "mode": "read", "timeout_seconds": 900.0, "service_tier": None},
+    "haiku": {"engine": "claude", "model": "haiku", "effort": "low",
+              "mode": "read", "timeout_seconds": 180.0, "service_tier": None},
+}
+BUILTIN_AGENT_DEFAULT = "sonnet"
 
 
 class ConfigError(ValueError):
     pass
+
+
+def automations_bin() -> str:
+    """The absolute path of the CLI, for handing to a job so a script can call
+    back into the capability without resolving anything itself. The CLI exports
+    it; the bundle layout answers when the daemon was started another way."""
+    declared = os.environ.get("AUTOMATIONS_BIN")
+    if declared and os.access(declared, os.X_OK):
+        return declared
+    sibling = Path(__file__).resolve().parent.parent / "bin" / "automations"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+    return shutil.which("automations") or "automations"
 
 
 def utc_now() -> datetime:
@@ -108,6 +143,77 @@ def cron_matches(expression: str, when: datetime) -> bool:
     else:
         day_match = dom_match or dow_match
     return when.minute in minute and when.hour in hour and when.month in month and day_match
+
+
+def _agent_profile(label: str, item: Any, base: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        raise ConfigError(f"{label} must be a table")
+    unknown = sorted(set(item) - AGENT_KEYS)
+    if unknown:
+        raise ConfigError(f"{label} has unknown key(s): {', '.join(unknown)}")
+    resolved = dict(base) if base else {}
+    engine = item.get("engine", resolved.get("engine"))
+    if engine not in AGENT_ENGINES:
+        raise ConfigError(f"{label}.engine must be one of {', '.join(AGENT_ENGINES)}")
+    model = item.get("model", resolved.get("model"))
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError(f"{label}.model must be a non-empty string")
+    mode = item.get("mode", resolved.get("mode", "read"))
+    if mode not in AGENT_MODES:
+        raise ConfigError(f"{label}.mode must be one of {', '.join(AGENT_MODES)}")
+    effort = item.get("effort", resolved.get("effort"))
+    if effort is not None:
+        if not isinstance(effort, str) or not effort.strip():
+            raise ConfigError(f"{label}.effort must be a non-empty string")
+        if engine == "claude" and effort not in CLAUDE_EFFORTS:
+            raise ConfigError(
+                f"{label}.effort must be one of {', '.join(CLAUDE_EFFORTS)} on claude"
+            )
+    service_tier = item.get("service_tier", resolved.get("service_tier"))
+    if service_tier is not None:
+        if engine != "codex":
+            raise ConfigError(f"{label}.service_tier applies to the codex engine only")
+        if not isinstance(service_tier, str) or not service_tier.strip():
+            raise ConfigError(f"{label}.service_tier must be a non-empty string")
+    return {
+        "engine": engine,
+        "model": model,
+        "effort": effort,
+        "mode": mode,
+        "timeout_seconds": _number(
+            item.get("timeout_seconds", resolved.get("timeout_seconds", 600.0)),
+            f"{label}.timeout_seconds", 1,
+        ),
+        "service_tier": service_tier,
+    }
+
+
+def load_agents(raw: dict[str, Any]) -> dict[str, Any]:
+    """Shipped profiles are always present; a declared profile of the same name
+    overrides the shipped one field by field, so a project can retune effort or
+    timeout without restating the engine."""
+    section = raw.get("agents") or {}
+    if not isinstance(section, dict):
+        raise ConfigError("agents must be a table")
+    unknown = sorted(set(section) - {"default", "workers"})
+    if unknown:
+        raise ConfigError(f"agents has unknown key(s): {', '.join(unknown)}")
+    declared = section.get("workers") or {}
+    if not isinstance(declared, dict):
+        raise ConfigError("agents.workers must be a table")
+    profiles = {name: dict(spec) for name, spec in BUILTIN_AGENTS.items()}
+    for name, item in declared.items():
+        if not AGENT_ID_RE.fullmatch(name):
+            raise ConfigError(f"agents.workers key {name!r} must match {AGENT_ID_RE.pattern}")
+        profiles[name] = _agent_profile(
+            f"agents.workers.{name}", item, BUILTIN_AGENTS.get(name)
+        )
+    default = section.get("default", BUILTIN_AGENT_DEFAULT)
+    if not isinstance(default, str) or default not in profiles:
+        raise ConfigError(
+            f"agents.default must name a declared profile; have {', '.join(sorted(profiles))}"
+        )
+    return {"default": default, "workers": profiles}
 
 
 def load_config(root: Path, config_path: Path) -> dict[str, Any]:
@@ -211,7 +317,8 @@ def load_config(root: Path, config_path: Path) -> dict[str, Any]:
             "arguments": arguments,
             "environments": environments,
         })
-    return {"version": 1, "engine": normalized_engine, "automations": automations}
+    return {"version": 1, "engine": normalized_engine,
+            "automations": automations, "agents": load_agents(raw)}
 
 
 def automation_map(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -624,6 +731,7 @@ class Daemon:
             "AUTOMATION_NAMESPACE": row["namespace"],
             "AUTOMATION_PROJECT_ROOT": str(self.root),
             "AUTOMATION_STATE_DIR": str(self.state_dir),
+            "AUTOMATIONS_BIN": automations_bin(),
         })
         try:
             proc = subprocess.Popen(

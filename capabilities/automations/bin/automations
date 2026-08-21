@@ -37,6 +37,12 @@ Commands:
       Cancel a pending run or request termination of a running process.
   automations retry <run-id>
       Enqueue a new attempt for a completed run.
+  automations agents
+      List agent profiles and which one is the default.
+  automations agent <prompt|-> [--profile NAME] [--schema PATH] [--timeout SEC]
+      Run one agent turn in this project and return its answer as JSON. `-`
+      reads the prompt from stdin. --schema names a JSON Schema file and makes
+      `answer` a parsed object instead of prose.
   automations service init [--force]
       Create project-local config and an example script.
   automations service doctor|run|start|stop|status|logs
@@ -48,12 +54,25 @@ Environment:
   AUTOMATIONS_NAMESPACE    Coordination namespace (default: project directory name).
   AUTOMATIONS_CONFIG       Optional config path override.
   AUTOMATIONS_STATE_DIR    Optional state root override.
+  AUTOMATIONS_BIN          Absolute path of this CLI, exported into every job so
+                           a script can call `automations agent` without
+                           resolving anything itself.
 
 Scheduling:
   Each automation may use a numeric five-field cron `schedule`, an
   `every_seconds` interval, or neither (manual only). The one-second ticker only
   registers due runs and dispatches subprocesses; job logic never runs inside the
   ticker. `overlap = "skip"` or `"queue"` controls overlapping scheduled runs.
+
+Agents:
+  A script that needs judgement rather than computation runs one agent turn
+  through `automations agent`. Profiles live in config.toml under [agents];
+  `sonnet`, `opus` and `haiku` ship with the capability and a project adds its
+  own, including codex profiles, under [agents.workers.<name>]. A profile names
+  engine, model, effort, mode and timeout_seconds. `mode = "read"` fences the
+  turn to reading the project; `mode = "write"` lets it change files, which a
+  scheduled job does unattended, so it is declared per profile and never the
+  shipped default.
 
 I/O contract:
   Success is JSON on stdout. Failure is {"error": {"code", "message", "hint"?}}
@@ -80,6 +99,8 @@ import importlib.util
 import json
 import os
 import signal
+import shutil
+import tempfile
 import sqlite3
 import subprocess
 import sys
@@ -1144,7 +1165,206 @@ def cmd_service_run() -> NoReturn:
     os.execvpe(sys.executable, [sys.executable, str(runtime)], _service_env(root))
 
 
+def _agent_prompt(raw: str) -> str:
+    """`-` means the prompt arrives on stdin, which is how a script hands over a
+    prompt too long or too quoted to survive argv."""
+    text = sys.stdin.read() if raw == "-" else raw
+    if not text.strip():
+        _die(6, "empty_prompt", "the prompt is empty")
+    return text
+
+
+def _agent_command(profile: dict[str, Any], root: Path, schema: Path | None,
+                   answer_file: Path) -> list[str]:
+    engine = profile["engine"]
+    if engine == "claude":
+        command = [_engine_binary("claude"), "-p",
+                   "--output-format", "json",
+                   "--model", profile["model"]]
+        if profile["effort"]:
+            command += ["--effort", profile["effort"]]
+        if profile["mode"] == "read":
+            command += ["--permission-mode", "plan",
+                        "--allowedTools", "Read", "Glob", "Grep"]
+        else:
+            command += ["--permission-mode", "bypassPermissions"]
+        if schema is not None:
+            command += ["--json-schema", schema.read_text(encoding="utf-8")]
+        return command
+    command = [_engine_binary("codex"), "exec", "-",
+               "-m", profile["model"],
+               "-C", str(root),
+               "--skip-git-repo-check",
+               "--json",
+               "-o", str(answer_file),
+               "-s", "read-only" if profile["mode"] == "read" else "workspace-write"]
+    if profile["effort"]:
+        command += ["-c", f"model_reasoning_effort={profile['effort']}"]
+    if profile["service_tier"]:
+        command += ["-c", f"model_service_tier={profile['service_tier']}"]
+    if schema is not None:
+        command += ["--output-schema", str(schema)]
+    return command
+
+
+def _engine_binary(engine: str) -> str:
+    """Engine CLIs are resolved for a daemon's environment rather than a login
+    shell's: a node version manager keeps the real executable outside PATH's
+    obvious places, and a per-shell shim path does not survive into a job."""
+    found = shutil.which(engine)
+    if found:
+        return found
+    candidates = [Path.home() / ".local" / "bin" / engine]
+    fnm = Path.home() / ".local" / "share" / "fnm" / "node-versions"
+    if fnm.is_dir():
+        candidates += sorted(fnm.glob(f"*/installation/bin/{engine}"), reverse=True)
+    for candidate in candidates:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    _die(5, "engine_not_found", f"the {engine} CLI is not installed",
+         f"install {engine} or point the profile at the other engine")
+
+
+def _agent_env() -> dict[str, str]:
+    env = dict(os.environ)
+    extra = ["/opt/homebrew/bin", "/usr/local/bin",
+             str(Path.home() / ".local" / "bin")]
+    parts = [item for item in env.get("PATH", "").split(os.pathsep) if item]
+    parts += [item for item in extra if item not in parts]
+    env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
+def _claude_answer(stdout: str, structured: bool) -> dict[str, Any]:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        _die(5, "engine_output_unparseable", f"claude did not return JSON: {exc}")
+    if payload.get("is_error"):
+        _die(5, "agent_failed", str(payload.get("result") or "claude reported an error"))
+    answer = payload.get("result")
+    if structured:
+        # A schema-constrained turn returns the object under `structured_output`
+        # and leaves `result` empty. Falling back to prose when a schema was
+        # demanded would hand a script the one shape it cannot branch on, so an
+        # unsatisfied schema is an error rather than a surprise at the call site.
+        structured_output = payload.get("structured_output")
+        if isinstance(structured_output, (dict, list)):
+            answer = structured_output
+        elif isinstance(answer, str) and answer.strip():
+            try:
+                answer = json.loads(answer)
+            except json.JSONDecodeError:
+                _die(5, "schema_unsatisfied",
+                     "the agent answered prose while a schema was required",
+                     "loosen the schema, or say in the prompt that the answer "
+                     "must be the structured object")
+        else:
+            _die(5, "schema_unsatisfied", "the agent returned no structured answer")
+    usage = payload.get("usage") or {}
+    return {
+        "answer": answer,
+        "cost_usd": payload.get("total_cost_usd"),
+        "duration_ms": payload.get("duration_ms"),
+        "num_turns": payload.get("num_turns"),
+        "session_id": payload.get("session_id"),
+        "tokens": {
+            "input": usage.get("input_tokens"),
+            "output": usage.get("output_tokens"),
+            "cache_read": usage.get("cache_read_input_tokens"),
+            "cache_creation": usage.get("cache_creation_input_tokens"),
+        },
+    }
+
+
+def _codex_answer(answer_file: Path, stdout: str, structured: bool) -> dict[str, Any]:
+    if not answer_file.is_file():
+        _die(5, "agent_failed", "codex wrote no final message",
+             (stdout or "")[-500:] or None)
+    answer: Any = answer_file.read_text(encoding="utf-8").strip()
+    if structured and isinstance(answer, str):
+        with contextlib.suppress(json.JSONDecodeError):
+            answer = json.loads(answer)
+    tokens: dict[str, Any] = {}
+    session_id = None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        with contextlib.suppress(json.JSONDecodeError):
+            event = json.loads(line)
+            usage = (event.get("info") or {}).get("total_token_usage") or event.get("usage")
+            if isinstance(usage, dict):
+                tokens = {
+                    "input": usage.get("input_tokens"),
+                    "output": usage.get("output_tokens"),
+                    "cache_read": usage.get("cached_input_tokens"),
+                    "cache_creation": None,
+                }
+            session_id = event.get("session_id") or session_id
+    return {"answer": answer, "cost_usd": None, "duration_ms": None,
+            "num_turns": None, "session_id": session_id, "tokens": tokens}
+
+
+def cmd_agents() -> dict[str, Any]:
+    root = _root_required()
+    _, config = _load(root)
+    agents = config["agents"]
+    return {"default": agents["default"],
+            "workers": {name: dict(spec) for name, spec in sorted(agents["workers"].items())}}
+
+
+def cmd_agent(profile_name: str | None, prompt_raw: str, schema_raw: str | None,
+              timeout_override: float | None) -> dict[str, Any]:
+    root = _root_required()
+    _, config = _load(root)
+    agents = config["agents"]
+    name = profile_name or agents["default"]
+    profile = agents["workers"].get(name)
+    if profile is None:
+        _die(3, "unknown_agent", f"unknown agent profile {name!r}",
+             f"declared profiles: {', '.join(sorted(agents['workers']))}")
+    schema = None
+    if schema_raw:
+        schema = Path(schema_raw).expanduser()
+        if not schema.is_absolute():
+            schema = (root / schema).resolve()
+        if not schema.is_file():
+            _die(6, "schema_not_found", f"schema file not found: {schema}")
+    prompt = _agent_prompt(prompt_raw)
+    timeout = timeout_override or profile["timeout_seconds"]
+
+    with tempfile.TemporaryDirectory(prefix="automations-agent-") as tmp:
+        answer_file = Path(tmp) / "answer.txt"
+        command = _agent_command(profile, root, schema, answer_file)
+        started = time.monotonic()
+        try:
+            completed = subprocess.run(
+                command, input=prompt, cwd=str(root), env=_agent_env(),
+                capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _die(5, "agent_timeout",
+                 f"the {profile['engine']} agent exceeded {timeout:g}s",
+                 "raise timeout_seconds on the profile or pass --timeout")
+        elapsed = int((time.monotonic() - started) * 1000)
+        if completed.returncode != 0:
+            _die(5, "agent_failed",
+                 (completed.stderr or completed.stdout or "").strip()[-500:]
+                 or f"{profile['engine']} exited {completed.returncode}")
+        if profile["engine"] == "claude":
+            result = _claude_answer(completed.stdout, schema is not None)
+        else:
+            result = _codex_answer(answer_file, completed.stdout, schema is not None)
+
+    if result["duration_ms"] is None:
+        result["duration_ms"] = elapsed
+    return {"ok": True, "profile": name, "engine": profile["engine"],
+            "model": profile["model"], "effort": profile["effort"],
+            "mode": profile["mode"], **result}
+
+
 def main() -> None:
+    os.environ.setdefault("AUTOMATIONS_BIN", str(Path(__file__).resolve()))
     _gate()
     argv = sys.argv[1:]
     if argv[:1] == ["manifest"]:
@@ -1171,6 +1391,12 @@ def main() -> None:
     cancel.add_argument("run_id")
     retry = sub.add_parser("retry", add_help=False)
     retry.add_argument("run_id")
+    sub.add_parser("agents", add_help=False)
+    agent = sub.add_parser("agent", add_help=False)
+    agent.add_argument("prompt")
+    agent.add_argument("--profile")
+    agent.add_argument("--schema")
+    agent.add_argument("--timeout", type=float)
 
     service = sub.add_parser("service", add_help=False)
     service_sub = service.add_subparsers(dest="service_cmd", required=True)
@@ -1210,6 +1436,12 @@ def main() -> None:
         _emit(cmd_cancel(args.run_id))
     elif args.cmd == "retry":
         _emit(cmd_retry(args.run_id))
+    elif args.cmd == "agents":
+        _emit(cmd_agents())
+    elif args.cmd == "agent":
+        if args.timeout is not None and args.timeout < 1:
+            _die(6, "invalid_timeout", "--timeout must be at least 1 second")
+        _emit(cmd_agent(args.profile, args.prompt, args.schema, args.timeout))
     elif args.cmd == "service":
         if args.service_cmd == "init":
             _emit(cmd_service_init(args.force))

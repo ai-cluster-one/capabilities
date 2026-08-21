@@ -49,6 +49,10 @@ class AutomationsTests(unittest.TestCase):
         (scripts / "job.py").write_text(
             "#!/usr/bin/env python3\nimport os\nprint('done:' + os.environ['AUTOMATION_RUN_ID'])\n"
         )
+        (scripts / "agentbin.py").write_text(
+            "#!/usr/bin/env python3\nimport os\n"
+            "print('bin:' + os.environ.get('AUTOMATIONS_BIN', 'MISSING'))\n"
+        )
         (scripts / "slow.py").write_text(
             "#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n"
         )
@@ -77,6 +81,16 @@ timeout_seconds = 5
 max_parallel = 1
 max_pending = 2
 overlap = "queue"
+retries = 0
+
+[[automations]]
+id = "agentbin"
+environments = ["test"]
+script = "capabilities/automations/scripts/agentbin.py"
+timeout_seconds = 5
+max_parallel = 1
+max_pending = 1
+overlap = "skip"
 retries = 0
 
 [[automations]]
@@ -137,6 +151,95 @@ retries = 1
                 return row
             time.sleep(0.1)
         self.fail(f"run {run_id} did not reach {wanted}")
+
+    def test_agent_profiles_ship_without_configuration(self) -> None:
+        agents = RUNTIME.load_agents({})
+        self.assertEqual(agents["default"], "sonnet")
+        self.assertEqual(sorted(agents["workers"]), ["haiku", "opus", "sonnet"])
+        self.assertEqual(agents["workers"]["haiku"]["engine"], "claude")
+        self.assertEqual(agents["workers"]["sonnet"]["mode"], "read")
+
+    def test_declared_agent_adds_and_overrides_field_by_field(self) -> None:
+        agents = RUNTIME.load_agents({
+            "agents": {
+                "default": "terra",
+                "workers": {
+                    "terra": {"engine": "codex", "model": "gpt-5.6-terra",
+                              "effort": "high", "service_tier": "priority"},
+                    "haiku": {"timeout_seconds": 42},
+                },
+            }
+        })
+        self.assertEqual(agents["default"], "terra")
+        terra = agents["workers"]["terra"]
+        self.assertEqual(terra["engine"], "codex")
+        self.assertEqual(terra["service_tier"], "priority")
+        self.assertEqual(terra["mode"], "read")
+        haiku = agents["workers"]["haiku"]
+        self.assertEqual(haiku["timeout_seconds"], 42)
+        self.assertEqual(haiku["model"], "haiku")
+        self.assertEqual(haiku["engine"], "claude")
+
+    def test_agent_config_rejects_bad_shapes(self) -> None:
+        cases = [
+            {"workers": {"x": {"engine": "gemini", "model": "m"}}},
+            {"workers": {"x": {"engine": "claude", "model": "m", "modle": "typo"}}},
+            {"workers": {"x": {"engine": "claude", "model": "m", "effort": "turbo"}}},
+            {"workers": {"x": {"engine": "claude", "model": "m", "service_tier": "priority"}}},
+            {"workers": {"x": {"engine": "claude", "model": "m", "mode": "act"}}},
+            {"workers": {"x": {"engine": "claude"}}},
+            {"default": "absent"},
+            {"unknown": True},
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                with self.assertRaises(RUNTIME.ConfigError):
+                    RUNTIME.load_agents({"agents": case})
+
+    def test_agent_command_fences_read_and_opens_write(self) -> None:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_loader("automations_cli_test", loader=None)
+        cli = _ilu.module_from_spec(spec)
+        cli.__dict__["__file__"] = str(CLI)
+        exec(compile(CLI.read_text(), str(CLI), "exec"), cli.__dict__)
+        base = {"engine": "claude", "model": "sonnet", "effort": "high",
+                "mode": "read", "timeout_seconds": 60.0, "service_tier": None}
+        answer = Path(self.tmp.name) / "answer.txt"
+        read = cli.__dict__["_agent_command"](base, self.root, None, answer)
+        self.assertIn("plan", read)
+        self.assertNotIn("bypassPermissions", read)
+        write = cli.__dict__["_agent_command"]({**base, "mode": "write"},
+                                               self.root, None, answer)
+        self.assertIn("bypassPermissions", write)
+        self.assertNotIn("plan", write)
+        codex = cli.__dict__["_agent_command"](
+            {**base, "engine": "codex", "model": "gpt-5.6-sol",
+             "service_tier": "priority"}, self.root, None, answer)
+        self.assertIn("read-only", codex)
+        self.assertIn("model_service_tier=priority", codex)
+        codex_write = cli.__dict__["_agent_command"](
+            {**base, "engine": "codex", "model": "gpt-5.6-sol", "mode": "write"},
+            self.root, None, answer)
+        self.assertIn("workspace-write", codex_write)
+
+    def test_agents_verb_lists_profiles(self) -> None:
+        listed = json.loads(self.cli("agents").stdout)
+        self.assertEqual(listed["default"], "sonnet")
+        self.assertIn("haiku", listed["workers"])
+
+    def test_agent_rejects_unknown_profile(self) -> None:
+        proc = self.cli("agent", "--profile", "absent", "hello", check=False)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(json.loads(proc.stderr)["error"]["code"], "unknown_agent")
+
+    def test_job_receives_the_cli_path(self) -> None:
+        self.cli("service", "start")
+        queued = json.loads(self.cli("run", "agentbin").stdout)
+        row = self.wait_status(queued["run"]["id"], {"succeeded"})
+        logs = json.loads(self.cli("logs", row["id"]).stdout)
+        reported = logs["lines"][-1].removeprefix("bin:")
+        self.assertNotEqual(reported, "MISSING")
+        self.assertTrue(os.access(reported, os.X_OK), reported)
 
     def test_manual_run_history_and_logs(self) -> None:
         doctor = json.loads(self.cli("doctor").stdout)

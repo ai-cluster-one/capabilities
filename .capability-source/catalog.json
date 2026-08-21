@@ -12,7 +12,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "d074fe0f1a11c8d29de4234135bc56be693f11126c65b9826dc720872e54f844",
+      "payload_sha256": "5c488d0135296c8b591ef0577f99c668e625ef7ff7c3025d289de6ef59128fbf",
       "summary": "Project-local scheduler and subprocess runner with versioned config, SQLite run history, concurrency, retries, timeouts, and cancellation."
     },
     "callva": {
