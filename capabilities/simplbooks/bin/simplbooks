@@ -406,6 +406,54 @@ def _env_dir() -> Path | None:
     return (_project_capabilities_dir(root) / NAME) if root is not None else None
 
 
+def _store_mode() -> tuple[str, str]:
+    """Whether this project keeps its records in files or in the store, and what
+    answered. One project may be moved without moving any other, so the answer is
+    per project and lives beside the project's identity — it has to be readable
+    before the store is reachable.
+
+    A project says nothing: files, which is every project that has not moved.
+    `CAPABILITIES_STORE_MODE` overrides for one invocation, for comparing the two
+    against each other. Nothing falls back silently in either direction: a
+    project on the store that cannot reach it fails rather than reading a stale
+    file it would have no way to report."""
+    if "open_store" not in globals():
+        return ("files", "capability carries no store tier")
+    override = os.environ.get("CAPABILITIES_STORE_MODE")
+    if override:
+        if override not in ("files", "db"):
+            _die(6, "bad_store_mode", f"CAPABILITIES_STORE_MODE must be files or db, got {override!r}")
+        return (override, "CAPABILITIES_STORE_MODE")
+    root = _project_root()
+    if root is None:
+        return ("files", "no project")
+    identity_file = _project_capabilities_dir(root) / "project.json"
+    try:
+        identity = json.loads(identity_file.read_text())
+    except (OSError, ValueError):
+        return ("files", "no project identity")
+    mode = identity.get("store", "files")
+    if mode not in ("files", "db"):
+        _die(6, "bad_store_mode", f"{identity_file} declares store {mode!r}",
+             "expected \"files\" or \"db\"")
+    return (mode, str(identity_file))
+
+
+def _project_identity() -> dict:
+    root = _project_root()
+    if root is None:
+        _die(6, "no_project", "no project here to resolve records for")
+    identity_file = _project_capabilities_dir(root) / "project.json"
+    try:
+        identity = json.loads(identity_file.read_text())
+    except (OSError, ValueError) as e:
+        _die(6, "no_project_identity", f"cannot read {identity_file}: {e}",
+             "run `capabilities init` in the project")
+    if not identity.get("slug"):
+        _die(6, "no_project_identity", f"{identity_file} declares no slug")
+    return identity
+
+
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where capabilities/ already exists."""
@@ -702,10 +750,60 @@ def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 
 
-def _connections_registry() -> tuple[dict | None, Path | None]:
-    """The connections envelope and its path: project envelope first, else the
-    user config home. First found wins, never merged. Every connection-bearing
-    capability requires a registry, even when it declares only one connection."""
+def _connections_from_store() -> dict:
+    """The same envelope shape, composed out of the store.
+
+    Deliberately reconstituted rather than returned in some store-shaped form:
+    selection, the write gate and the `connections` report all read the envelope
+    shape, and they should not learn where the rows came from. What changes here
+    is the source, never the shape.
+
+    The permission a project was granted is folded back onto the entry as
+    `allow_write`, which is where the rest of the contract looks for it."""
+    identity = _project_identity()
+    scopes = Scopes(project=identity["slug"],
+                    instance=os.environ.get("CAPABILITIES_INSTANCE") or None)
+    try:
+        with open_store() as store:
+            effective = store.connections_effective(
+                NAME, scopes, write_default=WRITE_DEFAULT)
+            default = store.config_get(NAME, "setting", "connection.default", scopes)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    if not effective:
+        _die(6, "connections_required",
+             f"the store holds no connections for {NAME} in project "
+             f"{identity['slug']!r}",
+             "declare one, or set this project's store to \"files\" in "
+             "capabilities/project.json")
+    return {
+        "default": default,
+        "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
+                        for cid, entry in effective.items()},
+    }
+
+
+def _store_source_label() -> str:
+    """What the report names as the origin of store-resolved values. A store URL
+    may carry a password, so the credential is stripped rather than masked —
+    `connections` prints this, and a report is not a place a secret appears."""
+    url = os.environ.get("CAPABILITIES_STORE_URL") or "?"
+    if "://" not in url:
+        return f"store(sqlite:{url})"
+    scheme, rest = url.split("://", 1)
+    if "@" in rest:
+        rest = rest.split("@", 1)[1]
+    return f"store({scheme}://{rest.split('?', 1)[0]})"
+
+
+def _connections_registry() -> tuple[dict | None, Path | str | None]:
+    """The connections envelope and its path: the store where this project keeps
+    its records there, else the project envelope, else the user config home.
+    First found wins, never merged. Every connection-bearing capability requires
+    a registry, even when it declares only one connection."""
+    mode, _source = _store_mode()
+    if mode == "db":
+        return _connections_from_store(), _store_source_label()
     envdir = _env_dir()
     candidates = ([envdir / "connections.json"] if envdir else []) + \
                  [_CONFIG_HOME / NAME / "connections.json"]
