@@ -4597,6 +4597,31 @@ class AudioPeerTrackingTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(daemon.MEDIA_AUDIO_PEERS, {7})
 
+    async def test_churn_inside_a_live_call_does_not_read_as_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.MEDIA_AUDIO_PEERS.clear()
+
+            def add(ssrc):
+                daemon._track_audio_peer(
+                    f"Adding incoming audio channel with ssrc {ssrc}")
+
+            def remove(ssrc):
+                daemon._track_audio_peer(
+                    f"Removing incoming audio channel with ssrc {ssrc}")
+
+            # The 2026-08-21 conference that recorded cleanly: two participants,
+            # and the same ssrc dropped and restored three times in nineteen
+            # seconds while the call was alive throughout.
+            add(946429944)
+            remove(946429944); add(946429944)
+            add(1425171273)
+            remove(946429944); add(946429944)
+            remove(1425171273); add(1425171273)
+
+            self.assertEqual(daemon.MEDIA_AUDIO_PEERS, {946429944, 1425171273})
+            self.assertGreaterEqual(daemon.CONFERENCE_PEER_TIMEOUT, 60.0)
+
     async def test_the_removal_that_ended_a_real_call_is_recognised(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())

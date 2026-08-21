@@ -110,7 +110,15 @@ CAPTURE_STALL_INTERVAL = 1.0
 # When to re-ask who is in a conference, as seconds after the join.
 CONFERENCE_AUDIO_MAP_RETRIES = (2.0, 3.0, 5.0, 10.0)
 CONFERENCE_PEER_INTERVAL = 2.0
-CONFERENCE_PEER_TIMEOUT = 20.0
+# Deliberately far above any observed gap. Incoming audio channels churn inside
+# a healthy call: a nineteen-second conference on 2026-08-21 removed and re-added
+# the same ssrc three times, so the set empties for a moment while the call is
+# very much alive. A threshold close to that would truncate real recordings, and
+# it would buy nothing — a new invite preempts a silent recording immediately,
+# which is what the caller actually waits on. This one only stops an abandoned
+# recording from writing silence for an hour, and ninety seconds is soon enough
+# for that.
+CONFERENCE_PEER_TIMEOUT = 90.0
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
@@ -5992,7 +6000,9 @@ async def run_session(client):
             busy.
 
             Counting only starts once a channel has actually appeared, since a
-            join legitimately precedes the first one by a few seconds.
+            join legitimately precedes the first one by a few seconds, and any
+            re-appearance resets it, because the churn inside a live call is the
+            normal case rather than the interesting one.
             """
             seen_any = False
             empty_for = 0.0
