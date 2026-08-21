@@ -92,12 +92,6 @@ class GetGroupCallChainBlocksRequest:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.__dict__.update(kwargs)
-
-
-class GetGroupParticipantsRequest:
-    def __init__(self, *args, **kwargs):
-        self.args = args
-        self.__dict__.update(kwargs)
 """.lstrip()
     )
     errors = package / "errors"
@@ -4671,8 +4665,7 @@ class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
 
         async def read(invite_msg_id):
             reads.append(invite_msg_id)
-            block = answers.pop(0) if len(answers) > 1 else answers[0]
-            return block, len(reads)
+            return answers.pop(0) if len(answers) > 1 else answers[0]
 
         return read, reads
 
@@ -4714,8 +4707,7 @@ class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
             counter = itertools.count()
 
             async def read(invite_msg_id):
-                n = next(counter)
-                return f"block-{n}".encode(), n
+                return f"block-{next(counter)}".encode()
 
             with self.assertRaises(RuntimeError) as caught:
                 await daemon.settle_conference_chain(4242, b"block-one",
@@ -4729,7 +4721,7 @@ class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
             self.prepare(daemon)
 
             async def read(invite_msg_id):
-                return None, None
+                return None
 
             with self.assertRaises(RuntimeError) as caught:
                 await daemon.settle_conference_chain(4242, b"block-one",

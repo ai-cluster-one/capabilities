@@ -64,7 +64,7 @@ from pathlib import Path
 
 import telethon
 from telethon import TelegramClient, events
-from telethon.tl.functions.phone import GetGroupCallChainBlocksRequest, GetGroupParticipantsRequest
+from telethon.tl.functions.phone import GetGroupCallChainBlocksRequest
 from telethon.tl.types import InputGroupCallInviteMessage, MessageActionConferenceCall, MessageActionInviteToGroupCall, MessageService, UpdateNewMessage
 
 import pytgcalls
@@ -117,26 +117,17 @@ CONFERENCE_PEER_INTERVAL = 2.0
 # because one failed round-trip must not end a live recording.
 CONFERENCE_QUIET_BEFORE_CHECK = 20.0
 CONFERENCE_JOIN_GRACE = 30.0
-# Six conferences on 2026-08-21 split without overlap on how long the chain took
-# to produce its first block: 0.1s, 0.1s and 0.6s joined cleanly, while 6.0s,
-# 6.5s and one of twenty reads joined, received no audio at all, and dropped the
-# caller out of their own call. The threshold sits in the empty gap between.
+# A conference is not always finished when its invite arrives. One whose chain
+# answers within this is joined straight away; one that takes longer is held
+# until its newest block has stood unchanged for the settle time and joined
+# then, which is worth the wait: a chain that first answered after 2.9s grew
+# another block while being held and then recorded cleanly. A chain still
+# producing new blocks when the budget runs out is declined, because no join
+# into one of those has yet been seen to work.
 CONFERENCE_CHAIN_READY_LIMIT = 2.0
-# What separates the two groups is the age of the block joined on. A chain that
-# answers at once was built before the invite reached us, so the block it hands
-# over already has some age; a chain that answers only after seconds produced
-# its first block while we were reading it, and the join went in on a block
-# with no age at all. A late block is therefore not refused, it is left to
-# age: re-read on this cadence until the newest block has stood unchanged for
-# the settle time, then join. Whether ageing is enough — whether a delayed join
-# works on an invite that was already delivered — no observation yet answers,
-# so every round is logged and the budget still ends in the decline it
-# replaces.
 CONFERENCE_CHAIN_SETTLE_STEP = 2.0
 CONFERENCE_CHAIN_SETTLE_MIN = 4.0
 CONFERENCE_CHAIN_SETTLE_BUDGET = 12.0
-CONFERENCE_CHAIN_LATE_WATCH = 45.0
-CONFERENCE_CHAIN_LATE_INTERVAL = 2.0
 CONFERENCE_EMPTY_ANSWERS = 2
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
@@ -697,18 +688,15 @@ _media_log.addHandler(_MediaStackLog())
 
 
 async def settle_conference_chain(invite_msg_id, block, waited, read_block):
-    """Hold a conference that was still being built until its chain stops.
+    """Hold a conference that is still being built until its chain stops.
 
     Nothing is re-sent and nothing is answered again: the caller stays invited,
-    their phone goes on showing the call, and the join simply happens a few
-    seconds later on a block that has had time to stand. Each round says what
-    it saw, because the join that follows is the only thing that can tell
-    whether ageing a block is what the failing conferences needed.
+    their phone goes on showing the call, and the join happens a few seconds
+    later on a block that has had time to stand.
 
     Growth is what the budget is spent on. A chain still issuing new blocks is
-    one still admitting people, and joining that has never worked, so when the
-    newest block keeps changing until the budget is gone the invite is declined
-    exactly as it was before this waiting existed.
+    one still admitting people, and no join into one of those has been seen to
+    work, so a chain that keeps changing until the budget is gone is declined.
     """
     digest = hashlib.sha256(block).hexdigest()[:12]
     log(f"call: conference chain for invite {invite_msg_id} was still being "
@@ -722,18 +710,15 @@ async def settle_conference_chain(invite_msg_id, block, waited, read_block):
                     CONFERENCE_CHAIN_SETTLE_MIN - age)
         if pause <= 0:
             log(f"call: conference chain for invite {invite_msg_id} settled — "
-                f"block {digest} unchanged for {age:.1f}s, joining a conference "
-                f"that was not ready when it invited us")
+                f"block {digest} unchanged for {age:.1f}s, joining")
             return block
         if time.monotonic() + pause > deadline:
             raise RuntimeError(
                 f"conference chain for invite {invite_msg_id} was still growing "
-                f"after {CONFERENCE_CHAIN_SETTLE_BUDGET:.0f}s of waiting; a "
-                f"conference that slow to build has never joined without "
-                f"dropping its caller, so this invite is declined — invite "
-                f"again in a few seconds")
+                f"after {CONFERENCE_CHAIN_SETTLE_BUDGET:.0f}s of waiting, so "
+                f"this invite is declined")
         await asyncio.sleep(pause)
-        fresh, height = await read_block(invite_msg_id)
+        fresh = await read_block(invite_msg_id)
         if not fresh:
             raise RuntimeError(
                 f"conference chain for invite {invite_msg_id} went empty while "
@@ -741,8 +726,8 @@ async def settle_conference_chain(invite_msg_id, block, waited, read_block):
         fresh_digest = hashlib.sha256(fresh).hexdigest()[:12]
         if fresh_digest != digest:
             log(f"call: conference chain for invite {invite_msg_id} still "
-                f"growing — block {digest} became {fresh_digest} at height "
-                f"{height} after {time.monotonic() - seen_at:.1f}s")
+                f"growing — block {digest} became {fresh_digest} after "
+                f"{time.monotonic() - seen_at:.1f}s")
             block, digest = fresh, fresh_digest
             seen_at = time.monotonic()
 
@@ -4848,93 +4833,13 @@ async def run_session(client):
         library_last_block = calls._app._bind_client.get_conference_last_block
 
         async def read_chain_last_block(invite_msg_id: int):
-            """Ask once for the last block of a conference's chain.
-
-            The height comes back with it. Joining means appending a block
-            derived from this one, so the height at the read and the height
-            after the join are what say whether this account built on the head
-            of the chain or on something the conference had already moved past.
-            """
+            """Ask once for the last block of a conference's chain."""
             result = await client(GetGroupCallChainBlocksRequest(
                 call=InputGroupCallInviteMessage(msg_id=invite_msg_id),
                 sub_chain_id=0, offset=-1, limit=1))
-            block = None
-            height = None
-            for update in getattr(result, "updates", None) or []:
-                blocks = getattr(update, "blocks", None) or []
-                if blocks:
-                    block = blocks[-1]
-                    height = getattr(update, "next_offset", None)
-            return block, height
-
-        async def log_conference_roster(invite_msg_id, when: str):
-            """Say who Telegram lists in this conference right now.
-
-            Asked through the invite rather than the call, so it can be put
-            before this account has joined anything. Whether the caller is in
-            that list before the join is the whole question: absent already
-            means the conference lost them on its own, present then gone means
-            it lost them to us.
-            """
-            if not invite_msg_id:
-                return
-            try:
-                answer = await client(GetGroupParticipantsRequest(
-                    call=InputGroupCallInviteMessage(msg_id=invite_msg_id),
-                    ids=[], sources=[], offset="", limit=100))
-            except Exception as exc:
-                log(f"call: roster ({when}) for invite {invite_msg_id} "
-                    f"unavailable — {type(exc).__name__}: {exc}")
-                return
-            rows = []
-            for participant in getattr(answer, "participants", None) or []:
-                peer = getattr(participant, "peer", None)
-                who = (getattr(peer, "user_id", None)
-                       or getattr(peer, "channel_id", None)
-                       or getattr(peer, "chat_id", None))
-                marks = "".join(mark for mark, on in (
-                    ("left", getattr(participant, "left", False)),
-                    ("muted", getattr(participant, "muted", False)),
-                    ("new", getattr(participant, "just_joined", False)),
-                ) if on)
-                rows.append(f"{who}{'(' + marks + ')' if marks else ''}")
-            log(f"call: roster ({when}) for invite {invite_msg_id} — "
-                f"count={getattr(answer, 'count', '?')} "
-                f"[{', '.join(rows) or 'nobody'}]")
-
-        async def watch_late_conference_chain(invite_msg_id):
-            """Keep reading a chain that produced nothing, after giving up on it.
-
-            An invite whose chain stays empty is one whose conference was never
-            created, and the caller loses their call over it whether or not this
-            account ever joins. Whether more patience would have helped is not
-            answerable from a read that stopped: this one goes on asking with
-            the join already declined, so the answer costs the caller nothing.
-            """
-            deadline = time.monotonic() + CONFERENCE_CHAIN_LATE_WATCH
-            while time.monotonic() < deadline:
-                await asyncio.sleep(CONFERENCE_CHAIN_LATE_INTERVAL)
-                try:
-                    block, height = await read_chain_last_block(invite_msg_id)
-                except Exception as exc:
-                    log(f"call: late chain watch for invite {invite_msg_id} "
-                        f"stopped — {type(exc).__name__}: {exc}")
-                    return
-                if block:
-                    log(f"call: chain for invite {invite_msg_id} appeared late "
-                        f"— {len(block)} bytes at height {height}, "
-                        f"{time.monotonic() - (deadline - CONFERENCE_CHAIN_LATE_WATCH):.0f}s "
-                        f"after the join was declined")
-                    await log_conference_roster(invite_msg_id, "late chain")
-                    return
-            log(f"call: chain for invite {invite_msg_id} never appeared, "
-                f"watched a further {CONFERENCE_CHAIN_LATE_WATCH:.0f}s")
-
-        async def watch_conference_roster(invite_msg_id):
-            """Follow the roster over the seconds a lost caller disappears in."""
-            for delay, when in ((3.0, "+3s after join"), (9.0, "+12s after join")):
-                await asyncio.sleep(delay)
-                await log_conference_roster(invite_msg_id, when)
+            blocks = [b for u in getattr(result, "updates", None) or []
+                      for b in getattr(u, "blocks", None) or []]
+            return blocks[-1] if blocks else None
 
         async def conference_last_block(chat_id: int, invite_msg_id=None):
             """Wait for the last block of a conference's chain to exist.
@@ -4959,18 +4864,11 @@ async def run_session(client):
             reads = 0
             while True:
                 reads += 1
-                block, height = await read_chain_last_block(invite_msg_id)
+                block = await read_chain_last_block(invite_msg_id)
                 if block:
-                    # The block's identity, its height, and how long it took to
-                    # appear. How long decides whether this join is safe to make
-                    # now; the digest says, on the next read, whether the chain
-                    # is still growing underneath it; the height says what this
-                    # account is about to build on.
-                    digest = hashlib.sha256(block).hexdigest()[:12]
                     log(f"call: conference chain for invite {invite_msg_id} — "
                         f"block of {len(block)} bytes after {reads} read(s) "
-                        f"in {time.monotonic() - started:.1f}s, digest {digest}, "
-                        f"height {height}")
+                        f"in {time.monotonic() - started:.1f}s")
                     return block
                 if time.monotonic() >= deadline:
                     log(f"call: conference chain for invite {invite_msg_id} — "
@@ -4987,19 +4885,14 @@ async def run_session(client):
 
             A chain with no block at all leaves the library's "create a
             conference instead" fallback reachable, and that fallback invites
-            the caller into a conference of our own making.
-
-            A chain that takes seconds to produce its first block is the one
-            that costs the caller their call: no incoming audio channel is
-            established, no end ever arrives, and the caller is dropped out of
-            the call while their phone goes on showing it. The block is not
-            stale — its digest is identical across the settling read and the
-            joining read — so the wait is not measuring a moving chain. It
-            measures a conference still being built, and it measures a block
-            with no age, because it came into existence while this account was
-            reading for it. Waiting is what gives the block that age.
+            the caller into a conference of our own making. It also means there
+            is no conference to join: Telegram does not always finish turning a
+            1:1 call into a group one, and when it does not, the chain stays
+            empty and the caller loses the call whatever this account does. An
+            invite declined here without a single block ever being appended has
+            already cost its caller the call, so nothing about the join is
+            worth hardening against that.
             """
-            await log_conference_roster(invite_msg_id, "at invite")
             started = time.monotonic()
             try:
                 block = await conference_last_block(caller_id, invite_msg_id)
@@ -5008,7 +4901,6 @@ async def run_session(client):
                     f"conference chain unreadable for invite {invite_msg_id} — "
                     f"{type(exc).__name__}: {exc}") from exc
             if not block:
-                asyncio.create_task(watch_late_conference_chain(invite_msg_id))
                 raise RuntimeError(
                     f"conference chain empty for invite {invite_msg_id}")
             waited = time.monotonic() - started
@@ -5018,7 +4910,6 @@ async def run_session(client):
             else:
                 log(f"call: conference chain readable — last block "
                     f"{len(block)} bytes in {waited:.1f}s")
-            await log_conference_roster(invite_msg_id, "before join")
 
         async def refresh_conference_audio_map(chat_id: int, reason: str):
             """Rebuild the participant-to-audio-stream map for a live call.
@@ -5124,8 +5015,6 @@ async def run_session(client):
                 if mode == "conference":
                     asyncio.create_task(settle_conference_audio_map(caller_id))
                     asyncio.create_task(watch_conference_peers(caller_id))
-                    asyncio.create_task(
-                        watch_conference_roster(call_config.conference))
             except Exception as exc:
                 # A media connection that never reached CONNECTED is reported as
                 # an argument-less exception, so the type carries the message.
@@ -5136,9 +5025,9 @@ async def run_session(client):
                     # on only one of them. A conference that never came into
                     # existence is not one this account failed to join.
                     notice = (
-                        "Конференция так и не создалась — Telegram не довёл "
-                        "перевод звонка в групповой. Я в неё не заходил, так "
-                        "что дело не во мне. Попробуй позвать ещё раз."
+                        "Конференция не создалась — Telegram не довёл перевод "
+                        "звонка в групповой, это у него бывает через раз. "
+                        "Я в неё не заходил. Перезвони и позови снова."
                         if "empty" in str(exc) else
                         "Не подключился к конференции: она всё ещё собиралась, "
                         "я подождал сколько мог. Позови ещё раз через "
@@ -6339,27 +6228,6 @@ async def run_session(client):
                     await finalize_call_recording("capture_stalled")
                     return
 
-        def describe_call_action(action) -> str:
-            """Everything the invite already says about the call it announces.
-
-            The service message carries whether the conference is active and who
-            Telegram thinks is in it, which is the earliest answer available to
-            the question of who this account is about to join — earlier than the
-            chain, which on a failing invite has nothing in it at all.
-            """
-            parts = []
-            for name in ("call_id", "missed", "active", "video", "duration"):
-                if hasattr(action, name):
-                    parts.append(f"{name}={getattr(action, name)}")
-            others = getattr(action, "other_participants", None)
-            if others is not None:
-                parts.append("other_participants=" + str([
-                    getattr(peer, "user_id", None)
-                    or getattr(peer, "channel_id", None)
-                    or getattr(peer, "chat_id", None)
-                    for peer in others]))
-            return f"{type(action).__name__}({', '.join(parts)})"
-
         @client.on(events.Raw)
         async def conference_invite(event):
             if not isinstance(event, UpdateNewMessage):
@@ -6378,10 +6246,6 @@ async def run_session(client):
             if (caller_id is None or caller_id not in set(
                     configured_call_recording_users()["allowed_callers"])):
                 return
-            if "Call" in type(action).__name__:
-                log(f"call: invite {message.id} from {caller_id} — "
-                    f"{describe_call_action(action)}"
-                    f"{' (already seen)' if message.id in seen_invite_ids else ''}")
             if message.id in seen_invite_ids:
                 return
             if isinstance(action, MessageActionConferenceCall) and not action.missed:
