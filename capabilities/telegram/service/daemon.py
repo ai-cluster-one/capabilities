@@ -122,6 +122,19 @@ CONFERENCE_JOIN_GRACE = 30.0
 # 6.5s and one of twenty reads joined, received no audio at all, and dropped the
 # caller out of their own call. The threshold sits in the empty gap between.
 CONFERENCE_CHAIN_READY_LIMIT = 2.0
+# What separates the two groups is the age of the block joined on. A chain that
+# answers at once was built before the invite reached us, so the block it hands
+# over already has some age; a chain that answers only after seconds produced
+# its first block while we were reading it, and the join went in on a block
+# with no age at all. A late block is therefore not refused, it is left to
+# age: re-read on this cadence until the newest block has stood unchanged for
+# the settle time, then join. Whether ageing is enough — whether a delayed join
+# works on an invite that was already delivered — no observation yet answers,
+# so every round is logged and the budget still ends in the decline it
+# replaces.
+CONFERENCE_CHAIN_SETTLE_STEP = 2.0
+CONFERENCE_CHAIN_SETTLE_MIN = 4.0
+CONFERENCE_CHAIN_SETTLE_BUDGET = 12.0
 CONFERENCE_EMPTY_ANSWERS = 2
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
@@ -679,6 +692,57 @@ class _MediaStackLog(logging.Handler):
 _media_log = logging.getLogger("ntgcalls")
 _media_log.setLevel(logging.INFO)
 _media_log.addHandler(_MediaStackLog())
+
+
+async def settle_conference_chain(invite_msg_id, block, waited, read_block):
+    """Hold a conference that was still being built until its chain stops.
+
+    Nothing is re-sent and nothing is answered again: the caller stays invited,
+    their phone goes on showing the call, and the join simply happens a few
+    seconds later on a block that has had time to stand. Each round says what
+    it saw, because the join that follows is the only thing that can tell
+    whether ageing a block is what the failing conferences needed.
+
+    Growth is what the budget is spent on. A chain still issuing new blocks is
+    one still admitting people, and joining that has never worked, so when the
+    newest block keeps changing until the budget is gone the invite is declined
+    exactly as it was before this waiting existed.
+    """
+    digest = hashlib.sha256(block).hexdigest()[:12]
+    log(f"call: conference chain for invite {invite_msg_id} was still being "
+        f"built — first block {digest} after {waited:.1f}s; letting it settle "
+        f"instead of joining now")
+    deadline = time.monotonic() + CONFERENCE_CHAIN_SETTLE_BUDGET
+    seen_at = time.monotonic()
+    while True:
+        age = time.monotonic() - seen_at
+        pause = min(CONFERENCE_CHAIN_SETTLE_STEP,
+                    CONFERENCE_CHAIN_SETTLE_MIN - age)
+        if pause <= 0:
+            log(f"call: conference chain for invite {invite_msg_id} settled — "
+                f"block {digest} unchanged for {age:.1f}s, joining a conference "
+                f"that was not ready when it invited us")
+            return block
+        if time.monotonic() + pause > deadline:
+            raise RuntimeError(
+                f"conference chain for invite {invite_msg_id} was still growing "
+                f"after {CONFERENCE_CHAIN_SETTLE_BUDGET:.0f}s of waiting; a "
+                f"conference that slow to build has never joined without "
+                f"dropping its caller, so this invite is declined — invite "
+                f"again in a few seconds")
+        await asyncio.sleep(pause)
+        fresh = await read_block(invite_msg_id)
+        if not fresh:
+            raise RuntimeError(
+                f"conference chain for invite {invite_msg_id} went empty while "
+                f"settling")
+        fresh_digest = hashlib.sha256(fresh).hexdigest()[:12]
+        if fresh_digest != digest:
+            log(f"call: conference chain for invite {invite_msg_id} still "
+                f"growing — block {digest} became {fresh_digest} after "
+                f"{time.monotonic() - seen_at:.1f}s")
+            block, digest = fresh, fresh_digest
+            seen_at = time.monotonic()
 
 
 def reconcile_orphaned_recordings():
@@ -4781,6 +4845,15 @@ async def run_session(client):
 
         library_last_block = calls._app._bind_client.get_conference_last_block
 
+        async def read_chain_last_block(invite_msg_id: int):
+            """Ask once for the last block of a conference's chain."""
+            result = await client(GetGroupCallChainBlocksRequest(
+                call=InputGroupCallInviteMessage(msg_id=invite_msg_id),
+                sub_chain_id=0, offset=-1, limit=1))
+            blocks = [b for u in getattr(result, "updates", None) or []
+                      for b in getattr(u, "blocks", None) or []]
+            return blocks[-1] if blocks else None
+
         async def conference_last_block(chat_id: int, invite_msg_id=None):
             """Wait for the last block of a conference's chain to exist.
 
@@ -4804,24 +4877,17 @@ async def run_session(client):
             reads = 0
             while True:
                 reads += 1
-                result = await client(GetGroupCallChainBlocksRequest(
-                    call=InputGroupCallInviteMessage(msg_id=invite_msg_id),
-                    sub_chain_id=0, offset=-1, limit=1))
-                updates = list(getattr(result, "updates", []) or [])
-                blocks = [b for u in updates
-                          for b in getattr(u, "blocks", None) or []]
-                if blocks:
-                    # The block's identity and how long it took to appear. A
-                    # conference joined on a block that has already moved on is
-                    # the current suspect for a join that connects, receives no
-                    # audio at all, and takes the caller's own call down with
-                    # it; the same block read twice says the chain was still,
-                    # two different ones say it was not.
-                    digest = hashlib.sha256(blocks[-1]).hexdigest()[:12]
+                block = await read_chain_last_block(invite_msg_id)
+                if block:
+                    # The block's identity and how long it took to appear. How
+                    # long is what decides whether this join is safe to make
+                    # now; the digest is what says, on the next read, whether
+                    # the chain is still growing underneath it.
+                    digest = hashlib.sha256(block).hexdigest()[:12]
                     log(f"call: conference chain for invite {invite_msg_id} — "
-                        f"block of {len(blocks[-1])} bytes after {reads} read(s) "
+                        f"block of {len(block)} bytes after {reads} read(s) "
                         f"in {time.monotonic() - started:.1f}s, digest {digest}")
-                    return blocks[-1]
+                    return block
                 if time.monotonic() >= deadline:
                     log(f"call: conference chain for invite {invite_msg_id} — "
                         f"still empty after {reads} read(s)")
@@ -4833,24 +4899,21 @@ async def run_session(client):
         calls._app._bind_client.get_conference_last_block = conference_last_block
 
         async def require_conference_chain(caller_id: int, invite_msg_id: int):
-            """Refuse a conference this account should not join.
+            """Join a conference only on a chain that has stopped moving.
 
             A chain with no block at all leaves the library's "create a
             conference instead" fallback reachable, and that fallback invites
             the caller into a conference of our own making.
 
             A chain that takes seconds to produce its first block is the one
-            that costs the caller their call. The block is not stale — its
-            digest is identical across the settling read and the joining read —
-            so the wait is not measuring a moving chain. It measures a
-            conference that is still being built, and joining one has yet to
-            work: no incoming audio channel is established, no end ever
-            arrives, and the caller is dropped out of the call while their
-            phone goes on showing it.
-
-            Not recording a call is a small loss. Taking the call down is not,
-            and the caller can invite again a few seconds later onto a chain
-            that is ready.
+            that costs the caller their call: no incoming audio channel is
+            established, no end ever arrives, and the caller is dropped out of
+            the call while their phone goes on showing it. The block is not
+            stale — its digest is identical across the settling read and the
+            joining read — so the wait is not measuring a moving chain. It
+            measures a conference still being built, and it measures a block
+            with no age, because it came into existence while this account was
+            reading for it. Waiting is what gives the block that age.
             """
             started = time.monotonic()
             try:
@@ -4864,11 +4927,9 @@ async def run_session(client):
                     f"conference chain empty for invite {invite_msg_id}")
             waited = time.monotonic() - started
             if waited > CONFERENCE_CHAIN_READY_LIMIT:
-                raise RuntimeError(
-                    f"conference chain for invite {invite_msg_id} needed "
-                    f"{waited:.1f}s to produce a block; a conference that slow "
-                    f"to build has never joined without dropping its caller, so "
-                    f"this invite is declined — invite again in a few seconds")
+                await settle_conference_chain(
+                    invite_msg_id, block, waited, read_chain_last_block)
+                return
             log(f"call: conference chain readable — last block {len(block)} bytes "
                 f"in {waited:.1f}s")
 
@@ -4985,9 +5046,10 @@ async def run_session(client):
                     with contextlib.suppress(Exception):
                         await client.send_message(
                             caller_id,
-                            "Не подключился к конференции: она ещё собиралась в "
-                            "момент приглашения. Позови ещё раз через несколько "
-                            "секунд — так звонок не разваливается.")
+                            "Не подключился к конференции: она всё ещё "
+                            "собиралась, я подождал сколько мог. Позови ещё раз "
+                            "через несколько секунд — так звонок не "
+                            "разваливается.")
                 metadata.update({
                     "status": "join_failed",
                     "stop_reason": "join_failed",

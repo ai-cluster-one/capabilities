@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import itertools
 import json
 import logging
 import os
@@ -4647,6 +4648,86 @@ class AudioPeerTrackingTests(unittest.IsolatedAsyncioTestCase):
             handler.emit(record("native_network_interface.cpp:214 Removing "
                                 "incoming audio channel with ssrc 1932033436"))
             self.assertFalse(daemon.MEDIA_AUDIO_PEERS)
+
+
+class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
+    """A conference still being built is waited out, not refused outright."""
+
+    def prepare(self, daemon):
+        daemon.CONFERENCE_CHAIN_SETTLE_STEP = 0.01
+        daemon.CONFERENCE_CHAIN_SETTLE_MIN = 0.04
+        daemon.CONFERENCE_CHAIN_SETTLE_BUDGET = 0.4
+
+    def reader(self, blocks):
+        """Answer each read from a list, holding the last answer afterwards."""
+        answers = list(blocks)
+        reads = []
+
+        async def read(invite_msg_id):
+            reads.append(invite_msg_id)
+            return answers.pop(0) if len(answers) > 1 else answers[0]
+
+        return read, reads
+
+    async def test_a_still_chain_is_joined_once_its_block_has_aged(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.prepare(daemon)
+            read, reads = self.reader([b"block-one"])
+
+            block = await daemon.settle_conference_chain(4242, b"block-one",
+                                                         6.0, read)
+
+            self.assertEqual(block, b"block-one")
+            self.assertTrue(reads, "the chain is re-read while it settles")
+            self.assertTrue(any("still being built" in line
+                                for line in daemon._test_logs))
+            # The join is announced as one made on an unready invite, because
+            # whether it works is what the wait exists to find out.
+            self.assertTrue(any("settled" in line and "joining" in line
+                                for line in daemon._test_logs))
+
+    async def test_growth_restarts_the_wait_and_joins_the_newest_block(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.prepare(daemon)
+            read, _ = self.reader([b"block-two", b"block-three"])
+
+            block = await daemon.settle_conference_chain(4242, b"block-one",
+                                                         6.0, read)
+
+            self.assertEqual(block, b"block-three")
+            self.assertEqual(
+                2, sum("still growing" in line for line in daemon._test_logs))
+
+    async def test_a_chain_that_never_stops_growing_is_declined(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.prepare(daemon)
+            counter = itertools.count()
+
+            async def read(invite_msg_id):
+                return f"block-{next(counter)}".encode()
+
+            with self.assertRaises(RuntimeError) as caught:
+                await daemon.settle_conference_chain(4242, b"block-one",
+                                                     6.0, read)
+
+            self.assertIn("declined", str(caught.exception))
+
+    async def test_a_chain_that_empties_while_settling_is_declined(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.prepare(daemon)
+
+            async def read(invite_msg_id):
+                return None
+
+            with self.assertRaises(RuntimeError) as caught:
+                await daemon.settle_conference_chain(4242, b"block-one",
+                                                     6.0, read)
+
+            self.assertIn("went empty", str(caught.exception))
 
 
 class OrphanedRecordingTests(unittest.IsolatedAsyncioTestCase):
