@@ -101,35 +101,141 @@ def test_policy_gate_merges_like_the_file_gate_did(store, scopes):
     assert resolved["slack"]["value"] == {"enabled": False}
 
 
-# --- FIRST: rule 18, the highest scope holding anything wins whole -----------
+# --- FIRST: the highest scope holding anything wins whole --------------------
 
-def test_first_never_merges_a_half_identity(store, scopes):
-    store.config_set("telegram", "connection", "kz", {"api_id": 1}, ("global", ""))
-    store.config_set("telegram", "connection", "marvin", {"api_id": 2}, ("global", ""))
-    store.config_set("telegram", "connection", "marvin", {"api_id": 3}, ("project", "marvin"))
-
-    resolved = store.config_resolve("telegram", "connection", scopes)
-    # The project scope holds an entry, so it wins whole: the global-only "kz"
-    # connection does NOT leak through.
-    assert set(resolved) == {"marvin"}
-    assert resolved["marvin"]["value"] == {"api_id": 3}
+@pytest.fixture()
+def isolated_collection():
+    """FIRST is available for a project that must not see the global set at all
+    — client work where personal connections may not show through."""
+    COLLECTIONS["isolated"] = {"resolve": "first", "writer": "human"}
+    yield "isolated"
+    del COLLECTIONS["isolated"]
 
 
-def test_first_falls_through_an_empty_scope(store, scopes):
-    store.config_set("telegram", "connection", "kz", {"api_id": 1}, ("global", ""))
-    resolved = store.config_resolve("telegram", "connection", scopes)
+def test_first_takes_one_scope_whole(store, scopes, isolated_collection):
+    store.config_set("telegram", isolated_collection, "kz", {"api_id": 1}, ("global", ""))
+    store.config_set("telegram", isolated_collection, "marvin", {"api_id": 3}, ("project", "marvin"))
+
+    resolved = store.config_resolve("telegram", isolated_collection, scopes)
+    assert set(resolved) == {"marvin"}  # the global-only "kz" does not leak through
+
+
+def test_first_falls_through_an_empty_scope(store, scopes, isolated_collection):
+    store.config_set("telegram", isolated_collection, "kz", {"api_id": 1}, ("global", ""))
+    resolved = store.config_resolve("telegram", isolated_collection, scopes)
     assert set(resolved) == {"kz"}
     assert resolved["kz"]["scope_kind"] == "global"
 
 
-def test_the_two_semantics_disagree_on_the_same_data(store, scopes):
+def test_the_two_semantics_disagree_on_the_same_data(store, scopes, isolated_collection):
     """The same rows resolve differently by collection — which is the point."""
-    for collection in ("connection", "setting"):
+    for collection in (isolated_collection, "setting"):
         store.config_set("x", collection, "only_global", "g", ("global", ""))
         store.config_set("x", collection, "overridden", "p", ("project", "marvin"))
 
     assert set(store.config_resolve("x", "setting", scopes)) == {"only_global", "overridden"}
-    assert set(store.config_resolve("x", "connection", scopes)) == {"overridden"}
+    assert set(store.config_resolve("x", isolated_collection, scopes)) == {"overridden"}
+
+
+# --- connection + grant: identity is a fact, permission is a decision --------
+
+MARVIN_BOX = {"address": "marvin@callva.io", "imap_host": "mail.amanati.ai",
+              "imap_port": 993, "secret_env": "MAILBOX_MARVIN_APP_PASSWORD"}
+
+
+def test_a_project_grants_write_without_restating_the_identity(store, scopes):
+    """The whole point: one grant row, and not one field of the box repeated."""
+    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "marvin", {"allow_write": False}, ("global", ""))
+    store.config_set("mailbox", "grant", "marvin", {"allow_write": True}, ("project", "marvin"))
+
+    effective = store.connections_effective("mailbox", scopes)
+    assert effective["marvin"]["allow_write"] is True
+    assert effective["marvin"]["value"] == MARVIN_BOX          # identity untouched
+    assert effective["marvin"]["scope"] == ("global", "")      # and still global
+    assert effective["marvin"]["grant_scope"] == ("project", "marvin")
+
+
+def test_a_project_can_disable_a_globally_declared_connection(store, scopes):
+    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
+    store.config_set("mailbox", "connection", "osyris", {"address": "osyris@gmail.com"}, ("global", ""))
+    store.config_set("mailbox", "grant", "osyris", {"enabled": False}, ("project", "marvin"))
+
+    assert set(store.connections_effective("mailbox", scopes)) == {"marvin"}
+    both = store.connections_effective("mailbox", scopes, include_disabled=True)
+    assert both["osyris"]["enabled"] is False
+
+
+def test_a_project_only_connection_lives_beside_the_global_ones(store, scopes):
+    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
+    store.config_set("mailbox", "connection", "client", {"address": "a@client.tld"},
+                     ("project", "marvin"))
+
+    effective = store.connections_effective("mailbox", scopes)
+    assert set(effective) == {"marvin", "client"}
+    assert effective["client"]["scope"] == ("project", "marvin")
+
+
+def test_a_project_may_replace_a_global_identity_whole(store, scopes):
+    """Entry-level merge, never field-level: the project's row is taken whole,
+    so no connection is ever assembled out of two scopes."""
+    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
+    store.config_set("mailbox", "connection", "marvin", {"address": "other@x.tld"},
+                     ("project", "marvin"))
+
+    value = store.connections_effective("mailbox", scopes)["marvin"]["value"]
+    assert value == {"address": "other@x.tld"}
+    assert "imap_host" not in value  # nothing inherited from the global entry
+
+
+def test_writability_falls_back_to_the_capability_default(store, scopes):
+    store.config_set("callva", "connection", "smart-id", {"k": 1}, ("global", ""))
+    assert store.connections_effective("callva", scopes)["smart-id"]["allow_write"] is False
+    assert store.connections_effective("callva", scopes, write_default=True)["smart-id"]["allow_write"] is True
+
+
+def test_a_grant_naming_an_unknown_field_is_refused(store, scopes):
+    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "marvin", {"allow_read": True}, ("global", ""))
+    with pytest.raises(StoreError) as exc:
+        store.connections_effective("mailbox", scopes)
+    assert exc.value.slug == "bad_grant"
+
+
+def test_a_grant_without_a_connection_grants_nothing(store, scopes):
+    store.config_set("mailbox", "grant", "ghost", {"allow_write": True}, ("global", ""))
+    assert store.connections_effective("mailbox", scopes) == {}
+
+
+# --- the project registry ----------------------------------------------------
+
+def test_a_project_is_addressed_by_slug_not_by_directory(store):
+    store.project_register("marvin", name="Marvin")
+    assert store.project_get("marvin")["name"] == "Marvin"
+    assert store.project_get("nope") is None
+
+
+def test_the_same_project_sits_at_a_different_path_on_each_machine(store):
+    store.project_register("marvin")
+    store.project_bind_path("marvin", "kz-mbp", "/Users/kz/dev/marvin")
+    store.project_bind_path("marvin", "prod-1", "/opt/marvin")
+
+    assert store.project_path("marvin", "kz-mbp") == "/Users/kz/dev/marvin"
+    assert store.project_path("marvin", "prod-1") == "/opt/marvin"
+    assert store.project_path("marvin", "unknown-box") is None
+
+
+def test_binding_a_path_to_an_unregistered_project_is_refused(store):
+    with pytest.raises(StoreError) as exc:
+        store.project_bind_path("ghost", "kz-mbp", "/tmp/ghost")
+    assert exc.value.slug == "unknown_project"
+
+
+def test_registering_twice_updates_rather_than_duplicates(store):
+    store.project_register("marvin", name="Marvin")
+    store.project_register("marvin", name="Marvin AI")
+    assert [p["slug"] for p in store.project_list()] == ["marvin"]
+    assert store.project_get("marvin")["name"] == "Marvin AI"
 
 
 # --- EXACT: rule 16, state does not cascade ----------------------------------

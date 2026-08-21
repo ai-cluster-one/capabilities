@@ -25,13 +25,16 @@ instance > project > global, but *how* the scopes combine is declared per
 collection, because the standing rules already contain two different answers
 and one collection needs a third:
 
-  - FIRST  — the highest scope holding ANY entry wins, whole, never merged.
-    This is rule 18 for connections: a half-project, half-global identity is
-    not an identity. Selection stays deterministic and refuses ambiguity.
-
   - MERGE  — per key; a key absent at the higher scope inherits the lower.
     This is rule 17 for the gate ("an absent project entry inherits the global
-    entry"), and it is what makes a setting worth scoping at all.
+    entry"), and it is what makes a scope worth having at all. Connections
+    take it too, at the entry level: rule 18 keeps an identity atomic — taken
+    whole from one scope, never assembled out of two — while letting a project
+    add to the set it inherits rather than replace it.
+
+  - FIRST  — the highest scope holding ANY entry wins, whole. Nothing takes
+    it by default; it is here for the project that must not see the global
+    set at all, where a personal connection showing through would be wrong.
 
   - EXACT  — no cascade; a record belongs to exactly one scope and is read
     there. This is rule 16: state follows the scope of the credentials that
@@ -86,12 +89,31 @@ EXACT = "exact"
 
 # The collection registry: how each resolves, and who is allowed to write it.
 # Adding a collection here is the only place a new record class is declared.
+#
+# `connection` and `grant` are the same fact split along the seam that matters:
+# an entry's identity — where the thing is and how to reach it — is a fact about
+# the world, the same in every project forever. What a project may DO with that
+# identity is a decision, different per project by definition. Glued together,
+# the second cannot be overridden without restating the first; apart, a project
+# that needs write access writes one grant row and repeats no address, no host,
+# no secret.
+#
+# An identity is atomic: it merges by entry, never by field, so no connection is
+# ever assembled from two scopes. That is what rule 18's "never merged" was
+# protecting, and it survives; what it gives up is refusing to let a project add
+# to the global set at all.
 COLLECTIONS: dict[str, dict[str, str]] = {
-    "connection": {"resolve": FIRST, "writer": "human"},
+    "connection": {"resolve": MERGE, "writer": "human"},
+    "grant": {"resolve": MERGE, "writer": "human"},
     "identifier": {"resolve": MERGE, "writer": "capability"},
     "setting": {"resolve": MERGE, "writer": "human"},
     "policy": {"resolve": MERGE, "writer": "manager"},
 }
+
+# Grant fields and what they mean when nothing declares them. `allow_write`
+# falls back to the capability's own WRITE_DEFAULT rather than to a value here,
+# because "does a write leave the system" is the capability's fact.
+GRANT_FIELDS = ("enabled", "allow_write")
 
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
@@ -242,6 +264,28 @@ _DDL = [
     """
     CREATE INDEX IF NOT EXISTS revisions_target_idx
         ON revisions (capability, collection, key, written_at)
+    """,
+    # A project is addressed by a slug it declares for itself, never by the name
+    # of the directory it happens to sit in: renaming a folder must not orphan
+    # every row scoped to it.
+    """
+    CREATE TABLE IF NOT EXISTS projects (
+        slug        TEXT PRIMARY KEY,
+        name        TEXT,
+        created_at  TEXT NOT NULL
+    )
+    """,
+    # Where a project sits is not a fact about the project — it is a fact about
+    # the project ON ONE MACHINE. The same slug lives at /Users/kz/dev/marvin on
+    # a laptop and /opt/marvin on a server, so the path is keyed by both.
+    """
+    CREATE TABLE IF NOT EXISTS project_paths (
+        slug        TEXT NOT NULL,
+        instance    TEXT NOT NULL,
+        path        TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        PRIMARY KEY (slug, instance)
+    )
     """,
 ]
 
@@ -529,6 +573,83 @@ class Store:
             "old_value": self._decode(r[4]), "new_value": self._decode(r[5]),
             "actor": r[6], "written_at": r[7],
         } for r in cur.fetchall()]
+
+    # -- connections, with their grants applied --------------------------------
+
+    def connections_effective(self, capability: str, scopes: Scopes,
+                              write_default: bool = False,
+                              include_disabled: bool = False) -> dict[str, dict[str, Any]]:
+        """Every connection this project may use, already carrying the decision
+        made about it — the one read a capability needs before it acts.
+
+        `write_default` is the capability's own WRITE_DEFAULT, used where no
+        grant declares writability, so the answer never changes shape depending
+        on whether anyone bothered to write a grant."""
+        identities = self.config_resolve(capability, "connection", scopes)
+        grants = self.config_resolve(capability, "grant", scopes)
+        out: dict[str, dict[str, Any]] = {}
+        for cid, entry in identities.items():
+            grant = grants.get(cid)
+            decided = grant["value"] if grant else {}
+            if not isinstance(decided, dict):
+                raise StoreError("bad_grant", f"grant {cid!r} must be a table, got {type(decided).__name__}")
+            unknown = set(decided) - set(GRANT_FIELDS)
+            if unknown:
+                raise StoreError("bad_grant", f"grant {cid!r} has unknown field(s): {', '.join(sorted(unknown))}",
+                                 f"known: {', '.join(GRANT_FIELDS)}")
+            enabled = bool(decided.get("enabled", True))
+            if not enabled and not include_disabled:
+                continue
+            out[cid] = {
+                "id": cid,
+                "value": entry["value"],
+                "scope": (entry["scope_kind"], entry["scope_name"]),
+                "enabled": enabled,
+                "allow_write": bool(decided.get("allow_write", write_default)),
+                "grant_scope": (grant["scope_kind"], grant["scope_name"]) if grant else None,
+            }
+        return out
+
+    # -- the project registry --------------------------------------------------
+
+    def project_register(self, slug: str, name: str | None = None) -> None:
+        _check("slug", slug, CAPABILITY_RE)
+        with self.transaction():
+            self._execute(
+                "INSERT INTO projects (slug, name, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name",
+                (slug, name, _now()),
+            )
+
+    def project_get(self, slug: str) -> dict[str, Any] | None:
+        cur = self._execute("SELECT slug, name, created_at FROM projects WHERE slug = ?", (slug,))
+        row = cur.fetchone()
+        return {"slug": row[0], "name": row[1], "created_at": row[2]} if row else None
+
+    def project_list(self) -> list[dict[str, Any]]:
+        cur = self._execute("SELECT slug, name, created_at FROM projects ORDER BY slug")
+        return [{"slug": r[0], "name": r[1], "created_at": r[2]} for r in cur.fetchall()]
+
+    def project_bind_path(self, slug: str, instance: str, path: str) -> None:
+        """Record where this project sits on this machine. Binding an unknown
+        slug is refused: a path is a fact about a project, not a way to invent
+        one."""
+        if not self.project_get(slug):
+            raise StoreError("unknown_project", f"no project registered as {slug!r}",
+                             "register it first")
+        with self.transaction():
+            self._execute(
+                "INSERT INTO project_paths (slug, instance, path, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (slug, instance) DO UPDATE "
+                "SET path = EXCLUDED.path, updated_at = EXCLUDED.updated_at",
+                (slug, instance, path, _now()),
+            )
+
+    def project_path(self, slug: str, instance: str) -> str | None:
+        cur = self._execute(
+            "SELECT path FROM project_paths WHERE slug = ? AND instance = ?", (slug, instance))
+        row = cur.fetchone()
+        return row[0] if row else None
 
     # -- state ----------------------------------------------------------------
 
