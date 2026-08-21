@@ -268,9 +268,17 @@ _DDL = [
     # A project is addressed by a slug it declares for itself, never by the name
     # of the directory it happens to sit in: renaming a folder must not orphan
     # every row scoped to it.
+    #
+    # The slug is the key rows are scoped by, so they stay readable without a
+    # join. What keeps it honest is `id`: a value the project generates once and
+    # carries in its own config, so two unrelated repositories that both want to
+    # be called "marvin" are told the label is taken instead of silently sharing
+    # each other's rows. A label collision is loud and costs a rename; an
+    # identity collision is silent and costs everything.
     """
     CREATE TABLE IF NOT EXISTS projects (
-        slug        TEXT PRIMARY KEY,
+        id          TEXT PRIMARY KEY,
+        slug        TEXT NOT NULL UNIQUE,
         name        TEXT,
         created_at  TEXT NOT NULL
     )
@@ -612,23 +620,59 @@ class Store:
 
     # -- the project registry --------------------------------------------------
 
-    def project_register(self, slug: str, name: str | None = None) -> None:
+    def project_register(self, project_id: str, slug: str, name: str | None = None) -> None:
+        """Claim a slug for a project id. Re-registering the same id is how a
+        second machine joins a project it already belongs to — the id travels in
+        the repository, so a laptop and a server agree without being told.
+
+        A slug already held by a DIFFERENT id is refused: that is another
+        project, and taking its label would take its rows."""
         _check("slug", slug, CAPABILITY_RE)
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise StoreError("bad_project_id", "a project id is required",
+                             "generate one once and keep it in the project's own config")
         with self.transaction():
-            self._execute(
-                "INSERT INTO projects (slug, name, created_at) VALUES (?, ?, ?) "
-                "ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name",
-                (slug, name, _now()),
-            )
+            holder = self._execute(
+                "SELECT id FROM projects WHERE slug = ?", (slug,)).fetchone()
+            if holder and holder[0] != project_id:
+                raise StoreError(
+                    "slug_taken", f"the label {slug!r} belongs to project {holder[0]}",
+                    "pick another label; this is a different project, and sharing "
+                    "the label would share its rows",
+                )
+            existing = self._execute(
+                "SELECT slug FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if existing and existing[0] != slug:
+                raise StoreError(
+                    "slug_immutable",
+                    f"project {project_id} is already labelled {existing[0]!r}",
+                    "rows are scoped by the label, so renaming one is a migration, "
+                    "not an edit",
+                )
+            if existing:
+                self._execute("UPDATE projects SET name = ? WHERE id = ?", (name, project_id))
+            else:
+                self._execute(
+                    "INSERT INTO projects (id, slug, name, created_at) VALUES (?, ?, ?, ?)",
+                    (project_id, slug, name, _now()),
+                )
 
     def project_get(self, slug: str) -> dict[str, Any] | None:
-        cur = self._execute("SELECT slug, name, created_at FROM projects WHERE slug = ?", (slug,))
+        cur = self._execute(
+            "SELECT id, slug, name, created_at FROM projects WHERE slug = ?", (slug,))
         row = cur.fetchone()
-        return {"slug": row[0], "name": row[1], "created_at": row[2]} if row else None
+        return {"id": row[0], "slug": row[1], "name": row[2], "created_at": row[3]} if row else None
+
+    def project_by_id(self, project_id: str) -> dict[str, Any] | None:
+        cur = self._execute(
+            "SELECT id, slug, name, created_at FROM projects WHERE id = ?", (project_id,))
+        row = cur.fetchone()
+        return {"id": row[0], "slug": row[1], "name": row[2], "created_at": row[3]} if row else None
 
     def project_list(self) -> list[dict[str, Any]]:
-        cur = self._execute("SELECT slug, name, created_at FROM projects ORDER BY slug")
-        return [{"slug": r[0], "name": r[1], "created_at": r[2]} for r in cur.fetchall()]
+        cur = self._execute("SELECT id, slug, name, created_at FROM projects ORDER BY slug")
+        return [{"id": r[0], "slug": r[1], "name": r[2], "created_at": r[3]}
+                for r in cur.fetchall()]
 
     def project_bind_path(self, slug: str, instance: str, path: str) -> None:
         """Record where this project sits on this machine. Binding an unknown

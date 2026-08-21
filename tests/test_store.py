@@ -209,14 +209,19 @@ def test_a_grant_without_a_connection_grants_nothing(store, scopes):
 
 # --- the project registry ----------------------------------------------------
 
+MARVIN_ID = "018f2c1a-7b3e-4d92-9a11-0c5e8f2d6a44"
+OTHER_ID = "018f2c1a-0000-4d92-9a11-000000000000"
+
+
 def test_a_project_is_addressed_by_slug_not_by_directory(store):
-    store.project_register("marvin", name="Marvin")
+    store.project_register(MARVIN_ID, "marvin", name="Marvin")
     assert store.project_get("marvin")["name"] == "Marvin"
+    assert store.project_get("marvin")["id"] == MARVIN_ID
     assert store.project_get("nope") is None
 
 
 def test_the_same_project_sits_at_a_different_path_on_each_machine(store):
-    store.project_register("marvin")
+    store.project_register(MARVIN_ID, "marvin")
     store.project_bind_path("marvin", "kz-mbp", "/Users/kz/dev/marvin")
     store.project_bind_path("marvin", "prod-1", "/opt/marvin")
 
@@ -231,11 +236,36 @@ def test_binding_a_path_to_an_unregistered_project_is_refused(store):
     assert exc.value.slug == "unknown_project"
 
 
-def test_registering_twice_updates_rather_than_duplicates(store):
-    store.project_register("marvin", name="Marvin")
-    store.project_register("marvin", name="Marvin AI")
+def test_a_second_machine_joins_the_project_the_id_names(store):
+    """The id travels in the repository, so a laptop and a server agree that
+    they are the same project without anyone telling them."""
+    store.project_register(MARVIN_ID, "marvin", name="Marvin")
+    store.project_register(MARVIN_ID, "marvin", name="Marvin AI")
     assert [p["slug"] for p in store.project_list()] == ["marvin"]
     assert store.project_get("marvin")["name"] == "Marvin AI"
+
+
+def test_another_project_cannot_take_a_label_that_is_held(store):
+    """The collision that matters: an unrelated repository also calling itself
+    marvin is told the label is taken, rather than silently sharing the rows."""
+    store.project_register(MARVIN_ID, "marvin")
+    with pytest.raises(StoreError) as exc:
+        store.project_register(OTHER_ID, "marvin")
+    assert exc.value.slug == "slug_taken"
+    assert store.project_get("marvin")["id"] == MARVIN_ID
+
+
+def test_relabelling_a_project_is_a_migration_not_an_edit(store):
+    store.project_register(MARVIN_ID, "marvin")
+    with pytest.raises(StoreError) as exc:
+        store.project_register(MARVIN_ID, "marvin-two")
+    assert exc.value.slug == "slug_immutable"
+
+
+def test_a_project_without_an_id_is_refused(store):
+    with pytest.raises(StoreError) as exc:
+        store.project_register("", "marvin")
+    assert exc.value.slug == "bad_project_id"
 
 
 # --- EXACT: rule 16, state does not cascade ----------------------------------
