@@ -117,6 +117,11 @@ CONFERENCE_PEER_INTERVAL = 2.0
 # because one failed round-trip must not end a live recording.
 CONFERENCE_QUIET_BEFORE_CHECK = 20.0
 CONFERENCE_JOIN_GRACE = 30.0
+# Six conferences on 2026-08-21 split without overlap on how long the chain took
+# to produce its first block: 0.1s, 0.1s and 0.6s joined cleanly, while 6.0s,
+# 6.5s and one of twenty reads joined, received no audio at all, and dropped the
+# caller out of their own call. The threshold sits in the empty gap between.
+CONFERENCE_CHAIN_READY_LIMIT = 2.0
 CONFERENCE_EMPTY_ANSWERS = 2
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
@@ -4828,8 +4833,26 @@ async def run_session(client):
         calls._app._bind_client.get_conference_last_block = conference_last_block
 
         async def require_conference_chain(caller_id: int, invite_msg_id: int):
-            """Refuse a conference whose chain has no block to build on, so the
-            library's "create a conference instead" fallback stays unreachable."""
+            """Refuse a conference this account should not join.
+
+            A chain with no block at all leaves the library's "create a
+            conference instead" fallback reachable, and that fallback invites
+            the caller into a conference of our own making.
+
+            A chain that takes seconds to produce its first block is the one
+            that costs the caller their call. The block is not stale — its
+            digest is identical across the settling read and the joining read —
+            so the wait is not measuring a moving chain. It measures a
+            conference that is still being built, and joining one has yet to
+            work: no incoming audio channel is established, no end ever
+            arrives, and the caller is dropped out of the call while their
+            phone goes on showing it.
+
+            Not recording a call is a small loss. Taking the call down is not,
+            and the caller can invite again a few seconds later onto a chain
+            that is ready.
+            """
+            started = time.monotonic()
             try:
                 block = await conference_last_block(caller_id, invite_msg_id)
             except Exception as exc:
@@ -4839,7 +4862,15 @@ async def run_session(client):
             if not block:
                 raise RuntimeError(
                     f"conference chain empty for invite {invite_msg_id}")
-            log(f"call: conference chain readable — last block {len(block)} bytes")
+            waited = time.monotonic() - started
+            if waited > CONFERENCE_CHAIN_READY_LIMIT:
+                raise RuntimeError(
+                    f"conference chain for invite {invite_msg_id} needed "
+                    f"{waited:.1f}s to produce a block; a conference that slow "
+                    f"to build has never joined without dropping its caller, so "
+                    f"this invite is declined — invite again in a few seconds")
+            log(f"call: conference chain readable — last block {len(block)} bytes "
+                f"in {waited:.1f}s")
 
         async def refresh_conference_audio_map(chat_id: int, reason: str):
             """Rebuild the participant-to-audio-stream map for a live call.
@@ -4950,6 +4981,13 @@ async def run_session(client):
                 # an argument-less exception, so the type carries the message.
                 log(f"call: failed to start {mode} recording from {caller_id}: "
                     f"{type(exc).__name__}: {exc}")
+                if mode == "conference":
+                    with contextlib.suppress(Exception):
+                        await client.send_message(
+                            caller_id,
+                            "Не подключился к конференции: она ещё собиралась в "
+                            "момент приглашения. Позови ещё раз через несколько "
+                            "секунд — так звонок не разваливается.")
                 metadata.update({
                     "status": "join_failed",
                     "stop_reason": "join_failed",
