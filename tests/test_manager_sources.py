@@ -256,7 +256,8 @@ def test_standalone_manager_has_complete_authoring_kit(tmp_path):
     shutil.copy2(MANAGER, standalone)
     for relative in (
         "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md", "ROUTINES.md",
-        "contract/preamble.py", "guides/authoring.md", "guides/conforming.md",
+        "contract/preamble.py", "contract/store.py",
+        "guides/authoring.md", "guides/conforming.md",
         "guides/contract.md", "guides/dev.md", "guides/grooming.md",
         "guides/publishing.md", "guides/repositories.md", "guides/sanitizing.md",
     ):
@@ -284,7 +285,8 @@ def test_standalone_manager_selfcheck_reports_missing_source_without_traceback(t
     shutil.copy2(MANAGER, standalone)
     for relative in (
         "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md", "ROUTINES.md",
-        "contract/preamble.py", "guides/authoring.md", "guides/conforming.md",
+        "contract/preamble.py", "contract/store.py",
+        "guides/authoring.md", "guides/conforming.md",
         "guides/contract.md", "guides/dev.md", "guides/grooming.md",
         "guides/publishing.md", "guides/repositories.md", "guides/sanitizing.md",
     ):

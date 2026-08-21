@@ -1582,6 +1582,19 @@ class Store:
             }
         return out
 
+    def grant_orphans(self, capability: str, scopes: Scopes) -> list[dict[str, Any]]:
+        """Grants naming a connection that does not resolve.
+
+        A grant is the only record that refers to another, so it is the only one
+        that can be aimed at nothing. Dropping it quietly is the failure this
+        whole move exists to stop: a mistyped id would mean permission silently
+        not granted, which looks exactly like permission correctly withheld."""
+        identities = self.config_resolve(capability, "connection", scopes)
+        grants = self.config_resolve(capability, "grant", scopes)
+        return [{"key": key, "scope": (row["scope_kind"], row["scope_name"]),
+                 "value": row["value"]}
+                for key, row in sorted(grants.items()) if key not in identities]
+
     # -- the project registry --------------------------------------------------
 
     def project_register(self, project_id: str, slug: str, name: str | None = None) -> None:
@@ -2041,6 +2054,10 @@ def _connections_report() -> dict:
     # what keeps that from looking like the store agreeing with the files.
     report: dict = {"store": {"mode": mode, "resolved_by": why},
                     "default": None, "connections": {}}
+    if mode == "db":
+        orphans = _grant_orphans()
+        if orphans:
+            report["store"]["orphan_grants"] = orphans
     if reg is None:
         value, tier, source = _resolve_env_key("CLICKUP_API_TOKEN")
         report["default"] = "default"
@@ -2066,6 +2083,20 @@ def _connections_report() -> dict:
             "keys": keys,
             "settings": _connection_settings(entry, reg_file)}
     return report
+
+
+def _grant_orphans() -> list[dict]:
+    """Grants this project holds that name no connection — reported, never
+    silently dropped."""
+    identity = _project_identity()
+    scopes = Scopes(project=identity["slug"],
+                    instance=os.environ.get("CAPABILITIES_INSTANCE") or None)
+    try:
+        with open_store() as store:
+            return [{"key": o["key"], "scope": f"{o['scope'][0]}:{o['scope'][1]}".rstrip(":")}
+                    for o in store.grant_orphans(NAME, scopes)]
+    except StoreError:
+        return []
 
 
 def _cmd_connections() -> None:
