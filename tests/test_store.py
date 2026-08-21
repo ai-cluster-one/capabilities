@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "contract"))
 
 from store import (
     COLLECTIONS,
+    SCHEMA_VERSION,
     PostgresStore,
     Scopes,
     SQLiteStore,
@@ -337,14 +338,14 @@ def test_a_delete_is_recorded_too(store):
 # --- migrations --------------------------------------------------------------
 
 def test_migrate_is_idempotent(store):
-    assert store.schema_version() == 1
-    assert store.migrate() == 1
+    assert store.schema_version() == SCHEMA_VERSION
+    assert store.migrate() == SCHEMA_VERSION
 
 
 def test_a_capability_owns_its_own_namespace(store):
     store.migrate("automations", 1, ["CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY)"])
     assert store.schema_version("automations") == 1
-    assert store.schema_version("core") == 1
+    assert store.schema_version("core") == SCHEMA_VERSION
 
 
 @pytest.mark.parametrize("step", [
@@ -414,7 +415,7 @@ def test_a_type_column_is_unnecessary(store, scopes):
 def test_health_reports_dialect_and_namespaces(store):
     health = store.health()
     assert health["dialect"] == store.dialect
-    assert health["namespaces"] == {"core": 1}
+    assert health["namespaces"] == {"core": SCHEMA_VERSION}
     assert health["roundtrip_ms"] >= 0
 
 
@@ -447,3 +448,74 @@ def test_sqlite_stores_json_as_text(tmp_path):
         s.config_set("telegram", "setting", "k", {"a": 1}, ("global", ""))
         raw = s.connection.execute("SELECT value FROM config WHERE key = 'k'").fetchone()[0]
     assert isinstance(raw, str) and json.loads(raw) == {"a": 1}
+
+
+# --- documents: saving is not deploying --------------------------------------
+
+def test_a_version_is_addressed_by_its_content(store):
+    a = store.document_put("telegram", "voice-agent", "you are terse")
+    b = store.document_put("telegram", "voice-agent", "you are terse")
+    c = store.document_put("telegram", "voice-agent", "you are verbose")
+    assert a == b and a != c
+    assert len(store.document_versions("telegram", "voice-agent")) == 2
+
+
+def test_saving_a_new_version_changes_nothing_until_the_pin_moves(store, scopes):
+    """The whole reason this is safe to hold executable text in."""
+    first = store.document_put("telegram", "voice-agent", "you are terse")
+    store.document_pin("telegram", "voice-agent", first, ("global", ""))
+    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "you are terse"
+
+    second = store.document_put("telegram", "voice-agent", "you are verbose")
+    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "you are terse"
+
+    store.document_pin("telegram", "voice-agent", second, ("global", ""))
+    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "you are verbose"
+
+
+def test_rolling_back_is_moving_the_pin(store, scopes):
+    first = store.document_put("telegram", "voice-agent", "v1")
+    second = store.document_put("telegram", "voice-agent", "v2")
+    store.document_pin("telegram", "voice-agent", second, ("global", ""))
+    store.document_pin("telegram", "voice-agent", first, ("global", ""), actor="kz")
+    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "v1"
+    assert store.revisions("telegram", "document", "voice-agent")[0]["actor"] == "kz"
+
+
+def test_a_project_runs_its_own_version_of_a_global_document(store, scopes):
+    """Falls out of keeping the pin in `config`: scoping and merge come free."""
+    stable = store.document_put("telegram", "voice-agent", "stable")
+    trial = store.document_put("telegram", "voice-agent", "trial")
+    store.document_pin("telegram", "voice-agent", stable, ("global", ""))
+    store.document_pin("telegram", "voice-agent", trial, ("project", "marvin"))
+
+    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "trial"
+    assert store.document_read("telegram", "voice-agent", Scopes())["body"] == "stable"
+
+
+def test_an_unpinned_document_reads_as_absent(store, scopes):
+    store.document_put("telegram", "voice-agent", "drafted, never deployed")
+    assert store.document_read("telegram", "voice-agent", scopes) is None
+
+
+def test_pinning_a_version_that_was_never_recorded_is_refused(store):
+    with pytest.raises(StoreError) as exc:
+        store.document_pin("telegram", "voice-agent", "0" * 64, ("global", ""))
+    assert exc.value.slug == "unknown_version"
+
+
+def test_a_body_survives_exactly(store, scopes):
+    body = "#!/usr/bin/env python3\nprint('héllo')\n\n\ttabbed\n"
+    digest = store.document_put("automations", "upstream-watch", body,
+                                media_type="text/x-python")
+    store.document_pin("automations", "upstream-watch", digest, ("project", "marvin"))
+    got = store.document_read("automations", "upstream-watch", scopes)
+    assert got["body"] == body
+    assert got["media_type"] == "text/x-python"
+    assert got["scope"] == ("project", "marvin")
+
+
+def test_history_omits_the_bodies_it_lists(store):
+    store.document_put("telegram", "voice-agent", "x" * 5000)
+    entry = store.document_versions("telegram", "voice-agent")[0]
+    assert entry["bytes"] == 5000 and "body" not in entry

@@ -212,7 +212,12 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
+        # Either marker names a project. `settings.json` is the gate and
+        # `project.json` the identity; a project keeping its records in the
+        # store needs the second and may eventually stop carrying the first,
+        # so neither is required while both worlds are in use.
         if ((d / "capabilities" / "settings.json").is_file()
+                or (d / "capabilities" / "project.json").is_file()
                 or (d / ".contextkit" / "config.toml").is_file()
                 or (d / ".capabilities").is_dir()
                 or (d / ".env").exists()

@@ -89,6 +89,12 @@ def plan(envelope: Path) -> list[dict]:
             rows.append({"capability": capability, "collection": "setting",
                          "key": key, "value": value, "note": None})
 
+    # `slack/policy.json` is deliberately not read. It restates four keys that
+    # `slack/service/settings.json` also carries, and the two have already
+    # diverged — the service file holds a real allowed user where the policy
+    # file holds an empty map. Choosing between them is a judgement about which
+    # is live, and a migration is the wrong place to make one.
+
     config = envelope / "automations" / "service" / "config.toml"
     if config.is_file():
         try:
@@ -102,6 +108,46 @@ def plan(envelope: Path) -> list[dict]:
                 rows.append({"capability": "automations", "collection": "setting",
                              "key": section, "value": raw[section], "note": None})
     return rows
+
+
+# Long text is imported as a document version and pinned, because the file on
+# disk IS the version in force today — a migration that recorded the text but
+# pinned nothing would quietly deploy nothing.
+DOCUMENT_SOURCES = (
+    ("*/reference/*.md", "reference"),
+    ("*/service/context/*.md", "context"),
+    ("*/service/context.md", None),
+    ("*/service/voice-agent.md", None),
+    ("geminitalk/base.md", None),
+    ("automations/scripts/*.py", "script"),
+    ("automations/scripts/*.json", "script"),
+)
+
+MEDIA_TYPES = {".md": "text/markdown", ".py": "text/x-python", ".json": "application/json"}
+
+
+def plan_documents(envelope: Path) -> list[dict]:
+    """Every long-text file the envelope holds, keyed so its origin stays legible."""
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for pattern, prefix in DOCUMENT_SOURCES:
+        for path in sorted(envelope.glob(pattern)):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            capability = path.relative_to(envelope).parts[0]
+            key = f"{prefix}.{path.stem}" if prefix else path.stem
+            key = key.replace("_", "-").lower()
+            if (capability, key) in seen:
+                continue
+            seen.add((capability, key))
+            try:
+                body = path.read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+            out.append({"capability": capability, "key": key, "body": body,
+                        "media_type": MEDIA_TYPES.get(path.suffix),
+                        "source": str(path.relative_to(envelope))})
+    return out
 
 
 def verify(store, rows: list[dict], scopes: Scopes) -> list[str]:
@@ -141,16 +187,20 @@ def main() -> int:
         return 5
 
     rows = plan(envelope)
+    documents = plan_documents(envelope)
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["collection"]] = counts.get(row["collection"], 0) + 1
 
     report = {"project": {"id": project_id, "slug": slug}, "envelope": str(envelope),
-              "rows": len(rows), "by_collection": counts, "applied": False}
+              "rows": len(rows), "by_collection": counts,
+              "documents": len(documents), "applied": False}
 
     if not args.apply:
         report["sample"] = [f"{r['capability']}/{r['collection']}/{r['key']}"
-                            for r in rows[:12]]
+                            for r in rows[:8]]
+        report["document_sample"] = [f"{d['capability']}/{d['key']} <- {d['source']}"
+                                     for d in documents]
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
 
@@ -164,7 +214,17 @@ def main() -> int:
             store.config_set(row["capability"], row["collection"], row["key"],
                              row["value"], scope, actor="import_envelope",
                              note=row["note"])
+        for doc in documents:
+            digest = store.document_put(doc["capability"], doc["key"], doc["body"],
+                                        author="import_envelope",
+                                        media_type=doc["media_type"])
+            store.document_pin(doc["capability"], doc["key"], digest, scope,
+                               actor="import_envelope")
         problems = verify(store, rows, scopes)
+        for doc in documents:
+            got = store.document_read(doc["capability"], doc["key"], scopes)
+            if not got or got["body"] != doc["body"]:
+                problems.append(f"{doc['capability']}/{doc['key']}: body differs")
 
     report["applied"] = True
     report["verified"] = not problems
