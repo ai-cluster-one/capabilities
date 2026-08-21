@@ -675,6 +675,46 @@ _media_log.setLevel(logging.INFO)
 _media_log.addHandler(_MediaStackLog())
 
 
+def reconcile_orphaned_recordings():
+    """Settle recordings a previous process left open.
+
+    A call recording is closed by the process that opened it, so one that ends
+    with the process — a restart, a crash, the stuck conference this was written
+    for — keeps saying `recording` for as long as its metadata survives. Four
+    such rows had accumulated by 2026-08-21, and each one makes `stop_reason`
+    less trustworthy as evidence about how calls actually end.
+
+    The audio is left exactly where it is. Nothing is delivered: an abandoned
+    capture is mostly the silence that followed the call, and guessing otherwise
+    would put an hour of it into a chat.
+    """
+    folder = CONNECTION_STATE_DIR / "calls" / "recordings"
+    settled = 0
+    for path in sorted(folder.glob("*.json")):
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("status") not in ("joining", "recording"):
+            continue
+        record["status"] = "interrupted"
+        record["stop_reason"] = "process_ended"
+        record.setdefault("recording_ended_at", None)
+        delivery = record.get("delivery")
+        if isinstance(delivery, dict) and delivery.get("status") == "pending":
+            delivery["status"] = "skipped"
+            delivery["error"] = "interrupted"
+        try:
+            path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+            settled += 1
+        except OSError:
+            continue
+    if settled:
+        log(f"calls: settled {settled} recording(s) left open by a previous process")
+
+
 def write_health(state=None, **updates):
     """Atomically publish update-stream liveness for `telegram service status`."""
     health = {}
@@ -3613,6 +3653,7 @@ async def run_session(client):
     log(f"direct messages: mode={DIRECT_MESSAGE_MODE}; default_role={DIRECT_DEFAULT_ROLE}")
     log(f"allowed: {allowed_labels}")
     log(f"allowed groups: {allowed_group_labels}; group aliases: {list(DEFAULT_GROUP_ALIASES)}")
+    reconcile_orphaned_recordings()
     routes = _route_map()
     if routes:
         log("worker routes: " + "; ".join(
@@ -6490,6 +6531,20 @@ async def run_session(client):
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
         bind_signalling_to_client_loop(calls, log)
+
+        # Every state other than CONNECTED is raised as one argument-less
+        # exception, so FAILED, TIMEOUT and CLOSED — three different causes —
+        # arrive indistinguishable. The media stack names the establishment of a
+        # connection but not the transition that ends one, which is the half
+        # that matters when a leg drops out of a live call.
+        _handle_connection_changed = calls._handle_connection_changed
+
+        async def log_connection_changed(chat_id, net_state):
+            log(f"call-net: chat_id={chat_id} state={net_state.state} "
+                f"kind={net_state.kind}")
+            return await _handle_connection_changed(chat_id, net_state)
+
+        calls._handle_connection_changed = log_connection_changed
         features = []
         if has_p2p_recording:
             features.append(f"p2p(allowed_callers={sorted(allowed_callers)})")

@@ -4644,5 +4644,58 @@ class AudioPeerTrackingTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(daemon.MEDIA_AUDIO_PEERS)
 
 
+class OrphanedRecordingTests(unittest.IsolatedAsyncioTestCase):
+    """A recording is closed by the process that opened it, so one that outlives
+    its process is not still running."""
+
+    def write(self, daemon, name, **fields):
+        folder = daemon.CONNECTION_STATE_DIR / "calls" / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        record = {"status": "recording", "stop_reason": None,
+                  "delivery": {"status": "pending", "error": None}}
+        record.update(fields)
+        path.write_text(json.dumps(record) + "\n")
+        return path
+
+    async def test_an_abandoned_recording_stops_claiming_to_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            stuck = self.write(daemon, "a.json")
+
+            daemon.reconcile_orphaned_recordings()
+
+            record = json.loads(stuck.read_text())
+            self.assertEqual(record["status"], "interrupted")
+            self.assertEqual(record["stop_reason"], "process_ended")
+            self.assertEqual(record["delivery"]["status"], "skipped")
+
+    async def test_a_settled_recording_is_left_exactly_as_it_was(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            done = self.write(daemon, "b.json", status="complete",
+                              stop_reason="call_closed",
+                              delivery={"status": "sent", "message_id": 7})
+
+            daemon.reconcile_orphaned_recordings()
+
+            record = json.loads(done.read_text())
+            self.assertEqual(record["status"], "complete")
+            self.assertEqual(record["stop_reason"], "call_closed")
+            self.assertEqual(record["delivery"]["message_id"], 7)
+
+    async def test_unreadable_metadata_does_not_stop_the_sweep(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            folder = daemon.CONNECTION_STATE_DIR / "calls" / "recordings"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "broken.json").write_text("{not json\n")
+            stuck = self.write(daemon, "c.json")
+
+            daemon.reconcile_orphaned_recordings()
+
+            self.assertEqual(json.loads(stuck.read_text())["status"], "interrupted")
+
+
 if __name__ == "__main__":
     unittest.main()
