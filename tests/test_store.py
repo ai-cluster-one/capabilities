@@ -202,9 +202,22 @@ def test_a_grant_naming_an_unknown_field_is_refused(store, scopes):
     assert exc.value.slug == "bad_grant"
 
 
-def test_a_grant_without_a_connection_grants_nothing(store, scopes):
-    store.config_set("mailbox", "grant", "ghost", {"allow_write": True}, ("global", ""))
-    assert store.connections_effective("mailbox", scopes) == {}
+def test_a_grant_aimed_at_nothing_is_reported_rather_than_dropped(store, scopes):
+    """A mistyped id would otherwise mean permission silently not granted, which
+    looks exactly like permission correctly withheld."""
+    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "marvni", {"allow_write": True}, ("project", "marvin"))
+
+    assert set(store.connections_effective("mailbox", scopes)) == {"marvin"}
+    orphans = store.grant_orphans("mailbox", scopes)
+    assert [o["key"] for o in orphans] == ["marvni"]
+    assert orphans[0]["scope"] == ("project", "marvin")
+
+
+def test_a_grant_that_lands_is_not_reported_as_an_orphan(store, scopes):
+    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "marvin", {"allow_write": True}, ("project", "marvin"))
+    assert store.grant_orphans("mailbox", scopes) == []
 
 
 # --- the project registry ----------------------------------------------------

@@ -621,6 +621,19 @@ class Store:
             }
         return out
 
+    def grant_orphans(self, capability: str, scopes: Scopes) -> list[dict[str, Any]]:
+        """Grants naming a connection that does not resolve.
+
+        A grant is the only record that refers to another, so it is the only one
+        that can be aimed at nothing. Dropping it quietly is the failure this
+        whole move exists to stop: a mistyped id would mean permission silently
+        not granted, which looks exactly like permission correctly withheld."""
+        identities = self.config_resolve(capability, "connection", scopes)
+        grants = self.config_resolve(capability, "grant", scopes)
+        return [{"key": key, "scope": (row["scope_kind"], row["scope_name"]),
+                 "value": row["value"]}
+                for key, row in sorted(grants.items()) if key not in identities]
+
     # -- the project registry --------------------------------------------------
 
     def project_register(self, project_id: str, slug: str, name: str | None = None) -> None:

@@ -4110,6 +4110,18 @@ def cmd_doctor() -> None:
 
 # ---------------------------------------------------------------- contract preamble
 
+def _contract_lock(contract_dir: Path) -> dict:
+    """The checksum of every file a region is canonical in. A second canonical
+    source is a second thing that can drift, so the lock names them all rather
+    than only the first one there was."""
+    lock = {"preamble_sha256": _sha256(contract_dir / "preamble.py")}
+    for rel in sorted(set(_REGION_SOURCE_REL.values())):
+        name = Path(rel).stem
+        if name != "preamble":
+            lock[f"{name}_sha256"] = _sha256(contract_dir / Path(rel).name)
+    return lock
+
+
 def _fence_markers(region: str) -> tuple[str, str]:
     """The exact open/close marker lines bounding a vendored contract region."""
     source = _REGION_SOURCE_REL.get(region, "contract/preamble.py")
@@ -4869,8 +4881,8 @@ def _scaffold_source_repo(source_id: str, root: Path) -> None:
         if source_asset.resolve() != target.resolve():
             shutil.copy2(source_asset, target)
     _write_json(root / "capabilities.repo.json", {"kind": "capability-source"})
-    _write_json(root / "contract" / "contract.json", {
-        "preamble_sha256": _sha256(root / "contract" / "preamble.py")})
+    _write_json(root / "contract" / "contract.json",
+                _contract_lock(root / "contract"))
     _write_json(root / ".capability-source" / "catalog.json", {"capabilities": {}})
     (root / "AUTHORING.md").write_text(_authoring_markdown(source_id))
     agent_text = _repo_agent_markdown(source_id)
@@ -5213,7 +5225,7 @@ def _source_contract_failures(root: Path) -> list[str]:
     elif source_preamble.read_bytes() != _PREAMBLE.read_bytes():
         failures.append("contract: preamble differs from the manager's canonical contract")
     lock = _read_json(root / "contract" / "contract.json")
-    if not isinstance(lock, dict) or lock.get("preamble_sha256") != _sha256(_PREAMBLE):
+    if not isinstance(lock, dict) or lock != _contract_lock(_PREAMBLE.parent):
         failures.append("contract: contract.json checksum is stale")
     return failures
 
@@ -6241,8 +6253,8 @@ def cmd_source_sync(source_id: str) -> None:
         if updated != source_text:
             script.write_text(updated)
             stamped.append({"capability": capdir.name, "regions": regions})
-    _write_json(root / "contract" / "contract.json", {
-        "preamble_sha256": _sha256(_PREAMBLE)})
+    _write_json(root / "contract" / "contract.json",
+                _contract_lock(_PREAMBLE.parent))
     _emit({"source": source_id, "contract": str(root / "contract"),
            "stamped": stamped, "ok": True})
 
