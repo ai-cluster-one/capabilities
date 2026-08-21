@@ -110,15 +110,13 @@ CAPTURE_STALL_INTERVAL = 1.0
 # When to re-ask who is in a conference, as seconds after the join.
 CONFERENCE_AUDIO_MAP_RETRIES = (2.0, 3.0, 5.0, 10.0)
 CONFERENCE_PEER_INTERVAL = 2.0
-# Deliberately far above any observed gap. Incoming audio channels churn inside
-# a healthy call: a nineteen-second conference on 2026-08-21 removed and re-added
-# the same ssrc three times, so the set empties for a moment while the call is
-# very much alive. A threshold close to that would truncate real recordings, and
-# it would buy nothing — a new invite preempts a silent recording immediately,
-# which is what the caller actually waits on. This one only stops an abandoned
-# recording from writing silence for an hour, and ninety seconds is soon enough
-# for that.
-CONFERENCE_PEER_TIMEOUT = 90.0
+# Silence is not absence. A call can be quiet for minutes and must not be cut
+# short for it, so the absence of incoming audio is only the cheap hint that
+# makes it worth asking Telegram who is still in the call; a conference with
+# people talking is never questioned at all. Two empty answers are required,
+# because one failed round-trip must not end a live recording.
+CONFERENCE_QUIET_BEFORE_CHECK = 20.0
+CONFERENCE_EMPTY_ANSWERS = 2
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
@@ -4934,8 +4932,16 @@ async def run_session(client):
                 if MEDIA_AUDIO_PEERS:
                     log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
                     return
-                log(f"call: preempting a recording with no incoming audio for "
-                    f"{mode} from {caller_id}")
+                held = active_recording["caller_id"]
+                others = await conference_others(held) if held is not None else None
+                if others:
+                    log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
+                    return
+                # An unanswerable question counts as deserted here, unlike in the
+                # watchdog: a caller is waiting on this slot right now, and the
+                # recording it holds has had no audio at all.
+                log(f"call: preempting a deserted recording for {mode} "
+                    f"from {caller_id}")
                 await finalize_call_recording("preempted")
             # A previous call's channels are not this call's silence.
             MEDIA_AUDIO_PEERS.clear()
@@ -5989,36 +5995,69 @@ async def run_session(client):
                 return
             await finalize_call_recording("call_closed")
 
+        async def conference_others(chat_id: int):
+            """Who Telegram still lists in this call, besides this account.
+
+            Asked fresh: the participant list is cached for an hour, which is
+            the same staleness the audio map has to work around, so the cache is
+            dropped before asking. Returns None when the question could not be
+            put, which is not the same answer as nobody.
+
+            The public participants method refuses a chat id that is not
+            negative, and a conference migrated from a p2p call is keyed by the
+            caller's user id, so the client-level call is the one that answers.
+            """
+            try:
+                cache = calls._app._bind_client._cache
+                cache._call_participants_cache.pop(chat_id)
+            except Exception:
+                pass
+            try:
+                participants = await calls._app.get_group_call_participants(chat_id)
+            except Exception as exc:
+                log(f"call: could not ask who is in the call "
+                    f"({type(exc).__name__}: {exc})")
+                return None
+            return [p for p in (participants or [])
+                    if int(getattr(p, "user_id", 0)) != int(me.id)]
+
         async def watch_conference_peers(caller_id: int):
-            """Close a conference recording once nothing is sending audio into it.
+            """Close a conference recording once nobody else is in the call.
 
             Being alone in a group call is legal, so the transport reports no
             disconnect and keeps handing over frames — silence, encoded for as
-            long as the process lives. The byte-growth watchdog cannot see this,
+            long as the process lives. The byte-growth watchdog cannot see that,
             because silence has bytes; the recording that prompted this ran for
-            an hour after its call was over and refused every later invite as
-            busy.
+            an hour after its call was over, holding the only recorder slot.
 
-            Counting only starts once a channel has actually appeared, since a
-            join legitimately precedes the first one by a few seconds, and any
-            re-appearance resets it, because the churn inside a live call is the
-            normal case rather than the interesting one.
+            What ends a call is the last participant leaving, not the room going
+            quiet, so quiet only decides when to ask. Telegram's own list gives
+            the answer.
             """
             seen_any = False
-            empty_for = 0.0
+            quiet_for = 0.0
+            empty_answers = 0
             while active_recording["caller_id"] == caller_id:
                 await asyncio.sleep(CONFERENCE_PEER_INTERVAL)
                 if MEDIA_AUDIO_PEERS:
                     seen_any = True
-                    empty_for = 0.0
+                    quiet_for = 0.0
+                    empty_answers = 0
                     continue
                 if not seen_any:
                     continue
-                empty_for += CONFERENCE_PEER_INTERVAL
-                if empty_for >= CONFERENCE_PEER_TIMEOUT:
-                    log(f"call: no incoming audio for {empty_for:.0f}s — "
-                        f"closing the recording")
-                    await finalize_call_recording("no_audio_peers")
+                quiet_for += CONFERENCE_PEER_INTERVAL
+                if quiet_for < CONFERENCE_QUIET_BEFORE_CHECK:
+                    continue
+                quiet_for = 0.0
+                others = await conference_others(caller_id)
+                if others is None or others:
+                    empty_answers = 0
+                    continue
+                empty_answers += 1
+                if empty_answers >= CONFERENCE_EMPTY_ANSWERS:
+                    log("call: no one left in the call — closing the recording")
+                    await finalize_call_recording("call_deserted")
                     return
 
         async def watch_capture_stall(caller_id: int, capture: Path):

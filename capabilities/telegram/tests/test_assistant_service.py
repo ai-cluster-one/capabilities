@@ -4620,7 +4620,10 @@ class AudioPeerTrackingTests(unittest.IsolatedAsyncioTestCase):
             remove(1425171273); add(1425171273)
 
             self.assertEqual(daemon.MEDIA_AUDIO_PEERS, {946429944, 1425171273})
-            self.assertGreaterEqual(daemon.CONFERENCE_PEER_TIMEOUT, 60.0)
+            # Quiet only decides when to ask Telegram who is still there; the
+            # answer, not the quiet, ends a recording.
+            self.assertGreaterEqual(daemon.CONFERENCE_QUIET_BEFORE_CHECK, 10.0)
+            self.assertGreaterEqual(daemon.CONFERENCE_EMPTY_ANSWERS, 2)
 
     async def test_the_removal_that_ended_a_real_call_is_recognised(self):
         with tempfile.TemporaryDirectory() as td:
