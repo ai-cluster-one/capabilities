@@ -4534,8 +4534,11 @@ class MediaStackLogTests(unittest.IsolatedAsyncioTestCase):
             daemon = import_daemon(Path(td), settings())
             media = logging.getLogger("ntgcalls")
 
-            self.assertLessEqual(media.level, logging.DEBUG)
+            # Audible, and low enough to carry the lines that decide anything:
+            # the migration to a conference and both audio-channel events all
+            # arrive at INFO.
             self.assertNotEqual(media.level, logging.NOTSET)
+            self.assertLessEqual(media.level, logging.INFO)
             self.assertTrue(any(isinstance(h, daemon._MediaStackLog)
                                 for h in media.handlers))
 
@@ -4557,6 +4560,60 @@ class MediaStackLogTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("connection lost", lines[0])
             self.assertIn("repeated 2x", lines[1])
             self.assertIn("something else", lines[2])
+
+
+class AudioPeerTrackingTests(unittest.IsolatedAsyncioTestCase):
+    """Nothing else surfaces whether anyone is still sending audio into a
+    conference, so the media stack's own channel lines are followed."""
+
+    async def test_channels_are_followed_by_ssrc(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.MEDIA_AUDIO_PEERS.clear()
+
+            daemon._track_audio_peer(
+                "native_network_interface.cpp:161 Adding incoming audio "
+                "channel with ssrc 1932033436")
+            daemon._track_audio_peer(
+                "native_network_interface.cpp:161 Adding incoming audio "
+                "channel with ssrc 42")
+            self.assertEqual(daemon.MEDIA_AUDIO_PEERS, {1932033436, 42})
+
+            daemon._track_audio_peer(
+                "native_network_interface.cpp:214 Removing incoming audio "
+                "channel with ssrc 1932033436")
+            self.assertEqual(daemon.MEDIA_AUDIO_PEERS, {42})
+
+    async def test_unrelated_lines_leave_the_set_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.MEDIA_AUDIO_PEERS.clear()
+            daemon.MEDIA_AUDIO_PEERS.add(7)
+
+            for line in ("ntgcalls.cpp:186 Migrating P2P call to conference call",
+                         "group_call.cpp:43 Data channel opened",
+                         "Adding incoming video channel with ssrc 99"):
+                daemon._track_audio_peer(line)
+
+            self.assertEqual(daemon.MEDIA_AUDIO_PEERS, {7})
+
+    async def test_the_removal_that_ended_a_real_call_is_recognised(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.MEDIA_AUDIO_PEERS.clear()
+            handler = daemon._MediaStackLog()
+
+            def record(message):
+                return logging.LogRecord("ntgcalls", logging.INFO, __file__, 0,
+                                         message, None, None)
+
+            # Verbatim from the 2026-08-21 conference that hung for an hour.
+            handler.emit(record("native_network_interface.cpp:161 Adding "
+                                "incoming audio channel with ssrc 1932033436"))
+            self.assertTrue(daemon.MEDIA_AUDIO_PEERS)
+            handler.emit(record("native_network_interface.cpp:214 Removing "
+                                "incoming audio channel with ssrc 1932033436"))
+            self.assertFalse(daemon.MEDIA_AUDIO_PEERS)
 
 
 if __name__ == "__main__":

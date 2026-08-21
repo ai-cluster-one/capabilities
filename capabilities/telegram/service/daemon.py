@@ -109,6 +109,8 @@ CAPTURE_STALL_TIMEOUT = 8.0
 CAPTURE_STALL_INTERVAL = 1.0
 # When to re-ask who is in a conference, as seconds after the join.
 CONFERENCE_AUDIO_MAP_RETRIES = (2.0, 3.0, 5.0, 10.0)
+CONFERENCE_PEER_INTERVAL = 2.0
+CONFERENCE_PEER_TIMEOUT = 20.0
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
@@ -596,6 +598,36 @@ _telethon_log.setLevel(logging.WARNING)
 _telethon_log.addHandler(_TelethonWarnings())
 
 
+# The ssrc of every incoming audio channel the media stack currently holds.
+# Nothing else surfaces this: a conference reports no disconnect when the other
+# side leaves, because being alone in a group call is a legal state. The one
+# thing that changes is that its audio channel is removed, and the media stack
+# says so out loud.
+MEDIA_AUDIO_PEERS: set[int] = set()
+_AUDIO_CHANNEL_SSRC = re.compile(
+    r"(?P<verb>Adding|Removing) incoming audio channel with ssrc (?P<ssrc>\d+)")
+
+
+def _track_audio_peer(message):
+    """Follow the incoming audio channels named in one media-stack line.
+
+    Derived from the log because the transport offers no other view of it: the
+    participants API refuses a conference migrated from a p2p call, whose chat
+    id is a positive user id, and the frames themselves never pass through this
+    process — ntgcalls writes them straight into its own encoder. If a future
+    build renames the line, this simply stops matching and the byte-growth
+    watchdog remains as it was.
+    """
+    found = _AUDIO_CHANNEL_SSRC.search(message)
+    if not found:
+        return
+    ssrc = int(found.group("ssrc"))
+    if found.group("verb") == "Adding":
+        MEDIA_AUDIO_PEERS.add(ssrc)
+    else:
+        MEDIA_AUDIO_PEERS.discard(ssrc)
+
+
 class _MediaStackLog(logging.Handler):
     """Surface what the media stack says about a call.
 
@@ -626,13 +658,14 @@ class _MediaStackLog(logging.Handler):
                 log(f"call-media: previous line repeated {self._repeats}x")
                 self._repeats = 0
             self._last = message
+            _track_audio_peer(message)
             log(f"call-media[{record.levelname.lower()}]: {message}")
 
 
 # Claimed after the import that muted it, never before: the mute is the import
 # itself, so an earlier level is simply overwritten.
 _media_log = logging.getLogger("ntgcalls")
-_media_log.setLevel(logging.DEBUG)
+_media_log.setLevel(logging.INFO)
 _media_log.addHandler(_MediaStackLog())
 
 
@@ -4854,6 +4887,7 @@ async def run_session(client):
                 asyncio.create_task(watch_capture_stall(caller_id, capture))
                 if mode == "conference":
                     asyncio.create_task(settle_conference_audio_map(caller_id))
+                    asyncio.create_task(watch_conference_peers(caller_id))
             except Exception as exc:
                 # A media connection that never reached CONNECTED is reported as
                 # an argument-less exception, so the type carries the message.
@@ -4881,9 +4915,22 @@ async def run_session(client):
                 return
 
         async def start_call_recording(caller_id: int, mode: str, call_config: CallConfig):
-            if active_recording["task"] is not None or voice_call_busy():
+            if voice_call_busy():
                 log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
                 return
+            if active_recording["task"] is not None:
+                # A recording with no incoming audio is a call that already
+                # ended, and holding the slot for it turns one lost call into
+                # every later one being refused while the caller watches an
+                # account that says Invited and never joins.
+                if MEDIA_AUDIO_PEERS:
+                    log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
+                    return
+                log(f"call: preempting a recording with no incoming audio for "
+                    f"{mode} from {caller_id}")
+                await finalize_call_recording("preempted")
+            # A previous call's channels are not this call's silence.
+            MEDIA_AUDIO_PEERS.clear()
             task = asyncio.create_task(record_call(caller_id, mode, call_config))
             active_recording["task"] = task
 
@@ -5933,6 +5980,36 @@ async def run_session(client):
             if active_recording["caller_id"] != update.chat_id:
                 return
             await finalize_call_recording("call_closed")
+
+        async def watch_conference_peers(caller_id: int):
+            """Close a conference recording once nothing is sending audio into it.
+
+            Being alone in a group call is legal, so the transport reports no
+            disconnect and keeps handing over frames — silence, encoded for as
+            long as the process lives. The byte-growth watchdog cannot see this,
+            because silence has bytes; the recording that prompted this ran for
+            an hour after its call was over and refused every later invite as
+            busy.
+
+            Counting only starts once a channel has actually appeared, since a
+            join legitimately precedes the first one by a few seconds.
+            """
+            seen_any = False
+            empty_for = 0.0
+            while active_recording["caller_id"] == caller_id:
+                await asyncio.sleep(CONFERENCE_PEER_INTERVAL)
+                if MEDIA_AUDIO_PEERS:
+                    seen_any = True
+                    empty_for = 0.0
+                    continue
+                if not seen_any:
+                    continue
+                empty_for += CONFERENCE_PEER_INTERVAL
+                if empty_for >= CONFERENCE_PEER_TIMEOUT:
+                    log(f"call: no incoming audio for {empty_for:.0f}s — "
+                        f"closing the recording")
+                    await finalize_call_recording("no_audio_peers")
+                    return
 
         async def watch_capture_stall(caller_id: int, capture: Path):
             """Close a conference recording once its capture stops growing.
