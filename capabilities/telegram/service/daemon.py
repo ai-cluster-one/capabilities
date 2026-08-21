@@ -135,6 +135,8 @@ CONFERENCE_CHAIN_READY_LIMIT = 2.0
 CONFERENCE_CHAIN_SETTLE_STEP = 2.0
 CONFERENCE_CHAIN_SETTLE_MIN = 4.0
 CONFERENCE_CHAIN_SETTLE_BUDGET = 12.0
+CONFERENCE_CHAIN_LATE_WATCH = 45.0
+CONFERENCE_CHAIN_LATE_INTERVAL = 2.0
 CONFERENCE_EMPTY_ANSWERS = 2
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
@@ -4900,6 +4902,34 @@ async def run_session(client):
                 f"count={getattr(answer, 'count', '?')} "
                 f"[{', '.join(rows) or 'nobody'}]")
 
+        async def watch_late_conference_chain(invite_msg_id):
+            """Keep reading a chain that produced nothing, after giving up on it.
+
+            An invite whose chain stays empty is one whose conference was never
+            created, and the caller loses their call over it whether or not this
+            account ever joins. Whether more patience would have helped is not
+            answerable from a read that stopped: this one goes on asking with
+            the join already declined, so the answer costs the caller nothing.
+            """
+            deadline = time.monotonic() + CONFERENCE_CHAIN_LATE_WATCH
+            while time.monotonic() < deadline:
+                await asyncio.sleep(CONFERENCE_CHAIN_LATE_INTERVAL)
+                try:
+                    block, height = await read_chain_last_block(invite_msg_id)
+                except Exception as exc:
+                    log(f"call: late chain watch for invite {invite_msg_id} "
+                        f"stopped — {type(exc).__name__}: {exc}")
+                    return
+                if block:
+                    log(f"call: chain for invite {invite_msg_id} appeared late "
+                        f"— {len(block)} bytes at height {height}, "
+                        f"{time.monotonic() - (deadline - CONFERENCE_CHAIN_LATE_WATCH):.0f}s "
+                        f"after the join was declined")
+                    await log_conference_roster(invite_msg_id, "late chain")
+                    return
+            log(f"call: chain for invite {invite_msg_id} never appeared, "
+                f"watched a further {CONFERENCE_CHAIN_LATE_WATCH:.0f}s")
+
         async def watch_conference_roster(invite_msg_id):
             """Follow the roster over the seconds a lost caller disappears in."""
             for delay, when in ((3.0, "+3s after join"), (9.0, "+12s after join")):
@@ -4978,6 +5008,7 @@ async def run_session(client):
                     f"conference chain unreadable for invite {invite_msg_id} — "
                     f"{type(exc).__name__}: {exc}") from exc
             if not block:
+                asyncio.create_task(watch_late_conference_chain(invite_msg_id))
                 raise RuntimeError(
                     f"conference chain empty for invite {invite_msg_id}")
             waited = time.monotonic() - started
@@ -5101,13 +5132,19 @@ async def run_session(client):
                 log(f"call: failed to start {mode} recording from {caller_id}: "
                     f"{type(exc).__name__}: {exc}")
                 if mode == "conference":
+                    # Two different things go wrong here and the caller can act
+                    # on only one of them. A conference that never came into
+                    # existence is not one this account failed to join.
+                    notice = (
+                        "Конференция так и не создалась — Telegram не довёл "
+                        "перевод звонка в групповой. Я в неё не заходил, так "
+                        "что дело не во мне. Попробуй позвать ещё раз."
+                        if "empty" in str(exc) else
+                        "Не подключился к конференции: она всё ещё собиралась, "
+                        "я подождал сколько мог. Позови ещё раз через "
+                        "несколько секунд.")
                     with contextlib.suppress(Exception):
-                        await client.send_message(
-                            caller_id,
-                            "Не подключился к конференции: она всё ещё "
-                            "собиралась, я подождал сколько мог. Позови ещё раз "
-                            "через несколько секунд — так звонок не "
-                            "разваливается.")
+                        await client.send_message(caller_id, notice)
                 metadata.update({
                     "status": "join_failed",
                     "stop_reason": "join_failed",
