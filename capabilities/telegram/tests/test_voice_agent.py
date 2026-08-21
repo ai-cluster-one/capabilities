@@ -64,10 +64,9 @@ def fake_runtime_modules():
     pytgcalls_types.Device = Device
     pytgcalls_types.Frame = Frame
 
-    # The 3.x line sends frames with an explicit rotation enum, so the frame
-    # sender imports one name from the compiled binding.
+    # The daemon imports the compiled binding at module scope; nothing in the
+    # voice path reads a name out of it.
     ntgcalls = types.ModuleType("ntgcalls")
-    ntgcalls.VIDEO_ROTATION_0 = 0
 
     telethon = types.ModuleType("telethon")
     telethon.TelegramClient = DummyType

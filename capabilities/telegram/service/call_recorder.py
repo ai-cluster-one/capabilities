@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "py-tgcalls==3.0.0.dev4",
+#     "py-tgcalls==3.0.0.dev5",
 #     "ntgcalls==3.0.0b16",
 #     "telethon==1.43.2",
 # ]
@@ -10,8 +10,8 @@
 # The 3.x line is what carries conference calls: joining one needs
 # CallConfig(conference=<invite message id>), which 2.x does not accept.
 # ntgcalls is pinned explicitly because inbound audio arrives only from b15 on
-# (ntgcalls#52), and because b16 is the first build whose signalling path this
-# capability rebinds — see bind_signalling_to_client_loop.
+# (ntgcalls#52). dev5 is the first release carrying the three defects this
+# capability used to work around: pytgcalls/pytgcalls#334, #335 and #336.
 """Record an existing Telegram group voice chat through a full MTProto account.
 
 This is a bundled engine helper, not a public capability executable.  The
@@ -67,7 +67,6 @@ from telethon.tl.types import (
 )
 
 from call_recording_helpers import (
-    bind_signalling_to_client_loop,
     build_voice_waveform,
     display_duration,
     finalize_mp3_capture,
@@ -447,10 +446,6 @@ async def run(args: argparse.Namespace, config: dict, runtime_session: Path) -> 
         # PyTgCalls prints a version banner; keep stdout reserved for our JSON result.
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
-        bind_signalling_to_client_loop(
-            calls,
-            lambda message: emit_event("call_signalling", message=message),
-        )
         chat_id = await resolve_chat_id(calls, client, args.chat)
         if chat_id >= 0:
             raise RecorderError(6, "group_required",
@@ -1043,10 +1038,6 @@ async def watch_groups(
         history_session = StringSession.save(client.session)
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
-        bind_signalling_to_client_loop(
-            calls,
-            lambda message: emit_event("call_signalling", message=message),
-        )
         # calls.start() creates the MTProto bridge used by active_call().
         bridge = getattr(getattr(calls, "_app", None), "_bind_client", None)
         emit_event(
@@ -1365,10 +1356,6 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
         me = await client.get_me()
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
-        bind_signalling_to_client_loop(
-            calls,
-            lambda message: emit_event("call_signalling", message=message),
-        )
         emit_event(
             "listening",
             connection=config["id"],

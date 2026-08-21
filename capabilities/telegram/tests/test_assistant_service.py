@@ -172,7 +172,7 @@ class AudioParameters:
         self.channels = channels
 """.lstrip()
     )
-    (root / "ntgcalls.py").write_text("VIDEO_ROTATION_0 = 0\n")
+    (root / "ntgcalls.py").write_text("")
 
 
 def import_daemon(tmp: Path, service_settings: dict, *,

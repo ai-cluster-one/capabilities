@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "telethon==1.43.2",
-#     "py-tgcalls==3.0.0.dev4",
+#     "py-tgcalls==3.0.0.dev5",
 #     "ntgcalls==3.0.0b16",
 #     "google-genai>=1.36.0",
 # ]
@@ -11,8 +11,8 @@
 # The 3.x line is what carries conference calls: joining one needs
 # CallConfig(conference=<invite message id>), which 2.x does not accept.
 # ntgcalls is pinned explicitly because inbound audio arrives only from b15 on
-# (ntgcalls#52), and because b16 is the first build whose signalling path this
-# capability rebinds — see bind_signalling_to_client_loop.
+# (ntgcalls#52). dev5 is the first release carrying the three defects this
+# capability used to work around: pytgcalls/pytgcalls#334, #335 and #336.
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
 
@@ -78,13 +78,11 @@ from pytgcalls.types import (
     MediaStream,
     RecordStream,
 )
-from pytgcalls.types import UpdatedGroupCallParticipant
 from pytgcalls.types.raw import AudioParameters
 
 # Import shared call recording helpers (same directory)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from call_recording_helpers import (
-    bind_signalling_to_client_loop,
     finalize_mp3_capture,
     iso_utc,
     send_recording_to_chat,
@@ -4914,12 +4912,12 @@ async def run_session(client):
         async def refresh_conference_audio_map(chat_id: int, reason: str):
             """Rebuild the participant-to-audio-stream map for a live call.
 
-            The map is built once, when the media layer asks who is in the call,
-            from a participant list cached for an hour. The participant-update
-            handler refreshes camera and screen sources only — audio is never
-            remapped — so anyone whose stream was not in that first snapshot is
-            never decoded and never reaches the recording. Dropping the cached
-            participants and asking again is what puts them back."""
+            The library remaps audio whenever a participant update arrives, so
+            what is left to cover is the join itself: anyone whose stream is not
+            in the snapshot taken as this account joins is never decoded and
+            never reaches the recording, and no update follows for someone who
+            was already there. Dropping the cached participants forces a real
+            answer rather than the hour-old one."""
             try:
                 cache = calls._app._bind_client._cache
                 cache._call_participants_cache.pop(chat_id)
@@ -6108,18 +6106,6 @@ async def run_session(client):
                 f"{'' if status is None else ' ' + str(status)} "
                 f"chat_id={getattr(update, 'chat_id', None)}{detail}")
 
-        @calls.on_update()
-        async def conference_participants_changed(_call_client: PyTgCalls, update):
-            """Remap audio whenever the roster of a live conference moves."""
-            if not isinstance(update, UpdatedGroupCallParticipant):
-                return
-            if active_recording["caller_id"] != update.chat_id:
-                return
-            if active_recording["mode"] != "conference":
-                return
-            await refresh_conference_audio_map(
-                update.chat_id, "participant update")
-
         @calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))
         async def call_ended(_call_client: PyTgCalls, update: ChatUpdate):
             if active_voice_call["caller_id"] == update.chat_id:
@@ -6627,7 +6613,6 @@ async def run_session(client):
     if calls is not None:
         with contextlib.redirect_stdout(sys.stderr):
             await calls.start()
-        bind_signalling_to_client_loop(calls, log)
 
         # Every state other than CONNECTED is raised as one argument-less
         # exception, so FAILED, TIMEOUT and CLOSED — three different causes —
