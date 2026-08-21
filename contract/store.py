@@ -167,7 +167,7 @@ class Scopes:
         self.instance = instance or None
 
     @classmethod
-    def from_env(cls, project: str | None = None) -> Scopes:
+    def from_env(cls, project: str | None = None) -> "Scopes":
         return cls(
             project=project or os.environ.get("CAPABILITIES_PROJECT") or None,
             instance=os.environ.get("CAPABILITIES_INSTANCE") or None,
@@ -322,7 +322,7 @@ class Store:
     def close(self) -> None:
         self._conn.close()
 
-    def __enter__(self) -> Store:
+    def __enter__(self) -> "Store":
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -765,7 +765,7 @@ class SQLiteStore(Store):
     dialect = "sqlite"
 
     @classmethod
-    def open(cls, path: str) -> SQLiteStore:
+    def open(cls, path: str) -> "SQLiteStore":
         conn = sqlite3.connect(path, isolation_level=None, timeout=15.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -807,7 +807,7 @@ class PostgresStore(Store):
     _PLACEHOLDER = re.compile(r"\?")
 
     @classmethod
-    def open(cls, url: str) -> PostgresStore:
+    def open(cls, url: str) -> "PostgresStore":
         try:
             import psycopg2  # imported lazily: a SQLite-only host never pays
         except ImportError as exc:  # pragma: no cover - depends on host wheels
@@ -840,7 +840,7 @@ class PostgresStore(Store):
 
 # --- Resolution --------------------------------------------------------------
 
-def open_store(url: str | None = None) -> Store:
+def open_store(url: str | None = None) -> "Store":
     """The one entry point. `CAPABILITIES_STORE_URL` is the root pointer that
     cannot itself live in the store, which is why it is an environment variable
     beside the secrets the cascade already resolves that way.

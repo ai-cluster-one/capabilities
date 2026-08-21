@@ -501,6 +501,54 @@ def _env_dir() -> Path | None:
     return (_project_capabilities_dir(root) / NAME) if root is not None else None
 
 
+def _store_mode() -> tuple[str, str]:
+    """Whether this project keeps its records in files or in the store, and what
+    answered. One project may be moved without moving any other, so the answer is
+    per project and lives beside the project's identity — it has to be readable
+    before the store is reachable.
+
+    A project says nothing: files, which is every project that has not moved.
+    `CAPABILITIES_STORE_MODE` overrides for one invocation, for comparing the two
+    against each other. Nothing falls back silently in either direction: a
+    project on the store that cannot reach it fails rather than reading a stale
+    file it would have no way to report."""
+    if "open_store" not in globals():
+        return ("files", "capability carries no store tier")
+    override = os.environ.get("CAPABILITIES_STORE_MODE")
+    if override:
+        if override not in ("files", "db"):
+            _die(6, "bad_store_mode", f"CAPABILITIES_STORE_MODE must be files or db, got {override!r}")
+        return (override, "CAPABILITIES_STORE_MODE")
+    root = _project_root()
+    if root is None:
+        return ("files", "no project")
+    identity_file = _project_capabilities_dir(root) / "project.json"
+    try:
+        identity = json.loads(identity_file.read_text())
+    except (OSError, ValueError):
+        return ("files", "no project identity")
+    mode = identity.get("store", "files")
+    if mode not in ("files", "db"):
+        _die(6, "bad_store_mode", f"{identity_file} declares store {mode!r}",
+             "expected \"files\" or \"db\"")
+    return (mode, str(identity_file))
+
+
+def _project_identity() -> dict:
+    root = _project_root()
+    if root is None:
+        _die(6, "no_project", "no project here to resolve records for")
+    identity_file = _project_capabilities_dir(root) / "project.json"
+    try:
+        identity = json.loads(identity_file.read_text())
+    except (OSError, ValueError) as e:
+        _die(6, "no_project_identity", f"cannot read {identity_file}: {e}",
+             "run `capabilities init` in the project")
+    if not identity.get("slug"):
+        _die(6, "no_project_identity", f"{identity_file} declares no slug")
+    return identity
+
+
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where capabilities/ already exists."""
