@@ -439,7 +439,12 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
+        # Either marker names a project. `settings.json` is the gate and
+        # `project.json` the identity; a project keeping its records in the
+        # store needs the second and may eventually stop carrying the first,
+        # so neither is required while both worlds are in use.
         if ((d / "capabilities" / "settings.json").is_file()
+                or (d / "capabilities" / "project.json").is_file()
                 or (d / ".contextkit" / "config.toml").is_file()
                 or (d / ".capabilities").is_dir()
                 or (d / ".env").exists()
@@ -1094,7 +1099,7 @@ def _contract(argv: list[str]) -> None:
 
 # >>> contract: store (generated — edit contract/store.py, run `capabilities sync-contract`) >>>
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCOPE_KINDS = ("global", "project", "instance")
 SCOPE_RANK = {"global": 1, "project": 2, "instance": 3}
@@ -1124,6 +1129,11 @@ COLLECTIONS: dict[str, dict[str, str]] = {
     "identifier": {"resolve": MERGE, "writer": "capability"},
     "setting": {"resolve": MERGE, "writer": "human"},
     "policy": {"resolve": MERGE, "writer": "manager"},
+    # A document row holds no text — it holds the hash of the version currently
+    # in force. Keeping the pin here rather than in the documents table is what
+    # makes it scoped and merged like everything else, so a project may run a
+    # different version of a globally declared prompt without copying it.
+    "document": {"resolve": MERGE, "writer": "human"},
 }
 
 # Grant fields and what they mean when nothing declares them. `allow_write`
@@ -1283,6 +1293,30 @@ _DDL = [
     """
     CREATE INDEX IF NOT EXISTS revisions_target_idx
         ON revisions (capability, collection, key, written_at)
+    """,
+    # Long text — a prompt, a reference, an automation's script — addressed by
+    # the hash of its own content, so a version is immutable and identical text
+    # is stored once. Versions accumulate; none of them is "current". Which one
+    # is in force is a pin, and it lives in `config`.
+    #
+    # Saving is therefore not deploying: an edit adds a row here and changes
+    # nothing that runs until the pin moves. That separation is the reason this
+    # is safe to hold executable text at all.
+    """
+    CREATE TABLE IF NOT EXISTS documents (
+        capability  TEXT NOT NULL,
+        key         TEXT NOT NULL,
+        hash        TEXT NOT NULL,
+        body        TEXT NOT NULL,
+        media_type  TEXT,
+        author      TEXT,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (capability, key, hash)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS documents_history_idx
+        ON documents (capability, key, created_at)
     """,
     # A project is addressed by a slug it declares for itself, never by the name
     # of the directory it happens to sit in: renaming a folder must not orphan
@@ -1649,6 +1683,82 @@ class Store:
         return [{"key": key, "scope": (row["scope_kind"], row["scope_name"]),
                  "value": row["value"]}
                 for key, row in sorted(grants.items()) if key not in identities]
+
+    # -- documents: long text, versioned by content, one version in force ------
+
+    def document_put(self, capability: str, key: str, body: str,
+                     author: str | None = None,
+                     media_type: str | None = None) -> str:
+        """Record a version and return its hash. Saving is not deploying: this
+        changes nothing that runs until `document_pin` names the hash."""
+        _check("capability", capability, CAPABILITY_RE)
+        _check("key", key, KEY_RE)
+        if not isinstance(body, str):
+            raise StoreError("bad_document", "a document body must be text")
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        with self.transaction():
+            self._execute(
+                "INSERT INTO documents (capability, key, hash, body, media_type, "
+                "author, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (capability, key, hash) DO NOTHING",
+                (capability, key, digest, body, media_type, author, _now()),
+            )
+        return digest
+
+    def document_pin(self, capability: str, key: str, digest: str,
+                     scope: tuple[str, str], actor: str | None = None) -> None:
+        """Put one version in force at one scope — the deploy step, recorded in
+        `revisions` like any other decision. A hash that was never recorded is
+        refused rather than pinned: a pin aimed at nothing is the same silent
+        failure a grant aimed at nothing was."""
+        cur = self._execute(
+            "SELECT 1 FROM documents WHERE capability = ? AND key = ? AND hash = ?",
+            (capability, key, digest))
+        if not cur.fetchone():
+            raise StoreError("unknown_version",
+                             f"no recorded version {digest[:12]} of {capability}/{key}",
+                             "record it with document_put first")
+        self.config_set(capability, "document", key, {"hash": digest}, scope, actor=actor)
+
+    def document_read(self, capability: str, key: str,
+                      scopes: Scopes) -> dict[str, Any] | None:
+        """The version in force here, or None where nothing is pinned."""
+        pin = self.config_get(capability, "document", key, scopes)
+        if not pin:
+            return None
+        digest = pin.get("hash") if isinstance(pin, dict) else None
+        if not digest:
+            raise StoreError("bad_pin", f"the pin for {capability}/{key} names no hash")
+        cur = self._execute(
+            "SELECT body, media_type, author, created_at FROM documents "
+            "WHERE capability = ? AND key = ? AND hash = ?",
+            (capability, key, digest))
+        row = cur.fetchone()
+        if not row:
+            raise StoreError(
+                "missing_version",
+                f"{capability}/{key} is pinned to version {digest[:12]}, which is "
+                "not recorded",
+                "pin a version that exists, or record this one")
+        return {"key": key, "hash": digest, "body": row[0], "media_type": row[1],
+                "author": row[2], "created_at": row[3],
+                "scope": self.config_origin(capability, "document", key, scopes)}
+
+    def document_versions(self, capability: str, key: str) -> list[dict[str, Any]]:
+        """Every recorded version, newest first. Bodies are omitted — a history
+        listing should not carry the whole of everything it lists."""
+        cur = self._execute(
+            "SELECT hash, media_type, author, created_at, length(body) FROM documents "
+            "WHERE capability = ? AND key = ? ORDER BY created_at DESC, hash",
+            (capability, key))
+        return [{"hash": r[0], "media_type": r[1], "author": r[2],
+                 "created_at": r[3], "bytes": r[4]} for r in cur.fetchall()]
+
+    def document_keys(self, capability: str) -> list[str]:
+        cur = self._execute(
+            "SELECT DISTINCT key FROM documents WHERE capability = ? ORDER BY key",
+            (capability,))
+        return [r[0] for r in cur.fetchall()]
 
     # -- the project registry --------------------------------------------------
 
