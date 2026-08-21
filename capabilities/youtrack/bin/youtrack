@@ -772,23 +772,91 @@ def _render_ids_markdown(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _identifiers_scopes() -> "Scopes":
+    identity = _project_identity()
+    return Scopes(project=identity["slug"],
+                  instance=os.environ.get("CAPABILITIES_INSTANCE") or None)
+
+
+def _identifiers_load() -> dict:
+    """The identifiers envelope, from wherever this project keeps its records.
+
+    The shape is the same either way — `{label: {value, note}}` — so the help
+    section, the report and `ids get` never learn which answered."""
+    mode, _why = _store_mode()
+    if mode == "db":
+        try:
+            with open_store() as store:
+                resolved = store.config_resolve(NAME, "identifier", _identifiers_scopes())
+        except StoreError as e:
+            _die(6, e.slug, e.message, e.hint)
+        # Key order matches the file envelope's `sort_keys` output so the two
+        # sources diff cleanly against each other.
+        return {label: {"note": row["note"] or "", "value": row["value"]}
+                for label, row in sorted(resolved.items())}
+    envdir = _env_dir()
+    ids_file = (envdir / "identifiers.json") if envdir else None
+    if not ids_file or not ids_file.exists():
+        return {}
+    try:
+        data = json.loads(ids_file.read_text())
+    except (OSError, ValueError):
+        _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    return data if isinstance(data, dict) else {}
+
+
+def _identifiers_write(label: str, value, note: str) -> None:
+    """Rule 15 holds either way: a capability is the sole writer of its own
+    identifiers, addressed by (capability, collection) rather than by path."""
+    mode, _why = _store_mode()
+    if mode == "db":
+        try:
+            with open_store() as store:
+                store.config_set(NAME, "identifier", label, value,
+                                 _identifiers_scopes().write_target("project"),
+                                 actor=f"{NAME} ids set", note=note or None)
+        except StoreError as e:
+            _die(6, e.slug, e.message, e.hint)
+        return
+    envdir = _env_dir()
+    if envdir is None or not (envdir.parent / "settings.json").is_file():
+        _die(6, "no_envelope", "no capabilities/ envelope in this project",
+             "run `capabilities init` first")
+    data = _identifiers_load()
+    data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
+    envdir.mkdir(parents=True, exist_ok=True)
+    (envdir / "identifiers.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def _identifiers_remove(label: str) -> None:
+    mode, _why = _store_mode()
+    if mode == "db":
+        try:
+            with open_store() as store:
+                store.config_delete(NAME, "identifier", label,
+                                    _identifiers_scopes().write_target("project"),
+                                    actor=f"{NAME} ids rm")
+        except StoreError as e:
+            _die(6, e.slug, e.message, e.hint)
+        return
+    envdir = _env_dir()
+    data = _identifiers_load()
+    del data[label]
+    (envdir / "identifiers.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
 def _identifiers_section() -> str:
     """The Identifiers block appended to the bare top-level help — deterministic
     first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
     agent following the `<NAME> help` startup protocol loads the discovered
     labels/values/notes into context at once. Empty when no project envelope
     or nothing recorded (do not bloat help with an empty section)."""
-    envdir = _env_dir()
-    if envdir is None:
+    if _store_mode()[0] == "files" and _env_dir() is None:
         return ""
-    ids_file = envdir / "identifiers.json"
-    if not ids_file.exists():
-        return ""
-    try:
-        data = json.loads(ids_file.read_text())
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(data, dict) or not data:
+    data = _identifiers_load()
+    if not data:
         return ""
     header = (
         "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
@@ -818,14 +886,7 @@ def _cmd_help() -> None:
 
 def _cmd_ids(argv: list[str]) -> None:
     sub = argv[0] if argv else "list"
-    envdir = _env_dir()
-    ids_file = (envdir / "identifiers.json") if envdir else None
-    data: dict = {}
-    if ids_file and ids_file.exists():
-        try:
-            data = json.loads(ids_file.read_text())
-        except ValueError:
-            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    data = _identifiers_load()
     if sub == "list":
         _emit(data); return
     if sub == "get":
@@ -836,9 +897,6 @@ def _cmd_ids(argv: list[str]) -> None:
     if sub == "set":
         if len(argv) < 3:
             _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
-        if envdir is None or not (envdir.parent / "settings.json").is_file():
-            _die(6, "no_envelope", "no capabilities/ envelope in this project",
-                 "run `capabilities init` first")
         label, raw = argv[1], argv[2]
         try:
             value = json.loads(raw)
@@ -850,16 +908,13 @@ def _cmd_ids(argv: list[str]) -> None:
             if ni + 1 >= len(argv):
                 _die(6, "input", "--note needs a value")
             note = argv[ni + 1]
-        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
-        envdir.mkdir(parents=True, exist_ok=True)
-        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _identifiers_write(label, value, note)
         _emit({"set": label}); return
     if sub == "rm":
         if len(argv) < 2 or argv[1] not in data:
             _die(3, "not_found", "unknown identifier label",
                  f"`{NAME} ids list` shows the labels")
-        del data[argv[1]]
-        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _identifiers_remove(argv[1])
         _emit({"removed": argv[1]}); return
     _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
 
