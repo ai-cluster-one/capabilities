@@ -359,6 +359,22 @@ def test_unknown_collection_is_refused(store, scopes):
     assert exc.value.slug == "bad_collection"
 
 
+def test_an_email_address_is_a_valid_connection_id(store, scopes):
+    """Real mailboxes are addressed by address; the key has to carry one."""
+    store.config_set("mailbox", "connection", "konstantin@amanati.ai",
+                     {"address": "konstantin@amanati.ai"}, ("global", ""))
+    store.config_set("mailbox", "grant", "konstantin@amanati.ai",
+                     {"allow_write": True}, ("project", "marvin"))
+    effective = store.connections_effective("mailbox", scopes)
+    assert effective["konstantin@amanati.ai"]["allow_write"] is True
+
+
+def test_a_key_with_whitespace_is_still_refused(store):
+    with pytest.raises(StoreError) as exc:
+        store.config_set("mailbox", "connection", "two words", {}, ("global", ""))
+    assert exc.value.slug == "bad_name"
+
+
 def test_capability_names_are_validated(store):
     with pytest.raises(StoreError) as exc:
         store.config_set("Not A Name", "setting", "k", 1, ("global", ""))

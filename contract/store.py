@@ -115,7 +115,10 @@ COLLECTIONS: dict[str, dict[str, str]] = {
 # because "does a write leave the system" is the capability's fact.
 GRANT_FIELDS = ("enabled", "allow_write")
 
-KEY_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}", re.IGNORECASE)
+# A key is a label a human chose, and for a mailbox that label is naturally an
+# email address — so `@` and `+` belong here. What stays out is whitespace,
+# separators and anything that would make a key ambiguous to address.
+KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@+-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
 
 
