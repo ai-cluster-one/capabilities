@@ -64,7 +64,7 @@ from pathlib import Path
 
 import telethon
 from telethon import TelegramClient, events
-from telethon.tl.functions.phone import GetGroupCallChainBlocksRequest
+from telethon.tl.functions.phone import GetGroupCallChainBlocksRequest, GetGroupParticipantsRequest
 from telethon.tl.types import InputGroupCallInviteMessage, MessageActionConferenceCall, MessageActionInviteToGroupCall, MessageService, UpdateNewMessage
 
 import pytgcalls
@@ -731,7 +731,7 @@ async def settle_conference_chain(invite_msg_id, block, waited, read_block):
                 f"dropping its caller, so this invite is declined — invite "
                 f"again in a few seconds")
         await asyncio.sleep(pause)
-        fresh = await read_block(invite_msg_id)
+        fresh, height = await read_block(invite_msg_id)
         if not fresh:
             raise RuntimeError(
                 f"conference chain for invite {invite_msg_id} went empty while "
@@ -739,8 +739,8 @@ async def settle_conference_chain(invite_msg_id, block, waited, read_block):
         fresh_digest = hashlib.sha256(fresh).hexdigest()[:12]
         if fresh_digest != digest:
             log(f"call: conference chain for invite {invite_msg_id} still "
-                f"growing — block {digest} became {fresh_digest} after "
-                f"{time.monotonic() - seen_at:.1f}s")
+                f"growing — block {digest} became {fresh_digest} at height "
+                f"{height} after {time.monotonic() - seen_at:.1f}s")
             block, digest = fresh, fresh_digest
             seen_at = time.monotonic()
 
@@ -4846,13 +4846,65 @@ async def run_session(client):
         library_last_block = calls._app._bind_client.get_conference_last_block
 
         async def read_chain_last_block(invite_msg_id: int):
-            """Ask once for the last block of a conference's chain."""
+            """Ask once for the last block of a conference's chain.
+
+            The height comes back with it. Joining means appending a block
+            derived from this one, so the height at the read and the height
+            after the join are what say whether this account built on the head
+            of the chain or on something the conference had already moved past.
+            """
             result = await client(GetGroupCallChainBlocksRequest(
                 call=InputGroupCallInviteMessage(msg_id=invite_msg_id),
                 sub_chain_id=0, offset=-1, limit=1))
-            blocks = [b for u in getattr(result, "updates", None) or []
-                      for b in getattr(u, "blocks", None) or []]
-            return blocks[-1] if blocks else None
+            block = None
+            height = None
+            for update in getattr(result, "updates", None) or []:
+                blocks = getattr(update, "blocks", None) or []
+                if blocks:
+                    block = blocks[-1]
+                    height = getattr(update, "next_offset", None)
+            return block, height
+
+        async def log_conference_roster(invite_msg_id, when: str):
+            """Say who Telegram lists in this conference right now.
+
+            Asked through the invite rather than the call, so it can be put
+            before this account has joined anything. Whether the caller is in
+            that list before the join is the whole question: absent already
+            means the conference lost them on its own, present then gone means
+            it lost them to us.
+            """
+            if not invite_msg_id:
+                return
+            try:
+                answer = await client(GetGroupParticipantsRequest(
+                    call=InputGroupCallInviteMessage(msg_id=invite_msg_id),
+                    ids=[], sources=[], offset="", limit=100))
+            except Exception as exc:
+                log(f"call: roster ({when}) for invite {invite_msg_id} "
+                    f"unavailable — {type(exc).__name__}: {exc}")
+                return
+            rows = []
+            for participant in getattr(answer, "participants", None) or []:
+                peer = getattr(participant, "peer", None)
+                who = (getattr(peer, "user_id", None)
+                       or getattr(peer, "channel_id", None)
+                       or getattr(peer, "chat_id", None))
+                marks = "".join(mark for mark, on in (
+                    ("left", getattr(participant, "left", False)),
+                    ("muted", getattr(participant, "muted", False)),
+                    ("new", getattr(participant, "just_joined", False)),
+                ) if on)
+                rows.append(f"{who}{'(' + marks + ')' if marks else ''}")
+            log(f"call: roster ({when}) for invite {invite_msg_id} — "
+                f"count={getattr(answer, 'count', '?')} "
+                f"[{', '.join(rows) or 'nobody'}]")
+
+        async def watch_conference_roster(invite_msg_id):
+            """Follow the roster over the seconds a lost caller disappears in."""
+            for delay, when in ((3.0, "+3s after join"), (9.0, "+12s after join")):
+                await asyncio.sleep(delay)
+                await log_conference_roster(invite_msg_id, when)
 
         async def conference_last_block(chat_id: int, invite_msg_id=None):
             """Wait for the last block of a conference's chain to exist.
@@ -4877,16 +4929,18 @@ async def run_session(client):
             reads = 0
             while True:
                 reads += 1
-                block = await read_chain_last_block(invite_msg_id)
+                block, height = await read_chain_last_block(invite_msg_id)
                 if block:
-                    # The block's identity and how long it took to appear. How
-                    # long is what decides whether this join is safe to make
-                    # now; the digest is what says, on the next read, whether
-                    # the chain is still growing underneath it.
+                    # The block's identity, its height, and how long it took to
+                    # appear. How long decides whether this join is safe to make
+                    # now; the digest says, on the next read, whether the chain
+                    # is still growing underneath it; the height says what this
+                    # account is about to build on.
                     digest = hashlib.sha256(block).hexdigest()[:12]
                     log(f"call: conference chain for invite {invite_msg_id} — "
                         f"block of {len(block)} bytes after {reads} read(s) "
-                        f"in {time.monotonic() - started:.1f}s, digest {digest}")
+                        f"in {time.monotonic() - started:.1f}s, digest {digest}, "
+                        f"height {height}")
                     return block
                 if time.monotonic() >= deadline:
                     log(f"call: conference chain for invite {invite_msg_id} — "
@@ -4929,9 +4983,10 @@ async def run_session(client):
             if waited > CONFERENCE_CHAIN_READY_LIMIT:
                 await settle_conference_chain(
                     invite_msg_id, block, waited, read_chain_last_block)
-                return
-            log(f"call: conference chain readable — last block {len(block)} bytes "
-                f"in {waited:.1f}s")
+            else:
+                log(f"call: conference chain readable — last block "
+                    f"{len(block)} bytes in {waited:.1f}s")
+            await log_conference_roster(invite_msg_id, "before join")
 
         async def refresh_conference_audio_map(chat_id: int, reason: str):
             """Rebuild the participant-to-audio-stream map for a live call.
@@ -5037,6 +5092,8 @@ async def run_session(client):
                 if mode == "conference":
                     asyncio.create_task(settle_conference_audio_map(caller_id))
                     asyncio.create_task(watch_conference_peers(caller_id))
+                    asyncio.create_task(
+                        watch_conference_roster(call_config.conference))
             except Exception as exc:
                 # A media connection that never reached CONNECTED is reported as
                 # an argument-less exception, so the type carries the message.
