@@ -4969,6 +4969,7 @@ async def run_session(client):
             with no age, because it came into existence while this account was
             reading for it. Waiting is what gives the block that age.
             """
+            await log_conference_roster(invite_msg_id, "at invite")
             started = time.monotonic()
             try:
                 block = await conference_last_block(caller_id, invite_msg_id)
@@ -6301,6 +6302,27 @@ async def run_session(client):
                     await finalize_call_recording("capture_stalled")
                     return
 
+        def describe_call_action(action) -> str:
+            """Everything the invite already says about the call it announces.
+
+            The service message carries whether the conference is active and who
+            Telegram thinks is in it, which is the earliest answer available to
+            the question of who this account is about to join — earlier than the
+            chain, which on a failing invite has nothing in it at all.
+            """
+            parts = []
+            for name in ("call_id", "missed", "active", "video", "duration"):
+                if hasattr(action, name):
+                    parts.append(f"{name}={getattr(action, name)}")
+            others = getattr(action, "other_participants", None)
+            if others is not None:
+                parts.append("other_participants=" + str([
+                    getattr(peer, "user_id", None)
+                    or getattr(peer, "channel_id", None)
+                    or getattr(peer, "chat_id", None)
+                    for peer in others]))
+            return f"{type(action).__name__}({', '.join(parts)})"
+
         @client.on(events.Raw)
         async def conference_invite(event):
             if not isinstance(event, UpdateNewMessage):
@@ -6319,6 +6341,10 @@ async def run_session(client):
             if (caller_id is None or caller_id not in set(
                     configured_call_recording_users()["allowed_callers"])):
                 return
+            if "Call" in type(action).__name__:
+                log(f"call: invite {message.id} from {caller_id} — "
+                    f"{describe_call_action(action)}"
+                    f"{' (already seen)' if message.id in seen_invite_ids else ''}")
             if message.id in seen_invite_ids:
                 return
             if isinstance(action, MessageActionConferenceCall) and not action.missed:
