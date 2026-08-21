@@ -4624,6 +4624,11 @@ class AudioPeerTrackingTests(unittest.IsolatedAsyncioTestCase):
             # answer, not the quiet, ends a recording.
             self.assertGreaterEqual(daemon.CONFERENCE_QUIET_BEFORE_CHECK, 10.0)
             self.assertGreaterEqual(daemon.CONFERENCE_EMPTY_ANSWERS, 2)
+            # Measured from the join: the 2026-08-21 conference that hung
+            # produced no incoming audio channel at all, so a grace that waits
+            # for a first channel would never start counting on the very case
+            # the watchdog exists for.
+            self.assertGreaterEqual(daemon.CONFERENCE_JOIN_GRACE, 20.0)
 
     async def test_the_removal_that_ended_a_real_call_is_recognised(self):
         with tempfile.TemporaryDirectory() as td:

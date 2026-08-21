@@ -116,6 +116,7 @@ CONFERENCE_PEER_INTERVAL = 2.0
 # people talking is never questioned at all. Two empty answers are required,
 # because one failed round-trip must not end a live recording.
 CONFERENCE_QUIET_BEFORE_CHECK = 20.0
+CONFERENCE_JOIN_GRACE = 30.0
 CONFERENCE_EMPTY_ANSWERS = 2
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
@@ -4794,6 +4795,7 @@ async def run_session(client):
             if not invite_msg_id:
                 return await library_last_block(chat_id, invite_msg_id)
             deadline = time.monotonic() + CONFERENCE_CHAIN_TIMEOUT
+            started = time.monotonic()
             reads = 0
             while True:
                 reads += 1
@@ -4804,8 +4806,16 @@ async def run_session(client):
                 blocks = [b for u in updates
                           for b in getattr(u, "blocks", None) or []]
                 if blocks:
+                    # The block's identity and how long it took to appear. A
+                    # conference joined on a block that has already moved on is
+                    # the current suspect for a join that connects, receives no
+                    # audio at all, and takes the caller's own call down with
+                    # it; the same block read twice says the chain was still,
+                    # two different ones say it was not.
+                    digest = hashlib.sha256(blocks[-1]).hexdigest()[:12]
                     log(f"call: conference chain for invite {invite_msg_id} — "
-                        f"block of {len(blocks[-1])} bytes after {reads} read(s)")
+                        f"block of {len(blocks[-1])} bytes after {reads} read(s) "
+                        f"in {time.monotonic() - started:.1f}s, digest {digest}")
                     return blocks[-1]
                 if time.monotonic() >= deadline:
                     log(f"call: conference chain for invite {invite_msg_id} — "
@@ -6075,17 +6085,20 @@ async def run_session(client):
             quiet, so quiet only decides when to ask. Telegram's own list gives
             the answer.
             """
-            seen_any = False
+            joined_at = time.monotonic()
             quiet_for = 0.0
             empty_answers = 0
             while active_recording["caller_id"] == caller_id:
                 await asyncio.sleep(CONFERENCE_PEER_INTERVAL)
                 if MEDIA_AUDIO_PEERS:
-                    seen_any = True
                     quiet_for = 0.0
                     empty_answers = 0
                     continue
-                if not seen_any:
+                # Measured from the join rather than from the first channel: a
+                # conference that never produces one at all is the failure this
+                # watches for, and waiting for a channel before starting to
+                # count made that the one case it could not see.
+                if time.monotonic() - joined_at < CONFERENCE_JOIN_GRACE:
                     continue
                 quiet_for += CONFERENCE_PEER_INTERVAL
                 if quiet_for < CONFERENCE_QUIET_BEFORE_CHECK:
