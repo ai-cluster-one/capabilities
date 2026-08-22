@@ -177,7 +177,7 @@ The cache is the **offline floor, never the authority**: `$XDG_STATE_HOME/<name>
 
 ## Project records and the envelope
 
-Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its durable id and slug and selects where live configuration is kept with `"store": "files"` or `"store": "db"`; absence preserves files mode. The project gate remains `capabilities/settings.json` in both modes because it is the bootstrap guard that must be readable before any configured backend is trusted. `CAPABILITIES_STORE_MODE` is a diagnostic override, not project doctrine.
+Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its durable id and slug and selects where live configuration is kept with `"store": "files"` or `"store": "db"`; absence preserves files mode. The project identity is the bootstrap fact that selects the records adapter, and the policy gate then comes through that adapter with every other live record. `CAPABILITIES_STORE_MODE` is a diagnostic override, not project doctrine.
 
 All runtime readers open the same records adapter. Files mode maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Database mode reads the same collections from the configured store (local SQLite by default, selected by the manager's store URL resolution). Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection and never branches on the backend.
 
@@ -186,7 +186,7 @@ In files mode, project material has this layout:
 ```
 capabilities/
   project.json        # durable project identity and files/db selection
-  settings.json       # bootstrap policy gate; always a file
+  settings.json       # policy records in files mode
   <name>/
     connections.json  # connection, grant, and default-setting records
     identifiers.json  # identifier records, managed by the ids verbs
@@ -196,7 +196,7 @@ capabilities/
     state/            # capability-written; never committed
 ```
 
-In database mode those logical records and document bodies live in the store; the envelope still holds identity, the policy gate, state guards, and source-owned project material that is not a live record.
+In database mode those logical records and document bodies, including the policy gate, live in the store; the envelope still holds project identity, the state guard, and source-owned project material that is not a live record.
 
 `capabilities/` is canonical and intentionally visible so the project's context
 owner and humans share one project body. The runtime also reads a legacy
@@ -209,7 +209,7 @@ never migrate.
 `.contextkit/config.toml` has a context owner that owns its visible body, so the
 runtime asks it — `contextkit path capabilities`, run in the project root,
 printing the absolute envelope path — and everything derived from the envelope
-follows that answer: the gate, the manager-owned `.gitignore`, per-capability
+follows that answer: the project identity, the manager-owned `.gitignore`, per-capability
 identifiers, references, connections, and state. `$CAPABILITIES_PROJECT_ENVELOPE`
 supplies the same answer in advance, so a context owner composing through
 `capabilities context --fragment` is never called back mid-compose. Resolution is
@@ -255,17 +255,17 @@ The `ids` verbs manage the identifier collection through the adapter:
 
 ## The capability policy gate
 
-Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns both policy files:
+Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns the policy collection. Files mode maps it to:
 
 1. Project: `capabilities/settings.json`.
 2. Global machine default: `$XDG_CONFIG_HOME/capabilities/settings.json`.
 
-An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
+Database mode keeps both scopes as policy rows in the configured store. An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
 
 ```python
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding capabilities/settings.json, legacy
+    the first directory holding capabilities/project.json or settings.json, legacy
     .capabilities/, .contextkit/config.toml, .env(.local), or .git.
     Markers are read from the filesystem alone: the root is what the envelope
     location is resolved against, so resolving one cannot depend on the other.
@@ -276,7 +276,8 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
-        if ((d / "capabilities" / "settings.json").is_file()
+        if ((d / "capabilities" / "project.json").is_file()
+                or (d / "capabilities" / "settings.json").is_file()
                 or (d / ".contextkit" / "config.toml").is_file()
                 or (d / ".capabilities").is_dir() or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
@@ -286,7 +287,8 @@ def _project_root() -> Path | None:
 def _project_capabilities_dir(root: Path) -> Path:
     current = root / "capabilities"
     legacy = root / ".capabilities"
-    if (current / "settings.json").is_file() or not legacy.is_dir():
+    if ((current / "project.json").is_file()
+            or (current / "settings.json").is_file() or not legacy.is_dir()):
         return current
     return legacy
 
@@ -294,9 +296,8 @@ def _gate() -> None:
     _auth_gate()
     if sys.argv[1] in {"help", "stub", "manifest", "connections"}:
         return
-    project_entry = _policy_entry(project_policy) if project_root else None
-    global_entry = _policy_entry(_CONFIG_HOME / "capabilities" / "settings.json")
-    effective = project_entry if project_entry is not None else global_entry
+    row = _records().resolve("capabilities", "policy").get(NAME)
+    effective = row.get("value") if row else None
     if isinstance(effective, dict) and effective.get("enabled") is True:
         return
     _die(4, "not_enabled", f"{NAME} is not enabled by effective policy",
@@ -510,7 +511,8 @@ def _state_dir() -> Path:
         root = _project_root()
         if root is not None:
             envelope = _project_capabilities_dir(root)
-            if (envelope / "settings.json").is_file():
+            if ((envelope / "project.json").is_file()
+                    or (envelope / "settings.json").is_file()):
                 return envelope / NAME / "state"
     return _STATE_HOME / NAME
 ```

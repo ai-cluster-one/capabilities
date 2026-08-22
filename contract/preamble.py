@@ -229,12 +229,15 @@ def _project_capabilities_dir(root: Path) -> Path:
 
     The resolved envelope is canonical. A legacy `.capabilities/` remains
     readable until `capabilities init` migrates it. If both exist, the canonical
-    tree wins once it carries settings.json; otherwise the legacy configured tree
-    remains active so merely creating an empty visible directory loses no gate.
+    tree wins once it carries either the legacy file gate or the project identity;
+    otherwise the legacy configured tree remains active so merely creating an
+    empty visible directory loses no gate.
     """
     current = _envelope_home(root)
     legacy = root / ".capabilities"
-    if (current / "settings.json").is_file() or not legacy.is_dir():
+    if ((current / "settings.json").is_file()
+            or (current / "project.json").is_file()
+            or not legacy.is_dir()):
         return current
     return legacy
 
@@ -314,34 +317,29 @@ def _auth_gate() -> None:
          f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
 
 
-def _policy_entry(path: Path):
-    if not path.is_file():
-        return None
+def _policy_row():
+    """The effective policy row from the same records adapter as everything else."""
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError) as e:
-        _die(6, "bad_policy", f"cannot read capability policy {path}: {e}")
-    capabilities = data.get("capabilities") if isinstance(data, dict) else None
-    if not isinstance(capabilities, dict):
-        _die(6, "bad_policy", f"{path} is not a capability policy",
-             'expected {"capabilities": {"<name>": {"enabled": true}}}')
-    entry = capabilities.get(NAME)
-    if entry is not None and (not isinstance(entry, dict)
-                              or set(entry) != {"enabled"}
-                              or not isinstance(entry.get("enabled"), bool)):
-        _die(6, "bad_policy", f"invalid {NAME} policy entry in {path}",
+        row = _records().resolve("capabilities", "policy").get(NAME)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    if row is None:
+        return None
+    entry = row.get("value")
+    if (not isinstance(entry, dict) or set(entry) != {"enabled"}
+            or not isinstance(entry.get("enabled"), bool)):
+        _die(6, "bad_policy",
+             f"invalid {NAME} policy entry in {_records().source}",
              'expected {"enabled": true|false}')
-    return entry
+    return row
 
 
 def _project_enabled_explicitly() -> bool:
     """True only for an explicit project enabled entry; global inheritance is
     deliberately insufficient for project-owned service activation."""
-    root = _project_root()
-    if root is None:
-        return False
-    entry = _policy_entry(_project_capabilities_dir(root) / "settings.json")
-    return isinstance(entry, dict) and entry.get("enabled") is True
+    row = _policy_row()
+    return bool(row and row.get("scope") == "project"
+                and row["value"].get("enabled") is True)
 
 
 def _require_project_enabled_for_service() -> Path:
@@ -371,23 +369,18 @@ def _gate() -> None:
         _require_project_enabled_for_service()
     if verb in {"help", "stub", "manifest", "connections"}:
         return
-    root = _project_root()
-    project_file = (_project_capabilities_dir(root) / "settings.json") \
-        if root is not None else None
-    project_entry = _policy_entry(project_file) if project_file else None
-    global_file = _CONFIG_HOME / "capabilities" / "settings.json"
-    global_entry = _policy_entry(global_file)
-    if isinstance(project_entry, dict) and project_entry.get("enabled") is True:
+    row = _policy_row()
+    entry = row.get("value") if row else None
+    scope = row.get("scope") if row else None
+    if isinstance(entry, dict) and entry.get("enabled") is True:
         return
-    if isinstance(project_entry, dict) and project_entry.get("enabled") is False:
+    if isinstance(entry, dict) and entry.get("enabled") is False and scope == "project":
         _die(4, "disabled",
-             f"{NAME} is disabled in this project ({project_file})",
+             f"{NAME} is disabled in this project ({_records().source})",
              f"ask the user whether to enable {NAME} for this project; if yes, "
              f"run `capabilities enable {NAME} --project`")
-    if isinstance(global_entry, dict) and global_entry.get("enabled") is True:
-        return
-    if isinstance(global_entry, dict) and global_entry.get("enabled") is False:
-        message = f"{NAME} is disabled globally ({global_file})"
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        message = f"{NAME} is disabled globally ({_records().source})"
     else:
         message = f"{NAME} is not enabled by project or global policy"
     _die(4, "not_enabled", message,
@@ -480,7 +473,8 @@ def _state_dir() -> Path:
         root = _project_root()
         if root is not None:
             envelope = _project_capabilities_dir(root)
-            if (envelope / "settings.json").is_file():
+            if ((envelope / "project.json").is_file()
+                    or (envelope / "settings.json").is_file()):
                 return envelope / NAME / "state"
     return _STATE_HOME / NAME
 

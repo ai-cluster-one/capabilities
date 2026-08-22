@@ -320,7 +320,8 @@ CHANNEL_ENABLED = os.environ.get(
 def _read_settings():
     try:
         settings = {key: row["value"] for key, row in
-                    _records().resolve("telegram", "setting").items()}
+                    _records().resolve("telegram", "setting").items()
+                    if key != "connection.default"}
     except _records_module().StoreError as exc:
         raise SettingsError(
             f"Telegram service records are unavailable: {exc.message}") from exc

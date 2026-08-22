@@ -148,7 +148,8 @@ def _load_settings(path: Path) -> dict:
     try:
         with records_store.open_records(envelope, config_home) as adapter:
             return {key: row["value"] for key, row in
-                    adapter.resolve("slack", "setting").items()}
+                    adapter.resolve("slack", "setting").items()
+                    if key != "connection.default"}
     except records_store.StoreError as exc:
         raise RuntimeError(f"Slack service records are unavailable: {exc.message}") from exc
 

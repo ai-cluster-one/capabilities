@@ -94,6 +94,26 @@ def test_contextkit_init_and_context_preserve_owned_files(tmp_path: Path) -> Non
     assert not (project / ".claude" / "rules" / "CAPABILITIES.md").exists()
 
 
+def test_doctor_does_not_judge_contextkit_owned_codex_paths(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True)
+    _json(_run(tmp_path, project, "init", "--claude", "--codex"))
+    files = {
+        project / ".codex" / "hooks" / "build-context.sh": "# ContextKit compiler\n",
+        project / ".codex" / "hooks.json": json.dumps({
+            "hooks": {"SessionStart": [{"hooks": [{
+                "type": "command", "command": ".codex/hooks/build-context.sh",
+            }]}]},
+        }),
+        project / ".codex" / "config.toml": "context = '.codex/generated/context.md'\n",
+    }
+    for path, body in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+
+    report = _json(_run(tmp_path, project, "doctor"))
+    assert report == {"ok": True, "findings": []}
+
+
 def test_context_fragment_is_manager_owned_and_write_free(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True)
     capability_dir = project / "capabilities" / "asana"

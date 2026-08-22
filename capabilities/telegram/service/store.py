@@ -1158,6 +1158,11 @@ class Records:
     def close(self) -> None:
         pass
 
+    def resolve_scope(self, capability: str, collection: str,
+                      scope: str) -> dict[str, dict[str, Any]]:
+        """Resolve exactly one scope, without inheritance."""
+        raise NotImplementedError
+
 
 class StoreRecords(Records):
     """Configuration kept as rows. Thin, because the store already does this —
@@ -1176,16 +1181,43 @@ class StoreRecords(Records):
     def resolve(self, capability: str, collection: str) -> dict[str, dict[str, Any]]:
         return self.store.config_resolve(capability, collection, self.scopes)
 
+    def resolve_scope(self, capability: str, collection: str,
+                      scope: str) -> dict[str, dict[str, Any]]:
+        if scope == "project":
+            scopes = Scopes(project=self.scopes.project, include_global=False)
+        elif scope == "global":
+            scopes = Scopes(project=None, include_global=True)
+        else:
+            raise StoreError("bad_scope",
+                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        return self.store.config_resolve(capability, collection, scopes)
+
     def get(self, capability: str, collection: str, key: str) -> Any:
         return self.store.config_get(capability, collection, key, self.scopes)
 
     def set(self, capability: str, collection: str, key: str, value: Any,
-            actor: str | None = None, note: str | None = None) -> None:
+            actor: str | None = None, note: str | None = None,
+            scope: str | None = None) -> None:
+        target = self.write_scope if scope is None else (
+            ("global", "") if scope == "global"
+            else ("project", self.scopes.project) if scope == "project"
+            else None)
+        if target is None:
+            raise StoreError("bad_scope",
+                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
         self.store.config_set(capability, collection, key, value,
-                              self.write_scope, actor=actor, note=note)
+                              target, actor=actor, note=note)
 
-    def delete(self, capability: str, collection: str, key: str) -> bool:
-        return self.store.config_delete(capability, collection, key, self.write_scope)
+    def delete(self, capability: str, collection: str, key: str,
+               scope: str | None = None) -> bool:
+        target = self.write_scope if scope is None else (
+            ("global", "") if scope == "global"
+            else ("project", self.scopes.project) if scope == "project"
+            else None)
+        if target is None:
+            raise StoreError("bad_scope",
+                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        return self.store.config_delete(capability, collection, key, target)
 
     def connections(self, capability: str, write_default: bool = False,
                     include_disabled: bool = False) -> dict[str, dict[str, Any]]:
@@ -1362,6 +1394,26 @@ class FileRecords(Records):
                 out.setdefault(key, row)
         return out
 
+    def resolve_scope(self, capability: str, collection: str,
+                      scope: str) -> dict[str, dict[str, Any]]:
+        _check("capability", capability, CAPABILITY_RE)
+        if scope == "project":
+            root, pid = self.envelope, self.project_id
+        elif scope == "global":
+            root, pid = self.global_dir, None
+        else:
+            raise StoreError("bad_scope",
+                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        return {
+            key: {"id": f"{scope}:{capability}/{collection}/{key}",
+                  "scope": scope, "project_id": pid,
+                  "capability": capability, "collection": collection,
+                  "key": key, "value": value,
+                  "note": self._note(root, capability, collection, key),
+                  "updated_at": None, "updated_by": None}
+            for key, value in self._entries(root, capability, collection).items()
+        }
+
     def get(self, capability: str, collection: str, key: str) -> Any:
         entry = self.resolve(capability, collection).get(key)
         return entry["value"] if entry else None
@@ -1392,14 +1444,20 @@ class FileRecords(Records):
     # -- writing ---------------------------------------------------------------
 
     def set(self, capability: str, collection: str, key: str, value: Any,
-            actor: str | None = None, note: str | None = None) -> None:
+            actor: str | None = None, note: str | None = None,
+            scope: str | None = None) -> None:
         _check("capability", capability, CAPABILITY_RE)
         _check("key", key, KEY_RE)
         Store._semantics(collection)
-        if not self.envelope.is_dir():
+        target_scope = scope or "project"
+        if target_scope not in SCOPE_KINDS:
+            raise StoreError("bad_scope",
+                             f"scope {target_scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        root = self.envelope if target_scope == "project" else self.global_dir
+        if target_scope == "project" and not self.envelope.is_dir():
             raise StoreError("no_envelope", "no capabilities/ envelope in this project",
                              "run `capabilities init` first")
-        path = self._file(self.envelope, capability, collection, key)
+        path = self._file(root, capability, collection, key)
         body = self._load(path)
         body = body if isinstance(body, dict) else {}
         if collection == "policy":
@@ -1427,8 +1485,14 @@ class FileRecords(Records):
             body[key] = value
         self._save(path, body, sort=collection == "identifier")
 
-    def delete(self, capability: str, collection: str, key: str) -> bool:
-        path = self._file(self.envelope, capability, collection, key)
+    def delete(self, capability: str, collection: str, key: str,
+               scope: str | None = None) -> bool:
+        target_scope = scope or "project"
+        if target_scope not in SCOPE_KINDS:
+            raise StoreError("bad_scope",
+                             f"scope {target_scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        root = self.envelope if target_scope == "project" else self.global_dir
+        path = self._file(root, capability, collection, key)
         body = self._load(path)
         if not isinstance(body, dict):
             return False

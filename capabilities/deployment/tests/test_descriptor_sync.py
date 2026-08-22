@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import uuid
 from pathlib import Path
 
 import pytest
 
 
 CAP_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(CAP_ROOT.parent / "contract"))
+import store as S  # noqa: E402
+
 DEPLOYMENT = CAP_ROOT / "deployment" / "bin" / "deployment"
 SERVICE_CAPABILITIES = ("telegram", "automations", "slack")
 
@@ -70,6 +75,37 @@ def test_auto_discovers_only_explicit_project_services(tmp_path: Path) -> None:
     supervisor = (root / "supervisord.conf").read_text()
     assert "command=automations service run" in supervisor
     assert "command=telegram service run" in supervisor
+
+
+def test_database_records_are_service_configuration_without_envelope_files(
+        tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ())
+    settings_path = root / "capabilities" / "settings.json"
+    settings_path.unlink()
+    project_id = str(uuid.uuid4())
+    slug = "fixture-" + project_id[:8]
+    (root / "capabilities" / "project.json").write_text(json.dumps({
+        "schema": "capabilities.project.v1", "id": project_id,
+        "slug": slug, "store": "db",
+    }))
+    store_path = tmp_path / "store.db"
+    with S.SQLiteStore.open(str(store_path)) as store:
+        store.migrate()
+        store.project_register(project_id, slug)
+        scope = ("project", slug)
+        for name in ("deployment", "telegram", "automations"):
+            store.config_set("capabilities", "policy", name, {"enabled": True}, scope)
+        store.config_set("telegram", "setting", "connection", "local", scope)
+        store.context_put("telegram", "context", "prompt\n", scope, activate=True)
+        store.config_set("automations", "setting", "engine", {"tick_seconds": 1}, scope)
+    env["CAPABILITIES_STORE_URL"] = str(store_path)
+
+    setup = _setup(root, env)
+    assert setup["embedded_services"] == ["automations", "telegram"]
+    doctor = _run(root, env, "doctor")
+    payload = json.loads(doctor.stdout)
+    assert not [finding for finding in payload["findings"]
+                if "is not configured" in finding["message"]]
 
 
 def test_explicit_disable_and_enable_overrides(tmp_path: Path) -> None:

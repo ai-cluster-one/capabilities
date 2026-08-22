@@ -14,11 +14,10 @@ the full usage contract on demand.
 The manager is the engine of the capability system: it installs capability
 scripts into the machine registry, snapshots their self-descriptions, gates
 them through project/global policy, composes the session context injection, and verifies the
-whole arrangement. It is the SOLE WRITER of every shared file it manages —
-the machine registry (~/.capabilities/<name>/), the project/global policy files
-(capabilities/settings.json and $XDG_CONFIG_HOME/capabilities/settings.json),
-the project capabilities/.gitignore, the generated skill, and the host hook
-wiring. Capability scripts never write any of these.
+whole arrangement. It is the SOLE WRITER of the shared surfaces it manages —
+the machine registry (~/.capabilities/<name>/), the project/global policy
+collection, the project capabilities/.gitignore, the generated skill, and the
+host hook wiring. Capability scripts never write any of these.
 
 ENVIRONMENT
   CAPABILITIES_HOME    machine registry root        (default ~/.capabilities)
@@ -40,9 +39,10 @@ PROJECT PATH VERB
         absolute in-project path; a broken binding is an error, never a fallback.
 
 THE PROJECT ENVELOPE
-  Every project file the system owns — the gate, the state guard, and each
-  capability's identifiers, references, connections and state — sits in one
-  envelope. In a project bound by `.contextkit/config.toml` its location
+  Every project file the system owns — identity, the state guard, and each
+  file-mode capability's identifiers, references, connections and state — sits
+  in one envelope. Database-backed live records, including the gate, sit in the
+  configured store. In a project bound by `.contextkit/config.toml` its location
   belongs to ContextKit and is asked for, never assumed or stored:
   `contextkit path capabilities`, once per invocation. Without that binding the
   envelope is <root>/capabilities and the project depends on nothing outside
@@ -157,8 +157,9 @@ DEVELOPMENT VERBS
 
 POLICY VERBS
   enable <name> --project|--global / disable <name> --project|--global [--deny]
-        Write an explicit project gate (capabilities/settings.json) or the
-        machine default gate ($XDG_CONFIG_HOME/capabilities/settings.json).
+        Write an explicit policy record at project or global scope through the
+        active records backend. Files mode maps those scopes to
+        capabilities/settings.json and $XDG_CONFIG_HOME/capabilities/settings.json.
         Scope is mandatory: ask whether the decision is for this project or
         every project before invoking the manager. Project enable removes any
         harness deny rule; project disable --deny additionally writes
@@ -169,8 +170,9 @@ POLICY VERBS
 
 PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex]
-        Wire the project: scaffold capabilities/settings.json and the
-        manager-owned capabilities/.gitignore; per host, wire the
+        Wire the project: scaffold the durable project identity, the
+        manager-owned capabilities/.gitignore, and settings.json only in files
+        mode; per host, wire the
         SessionStart hook/context compiler and generate the skill. No flags
         defaults to Claude Code wiring; Codex projects must pass --codex.
         The Codex compiler is manager-owned and overwritten on each init.
@@ -185,8 +187,8 @@ PROJECT VERBS (run inside a consuming project)
         verbatim. The host modes place the same block where the host reads it (--claude:
         .claude/rules/CAPABILITIES.md; --codex: the capabilities fragment used
         by the generated .codex context compiler).
-        Composition reads files only and degradation is per-capability, never
-        whole; when Codex wiring exists, --codex also asks the generated local
+        Composition reads the active records backend and degradation is
+        per-capability, never whole; when Codex wiring exists, --codex also asks the generated local
         compiler to refresh .codex/generated/context.md. The generated agent
         instruction paragraph defaults to identifier persistence guidance and
         can be overridden with CAPABILITIES_CONTEXT_PROMPT in the project's
@@ -623,7 +625,9 @@ def _project_capabilities_dir(root: Path) -> Path:
     """Active envelope, with read compatibility for legacy projects."""
     current = _envelope_home(root)
     legacy = root / LEGACY_PROJECT_CAPABILITIES_REL
-    if (current / "settings.json").is_file() or not legacy.is_dir():
+    if ((current / "settings.json").is_file()
+            or (current / PROJECT_IDENTITY_REL).is_file()
+            or not legacy.is_dir()):
         return current
     return legacy
 
@@ -1670,10 +1674,7 @@ def cmd_self_update(from_ref: str | None = None) -> None:
 def cmd_list() -> None:
     entries = []
     root = _project_root()
-    project_gate = _load_gate_file(_gate_file(root)) if root else {"capabilities": {}}
-    global_gate = _load_gate_file(GLOBAL_GATE_FILE)
-    project_caps = project_gate["capabilities"]
-    global_caps = global_gate["capabilities"]
+    project_caps, global_caps = _policy_views(root)
     for name, meta in _installed().items():
         stub, manifest = _load_snapshots(name)
         entry: dict = {"name": name,
@@ -2475,9 +2476,9 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
     if not isinstance(manifest, dict):
         _die(6, "dev_manifest_missing", f"session payload has no manifest: {capability}")
 
-    envelope = _project_capabilities_dir(project)
-    project_gate = _load_gate_file(envelope / "settings.json").get("capabilities", {}).get(capability)
-    global_gate = None if project_only else _load_gate_file(GLOBAL_GATE_FILE).get("capabilities", {}).get(capability)
+    project_caps, global_caps = _policy_views(project)
+    project_gate = project_caps.get(capability)
+    global_gate = None if project_only else global_caps.get(capability)
     effective, gate_tier = _effective_gate_state(project_gate, global_gate)
     if effective != "enabled":
         _die(4, "disabled", f"{capability} is disabled for attached project {project}")
@@ -2592,8 +2593,8 @@ def _dev_live_inputs(session: dict) -> dict:
     """Resolve Telegram live policy, connection, state and process-only inputs."""
     project = _dev_project(session)
     assert project is not None
-    envelope = _project_capabilities_dir(project)
-    gate = _load_gate_file(envelope / "settings.json").get("capabilities", {}).get("telegram")
+    project_caps, _global_caps = _policy_views(project)
+    gate = project_caps.get("telegram")
     if not isinstance(gate, dict) or gate.get("enabled") is not True:
         _die(4, "service_project_enable_required",
              "Telegram live mode requires explicit project enable")
@@ -2603,7 +2604,8 @@ def _dev_live_inputs(session: dict) -> dict:
     adapter = _records_for(project)
     try:
         settings = {key: row["value"] for key, row in
-                    adapter.resolve("telegram", "setting").items()}
+                    adapter.resolve("telegram", "setting").items()
+                    if key != "connection.default"}
     except _store_module().StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
     finally:
@@ -3418,6 +3420,30 @@ def _load_gate(root: Path) -> dict:
     return _load_gate_file(_gate_file(root))
 
 
+def _policy_views(root: Path | None) -> tuple[dict, dict]:
+    """Policy values at each exact scope through the active records backend."""
+    if root is None:
+        return {}, _load_gate_file(GLOBAL_GATE_FILE)["capabilities"]
+    adapter = _records_for(root)
+    try:
+        project_rows = adapter.resolve_scope("capabilities", "policy", "project")
+        global_rows = adapter.resolve_scope("capabilities", "policy", "global")
+    except _store_module().StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    finally:
+        adapter.close()
+    project = {key: row["value"] for key, row in project_rows.items()}
+    global_ = {key: row["value"] for key, row in global_rows.items()}
+    for scope, entries in (("project", project), ("global", global_)):
+        for name, entry in entries.items():
+            if (not isinstance(entry, dict) or set(entry) != {"enabled"}
+                    or not isinstance(entry.get("enabled"), bool)):
+                _die(6, "bad_policy",
+                     f"invalid capability policy entry {name!r} at {scope} scope",
+                     'each entry must be exactly {"enabled": true|false}')
+    return project, global_
+
+
 def _gate_state(entry) -> str:
     if isinstance(entry, dict) and entry.get("enabled") is True:
         return "enabled"
@@ -3546,10 +3572,10 @@ def _ensure_envelope(root: Path) -> list[str]:
         existing = gi.read_text() if gi.exists() else ""
         gi.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n")
                       + GITIGNORE_BODY)
+    identity = _ensure_project_identity(capdir, root)
     gate_file = capdir / "settings.json"
-    if not gate_file.exists():
+    if identity.get("store", "files") == "files" and not gate_file.exists():
         _write_json(gate_file, {"capabilities": {}})
-    _ensure_project_identity(capdir, root)
     return migrated
 
 
@@ -3658,16 +3684,26 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False) -> None:
     if scope == "project":
         root = _require_project()
         migrated = _ensure_envelope(root)
-        gate_file = _gate_file(root)
+    elif deny:
+        _die(6, "input", "--deny is available only with --project")
+    if root is not None:
+        adapter = _records_for(root)
+        try:
+            adapter.set("capabilities", "policy", name, {"enabled": enabled},
+                        actor="capabilities", scope=scope)
+            gate_source = adapter.source
+        except _store_module().StoreError as exc:
+            _die(6, exc.slug, exc.message, exc.hint)
+        finally:
+            adapter.close()
     else:
         gate_file = GLOBAL_GATE_FILE
-        if deny:
-            _die(6, "input", "--deny is available only with --project")
-    gate = _load_gate_file(gate_file)
-    gate["capabilities"].setdefault(name, {})["enabled"] = enabled
-    _write_json(gate_file, gate)
+        gate = _load_gate_file(gate_file)
+        gate["capabilities"].setdefault(name, {})["enabled"] = enabled
+        _write_json(gate_file, gate)
+        gate_source = str(gate_file)
     result: dict = {("enabled" if enabled else "disabled"): name,
-                    "scope": scope, "gate": str(gate_file)}
+                    "scope": scope, "gate": gate_source}
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)
     if scope == "project" and enabled:
@@ -3688,14 +3724,23 @@ def _inherit_gate(name: str, scope: str) -> None:
     if scope == "project":
         root = _require_project()
         _ensure_envelope(root)
-        gate_file = _gate_file(root)
+    if root is not None:
+        adapter = _records_for(root)
+        try:
+            removed = adapter.delete("capabilities", "policy", name, scope=scope)
+            gate_source = adapter.source
+        except _store_module().StoreError as exc:
+            _die(6, exc.slug, exc.message, exc.hint)
+        finally:
+            adapter.close()
     else:
         gate_file = GLOBAL_GATE_FILE
-    gate = _load_gate_file(gate_file)
-    removed = gate["capabilities"].pop(name, None) is not None
-    _write_json(gate_file, gate)
+        gate = _load_gate_file(gate_file)
+        removed = gate["capabilities"].pop(name, None) is not None
+        _write_json(gate_file, gate)
+        gate_source = str(gate_file)
     result = {"inherited": name, "scope": scope, "removed": removed,
-              "gate": str(gate_file)}
+              "gate": gate_source}
     _refresh_after_gate(root, result)
     _regen_skills()
     _emit(result)
@@ -3726,8 +3771,7 @@ def _front_matter(source: Path | str) -> dict:
 
 def _compose_context(root: Path) -> str:
     """Deterministic injection body: gate, snapshots, and resolved records."""
-    project_caps = _load_gate(root)["capabilities"]
-    global_caps = _load_gate_file(GLOBAL_GATE_FILE)["capabilities"]
+    project_caps, global_caps = _policy_views(root)
     names = set(project_caps) | set(global_caps)
     enabled = sorted(
         name for name in names
@@ -4007,8 +4051,7 @@ def cmd_context(host: str) -> None:
         target.write_text(_compose_context(root))
     else:
         target = _write_codex_capabilities(root)
-    project_caps = _load_gate(root)["capabilities"]
-    global_caps = _load_gate_file(GLOBAL_GATE_FILE)["capabilities"]
+    project_caps, global_caps = _policy_views(root)
     enabled = [
         n for n in set(project_caps) | set(global_caps)
         if _effective_gate_state(project_caps.get(n), global_caps.get(n))[0]
@@ -4297,9 +4340,9 @@ def cmd_doctor() -> None:
             "project: legacy .capabilities/ envelope is still present — run "
             "`capabilities init` to migrate it into visible capabilities/")
     envelope = _project_capabilities_dir(root) if root else None
-    if root and envelope and (envelope / "settings.json").is_file():
-        gate_file = envelope / "settings.json"
-        caps = _check_policy(findings, "project", gate_file)
+    if root and envelope and ((envelope / "settings.json").is_file()
+                              or (envelope / PROJECT_IDENTITY_REL).is_file()):
+        caps, _global_caps = _policy_views(root)
         gi = envelope / ".gitignore"
         if not gi.exists() or "*/state/" not in gi.read_text():
             findings.append(f"project: {gi} missing the */state/ "
@@ -4321,25 +4364,28 @@ def cmd_doctor() -> None:
                     and _deny_rule(n) in deny:
                 findings.append(f"project: {n} is enabled but a deny rule blocks it "
                                 f"— remove {_deny_rule(n)} or disable the capability")
-        # Check for legacy Codex wiring (pre-direct-invocation)
-        legacy_script = root / ".codex" / "hooks" / "build-context.sh"
-        if legacy_script.exists():
-            findings.append("project: legacy .codex/hooks/build-context.sh present "
-                            "— run `capabilities init --codex` to migrate to direct invocation")
-        codex_hooks_file = root / CODEX_HOOKS_REL
-        if codex_hooks_file.exists():
-            hooks = _read_json(codex_hooks_file) or {}
-            for entry in (hooks.get("hooks", {}).get("SessionStart") or []):
-                for h in (entry or {}).get("hooks", []):
-                    if ".codex/hooks/build-context.sh" in h.get("command", ""):
-                        findings.append("project: .codex/hooks.json contains legacy hook to "
-                                        "build-context.sh — run `capabilities init --codex` to migrate")
-        codex_config = root / CODEX_CONFIG_REL
-        if codex_config.exists():
-            config_text = codex_config.read_text()
-            if ".codex/generated/context.md" in config_text:
-                findings.append("project: .codex/config.toml points to legacy context.md "
-                                "— run `capabilities init --codex` to migrate to capabilities.md")
+        # ContextKit owns every host binding in a bound project. Its compiler
+        # may intentionally use the same legacy-looking paths that standalone
+        # capabilities wiring used, so only the owner may judge them there.
+        if not _contextkit_managed(root):
+            legacy_script = root / ".codex" / "hooks" / "build-context.sh"
+            if legacy_script.exists():
+                findings.append("project: legacy .codex/hooks/build-context.sh present "
+                                "— run `capabilities init --codex` to migrate to direct invocation")
+            codex_hooks_file = root / CODEX_HOOKS_REL
+            if codex_hooks_file.exists():
+                hooks = _read_json(codex_hooks_file) or {}
+                for entry in (hooks.get("hooks", {}).get("SessionStart") or []):
+                    for h in (entry or {}).get("hooks", []):
+                        if ".codex/hooks/build-context.sh" in h.get("command", ""):
+                            findings.append("project: .codex/hooks.json contains legacy hook to "
+                                            "build-context.sh — run `capabilities init --codex` to migrate")
+            codex_config = root / CODEX_CONFIG_REL
+            if codex_config.exists():
+                config_text = codex_config.read_text()
+                if ".codex/generated/context.md" in config_text:
+                    findings.append("project: .codex/config.toml points to legacy context.md "
+                                    "— run `capabilities init --codex` to migrate to capabilities.md")
     report = {"ok": not findings, "findings": findings}
     if findings:
         _emit(report)

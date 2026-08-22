@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -71,6 +72,34 @@ emit({"type": "turn.completed", "usage": {
 }})
 Path(outfile).write_text("FINAL ANSWER MUST NOT BE PROGRESS")
 '''
+
+
+def test_database_project_migrates_session_map_from_file(tmp_path, monkeypatch):
+    root = tmp_path / "caller"
+    envelope = root / "capabilities"
+    state_file = envelope / "askproject" / "state" / "sessions.json"
+    state_file.parent.mkdir(parents=True)
+    project_id = str(uuid.uuid4())
+    slug = "fixture-" + project_id[:8]
+    (envelope / "project.json").write_text(json.dumps({
+        "schema": "capabilities.project.v1", "id": project_id,
+        "slug": slug, "store": "db",
+    }))
+    original = {"/tmp/target": {"last_session_id": "thread-1"}}
+    state_file.write_text(json.dumps(original))
+    store_path = tmp_path / "store.db"
+    with CLI.SQLiteStore.open(str(store_path)) as store:
+        store.migrate()
+        store.project_register(project_id, slug)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(root))
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ENVELOPE", str(envelope))
+    monkeypatch.setenv("CAPABILITIES_STORE_URL", str(store_path))
+
+    assert CLI.load_state() == original
+    updated = {**original, "/tmp/other": {"last_session_id": "thread-2"}}
+    CLI.save_state(updated)
+    with CLI.SQLiteStore.open(str(store_path)) as store:
+        assert store.state_get("askproject", "sessions", ("project", slug)) == updated
 
 
 CODEX_TIMEOUT_FAKE = r'''#!/usr/bin/env python3

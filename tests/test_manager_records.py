@@ -27,16 +27,14 @@ def _project(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
         "schema": "capabilities.project.v1", "id": project_id,
         "slug": slug, "store": "db",
     }))
-    (envelope / "settings.json").write_text(json.dumps({
-        "capabilities": {
-            "deployment": {"enabled": True},
-            "telegram": {"enabled": True},
-        }
-    }))
     store_path = tmp_path / "store.db"
     with S.SQLiteStore.open(str(store_path)) as store:
         store.migrate()
         store.project_register(project_id, slug)
+        store.config_set("capabilities", "policy", "deployment",
+                         {"enabled": True}, ("project", slug))
+        store.config_set("capabilities", "policy", "telegram",
+                         {"enabled": True}, ("project", slug))
     env = dict(os.environ)
     env.update({
         "CLAUDE_PROJECT_DIR": str(root),
@@ -68,6 +66,29 @@ def test_manager_get_and_set_use_the_project_records_adapter(tmp_path):
         [str(MANAGER), "get", "telegram", "setting", "tail_size"],
         root, env).stdout)
     assert value == 40
+
+
+def test_manager_lists_database_policy_without_a_settings_file(tmp_path):
+    root, env, _store_path = _project(tmp_path)
+    assert not (root / "capabilities" / "settings.json").exists()
+    listed = json.loads(_run([str(MANAGER), "list"], root, env).stdout)
+    assert listed["enabled_not_installed"] == ["deployment", "telegram"]
+
+
+def test_manager_policy_verbs_write_the_database_not_settings_json(tmp_path):
+    root, env, store_path = _project(tmp_path)
+    _run([str(MANAGER), "enable", "slack", "--project"], root, env)
+    assert not (root / "capabilities" / "settings.json").exists()
+    identity = json.loads((root / "capabilities" / "project.json").read_text())
+    with S.SQLiteStore.open(str(store_path)) as store:
+        assert store.config_get(
+            "capabilities", "policy", "slack",
+            S.Scopes(identity["slug"], include_global=False)) == {"enabled": True}
+    _run([str(MANAGER), "inherit", "slack", "--project"], root, env)
+    with S.SQLiteStore.open(str(store_path)) as store:
+        assert store.config_get(
+            "capabilities", "policy", "slack",
+            S.Scopes(identity["slug"], include_global=False)) is None
 
 
 def test_manager_does_not_take_another_writers_collection(tmp_path):
@@ -124,6 +145,7 @@ def test_telegram_service_status_is_initialized_from_store_records(tmp_path):
     with S.SQLiteStore.open(str(store_path)) as store:
         for key, value in settings.items():
             store.config_set("telegram", "setting", key, value, scope)
+        store.config_set("telegram", "setting", "connection.default", "local", scope)
         store.config_set("telegram", "connection", "local", {
             "api_id": 12345,
             "expected_account_id": 42,
