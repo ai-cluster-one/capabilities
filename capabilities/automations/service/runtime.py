@@ -15,6 +15,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -597,6 +598,130 @@ def connect(db_path: Path) -> sqlite3.Connection:
         """
     )
     return db
+
+
+class RunLedger:
+    """Every question and every claim about runs, in one place that knows whose.
+
+    The ledger is shared: on a store two machines write to, a query that forgets
+    which project it is asking about would answer with another project's runs.
+    Scoping cannot therefore be a `WHERE` clause fifteen callers are trusted to
+    remember — it is the reason this boundary exists, and it is applied here
+    once rather than at each call.
+
+    The same class serves a project keeping its runs in its own SQLite: there
+    the scope narrows nothing, because there is only one project in the file,
+    and the queries do not change shape for it."""
+
+    def __init__(self, db, project_id: str | None, environment: str):
+        self.db = db
+        self.project_id = project_id
+        self.environment = environment
+        self._scoped = project_id is not None
+
+    # -- the scope, applied once ----------------------------------------------
+
+    def _where(self, *predicates: str) -> tuple[str, list]:
+        parts, params = [], []
+        if self._scoped:
+            parts.append("project_id = ?")
+            params.append(self.project_id)
+        parts.extend(predicates)
+        return (" WHERE " + " AND ".join(parts)) if parts else "", params
+
+    @staticmethod
+    def _dicts(cursor) -> list[dict[str, Any]]:
+        """Rows as dicts without depending on a row factory. The ledger runs
+        against a bare store connection and, later, against a driver that has no
+        such notion at all, so the column names come from the cursor."""
+        names = [c[0] for c in cursor.description]
+        return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+    def _rows(self, predicates: str = "", params: Sequence[Any] = (),
+              order: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+        clause, scope_params = self._where(*([predicates] if predicates else []))
+        sql = "SELECT * FROM runs" + clause + (f" ORDER BY {order}" if order else "")
+        args = scope_params + list(params)
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(limit)
+        return self._dicts(self.db.execute(sql, tuple(args)))
+
+    # -- reads ----------------------------------------------------------------
+
+    def get(self, run_id: str) -> dict[str, Any] | None:
+        rows = self._rows("id = ?", (run_id,))
+        return rows[0] if rows else None
+
+    def list(self, *, limit: int = 50, status: str | None = None) -> list[dict[str, Any]]:
+        if status:
+            return self._rows("status = ?", (status,), order="queued_at DESC", limit=limit)
+        return self._rows(order="queued_at DESC", limit=limit)
+
+    def counts(self) -> dict[str, int]:
+        clause, params = self._where()
+        rows = self.db.execute(
+            "SELECT status, COUNT(*) AS count FROM runs" + clause + " GROUP BY status",
+            tuple(params)).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def unfinished(self) -> list[dict[str, Any]]:
+        return self._rows("status IN ('starting', 'running')")
+
+    def pending(self) -> list[dict[str, Any]]:
+        return self._rows("status = 'pending'", order="queued_at, id")
+
+    def has_active(self, slug: str, statuses: Sequence[str]) -> bool:
+        marks = ", ".join("?" for _ in statuses)
+        clause, params = self._where("automation_slug = ?", f"status IN ({marks})")
+        row = self.db.execute("SELECT 1 FROM runs" + clause + " LIMIT 1",
+                              tuple(params + [slug] + list(statuses))).fetchone()
+        return row is not None
+
+    def count_for(self, slug: str, status: str) -> int:
+        clause, params = self._where("automation_slug = ?", "status = ?")
+        return self.db.execute("SELECT COUNT(*) FROM runs" + clause,
+                               tuple(params + [slug, status])).fetchone()[0]
+
+    def running(self) -> int:
+        clause, params = self._where("status IN ('starting', 'running')")
+        return self.db.execute("SELECT COUNT(*) FROM runs" + clause,
+                               tuple(params)).fetchone()[0]
+
+    # -- writes ---------------------------------------------------------------
+
+    def claim(self, automation_uuid: str | None, slug: str, state_dir: Path, *,
+              trigger: str, scheduled_for: str | None = None,
+              dedupe_key: str | None = None, attempt: int = 1,
+              parent_run_id: str | None = None) -> dict[str, Any] | None:
+        """Take one firing, or find it already taken.
+
+        `dedupe_key` is unique, so on a shared store this is the whole of the
+        mutual exclusion: whichever machine inserts first owns the run and the
+        other is told, rather than discovering the collision by running."""
+        run_id = uuid.uuid4().hex
+        log_path = state_dir / "runs" / f"{run_id}.log"
+        try:
+            self.db.execute(
+                "INSERT INTO runs (id, project_id, automation_id, automation_slug, "
+                "environment, trigger, scheduled_for, dedupe_key, status, attempt, "
+                "parent_run_id, queued_at, log_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                (run_id, self.project_id, automation_uuid or slug, slug,
+                 self.environment, trigger, scheduled_for, dedupe_key, attempt,
+                 parent_run_id, iso(), str(log_path)))
+            self.db.commit()
+        except sqlite3.IntegrityError:
+            self.db.rollback()
+            return None
+        return self.get(run_id)
+
+    def update(self, run_id: str, **columns: Any) -> None:
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        clause, params = self._where("id = ?")
+        self.db.execute(f"UPDATE runs SET {assignments}" + clause,
+                        tuple(list(columns.values()) + params + [run_id]))
+        self.db.commit()
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:

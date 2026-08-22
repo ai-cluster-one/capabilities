@@ -462,3 +462,73 @@ def test_a_run_cannot_name_an_automation_that_is_not_there(tmp_path):
     with pytest.raises(_sqlite3.IntegrityError):
         _claim(st, project_id, "99999999-9999-9999-9999-999999999999", "x")
     st.close()
+
+
+def _ledger(st, project_id, environment="production"):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import runtime as rt
+    return rt.RunLedger(st._conn, project_id, environment)
+
+
+def test_the_ledger_answers_only_about_its_own_project(tmp_path):
+    """The reason scoping is a boundary and not a WHERE clause fifteen callers
+    are trusted to remember."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import runtime as rt
+
+    st, mine, automation_id = _store_with_automation(tmp_path)
+    st.project_register("99999999-8888-7777-6666-555555555555", "other")
+    theirs = st._project_id("other")
+    other_automation = rt.store_upsert(st, "project", theirs, {
+        "slug": "nightly", "name": None, "description": None, "enabled": 1,
+        "script_key": "script.nightly", "schedule": "0 3 * * *", "every_seconds": None,
+        "timeout_seconds": 300.0, "max_parallel": 1, "max_pending": 1,
+        "overlap": "skip", "retries": 0, "arguments": [], "environments": [],
+    })
+    st._conn.commit()
+
+    ours = _ledger(st, mine)
+    others = _ledger(st, theirs)
+    (tmp_path / "runs").mkdir(exist_ok=True)
+
+    assert ours.claim(automation_id, "nightly", tmp_path, trigger="manual") is not None
+    assert others.claim(other_automation, "nightly", tmp_path, trigger="manual") is not None
+
+    assert len(ours.list()) == 1
+    assert len(others.list()) == 1
+    assert ours.counts() == {"pending": 1}
+    assert st._execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+
+    # and a run belonging to the other project is invisible, not merely filtered
+    theirs_run = others.list()[0]
+    assert ours.get(theirs_run["id"]) is None
+    st.close()
+
+
+def test_two_ledgers_racing_one_firing_leave_one_run(tmp_path):
+    st, project_id, automation_id = _store_with_automation(tmp_path)
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    a, b = _ledger(st, project_id), _ledger(st, project_id)
+    dedupe = "marvin:production:nightly:2026-08-23T03:00:00+00:00"
+
+    first = a.claim(automation_id, "nightly", tmp_path, trigger="schedule", dedupe_key=dedupe)
+    second = b.claim(automation_id, "nightly", tmp_path, trigger="schedule", dedupe_key=dedupe)
+
+    assert first is not None and second is None
+    assert len(a.list()) == 1
+    st.close()
+
+
+def test_the_ledger_counts_per_automation_within_the_project(tmp_path):
+    st, project_id, automation_id = _store_with_automation(tmp_path)
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    led = _ledger(st, project_id)
+    led.claim(automation_id, "nightly", tmp_path, trigger="manual")
+
+    assert led.count_for("nightly", "pending") == 1
+    assert led.count_for("other-thing", "pending") == 0
+    assert led.has_active("nightly", ["pending"]) is True
+    assert led.running() == 0
+    st.close()
