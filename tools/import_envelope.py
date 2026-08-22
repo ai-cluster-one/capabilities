@@ -121,6 +121,26 @@ def _script_key(script_path: str) -> str:
     return "script." + Path(script_path).stem.replace("_", "-").lower()
 
 
+def _toml_comments(text: str) -> list[str]:
+    """The comment block standing above each `[[automations]]` header, in order.
+
+    `tomllib` throws comments away, and for this file that would throw away the
+    only record of WHY each automation exists — which is exactly what the
+    description column is for. So the text is read twice: once for the values,
+    once for the prose above them."""
+    blocks, current = [], []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            current.append(stripped.lstrip("#").strip())
+        elif stripped == "[[automations]]":
+            blocks.append(" ".join(current).strip() or None)
+            current = []
+        elif stripped:
+            current = []
+    return blocks
+
+
 def plan_automations(envelope: Path) -> list[dict]:
     """The `[[automations]]` array as rows. The one transformation: `script`
     stops being a path into the repository and becomes the key of a document,
@@ -128,16 +148,21 @@ def plan_automations(envelope: Path) -> list[dict]:
     config = envelope / "automations" / "service" / "config.toml"
     if not config.is_file():
         return []
+    text = config.read_text()
     try:
-        raw = tomllib.loads(config.read_text())
+        raw = tomllib.loads(text)
     except (OSError, tomllib.TOMLDecodeError):
         return []
+    descriptions = _toml_comments(text)
     out = []
-    for item in raw.get("automations") or []:
+    for index, item in enumerate(raw.get("automations") or []):
         if not isinstance(item, dict) or not item.get("id"):
             continue
         out.append({
-            "id": item["id"],
+            "slug": item["id"],
+            "name": item.get("name"),
+            "description": item.get("description")
+            or (descriptions[index] if index < len(descriptions) else None),
             "enabled": 1 if item.get("enabled", True) else 0,
             "script_key": _script_key(str(item.get("script") or "")),
             "schedule": item.get("schedule"),
@@ -241,7 +266,7 @@ def main() -> int:
               "rows": len(rows), "by_collection": counts,
               "documents": len(documents), "automations": len(automations),
               "applied": False}
-    orphan_scripts = [a["id"] for a in automations
+    orphan_scripts = [a["slug"] for a in automations
                       if ("automations", a["script_key"]) not in document_keys]
     if orphan_scripts:
         report["automations_without_a_script"] = orphan_scripts

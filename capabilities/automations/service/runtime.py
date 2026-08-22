@@ -232,10 +232,12 @@ STORE_VERSION = 1
 STORE_MIGRATIONS = [
     """
     CREATE TABLE IF NOT EXISTS automations (
-        id_uuid          TEXT,
+        id               TEXT PRIMARY KEY,
         scope            TEXT NOT NULL,
         project_id       TEXT REFERENCES projects(id),
-        id               TEXT NOT NULL,
+        slug             TEXT NOT NULL,
+        name             TEXT,
+        description      TEXT,
         enabled          INTEGER NOT NULL DEFAULT 1,
         script_key       TEXT NOT NULL,
         schedule         TEXT,
@@ -247,10 +249,15 @@ STORE_MIGRATIONS = [
         retries          INTEGER NOT NULL DEFAULT 0,
         arguments        {json},
         environments     {json},
-        note             TEXT,
-        updated_at       TEXT NOT NULL,
-        PRIMARY KEY (scope, project_id, id)
+        updated_at       TEXT NOT NULL
     )
+    """,
+    # The slug is what a person types and what a run refers to; the id is what
+    # a row refers to. Unique per scope, because two projects may each have an
+    # automation they both call `nightly`.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS automations_slug_idx
+        ON automations (scope, COALESCE(project_id, ''), slug)
     """,
     """
     CREATE INDEX IF NOT EXISTS automations_due_idx
@@ -259,28 +266,33 @@ STORE_MIGRATIONS = [
 ]
 
 
-def store_upsert(store, scope: str, project_id: str | None, item: dict) -> None:
-    """Write one automation row. The table is this capability's, so the SQL that
-    touches it lives here beside the schema rather than in whatever tool happens
-    to be filling it in."""
+def store_upsert(store, scope: str, project_id: str | None, item: dict) -> str:
+    """Write one automation row and return its id. The table is this
+    capability's, so the SQL that touches it lives here beside the schema rather
+    than in whatever tool happens to be filling it in."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    existing = store._execute(
+        "SELECT id FROM automations WHERE scope = ? AND COALESCE(project_id,'') = ? "
+        "AND slug = ?", (scope, project_id or "", item["slug"])).fetchone()
+    values = (item["name"], item["description"], item["enabled"], item["script_key"],
+              item["schedule"], item["every_seconds"], item["timeout_seconds"],
+              item["max_parallel"], item["max_pending"], item["overlap"], item["retries"],
+              store._encode(item["arguments"]), store._encode(item["environments"]), now)
+    if existing:
+        store._execute(
+            "UPDATE automations SET name = ?, description = ?, enabled = ?, script_key = ?, "
+            "schedule = ?, every_seconds = ?, timeout_seconds = ?, max_parallel = ?, "
+            "max_pending = ?, overlap = ?, retries = ?, arguments = ?, environments = ?, "
+            "updated_at = ? WHERE id = ?", values + (existing[0],))
+        return existing[0]
+    row_id = str(uuid.uuid4())
     store._execute(
-        "INSERT INTO automations (id_uuid, scope, project_id, id, enabled, script_key, "
-        "schedule, every_seconds, timeout_seconds, max_parallel, max_pending, overlap, "
-        "retries, arguments, environments, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT (scope, project_id, id) DO UPDATE SET "
-        "enabled = EXCLUDED.enabled, script_key = EXCLUDED.script_key, "
-        "schedule = EXCLUDED.schedule, every_seconds = EXCLUDED.every_seconds, "
-        "timeout_seconds = EXCLUDED.timeout_seconds, max_parallel = EXCLUDED.max_parallel, "
-        "max_pending = EXCLUDED.max_pending, overlap = EXCLUDED.overlap, "
-        "retries = EXCLUDED.retries, arguments = EXCLUDED.arguments, "
-        "environments = EXCLUDED.environments, updated_at = EXCLUDED.updated_at",
-        (str(uuid.uuid4()), scope, project_id, item["id"], item["enabled"],
-         item["script_key"], item["schedule"], item["every_seconds"],
-         item["timeout_seconds"], item["max_parallel"], item["max_pending"],
-         item["overlap"], item["retries"],
-         store._encode(item["arguments"]), store._encode(item["environments"]),
-         datetime.now(timezone.utc).isoformat(timespec="seconds")))
+        "INSERT INTO automations (id, scope, project_id, slug, name, description, enabled, "
+        "script_key, schedule, every_seconds, timeout_seconds, max_parallel, max_pending, "
+        "overlap, retries, arguments, environments, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (row_id, scope, project_id, item["slug"]) + values)
+    return row_id
 
 
 def load_config(root: Path, config_path: Path) -> dict[str, Any]:
