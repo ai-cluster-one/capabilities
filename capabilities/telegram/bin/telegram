@@ -1110,6 +1110,14 @@ COLLECTIONS: dict[str, dict[str, str]] = {
 # because "does a write leave the system" is the capability's fact.
 GRANT_FIELDS = ("enabled", "allow_write")
 
+# A document version is named by the first twelve hex characters of its sha256.
+# Forty-eight bits is far more than a project's worth of prose needs, and a name
+# a person can read at a glance is worth more than headroom nobody will reach.
+# What makes the truncation safe is not the arithmetic but `document_put`, which
+# refuses a hash that already names different text rather than keeping the older
+# body and serving it under the newer name.
+HASH_LENGTH = 12
+
 # A key is a label a human chose, and for a mailbox that label is naturally an
 # email address — so `@` and `+` belong here. What stays out is whitespace,
 # separators and anything that would make a key ambiguous to address.
@@ -1664,14 +1672,23 @@ class Store:
         _check("key", key, KEY_RE)
         if not isinstance(body, str):
             raise StoreError("bad_document", "a document body must be text")
-        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:HASH_LENGTH]
         with self.transaction():
-            self._execute(
-                "INSERT INTO documents (capability, key, hash, body, media_type, "
-                "author, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT (capability, key, hash) DO NOTHING",
-                (capability, key, digest, body, media_type, author, _now()),
-            )
+            cur = self._execute(
+                "SELECT body FROM documents WHERE capability = ? AND key = ? AND hash = ?",
+                (capability, key, digest))
+            existing = cur.fetchone()
+            if existing and existing[0] != body:
+                raise StoreError(
+                    "hash_collision",
+                    f"version {digest} of {capability}/{key} already names different text",
+                    "this is what the truncated hash is checked for; report it")
+            if not existing:
+                self._execute(
+                    "INSERT INTO documents (capability, key, hash, body, media_type, "
+                    "author, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (capability, key, digest, body, media_type, author, _now()),
+                )
         return digest
 
     def document_pin(self, capability: str, key: str, digest: str,
@@ -1685,7 +1702,7 @@ class Store:
             (capability, key, digest))
         if not cur.fetchone():
             raise StoreError("unknown_version",
-                             f"no recorded version {digest[:12]} of {capability}/{key}",
+                             f"no recorded version {digest} of {capability}/{key}",
                              "record it with document_put first")
         self.config_set(capability, "document", key, {"hash": digest}, scope, actor=actor)
 
@@ -1706,7 +1723,7 @@ class Store:
         if not row:
             raise StoreError(
                 "missing_version",
-                f"{capability}/{key} is pinned to version {digest[:12]}, which is "
+                f"{capability}/{key} is pinned to version {digest}, which is "
                 "not recorded",
                 "pin a version that exists, or record this one")
         return {"key": key, "hash": digest, "body": row[0], "media_type": row[1],
