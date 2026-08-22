@@ -2156,6 +2156,11 @@ def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items()
            if key in safe_keys or key.startswith("LC_")}
     paths = session["paths"]
+    canonical_bin = _bin_dir().resolve()
+    inherited_path = os.pathsep.join(
+        entry for entry in os.environ.get("PATH", os.defpath).split(os.pathsep)
+        if entry and Path(entry).expanduser().resolve() != canonical_bin
+    )
     env.update({
         "HOME": paths["home"],
         "CAPABILITIES_HOME": paths["registry"],
@@ -2167,7 +2172,7 @@ def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
         "CAPABILITIES_DEV_SESSION": session["id"],
         "CAPABILITIES_DEV_SOURCE": session["source"]["worktree"],
         "CAPABILITIES_DEV_SOURCE_ID": session["source"]["id"],
-        "PATH": paths["bin"] + os.pathsep + os.environ.get("PATH", os.defpath),
+        "PATH": paths["bin"] + os.pathsep + inherited_path,
         "UV_CACHE_DIR": str(Path(paths["cache"]) / "uv"),
     })
     for key in inherit or []:
@@ -2547,6 +2552,11 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
             "CAPABILITIES_DEV_PROJECT": str(project),
             "CAPABILITIES_DEV_EXECUTION": "project",
         })
+        if registry_mode == "db":
+            env["CAPABILITIES_STORE_URL"] = (
+                os.environ.get("CAPABILITIES_STORE_URL")
+                or str(DEFAULT_STORE_PATH)
+            )
         if project_only:
             env["CAPABILITIES_RECORDS_PROJECT_ONLY"] = "1"
         proc = subprocess.run(
