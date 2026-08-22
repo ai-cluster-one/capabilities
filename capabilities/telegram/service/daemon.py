@@ -1028,19 +1028,19 @@ def _project_identity_file():
 
 
 def _store_document(key):
+    """The pinned version of one document, or nothing if the project keeps no
+    such document. Every other way this can fail raises: a prompt the daemon
+    could not read is not a prompt that is empty, and answering without one is
+    the silent degradation the mode exists to prevent. The dispatch loop turns
+    the raise into a failed job the requester is told about."""
     identity = _project_identity_file() or {}
     if not identity.get("slug"):
-        return None
-    try:
-        import store as _store
-    except ImportError:
-        return None
-    try:
-        with _store.open_store() as st:
-            doc = st.context_read(NAME, key, _store.Scopes(project=identity["slug"]))
-    except _store.StoreError as e:
-        log(f"store: cannot read document {key!r}: {e.message}")
-        return None
+        raise RuntimeError(
+            f"{PROJECT_CAPABILITIES_DIR / 'project.json'} keeps this project's "
+            "records in the store but declares no slug to read them under")
+    import store as _store
+    with _store.open_store() as st:
+        doc = st.context_read(NAME, key, _store.Scopes(project=identity["slug"]))
     return doc["body"] if doc else None
 
 
