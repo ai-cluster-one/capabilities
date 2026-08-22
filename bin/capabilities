@@ -283,6 +283,12 @@ LEGACY_DEV_SESSION_SCHEMA = "capabilities.dev.session.v1"
 DEV_STATE_ROOT = _STATE_HOME / "capabilities" / "dev"
 DEV_DATA_ROOT = _DATA_HOME / "capabilities" / "dev"
 MANAGER_MUTATION_LOCK = _STATE_HOME / "capabilities" / "manager-mutation.lock"
+# Where records live when nothing overrides it. Operational tracking always
+# goes to a store — a capability inventing its own database for a queue or a
+# ledger is an accident of that being easy, not a decision — so the store has
+# to exist without anyone having configured one. The manager answers for the
+# location at use time and never records it, as it does for the envelope.
+DEFAULT_STORE_PATH = _STATE_HOME / "capabilities" / "store.db"
 _MANAGER_MUTATION_DEPTH = 0
 DEV_MANAGED_ENV_KEYS = {
     "HOME", "PATH", "CAPABILITIES_HOME", "CAPABILITIES_BIN",
@@ -3467,6 +3473,22 @@ def _default_project_slug(root: Path) -> str:
 def _project_identity(root: Path) -> dict | None:
     identity = _read_json(_envelope_home(root) / PROJECT_IDENTITY_REL)
     return identity if isinstance(identity, dict) and identity.get("id") else None
+
+
+def cmd_path_store() -> None:
+    """Where records go, and what decided. A store URL may carry a password, so
+    the credential is stripped rather than printed: this is a report, and a
+    report is not a place a secret appears."""
+    configured = os.environ.get("CAPABILITIES_STORE_URL")
+    url = configured or str(DEFAULT_STORE_PATH)
+    shown = url
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        if "@" in rest:
+            rest = rest.split("@", 1)[1]
+        shown = f"{scheme}://{rest.split('?', 1)[0]}"
+    _emit({"store": shown,
+           "source": "CAPABILITIES_STORE_URL" if configured else "default"})
 
 
 def _deny_rule(name: str) -> str:
@@ -6695,6 +6717,8 @@ def main() -> None:
         cmd_self_update()
     elif cmd == "list":
         cmd_list()
+    elif cmd == "path" and pos and pos[0] == "store":
+        cmd_path_store()
     elif cmd == "path":
         cmd_path(flag("--json"))
     elif cmd == "search":
