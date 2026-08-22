@@ -720,28 +720,94 @@ def _cmd_ids(argv: list[str]) -> None:
     _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
 
 
-def _cmd_refs() -> None:
+REFERENCE_PREFIX = "reference."
+
+
+def _front_matter(body: str) -> tuple[str | None, str | None]:
+    """`name` and `description` out of a reference's leading front matter."""
+    lines = body.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, None
+    name = desc = None
+    for line in lines[1:30]:
+        if line.strip() == "---":
+            break
+        if line.startswith("name:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("description:"):
+            desc = line.split(":", 1)[1].strip()
+    return name, desc
+
+
+def _reference_bodies() -> dict[str, str]:
+    """Every reference this project can see, keyed by its document key.
+
+    In the store a reference is a pinned document like any other long text, so
+    an edit reaches every host at once and an unpinned draft reaches none."""
+    mode, _why = _store_mode()
+    if mode == "db":
+        scopes = _identifiers_scopes()
+        out: dict[str, str] = {}
+        try:
+            with open_store() as store:
+                for key in store.document_keys(NAME):
+                    if not key.startswith(REFERENCE_PREFIX):
+                        continue
+                    doc = store.document_read(NAME, key, scopes)
+                    if doc:
+                        out[key] = doc["body"]
+        except StoreError as e:
+            _die(6, e.slug, e.message, e.hint)
+        return out
     envdir = _env_dir()
     refdir = (envdir / "reference") if envdir else None
-    out = []
-    if refdir and refdir.is_dir():
-        for md in sorted(refdir.glob("*.md")):
-            name = desc = None
-            try:
-                lines = md.read_text().splitlines()
-            except OSError:
-                continue
-            if lines and lines[0].strip() == "---":
-                for line in lines[1:30]:
-                    if line.strip() == "---":
-                        break
-                    if line.startswith("name:"):
-                        name = line.split(":", 1)[1].strip()
-                    elif line.startswith("description:"):
-                        desc = line.split(":", 1)[1].strip()
-            if name:
-                out.append({"name": name, "description": desc or "", "path": str(md)})
-    _emit(out)
+    if not refdir or not refdir.is_dir():
+        return {}
+    bodies = {}
+    for md in sorted(refdir.glob("*.md")):
+        try:
+            bodies[REFERENCE_PREFIX + md.stem.replace("_", "-").lower()] = md.read_text()
+        except OSError:
+            continue
+    return bodies
+
+
+def _cmd_refs(argv: list[str] | None = None) -> None:
+    """`refs` lists what this project can load; `refs show <name>` prints one.
+
+    The listing carries a `source` rather than a path, because a reference kept
+    in the store has no path to open — `refs show` is the one way to read a
+    body that works whichever source answered."""
+    argv = argv or []
+    bodies = _reference_bodies()
+    mode, _why = _store_mode()
+    entries = []
+    for key, body in sorted(bodies.items()):
+        name, desc = _front_matter(body)
+        if not name:
+            continue
+        entry = {"name": name, "description": desc or "", "key": key}
+        if mode == "db":
+            entry["source"] = _store_source_label()
+        else:
+            envdir = _env_dir()
+            stem = key[len(REFERENCE_PREFIX):]
+            entry["path"] = str((envdir / "reference" / f"{stem}.md")) if envdir else ""
+        entries.append((name, entry, body))
+
+    if argv and argv[0] == "show":
+        if len(argv) < 2:
+            _die(6, "input", f"usage: {NAME} refs show <name>")
+        wanted = argv[1]
+        for name, entry, body in entries:
+            if wanted in (name, entry["key"], entry["key"][len(REFERENCE_PREFIX):]):
+                sys.stdout.write(body if body.endswith("\n") else body + "\n")
+                return
+        _die(3, "not_found", f"no reference named {wanted!r}",
+             f"`{NAME} refs` lists them")
+    if argv:
+        _die(6, "input", f"unknown refs subcommand {argv[0]!r}", f"{NAME} refs [show <name>]")
+    _emit([entry for _name, entry, _body in entries])
 
 
 def _contract(argv: list[str]) -> None:
@@ -765,7 +831,7 @@ def _contract(argv: list[str]) -> None:
     elif cmd == "ids":
         _cmd_ids(argv[1:])
     elif cmd == "refs":
-        _cmd_refs()
+        _cmd_refs(argv[1:])
     elif cmd == "connections":
         _cmd_connections()
     elif cmd == "help" and len(argv) == 1:

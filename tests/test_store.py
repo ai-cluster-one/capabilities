@@ -519,3 +519,14 @@ def test_history_omits_the_bodies_it_lists(store):
     store.document_put("telegram", "voice-agent", "x" * 5000)
     entry = store.document_versions("telegram", "voice-agent")[0]
     assert entry["bytes"] == 5000 and "body" not in entry
+
+
+def test_a_reference_is_a_document_like_any_other(store, scopes):
+    """What `refs` reads in store mode: pinned versions only, drafts invisible."""
+    body = "---\nname: Project Telegram Session\ndescription: how to wire it\n---\n\nbody\n"
+    digest = store.document_put("telegram", "reference.project-session", body,
+                                media_type="text/markdown")
+    assert store.document_read("telegram", "reference.project-session", scopes) is None
+    store.document_pin("telegram", "reference.project-session", digest, ("project", "marvin"))
+    assert store.document_read("telegram", "reference.project-session", scopes)["body"] == body
+    assert store.document_keys("telegram") == ["reference.project-session"]
