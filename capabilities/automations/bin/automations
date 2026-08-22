@@ -1032,7 +1032,7 @@ def _runtime_module():
 def _load(root: Path):
     runtime = _runtime_module()
     try:
-        config = runtime.load_config(root, _config_path(root))
+        config = runtime.load_effective_config(root, _config_path(root), _state_path(root))
     except runtime.ConfigError as exc:
         _die(6, "invalid_config", str(exc), "run `automations service init` or repair config.toml")
     project_env = _project_env()
