@@ -75,6 +75,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -1087,5 +1088,443 @@ def open_store(url: str | None = None) -> "Store":
         return SQLiteStore.open(url)
     raise StoreError("unknown_store", f"unsupported store scheme {scheme!r}",
                      "expected sqlite:// or postgresql://")
+
+
+# --- records: the two places a project may keep its configuration ------------
+#
+# Tracking is not on this axis. Runs, queues and cursors live in the store
+# always, because a ledger with a files mode is a ledger nothing can query.
+# What a project chooses is where its CONFIGURATION is read and written, and
+# these two answer that. A capability calls the same verbs either way and is
+# never told which answered, which is the whole point: a call site that can
+# tell is a call site that will eventually decide.
+
+DOCUMENT_LOCATIONS: tuple[tuple[str | None, str, str], ...] = (
+    ("reference", "{cap}/reference", ".md"),
+    ("context", "{cap}/service/context", ".md"),
+    ("script", "automations/scripts", ".py"),
+    (None, "{cap}/service", ".md"),
+)
+
+
+def _document_key(prefix: str | None, stem: str) -> str:
+    """The key a file answers to. Underscores fold to hyphens and case is lost,
+    so the map from file to key is one-way — which is why finding a document
+    searches rather than computes."""
+    slug = stem.replace("_", "-").lower()
+    return f"{prefix}.{slug}" if prefix else slug
+
+
+class Records:
+    """The surface a capability reads and writes its configuration through.
+
+    Every verb here is answered by both a directory of files and a database.
+    Neither is asked which it is."""
+
+    mode = "?"
+    source = "?"
+
+    def __enter__(self) -> "Records":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        pass
+
+
+class StoreRecords(Records):
+    """Configuration kept as rows. Thin, because the store already does this —
+    what this adds is a fixed project, so no call site carries a scope it could
+    forget."""
+
+    mode = "db"
+
+    def __init__(self, store: "Store", scopes: "Scopes", write_scope: tuple):
+        self.store, self.scopes, self.write_scope = store, scopes, write_scope
+        self.source = getattr(store, "label", "store")
+
+    def close(self) -> None:
+        self.store.close()
+
+    def resolve(self, capability: str, collection: str) -> dict[str, dict[str, Any]]:
+        return self.store.config_resolve(capability, collection, self.scopes)
+
+    def get(self, capability: str, collection: str, key: str) -> Any:
+        return self.store.config_get(capability, collection, key, self.scopes)
+
+    def set(self, capability: str, collection: str, key: str, value: Any,
+            actor: str | None = None, note: str | None = None) -> None:
+        self.store.config_set(capability, collection, key, value,
+                              self.write_scope, actor=actor, note=note)
+
+    def delete(self, capability: str, collection: str, key: str) -> bool:
+        return self.store.config_delete(capability, collection, key, self.write_scope)
+
+    def connections(self, capability: str, write_default: bool = False,
+                    include_disabled: bool = False) -> dict[str, dict[str, Any]]:
+        return self.store.connections_effective(
+            capability, self.scopes, write_default=write_default,
+            include_disabled=include_disabled)
+
+    def document_read(self, capability: str, key: str) -> dict[str, Any] | None:
+        return self.store.context_read(capability, key, self.scopes)
+
+    def document_keys(self, capability: str) -> list[str]:
+        return self.store.context_keys(capability, self.scopes)
+
+    def document_path(self, capability: str, key: str) -> Path | None:
+        """Nothing to open: a version in the store is not a file anywhere. The
+        working copy an edit needs is the caller's to make, and `put` is what
+        makes it land."""
+        return None
+
+    def document_put(self, capability: str, key: str, body: str,
+                     author: str | None = None, media_type: str | None = None,
+                     base: str | None = None) -> str:
+        if base is not None:
+            current = self.store.context_read(capability, key, self.scopes)
+            live = current["hash"] if current else None
+            if live != base:
+                raise StoreError(
+                    "stale_edit",
+                    f"{capability}/{key} was {live or 'absent'} when this landed, "
+                    f"not {base} as it was when the edit began",
+                    "re-read it and apply the change again")
+        return self.store.context_put(capability, key, body, self.write_scope,
+                                      author=author, media_type=media_type,
+                                      activate=True)
+
+
+class FileRecords(Records):
+    """Configuration kept as the files the envelope has always held.
+
+    The layout is not invented here — it is the one the capabilities already
+    read, described in one place instead of re-derived at each call site. Two
+    directories with that layout make the scope chain: the project's envelope,
+    then the user's config home."""
+
+    mode = "files"
+
+    def __init__(self, envelope: Path, global_dir: Path,
+                 project_id: str | None = None, project: str | None = None):
+        self.envelope, self.global_dir = Path(envelope), Path(global_dir)
+        self.project_id, self.project = project_id, project
+        self.source = str(self.envelope)
+
+    # -- where a record lives --------------------------------------------------
+
+    def _chain(self) -> list[tuple[str, str | None, Path]]:
+        return [("project", self.project_id, self.envelope),
+                ("global", None, self.global_dir)]
+
+    @staticmethod
+    def _load(path: Path) -> Any:
+        try:
+            return json.loads(path.read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise StoreError("bad_config", f"cannot read {path}: {exc}") from None
+
+    @staticmethod
+    def _save(path: Path, body: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(body, indent=2, ensure_ascii=False) + "\n")
+
+    def _file(self, root: Path, capability: str, collection: str,
+              key: str | None = None) -> Path:
+        if collection == "policy":
+            return root / "settings.json"
+        if collection == "identifier":
+            return root / capability / "identifiers.json"
+        if collection in ("connection", "grant"):
+            return root / capability / "connections.json"
+        if collection == "setting":
+            if key == "connection.default":
+                return root / capability / "connections.json"
+            return root / capability / "service" / "settings.json"
+        raise StoreError("bad_collection",
+                         f"collection {collection!r} is not kept in files",
+                         "it exists only where the project keeps records in the store")
+
+    # -- reading ---------------------------------------------------------------
+
+    def _entries(self, root: Path, capability: str, collection: str) -> dict[str, Any]:
+        """Every entry of one collection held at one scope, keyed as the store
+        keys them, so the two agree on what a record is called."""
+        if collection == "policy":
+            body = self._load(root / "settings.json") or {}
+            return dict((body.get("capabilities") or {}))
+        if collection == "identifier":
+            body = self._load(root / capability / "identifiers.json") or {}
+            raw = body.get("identifiers") if isinstance(body.get("identifiers"), dict) else body
+            out = {}
+            for label, entry in raw.items():
+                out[label] = entry["value"] if isinstance(entry, dict) and "value" in entry else entry
+            return out
+        registry = self._load(root / capability / "connections.json") or {}
+        if collection in ("connection", "grant"):
+            declared = registry.get("connections")
+            if not isinstance(declared, dict):
+                return {}
+            out = {}
+            for cid, entry in declared.items():
+                if not isinstance(entry, dict):
+                    continue
+                if collection == "connection":
+                    out[cid] = {k: v for k, v in entry.items() if k not in GRANT_FIELDS}
+                else:
+                    grant = {k: entry[k] for k in GRANT_FIELDS if k in entry}
+                    if grant:
+                        out[cid] = grant
+            return out
+        if collection == "setting":
+            out = {}
+            if registry.get("default"):
+                out["connection.default"] = registry["default"]
+            service = self._load(root / capability / "service" / "settings.json")
+            if isinstance(service, dict):
+                out.update(service)
+            return out
+        raise StoreError("bad_collection", f"unknown collection {collection!r}",
+                         f"known: {', '.join(sorted(COLLECTIONS))}")
+
+    def _note(self, root: Path, capability: str, collection: str, key: str) -> str | None:
+        if collection != "identifier":
+            return None
+        body = self._load(root / capability / "identifiers.json") or {}
+        raw = body.get("identifiers") if isinstance(body.get("identifiers"), dict) else body
+        entry = raw.get(key)
+        return entry.get("note") if isinstance(entry, dict) else None
+
+    def resolve(self, capability: str, collection: str) -> dict[str, dict[str, Any]]:
+        _check("capability", capability, CAPABILITY_RE)
+        semantics = Store._semantics(collection)
+        out: dict[str, dict[str, Any]] = {}
+        for scope, pid, root in self._chain():
+            entries = self._entries(root, capability, collection)
+            if not entries:
+                continue
+            rows = {
+                key: {"id": f"{scope}:{capability}/{collection}/{key}", "scope": scope,
+                      "project_id": pid, "capability": capability,
+                      "collection": collection, "key": key, "value": value,
+                      "note": self._note(root, capability, collection, key),
+                      "updated_at": None, "updated_by": None}
+                for key, value in entries.items()
+            }
+            if semantics == FIRST:
+                return rows
+            for key, row in rows.items():
+                out.setdefault(key, row)
+        return out
+
+    def get(self, capability: str, collection: str, key: str) -> Any:
+        entry = self.resolve(capability, collection).get(key)
+        return entry["value"] if entry else None
+
+    def connections(self, capability: str, write_default: bool = False,
+                    include_disabled: bool = False) -> dict[str, dict[str, Any]]:
+        """Assembled exactly as the store assembles it, from the same two
+        collections, so a project changing where it keeps records does not
+        change which connection answers."""
+        return Store.connections_effective(
+            self, capability, None, write_default=write_default,
+            include_disabled=include_disabled)
+
+    def config_resolve(self, capability: str, collection: str, _scopes: Any) -> dict:
+        """`connections_effective` reaches for this name; the scopes it passes
+        are already fixed here."""
+        return self.resolve(capability, collection)
+
+    # -- writing ---------------------------------------------------------------
+
+    def set(self, capability: str, collection: str, key: str, value: Any,
+            actor: str | None = None, note: str | None = None) -> None:
+        _check("capability", capability, CAPABILITY_RE)
+        _check("key", key, KEY_RE)
+        Store._semantics(collection)
+        path = self._file(self.envelope, capability, collection, key)
+        body = self._load(path)
+        body = body if isinstance(body, dict) else {}
+        if collection == "policy":
+            body.setdefault("capabilities", {})[key] = value
+        elif collection == "identifier":
+            holder = body.setdefault("identifiers", {}) if "identifiers" in body or not body else body
+            holder[key] = {"value": value, "note": note} if note else {"value": value}
+        elif collection in ("connection", "grant"):
+            entry = body.setdefault("connections", {}).setdefault(key, {})
+            if collection == "connection":
+                for field in list(entry):
+                    if field not in GRANT_FIELDS:
+                        entry.pop(field)
+                entry.update(value if isinstance(value, dict) else {})
+            else:
+                entry.update({k: v for k, v in (value or {}).items() if k in GRANT_FIELDS})
+        elif key == "connection.default":
+            body["default"] = value
+        else:
+            body[key] = value
+        self._save(path, body)
+
+    def delete(self, capability: str, collection: str, key: str) -> bool:
+        path = self._file(self.envelope, capability, collection, key)
+        body = self._load(path)
+        if not isinstance(body, dict):
+            return False
+        if collection == "policy":
+            gone = (body.get("capabilities") or {}).pop(key, None) is not None
+        elif collection == "identifier":
+            holder = body.get("identifiers") if isinstance(body.get("identifiers"), dict) else body
+            gone = holder.pop(key, None) is not None
+        elif collection in ("connection", "grant"):
+            entry = (body.get("connections") or {}).get(key)
+            if not isinstance(entry, dict):
+                return False
+            if collection == "connection":
+                gone = body["connections"].pop(key, None) is not None
+            else:
+                gone = any(entry.pop(field, None) is not None for field in GRANT_FIELDS)
+        elif key == "connection.default":
+            gone = body.pop("default", None) is not None
+        else:
+            gone = body.pop(key, None) is not None
+        if gone:
+            self._save(path, body)
+        return gone
+
+    # -- documents -------------------------------------------------------------
+
+    def _documents(self, root: Path, capability: str) -> dict[str, Path]:
+        """Every long-text file this scope holds, by the key it answers to. The
+        map is built by walking rather than by computing a path from a key,
+        because the key loses case and underscores on the way in."""
+        found: dict[str, Path] = {}
+        for prefix, shape, suffix in DOCUMENT_LOCATIONS:
+            folder = root / shape.format(cap=capability)
+            if not folder.is_dir():
+                continue
+            for path in sorted(folder.glob(f"*{suffix}")):
+                if path.is_file():
+                    found.setdefault(_document_key(prefix, path.stem), path)
+        return found
+
+    def document_path(self, capability: str, key: str) -> Path | None:
+        """The file this key names. It is the truth here, not a copy of it, so
+        an edit to what this returns is the edit — which is why `put` validates
+        rather than transports."""
+        for _scope, _pid, root in self._chain():
+            path = self._documents(root, capability).get(key)
+            if path:
+                return path
+        return None
+
+    def document_read(self, capability: str, key: str) -> dict[str, Any] | None:
+        for scope, pid, root in self._chain():
+            path = self._documents(root, capability).get(key)
+            if not path:
+                continue
+            body = path.read_text()
+            return {"id": str(path), "key": key,
+                    "hash": hashlib.sha256(body.encode()).hexdigest()[:HASH_LENGTH],
+                    "body": body, "media_type": None, "author": None,
+                    "created_at": None, "scope": (scope, pid), "path": str(path)}
+        return None
+
+    def document_keys(self, capability: str) -> list[str]:
+        keys: set[str] = set()
+        for _scope, _pid, root in self._chain():
+            keys.update(self._documents(root, capability))
+        return sorted(keys)
+
+    def document_put(self, capability: str, key: str, body: str,
+                     author: str | None = None, media_type: str | None = None,
+                     base: str | None = None) -> str:
+        path = self._documents(self.envelope, capability).get(key)
+        if path is None:
+            path = self._new_document_path(capability, key)
+        if base is not None and path.is_file():
+            live = hashlib.sha256(path.read_text().encode()).hexdigest()[:HASH_LENGTH]
+            if live != base:
+                raise StoreError(
+                    "stale_edit",
+                    f"{path} is {live} now, not {base} as it was when the edit began",
+                    "re-read it and apply the change again")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        return hashlib.sha256(body.encode()).hexdigest()[:HASH_LENGTH]
+
+    def _new_document_path(self, capability: str, key: str) -> Path:
+        """Where a document this project does not have yet would go. The prefix
+        chooses the folder; what follows it is the file."""
+        for prefix, shape, suffix in DOCUMENT_LOCATIONS:
+            if prefix and key.startswith(prefix + "."):
+                return self.envelope / shape.format(cap=capability) / (key[len(prefix) + 1:] + suffix)
+        prefix, shape, suffix = DOCUMENT_LOCATIONS[-1]
+        return self.envelope / shape.format(cap=capability) / (key + suffix)
+
+    # -- what a directory cannot answer ---------------------------------------
+
+    def _refuse(self, what: str) -> None:
+        raise StoreError("files_mode", f"{what} needs records kept in the store",
+                         "this project keeps them in files, where there is no history")
+
+    def revisions(self, *_a: Any, **_k: Any) -> list:
+        self._refuse("a record's history")
+        return []
+
+    def document_versions(self, *_a: Any, **_k: Any) -> list:
+        self._refuse("a document's earlier versions")
+        return []
+
+
+def records_mode(envelope: Path | str) -> tuple[str, str]:
+    """Where this project keeps its configuration, and what said so.
+
+    This is the only place the choice is read. Everything downstream takes an
+    adapter and cannot tell which it got, because a call site that can tell is
+    a call site that will eventually decide for itself."""
+    override = os.environ.get("CAPABILITIES_STORE_MODE")
+    if override:
+        if override not in ("files", "db"):
+            raise StoreError("bad_store_mode",
+                             f"CAPABILITIES_STORE_MODE must be files or db, got {override!r}")
+        return (override, "CAPABILITIES_STORE_MODE")
+    identity_file = Path(envelope) / "project.json"
+    try:
+        identity = json.loads(identity_file.read_text())
+    except (OSError, ValueError):
+        return ("files", "no project identity")
+    mode = identity.get("store", "files")
+    if mode not in ("files", "db"):
+        raise StoreError("bad_store_mode", f"{identity_file} declares store {mode!r}",
+                         'expected "files" or "db"')
+    return (mode, str(identity_file))
+
+
+def open_records(envelope: Path | str, global_dir: Path | str,
+                 url: str | None = None) -> Records:
+    """The adapter this project's configuration is read and written through."""
+    envelope, global_dir = Path(envelope), Path(global_dir)
+    mode, source = records_mode(envelope)
+    identity = {}
+    try:
+        identity = json.loads((envelope / "project.json").read_text())
+    except (OSError, ValueError):
+        pass
+    slug, project_id = identity.get("slug"), identity.get("id")
+    if mode == "files":
+        adapter = FileRecords(envelope, global_dir, project_id, slug)
+        adapter.source = source if source == "CAPABILITIES_STORE_MODE" else str(envelope)
+        return adapter
+    if not slug:
+        raise StoreError("no_project_identity",
+                         f"{envelope / 'project.json'} keeps this project's records "
+                         "in the store but declares no slug to read them under",
+                         "run `capabilities init` in the project")
+    store = open_store(url)
+    return StoreRecords(store, Scopes(project=slug), ("project", slug))
 
 # <<< contract: store <<<
