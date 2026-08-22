@@ -79,7 +79,7 @@ from urllib.parse import urlparse
 
 # >>> contract: store (generated — edit contract/store.py, run `capabilities sync-contract`) >>>
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCOPE_KINDS = ("global", "project", "instance")
 SCOPE_RANK = {"global": 1, "project": 2, "instance": 3}
@@ -292,6 +292,8 @@ _DDL = [
     # is safe to hold executable text at all.
     """
     CREATE TABLE IF NOT EXISTS documents (
+        scope_kind  TEXT NOT NULL,
+        scope_name  TEXT NOT NULL,
         capability  TEXT NOT NULL,
         key         TEXT NOT NULL,
         hash        TEXT NOT NULL,
@@ -299,7 +301,7 @@ _DDL = [
         media_type  TEXT,
         author      TEXT,
         created_at  TEXT NOT NULL,
-        PRIMARY KEY (capability, key, hash)
+        PRIMARY KEY (scope_kind, scope_name, capability, key, hash)
     )
     """,
     """
@@ -675,19 +677,25 @@ class Store:
     # -- documents: long text, versioned by content, one version in force ------
 
     def document_put(self, capability: str, key: str, body: str,
-                     author: str | None = None,
+                     scope: tuple[str, str], author: str | None = None,
                      media_type: str | None = None) -> str:
-        """Record a version and return its hash. Saving is not deploying: this
-        changes nothing that runs until `document_pin` names the hash."""
+        """Record a version at one scope and return its hash. Saving is not
+        deploying: this changes nothing that runs until `document_pin` names it.
+
+        A version belongs to the scope that wrote it, like every other record.
+        Without that, every project's drafts of `telegram/voice-agent` would
+        pool under one key and each would be reading the others' history."""
         _check("capability", capability, CAPABILITY_RE)
         _check("key", key, KEY_RE)
+        kind, name = _check_scope(*scope)
         if not isinstance(body, str):
             raise StoreError("bad_document", "a document body must be text")
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:HASH_LENGTH]
         with self.transaction():
             cur = self._execute(
-                "SELECT body FROM documents WHERE capability = ? AND key = ? AND hash = ?",
-                (capability, key, digest))
+                "SELECT body FROM documents WHERE scope_kind = ? AND scope_name = ? "
+                "AND capability = ? AND key = ? AND hash = ?",
+                (kind, name, capability, key, digest))
             existing = cur.fetchone()
             if existing and existing[0] != body:
                 raise StoreError(
@@ -696,26 +704,43 @@ class Store:
                     "this is what the truncated hash is checked for; report it")
             if not existing:
                 self._execute(
-                    "INSERT INTO documents (capability, key, hash, body, media_type, "
-                    "author, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (capability, key, digest, body, media_type, author, _now()),
+                    "INSERT INTO documents (scope_kind, scope_name, capability, key, hash, "
+                    "body, media_type, author, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (kind, name, capability, key, digest, body, media_type, author, _now()),
                 )
         return digest
 
     def document_pin(self, capability: str, key: str, digest: str,
-                     scope: tuple[str, str], actor: str | None = None) -> None:
+                     scope: tuple[str, str], actor: str | None = None,
+                     scopes: Scopes | None = None) -> None:
         """Put one version in force at one scope — the deploy step, recorded in
-        `revisions` like any other decision. A hash that was never recorded is
-        refused rather than pinned: a pin aimed at nothing is the same silent
-        failure a grant aimed at nothing was."""
-        cur = self._execute(
-            "SELECT 1 FROM documents WHERE capability = ? AND key = ? AND hash = ?",
-            (capability, key, digest))
-        if not cur.fetchone():
+        `revisions` like any other decision. A hash nobody recorded is refused
+        rather than pinned: a pin aimed at nothing is the same silent failure a
+        grant aimed at nothing was.
+
+        The version is looked for down the whole chain, so a project may put a
+        globally declared version in force without copying it."""
+        chain = (scopes or Scopes(project=scope[1] if scope[0] == "project" else None,
+                                  instance=scope[1] if scope[0] == "instance" else None))
+        if not self._document_body(capability, key, digest, chain):
             raise StoreError("unknown_version",
                              f"no recorded version {digest} of {capability}/{key}",
                              "record it with document_put first")
         self.config_set(capability, "document", key, {"hash": digest}, scope, actor=actor)
+
+    def _document_body(self, capability: str, key: str, digest: str,
+                       scopes: Scopes) -> tuple | None:
+        """The version's row, found at the highest scope in the chain holding it."""
+        for kind, name in scopes.chain():
+            cur = self._execute(
+                "SELECT body, media_type, author, created_at, scope_kind, scope_name "
+                "FROM documents WHERE scope_kind = ? AND scope_name = ? "
+                "AND capability = ? AND key = ? AND hash = ?",
+                (kind, name, capability, key, digest))
+            row = cur.fetchone()
+            if row:
+                return row
+        return None
 
     def document_read(self, capability: str, key: str,
                       scopes: Scopes) -> dict[str, Any] | None:
@@ -726,35 +751,45 @@ class Store:
         digest = pin.get("hash") if isinstance(pin, dict) else None
         if not digest:
             raise StoreError("bad_pin", f"the pin for {capability}/{key} names no hash")
-        cur = self._execute(
-            "SELECT body, media_type, author, created_at FROM documents "
-            "WHERE capability = ? AND key = ? AND hash = ?",
-            (capability, key, digest))
-        row = cur.fetchone()
+        row = self._document_body(capability, key, digest, scopes)
         if not row:
             raise StoreError(
                 "missing_version",
                 f"{capability}/{key} is pinned to version {digest}, which is "
-                "not recorded",
+                "not recorded in this project's scopes",
                 "pin a version that exists, or record this one")
         return {"key": key, "hash": digest, "body": row[0], "media_type": row[1],
                 "author": row[2], "created_at": row[3],
+                "version_scope": (row[4], row[5]),
                 "scope": self.config_origin(capability, "document", key, scopes)}
 
-    def document_versions(self, capability: str, key: str) -> list[dict[str, Any]]:
-        """Every recorded version, newest first. Bodies are omitted — a history
-        listing should not carry the whole of everything it lists."""
+    def document_versions(self, capability: str, key: str,
+                          scopes: Scopes) -> list[dict[str, Any]]:
+        """Every version this project can see, newest first — its own chain and
+        nothing else, so one project's drafts stay out of another's history.
+        Bodies are omitted; a listing should not carry the whole of what it
+        lists."""
+        chain = scopes.chain()
+        clause = " OR ".join(["(scope_kind = ? AND scope_name = ?)"] * len(chain))
+        params: list[Any] = [capability, key]
+        for kind, name in chain:
+            params += [kind, name]
         cur = self._execute(
-            "SELECT hash, media_type, author, created_at, length(body) FROM documents "
-            "WHERE capability = ? AND key = ? ORDER BY created_at DESC, hash",
-            (capability, key))
-        return [{"hash": r[0], "media_type": r[1], "author": r[2],
-                 "created_at": r[3], "bytes": r[4]} for r in cur.fetchall()]
+            "SELECT hash, media_type, author, created_at, length(body), scope_kind, "
+            f"scope_name FROM documents WHERE capability = ? AND key = ? AND ({clause}) "
+            "ORDER BY created_at DESC, hash", params)
+        return [{"hash": r[0], "media_type": r[1], "author": r[2], "created_at": r[3],
+                 "bytes": r[4], "scope": (r[5], r[6])} for r in cur.fetchall()]
 
-    def document_keys(self, capability: str) -> list[str]:
+    def document_keys(self, capability: str, scopes: Scopes) -> list[str]:
+        chain = scopes.chain()
+        clause = " OR ".join(["(scope_kind = ? AND scope_name = ?)"] * len(chain))
+        params: list[Any] = [capability]
+        for kind, name in chain:
+            params += [kind, name]
         cur = self._execute(
-            "SELECT DISTINCT key FROM documents WHERE capability = ? ORDER BY key",
-            (capability,))
+            f"SELECT DISTINCT key FROM documents WHERE capability = ? AND ({clause}) "
+            "ORDER BY key", params)
         return [r[0] for r in cur.fetchall()]
 
     # -- the project registry --------------------------------------------------

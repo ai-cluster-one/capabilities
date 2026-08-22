@@ -454,21 +454,21 @@ def test_sqlite_stores_json_as_text(tmp_path):
 
 # --- documents: saving is not deploying --------------------------------------
 
-def test_a_version_is_addressed_by_its_content(store):
-    a = store.document_put("telegram", "voice-agent", "you are terse")
-    b = store.document_put("telegram", "voice-agent", "you are terse")
-    c = store.document_put("telegram", "voice-agent", "you are verbose")
+def test_a_version_is_addressed_by_its_content(store, scopes):
+    a = store.document_put("telegram", "voice-agent", "you are terse", ("global", ""))
+    b = store.document_put("telegram", "voice-agent", "you are terse", ("global", ""))
+    c = store.document_put("telegram", "voice-agent", "you are verbose", ("global", ""))
     assert a == b and a != c
-    assert len(store.document_versions("telegram", "voice-agent")) == 2
+    assert len(store.document_versions("telegram", "voice-agent", scopes)) == 2
 
 
 def test_saving_a_new_version_changes_nothing_until_the_pin_moves(store, scopes):
     """The whole reason this is safe to hold executable text in."""
-    first = store.document_put("telegram", "voice-agent", "you are terse")
+    first = store.document_put("telegram", "voice-agent", "you are terse", ("global", ""))
     store.document_pin("telegram", "voice-agent", first, ("global", ""))
     assert store.document_read("telegram", "voice-agent", scopes)["body"] == "you are terse"
 
-    second = store.document_put("telegram", "voice-agent", "you are verbose")
+    second = store.document_put("telegram", "voice-agent", "you are verbose", ("global", ""))
     assert store.document_read("telegram", "voice-agent", scopes)["body"] == "you are terse"
 
     store.document_pin("telegram", "voice-agent", second, ("global", ""))
@@ -476,8 +476,8 @@ def test_saving_a_new_version_changes_nothing_until_the_pin_moves(store, scopes)
 
 
 def test_rolling_back_is_moving_the_pin(store, scopes):
-    first = store.document_put("telegram", "voice-agent", "v1")
-    second = store.document_put("telegram", "voice-agent", "v2")
+    first = store.document_put("telegram", "voice-agent", "v1", ("global", ""))
+    second = store.document_put("telegram", "voice-agent", "v2", ("global", ""))
     store.document_pin("telegram", "voice-agent", second, ("global", ""))
     store.document_pin("telegram", "voice-agent", first, ("global", ""), actor="kz")
     assert store.document_read("telegram", "voice-agent", scopes)["body"] == "v1"
@@ -486,8 +486,8 @@ def test_rolling_back_is_moving_the_pin(store, scopes):
 
 def test_a_project_runs_its_own_version_of_a_global_document(store, scopes):
     """Falls out of keeping the pin in `config`: scoping and merge come free."""
-    stable = store.document_put("telegram", "voice-agent", "stable")
-    trial = store.document_put("telegram", "voice-agent", "trial")
+    stable = store.document_put("telegram", "voice-agent", "stable", ("global", ""))
+    trial = store.document_put("telegram", "voice-agent", "trial", ("global", ""))
     store.document_pin("telegram", "voice-agent", stable, ("global", ""))
     store.document_pin("telegram", "voice-agent", trial, ("project", "marvin"))
 
@@ -496,7 +496,7 @@ def test_a_project_runs_its_own_version_of_a_global_document(store, scopes):
 
 
 def test_an_unpinned_document_reads_as_absent(store, scopes):
-    store.document_put("telegram", "voice-agent", "drafted, never deployed")
+    store.document_put("telegram", "voice-agent", "drafted, never deployed", ("global", ""))
     assert store.document_read("telegram", "voice-agent", scopes) is None
 
 
@@ -508,8 +508,7 @@ def test_pinning_a_version_that_was_never_recorded_is_refused(store):
 
 def test_a_body_survives_exactly(store, scopes):
     body = "#!/usr/bin/env python3\nprint('héllo')\n\n\ttabbed\n"
-    digest = store.document_put("automations", "upstream-watch", body,
-                                media_type="text/x-python")
+    digest = store.document_put("automations", "upstream-watch", body, ("global", ""), media_type="text/x-python")
     store.document_pin("automations", "upstream-watch", digest, ("project", "marvin"))
     got = store.document_read("automations", "upstream-watch", scopes)
     assert got["body"] == body
@@ -517,36 +516,70 @@ def test_a_body_survives_exactly(store, scopes):
     assert got["scope"] == ("project", "marvin")
 
 
-def test_history_omits_the_bodies_it_lists(store):
-    store.document_put("telegram", "voice-agent", "x" * 5000)
-    entry = store.document_versions("telegram", "voice-agent")[0]
+def test_history_omits_the_bodies_it_lists(store, scopes):
+    store.document_put("telegram", "voice-agent", "x" * 5000, ("global", ""))
+    entry = store.document_versions("telegram", "voice-agent", scopes)[0]
     assert entry["bytes"] == 5000 and "body" not in entry
 
 
 def test_a_reference_is_a_document_like_any_other(store, scopes):
     """What `refs` reads in store mode: pinned versions only, drafts invisible."""
     body = "---\nname: Project Telegram Session\ndescription: how to wire it\n---\n\nbody\n"
-    digest = store.document_put("telegram", "reference.project-session", body,
-                                media_type="text/markdown")
+    digest = store.document_put("telegram", "reference.project-session", body, ("global", ""), media_type="text/markdown")
     assert store.document_read("telegram", "reference.project-session", scopes) is None
     store.document_pin("telegram", "reference.project-session", digest, ("project", "marvin"))
     assert store.document_read("telegram", "reference.project-session", scopes)["body"] == body
-    assert store.document_keys("telegram") == ["reference.project-session"]
+    assert store.document_keys("telegram", scopes) == ["reference.project-session"]
 
 
 def test_a_version_name_is_short_enough_to_read(store):
-    digest = store.document_put("telegram", "voice-agent", "text")
+    digest = store.document_put("telegram", "voice-agent", "text", ("global", ""))
     assert len(digest) == SCHEMA_HASH_LENGTH
     assert digest == hashlib.sha256(b"text").hexdigest()[:SCHEMA_HASH_LENGTH]
 
 
 def test_a_truncated_hash_naming_different_text_is_refused(store):
     """What makes twelve characters safe is that a clash is loud, not unlikely."""
-    digest = store.document_put("telegram", "voice-agent", "original")
+    digest = store.document_put("telegram", "voice-agent", "original", ("global", ""))
     with store.transaction():
         store._execute(
             "UPDATE documents SET body = ? WHERE capability = ? AND key = ? AND hash = ?",
             ("tampered", "telegram", "voice-agent", digest))
     with pytest.raises(StoreError) as exc:
-        store.document_put("telegram", "voice-agent", "original")
+        store.document_put("telegram", "voice-agent", "original", ("global", ""))
     assert exc.value.slug == "hash_collision"
+
+
+def test_one_projects_drafts_stay_out_of_anothers_history(store):
+    """The hole this closes: without a scope on the body, every project's
+    versions of the same key pooled under one name."""
+    mine = Scopes(project="marvin")
+    theirs = Scopes(project="client")
+    store.document_put("telegram", "voice-agent", "marvin's draft", ("project", "marvin"))
+    store.document_put("telegram", "voice-agent", "client's draft", ("project", "client"))
+
+    assert [v["bytes"] for v in store.document_versions("telegram", "voice-agent", mine)] == [14]
+    assert store.document_versions("telegram", "voice-agent", theirs)[0]["scope"] == \
+        ("project", "client")
+    assert len(store.document_versions("telegram", "voice-agent", theirs)) == 1
+
+
+def test_a_project_pins_a_global_version_without_copying_it(store):
+    """The chain still reaches down, so sharing a prompt costs no duplication."""
+    mine = Scopes(project="marvin")
+    shared = store.document_put("telegram", "voice-agent", "the shared one", ("global", ""))
+    store.document_pin("telegram", "voice-agent", shared, ("project", "marvin"), scopes=mine)
+
+    got = store.document_read("telegram", "voice-agent", mine)
+    assert got["body"] == "the shared one"
+    assert got["version_scope"] == ("global", "")     # the text stayed where it was
+    assert got["scope"] == ("project", "marvin")      # the decision is the project's
+
+
+def test_a_version_from_another_project_cannot_be_pinned(store):
+    store.document_put("telegram", "voice-agent", "theirs", ("project", "client"))
+    digest = store.document_put("telegram", "voice-agent", "theirs", ("project", "client"))
+    with pytest.raises(StoreError) as exc:
+        store.document_pin("telegram", "voice-agent", digest, ("project", "marvin"),
+                           scopes=Scopes(project="marvin"))
+    assert exc.value.slug == "unknown_version"

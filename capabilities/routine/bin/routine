@@ -770,7 +770,7 @@ def _reference_bodies() -> dict[str, str]:
         out: dict[str, str] = {}
         try:
             with open_store() as store:
-                for key in store.document_keys(NAME):
+                for key in store.document_keys(NAME, scopes):
                     if not key.startswith(REFERENCE_PREFIX):
                         continue
                     doc = store.document_read(NAME, key, scopes)

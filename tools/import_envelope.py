@@ -295,10 +295,10 @@ def main() -> int:
             store._conn.commit()
         for doc in documents:
             digest = store.document_put(doc["capability"], doc["key"], doc["body"],
-                                        author="import_envelope",
+                                        scope, author="import_envelope",
                                         media_type=doc["media_type"])
             store.document_pin(doc["capability"], doc["key"], digest, scope,
-                               actor="import_envelope")
+                               actor="import_envelope", scopes=scopes)
         problems = verify(store, rows, scopes)
         for doc in documents:
             got = store.document_read(doc["capability"], doc["key"], scopes)
