@@ -2130,18 +2130,38 @@ class PostgresStore(Store):
 
 # --- Resolution --------------------------------------------------------------
 
+def default_store_path() -> str:
+    """Where records live when nothing says otherwise.
+
+    A store is not optional the way a config source is. A queue, a ledger, a
+    cursor have to go somewhere, and letting each capability invent its own
+    database for them is how they came to be scattered in the first place. So
+    there is always one, and the first caller to ask for it creates it.
+
+    The fenced body cannot ask the manager where that is — it may not import a
+    sibling, and a subprocess per open would be absurd — so both compute the
+    same XDG convention independently. That is one convention arrived at twice,
+    not one value stored twice, but the two must agree: `capabilities path
+    store` is the authority, and anything that overrides the location does it
+    through `CAPABILITIES_STORE_URL`, which both read first."""
+    home = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state")
+    return os.path.join(home, "capabilities", "store.db")
+
+
 def open_store(url: str | None = None) -> "Store":
     """The one entry point. `CAPABILITIES_STORE_URL` is the root pointer that
     cannot itself live in the store, which is why it is an environment variable
     beside the secrets the cascade already resolves that way.
 
-    Absent, the local floor is used at the caller's default path."""
-    url = url or os.environ.get("CAPABILITIES_STORE_URL")
-    if not url:
-        raise StoreError("no_store_url", "no store URL is configured",
-                         "set CAPABILITIES_STORE_URL, or pass an explicit "
-                         "sqlite path")
+    Absent, the local floor is opened at the default path, and created there if
+    nothing has created it yet."""
+    url = url or os.environ.get("CAPABILITIES_STORE_URL") or default_store_path()
     scheme = urlparse(url).scheme
+    if scheme in ("", "sqlite"):
+        path = urlparse(url).path if scheme == "sqlite" else url
+        if path and path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     if scheme in ("postgres", "postgresql"):
         return PostgresStore.open(url)
     if scheme == "sqlite":

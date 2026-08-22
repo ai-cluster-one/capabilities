@@ -439,10 +439,6 @@ def test_health_reports_dialect_and_namespaces(store):
 
 def test_open_store_routes_by_scheme(tmp_path, monkeypatch):
     monkeypatch.delenv("CAPABILITIES_STORE_URL", raising=False)
-    with pytest.raises(StoreError) as exc:
-        open_store()
-    assert exc.value.slug == "no_store_url"
-
     with open_store(str(tmp_path / "s.db")) as s:
         assert s.dialect == "sqlite"
 
@@ -597,3 +593,14 @@ def test_a_truncated_hash_naming_different_text_is_refused(store):
     with pytest.raises(StoreError) as exc:
         store.context_put("telegram", "voice-agent", "original", ("global", ""))
     assert exc.value.slug == "hash_collision"
+
+
+def test_a_store_exists_without_anyone_configuring_one(tmp_path, monkeypatch):
+    """Tracking is not optional: the first caller to ask creates the store."""
+    monkeypatch.delenv("CAPABILITIES_STORE_URL", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    expected = tmp_path / "state" / "capabilities" / "store.db"
+    assert not expected.exists()
+    with open_store() as s:
+        s.migrate()
+    assert expected.is_file()
