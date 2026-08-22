@@ -4222,8 +4222,13 @@ def cmd_sync_contract(check_only: bool) -> None:
         # carries the store tier: a capability using the store from the command
         # line and not from its daemon would be a split brain, not a choice.
         service_dir = capdir / "service"
-        if service_dir.is_dir() and _split_region(new_text, "store") is not None:
-            module = service_dir / "store.py"
+        module = service_dir / "store.py"
+        # Two ways to be owed the module: the capability's CLI carries the store
+        # tier, or the service already holds a copy. The second is what keeps a
+        # service that reads the store from its own runtime — without its CLI
+        # needing to — from drifting away from the canonical body unwatched.
+        if service_dir.is_dir() and (
+                module.is_file() or _split_region(new_text, "store") is not None):
             canonical_body = (_ASSET_ROOT / _REGION_SOURCE_REL["store"]).read_text()
             if not module.is_file() or module.read_text() != canonical_body:
                 changed.append({"capability": capdir.name, "service_module": "store.py"})
