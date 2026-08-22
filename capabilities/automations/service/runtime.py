@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import shutil
@@ -14,6 +15,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -216,13 +218,255 @@ def load_agents(raw: dict[str, Any]) -> dict[str, Any]:
     return {"default": default, "workers": profiles}
 
 
+# --- the store schema this capability owns -----------------------------------
+
+# `automations` declares its own namespace and migrates it itself; the core
+# tier knows nothing about these columns. They are columns rather than a JSON
+# blob because the scheduler filters on them on every tick — `enabled`, the
+# environment, the pending count against `runs` — which is the test for whether
+# a record class has earned a table of its own.
+#
+# `script_key` names a document, not a path. The version that runs is whichever
+# one the document's pin names, so editing a script and deploying it stay two
+# separate acts.
+STORE_NAMESPACE = "automations"
+STORE_VERSION = 2
+STORE_MIGRATIONS = [
+    """
+    CREATE TABLE IF NOT EXISTS automations (
+        id               TEXT PRIMARY KEY,
+        scope            TEXT NOT NULL,
+        project_id       TEXT REFERENCES projects(id),
+        slug             TEXT NOT NULL,
+        name             TEXT,
+        description      TEXT,
+        enabled          INTEGER NOT NULL DEFAULT 1,
+        script_key       TEXT NOT NULL,
+        schedule         TEXT,
+        every_seconds    REAL,
+        timeout_seconds  REAL NOT NULL DEFAULT 300,
+        max_parallel     INTEGER NOT NULL DEFAULT 1,
+        max_pending      INTEGER NOT NULL DEFAULT 1,
+        overlap          TEXT NOT NULL DEFAULT 'skip',
+        retries          INTEGER NOT NULL DEFAULT 0,
+        arguments        {json},
+        environments     {json},
+        updated_at       TEXT NOT NULL
+    )
+    """,
+    # The slug is what a person types and what a run refers to; the id is what
+    # a row refers to. Unique per scope, because two projects may each have an
+    # automation they both call `nightly`.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS automations_slug_idx
+        ON automations (scope, COALESCE(project_id, ''), slug)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS automations_due_idx
+        ON automations (scope, project_id, enabled)
+    """,
+    # The ledger. It differs from the one a file-mode project keeps in its own
+    # SQLite in two ways, and both are the point: a run names its project, and
+    # it names its automation by id rather than by the label a person types.
+    #
+    # `dedupe_key` was already project, environment, automation and scheduled
+    # time, and already unique. On a store two machines share, that uniqueness
+    # stops being bookkeeping and becomes the thing that keeps them from both
+    # firing one schedule: whichever inserts first wins and the other is told.
+    """
+    CREATE TABLE IF NOT EXISTS runs (
+        id                TEXT PRIMARY KEY,
+        project_id        TEXT REFERENCES projects(id),
+        -- The uuid when the automation is a row in this store, and null when
+        -- the project still declares its automations in a file. The slug is
+        -- always there, because a run has to say what it ran whether or not
+        -- anything else knows about it.
+        automation_id     TEXT REFERENCES automations(id),
+        automation_slug   TEXT NOT NULL,
+        environment       TEXT NOT NULL,
+        trigger           TEXT NOT NULL,
+        scheduled_for     TEXT,
+        dedupe_key        TEXT UNIQUE,
+        status            TEXT NOT NULL,
+        attempt           INTEGER NOT NULL DEFAULT 1,
+        parent_run_id     TEXT,
+        queued_at         TEXT NOT NULL,
+        started_at        TEXT,
+        finished_at       TEXT,
+        pid               INTEGER,
+        exit_code         INTEGER,
+        summary           TEXT,
+        log_path          TEXT NOT NULL,
+        cancel_requested  INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status, queued_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS runs_automation_idx ON runs (automation_id, queued_at)
+    """,
+]
+
+
+def store_upsert(store, scope: str, project_id: str | None, item: dict) -> str:
+    """Write one automation row and return its id. The table is this
+    capability's, so the SQL that touches it lives here beside the schema rather
+    than in whatever tool happens to be filling it in."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    existing = store._execute(
+        "SELECT id FROM automations WHERE scope = ? AND COALESCE(project_id,'') = ? "
+        "AND slug = ?", (scope, project_id or "", item["slug"])).fetchone()
+    values = (item["name"], item["description"], item["enabled"], item["script_key"],
+              item["schedule"], item["every_seconds"], item["timeout_seconds"],
+              item["max_parallel"], item["max_pending"], item["overlap"], item["retries"],
+              store._encode(item["arguments"]), store._encode(item["environments"]), now)
+    if existing:
+        store._execute(
+            "UPDATE automations SET name = ?, description = ?, enabled = ?, script_key = ?, "
+            "schedule = ?, every_seconds = ?, timeout_seconds = ?, max_parallel = ?, "
+            "max_pending = ?, overlap = ?, retries = ?, arguments = ?, environments = ?, "
+            "updated_at = ? WHERE id = ?", values + (existing[0],))
+        return existing[0]
+    row_id = str(uuid.uuid4())
+    store._execute(
+        "INSERT INTO automations (id, scope, project_id, slug, name, description, enabled, "
+        "script_key, schedule, every_seconds, timeout_seconds, max_parallel, max_pending, "
+        "overlap, retries, arguments, environments, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (row_id, scope, project_id, item["slug"]) + values)
+    return row_id
+
+
+def load_effective_config(root: Path, config_path: Path,
+                          state_dir: Path) -> dict[str, Any]:
+    """The config the scheduler acts on, from whichever source this project
+    keeps its records in. One entry point, so no caller has to know which."""
+    if _store_mode(root)[0] == "db":
+        return load_config_from_store(root, state_dir)
+    return load_config(root, config_path)
+
+
+def _store_mode(root: Path) -> tuple[str, str]:
+    """Where this project keeps its records, asked of the one place that knows.
+
+    An automation is a table row with no file half on purpose -- `config.toml`
+    carries its description in comments a writer would destroy -- so this fork
+    stays. What does not stay is a second opinion about which mode is in force."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import store as _store
+    except ImportError:
+        return "files", "no store module beside the service"
+    finally:
+        sys.path.pop(0)
+    try:
+        return _store.records_mode(root / "capabilities")
+    except _store.StoreError as exc:
+        raise ConfigError(exc.message) from exc
+
+
+def _project_identity(root: Path) -> dict:
+    try:
+        return json.loads((root / "capabilities" / "project.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"no project identity under {root}") from exc
+
+
+def materialise_script(state_dir: Path, key: str, version: str, body: str) -> Path:
+    """Write a script's active version where a subprocess can run it.
+
+    The file is named by the version's hash, so a cached copy can never be the
+    wrong text: a different version is a different filename, and the old one
+    simply stops being asked for."""
+    cache = state_dir / "scripts"
+    cache.mkdir(parents=True, exist_ok=True)
+    suffix = ".py" if not key.endswith(".schema") else ".json"
+    path = cache / f"{key}.{version}{suffix}"
+    if not path.is_file() or path.read_text() != body:
+        path.write_text(body)
+    return path
+
+
+def load_config_from_store(root: Path, state_dir: Path) -> dict[str, Any]:
+    """The same normalised config, composed out of the store.
+
+    Everything the scheduler reads on a tick is here: the engine settings, the
+    agent profiles, and one row per automation. A script is not a path into the
+    repository any more — it is a context item, and the version that runs is
+    whichever one is active, written out under its own hash so a subprocess has
+    something to execute."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import store as _store
+    except ImportError as exc:
+        raise ConfigError("this project keeps its records in the store, but the "
+                          "store module is not installed beside the service") from exc
+    finally:
+        sys.path.pop(0)
+
+    identity = _project_identity(root)
+    scopes = _store.Scopes(project=identity["slug"])
+    try:
+        with _store.open_store() as st:
+            engine = st.config_get("automations", "setting", "engine", scopes) or {}
+            agents = st.config_get("automations", "setting", "agents", scopes) or {}
+            chain = st._chain(scopes)
+            clause, params = st._chain_clause(chain)
+            rows = st._execute(
+                "SELECT slug, name, description, enabled, script_key, schedule, "
+                "every_seconds, timeout_seconds, max_parallel, max_pending, overlap, "
+                f"retries, arguments, environments FROM automations WHERE ({clause}) "
+                "ORDER BY slug", params).fetchall()
+            scripts = {}
+            for row in rows:
+                doc = st.context_read("automations", row[4], scopes)
+                if doc is None:
+                    raise ConfigError(
+                        f"automation {row[0]!r} names script {row[4]!r}, which has no "
+                        "active version")
+                scripts[row[4]] = materialise_script(state_dir, row[4], doc["hash"],
+                                                     doc["body"])
+    except _store.StoreError as exc:
+        raise ConfigError(f"cannot read the store: {exc.message}") from exc
+
+    raw = {"version": 1, "engine": dict(engine), "agents": dict(agents), "automations": []}
+    for row in rows:
+        raw["automations"].append({
+            # Relative to the root, like a file-declared script: the rule that a
+            # script may not point outside the project is worth keeping, and the
+            # cache it is written into sits under the root anyway.
+            "id": row[0], "enabled": bool(row[3]),
+            "script": str(scripts[row[4]].relative_to(root.resolve())),
+            "schedule": row[5], "every_seconds": row[6], "timeout_seconds": row[7],
+            "max_parallel": row[8], "max_pending": row[9], "overlap": row[10],
+            "retries": row[11],
+            "arguments": st_decode(row[12]), "environments": st_decode(row[13]),
+        })
+    return normalise_config(root, raw)
+
+
+def st_decode(value: Any) -> Any:
+    if value is None:
+        return []
+    return json.loads(value) if isinstance(value, str) else value
+
+
 def load_config(root: Path, config_path: Path) -> dict[str, Any]:
+    """The config as the file declares it."""
     try:
         raw = tomllib.loads(config_path.read_text())
     except FileNotFoundError as exc:
         raise ConfigError(f"config not found: {config_path}") from exc
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"cannot read config {config_path}: {exc}") from exc
+    return normalise_config(root, raw)
+
+
+def normalise_config(root: Path, raw: dict[str, Any]) -> dict[str, Any]:
+    """Validation and defaulting, shared by both sources. A record that came
+    from the store is checked exactly as one that came from the file, so the
+    two cannot drift into disagreeing about what a valid automation is."""
     if raw.get("version") != 1:
         raise ConfigError("config version must be 1")
     engine = raw.get("engine") or {}
@@ -331,91 +575,166 @@ def applies(item: dict[str, Any], environment: str) -> bool:
     )
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(db_path, timeout=5.0)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA busy_timeout=5000")
-    db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS runs (
-            id TEXT PRIMARY KEY,
-            automation_id TEXT NOT NULL,
-            namespace TEXT NOT NULL,
-            environment TEXT NOT NULL,
-            trigger TEXT NOT NULL,
-            scheduled_for TEXT,
-            dedupe_key TEXT UNIQUE,
-            status TEXT NOT NULL,
-            attempt INTEGER NOT NULL DEFAULT 1,
-            parent_run_id TEXT,
-            queued_at TEXT NOT NULL,
-            started_at TEXT,
-            finished_at TEXT,
-            pid INTEGER,
-            exit_code INTEGER,
-            summary TEXT,
-            log_path TEXT NOT NULL,
-            cancel_requested INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS runs_status_idx ON runs(status, queued_at);
-        CREATE INDEX IF NOT EXISTS runs_automation_idx ON runs(automation_id, queued_at);
-        """
-    )
-    return db
+def open_ledger(root: Path, config: dict[str, Any]):
+    """The store this project's runs live in, and the ledger onto it.
 
-
-def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    return dict(row) if row is not None else None
-
-
-def enqueue(
-    db: sqlite3.Connection,
-    config: dict[str, Any],
-    state_dir: Path,
-    automation_id: str,
-    *,
-    trigger: str,
-    scheduled_for: str | None = None,
-    dedupe_key: str | None = None,
-    attempt: int = 1,
-    parent_run_id: str | None = None,
-) -> dict[str, Any] | None:
-    run_id = uuid.uuid4().hex
-    log_path = state_dir / "runs" / f"{run_id}.log"
-    engine = config["engine"]
+    There is no file-mode ledger any more. A run, a queue, a cursor are records
+    nobody authors and nobody reviews, so a capability keeping its own database
+    for them was only ever the easy thing; the store exists unconditionally and
+    this is where automations joins it. The caller closes the store."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        db.execute(
-            """
-            INSERT INTO runs (
-                id, automation_id, namespace, environment, trigger, scheduled_for,
-                dedupe_key, status, attempt, parent_run_id, queued_at, log_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-            """,
-            (
-                run_id,
-                automation_id,
-                engine["namespace"],
-                engine["environment"],
-                trigger,
-                scheduled_for,
-                dedupe_key,
-                attempt,
-                parent_run_id,
-                iso(),
-                str(log_path),
-            ),
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        db.rollback()
-        return None
-    return row_dict(db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+        import store as _store
+    except ImportError as exc:
+        raise ConfigError("the store module is not installed beside the service") from exc
+    finally:
+        sys.path.pop(0)
+    identity = _project_identity(root)
+    st = _store.open_store()
+    try:
+        st.migrate()
+        st.project_register(identity["id"], identity["slug"])
+        st.migrate(STORE_NAMESPACE, STORE_VERSION, STORE_MIGRATIONS)
+    except _store.StoreError as exc:
+        st.close()
+        raise ConfigError(f"cannot prepare the store: {exc.message}") from exc
+    project_id = st._project_id(identity["slug"])
+    return st, RunLedger(st._conn, project_id, config["engine"]["environment"])
+
+
+class RunLedger:
+    """Every question and every claim about runs, in one place that knows whose.
+
+    The ledger is shared: on a store two machines write to, a query that forgets
+    which project it is asking about would answer with another project's runs.
+    Scoping cannot therefore be a `WHERE` clause fifteen callers are trusted to
+    remember — it is the reason this boundary exists, and it is applied here
+    once rather than at each call.
+
+    The same class serves a project keeping its runs in its own SQLite: there
+    the scope narrows nothing, because there is only one project in the file,
+    and the queries do not change shape for it."""
+
+    def __init__(self, db, project_id: str | None, environment: str):
+        self.db = db
+        self.project_id = project_id
+        self.environment = environment
+        self._scoped = project_id is not None
+
+    # -- the scope, applied once ----------------------------------------------
+
+    def _where(self, *predicates: str) -> tuple[str, list]:
+        parts, params = [], []
+        if self._scoped:
+            parts.append("project_id = ?")
+            params.append(self.project_id)
+        parts.extend(predicates)
+        return (" WHERE " + " AND ".join(parts)) if parts else "", params
+
+    @staticmethod
+    def _dicts(cursor) -> list[dict[str, Any]]:
+        """Rows as dicts without depending on a row factory. The ledger runs
+        against a bare store connection and, later, against a driver that has no
+        such notion at all, so the column names come from the cursor."""
+        names = [c[0] for c in cursor.description]
+        return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+    def _rows(self, predicates: str = "", params: Sequence[Any] = (),
+              order: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+        clause, scope_params = self._where(*([predicates] if predicates else []))
+        sql = "SELECT * FROM runs" + clause + (f" ORDER BY {order}" if order else "")
+        args = scope_params + list(params)
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(limit)
+        return self._dicts(self.db.execute(sql, tuple(args)))
+
+    # -- reads ----------------------------------------------------------------
+
+    def get(self, run_id: str) -> dict[str, Any] | None:
+        rows = self._rows("id = ?", (run_id,))
+        return rows[0] if rows else None
+
+    def list(self, *, limit: int = 50, status: str | None = None) -> list[dict[str, Any]]:
+        if status:
+            return self._rows("status = ?", (status,), order="queued_at DESC", limit=limit)
+        return self._rows(order="queued_at DESC", limit=limit)
+
+    def counts(self) -> dict[str, int]:
+        clause, params = self._where()
+        rows = self.db.execute(
+            "SELECT status, COUNT(*) AS count FROM runs" + clause + " GROUP BY status",
+            tuple(params)).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def unfinished(self) -> list[dict[str, Any]]:
+        return self._rows("status IN ('starting', 'running')")
+
+    def pending(self) -> list[dict[str, Any]]:
+        return self._rows("status = 'pending'", order="queued_at, id")
+
+    def has_active(self, slug: str, statuses: Sequence[str]) -> bool:
+        marks = ", ".join("?" for _ in statuses)
+        clause, params = self._where("automation_slug = ?", f"status IN ({marks})")
+        row = self.db.execute("SELECT 1 FROM runs" + clause + " LIMIT 1",
+                              tuple(params + [slug] + list(statuses))).fetchone()
+        return row is not None
+
+    def count_for(self, slug: str, status: str) -> int:
+        clause, params = self._where("automation_slug = ?", "status = ?")
+        return self.db.execute("SELECT COUNT(*) FROM runs" + clause,
+                               tuple(params + [slug, status])).fetchone()[0]
+
+    def running(self) -> int:
+        clause, params = self._where("status IN ('starting', 'running')")
+        return self.db.execute("SELECT COUNT(*) FROM runs" + clause,
+                               tuple(params)).fetchone()[0]
+
+    # -- writes ---------------------------------------------------------------
+
+    def claim(self, automation_uuid: str | None, slug: str, state_dir: Path, *,
+              trigger: str, scheduled_for: str | None = None,
+              dedupe_key: str | None = None, attempt: int = 1,
+              parent_run_id: str | None = None) -> dict[str, Any] | None:
+        """Take one firing, or find it already taken.
+
+        `dedupe_key` is unique, so on a shared store this is the whole of the
+        mutual exclusion: whichever machine inserts first owns the run and the
+        other is told, rather than discovering the collision by running."""
+        run_id = uuid.uuid4().hex
+        log_path = state_dir / "runs" / f"{run_id}.log"
+        try:
+            self.db.execute(
+                "INSERT INTO runs (id, project_id, automation_id, automation_slug, "
+                "environment, trigger, scheduled_for, dedupe_key, status, attempt, "
+                "parent_run_id, queued_at, log_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                (run_id, self.project_id, automation_uuid, slug,
+                 self.environment, trigger, scheduled_for, dedupe_key, attempt,
+                 parent_run_id, iso(), str(log_path)))
+            self.db.commit()
+        except sqlite3.IntegrityError:
+            self.db.rollback()
+            return None
+        return self.get(run_id)
+
+    def update(self, run_id: str, **columns: Any) -> None:
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        clause, params = self._where("id = ?")
+        self.db.execute(f"UPDATE runs SET {assignments}" + clause,
+                        tuple(list(columns.values()) + params + [run_id]))
+        self.db.commit()
+
+
+def _automation_uuid(store, project_id: str | None, slug: str) -> str | None:
+    row = store._execute(
+        "SELECT id FROM automations WHERE scope = 'project' AND project_id = ? AND slug = ?",
+        (project_id, slug)).fetchone()
+    return row[0] if row else None
 
 
 def enqueue_manual(
-    db_path: Path, config: dict[str, Any], state_dir: Path, automation_id: str
+    root: Path, config: dict[str, Any], state_dir: Path, automation_id: str
 ) -> dict[str, Any]:
     item = automation_map(config).get(automation_id)
     if item is None:
@@ -425,80 +744,78 @@ def enqueue_manual(
             f"automation {automation_id!r} is disabled or not enabled for environment "
             f"{config['engine']['environment']!r}"
         )
-    with contextlib.closing(connect(db_path)) as db:
-        row = enqueue(db, config, state_dir, automation_id, trigger="manual")
+    store, ledger = open_ledger(root, config)
+    try:
+        row = ledger.claim(_automation_uuid(store, ledger.project_id, automation_id),
+                           automation_id, state_dir, trigger="manual")
+    finally:
+        store.close()
     assert row is not None
     return row
 
 
-def list_runs(
-    db_path: Path, *, limit: int = 50, status: str | None = None
-) -> list[dict[str, Any]]:
-    with contextlib.closing(connect(db_path)) as db:
-        if status:
-            rows = db.execute(
-                "SELECT * FROM runs WHERE status = ? ORDER BY queued_at DESC LIMIT ?",
-                (status, limit),
-            ).fetchall()
-        else:
-            rows = db.execute(
-                "SELECT * FROM runs ORDER BY queued_at DESC LIMIT ?", (limit,)
-            ).fetchall()
-    return [dict(row) for row in rows]
+def list_runs(root: Path, config: dict[str, Any], *, limit: int = 50,
+              status: str | None = None) -> list[dict[str, Any]]:
+    store, ledger = open_ledger(root, config)
+    try:
+        return ledger.list(limit=limit, status=status)
+    finally:
+        store.close()
 
 
-def get_run(db_path: Path, run_id: str) -> dict[str, Any] | None:
-    with contextlib.closing(connect(db_path)) as db:
-        return row_dict(db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+def get_run(root: Path, config: dict[str, Any], run_id: str) -> dict[str, Any] | None:
+    store, ledger = open_ledger(root, config)
+    try:
+        return ledger.get(run_id)
+    finally:
+        store.close()
 
 
-def counts(db_path: Path) -> dict[str, int]:
-    with contextlib.closing(connect(db_path)) as db:
-        rows = db.execute("SELECT status, COUNT(*) AS count FROM runs GROUP BY status").fetchall()
-    return {row["status"]: row["count"] for row in rows}
+def counts(root: Path, config: dict[str, Any]) -> dict[str, int]:
+    store, ledger = open_ledger(root, config)
+    try:
+        return ledger.counts()
+    finally:
+        store.close()
 
 
-def request_cancel(db_path: Path, run_id: str) -> dict[str, Any] | None:
-    with contextlib.closing(connect(db_path)) as db:
-        row = db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+def request_cancel(root: Path, config: dict[str, Any], run_id: str) -> dict[str, Any] | None:
+    store, ledger = open_ledger(root, config)
+    try:
+        row = ledger.get(run_id)
         if row is None:
             return None
         if row["status"] == "pending":
-            db.execute(
-                "UPDATE runs SET status = 'canceled', cancel_requested = 1, "
-                "finished_at = ? WHERE id = ?",
-                (iso(), run_id),
-            )
+            ledger.update(run_id, status="canceled", cancel_requested=1, finished_at=iso())
         elif row["status"] in {"starting", "running"}:
-            db.execute("UPDATE runs SET cancel_requested = 1 WHERE id = ?", (run_id,))
-        db.commit()
-        return row_dict(db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+            ledger.update(run_id, cancel_requested=1)
+        return ledger.get(run_id)
+    finally:
+        store.close()
 
 
-def retry_run(
-    db_path: Path, config: dict[str, Any], state_dir: Path, run_id: str
-) -> dict[str, Any] | None:
-    with contextlib.closing(connect(db_path)) as db:
-        row = db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+def retry_run(root: Path, config: dict[str, Any], state_dir: Path,
+              run_id: str) -> dict[str, Any] | None:
+    store, ledger = open_ledger(root, config)
+    try:
+        row = ledger.get(run_id)
         if row is None:
             return None
         if row["status"] not in FINAL_STATUSES:
             raise ConfigError(f"run {run_id} is still {row['status']}")
-        item = automation_map(config).get(row["automation_id"])
+        slug = row["automation_slug"]
+        item = automation_map(config).get(slug)
         if item is None or not applies(item, config["engine"]["environment"]):
             raise ConfigError(
-                f"automation {row['automation_id']!r} is missing, disabled, or outside "
+                f"automation {slug!r} is missing, disabled, or outside "
                 f"environment {config['engine']['environment']!r}"
             )
-        return enqueue(
-            db,
-            config,
-            state_dir,
-            row["automation_id"],
-            trigger="retry",
-            attempt=int(row["attempt"]) + 1,
-            parent_run_id=row["parent_run_id"] or row["id"],
-        )
+        return ledger.claim(
+            _automation_uuid(store, ledger.project_id, slug), slug, state_dir,
+            trigger="retry", attempt=int(row["attempt"]) + 1,
+            parent_run_id=row["parent_run_id"] or row["id"])
+    finally:
+        store.close()
 
 
 def _summary(log_path: Path) -> str | None:
@@ -537,19 +854,25 @@ class Daemon:
         self.root = root.resolve()
         self.config_path = config_path.resolve()
         self.state_dir = state_dir.resolve()
-        self.db_path = self.state_dir / "automations.db"
-        self.config = load_config(self.root, self.config_path)
+        self.config = load_effective_config(self.root, self.config_path,
+                                            self.state_dir)
         self.by_id = automation_map(self.config)
         self.children: dict[str, Child] = {}
         self.stop_requested = False
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "runs").mkdir(parents=True, exist_ok=True)
-        self.db = connect(self.db_path)
+        self.store, self.runs = open_ledger(self.root, self.config)
+        self.db = self.store._conn
+        self._uuids = {
+            item["id"]: _automation_uuid(self.store, self.runs.project_id, item["id"])
+            for item in self.config["automations"]
+        }
+
+    def _claim(self, slug: str, **kwargs) -> dict[str, Any] | None:
+        return self.runs.claim(self._uuids.get(slug), slug, self.state_dir, **kwargs)
 
     def recover(self) -> None:
-        rows = self.db.execute(
-            "SELECT * FROM runs WHERE status IN ('starting', 'running')"
-        ).fetchall()
+        rows = self.runs.unfinished()
         live_pids = [int(row["pid"]) for row in rows if row["pid"]]
         for pid in live_pids:
             _signal_group(pid, signal.SIGTERM)
@@ -572,35 +895,20 @@ class Daemon:
             for pid in live_pids:
                 _signal_group(pid, signal.SIGKILL)
         for row in rows:
-            self.db.execute(
-                "UPDATE runs SET status = 'interrupted', finished_at = ?, pid = NULL, "
-                "summary = 'daemon restarted while run was active' WHERE id = ?",
-                (iso(), row["id"]),
-            )
-            self.db.commit()
-            item = self.by_id.get(row["automation_id"])
+            self.runs.update(row["id"], status="interrupted", finished_at=iso(), pid=None,
+                             summary="daemon restarted while run was active")
+            slug = row["automation_slug"]
+            item = self.by_id.get(slug)
             if (
                 self.config["engine"]["recovery"] == "retry"
                 and item is not None
                 and applies(item, self.config["engine"]["environment"])
             ):
-                enqueue(
-                    self.db,
-                    self.config,
-                    self.state_dir,
-                    row["automation_id"],
-                    trigger="recovery",
-                    attempt=int(row["attempt"]) + 1,
-                    parent_run_id=row["parent_run_id"] or row["id"],
-                )
+                self._claim(slug, trigger="recovery", attempt=int(row["attempt"]) + 1,
+                            parent_run_id=row["parent_run_id"] or row["id"])
 
     def _has_active(self, automation_id: str) -> bool:
-        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
-        row = self.db.execute(
-            f"SELECT 1 FROM runs WHERE automation_id = ? AND status IN ({placeholders}) LIMIT 1",
-            (automation_id, *ACTIVE_STATUSES),
-        ).fetchone()
-        return row is not None
+        return self.runs.has_active(automation_id, ACTIVE_STATUSES)
 
     def schedule_due(self, now: datetime) -> None:
         engine = self.config["engine"]
@@ -625,74 +933,49 @@ class Daemon:
             if item["overlap"] == "skip" and self._has_active(item["id"]):
                 self._insert_skipped(item["id"], scheduled_text, dedupe, "overlap policy")
                 continue
-            pending = self.db.execute(
-                "SELECT COUNT(*) FROM runs WHERE automation_id = ? AND status = 'pending'",
-                (item["id"],),
-            ).fetchone()[0]
+            pending = self.runs.count_for(item["id"], "pending")
             if pending >= item["max_pending"]:
                 self._insert_skipped(item["id"], scheduled_text, dedupe, "pending limit")
                 continue
-            enqueue(
-                self.db,
-                self.config,
-                self.state_dir,
-                item["id"],
-                trigger="schedule",
-                scheduled_for=scheduled_text,
-                dedupe_key=dedupe,
-            )
+            self._claim(item["id"], trigger="schedule",
+                        scheduled_for=scheduled_text, dedupe_key=dedupe)
 
     def _insert_skipped(self, automation_id: str, scheduled: str, dedupe: str, reason: str) -> None:
-        row = enqueue(
-            self.db,
-            self.config,
-            self.state_dir,
+        row = self._claim(
             automation_id,
             trigger="schedule",
             scheduled_for=scheduled,
             dedupe_key=dedupe,
         )
         if row:
-            self.db.execute(
-                "UPDATE runs SET status = 'skipped', finished_at = ?, summary = ? WHERE id = ?",
-                (iso(), reason, row["id"]),
-            )
-            self.db.commit()
+            self.runs.update(row["id"], status="skipped", finished_at=iso(), summary=reason)
 
     def _claim_one(self) -> dict[str, Any] | None:
+        """Take the next pending run, under a lock so two dispatchers cannot
+        take the same one. Every question inside asks the ledger, so the answers
+        are about this project even where the table is shared."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            active = self.db.execute(
-                "SELECT COUNT(*) FROM runs WHERE status IN ('starting', 'running')"
-            ).fetchone()[0]
-            if active >= self.config["engine"]["max_parallel"]:
+            if self.runs.running() >= self.config["engine"]["max_parallel"]:
                 self.db.commit()
                 return None
-            rows = self.db.execute(
-                "SELECT * FROM runs WHERE status = 'pending' ORDER BY queued_at, id"
-            ).fetchall()
-            for row in rows:
-                item = self.by_id.get(row["automation_id"])
+            for row in self.runs.pending():
+                slug = row["automation_slug"]
+                item = self.by_id.get(slug)
                 if item is None or not applies(item, self.config["engine"]["environment"]):
-                    self.db.execute(
-                        "UPDATE runs SET status = 'skipped', finished_at = ?, summary = ? WHERE id = ?",
-                        (iso(), "automation missing, disabled, or outside environment", row["id"]),
-                    )
+                    self.runs.update(
+                        row["id"], status="skipped", finished_at=iso(),
+                        summary="automation missing, disabled, or outside environment")
                     continue
-                same = self.db.execute(
-                    "SELECT COUNT(*) FROM runs WHERE automation_id = ? "
-                    "AND status IN ('starting', 'running')",
-                    (row["automation_id"],),
-                ).fetchone()[0]
-                if same >= item["max_parallel"]:
+                if self.runs.count_for(slug, "starting") + \
+                        self.runs.count_for(slug, "running") >= item["max_parallel"]:
                     continue
                 updated = self.db.execute(
                     "UPDATE runs SET status = 'starting' WHERE id = ? AND status = 'pending'",
-                    (row["id"],),
-                ).rowcount
+                    (row["id"],)).rowcount
                 if updated:
                     self.db.commit()
-                    return dict(row)
+                    return row
             self.db.commit()
             return None
         except Exception:
@@ -707,7 +990,7 @@ class Daemon:
             self._start(row)
 
     def _start(self, row: dict[str, Any]) -> None:
-        item = self.by_id[row["automation_id"]]
+        item = self.by_id[row["automation_slug"]]
         script = item["script_path"]
         if not script.is_file():
             self._finish_without_child(row, "failed", None, f"script not found: {script}")
@@ -723,12 +1006,12 @@ class Daemon:
         log_handle = log_path.open("a", encoding="utf-8")
         env = dict(os.environ)
         env.update({
-            "AUTOMATION_ID": row["automation_id"],
+            "AUTOMATION_ID": row["automation_slug"],
             "AUTOMATION_RUN_ID": row["id"],
             "AUTOMATION_ATTEMPT": str(row["attempt"]),
             "AUTOMATION_TRIGGER": row["trigger"],
             "AUTOMATION_ENVIRONMENT": row["environment"],
-            "AUTOMATION_NAMESPACE": row["namespace"],
+            "AUTOMATION_NAMESPACE": self.config["engine"]["namespace"],
             "AUTOMATION_PROJECT_ROOT": str(self.root),
             "AUTOMATION_STATE_DIR": str(self.state_dir),
             "AUTOMATIONS_BIN": automations_bin(),
@@ -747,14 +1030,10 @@ class Daemon:
             log_handle.close()
             self._finish_without_child(row, "failed", None, f"spawn failed: {exc}")
             return
-        self.db.execute(
-            "UPDATE runs SET status = 'running', started_at = ?, pid = ? WHERE id = ?",
-            (iso(), proc.pid, row["id"]),
-        )
-        self.db.commit()
+        self.runs.update(row["id"], status="running", started_at=iso(), pid=proc.pid)
         self.children[row["id"]] = Child(
             run_id=row["id"],
-            automation_id=row["automation_id"],
+            automation_id=row["automation_slug"],
             process=proc,
             log_handle=log_handle,
             log_path=log_path,
@@ -765,19 +1044,15 @@ class Daemon:
     def _finish_without_child(
         self, row: dict[str, Any], status: str, exit_code: int | None, summary: str
     ) -> None:
-        self.db.execute(
-            "UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, summary = ?, "
-            "pid = NULL WHERE id = ?",
-            (status, iso(), exit_code, summary, row["id"]),
-        )
-        self.db.commit()
+        self.runs.update(row["id"], status=status, finished_at=iso(), exit_code=exit_code,
+                         summary=summary, pid=None)
         self._maybe_retry(row["id"])
 
     def reap(self) -> None:
         now_mono = time.monotonic()
         for run_id, child in list(self.children.items()):
-            row = self.db.execute("SELECT cancel_requested FROM runs WHERE id = ?", (run_id,)).fetchone()
-            cancel = bool(row and row[0])
+            row = self.runs.get(run_id)
+            cancel = bool(row and row["cancel_requested"])
             timed_out = now_mono - child.started_monotonic >= child.timeout_seconds
             if child.process.poll() is None and child.stopping_at is None and (cancel or timed_out):
                 child.stop_reason = "canceled" if cancel else "timeout"
@@ -801,32 +1076,22 @@ class Daemon:
                 status, summary = "succeeded", _summary(child.log_path)
             else:
                 status, summary = "failed", _summary(child.log_path) or f"exited {code}"
-            self.db.execute(
-                "UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, summary = ?, "
-                "pid = NULL WHERE id = ?",
-                (status, iso(), code, summary, run_id),
-            )
-            self.db.commit()
+            self.runs.update(run_id, status=status, finished_at=iso(), exit_code=code,
+                             summary=summary, pid=None)
             del self.children[run_id]
             if status == "failed":
                 self._maybe_retry(run_id)
 
     def _maybe_retry(self, run_id: str) -> None:
-        row = self.db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        row = self.runs.get(run_id)
         if row is None:
             return
-        item = self.by_id.get(row["automation_id"])
+        slug = row["automation_slug"]
+        item = self.by_id.get(slug)
         if item is None or int(row["attempt"]) > item["retries"]:
             return
-        enqueue(
-            self.db,
-            self.config,
-            self.state_dir,
-            row["automation_id"],
-            trigger="retry",
-            attempt=int(row["attempt"]) + 1,
-            parent_run_id=row["parent_run_id"] or row["id"],
-        )
+        self._claim(slug, trigger="retry", attempt=int(row["attempt"]) + 1,
+                    parent_run_id=row["parent_run_id"] or row["id"])
 
     def shutdown(self) -> None:
         grace = self.config["engine"]["shutdown_grace_seconds"]
@@ -841,12 +1106,8 @@ class Daemon:
                 if code is None:
                     continue
                 child.log_handle.close()
-                self.db.execute(
-                    "UPDATE runs SET status = 'interrupted', finished_at = ?, exit_code = ?, "
-                    "summary = 'daemon stopped', pid = NULL WHERE id = ?",
-                    (iso(), code, run_id),
-                )
-                self.db.commit()
+                self.runs.update(run_id, status="interrupted", finished_at=iso(),
+                                 exit_code=code, summary="daemon stopped", pid=None)
                 del self.children[run_id]
             time.sleep(0.05)
         for run_id, child in list(self.children.items()):
@@ -854,12 +1115,8 @@ class Daemon:
             with contextlib.suppress(Exception):
                 child.process.wait(timeout=2)
             child.log_handle.close()
-            self.db.execute(
-                "UPDATE runs SET status = 'interrupted', finished_at = ?, "
-                "summary = 'daemon stopped', pid = NULL WHERE id = ?",
-                (iso(), run_id),
-            )
-            self.db.commit()
+            self.runs.update(run_id, status="interrupted", finished_at=iso(),
+                             summary="daemon stopped", pid=None)
             del self.children[run_id]
 
     def run(self) -> None:
@@ -889,7 +1146,7 @@ class Daemon:
         finally:
             self.shutdown()
             pid_path.unlink(missing_ok=True)
-            self.db.close()
+            self.store.close()
             lock.close()
 
 

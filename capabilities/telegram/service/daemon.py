@@ -46,6 +46,7 @@ import contextlib
 import fcntl
 import hashlib
 import html
+import importlib.util
 import json
 import logging
 import os
@@ -228,6 +229,32 @@ CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_CONTEXT")
                     or SERVICE_DIR / "context.md")
 
 
+_RECORDS = None
+_RECORDS_MODULE = None
+
+
+def _records_module():
+    global _RECORDS_MODULE
+    if _RECORDS_MODULE is None:
+        path = Path(__file__).with_name("store.py")
+        spec = importlib.util.spec_from_file_location("telegram_service_store", path)
+        if spec is None or spec.loader is None:
+            raise SettingsError(f"cannot load records adapter from {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _RECORDS_MODULE = module
+    return _RECORDS_MODULE
+
+
+def _records():
+    """The same adapter the CLIs read through, opened once here as well."""
+    global _RECORDS
+    if _RECORDS is None:
+        _store = _records_module()
+        _RECORDS = _store.open_records(PROJECT_CAPABILITIES_DIR, CONFIG_HOME)
+    return _RECORDS
+
+
 def _read_project_layout(reload_file=False):
     """Validate the launcher-owned absolute project layout snapshot."""
     raw = os.environ.get("TELEGRAM_SERVICE_PROJECT_LAYOUT", "").strip()
@@ -292,12 +319,14 @@ CHANNEL_ENABLED = os.environ.get(
 
 def _read_settings():
     try:
-        settings = json.loads(SETTINGS_FILE.read_text())
-    except OSError as exc:
+        settings = {key: row["value"] for key, row in
+                    _records().resolve("telegram", "setting").items()}
+    except _records_module().StoreError as exc:
         raise SettingsError(
-            f"Telegram service settings not found: {SETTINGS_FILE}") from exc
-    except json.JSONDecodeError as e:
-        raise SettingsError(f"{SETTINGS_FILE} is not valid JSON: {e}") from e
+            f"Telegram service records are unavailable: {exc.message}") from exc
+    if not settings:
+        raise SettingsError(
+            f"Telegram service settings not found in {_records().source}")
     if not isinstance(settings, dict):
         raise SettingsError(f"{SETTINGS_FILE} must contain a JSON object")
     try:
@@ -990,12 +1019,45 @@ GEMINI_SECRET_ENV = ((CONNECTION_ENTRY or {}).get("gemini_secret_env")
                      or "GOOGLE_API_KEY")
 
 
+NAME = "telegram"
+
+
+def _document_key(path):
+    """The document key a service file corresponds to, by the one convention
+    the import follows: `context.md` is `context`, `context/<x>.md` is
+    `context.<x>`, and anything else is its own stem."""
+    try:
+        rel = Path(path).resolve().relative_to(SERVICE_DIR.resolve())
+    except (OSError, ValueError):
+        rel = Path(path)
+    stem = rel.stem.replace("_", "-").lower()
+    if rel.parent.name == "context":
+        return f"context.{stem}"
+    return stem
+
+
+def read_service_document(path):
+    """Prose the daemon serves at request time — the soft-gate context, a
+    channel's own context, the voice prompt.
+
+    The adapter answers from wherever this project keeps its records, and the
+    daemon is not told which. Nothing falls back between them: a project on the
+    store that cannot reach it raises rather than serving an empty prompt, and
+    the dispatch loop turns that into a failed job the requester hears about.
+    A prompt the daemon could not read is not a prompt that is empty."""
+    doc = _service_document(path)
+    return (doc["body"] if doc else "").strip()
+
+
+def _service_document(path):
+    """One document as the records surface holds it, or None where the project
+    keeps no such document."""
+    return _records().document_read(NAME, _document_key(path))
+
+
 def read_voice_context():
     """The voice channel's own system prompt, owned by the project."""
-    try:
-        return VOICE_CONTEXT_FILE.read_text().strip()
-    except OSError:
-        return ""
+    return read_service_document(VOICE_CONTEXT_FILE)
 
 
 def voice_call_readiness():
@@ -2742,13 +2804,12 @@ def _channel_context_from_policy(policy):
     path = _service_context_path(context_file)
     if context_file and path is None:
         parts.append(f"[channel context file ignored: {context_file}]")
-    elif path and path.exists():
-        try:
-            text = path.read_text().strip()
-        except OSError as e:
-            text = f"[channel context file unreadable: {context_file}: {e}]"
-        if text:
-            parts.append(text)
+    elif (doc := _service_document(path) if path else None) is not None:
+        # Held apart deliberately: a document that exists and says nothing is
+        # not the same as one the project does not have, and only the second
+        # is worth telling the room about.
+        if (doc["body"] or "").strip():
+            parts.append(doc["body"].strip())
     elif context_file:
         parts.append(f"[channel context file missing: {context_file}]")
     return "\n\n".join(parts).strip()
@@ -2812,7 +2873,7 @@ def build_prompt(tail, state=None):
     # An exclusive channel answers with its own prose alone. The service context
     # goes with the room's, which is the point of the mode and the cost of it.
     context = ("" if st.get("context_exclusive")
-               else (CONTEXT_FILE.read_text().strip() if CONTEXT_FILE.exists() else ""))
+               else read_service_document(CONTEXT_FILE))
     channel_context = (st.get("channel_context") or "").strip()
     progress_command = None
     if st.get("chat_id") is not None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -383,6 +384,10 @@ def test_dev_install_uses_session_registry_and_refuses_canonical_fallback(tmp_pa
     canonical_mailbox = Path(env["CAPABILITIES_HOME"]) / "mailbox"
     canonical_mailbox.mkdir(parents=True)
     (canonical_mailbox / "mailbox").write_text("#!/bin/sh\nexit 0\n")
+    outer_bin = Path(env["CAPABILITIES_BIN"])
+    outer_bin.mkdir(parents=True)
+    (outer_bin / "mailbox").symlink_to(canonical_mailbox / "mailbox")
+    env["PATH"] = str(outer_bin) + os.pathsep + env.get("PATH", os.defpath)
 
     started = _start(env, source, consumer)
     installed = json.loads(
@@ -488,6 +493,54 @@ def test_dev_run_executes_only_the_session_payload_against_attached_project(tmp_
     assert diagnostic["selected_connection"] is None
     assert diagnostic["payload"].startswith(started["isolated"]["registry"])
     _run(env, "dev", "stop", "deployment-test")
+
+
+def test_dev_run_projects_the_attached_projects_database(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    identity = {
+        "schema": "capabilities.project.v1",
+        "id": "project-db-fixture",
+        "slug": "db-fixture",
+        "store": "db",
+    }
+    (consumer / "capabilities" / "project.json").write_text(
+        json.dumps(identity) + "\n")
+    db_path = tmp_path / "project-store.db"
+    probe = subprocess.run(
+        [str(MANAGER), "path", "store"],
+        env={**_env(tmp_path), "CAPABILITIES_STORE_URL": str(db_path)},
+        text=True, capture_output=True, check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    store_spec = importlib.util.spec_from_file_location(
+        "dev_test_store", REPO / "contract" / "store.py")
+    assert store_spec is not None and store_spec.loader is not None
+    store_module = importlib.util.module_from_spec(store_spec)
+    store_spec.loader.exec_module(store_module)
+    with store_module.SQLiteStore.open(str(db_path)) as db:
+        db.migrate()
+        db.project_register(identity["id"], identity["slug"])
+
+    env = _env(tmp_path)
+    env["CAPABILITIES_STORE_URL"] = str(db_path)
+    started = _start(env, source, consumer, session="db-run")
+    script = Path(started["source_worktree"]) / "capabilities" / "deployment" / "bin" / "deployment"
+    original = script.read_text()
+    script.write_text(original.replace(
+        'if __name__ == "__main__":',
+        'if len(sys.argv) > 1 and sys.argv[1] == "store-probe":\n'
+        '    print(os.environ.get("CAPABILITIES_STORE_URL"))\n'
+        '    raise SystemExit(0)\n\n\n'
+        'if __name__ == "__main__":',
+    ))
+    _run(env, "dev", "install", "db-run", "deployment")
+    result = _run(
+        env, "dev", "run", "db-run", "deployment",
+        "--project-only", "--", "store-probe")
+    assert result.stdout.strip() == str(db_path)
+    script.write_text(original)
+    _run(env, "dev", "stop", "db-run")
 
 
 def test_dev_stop_preserves_dirty_and_unmerged_work_then_allows_merged_cleanup(

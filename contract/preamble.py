@@ -118,7 +118,12 @@ def _project_root() -> Path | None:
     for d in (here, *here.parents):
         if d == home:
             return None
+        # Either marker names a project. `settings.json` is the gate and
+        # `project.json` the identity; a project keeping its records in the
+        # store needs the second and may eventually stop carrying the first,
+        # so neither is required while both worlds are in use.
         if ((d / "capabilities" / "settings.json").is_file()
+                or (d / "capabilities" / "project.json").is_file()
                 or (d / ".contextkit" / "config.toml").is_file()
                 or (d / ".capabilities").is_dir()
                 or (d / ".env").exists()
@@ -397,6 +402,77 @@ def _env_dir() -> Path | None:
     return (_project_capabilities_dir(root) / NAME) if root is not None else None
 
 
+_RECORDS = None
+
+
+def _store_source_label() -> str:
+    """A credential-free label for the store that answered.
+
+    Core-only capabilities need this just as much as connection-bearing ones,
+    so it belongs with the records adapter rather than in the connections tier.
+    """
+    url = os.environ.get("CAPABILITIES_STORE_URL") or "?"
+    if "://" not in url:
+        return f"store(sqlite:{url})"
+    scheme, rest = url.split("://", 1)
+    if "@" in rest:
+        rest = rest.split("@", 1)[1]
+    return f"store({scheme}://{rest.split('?', 1)[0]})"
+
+
+def _records():
+    """The adapter this project's records are read and written through.
+
+    Everything below takes what this returns and none of it can tell which it
+    got. That is the whole of the arrangement: a call site that can tell where
+    a record lives is a call site that will eventually decide for itself, and
+    then there are two answers to a question that has one."""
+    global _RECORDS
+    if _RECORDS is None:
+        root = _project_root()
+        envelope = (_project_capabilities_dir(root) if root is not None
+                    else _CONFIG_HOME / "no-project")
+        try:
+            project_only = os.environ.get("CAPABILITIES_RECORDS_PROJECT_ONLY", "") \
+                .strip().lower() in ("1", "true", "yes", "on")
+            _RECORDS = open_records(
+                envelope, _CONFIG_HOME, project_only=project_only)
+        except StoreError as e:
+            _die(6, e.slug, e.message, e.hint)
+        if _RECORDS.mode == "db":
+            _RECORDS.source = _store_source_label()
+    return _RECORDS
+
+
+def _store_mode() -> tuple[str, str]:
+    """Where this project keeps its records, as a report rather than a fork.
+
+    Nothing branches on this any more; it is here because a status surface may
+    still want to say which source answered. One project may be moved without moving any other, so the answer is
+    per project and lives beside the project's identity — it has to be readable
+    before the store is reachable.
+
+    The declaration itself is read in one place, `records_mode`, and acted on
+    in one place, `open_records`."""
+    adapter = _records()
+    return (adapter.mode, adapter.source)
+
+
+def _project_identity() -> dict:
+    root = _project_root()
+    if root is None:
+        _die(6, "no_project", "no project here to resolve records for")
+    identity_file = _project_capabilities_dir(root) / "project.json"
+    try:
+        identity = json.loads(identity_file.read_text())
+    except (OSError, ValueError) as e:
+        _die(6, "no_project_identity", f"cannot read {identity_file}: {e}",
+             "run `capabilities init` in the project")
+    if not identity.get("slug"):
+        _die(6, "no_project_identity", f"{identity_file} declares no slug")
+    return identity
+
+
 def _state_dir() -> Path:
     """State follows the scope of the credentials that minted it; project state
     lands inside the envelope only where capabilities/ already exists."""
@@ -520,23 +596,50 @@ def _render_ids_markdown(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _identifiers_scopes() -> "Scopes":
+    identity = _project_identity()
+    return Scopes(project=identity["slug"])
+
+
+def _identifiers_load() -> dict:
+    """The identifiers envelope, from wherever this project keeps its records.
+
+    The shape is the same either way — `{label: {value, note}}` — so the help
+    section, the report and `ids get` never learn which answered."""
+    try:
+        resolved = _records().resolve(NAME, "identifier")
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    return {label: {"note": row["note"] or "", "value": row["value"]}
+            for label, row in sorted(resolved.items())}
+
+
+def _identifiers_write(label: str, value, note: str) -> None:
+    """Rule 15 holds either way: a capability is the sole writer of its own
+    identifiers, addressed by (capability, collection) rather than by path."""
+    kept = note or (_identifiers_load().get(label) or {}).get("note", "")
+    try:
+        _records().set(NAME, "identifier", label, value,
+                       actor=f"{NAME} ids set", note=kept or None)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+
+
+def _identifiers_remove(label: str) -> None:
+    try:
+        _records().delete(NAME, "identifier", label)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+
+
 def _identifiers_section() -> str:
     """The Identifiers block appended to the bare top-level help — deterministic
     first-touch surfacing of `capabilities/<NAME>/identifiers.json` so an
     agent following the `<NAME> help` startup protocol loads the discovered
     labels/values/notes into context at once. Empty when no project envelope
     or nothing recorded (do not bloat help with an empty section)."""
-    envdir = _env_dir()
-    if envdir is None:
-        return ""
-    ids_file = envdir / "identifiers.json"
-    if not ids_file.exists():
-        return ""
-    try:
-        data = json.loads(ids_file.read_text())
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(data, dict) or not data:
+    data = _identifiers_load()
+    if not data:
         return ""
     header = (
         "\n═══ Identifiers ═════════════════════════════════════════════════════════════\n\n"
@@ -566,14 +669,7 @@ def _cmd_help() -> None:
 
 def _cmd_ids(argv: list[str]) -> None:
     sub = argv[0] if argv else "list"
-    envdir = _env_dir()
-    ids_file = (envdir / "identifiers.json") if envdir else None
-    data: dict = {}
-    if ids_file and ids_file.exists():
-        try:
-            data = json.loads(ids_file.read_text())
-        except ValueError:
-            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
+    data = _identifiers_load()
     if sub == "list":
         _emit(data); return
     if sub == "get":
@@ -584,9 +680,6 @@ def _cmd_ids(argv: list[str]) -> None:
     if sub == "set":
         if len(argv) < 3:
             _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
-        if envdir is None or not (envdir.parent / "settings.json").is_file():
-            _die(6, "no_envelope", "no capabilities/ envelope in this project",
-                 "run `capabilities init` first")
         label, raw = argv[1], argv[2]
         try:
             value = json.loads(raw)
@@ -598,42 +691,163 @@ def _cmd_ids(argv: list[str]) -> None:
             if ni + 1 >= len(argv):
                 _die(6, "input", "--note needs a value")
             note = argv[ni + 1]
-        data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
-        envdir.mkdir(parents=True, exist_ok=True)
-        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _identifiers_write(label, value, note)
         _emit({"set": label}); return
     if sub == "rm":
         if len(argv) < 2 or argv[1] not in data:
             _die(3, "not_found", "unknown identifier label",
                  f"`{NAME} ids list` shows the labels")
-        del data[argv[1]]
-        ids_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        _identifiers_remove(argv[1])
         _emit({"removed": argv[1]}); return
     _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
 
 
-def _cmd_refs() -> None:
-    envdir = _env_dir()
-    refdir = (envdir / "reference") if envdir else None
-    out = []
-    if refdir and refdir.is_dir():
-        for md in sorted(refdir.glob("*.md")):
-            name = desc = None
-            try:
-                lines = md.read_text().splitlines()
-            except OSError:
+REFERENCE_PREFIX = "reference."
+
+
+def _front_matter(body: str) -> tuple[str | None, str | None]:
+    """`name` and `description` out of a reference's leading front matter."""
+    lines = body.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, None
+    name = desc = None
+    for line in lines[1:30]:
+        if line.strip() == "---":
+            break
+        if line.startswith("name:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("description:"):
+            desc = line.split(":", 1)[1].strip()
+    return name, desc
+
+
+def _reference_bodies() -> dict[str, str]:
+    """Every reference this project can see, keyed by its document key.
+
+    In the store a reference is a pinned document like any other long text, so
+    an edit reaches every host at once and an unpinned draft reaches none."""
+    out: dict[str, str] = {}
+    try:
+        adapter = _records()
+        for key in adapter.document_keys(NAME):
+            if not key.startswith(REFERENCE_PREFIX):
                 continue
-            if lines and lines[0].strip() == "---":
-                for line in lines[1:30]:
-                    if line.strip() == "---":
-                        break
-                    if line.startswith("name:"):
-                        name = line.split(":", 1)[1].strip()
-                    elif line.startswith("description:"):
-                        desc = line.split(":", 1)[1].strip()
-            if name:
-                out.append({"name": name, "description": desc or "", "path": str(md)})
-    _emit(out)
+            doc = adapter.document_read(NAME, key)
+            if doc:
+                out[key] = doc["body"]
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    return out
+
+
+def _cmd_refs(argv: list[str] | None = None) -> None:
+    """`refs` lists what this project can load; `refs show <name>` prints one.
+
+    The listing carries a `source` rather than a path, because a reference kept
+    in the store has no path to open — `refs show` is the one way to read a
+    body that works whichever source answered."""
+    argv = argv or []
+    bodies = _reference_bodies()
+    adapter = _records()
+    entries = []
+    for key, body in sorted(bodies.items()):
+        name, desc = _front_matter(body)
+        if not name:
+            continue
+        entry = {"name": name, "description": desc or "", "key": key}
+        # A path when there is one to open, a source when there is not. The
+        # adapter answers that; the listing does not ask where it lives.
+        path = adapter.document_path(NAME, key)
+        if path is None:
+            entry["source"] = adapter.source
+        else:
+            entry["path"] = str(path)
+        entries.append((name, entry, body))
+
+    if argv and argv[0] == "show":
+        if len(argv) < 2:
+            _die(6, "input", f"usage: {NAME} refs show <name>")
+        wanted = argv[1]
+        for name, entry, body in entries:
+            if wanted in (name, entry["key"], entry["key"][len(REFERENCE_PREFIX):]):
+                sys.stdout.write(body if body.endswith("\n") else body + "\n")
+                return
+        _die(3, "not_found", f"no reference named {wanted!r}",
+             f"`{NAME} refs` lists them")
+    if argv:
+        _die(6, "input", f"unknown refs subcommand {argv[0]!r}", f"{NAME} refs [show <name>]")
+    _emit([entry for _name, entry, _body in entries])
+
+
+def _context_edit_files(key: str) -> tuple[Path, Path]:
+    token = hashlib.sha256(f"{NAME}\0{key}".encode()).hexdigest()[:16]
+    root = _state_dir() / "record-edits"
+    return root / f"{token}.md", root / f"{token}.json"
+
+
+def _cmd_context(argv: list[str]) -> None:
+    """Read or edit project long text without exposing its backend."""
+    sub = argv[0] if argv else "list"
+    adapter = _records()
+    if sub == "list":
+        _emit({"documents": adapter.document_keys(NAME),
+               "records": {"mode": adapter.mode, "source": adapter.source}})
+        return
+    if len(argv) < 2:
+        _die(6, "input", f"usage: {NAME} context show|edit|put <key>")
+    key = argv[1]
+    if sub == "show":
+        doc = adapter.document_read(NAME, key)
+        if doc is None:
+            _die(3, "not_found", f"no context document {key!r}",
+                 f"`{NAME} context list` shows the keys")
+        sys.stdout.write(doc["body"] if doc["body"].endswith("\n")
+                         else doc["body"] + "\n")
+        return
+    work, meta = _context_edit_files(key)
+    if sub == "edit":
+        doc = adapter.document_read(NAME, key)
+        direct = adapter.document_path(NAME, key)
+        base = doc["hash"] if doc else None
+        path = direct or work
+        if direct is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(doc["body"] if doc else "")
+        meta.parent.mkdir(parents=True, exist_ok=True)
+        meta.write_text(json.dumps({"key": key, "path": str(path),
+                                    "base": base, "direct": direct is not None},
+                                   ensure_ascii=False, indent=2) + "\n")
+        _emit({"key": key, "path": str(path), "base": base,
+               "records": {"mode": adapter.mode, "source": adapter.source},
+               "next": f"edit the path, then run `{NAME} context put {key}`"})
+        return
+    if sub == "put":
+        try:
+            checkout = json.loads(meta.read_text())
+        except (OSError, ValueError) as exc:
+            _die(6, "edit_not_started",
+                 f"no valid edit checkout for {key!r}: {exc}",
+                 f"run `{NAME} context edit {key}` first")
+        if checkout.get("key") != key:
+            _die(6, "edit_mismatch", f"edit checkout does not belong to {key!r}")
+        path = Path(str(checkout.get("path") or ""))
+        try:
+            body = path.read_text()
+            version = adapter.document_put(
+                NAME, key, body, author=f"{NAME} context put",
+                media_type="text/markdown", base=checkout.get("base"))
+        except OSError as exc:
+            _die(6, "edit_unreadable", f"cannot read edit path {path}: {exc}")
+        except StoreError as exc:
+            _die(6, exc.slug, exc.message, exc.hint)
+        meta.unlink(missing_ok=True)
+        if not checkout.get("direct"):
+            path.unlink(missing_ok=True)
+        _emit({"put": key, "version": version,
+               "records": {"mode": adapter.mode, "source": adapter.source}})
+        return
+    _die(6, "input", f"unknown context subcommand {sub!r}",
+         f"{NAME} context list|show|edit|put")
 
 
 def _contract(argv: list[str]) -> None:
@@ -657,7 +871,9 @@ def _contract(argv: list[str]) -> None:
     elif cmd == "ids":
         _cmd_ids(argv[1:])
     elif cmd == "refs":
-        _cmd_refs()
+        _cmd_refs(argv[1:])
+    elif cmd == "context":
+        _cmd_context(argv[1:])
     elif cmd == "connections":
         _cmd_connections()
     elif cmd == "help" and len(argv) == 1:
@@ -693,32 +909,42 @@ def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 
 
-def _connections_registry() -> tuple[dict | None, Path | None]:
-    """The connections envelope and its path: project envelope first, else the
-    user config home. First found wins, never merged. Every connection-bearing
-    capability requires a registry, even when it declares only one connection."""
-    envdir = _env_dir()
-    candidates = ([envdir / "connections.json"] if envdir else []) + \
-                 [_CONFIG_HOME / NAME / "connections.json"]
-    for reg_file in candidates:
-        if not reg_file.is_file():
-            continue
-        try:
-            raw = json.loads(reg_file.read_text())
-        except (ValueError, OSError) as e:
-            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
-        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
-                or not raw["connections"]:
-            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
-                 'expected {"default": "<id>", "connections": { ... }}')
-        return raw, reg_file
-    project_path = (envdir / "connections.json") if envdir else None
-    homes = ([str(project_path)] if project_path else []) + \
-            [str(_CONFIG_HOME / NAME / "connections.json")]
-    _die(6, "connections_required",
-         f"{NAME} requires an explicit connections registry",
-         "create one of: " + ", ".join(homes) +
-         '; expected {"default": "<id>", "connections": {"<id>": { ... }}}')
+def _connections_composed() -> dict:
+    """The connections envelope shape, composed out of resolved records.
+
+    Deliberately reconstituted rather than returned in some store-shaped form:
+    selection, the write gate and the `connections` report all read the envelope
+    shape, and they should not learn where the rows came from. What changes here
+    is the source, never the shape.
+
+    The permission a project was granted is folded back onto the entry as
+    `allow_write`, which is where the rest of the contract looks for it."""
+    adapter = _records()
+    try:
+        effective = adapter.connections(NAME, write_default=WRITE_DEFAULT)
+        default = adapter.get(NAME, "setting", "connection.default")
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    if not effective:
+        _die(6, "connections_required",
+             f"{NAME} requires an explicit connections registry and "
+             f"{adapter.source} holds none",
+             'expected {"default": "<id>", "connections": {"<id>": { ... }}}')
+    return {
+        "default": default,
+        "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
+                        for cid, entry in effective.items()},
+    }
+
+
+def _connections_registry() -> tuple[dict | None, Path | str | None]:
+    """The connections envelope and where it came from.
+
+    Composed from the two records a connection is kept as -- who it is, and
+    what this project may do with it -- and handed on in the shape the rest of
+    the contract already reads, so selection, the write gate and the report
+    never learn which source answered."""
+    return _connections_composed(), _records().collection_source(NAME, "connection")
 
 
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:

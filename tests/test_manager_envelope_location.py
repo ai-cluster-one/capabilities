@@ -11,6 +11,12 @@ MANAGER = Path(__file__).parents[1] / "bin" / "capabilities"
 YOUTRACK = Path(__file__).parents[1] / "capabilities" / "youtrack" / "bin" / "youtrack"
 
 
+def _stderr_error(result: subprocess.CompletedProcess[str]) -> dict:
+    line = next(line for line in reversed(result.stderr.splitlines())
+                if line.lstrip().startswith("{"))
+    return json.loads(line)["error"]
+
+
 def _project(tmp_path: Path, contextkit: bool, body_root: str | None = None) -> Path:
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
@@ -97,13 +103,13 @@ def test_capability_reads_the_gate_from_the_resolved_envelope(tmp_path: Path) ->
     _fake_contextkit(tmp_path, envelope)
 
     result = subprocess.run(
-        [sys.executable, str(YOUTRACK), "refs"], cwd=project,
+        [str(YOUTRACK), "refs"], cwd=project,
         env=_env(tmp_path, project), text=True, capture_output=True, timeout=60,
     )
 
     # `disabled` (not `not_enabled`) proves the relocated project gate was read.
     assert result.returncode == 4
-    assert json.loads(result.stderr)["error"]["code"] == "disabled"
+    assert _stderr_error(result)["code"] == "disabled"
 
 
 def test_contextkit_without_body_root_keeps_the_root_envelope(tmp_path: Path) -> None:

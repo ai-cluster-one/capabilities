@@ -5,11 +5,13 @@ import contextlib
 import importlib.util
 import json
 import os
+import pytest
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -35,10 +37,29 @@ class AutomationsTests(unittest.TestCase):
         (self.root / "capabilities" / "settings.json").write_text(
             json.dumps({"capabilities": {"automations": {"enabled": True}}}) + "\n"
         )
+        # Runs are scoped to a project, so the project has to have said who it
+        # is. The manager writes this file; a fixture that skipped it was only
+        # ever describing a project that could not exist.
+        # A slug belongs to one project, so a fixture that reuses one across
+        # tests is describing two projects wearing the same label — which the
+        # store refuses, correctly.
+        self.project_id = str(uuid.uuid4())
+        self.project_slug = "fixture-" + self.project_id[:8]
+        (self.root / "capabilities" / "project.json").write_text(
+            json.dumps({"schema": "capabilities.project.v1",
+                        "id": self.project_id, "slug": self.project_slug}) + "\n"
+        )
+        # In-process code reads the ambient environment, not `self.env`, so a
+        # fixture that only pointed the subprocesses at a scratch store was
+        # writing its projects into the developer's real one.
+        self.store_path = Path(self.tmp.name) / "store.db"
+        self._store_url_before = os.environ.get("CAPABILITIES_STORE_URL")
+        os.environ["CAPABILITIES_STORE_URL"] = str(self.store_path)
         self.env = dict(os.environ)
         self.env.update(
             {
                 "CLAUDE_PROJECT_DIR": str(self.root),
+                "CAPABILITIES_STORE_URL": str(Path(self.tmp.name) / "store.db"),
                 "AUTOMATIONS_ENVIRONMENT": "test",
                 "XDG_STATE_HOME": str(Path(self.tmp.name) / "xdg-state"),
             }
@@ -128,6 +149,10 @@ retries = 1
     def tearDown(self) -> None:
         with contextlib.suppress(Exception):
             self.cli("service", "stop", "--timeout", "2", "--force")
+        if self._store_url_before is None:
+            os.environ.pop("CAPABILITIES_STORE_URL", None)
+        else:
+            os.environ["CAPABILITIES_STORE_URL"] = self._store_url_before
         self.tmp.cleanup()
 
     def cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -338,8 +363,9 @@ retries = 0
             daemon.schedule_due(when)
             daemon.schedule_due(when)
         finally:
-            daemon.db.close()
-        rows = RUNTIME.list_runs(state_dir / "automations.db", limit=10)
+            daemon.store.close()
+        rows = RUNTIME.list_runs(self.root, RUNTIME.load_config(self.root, config_path),
+                                 limit=10)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "pending")
         self.assertEqual(rows[0]["trigger"], "schedule")
@@ -348,18 +374,17 @@ retries = 0
         config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
         state_dir = self.root / "capabilities" / "automations" / "state"
         config = RUNTIME.load_config(self.root, config_path)
-        db_path = state_dir / "automations.db"
-        with contextlib.closing(RUNTIME.connect(db_path)) as db:
-            row = RUNTIME.enqueue(db, config, state_dir, "job", trigger="manual")
-            self.assertIsNotNone(row)
-            db.execute("UPDATE runs SET status = 'running' WHERE id = ?", (row["id"],))
-            db.commit()
+        row = RUNTIME.enqueue_manual(self.root, config, state_dir, "job")
+        self.assertIsNotNone(row)
+        store, ledger = RUNTIME.open_ledger(self.root, config)
+        ledger.update(row["id"], status="running")
+        store.close()
         daemon = RUNTIME.Daemon(self.root, config_path, state_dir)
         try:
             daemon.recover()
         finally:
-            daemon.db.close()
-        rows = RUNTIME.list_runs(db_path, limit=10)
+            daemon.store.close()
+        rows = RUNTIME.list_runs(self.root, config, limit=10)
         original = next(item for item in rows if item["id"] == row["id"])
         recovered = next(item for item in rows if item["parent_run_id"] == row["id"])
         self.assertEqual(original["status"], "interrupted")
@@ -380,7 +405,7 @@ retries = 0
             retries = [
                 row
                 for row in rows
-                if row["automation_id"] == "flaky" and row["parent_run_id"] == first["id"]
+                if row["automation_slug"] == "flaky" and row["parent_run_id"] == first["id"]
             ]
             if retries and retries[0]["status"] == "succeeded":
                 self.assertEqual(retries[0]["attempt"], 2)
@@ -391,3 +416,143 @@ retries = 0
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- the ledger on a shared store --------------------------------------------
+
+def _store_with_automation(tmp_path):
+    """A store holding one project and one automation, as two machines sharing
+    a database would see it."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import store as store_mod
+    import runtime as rt
+
+    st = store_mod.SQLiteStore.open(str(tmp_path / "shared.db"))
+    st.migrate()
+    st.project_register("11111111-2222-3333-4444-555555555555", "marvin")
+    st.migrate(rt.STORE_NAMESPACE, rt.STORE_VERSION, rt.STORE_MIGRATIONS)
+    project_id = st._project_id("marvin")
+    automation_id = rt.store_upsert(st, "project", project_id, {
+        "slug": "nightly", "name": None, "description": None, "enabled": 1,
+        "script_key": "script.nightly", "schedule": "0 3 * * *", "every_seconds": None,
+        "timeout_seconds": 300.0, "max_parallel": 1, "max_pending": 1,
+        "overlap": "skip", "retries": 0, "arguments": [], "environments": [],
+    })
+    st._conn.commit()
+    return st, project_id, automation_id
+
+
+def _claim(st, project_id, automation_id, dedupe):
+    """One machine trying to claim one scheduled firing."""
+    import uuid as _uuid
+    st._execute(
+        "INSERT INTO runs (id, project_id, automation_id, automation_slug, environment, "
+        "trigger, scheduled_for, dedupe_key, status, queued_at, log_path) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (str(_uuid.uuid4()), project_id, automation_id, "nightly", "production",
+         "schedule", "2026-08-23T03:00:00+00:00", dedupe, "pending",
+         "2026-08-23T03:00:00+00:00", "/dev/null"))
+    st._conn.commit()
+
+
+def test_two_machines_cannot_both_claim_one_scheduled_firing(tmp_path):
+    """The whole reason the ledger moves to a shared store."""
+    import sqlite3 as _sqlite3
+    st, project_id, automation_id = _store_with_automation(tmp_path)
+    dedupe = "marvin:production:nightly:2026-08-23T03:00:00+00:00"
+
+    _claim(st, project_id, automation_id, dedupe)
+    with pytest.raises(_sqlite3.IntegrityError):
+        _claim(st, project_id, automation_id, dedupe)
+
+    assert st._execute("SELECT COUNT(*) FROM runs WHERE dedupe_key = ?",
+                       (dedupe,)).fetchone()[0] == 1
+    st.close()
+
+
+def test_a_different_firing_of_the_same_automation_still_claims(tmp_path):
+    st, project_id, automation_id = _store_with_automation(tmp_path)
+    _claim(st, project_id, automation_id, "marvin:production:nightly:2026-08-23T03:00:00+00:00")
+    _claim(st, project_id, automation_id, "marvin:production:nightly:2026-08-24T03:00:00+00:00")
+    assert st._execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+    st.close()
+
+
+def test_a_run_cannot_name_an_automation_that_is_not_there(tmp_path):
+    """The uuid reference is a real constraint, not a naming convention."""
+    import sqlite3 as _sqlite3
+    st, project_id, _automation_id = _store_with_automation(tmp_path)
+    with pytest.raises(_sqlite3.IntegrityError):
+        _claim(st, project_id, "99999999-9999-9999-9999-999999999999", "x")
+    st.close()
+
+
+def _ledger(st, project_id, environment="production"):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import runtime as rt
+    return rt.RunLedger(st._conn, project_id, environment)
+
+
+def test_the_ledger_answers_only_about_its_own_project(tmp_path):
+    """The reason scoping is a boundary and not a WHERE clause fifteen callers
+    are trusted to remember."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import runtime as rt
+
+    st, mine, automation_id = _store_with_automation(tmp_path)
+    st.project_register("99999999-8888-7777-6666-555555555555", "other")
+    theirs = st._project_id("other")
+    other_automation = rt.store_upsert(st, "project", theirs, {
+        "slug": "nightly", "name": None, "description": None, "enabled": 1,
+        "script_key": "script.nightly", "schedule": "0 3 * * *", "every_seconds": None,
+        "timeout_seconds": 300.0, "max_parallel": 1, "max_pending": 1,
+        "overlap": "skip", "retries": 0, "arguments": [], "environments": [],
+    })
+    st._conn.commit()
+
+    ours = _ledger(st, mine)
+    others = _ledger(st, theirs)
+    (tmp_path / "runs").mkdir(exist_ok=True)
+
+    assert ours.claim(automation_id, "nightly", tmp_path, trigger="manual") is not None
+    assert others.claim(other_automation, "nightly", tmp_path, trigger="manual") is not None
+
+    assert len(ours.list()) == 1
+    assert len(others.list()) == 1
+    assert ours.counts() == {"pending": 1}
+    assert st._execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+
+    # and a run belonging to the other project is invisible, not merely filtered
+    theirs_run = others.list()[0]
+    assert ours.get(theirs_run["id"]) is None
+    st.close()
+
+
+def test_two_ledgers_racing_one_firing_leave_one_run(tmp_path):
+    st, project_id, automation_id = _store_with_automation(tmp_path)
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    a, b = _ledger(st, project_id), _ledger(st, project_id)
+    dedupe = "marvin:production:nightly:2026-08-23T03:00:00+00:00"
+
+    first = a.claim(automation_id, "nightly", tmp_path, trigger="schedule", dedupe_key=dedupe)
+    second = b.claim(automation_id, "nightly", tmp_path, trigger="schedule", dedupe_key=dedupe)
+
+    assert first is not None and second is None
+    assert len(a.list()) == 1
+    st.close()
+
+
+def test_the_ledger_counts_per_automation_within_the_project(tmp_path):
+    st, project_id, automation_id = _store_with_automation(tmp_path)
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    led = _ledger(st, project_id)
+    led.claim(automation_id, "nightly", tmp_path, trigger="manual")
+
+    assert led.count_for("nightly", "pending") == 1
+    assert led.count_for("other-thing", "pending") == 0
+    assert led.has_active("nightly", ["pending"]) is True
+    assert led.running() == 0
+    st.close()

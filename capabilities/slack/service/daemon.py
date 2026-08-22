@@ -46,6 +46,7 @@ from register import Register
 from validation import require_valid_settings
 from watermark import Watermark
 from workers import WORKERS, WorkerTimeout, sanitized_worker_env
+import store as records_store
 
 
 def event_key(evt: dict) -> str:
@@ -139,11 +140,17 @@ def process_event(
 
 
 def _load_settings(path: Path) -> dict:
+    root = Path(os.environ.get("SLACK_SERVICE_PROJECT_ROOT") or os.getcwd()).resolve()
+    envelope = Path(os.environ.get("CAPABILITIES_PROJECT_ENVELOPE")
+                    or root / "capabilities").resolve()
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME")
+                       or (Path.home() / ".config"))
     try:
-        data = json.loads(Path(path).read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+        with records_store.open_records(envelope, config_home) as adapter:
+            return {key: row["value"] for key, row in
+                    adapter.resolve("slack", "setting").items()}
+    except records_store.StoreError as exc:
+        raise RuntimeError(f"Slack service records are unavailable: {exc.message}") from exc
 
 
 def _log(log_path, msg: str) -> None:
@@ -818,11 +825,11 @@ def main() -> None:
         _log(log_path, "missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN; exiting")
         sys.exit(2)
 
-    settings = _load_settings(settings_path)
     project_root = os.environ.get("SLACK_SERVICE_PROJECT_ROOT") or os.getcwd()
     try:
+        settings = _load_settings(settings_path)
         require_valid_settings(settings, project_root=project_root, check_worker=True)
-    except ValueError as exc:
+    except (RuntimeError, ValueError) as exc:
         _log(log_path, f"invalid service settings: {exc}")
         sys.exit(6)
     register = Register(state_dir / "register.json")
