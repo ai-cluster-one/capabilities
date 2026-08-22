@@ -492,27 +492,36 @@ def _store_mode() -> tuple[str, str]:
     `CAPABILITIES_STORE_MODE` overrides for one invocation, for comparing the two
     against each other. Nothing falls back silently in either direction: a
     project on the store that cannot reach it fails rather than reading a stale
-    file it would have no way to report."""
-    if "open_store" not in globals():
-        return ("files", "capability carries no store tier")
+    file it would have no way to report, and a capability carrying no store tier
+    fails the same way rather than answering out of files the project no longer
+    keeps. The declaration is read before the tier is looked for, because a
+    missing tier is a capability that wants stamping, never a project that meant
+    files."""
     override = os.environ.get("CAPABILITIES_STORE_MODE")
     if override:
         if override not in ("files", "db"):
             _die(6, "bad_store_mode", f"CAPABILITIES_STORE_MODE must be files or db, got {override!r}")
-        return (override, "CAPABILITIES_STORE_MODE")
-    root = _project_root()
-    if root is None:
-        return ("files", "no project")
-    identity_file = _project_capabilities_dir(root) / "project.json"
-    try:
-        identity = json.loads(identity_file.read_text())
-    except (OSError, ValueError):
-        return ("files", "no project identity")
-    mode = identity.get("store", "files")
-    if mode not in ("files", "db"):
-        _die(6, "bad_store_mode", f"{identity_file} declares store {mode!r}",
-             "expected \"files\" or \"db\"")
-    return (mode, str(identity_file))
+        mode, source = override, "CAPABILITIES_STORE_MODE"
+    else:
+        root = _project_root()
+        if root is None:
+            return ("files", "no project")
+        identity_file = _project_capabilities_dir(root) / "project.json"
+        try:
+            identity = json.loads(identity_file.read_text())
+        except (OSError, ValueError):
+            return ("files", "no project identity")
+        mode = identity.get("store", "files")
+        if mode not in ("files", "db"):
+            _die(6, "bad_store_mode", f"{identity_file} declares store {mode!r}",
+                 "expected \"files\" or \"db\"")
+        source = str(identity_file)
+    if mode == "db" and "open_store" not in globals():
+        _die(6, "no_store_tier",
+             f"{source} keeps this project's records in the store, "
+             f"but {NAME} carries no store tier to read them with",
+             "run `capabilities sync-contract` to stamp the tier into this capability")
+    return (mode, source)
 
 
 def _project_identity() -> dict:
