@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import pytest
 import subprocess
 import sys
 import tempfile
@@ -391,3 +392,73 @@ retries = 0
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- the ledger on a shared store --------------------------------------------
+
+def _store_with_automation(tmp_path):
+    """A store holding one project and one automation, as two machines sharing
+    a database would see it."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import store as store_mod
+    import runtime as rt
+
+    st = store_mod.SQLiteStore.open(str(tmp_path / "shared.db"))
+    st.migrate()
+    st.project_register("11111111-2222-3333-4444-555555555555", "marvin")
+    st.migrate(rt.STORE_NAMESPACE, rt.STORE_VERSION, rt.STORE_MIGRATIONS)
+    project_id = st._project_id("marvin")
+    automation_id = rt.store_upsert(st, "project", project_id, {
+        "slug": "nightly", "name": None, "description": None, "enabled": 1,
+        "script_key": "script.nightly", "schedule": "0 3 * * *", "every_seconds": None,
+        "timeout_seconds": 300.0, "max_parallel": 1, "max_pending": 1,
+        "overlap": "skip", "retries": 0, "arguments": [], "environments": [],
+    })
+    st._conn.commit()
+    return st, project_id, automation_id
+
+
+def _claim(st, project_id, automation_id, dedupe):
+    """One machine trying to claim one scheduled firing."""
+    import uuid as _uuid
+    st._execute(
+        "INSERT INTO runs (id, project_id, automation_id, automation_slug, environment, "
+        "trigger, scheduled_for, dedupe_key, status, queued_at, log_path) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (str(_uuid.uuid4()), project_id, automation_id, "nightly", "production",
+         "schedule", "2026-08-23T03:00:00+00:00", dedupe, "pending",
+         "2026-08-23T03:00:00+00:00", "/dev/null"))
+    st._conn.commit()
+
+
+def test_two_machines_cannot_both_claim_one_scheduled_firing(tmp_path):
+    """The whole reason the ledger moves to a shared store."""
+    import sqlite3 as _sqlite3
+    st, project_id, automation_id = _store_with_automation(tmp_path)
+    dedupe = "marvin:production:nightly:2026-08-23T03:00:00+00:00"
+
+    _claim(st, project_id, automation_id, dedupe)
+    with pytest.raises(_sqlite3.IntegrityError):
+        _claim(st, project_id, automation_id, dedupe)
+
+    assert st._execute("SELECT COUNT(*) FROM runs WHERE dedupe_key = ?",
+                       (dedupe,)).fetchone()[0] == 1
+    st.close()
+
+
+def test_a_different_firing_of_the_same_automation_still_claims(tmp_path):
+    st, project_id, automation_id = _store_with_automation(tmp_path)
+    _claim(st, project_id, automation_id, "marvin:production:nightly:2026-08-23T03:00:00+00:00")
+    _claim(st, project_id, automation_id, "marvin:production:nightly:2026-08-24T03:00:00+00:00")
+    assert st._execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+    st.close()
+
+
+def test_a_run_cannot_name_an_automation_that_is_not_there(tmp_path):
+    """The uuid reference is a real constraint, not a naming convention."""
+    import sqlite3 as _sqlite3
+    st, project_id, _automation_id = _store_with_automation(tmp_path)
+    with pytest.raises(_sqlite3.IntegrityError):
+        _claim(st, project_id, "99999999-9999-9999-9999-999999999999", "x")
+    st.close()

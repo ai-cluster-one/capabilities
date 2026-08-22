@@ -229,7 +229,7 @@ def load_agents(raw: dict[str, Any]) -> dict[str, Any]:
 # one the document's pin names, so editing a script and deploying it stay two
 # separate acts.
 STORE_NAMESPACE = "automations"
-STORE_VERSION = 1
+STORE_VERSION = 2
 STORE_MIGRATIONS = [
     """
     CREATE TABLE IF NOT EXISTS automations (
@@ -263,6 +263,43 @@ STORE_MIGRATIONS = [
     """
     CREATE INDEX IF NOT EXISTS automations_due_idx
         ON automations (scope, project_id, enabled)
+    """,
+    # The ledger. It differs from the one a file-mode project keeps in its own
+    # SQLite in two ways, and both are the point: a run names its project, and
+    # it names its automation by id rather than by the label a person types.
+    #
+    # `dedupe_key` was already project, environment, automation and scheduled
+    # time, and already unique. On a store two machines share, that uniqueness
+    # stops being bookkeeping and becomes the thing that keeps them from both
+    # firing one schedule: whichever inserts first wins and the other is told.
+    """
+    CREATE TABLE IF NOT EXISTS runs (
+        id                TEXT PRIMARY KEY,
+        project_id        TEXT REFERENCES projects(id),
+        automation_id     TEXT NOT NULL REFERENCES automations(id),
+        automation_slug   TEXT NOT NULL,
+        environment       TEXT NOT NULL,
+        trigger           TEXT NOT NULL,
+        scheduled_for     TEXT,
+        dedupe_key        TEXT UNIQUE,
+        status            TEXT NOT NULL,
+        attempt           INTEGER NOT NULL DEFAULT 1,
+        parent_run_id     TEXT,
+        queued_at         TEXT NOT NULL,
+        started_at        TEXT,
+        finished_at       TEXT,
+        pid               INTEGER,
+        exit_code         INTEGER,
+        summary           TEXT,
+        log_path          TEXT NOT NULL,
+        cancel_requested  INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status, queued_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS runs_automation_idx ON runs (automation_id, queued_at)
     """,
 ]
 
