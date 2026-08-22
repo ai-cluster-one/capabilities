@@ -4,6 +4,7 @@ The three resolution semantics are the part worth pinning down, because each
 one exists to satisfy a different standing rule and they disagree on purpose.
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "contract"))
 
 from store import (
     COLLECTIONS,
+    HASH_LENGTH as SCHEMA_HASH_LENGTH,
     SCHEMA_VERSION,
     PostgresStore,
     Scopes,
@@ -500,7 +502,7 @@ def test_an_unpinned_document_reads_as_absent(store, scopes):
 
 def test_pinning_a_version_that_was_never_recorded_is_refused(store):
     with pytest.raises(StoreError) as exc:
-        store.document_pin("telegram", "voice-agent", "0" * 64, ("global", ""))
+        store.document_pin("telegram", "voice-agent", "0" * 12, ("global", ""))
     assert exc.value.slug == "unknown_version"
 
 
@@ -530,3 +532,21 @@ def test_a_reference_is_a_document_like_any_other(store, scopes):
     store.document_pin("telegram", "reference.project-session", digest, ("project", "marvin"))
     assert store.document_read("telegram", "reference.project-session", scopes)["body"] == body
     assert store.document_keys("telegram") == ["reference.project-session"]
+
+
+def test_a_version_name_is_short_enough_to_read(store):
+    digest = store.document_put("telegram", "voice-agent", "text")
+    assert len(digest) == SCHEMA_HASH_LENGTH
+    assert digest == hashlib.sha256(b"text").hexdigest()[:SCHEMA_HASH_LENGTH]
+
+
+def test_a_truncated_hash_naming_different_text_is_refused(store):
+    """What makes twelve characters safe is that a clash is loud, not unlikely."""
+    digest = store.document_put("telegram", "voice-agent", "original")
+    with store.transaction():
+        store._execute(
+            "UPDATE documents SET body = ? WHERE capability = ? AND key = ? AND hash = ?",
+            ("tampered", "telegram", "voice-agent", digest))
+    with pytest.raises(StoreError) as exc:
+        store.document_put("telegram", "voice-agent", "original")
+    assert exc.value.slug == "hash_collision"

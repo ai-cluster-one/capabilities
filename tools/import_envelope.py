@@ -31,6 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "contract"))
 
 from store import Scopes, StoreError, open_store  # noqa: E402
 
+
+def _stamp() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 GRANT_KEYS = ("allow_write", "enabled")
 MANAGER = "capabilities"
 SERVICE_SETTINGS = ("telegram", "slack")
@@ -108,6 +113,44 @@ def plan(envelope: Path) -> list[dict]:
                 rows.append({"capability": "automations", "collection": "setting",
                              "key": section, "value": raw[section], "note": None})
     return rows
+
+
+def _script_key(script_path: str) -> str:
+    """A script's document key, by the same rule `plan_documents` uses, so the
+    row and the document agree on a name without either naming the other."""
+    return "script." + Path(script_path).stem.replace("_", "-").lower()
+
+
+def plan_automations(envelope: Path) -> list[dict]:
+    """The `[[automations]]` array as rows. The one transformation: `script`
+    stops being a path into the repository and becomes the key of a document,
+    because a row that points at a file has not actually moved anywhere."""
+    config = envelope / "automations" / "service" / "config.toml"
+    if not config.is_file():
+        return []
+    try:
+        raw = tomllib.loads(config.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    out = []
+    for item in raw.get("automations") or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        out.append({
+            "id": item["id"],
+            "enabled": 1 if item.get("enabled", True) else 0,
+            "script_key": _script_key(str(item.get("script") or "")),
+            "schedule": item.get("schedule"),
+            "every_seconds": item.get("every_seconds"),
+            "timeout_seconds": float(item.get("timeout_seconds", 300)),
+            "max_parallel": int(item.get("max_parallel", 1)),
+            "max_pending": int(item.get("max_pending", 1)),
+            "overlap": str(item.get("overlap") or "skip"),
+            "retries": int(item.get("retries", 0)),
+            "arguments": item.get("arguments") or [],
+            "environments": item.get("environments") or [],
+        })
+    return out
 
 
 # Long text is imported as a document version and pinned, because the file on
@@ -188,13 +231,20 @@ def main() -> int:
 
     rows = plan(envelope)
     documents = plan_documents(envelope)
+    automations = plan_automations(envelope)
+    document_keys = {(d["capability"], d["key"]) for d in documents}
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["collection"]] = counts.get(row["collection"], 0) + 1
 
     report = {"project": {"id": project_id, "slug": slug}, "envelope": str(envelope),
               "rows": len(rows), "by_collection": counts,
-              "documents": len(documents), "applied": False}
+              "documents": len(documents), "automations": len(automations),
+              "applied": False}
+    orphan_scripts = [a["id"] for a in automations
+                      if ("automations", a["script_key"]) not in document_keys]
+    if orphan_scripts:
+        report["automations_without_a_script"] = orphan_scripts
 
     if not args.apply:
         report["sample"] = [f"{r['capability']}/{r['collection']}/{r['key']}"
@@ -214,6 +264,35 @@ def main() -> int:
             store.config_set(row["capability"], row["collection"], row["key"],
                              row["value"], scope, actor="import_envelope",
                              note=row["note"])
+        if automations:
+            # The schema is the capability's to declare, so it is read from the
+            # capability source rather than restated here.
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]
+                                   / "capabilities" / "automations" / "service"))
+            import runtime as _automations_runtime  # noqa: PLC0415
+            store.migrate(_automations_runtime.STORE_NAMESPACE,
+                          _automations_runtime.STORE_VERSION,
+                          _automations_runtime.STORE_MIGRATIONS)
+            for a in automations:
+                store._execute(
+                    "INSERT INTO automations (scope_kind, scope_name, id, enabled, "
+                    "script_key, schedule, every_seconds, timeout_seconds, max_parallel, "
+                    "max_pending, overlap, retries, arguments, environments, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (scope_kind, scope_name, id) DO UPDATE SET "
+                    "enabled = EXCLUDED.enabled, script_key = EXCLUDED.script_key, "
+                    "schedule = EXCLUDED.schedule, every_seconds = EXCLUDED.every_seconds, "
+                    "timeout_seconds = EXCLUDED.timeout_seconds, "
+                    "max_parallel = EXCLUDED.max_parallel, max_pending = EXCLUDED.max_pending, "
+                    "overlap = EXCLUDED.overlap, retries = EXCLUDED.retries, "
+                    "arguments = EXCLUDED.arguments, environments = EXCLUDED.environments, "
+                    "updated_at = EXCLUDED.updated_at",
+                    (scope[0], scope[1], a["id"], a["enabled"], a["script_key"],
+                     a["schedule"], a["every_seconds"], a["timeout_seconds"],
+                     a["max_parallel"], a["max_pending"], a["overlap"], a["retries"],
+                     store._encode(a["arguments"]), store._encode(a["environments"]),
+                     _stamp()))
+            store._conn.commit()
         for doc in documents:
             digest = store.document_put(doc["capability"], doc["key"], doc["body"],
                                         author="import_envelope",

@@ -216,6 +216,48 @@ def load_agents(raw: dict[str, Any]) -> dict[str, Any]:
     return {"default": default, "workers": profiles}
 
 
+# --- the store schema this capability owns -----------------------------------
+
+# `automations` declares its own namespace and migrates it itself; the core
+# tier knows nothing about these columns. They are columns rather than a JSON
+# blob because the scheduler filters on them on every tick — `enabled`, the
+# environment, the pending count against `runs` — which is the test for whether
+# a record class has earned a table of its own.
+#
+# `script_key` names a document, not a path. The version that runs is whichever
+# one the document's pin names, so editing a script and deploying it stay two
+# separate acts.
+STORE_NAMESPACE = "automations"
+STORE_VERSION = 1
+STORE_MIGRATIONS = [
+    """
+    CREATE TABLE IF NOT EXISTS automations (
+        scope_kind       TEXT NOT NULL,
+        scope_name       TEXT NOT NULL,
+        id               TEXT NOT NULL,
+        enabled          INTEGER NOT NULL DEFAULT 1,
+        script_key       TEXT NOT NULL,
+        schedule         TEXT,
+        every_seconds    REAL,
+        timeout_seconds  REAL NOT NULL DEFAULT 300,
+        max_parallel     INTEGER NOT NULL DEFAULT 1,
+        max_pending      INTEGER NOT NULL DEFAULT 1,
+        overlap          TEXT NOT NULL DEFAULT 'skip',
+        retries          INTEGER NOT NULL DEFAULT 0,
+        arguments        {json},
+        environments     {json},
+        note             TEXT,
+        updated_at       TEXT NOT NULL,
+        PRIMARY KEY (scope_kind, scope_name, id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS automations_due_idx
+        ON automations (scope_kind, scope_name, enabled)
+    """,
+]
+
+
 def load_config(root: Path, config_path: Path) -> dict[str, Any]:
     try:
         raw = tomllib.loads(config_path.read_text())
