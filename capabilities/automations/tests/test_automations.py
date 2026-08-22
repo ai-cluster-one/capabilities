@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -36,10 +37,29 @@ class AutomationsTests(unittest.TestCase):
         (self.root / "capabilities" / "settings.json").write_text(
             json.dumps({"capabilities": {"automations": {"enabled": True}}}) + "\n"
         )
+        # Runs are scoped to a project, so the project has to have said who it
+        # is. The manager writes this file; a fixture that skipped it was only
+        # ever describing a project that could not exist.
+        # A slug belongs to one project, so a fixture that reuses one across
+        # tests is describing two projects wearing the same label — which the
+        # store refuses, correctly.
+        self.project_id = str(uuid.uuid4())
+        self.project_slug = "fixture-" + self.project_id[:8]
+        (self.root / "capabilities" / "project.json").write_text(
+            json.dumps({"schema": "capabilities.project.v1",
+                        "id": self.project_id, "slug": self.project_slug}) + "\n"
+        )
+        # In-process code reads the ambient environment, not `self.env`, so a
+        # fixture that only pointed the subprocesses at a scratch store was
+        # writing its projects into the developer's real one.
+        self.store_path = Path(self.tmp.name) / "store.db"
+        self._store_url_before = os.environ.get("CAPABILITIES_STORE_URL")
+        os.environ["CAPABILITIES_STORE_URL"] = str(self.store_path)
         self.env = dict(os.environ)
         self.env.update(
             {
                 "CLAUDE_PROJECT_DIR": str(self.root),
+                "CAPABILITIES_STORE_URL": str(Path(self.tmp.name) / "store.db"),
                 "AUTOMATIONS_ENVIRONMENT": "test",
                 "XDG_STATE_HOME": str(Path(self.tmp.name) / "xdg-state"),
             }
@@ -129,6 +149,10 @@ retries = 1
     def tearDown(self) -> None:
         with contextlib.suppress(Exception):
             self.cli("service", "stop", "--timeout", "2", "--force")
+        if self._store_url_before is None:
+            os.environ.pop("CAPABILITIES_STORE_URL", None)
+        else:
+            os.environ["CAPABILITIES_STORE_URL"] = self._store_url_before
         self.tmp.cleanup()
 
     def cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -339,8 +363,9 @@ retries = 0
             daemon.schedule_due(when)
             daemon.schedule_due(when)
         finally:
-            daemon.db.close()
-        rows = RUNTIME.list_runs(state_dir / "automations.db", limit=10)
+            daemon.store.close()
+        rows = RUNTIME.list_runs(self.root, RUNTIME.load_config(self.root, config_path),
+                                 limit=10)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "pending")
         self.assertEqual(rows[0]["trigger"], "schedule")
@@ -349,18 +374,17 @@ retries = 0
         config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
         state_dir = self.root / "capabilities" / "automations" / "state"
         config = RUNTIME.load_config(self.root, config_path)
-        db_path = state_dir / "automations.db"
-        with contextlib.closing(RUNTIME.connect(db_path)) as db:
-            row = RUNTIME.enqueue(db, config, state_dir, "job", trigger="manual")
-            self.assertIsNotNone(row)
-            db.execute("UPDATE runs SET status = 'running' WHERE id = ?", (row["id"],))
-            db.commit()
+        row = RUNTIME.enqueue_manual(self.root, config, state_dir, "job")
+        self.assertIsNotNone(row)
+        store, ledger = RUNTIME.open_ledger(self.root, config)
+        ledger.update(row["id"], status="running")
+        store.close()
         daemon = RUNTIME.Daemon(self.root, config_path, state_dir)
         try:
             daemon.recover()
         finally:
-            daemon.db.close()
-        rows = RUNTIME.list_runs(db_path, limit=10)
+            daemon.store.close()
+        rows = RUNTIME.list_runs(self.root, config, limit=10)
         original = next(item for item in rows if item["id"] == row["id"])
         recovered = next(item for item in rows if item["parent_run_id"] == row["id"])
         self.assertEqual(original["status"], "interrupted")
@@ -381,7 +405,7 @@ retries = 0
             retries = [
                 row
                 for row in rows
-                if row["automation_id"] == "flaky" and row["parent_run_id"] == first["id"]
+                if row["automation_slug"] == "flaky" and row["parent_run_id"] == first["id"]
             ]
             if retries and retries[0]["status"] == "succeeded":
                 self.assertEqual(retries[0]["attempt"], 2)
