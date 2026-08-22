@@ -433,17 +433,17 @@ def load_config_from_store(root: Path, state_dir: Path) -> dict[str, Any]:
     raw = {"version": 1, "engine": dict(engine), "agents": dict(agents), "automations": []}
     for row in rows:
         raw["automations"].append({
-            # Relative to the root, like a file-declared script: the rule that a
-            # script may not point outside the project is worth keeping, and the
-            # cache it is written into sits under the root anyway.
+            # The record names a versioned document, not an operator-supplied
+            # filesystem path. Keep the materialized name relative to its XDG
+            # cache and fence it to that cache below.
             "id": row[0], "enabled": bool(row[3]),
-            "script": str(scripts[row[4]].relative_to(root.resolve())),
+            "script": str(scripts[row[4]].relative_to(state_dir.resolve())),
             "schedule": row[5], "every_seconds": row[6], "timeout_seconds": row[7],
             "max_parallel": row[8], "max_pending": row[9], "overlap": row[10],
             "retries": row[11],
             "arguments": st_decode(row[12]), "environments": st_decode(row[13]),
         })
-    return normalise_config(root, raw)
+    return normalise_config(root, raw, script_root=state_dir)
 
 
 def st_decode(value: Any) -> Any:
@@ -463,7 +463,8 @@ def load_config(root: Path, config_path: Path) -> dict[str, Any]:
     return normalise_config(root, raw)
 
 
-def normalise_config(root: Path, raw: dict[str, Any]) -> dict[str, Any]:
+def normalise_config(root: Path, raw: dict[str, Any],
+                     script_root: Path | None = None) -> dict[str, Any]:
     """Validation and defaulting, shared by both sources. A record that came
     from the store is checked exactly as one that came from the file, so the
     two cannot drift into disagreeing about what a valid automation is."""
@@ -517,12 +518,15 @@ def normalise_config(root: Path, raw: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError(f"{label}.script must be a non-empty relative path")
         script = Path(script_raw)
         if script.is_absolute():
-            raise ConfigError(f"{label}.script must be relative to the project root")
-        resolved_script = (root / script).resolve()
+            boundary = "script cache" if script_root is not None else "project root"
+            raise ConfigError(f"{label}.script must be relative to the {boundary}")
+        allowed_root = (script_root or root).resolve()
+        resolved_script = (allowed_root / script).resolve()
         try:
-            resolved_script.relative_to(root.resolve())
+            resolved_script.relative_to(allowed_root)
         except ValueError as exc:
-            raise ConfigError(f"{label}.script escapes the project root") from exc
+            boundary = "script cache" if script_root is not None else "project root"
+            raise ConfigError(f"{label}.script escapes the {boundary}") from exc
         schedule = item.get("schedule")
         every_seconds = item.get("every_seconds")
         if schedule is not None and every_seconds is not None:
@@ -611,9 +615,8 @@ class RunLedger:
     remember — it is the reason this boundary exists, and it is applied here
     once rather than at each call.
 
-    The same class serves a project keeping its runs in its own SQLite: there
-    the scope narrows nothing, because there is only one project in the file,
-    and the queries do not change shape for it."""
+    The same class serves a local SQLite store and a coordinated backend; the
+    project scope and query shape do not change with the store deployment."""
 
     def __init__(self, db, project_id: str | None, environment: str):
         self.db = db

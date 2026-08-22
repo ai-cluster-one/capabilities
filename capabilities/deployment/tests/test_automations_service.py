@@ -68,12 +68,12 @@ class DeploymentAutomationsTests(unittest.TestCase):
         self.assertTrue(result["with_automations"])
         compose = (self.root / "docker-compose.yaml").read_text()
         self.assertNotIn('command: ["automations", "service", "run"]', compose)
-        self.assertIn("automations_state:/app/capabilities/automations/state", compose)
+        self.assertIn("automations_state:/home/agent/.local/state/capabilities/projects", compose)
         runtime = json.loads((self.root / "deployment" / "runtime.json").read_text())
         self.assertEqual(runtime["services"]["agent"]["embedded_services"], ["automations"])
         self.assertEqual(
             runtime["volumes"]["automations_state"]["mount"],
-            "/app/capabilities/automations/state",
+            "/home/agent/.local/state/capabilities/projects",
         )
         supervisor = (self.root / "supervisord.conf").read_text()
         self.assertIn("command=automations service run", supervisor)

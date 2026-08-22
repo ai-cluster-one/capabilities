@@ -5,9 +5,9 @@
 # ///
 """automations — project-local scheduler and subprocess runner.
 
-Automations keeps schedules and executable scripts in the consuming repository,
-runs the same way on a developer machine and in an agent container, and records
-operational state in a SQLite ledger.
+Automations keeps schedules and executable scripts in the consuming project's
+selected records backend, runs the same way on a developer machine and in an
+agent container, and records operational state in the capabilities store.
 
 Configuration:
   capabilities/automations/service/config.toml
@@ -28,7 +28,7 @@ Commands:
   automations run <automation-id>
       Enqueue one manual run. The daemon dispatches it asynchronously.
   automations runs [--limit N] [--status STATUS]
-      List recent run records from SQLite.
+      List recent run records from the capabilities store.
   automations show <run-id>
       Show one run record.
   automations logs <run-id> [--tail N]
@@ -53,7 +53,9 @@ Environment:
   AUTOMATIONS_ENVIRONMENT  Active environment selector (default: development).
   AUTOMATIONS_NAMESPACE    Coordination namespace (default: project directory name).
   AUTOMATIONS_CONFIG       Optional config path override.
-  AUTOMATIONS_STATE_DIR    Optional state root override.
+  AUTOMATIONS_STATE_DIR    Optional state root override. By default project runtime
+                           state lives under $XDG_STATE_HOME/capabilities/projects/
+                           <project-slug>/automations.
   AUTOMATIONS_BIN          Absolute path of this CLI, exported into every job so
                            a script can call `automations agent` without
                            resolving anything itself.
@@ -95,6 +97,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -112,7 +115,7 @@ from typing import Any, NoReturn
 NAME = "automations"
 SUMMARY = (
     "Project-local scheduler and subprocess runner with versioned config, "
-    "SQLite run history, concurrency, retries, timeouts, and cancellation."
+    "store-backed run history, concurrency, retries, timeouts, and cancellation."
 )
 SCOPE = "project"
 CRED_KEYS: list = []
@@ -126,10 +129,10 @@ STATE = True
 POST_INSTALL: list = []
 SERVICE = {
     "name": "scheduler",
-    "summary": "Project-local scheduler, SQLite queue, and subprocess workers.",
+    "summary": "Project-local scheduler, store-backed queue, and subprocess workers.",
     "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
     "config": "capabilities/automations/service/config.toml",
-    "state": "capabilities/automations/state",
+    "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/automations",
     "deploy": {
         "schema": "capabilities.service.deploy.v1",
         "default_policy": "auto",
@@ -143,7 +146,7 @@ SERVICE = {
         },
         "mounts": [
             {"name": "automations_state", "kind": "state",
-             "target": "{project_root}/capabilities/automations/state"},
+             "target": "{agent_home}/.local/state/capabilities/projects"},
             {"name": "claude_state", "kind": "shared",
              "target": "{agent_home}/.claude"},
             {"name": "codex_state", "kind": "shared",
@@ -2563,6 +2566,14 @@ def open_records(envelope: Path | str, global_dir: Path | str,
 # <<< contract: store <<<
 
 
+def _context_edit_files(key: str) -> tuple[Path, Path]:
+    """Keep automations' record-edit scratch beside its XDG runtime state."""
+    token = hashlib.sha256(f"{NAME}\0{key}".encode()).hexdigest()[:16]
+    project = _project_root()
+    root = (_state_path(project) if project is not None else _STATE_HOME / NAME) / "record-edits"
+    return root / f"{token}.md", root / f"{token}.json"
+
+
 def _cmd_connections() -> None:
     _emit({"connections": {}})
 
@@ -2615,14 +2626,120 @@ def _config_path(root: Path) -> Path:
     return _service_dir(root) / "config.toml"
 
 
-def _state_path(root: Path) -> Path:
-    override = os.environ.get("AUTOMATIONS_STATE_DIR") or _project_env().get(
-        "AUTOMATIONS_STATE_DIR"
-    )
+def _state_override(root: Path) -> Path | None:
+    override = os.environ.get("AUTOMATIONS_STATE_DIR") or _project_env().get("AUTOMATIONS_STATE_DIR")
     if override:
         path = Path(override).expanduser()
         return path if path.is_absolute() else root / path
+    return None
+
+
+def _state_project_key(root: Path) -> str:
+    try:
+        identity = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
+    except (OSError, ValueError):
+        identity = {}
+    slug = identity.get("slug") if isinstance(identity, dict) else None
+    if isinstance(slug, str) and slug.strip():
+        return slug.strip()
+    digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+    return f"path-{digest}"
+
+
+def _state_path(root: Path) -> Path:
+    override = _state_override(root)
+    if override is not None:
+        return override
+    return _STATE_HOME / "capabilities" / "projects" / _state_project_key(root) / NAME
+
+
+def _legacy_state_path(root: Path) -> Path:
     return _project_capabilities_dir(root) / NAME / "state"
+
+
+LEGACY_REGENERATED = {
+    "automations.db", "automations.db-shm", "automations.db-wal",
+    "daemon.lock", "daemon.pid", "scripts",
+}
+
+
+def _copy_legacy_state(source: Path, destination: Path) -> int:
+    if source.is_symlink():
+        raise RuntimeError(f"legacy state contains a symlink: {source}")
+    if source.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        return sum(_copy_legacy_state(child, destination / child.name)
+                   for child in sorted(source.iterdir()))
+    if not source.is_file():
+        raise RuntimeError(f"legacy state contains an unsupported entry: {source}")
+    if destination.exists():
+        if not destination.is_file() or destination.read_bytes() != source.read_bytes():
+            raise RuntimeError(f"legacy state conflicts with XDG state: {destination}")
+        return 0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return 1
+
+
+def _migrate_legacy_state(root: Path, runtime, config: dict[str, Any]) -> dict[str, Any] | None:
+    """Copy durable envelope state once and repoint historical run logs.
+
+    The source remains untouched. A consuming project may remove it only after
+    proving the XDG copy and the restarted service, which keeps rollback safe.
+    Explicit AUTOMATIONS_STATE_DIR overrides are deliberate and never trigger
+    an implicit migration from the former default.
+    """
+    if _state_override(root) is not None:
+        return None
+    legacy = _legacy_state_path(root)
+    target = _state_path(root)
+    if not legacy.is_dir() or legacy.resolve() == target.resolve():
+        return None
+    copied = 0
+    try:
+        for source in sorted(legacy.iterdir()):
+            if source.name in LEGACY_REGENERATED:
+                continue
+            if source.name == "daemon.log" and source.is_file() and source.stat().st_size == 0:
+                continue
+            copied += _copy_legacy_state(source, target / source.name)
+    except (OSError, RuntimeError) as exc:
+        raise runtime.ConfigError(f"cannot migrate legacy automation state: {exc}") from exc
+
+    store, ledger = runtime.open_ledger(root, config)
+    repointed = 0
+    try:
+        legacy_resolved = legacy.resolve()
+        for row in ledger._rows():
+            old_log = Path(row["log_path"])
+            try:
+                relative = old_log.resolve().relative_to(legacy_resolved)
+            except (OSError, ValueError):
+                continue
+            new_log = target / relative
+            if old_log.is_file() and not new_log.is_file():
+                raise runtime.ConfigError(
+                    f"run log was not copied from {old_log} to {new_log}")
+            if new_log.is_file() and str(new_log) != row["log_path"]:
+                ledger.update(row["id"], log_path=str(new_log))
+                repointed += 1
+    finally:
+        store.close()
+    return {
+        "source": str(legacy), "target": str(target),
+        "files_copied": copied, "run_logs_repointed": repointed,
+        "source_preserved": True,
+    }
+
+
+def _prepare_service(root: Path):
+    runtime, config = _load(root)
+    try:
+        migration = _migrate_legacy_state(root, runtime, config)
+    except runtime.ConfigError as exc:
+        _die(6, "state_migration_failed", str(exc),
+             "resolve the conflicting XDG and legacy files, then start again")
+    return runtime, config, migration
 
 
 def _runtime_module():
@@ -2889,7 +3006,7 @@ def cmd_retry(run_id: str) -> dict[str, Any]:
 
 def cmd_service_start() -> dict[str, Any]:
     root = _root_required()
-    _load(root)
+    _runtime, _config, migration = _prepare_service(root)
     status = service_status(root)
     if status["running"]:
         status["already_running"] = True
@@ -2914,6 +3031,8 @@ def cmd_service_start() -> dict[str, Any]:
         _die(5, "service_start_failed", f"automations daemon exited with {proc.returncode}", "\n".join(tail))
     out = service_status(root)
     out["started"] = True
+    if migration is not None:
+        out["state_migration"] = migration
     return out
 
 
@@ -2960,7 +3079,7 @@ def cmd_service_logs(tail: int) -> dict[str, Any]:
 
 def cmd_service_run() -> NoReturn:
     root = _root_required()
-    _load(root)
+    _prepare_service(root)
     runtime = _runtime_path()
     os.execvpe(sys.executable, [sys.executable, str(runtime)], _service_env(root))
 

@@ -434,7 +434,7 @@ def test_mixed_ownership_nested_layout_preserves_external_files_and_compose_sema
         "claude_state": {"kind": "shared", "mount": "/home/jess/.claude"},
         "codex_state": {"kind": "shared", "mount": "/home/jess/.codex"},
         "telegram_state": {"kind": "state", "mount": "/home/jess/.local/state/telegram"},
-        "automations_state": {"kind": "state", "mount": "/app/capabilities/automations/state"},
+        "automations_state": {"kind": "state", "mount": "/home/jess/.local/state/capabilities/projects"},
         "worker_state": {"kind": "shared", "mount": "/home/jess/.local/state/worker"},
     }
     runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
@@ -526,7 +526,7 @@ def test_mixed_ownership_nested_layout_preserves_external_files_and_compose_sema
     }
     assert compiled["volumes"]["claude_state"]["mount"] == "/home/jess/.claude"
     assert compiled["volumes"]["codex_state"]["mount"] == "/home/jess/.codex"
-    assert compiled["volumes"]["automations_state"]["mount"] == "/app/capabilities/automations/state"
+    assert compiled["volumes"]["automations_state"]["mount"] == "/home/jess/.local/state/capabilities/projects"
 
     compose = (root / "deployment" / "compose.yaml").read_text()
     assert 'context: ".."' in compose
@@ -545,7 +545,7 @@ def test_mixed_ownership_nested_layout_preserves_external_files_and_compose_sema
     assert ":?" not in compose
     assert "worker_state:/home/jess/.local/state/worker" in compose
     assert "telegram_state:/home/jess/.local/state/telegram" in compose
-    assert "automations_state:/app/capabilities/automations/state" in compose
+    assert "automations_state:/home/jess/.local/state/capabilities/projects" in compose
     for volume_name in ("claude_state", "codex_state", "telegram_state",
                         "automations_state", "worker_state"):
         assert f"  {volume_name}:" in compose

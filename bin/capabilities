@@ -2461,6 +2461,7 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
     session = _dev_session(session_id)
     project = _dev_project(session)
     assert project is not None
+    envelope = _project_capabilities_dir(project).resolve()
     payload = (session.get("installed_payloads") or {}).get(capability)
     if not isinstance(payload, dict):
         _die(6, "dev_capability_not_installed",
@@ -2566,6 +2567,7 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
         diagnostic = {
             "mode": "project", "session": session_id, "capability": capability,
             "payload": str(executable), "attached_project": str(project),
+            "project_envelope": str(envelope),
             "selected_connection": selected_id,
             "policy_tier": gate_tier, "connection_tier": registry_source,
             "value_tiers": value_tiers,

@@ -490,6 +490,7 @@ def test_dev_run_executes_only_the_session_payload_against_attached_project(tmp_
     diagnostic = json.loads(result.stderr.splitlines()[-1])["dev_run"]
     assert diagnostic["mode"] == "project"
     assert diagnostic["attached_project"] == str(consumer)
+    assert diagnostic["project_envelope"] == str(consumer / "capabilities")
     assert diagnostic["selected_connection"] is None
     assert diagnostic["payload"].startswith(started["isolated"]["registry"])
     _run(env, "dev", "stop", "deployment-test")
@@ -521,6 +522,8 @@ def test_dev_run_projects_the_attached_projects_database(tmp_path):
     with store_module.SQLiteStore.open(str(db_path)) as db:
         db.migrate()
         db.project_register(identity["id"], identity["slug"])
+        db.config_set("capabilities", "policy", "deployment",
+                      {"enabled": True}, ("project", identity["slug"]))
 
     env = _env(tmp_path)
     env["CAPABILITIES_STORE_URL"] = str(db_path)

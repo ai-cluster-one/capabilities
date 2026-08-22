@@ -12,8 +12,8 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "0ba049269c0c1ed1fc69919c18c3f0e1d4874d7dc7e96926db61481d8d46feb4",
-      "summary": "Project-local scheduler and subprocess runner with versioned config, SQLite run history, concurrency, retries, timeouts, and cancellation."
+      "payload_sha256": "1495c4a9e828a420e6f951a1283e70b72645433d11bf80fcc693aeee86bb5bfa",
+      "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "callva": {
       "path": "capabilities/callva",
@@ -37,7 +37,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "ddbcd50517542751b950cc19ec6407d36351ffbc871f474915c0b243b49c0b57",
+      "payload_sha256": "64340e16c392bcdc5518aef16a9cde143f70e4b3ff2e68d9024576d7030391f1",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into supervised processes on the machine itself, and describe the targets they deploy to."
     },
     "directo": {

@@ -184,6 +184,66 @@ retries = 1
         self.assertEqual(agents["workers"]["haiku"]["engine"], "claude")
         self.assertEqual(agents["workers"]["sonnet"]["mode"], "read")
 
+    def test_default_state_is_project_scoped_under_xdg(self) -> None:
+        status = json.loads(self.cli("service", "status").stdout)
+        expected = (Path(self.env["XDG_STATE_HOME"]) / "capabilities" / "projects"
+                    / self.project_slug / "automations")
+        self.assertEqual(status["state_dir"], str(expected))
+        self.assertNotEqual(expected, self.root / "capabilities" / "automations" / "state")
+
+    def test_explicit_state_override_wins(self) -> None:
+        override = Path(self.tmp.name) / "operator-state"
+        self.env["AUTOMATIONS_STATE_DIR"] = str(override)
+        status = json.loads(self.cli("service", "status").stdout)
+        self.assertEqual(status["state_dir"], str(override))
+
+    def test_service_start_copies_durable_legacy_state_and_repoints_logs(self) -> None:
+        legacy = self.root / "capabilities" / "automations" / "state"
+        (legacy / "runs").mkdir(parents=True)
+        (legacy / "scripts").mkdir()
+        (legacy / "pytgcalls-upstream.json").write_text('{"cursor": 1}\n')
+        (legacy / "scripts" / "cached.py").write_text("generated\n")
+        (legacy / "automations.db").write_text("obsolete\n")
+
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config = RUNTIME.load_config(self.root, config_path)
+        row = RUNTIME.enqueue_manual(self.root, config, legacy, "job")
+        self.assertIsNotNone(row)
+        old_log = Path(row["log_path"])
+        old_log.write_text("historical output\n")
+        store, ledger = RUNTIME.open_ledger(self.root, config)
+        ledger.update(row["id"], status="succeeded",
+                      finished_at=datetime.now(timezone.utc).isoformat())
+        store.close()
+
+        started = json.loads(self.cli("service", "start").stdout)
+        self.assertIn("state_migration", started)
+        self.assertTrue(started["state_migration"]["source_preserved"])
+        target = Path(started["state_dir"])
+        self.assertEqual((target / "pytgcalls-upstream.json").read_text(), '{"cursor": 1}\n')
+        self.assertFalse((target / "automations.db").exists())
+        self.assertFalse((target / "scripts" / "cached.py").exists())
+        shown = json.loads(self.cli("show", row["id"]).stdout)
+        self.assertEqual(Path(shown["log_path"]), target / "runs" / old_log.name)
+        self.assertEqual(Path(shown["log_path"]).read_text(), "historical output\n")
+        self.assertTrue(old_log.is_file())
+
+    def test_service_start_refuses_conflicting_legacy_state(self) -> None:
+        legacy = self.root / "capabilities" / "automations" / "state"
+        legacy.mkdir(parents=True)
+        (legacy / "cursor.json").write_text('{"source": 1}\n')
+        target = (Path(self.env["XDG_STATE_HOME"]) / "capabilities" / "projects"
+                  / self.project_slug / "automations")
+        target.mkdir(parents=True)
+        (target / "cursor.json").write_text('{"target": 2}\n')
+
+        refused = self.cli("service", "start", check=False)
+        self.assertEqual(refused.returncode, 6)
+        error = json.loads(refused.stderr)["error"]
+        self.assertEqual(error["code"], "state_migration_failed")
+        self.assertEqual((legacy / "cursor.json").read_text(), '{"source": 1}\n')
+        self.assertEqual((target / "cursor.json").read_text(), '{"target": 2}\n')
+
     def test_declared_agent_adds_and_overrides_field_by_field(self) -> None:
         agents = RUNTIME.load_agents({
             "agents": {
@@ -311,6 +371,11 @@ retries = 1
         )
         self.assertEqual(manifest.returncode, 0, manifest.stderr)
         self.assertEqual(json.loads(manifest.stdout)["service"]["name"], "scheduler")
+        service = json.loads(manifest.stdout)["service"]
+        self.assertIn("$XDG_STATE_HOME", service["state"])
+        mounts = {item["name"]: item for item in service["deploy"]["mounts"]}
+        self.assertEqual(mounts["automations_state"]["target"],
+                         "{agent_home}/.local/state/capabilities/projects")
 
     def test_cancel_running_job(self) -> None:
         self.cli("service", "start")
