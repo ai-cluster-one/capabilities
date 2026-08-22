@@ -997,51 +997,33 @@ def read_service_document(path):
     """Prose the daemon serves at request time — the soft-gate context, a
     channel's own context, the voice prompt.
 
-    Where the project keeps its records in the store this reads the pinned
-    version, so an edit reaches every host at once and a draft reaches none.
-    Where it does not, it reads the file. Nothing falls back between them: a
-    project on the store that cannot reach it must not quietly serve a stale
-    file it has no way to report serving."""
-    mode, _why = _store_mode()
-    if mode == "db":
-        doc = _store_document(_document_key(path))
-        return (doc or "").strip()
-    try:
-        return Path(path).read_text().strip()
-    except OSError:
-        return ""
+    The adapter answers from wherever this project keeps its records, and the
+    daemon is not told which. Nothing falls back between them: a project on the
+    store that cannot reach it raises rather than serving an empty prompt, and
+    the dispatch loop turns that into a failed job the requester hears about.
+    A prompt the daemon could not read is not a prompt that is empty."""
+    doc = _service_document(path)
+    return (doc["body"] if doc else "").strip()
 
 
-def _store_mode():
-    identity = _project_identity_file()
-    override = os.environ.get("CAPABILITIES_STORE_MODE")
-    if override in ("files", "db"):
-        return override, "CAPABILITIES_STORE_MODE"
-    return (identity.get("store", "files") if identity else "files"), "project.json"
+def _service_document(path):
+    """One document as the records surface holds it, or None where the project
+    keeps no such document."""
+    return _records().document_read(NAME, _document_key(path))
 
 
-def _project_identity_file():
-    try:
-        return json.loads((PROJECT_CAPABILITIES_DIR / "project.json").read_text())
-    except (OSError, ValueError):
-        return None
+_RECORDS = None
 
 
-def _store_document(key):
-    """The pinned version of one document, or nothing if the project keeps no
-    such document. Every other way this can fail raises: a prompt the daemon
-    could not read is not a prompt that is empty, and answering without one is
-    the silent degradation the mode exists to prevent. The dispatch loop turns
-    the raise into a failed job the requester is told about."""
-    identity = _project_identity_file() or {}
-    if not identity.get("slug"):
-        raise RuntimeError(
-            f"{PROJECT_CAPABILITIES_DIR / 'project.json'} keeps this project's "
-            "records in the store but declares no slug to read them under")
-    import store as _store
-    with _store.open_store() as st:
-        doc = st.context_read(NAME, key, _store.Scopes(project=identity["slug"]))
-    return doc["body"] if doc else None
+def _records():
+    """The same adapter the CLIs read through, opened once here as well. The
+    daemon does not get its own answer to where records live -- there is one
+    answer and one place that gives it."""
+    global _RECORDS
+    if _RECORDS is None:
+        import store as _store
+        _RECORDS = _store.open_records(PROJECT_CAPABILITIES_DIR, CONFIG_HOME)
+    return _RECORDS
 
 
 def read_voice_context():
@@ -2793,10 +2775,12 @@ def _channel_context_from_policy(policy):
     path = _service_context_path(context_file)
     if context_file and path is None:
         parts.append(f"[channel context file ignored: {context_file}]")
-    elif path and (_store_mode()[0] == "db" or path.exists()):
-        text = read_service_document(path)
-        if text:
-            parts.append(text)
+    elif (doc := _service_document(path) if path else None) is not None:
+        # Held apart deliberately: a document that exists and says nothing is
+        # not the same as one the project does not have, and only the second
+        # is worth telling the room about.
+        if (doc["body"] or "").strip():
+            parts.append(doc["body"].strip())
     elif context_file:
         parts.append(f"[channel context file missing: {context_file}]")
     return "\n\n".join(parts).strip()

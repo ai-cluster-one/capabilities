@@ -110,6 +110,17 @@ class FileAdapter(unittest.TestCase):
         self.assertIsNone(self.r.get("clickup", "identifier", "new-id"))
         self.assertFalse(self.r.delete("clickup", "identifier", "new-id"))
 
+    def test_a_flat_envelope_is_written_flat(self):
+        """The shape `audit` holds every capability to: labels at the top level,
+        each carrying a value and a note."""
+        flat = self.env / "telegram" / "identifiers.json"
+        flat.write_text(json.dumps({"already": {"value": "here", "note": ""}}))
+        self.r.set("telegram", "identifier", "audit-probe", {"v": 1}, note="a probe")
+        body = json.loads(flat.read_text())
+        self.assertNotIn("identifiers", body)
+        self.assertEqual(body["audit-probe"], {"value": {"v": 1}, "note": "a probe"})
+        self.assertEqual(self.r.get("telegram", "identifier", "already"), "here")
+
     def test_a_project_entry_shadows_a_global_one_by_entry(self):
         (self.globals / "clickup").mkdir(parents=True)
         (self.globals / "clickup" / "identifiers.json").write_text(json.dumps(

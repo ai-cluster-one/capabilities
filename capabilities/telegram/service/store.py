@@ -81,6 +81,24 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 # >>> contract: store (generated — edit contract/store.py, run `capabilities sync-contract`) >>>
+# A region carries what it needs. Relying on the host file to have imported
+# the right names is a coupling nothing checks and nothing reports: it works in
+# whichever capability happened to import them and fails at import time in the
+# rest. Re-importing a name the host already has costs nothing.
+import json
+import os
+import hashlib
+import re
+import sqlite3
+import time
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+from uuid import uuid4
+
 
 SCHEMA_VERSION = 4
 
@@ -1174,6 +1192,10 @@ class StoreRecords(Records):
     def document_keys(self, capability: str) -> list[str]:
         return self.store.context_keys(capability, self.scopes)
 
+    def collection_source(self, capability: str, collection: str) -> str:
+        """What answered. A row has no path, so the store says so as itself."""
+        return self.source
+
     def document_path(self, capability: str, key: str) -> Path | None:
         """Nothing to open: a version in the store is not a file anywhere. The
         working copy an edit needs is the caller's to make, and `put` is what
@@ -1229,14 +1251,22 @@ class FileRecords(Records):
             raise StoreError("bad_config", f"cannot read {path}: {exc}") from None
 
     @staticmethod
-    def _save(path: Path, body: Any) -> None:
+    def _save(path: Path, body: Any, sort: bool = False) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(body, indent=2, ensure_ascii=False) + "\n")
+        path.write_text(json.dumps(body, indent=2, ensure_ascii=False,
+                                   sort_keys=sort) + "\n")
+
+    def _policy_file(self, root: Path) -> Path:
+        """The gate. A project keeps it at the envelope root; the config home
+        keeps it under the manager's own name, which is the same rule seen from
+        outside -- there, `capabilities` is a capability like any other."""
+        return (root / "settings.json" if root == self.envelope
+                else root / "capabilities" / "settings.json")
 
     def _file(self, root: Path, capability: str, collection: str,
               key: str | None = None) -> Path:
         if collection == "policy":
-            return root / "settings.json"
+            return self._policy_file(root)
         if collection == "identifier":
             return root / capability / "identifiers.json"
         if collection in ("connection", "grant"):
@@ -1255,7 +1285,7 @@ class FileRecords(Records):
         """Every entry of one collection held at one scope, keyed as the store
         keys them, so the two agree on what a record is called."""
         if collection == "policy":
-            body = self._load(root / "settings.json") or {}
+            body = self._load(self._policy_file(root)) or {}
             return dict((body.get("capabilities") or {}))
         if collection == "identifier":
             body = self._load(root / capability / "identifiers.json") or {}
@@ -1325,6 +1355,15 @@ class FileRecords(Records):
         entry = self.resolve(capability, collection).get(key)
         return entry["value"] if entry else None
 
+    def collection_source(self, capability: str, collection: str) -> str:
+        """The file that answered, named exactly. A report that says only
+        "files" makes the reader go and find out which one, and the scope a
+        record resolved at is half of what they came to learn."""
+        for _scope, _pid, root in self._chain():
+            if self._entries(root, capability, collection):
+                return str(self._file(root, capability, collection))
+        return str(self._file(self.envelope, capability, collection))
+
     def connections(self, capability: str, write_default: bool = False,
                     include_disabled: bool = False) -> dict[str, dict[str, Any]]:
         """Assembled exactly as the store assembles it, from the same two
@@ -1346,14 +1385,22 @@ class FileRecords(Records):
         _check("capability", capability, CAPABILITY_RE)
         _check("key", key, KEY_RE)
         Store._semantics(collection)
+        if not self.envelope.is_dir():
+            raise StoreError("no_envelope", "no capabilities/ envelope in this project",
+                             "run `capabilities init` first")
         path = self._file(self.envelope, capability, collection, key)
         body = self._load(path)
         body = body if isinstance(body, dict) else {}
         if collection == "policy":
             body.setdefault("capabilities", {})[key] = value
         elif collection == "identifier":
-            holder = body.setdefault("identifiers", {}) if "identifiers" in body or not body else body
-            holder[key] = {"value": value, "note": note} if note else {"value": value}
+            # Flat at the top level, which is the shape the envelope has always
+            # had and the shape `audit` holds this to. A file already carrying
+            # the wrapper keeps it: reshaping someone's file on an unrelated
+            # write is not this writer's business.
+            holder = (body["identifiers"] if isinstance(body.get("identifiers"), dict)
+                      else body)
+            holder[key] = {"value": value, "note": note or ""}
         elif collection in ("connection", "grant"):
             entry = body.setdefault("connections", {}).setdefault(key, {})
             if collection == "connection":
@@ -1367,7 +1414,7 @@ class FileRecords(Records):
             body["default"] = value
         else:
             body[key] = value
-        self._save(path, body)
+        self._save(path, body, sort=collection == "identifier")
 
     def delete(self, capability: str, collection: str, key: str) -> bool:
         path = self._file(self.envelope, capability, collection, key)
@@ -1392,7 +1439,7 @@ class FileRecords(Records):
         else:
             gone = body.pop(key, None) is not None
         if gone:
-            self._save(path, body)
+            self._save(path, body, sort=collection == "identifier")
         return gone
 
     # -- documents -------------------------------------------------------------

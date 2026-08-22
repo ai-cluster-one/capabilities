@@ -402,46 +402,42 @@ def _env_dir() -> Path | None:
     return (_project_capabilities_dir(root) / NAME) if root is not None else None
 
 
+_RECORDS = None
+
+
+def _records():
+    """The adapter this project's records are read and written through.
+
+    Everything below takes what this returns and none of it can tell which it
+    got. That is the whole of the arrangement: a call site that can tell where
+    a record lives is a call site that will eventually decide for itself, and
+    then there are two answers to a question that has one."""
+    global _RECORDS
+    if _RECORDS is None:
+        root = _project_root()
+        envelope = (_project_capabilities_dir(root) if root is not None
+                    else _CONFIG_HOME / "no-project")
+        try:
+            _RECORDS = open_records(envelope, _CONFIG_HOME)
+        except StoreError as e:
+            _die(6, e.slug, e.message, e.hint)
+        if _RECORDS.mode == "db":
+            _RECORDS.source = _store_source_label()
+    return _RECORDS
+
+
 def _store_mode() -> tuple[str, str]:
-    """Whether this project keeps its records in files or in the store, and what
-    answered. One project may be moved without moving any other, so the answer is
+    """Where this project keeps its records, as a report rather than a fork.
+
+    Nothing branches on this any more; it is here because a status surface may
+    still want to say which source answered. One project may be moved without moving any other, so the answer is
     per project and lives beside the project's identity — it has to be readable
     before the store is reachable.
 
-    A project says nothing: files, which is every project that has not moved.
-    `CAPABILITIES_STORE_MODE` overrides for one invocation, for comparing the two
-    against each other. Nothing falls back silently in either direction: a
-    project on the store that cannot reach it fails rather than reading a stale
-    file it would have no way to report, and a capability carrying no store tier
-    fails the same way rather than answering out of files the project no longer
-    keeps. The declaration is read before the tier is looked for, because a
-    missing tier is a capability that wants stamping, never a project that meant
-    files."""
-    override = os.environ.get("CAPABILITIES_STORE_MODE")
-    if override:
-        if override not in ("files", "db"):
-            _die(6, "bad_store_mode", f"CAPABILITIES_STORE_MODE must be files or db, got {override!r}")
-        mode, source = override, "CAPABILITIES_STORE_MODE"
-    else:
-        root = _project_root()
-        if root is None:
-            return ("files", "no project")
-        identity_file = _project_capabilities_dir(root) / "project.json"
-        try:
-            identity = json.loads(identity_file.read_text())
-        except (OSError, ValueError):
-            return ("files", "no project identity")
-        mode = identity.get("store", "files")
-        if mode not in ("files", "db"):
-            _die(6, "bad_store_mode", f"{identity_file} declares store {mode!r}",
-                 "expected \"files\" or \"db\"")
-        source = str(identity_file)
-    if mode == "db" and "open_store" not in globals():
-        _die(6, "no_store_tier",
-             f"{source} keeps this project's records in the store, "
-             f"but {NAME} carries no store tier to read them with",
-             "run `capabilities sync-contract` to stamp the tier into this capability")
-    return (mode, source)
+    The declaration itself is read in one place, `records_mode`, and acted on
+    in one place, `open_records`."""
+    adapter = _records()
+    return (adapter.mode, adapter.source)
 
 
 def _project_identity() -> dict:
@@ -592,68 +588,30 @@ def _identifiers_load() -> dict:
 
     The shape is the same either way — `{label: {value, note}}` — so the help
     section, the report and `ids get` never learn which answered."""
-    mode, _why = _store_mode()
-    if mode == "db":
-        try:
-            with open_store() as store:
-                resolved = store.config_resolve(NAME, "identifier", _identifiers_scopes())
-        except StoreError as e:
-            _die(6, e.slug, e.message, e.hint)
-        # Key order matches the file envelope's `sort_keys` output so the two
-        # sources diff cleanly against each other.
-        return {label: {"note": row["note"] or "", "value": row["value"]}
-                for label, row in sorted(resolved.items())}
-    envdir = _env_dir()
-    ids_file = (envdir / "identifiers.json") if envdir else None
-    if not ids_file or not ids_file.exists():
-        return {}
     try:
-        data = json.loads(ids_file.read_text())
-    except (OSError, ValueError):
-        _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
-    return data if isinstance(data, dict) else {}
+        resolved = _records().resolve(NAME, "identifier")
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    return {label: {"note": row["note"] or "", "value": row["value"]}
+            for label, row in sorted(resolved.items())}
 
 
 def _identifiers_write(label: str, value, note: str) -> None:
     """Rule 15 holds either way: a capability is the sole writer of its own
     identifiers, addressed by (capability, collection) rather than by path."""
-    mode, _why = _store_mode()
-    if mode == "db":
-        try:
-            with open_store() as store:
-                store.config_set(NAME, "identifier", label, value,
-                                 _identifiers_scopes().write_target("project"),
-                                 actor=f"{NAME} ids set", note=note or None)
-        except StoreError as e:
-            _die(6, e.slug, e.message, e.hint)
-        return
-    envdir = _env_dir()
-    if envdir is None or not (envdir.parent / "settings.json").is_file():
-        _die(6, "no_envelope", "no capabilities/ envelope in this project",
-             "run `capabilities init` first")
-    data = _identifiers_load()
-    data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
-    envdir.mkdir(parents=True, exist_ok=True)
-    (envdir / "identifiers.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    kept = note or (_identifiers_load().get(label) or {}).get("note", "")
+    try:
+        _records().set(NAME, "identifier", label, value,
+                       actor=f"{NAME} ids set", note=kept or None)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
 
 
 def _identifiers_remove(label: str) -> None:
-    mode, _why = _store_mode()
-    if mode == "db":
-        try:
-            with open_store() as store:
-                store.config_delete(NAME, "identifier", label,
-                                    _identifiers_scopes().write_target("project"),
-                                    actor=f"{NAME} ids rm")
-        except StoreError as e:
-            _die(6, e.slug, e.message, e.hint)
-        return
-    envdir = _env_dir()
-    data = _identifiers_load()
-    del data[label]
-    (envdir / "identifiers.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    try:
+        _records().delete(NAME, "identifier", label)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
 
 
 def _identifiers_section() -> str:
@@ -662,8 +620,6 @@ def _identifiers_section() -> str:
     agent following the `<NAME> help` startup protocol loads the discovered
     labels/values/notes into context at once. Empty when no project envelope
     or nothing recorded (do not bloat help with an empty section)."""
-    if _store_mode()[0] == "files" and _env_dir() is None:
-        return ""
     data = _identifiers_load()
     if not data:
         return ""
@@ -752,32 +708,18 @@ def _reference_bodies() -> dict[str, str]:
 
     In the store a reference is a pinned document like any other long text, so
     an edit reaches every host at once and an unpinned draft reaches none."""
-    mode, _why = _store_mode()
-    if mode == "db":
-        scopes = _identifiers_scopes()
-        out: dict[str, str] = {}
-        try:
-            with open_store() as store:
-                for key in store.context_keys(NAME, scopes):
-                    if not key.startswith(REFERENCE_PREFIX):
-                        continue
-                    doc = store.context_read(NAME, key, scopes)
-                    if doc:
-                        out[key] = doc["body"]
-        except StoreError as e:
-            _die(6, e.slug, e.message, e.hint)
-        return out
-    envdir = _env_dir()
-    refdir = (envdir / "reference") if envdir else None
-    if not refdir or not refdir.is_dir():
-        return {}
-    bodies = {}
-    for md in sorted(refdir.glob("*.md")):
-        try:
-            bodies[REFERENCE_PREFIX + md.stem.replace("_", "-").lower()] = md.read_text()
-        except OSError:
-            continue
-    return bodies
+    out: dict[str, str] = {}
+    try:
+        adapter = _records()
+        for key in adapter.document_keys(NAME):
+            if not key.startswith(REFERENCE_PREFIX):
+                continue
+            doc = adapter.document_read(NAME, key)
+            if doc:
+                out[key] = doc["body"]
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    return out
 
 
 def _cmd_refs(argv: list[str] | None = None) -> None:
@@ -788,19 +730,20 @@ def _cmd_refs(argv: list[str] | None = None) -> None:
     body that works whichever source answered."""
     argv = argv or []
     bodies = _reference_bodies()
-    mode, _why = _store_mode()
+    adapter = _records()
     entries = []
     for key, body in sorted(bodies.items()):
         name, desc = _front_matter(body)
         if not name:
             continue
         entry = {"name": name, "description": desc or "", "key": key}
-        if mode == "db":
-            entry["source"] = _store_source_label()
+        # A path when there is one to open, a source when there is not. The
+        # adapter answers that; the listing does not ask where it lives.
+        path = adapter.document_path(NAME, key)
+        if path is None:
+            entry["source"] = adapter.source
         else:
-            envdir = _env_dir()
-            stem = key[len(REFERENCE_PREFIX):]
-            entry["path"] = str((envdir / "reference" / f"{stem}.md")) if envdir else ""
+            entry["path"] = str(path)
         entries.append((name, entry, body))
 
     if argv and argv[0] == "show":
@@ -875,8 +818,8 @@ def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 
 
-def _connections_from_store() -> dict:
-    """The same envelope shape, composed out of the store.
+def _connections_composed() -> dict:
+    """The connections envelope shape, composed out of resolved records.
 
     Deliberately reconstituted rather than returned in some store-shaped form:
     selection, the write gate and the `connections` report all read the envelope
@@ -885,21 +828,17 @@ def _connections_from_store() -> dict:
 
     The permission a project was granted is folded back onto the entry as
     `allow_write`, which is where the rest of the contract looks for it."""
-    identity = _project_identity()
-    scopes = Scopes(project=identity["slug"])
+    adapter = _records()
     try:
-        with open_store() as store:
-            effective = store.connections_effective(
-                NAME, scopes, write_default=WRITE_DEFAULT)
-            default = store.config_get(NAME, "setting", "connection.default", scopes)
+        effective = adapter.connections(NAME, write_default=WRITE_DEFAULT)
+        default = adapter.get(NAME, "setting", "connection.default")
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
     if not effective:
         _die(6, "connections_required",
-             f"the store holds no connections for {NAME} in project "
-             f"{identity['slug']!r}",
-             "declare one, or set this project's store to \"files\" in "
-             "capabilities/project.json")
+             f"{NAME} requires an explicit connections registry and "
+             f"{adapter.source} holds none",
+             'expected {"default": "<id>", "connections": {"<id>": { ... }}}')
     return {
         "default": default,
         "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
@@ -921,35 +860,13 @@ def _store_source_label() -> str:
 
 
 def _connections_registry() -> tuple[dict | None, Path | str | None]:
-    """The connections envelope and its path: the store where this project keeps
-    its records there, else the project envelope, else the user config home.
-    First found wins, never merged. Every connection-bearing capability requires
-    a registry, even when it declares only one connection."""
-    mode, _source = _store_mode()
-    if mode == "db":
-        return _connections_from_store(), _store_source_label()
-    envdir = _env_dir()
-    candidates = ([envdir / "connections.json"] if envdir else []) + \
-                 [_CONFIG_HOME / NAME / "connections.json"]
-    for reg_file in candidates:
-        if not reg_file.is_file():
-            continue
-        try:
-            raw = json.loads(reg_file.read_text())
-        except (ValueError, OSError) as e:
-            _die(6, "bad_config", f"cannot read {reg_file}: {e}")
-        if not isinstance(raw, dict) or not isinstance(raw.get("connections"), dict) \
-                or not raw["connections"]:
-            _die(6, "bad_config", f"{reg_file} is not a connections envelope",
-                 'expected {"default": "<id>", "connections": { ... }}')
-        return raw, reg_file
-    project_path = (envdir / "connections.json") if envdir else None
-    homes = ([str(project_path)] if project_path else []) + \
-            [str(_CONFIG_HOME / NAME / "connections.json")]
-    _die(6, "connections_required",
-         f"{NAME} requires an explicit connections registry",
-         "create one of: " + ", ".join(homes) +
-         '; expected {"default": "<id>", "connections": {"<id>": { ... }}}')
+    """The connections envelope and where it came from.
+
+    Composed from the two records a connection is kept as -- who it is, and
+    what this project may do with it -- and handed on in the shape the rest of
+    the contract already reads, so selection, the write gate and the report
+    never learn which source answered."""
+    return _connections_composed(), _records().collection_source(NAME, "connection")
 
 
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:

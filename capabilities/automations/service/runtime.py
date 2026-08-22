@@ -342,22 +342,28 @@ def load_effective_config(root: Path, config_path: Path,
                           state_dir: Path) -> dict[str, Any]:
     """The config the scheduler acts on, from whichever source this project
     keeps its records in. One entry point, so no caller has to know which."""
-    mode, _why = _store_mode(root)
-    if mode == "db":
+    if _store_mode(root)[0] == "db":
         return load_config_from_store(root, state_dir)
     return load_config(root, config_path)
 
 
 def _store_mode(root: Path) -> tuple[str, str]:
-    """Whether this project keeps its records in the store, and what said so."""
-    override = os.environ.get("CAPABILITIES_STORE_MODE")
-    if override in ("files", "db"):
-        return override, "CAPABILITIES_STORE_MODE"
+    """Where this project keeps its records, asked of the one place that knows.
+
+    An automation is a table row with no file half on purpose -- `config.toml`
+    carries its description in comments a writer would destroy -- so this fork
+    stays. What does not stay is a second opinion about which mode is in force."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        identity = json.loads((root / "capabilities" / "project.json").read_text())
-    except (OSError, ValueError):
-        return "files", "no project identity"
-    return identity.get("store", "files"), "project.json"
+        import store as _store
+    except ImportError:
+        return "files", "no store module beside the service"
+    finally:
+        sys.path.pop(0)
+    try:
+        return _store.records_mode(root / "capabilities")
+    except _store.StoreError as exc:
+        raise ConfigError(exc.message) from exc
 
 
 def _project_identity(root: Path) -> dict:
