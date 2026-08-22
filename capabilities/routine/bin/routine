@@ -595,8 +595,7 @@ def _render_ids_markdown(data: dict) -> str:
 
 def _identifiers_scopes() -> "Scopes":
     identity = _project_identity()
-    return Scopes(project=identity["slug"],
-                  instance=os.environ.get("CAPABILITIES_INSTANCE") or None)
+    return Scopes(project=identity["slug"])
 
 
 def _identifiers_load() -> dict:
@@ -770,10 +769,10 @@ def _reference_bodies() -> dict[str, str]:
         out: dict[str, str] = {}
         try:
             with open_store() as store:
-                for key in store.document_keys(NAME, scopes):
+                for key in store.context_keys(NAME, scopes):
                     if not key.startswith(REFERENCE_PREFIX):
                         continue
-                    doc = store.document_read(NAME, key, scopes)
+                    doc = store.context_read(NAME, key, scopes)
                     if doc:
                         out[key] = doc["body"]
         except StoreError as e:

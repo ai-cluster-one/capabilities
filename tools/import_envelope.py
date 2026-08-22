@@ -273,35 +273,17 @@ def main() -> int:
             store.migrate(_automations_runtime.STORE_NAMESPACE,
                           _automations_runtime.STORE_VERSION,
                           _automations_runtime.STORE_MIGRATIONS)
+            project_id = store._project_id(slug)
             for a in automations:
-                store._execute(
-                    "INSERT INTO automations (scope_kind, scope_name, id, enabled, "
-                    "script_key, schedule, every_seconds, timeout_seconds, max_parallel, "
-                    "max_pending, overlap, retries, arguments, environments, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT (scope_kind, scope_name, id) DO UPDATE SET "
-                    "enabled = EXCLUDED.enabled, script_key = EXCLUDED.script_key, "
-                    "schedule = EXCLUDED.schedule, every_seconds = EXCLUDED.every_seconds, "
-                    "timeout_seconds = EXCLUDED.timeout_seconds, "
-                    "max_parallel = EXCLUDED.max_parallel, max_pending = EXCLUDED.max_pending, "
-                    "overlap = EXCLUDED.overlap, retries = EXCLUDED.retries, "
-                    "arguments = EXCLUDED.arguments, environments = EXCLUDED.environments, "
-                    "updated_at = EXCLUDED.updated_at",
-                    (scope[0], scope[1], a["id"], a["enabled"], a["script_key"],
-                     a["schedule"], a["every_seconds"], a["timeout_seconds"],
-                     a["max_parallel"], a["max_pending"], a["overlap"], a["retries"],
-                     store._encode(a["arguments"]), store._encode(a["environments"]),
-                     _stamp()))
+                _automations_runtime.store_upsert(store, "project", project_id, a)
             store._conn.commit()
         for doc in documents:
-            digest = store.document_put(doc["capability"], doc["key"], doc["body"],
-                                        scope, author="import_envelope",
-                                        media_type=doc["media_type"])
-            store.document_pin(doc["capability"], doc["key"], digest, scope,
-                               actor="import_envelope", scopes=scopes)
+            store.context_put(doc["capability"], doc["key"], doc["body"], scope,
+                              author="import_envelope", media_type=doc["media_type"],
+                              activate=True)
         problems = verify(store, rows, scopes)
         for doc in documents:
-            got = store.document_read(doc["capability"], doc["key"], scopes)
+            got = store.context_read(doc["capability"], doc["key"], scopes)
             if not got or got["body"] != doc["body"]:
                 problems.append(f"{doc['capability']}/{doc['key']}: body differs")
 
