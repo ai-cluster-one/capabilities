@@ -4527,21 +4527,21 @@ def _chunks(text, limit):
 
 
 class MediaStackLogTests(unittest.IsolatedAsyncioTestCase):
-    """The media stack silences itself on import, which is why a call that
-    drops leaves nothing behind. The daemon claims that logger back."""
+    """Whatever the media stack does emit is routed into the daemon's log, but
+    the daemon does not lower the bar for what it emits."""
 
-    async def test_the_media_logger_is_audible_and_routed(self):
+    async def test_the_media_logger_is_routed_but_not_claimed(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             media = logging.getLogger("ntgcalls")
 
-            # Audible, and low enough to carry the lines that decide anything:
-            # the migration to a conference and both audio-channel events all
-            # arrive at INFO.
-            self.assertNotEqual(media.level, logging.NOTSET)
-            self.assertLessEqual(media.level, logging.INFO)
             self.assertTrue(any(isinstance(h, daemon._MediaStackLog)
                                 for h in media.handlers))
+            # Left where the import put it. Claiming it back at INFO is what
+            # puts the stack's own log thread into the interpreter on every
+            # line, and that thread was one of three waiting on the GIL when
+            # the daemon wedged on 2026-08-22.
+            self.assertEqual(media.level, logging.NOTSET)
 
     async def test_a_repeated_condition_is_collapsed_not_dropped(self):
         with tempfile.TemporaryDirectory() as td:

@@ -630,9 +630,12 @@ def _track_audio_peer(message):
     Derived from the log because the transport offers no other view of it: the
     participants API refuses a conference migrated from a p2p call, whose chat
     id is a positive user id, and the frames themselves never pass through this
-    process — ntgcalls writes them straight into its own encoder. If a future
-    build renames the line, this simply stops matching and the byte-growth
-    watchdog remains as it was.
+    process — ntgcalls writes them straight into its own encoder.
+
+    Fed only while the `ntgcalls` logger is low enough to carry channel lines,
+    which it is not by default. With nothing feeding it the set stays empty, and
+    both readers treat empty as "ask Telegram" rather than as "nobody is here",
+    so the answer stays correct and only costs a round-trip.
     """
     found = _AUDIO_CHANNEL_SSRC.search(message)
     if not found:
@@ -678,10 +681,21 @@ class _MediaStackLog(logging.Handler):
             log(f"call-media[{record.levelname.lower()}]: {message}")
 
 
-# Claimed after the import that muted it, never before: the mute is the import
-# itself, so an earlier level is simply overwritten.
+# The level the import leaves behind is the level that stands. Importing
+# pytgcalls raises this logger from NOTSET to CRITICAL, and claiming it back at
+# INFO — which is what made the 2026-08-19/21 call failures readable at all —
+# puts the media stack's own log thread into the interpreter on every line it
+# emits. On 2026-08-22 that thread was one of three sitting in
+# PyEval_AcquireThread while a Python thread held the GIL inside a blocking
+# ntgcalls call, and the daemon was wedged for seventeen minutes. The deadlock
+# is in the binding and not in this handler, but this is the one side of it
+# under local control, so the level is left alone and the question of whether
+# that is enough is answered by whether conferences stop wedging.
+#
+# The handler stays attached: anything the stack considers critical still gets
+# through, and it costs nothing when nothing is emitted. Raise the level here to
+# read the media stack again, knowing what it widens.
 _media_log = logging.getLogger("ntgcalls")
-_media_log.setLevel(logging.INFO)
 _media_log.addHandler(_MediaStackLog())
 
 
