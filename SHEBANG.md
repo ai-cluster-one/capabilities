@@ -175,21 +175,28 @@ Resolution order, per topic:
 
 The cache is the **offline floor, never the authority**: `$XDG_STATE_HOME/<name>/guides/<topic>.md` (plus `<topic>.etag`) — user-level regardless of credential scope, because guide content is capability-scoped, project-independent, and non-secret.
 
-## The project envelope
+## Project records and the envelope
 
-Everything the capability reads and writes in a consuming project lives under `capabilities/<name>/`:
+Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its durable id and slug and selects where live configuration is kept with `"store": "files"` or `"store": "db"`; absence preserves files mode. The project gate remains `capabilities/settings.json` in both modes because it is the bootstrap guard that must be readable before any configured backend is trusted. `CAPABILITIES_STORE_MODE` is a diagnostic override, not project doctrine.
+
+All runtime readers open the same records adapter. Files mode maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Database mode reads the same collections from the configured store (local SQLite by default, selected by the manager's store URL resolution). Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection and never branches on the backend.
+
+In files mode, project material has this layout:
 
 ```
-capabilities/<name>/
-  connections.json    # the connections registry — standard envelope (see Connections)
-  identifiers.json    # the identifiers envelope, managed by the ids verbs
-  reference/          # the single home for references — one front-matter .md per topic
-    *.md              # front-matter envelope + free prose, surfaced by `<name> refs`
-  service/            # project-local config/policy for a bundled service, if any
-  state/              # capability-written; never committed
+capabilities/
+  project.json        # durable project identity and files/db selection
+  settings.json       # bootstrap policy gate; always a file
+  <name>/
+    connections.json  # connection, grant, and default-setting records
+    identifiers.json  # identifier records, managed by the ids verbs
+    reference/        # one front-matter .md per reference in files mode
+      *.md
+    service/          # project-local service settings/context in files mode
+    state/            # capability-written; never committed
 ```
 
-(`capabilities/settings.json` — one level up — is the manager-owned gate; the script only ever reads it.)
+In database mode those logical records and document bodies live in the store; the envelope still holds identity, the policy gate, state guards, and source-owned project material that is not a live record.
 
 `capabilities/` is canonical and intentionally visible so the project's context
 owner and humans share one project body. The runtime also reads a legacy
@@ -213,7 +220,7 @@ output that is not an absolute path inside the project — keeps the envelope at
 `<root>/capabilities`, so a project without a context owner depends on nothing
 but itself.
 
-- **`identifiers.json`** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). A thin standard envelope — label → `{ value, note }` — so any reader can render the menu without understanding the capability; capability-specific structure lives inside values:
+- **Identifiers** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). In files mode `identifiers.json` is a thin standard envelope — label → `{ value, note }`; in database mode the same entries are identifier records. Any reader renders the same menu without understanding the capability, and capability-specific structure lives inside values:
 
   ```json
   {
@@ -224,7 +231,7 @@ but itself.
 
   Connections vs identifiers is a **provenance split**: connection entries hold values someone *chose* (wiring, per-connection behavioural keys); identifiers hold values the CLI *discovered*. Different writer, different cadence, different git-diff meaning — never merged.
 
-- **References** — prose by nature (a model, a treatment, a taxonomy); the envelope is standardized, the content free. Each is its own `.md` under `capabilities/<name>/reference/` — the single home for references, kept apart from the JSON config files. Drop a file in with the front-matter below and the context build picks it up; no index to maintain:
+- **References and service context** — prose by nature (a model, treatment, taxonomy, or prompt), exposed as versioned documents through `<name> context`. Files mode keeps them as `.md` under their established envelope paths; database mode keeps immutable bodies plus the active project/global pin. `<name> context edit <key>` yields an editable path and `<name> context put <key>` publishes it with an optimistic base-version check. `<name> refs` remains the compact reference menu and `<name> context show <key>` returns a body without exposing which backend answered.
 
   ```markdown
   ---
@@ -233,18 +240,18 @@ but itself.
   ---
   ```
 
-  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading **front-matter only** from `capabilities/<name>/reference/*.md`, never the bodies. References elsewhere in the envelope (loose `.md` beside the JSON files) are not read.
+  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading front matter without loading unrelated bodies. In files mode `path` is the document path; in database mode it is the corresponding `<name> refs show <key>` command.
 
-The `ids` verbs manage the identifiers envelope:
+The `ids` verbs manage the identifier collection through the adapter:
 
 | Verb | Does |
 |---|---|
-| `ids list` | Prints the envelope verbatim (it is small, non-secret lookup). Empty/absent → `{}`. |
+| `ids list` | Prints the resolved small, non-secret lookup. Empty/absent → `{}`. |
 | `ids get <label>` | Prints the value as stored. Unknown label → exit 3. |
 | `ids set <label> <value> [--note <text>]` | Upsert: `<value>` parses as JSON, a non-JSON argument stores as a string; `--note` sets the annotation. |
 | `ids rm <label>` | Removes the label. Unknown label → exit 3. |
 
-`ids set` creates `capabilities/<name>/` on demand **inside an existing `capabilities/`**; in a project with no `capabilities/` envelope it exits 6, naming `capabilities init` as the remediation.
+`ids set` writes the project scope selected by `project.json`; in files mode it creates `capabilities/<name>/` on demand inside an existing envelope. In a project with no envelope it exits 6, naming `capabilities init` as the remediation.
 
 ## The capability policy gate
 
@@ -377,12 +384,7 @@ A capability whose secret is not a flat token resolves it in its own shape — k
 
 Every connection-bearing capability resolves its configuration as **explicit named connections**. A registry is required even when there is only one connection; environment variables resolve values for that declared connection but never create an identity implicitly. Core-only capabilities omit the connections tier and report an empty connections map.
 
-Endpoints and identities are declared in the **connections registry** — a standard envelope, written at configuration time by whoever configures, read by the script. The registry resolves through two homes, **first found wins, never merged**:
-
-1. **Project** — `capabilities/<name>/connections.json`: the project's own endpoints and identities.
-2. **User** — `$XDG_CONFIG_HOME/<name>/connections.json` (default `~/.config/<name>/`): machine-level identities, the shape for personal-account tools whose connections are a fact of the machine, not of any one project.
-
-Whichever registry is found is **authoritative**: it fully defines the connection set and the other home is not consulted.
+Endpoints and identities are declared as **connection records**, written at configuration time by whoever configures and read through the shared adapter. The two scopes are project then global. They compose by connection id: the highest scope declaring an id supplies that entire identity, while other ids inherit from the lower scope. A separate grant record carries `enabled` and `allow_write`, so project permission can change without restating identity. In files mode the compatible representation stores identities and grants together in `connections.json`; in database mode they remain separate collections.
 
 ```json
 {
@@ -399,7 +401,7 @@ Whichever registry is found is **authoritative**: it fully defines the connectio
 The envelope is the standard's; the entry **interior** is the capability's (hosts and ports for an IMAP tool; url and workspace for a REST tool). Two field names are reserved in every entry:
 
 - **`secret_env`** — a secret never sits in the registry. The entry names the env key holding it, and that key's *value* resolves through cascade tiers 2–4 exactly as any secret does — the registry namespaces the key, the cascade resolves it. A capability with several secrets names each through its own `*_env` field.
-- **`allow_write`** — the connection's write gate ([below](#the-write-gate)). Absent falls to the capability's declared `WRITE_DEFAULT`.
+- **`allow_write`** — the connection's write gate ([below](#the-write-gate)), represented logically as a grant. Absent falls to the capability's declared `WRITE_DEFAULT`.
 
 Non-secret values sit literally in the entry: chosen, committed, per-connection project config — both the wiring (endpoints, workspaces) and any behavioural per-connection keys the capability defines.
 
@@ -409,23 +411,11 @@ One flag selects, accepted by every domain verb: `--connection <id>`. A capabili
 
 ```python
 def _connections_registry() -> dict:
-    """The connections envelope: project envelope first, else the user config
-    home. First found wins; a registry is required."""
-    envdir = _env_dir()
-    candidates = ([envdir / "connections.json"] if envdir else []) + \
-                 [_CONFIG_HOME / NAME / "connections.json"]
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            reg = json.loads(path.read_text())
-        except (OSError, ValueError) as e:
-            _die(6, "bad_config", f"cannot read {path}: {e}")
-        if not isinstance(reg.get("connections"), dict) or not reg["connections"]:
-            _die(6, "bad_config", f"{path} is not a connections envelope",
-                 'expected {"default": "<id>", "connections": { ... }}')
-        return reg
-    _die(6, "connections_required", f"{NAME} requires an explicit registry")
+    """The effective identities and grants, independent of their backend."""
+    registry = _records().connections(NAME, write_default=WRITE_DEFAULT)
+    if not registry.get("connections"):
+        _die(6, "connections_required", f"{NAME} requires an explicit connection")
+    return registry
 
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
     """flag → default pointer → sole entry → die 6."""

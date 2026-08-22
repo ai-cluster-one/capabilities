@@ -405,6 +405,21 @@ def _env_dir() -> Path | None:
 _RECORDS = None
 
 
+def _store_source_label() -> str:
+    """A credential-free label for the store that answered.
+
+    Core-only capabilities need this just as much as connection-bearing ones,
+    so it belongs with the records adapter rather than in the connections tier.
+    """
+    url = os.environ.get("CAPABILITIES_STORE_URL") or "?"
+    if "://" not in url:
+        return f"store(sqlite:{url})"
+    scheme, rest = url.split("://", 1)
+    if "@" in rest:
+        rest = rest.split("@", 1)[1]
+    return f"store({scheme}://{rest.split('?', 1)[0]})"
+
+
 def _records():
     """The adapter this project's records are read and written through.
 
@@ -418,7 +433,10 @@ def _records():
         envelope = (_project_capabilities_dir(root) if root is not None
                     else _CONFIG_HOME / "no-project")
         try:
-            _RECORDS = open_records(envelope, _CONFIG_HOME)
+            project_only = os.environ.get("CAPABILITIES_RECORDS_PROJECT_ONLY", "") \
+                .strip().lower() in ("1", "true", "yes", "on")
+            _RECORDS = open_records(
+                envelope, _CONFIG_HOME, project_only=project_only)
         except StoreError as e:
             _die(6, e.slug, e.message, e.hint)
         if _RECORDS.mode == "db":
@@ -761,6 +779,77 @@ def _cmd_refs(argv: list[str] | None = None) -> None:
     _emit([entry for _name, entry, _body in entries])
 
 
+def _context_edit_files(key: str) -> tuple[Path, Path]:
+    token = hashlib.sha256(f"{NAME}\0{key}".encode()).hexdigest()[:16]
+    root = _state_dir() / "record-edits"
+    return root / f"{token}.md", root / f"{token}.json"
+
+
+def _cmd_context(argv: list[str]) -> None:
+    """Read or edit project long text without exposing its backend."""
+    sub = argv[0] if argv else "list"
+    adapter = _records()
+    if sub == "list":
+        _emit({"documents": adapter.document_keys(NAME),
+               "records": {"mode": adapter.mode, "source": adapter.source}})
+        return
+    if len(argv) < 2:
+        _die(6, "input", f"usage: {NAME} context show|edit|put <key>")
+    key = argv[1]
+    if sub == "show":
+        doc = adapter.document_read(NAME, key)
+        if doc is None:
+            _die(3, "not_found", f"no context document {key!r}",
+                 f"`{NAME} context list` shows the keys")
+        sys.stdout.write(doc["body"] if doc["body"].endswith("\n")
+                         else doc["body"] + "\n")
+        return
+    work, meta = _context_edit_files(key)
+    if sub == "edit":
+        doc = adapter.document_read(NAME, key)
+        direct = adapter.document_path(NAME, key)
+        base = doc["hash"] if doc else None
+        path = direct or work
+        if direct is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(doc["body"] if doc else "")
+        meta.parent.mkdir(parents=True, exist_ok=True)
+        meta.write_text(json.dumps({"key": key, "path": str(path),
+                                    "base": base, "direct": direct is not None},
+                                   ensure_ascii=False, indent=2) + "\n")
+        _emit({"key": key, "path": str(path), "base": base,
+               "records": {"mode": adapter.mode, "source": adapter.source},
+               "next": f"edit the path, then run `{NAME} context put {key}`"})
+        return
+    if sub == "put":
+        try:
+            checkout = json.loads(meta.read_text())
+        except (OSError, ValueError) as exc:
+            _die(6, "edit_not_started",
+                 f"no valid edit checkout for {key!r}: {exc}",
+                 f"run `{NAME} context edit {key}` first")
+        if checkout.get("key") != key:
+            _die(6, "edit_mismatch", f"edit checkout does not belong to {key!r}")
+        path = Path(str(checkout.get("path") or ""))
+        try:
+            body = path.read_text()
+            version = adapter.document_put(
+                NAME, key, body, author=f"{NAME} context put",
+                media_type="text/markdown", base=checkout.get("base"))
+        except OSError as exc:
+            _die(6, "edit_unreadable", f"cannot read edit path {path}: {exc}")
+        except StoreError as exc:
+            _die(6, exc.slug, exc.message, exc.hint)
+        meta.unlink(missing_ok=True)
+        if not checkout.get("direct"):
+            path.unlink(missing_ok=True)
+        _emit({"put": key, "version": version,
+               "records": {"mode": adapter.mode, "source": adapter.source}})
+        return
+    _die(6, "input", f"unknown context subcommand {sub!r}",
+         f"{NAME} context list|show|edit|put")
+
+
 def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
     parser. Runs after _gate(), before any credential is resolved.
@@ -783,6 +872,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs(argv[1:])
+    elif cmd == "context":
+        _cmd_context(argv[1:])
     elif cmd == "connections":
         _cmd_connections()
     elif cmd == "help" and len(argv) == 1:
@@ -844,19 +935,6 @@ def _connections_composed() -> dict:
         "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
                         for cid, entry in effective.items()},
     }
-
-
-def _store_source_label() -> str:
-    """What the report names as the origin of store-resolved values. A store URL
-    may carry a password, so the credential is stripped rather than masked —
-    `connections` prints this, and a report is not a place a secret appears."""
-    url = os.environ.get("CAPABILITIES_STORE_URL") or "?"
-    if "://" not in url:
-        return f"store(sqlite:{url})"
-    scheme, rest = url.split("://", 1)
-    if "@" in rest:
-        rest = rest.split("@", 1)[1]
-    return f"store({scheme}://{rest.split('?', 1)[0]})"
 
 
 def _connections_registry() -> tuple[dict | None, Path | str | None]:

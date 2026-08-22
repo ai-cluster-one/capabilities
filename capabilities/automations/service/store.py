@@ -207,12 +207,15 @@ class Scopes:
     everything downstream joins on that: the name is the way in, the id is what
     rows hold."""
 
-    def __init__(self, project: str | None = None):
+    def __init__(self, project: str | None = None, include_global: bool = True):
         self.project = project or None
+        self.include_global = bool(include_global)
 
     @classmethod
-    def from_env(cls, project: str | None = None) -> "Scopes":
-        return cls(project=project or os.environ.get("CAPABILITIES_PROJECT") or None)
+    def from_env(cls, project: str | None = None,
+                 include_global: bool = True) -> "Scopes":
+        return cls(project=project or os.environ.get("CAPABILITIES_PROJECT") or None,
+                   include_global=include_global)
 
     def write_target(self, scope: str | None) -> tuple[str, str | None]:
         """Where a write lands, as (scope, project slug). A write never guesses
@@ -228,7 +231,8 @@ class Scopes:
         raise StoreError("bad_scope", f"scope {kind!r} must be one of {', '.join(SCOPE_KINDS)}")
 
     def __repr__(self) -> str:
-        return f"Scopes(project={self.project!r})"
+        return (f"Scopes(project={self.project!r}, "
+                f"include_global={self.include_global!r})")
 
 
 
@@ -509,7 +513,8 @@ class Store:
         out: list[tuple[str, str | None]] = []
         if project_id:
             out.append(("project", project_id))
-        out.append(("global", None))
+        if scopes.include_global:
+            out.append(("global", None))
         return out
 
     def _target(self, scope: tuple) -> tuple[str, str | None]:
@@ -530,6 +535,8 @@ class Store:
 
     @staticmethod
     def _chain_clause(chain: list) -> tuple[str, list]:
+        if not chain:
+            return "0", []
         clause = " OR ".join(["(scope = ? AND COALESCE(project_id,'') = ?)"] * len(chain))
         params: list[Any] = []
         for kind, pid in chain:
@@ -1230,16 +1237,20 @@ class FileRecords(Records):
     mode = "files"
 
     def __init__(self, envelope: Path, global_dir: Path,
-                 project_id: str | None = None, project: str | None = None):
+                 project_id: str | None = None, project: str | None = None,
+                 include_global: bool = True):
         self.envelope, self.global_dir = Path(envelope), Path(global_dir)
         self.project_id, self.project = project_id, project
+        self.include_global = bool(include_global)
         self.source = str(self.envelope)
 
     # -- where a record lives --------------------------------------------------
 
     def _chain(self) -> list[tuple[str, str | None, Path]]:
-        return [("project", self.project_id, self.envelope),
-                ("global", None, self.global_dir)]
+        chain = [("project", self.project_id, self.envelope)]
+        if self.include_global:
+            chain.append(("global", None, self.global_dir))
+        return chain
 
     @staticmethod
     def _load(path: Path) -> Any:
@@ -1450,6 +1461,8 @@ class FileRecords(Records):
         because the key loses case and underscores on the way in."""
         found: dict[str, Path] = {}
         for prefix, shape, suffix in DOCUMENT_LOCATIONS:
+            if prefix == "script" and capability != "automations":
+                continue
             folder = root / shape.format(cap=capability)
             if not folder.is_dir():
                 continue
@@ -1493,8 +1506,13 @@ class FileRecords(Records):
         if path is None:
             path = self._new_document_path(capability, key)
         if base is not None and path.is_file():
-            live = hashlib.sha256(path.read_text().encode()).hexdigest()[:HASH_LENGTH]
-            if live != base:
+            current = path.read_text()
+            live = hashlib.sha256(current.encode()).hexdigest()[:HASH_LENGTH]
+            # In files mode `context edit` deliberately hands out the truth,
+            # not a copy. By put-time the live hash is therefore expected to
+            # differ from the checkout hash; equality of the submitted body and
+            # the file proves the edit landed at the path the adapter named.
+            if live != base and current != body:
                 raise StoreError(
                     "stale_edit",
                     f"{path} is {live} now, not {base} as it was when the edit began",
@@ -1552,7 +1570,7 @@ def records_mode(envelope: Path | str) -> tuple[str, str]:
 
 
 def open_records(envelope: Path | str, global_dir: Path | str,
-                 url: str | None = None) -> Records:
+                 url: str | None = None, project_only: bool = False) -> Records:
     """The adapter this project's configuration is read and written through."""
     envelope, global_dir = Path(envelope), Path(global_dir)
     mode, source = records_mode(envelope)
@@ -1563,7 +1581,8 @@ def open_records(envelope: Path | str, global_dir: Path | str,
         pass
     slug, project_id = identity.get("slug"), identity.get("id")
     if mode == "files":
-        adapter = FileRecords(envelope, global_dir, project_id, slug)
+        adapter = FileRecords(envelope, global_dir, project_id, slug,
+                              include_global=not project_only)
         adapter.source = source if source == "CAPABILITIES_STORE_MODE" else str(envelope)
         return adapter
     if not slug:
@@ -1572,6 +1591,7 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                          "in the store but declares no slug to read them under",
                          "run `capabilities init` in the project")
     store = open_store(url)
-    return StoreRecords(store, Scopes(project=slug), ("project", slug))
+    return StoreRecords(store, Scopes(project=slug, include_global=not project_only),
+                        ("project", slug))
 
 # <<< contract: store <<<

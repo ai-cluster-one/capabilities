@@ -44,6 +44,12 @@ def _json(result: subprocess.CompletedProcess[str]) -> dict:
     return json.loads(result.stdout)
 
 
+def _stderr_error(result: subprocess.CompletedProcess[str]) -> dict:
+    line = next(line for line in reversed(result.stderr.splitlines())
+                if line.lstrip().startswith("{"))
+    return json.loads(line)["error"]
+
+
 def test_contextkit_init_skips_both_host_bindings(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True)
 
@@ -318,12 +324,12 @@ def test_capability_reads_legacy_gate_before_migration(tmp_path: Path) -> None:
     env.update({"HOME": str(tmp_path / "home"), "CLAUDE_PROJECT_DIR": str(project)})
 
     result = subprocess.run(
-        [sys.executable, str(YOUTRACK), "refs"], cwd=project, env=env,
+        [str(YOUTRACK), "refs"], cwd=project, env=env,
         text=True, capture_output=True, timeout=30,
     )
 
     assert result.returncode == 4
-    assert json.loads(result.stderr)["error"]["code"] == "disabled"
+    assert _stderr_error(result)["code"] == "disabled"
 
 
 def test_capability_inherits_global_policy_with_default_deny(tmp_path: Path) -> None:
@@ -337,11 +343,11 @@ def test_capability_inherits_global_policy_with_default_deny(tmp_path: Path) -> 
     })
 
     denied = subprocess.run(
-        [sys.executable, str(YOUTRACK), "refs"], cwd=project, env=env,
+        [str(YOUTRACK), "refs"], cwd=project, env=env,
         text=True, capture_output=True, timeout=30,
     )
     assert denied.returncode == 4
-    assert json.loads(denied.stderr)["error"]["code"] == "not_enabled"
+    assert _stderr_error(denied)["code"] == "not_enabled"
 
     global_gate = config / "capabilities" / "settings.json"
     global_gate.parent.mkdir(parents=True)
@@ -349,7 +355,7 @@ def test_capability_inherits_global_policy_with_default_deny(tmp_path: Path) -> 
         "capabilities": {"youtrack": {"enabled": True}},
     }))
     inherited = subprocess.run(
-        [sys.executable, str(YOUTRACK), "refs"], cwd=project, env=env,
+        [str(YOUTRACK), "refs"], cwd=project, env=env,
         text=True, capture_output=True, timeout=30,
     )
     assert inherited.returncode == 0, inherited.stderr
@@ -360,7 +366,7 @@ def test_capability_inherits_global_policy_with_default_deny(tmp_path: Path) -> 
         "capabilities": {"youtrack": {"enabled": False}},
     }))
     overridden = subprocess.run(
-        [sys.executable, str(YOUTRACK), "refs"], cwd=project, env=env,
+        [str(YOUTRACK), "refs"], cwd=project, env=env,
         text=True, capture_output=True, timeout=30,
     )
     assert overridden.returncode == 4
@@ -378,11 +384,11 @@ def test_connection_bearing_capability_requires_registry(tmp_path: Path) -> None
     })
 
     missing = subprocess.run(
-        [sys.executable, str(YOUTRACK), "connections"], cwd=project, env=env,
+        [str(YOUTRACK), "connections"], cwd=project, env=env,
         text=True, capture_output=True, timeout=30,
     )
     assert missing.returncode == 6
-    assert json.loads(missing.stderr)["error"]["code"] == "connections_required"
+    assert _stderr_error(missing)["code"] == "connections_required"
 
     registry = config / "youtrack" / "connections.json"
     registry.parent.mkdir(parents=True)
@@ -391,7 +397,7 @@ def test_connection_bearing_capability_requires_registry(tmp_path: Path) -> None
         "connections": {"work": {}},
     }))
     declared = subprocess.run(
-        [sys.executable, str(YOUTRACK), "connections"], cwd=project, env=env,
+        [str(YOUTRACK), "connections"], cwd=project, env=env,
         text=True, capture_output=True, timeout=30,
     )
     assert declared.returncode == 0, declared.stderr
