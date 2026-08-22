@@ -1007,10 +1007,6 @@ def _state_path(root: Path) -> Path:
     return _project_capabilities_dir(root) / NAME / "state"
 
 
-def _db_path(root: Path) -> Path:
-    return _state_path(root) / "automations.db"
-
-
 def _runtime_module():
     path = _runtime_path()
     if not path.is_file():
@@ -1121,12 +1117,14 @@ def service_status(root: Path) -> dict[str, Any]:
     pid = _read_pid(pid_file)
     running = _pid_alive(pid)
     counts: dict[str, int] = {}
-    db_path = state / "automations.db"
-    if db_path.exists():
+    # The store always exists, so there is no file to check for first; what can
+    # still fail is reaching it, and a status report says so by staying empty
+    # rather than by refusing to report at all.
+    if _config_path(root).is_file():
         try:
             runtime = _runtime_module()
-            counts = runtime.counts(db_path)
-        except (OSError, sqlite3.Error):
+            counts = runtime.counts(root, _load(root))
+        except (OSError, sqlite3.Error, Exception):
             counts = {}
     return {
         "initialized": _config_path(root).is_file(),
@@ -1139,7 +1137,7 @@ def service_status(root: Path) -> dict[str, Any]:
         or "development",
         "config": str(_config_path(root)),
         "state_dir": str(state),
-        "database": str(db_path),
+        "store": os.environ.get("CAPABILITIES_STORE_URL") or "default",
         "pid_file": str(pid_file),
         "log_file": str(state / "daemon.log"),
         "counts": counts,
@@ -1155,10 +1153,10 @@ def cmd_doctor() -> dict[str, Any]:
         item["script"] for item in config["automations"] if not item["script_path"].is_file()
     ]
     try:
-        with contextlib.closing(runtime.connect(_db_path(root))) as db:
-            db.execute("SELECT 1").fetchone()
-    except (OSError, sqlite3.Error) as exc:
-        _die(5, "state_unavailable", f"SQLite state is unavailable: {exc}")
+        store, _ledger = runtime.open_ledger(root, config)
+        store.close()
+    except Exception as exc:
+        _die(5, "state_unavailable", f"the store is unavailable: {exc}")
     status = service_status(root)
     return {
         "ok": not missing_scripts,
@@ -1199,7 +1197,7 @@ def cmd_run(automation_id: str) -> dict[str, Any]:
     root = _root_required()
     runtime, config = _load(root)
     try:
-        row = runtime.enqueue_manual(_db_path(root), config, _state_path(root), automation_id)
+        row = runtime.enqueue_manual(root, config, _state_path(root), automation_id)
     except KeyError:
         _die(3, "not_found", f"unknown automation {automation_id!r}", "run `automations list`")
     except runtime.ConfigError as exc:
@@ -1209,15 +1207,15 @@ def cmd_run(automation_id: str) -> dict[str, Any]:
 
 def cmd_runs(limit: int, status: str | None) -> dict[str, Any]:
     root = _root_required()
-    runtime, _config = _load(root)
+    runtime, config = _load(root)
     if status and status not in {*runtime.ACTIVE_STATUSES, *runtime.FINAL_STATUSES}:
         _die(6, "invalid_status", f"unknown run status {status!r}")
-    return {"runs": runtime.list_runs(_db_path(root), limit=limit, status=status)}
+    return {"runs": runtime.list_runs(root, config, limit=limit, status=status)}
 
 
 def _run_required(root: Path, run_id: str):
     runtime, config = _load(root)
-    row = runtime.get_run(_db_path(root), run_id)
+    row = runtime.get_run(root, config, run_id)
     if row is None:
         _die(3, "not_found", f"unknown run {run_id!r}", "run `automations runs`")
     return runtime, config, row
@@ -1241,8 +1239,8 @@ def cmd_logs(run_id: str, tail: int) -> dict[str, Any]:
 
 def cmd_cancel(run_id: str) -> dict[str, Any]:
     root = _root_required()
-    runtime, _config = _load(root)
-    row = runtime.request_cancel(_db_path(root), run_id)
+    runtime, config = _load(root)
+    row = runtime.request_cancel(root, config, run_id)
     if row is None:
         _die(3, "not_found", f"unknown run {run_id!r}")
     return {"cancel_requested": bool(row["cancel_requested"]), "run": row}
@@ -1252,7 +1250,7 @@ def cmd_retry(run_id: str) -> dict[str, Any]:
     root = _root_required()
     runtime, config = _load(root)
     try:
-        row = runtime.retry_run(_db_path(root), config, _state_path(root), run_id)
+        row = runtime.retry_run(root, config, _state_path(root), run_id)
     except runtime.ConfigError as exc:
         _die(6, "not_retryable", str(exc))
     if row is None:
