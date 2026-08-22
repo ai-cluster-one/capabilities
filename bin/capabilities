@@ -3448,7 +3448,9 @@ def _ensure_project_identity(capdir: Path, root: Path) -> dict:
         return _read_json(identity_file) or {}
     identity = {
         "schema": PROJECT_IDENTITY_SCHEMA,
-        "id": "prj_" + secrets.token_hex(16),
+        # Twelve hex characters, for the reason a document version has twelve:
+        # an identifier nobody can read is an identifier nobody checks.
+        "id": "prj_" + secrets.token_hex(6),
         "slug": _default_project_slug(root),
     }
     _write_json(identity_file, identity)
