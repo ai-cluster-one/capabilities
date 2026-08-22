@@ -132,6 +132,15 @@ class FileAdapter(unittest.TestCase):
         self.assertEqual(resolved["global-only"]["value"], "kept")
         self.assertEqual(resolved["global-only"]["scope"], "global")
 
+    def test_project_only_does_not_inherit_global_entries(self):
+        (self.globals / "clickup").mkdir(parents=True)
+        (self.globals / "clickup" / "identifiers.json").write_text(json.dumps(
+            {"global-only": {"value": "hidden", "note": ""}}))
+        project_only = S.FileRecords(
+            self.env, self.globals, self.project_id, self.slug,
+            include_global=False)
+        self.assertNotIn("global-only", project_only.resolve("clickup", "identifier"))
+
     def test_documents_are_found_by_the_key_the_store_would_use(self):
         self.assertEqual(
             sorted(self.r.document_keys("telegram")),
@@ -139,6 +148,13 @@ class FileAdapter(unittest.TestCase):
         doc = self.r.document_read("telegram", "context.iishnitsa")
         self.assertEqual(doc["body"], "a room's prose\n")
         self.assertEqual(doc["scope"], ("project", self.project_id))
+
+    def test_automation_scripts_belong_only_to_automations(self):
+        scripts = self.env / "automations" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "daily.py").write_text("print('daily')\n")
+        self.assertIn("script.daily", self.r.document_keys("automations"))
+        self.assertNotIn("script.daily", self.r.document_keys("telegram"))
 
     def test_the_path_it_hands_out_is_the_file_itself(self):
         path = self.r.document_path("telegram", "context")
@@ -271,6 +287,14 @@ class BothAdaptersAgree(unittest.TestCase):
     def test_only_the_store_hands_out_nothing_to_open(self):
         self.assertIsNotNone(self.files.document_path("telegram", "context"))
         self.assertIsNone(self.db.document_path("telegram", "context"))
+
+    def test_project_only_store_does_not_inherit_global_entries(self):
+        self.store.config_set("clickup", "identifier", "global-only", "hidden",
+                              ("global", ""))
+        project_only = S.StoreRecords(
+            self.store, S.Scopes(project=self.slug, include_global=False),
+            ("project", self.slug))
+        self.assertNotIn("global-only", project_only.resolve("clickup", "identifier"))
 
 
 if __name__ == "__main__":

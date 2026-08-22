@@ -237,7 +237,18 @@ class TelegramClient:
     fake_tl = fake_telethon / "tl"
     fake_tl.mkdir()
     (fake_tl / "__init__.py").write_text("")
+    functions_pkg = fake_tl / "functions"
+    functions_pkg.mkdir()
+    (functions_pkg / "__init__.py").write_text("")
+    (functions_pkg / "phone.py").write_text(
+        "class GetGroupCallChainBlocksRequest:\n"
+        "    def __init__(self, *args, **kwargs): pass\n"
+    )
     (fake_tl / "types.py").write_text("""
+class InputGroupCallInviteMessage:
+    pass
+
+
 class MessageActionConferenceCall:
     pass
 

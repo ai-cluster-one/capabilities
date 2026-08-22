@@ -46,6 +46,7 @@ import contextlib
 import fcntl
 import hashlib
 import html
+import importlib.util
 import json
 import logging
 import os
@@ -228,6 +229,32 @@ CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_CONTEXT")
                     or SERVICE_DIR / "context.md")
 
 
+_RECORDS = None
+_RECORDS_MODULE = None
+
+
+def _records_module():
+    global _RECORDS_MODULE
+    if _RECORDS_MODULE is None:
+        path = Path(__file__).with_name("store.py")
+        spec = importlib.util.spec_from_file_location("telegram_service_store", path)
+        if spec is None or spec.loader is None:
+            raise SettingsError(f"cannot load records adapter from {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _RECORDS_MODULE = module
+    return _RECORDS_MODULE
+
+
+def _records():
+    """The same adapter the CLIs read through, opened once here as well."""
+    global _RECORDS
+    if _RECORDS is None:
+        _store = _records_module()
+        _RECORDS = _store.open_records(PROJECT_CAPABILITIES_DIR, CONFIG_HOME)
+    return _RECORDS
+
+
 def _read_project_layout(reload_file=False):
     """Validate the launcher-owned absolute project layout snapshot."""
     raw = os.environ.get("TELEGRAM_SERVICE_PROJECT_LAYOUT", "").strip()
@@ -292,12 +319,14 @@ CHANNEL_ENABLED = os.environ.get(
 
 def _read_settings():
     try:
-        settings = json.loads(SETTINGS_FILE.read_text())
-    except OSError as exc:
+        settings = {key: row["value"] for key, row in
+                    _records().resolve("telegram", "setting").items()}
+    except _records_module().StoreError as exc:
         raise SettingsError(
-            f"Telegram service settings not found: {SETTINGS_FILE}") from exc
-    except json.JSONDecodeError as e:
-        raise SettingsError(f"{SETTINGS_FILE} is not valid JSON: {e}") from e
+            f"Telegram service records are unavailable: {exc.message}") from exc
+    if not settings:
+        raise SettingsError(
+            f"Telegram service settings not found in {_records().source}")
     if not isinstance(settings, dict):
         raise SettingsError(f"{SETTINGS_FILE} must contain a JSON object")
     try:
@@ -1024,20 +1053,6 @@ def _service_document(path):
     """One document as the records surface holds it, or None where the project
     keeps no such document."""
     return _records().document_read(NAME, _document_key(path))
-
-
-_RECORDS = None
-
-
-def _records():
-    """The same adapter the CLIs read through, opened once here as well. The
-    daemon does not get its own answer to where records live -- there is one
-    answer and one place that gives it."""
-    global _RECORDS
-    if _RECORDS is None:
-        import store as _store
-        _RECORDS = _store.open_records(PROJECT_CAPABILITIES_DIR, CONFIG_HOME)
-    return _RECORDS
 
 
 def read_voice_context():

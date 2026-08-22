@@ -505,6 +505,21 @@ def _env_dir() -> Path | None:
 _RECORDS = None
 
 
+def _store_source_label() -> str:
+    """A credential-free label for the store that answered.
+
+    Core-only capabilities need this just as much as connection-bearing ones,
+    so it belongs with the records adapter rather than in the connections tier.
+    """
+    url = os.environ.get("CAPABILITIES_STORE_URL") or "?"
+    if "://" not in url:
+        return f"store(sqlite:{url})"
+    scheme, rest = url.split("://", 1)
+    if "@" in rest:
+        rest = rest.split("@", 1)[1]
+    return f"store({scheme}://{rest.split('?', 1)[0]})"
+
+
 def _records():
     """The adapter this project's records are read and written through.
 
@@ -518,7 +533,10 @@ def _records():
         envelope = (_project_capabilities_dir(root) if root is not None
                     else _CONFIG_HOME / "no-project")
         try:
-            _RECORDS = open_records(envelope, _CONFIG_HOME)
+            project_only = os.environ.get("CAPABILITIES_RECORDS_PROJECT_ONLY", "") \
+                .strip().lower() in ("1", "true", "yes", "on")
+            _RECORDS = open_records(
+                envelope, _CONFIG_HOME, project_only=project_only)
         except StoreError as e:
             _die(6, e.slug, e.message, e.hint)
         if _RECORDS.mode == "db":
@@ -861,6 +879,77 @@ def _cmd_refs(argv: list[str] | None = None) -> None:
     _emit([entry for _name, entry, _body in entries])
 
 
+def _context_edit_files(key: str) -> tuple[Path, Path]:
+    token = hashlib.sha256(f"{NAME}\0{key}".encode()).hexdigest()[:16]
+    root = _state_dir() / "record-edits"
+    return root / f"{token}.md", root / f"{token}.json"
+
+
+def _cmd_context(argv: list[str]) -> None:
+    """Read or edit project long text without exposing its backend."""
+    sub = argv[0] if argv else "list"
+    adapter = _records()
+    if sub == "list":
+        _emit({"documents": adapter.document_keys(NAME),
+               "records": {"mode": adapter.mode, "source": adapter.source}})
+        return
+    if len(argv) < 2:
+        _die(6, "input", f"usage: {NAME} context show|edit|put <key>")
+    key = argv[1]
+    if sub == "show":
+        doc = adapter.document_read(NAME, key)
+        if doc is None:
+            _die(3, "not_found", f"no context document {key!r}",
+                 f"`{NAME} context list` shows the keys")
+        sys.stdout.write(doc["body"] if doc["body"].endswith("\n")
+                         else doc["body"] + "\n")
+        return
+    work, meta = _context_edit_files(key)
+    if sub == "edit":
+        doc = adapter.document_read(NAME, key)
+        direct = adapter.document_path(NAME, key)
+        base = doc["hash"] if doc else None
+        path = direct or work
+        if direct is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(doc["body"] if doc else "")
+        meta.parent.mkdir(parents=True, exist_ok=True)
+        meta.write_text(json.dumps({"key": key, "path": str(path),
+                                    "base": base, "direct": direct is not None},
+                                   ensure_ascii=False, indent=2) + "\n")
+        _emit({"key": key, "path": str(path), "base": base,
+               "records": {"mode": adapter.mode, "source": adapter.source},
+               "next": f"edit the path, then run `{NAME} context put {key}`"})
+        return
+    if sub == "put":
+        try:
+            checkout = json.loads(meta.read_text())
+        except (OSError, ValueError) as exc:
+            _die(6, "edit_not_started",
+                 f"no valid edit checkout for {key!r}: {exc}",
+                 f"run `{NAME} context edit {key}` first")
+        if checkout.get("key") != key:
+            _die(6, "edit_mismatch", f"edit checkout does not belong to {key!r}")
+        path = Path(str(checkout.get("path") or ""))
+        try:
+            body = path.read_text()
+            version = adapter.document_put(
+                NAME, key, body, author=f"{NAME} context put",
+                media_type="text/markdown", base=checkout.get("base"))
+        except OSError as exc:
+            _die(6, "edit_unreadable", f"cannot read edit path {path}: {exc}")
+        except StoreError as exc:
+            _die(6, exc.slug, exc.message, exc.hint)
+        meta.unlink(missing_ok=True)
+        if not checkout.get("direct"):
+            path.unlink(missing_ok=True)
+        _emit({"put": key, "version": version,
+               "records": {"mode": adapter.mode, "source": adapter.source}})
+        return
+    _die(6, "input", f"unknown context subcommand {sub!r}",
+         f"{NAME} context list|show|edit|put")
+
+
 def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
     parser. Runs after _gate(), before any credential is resolved.
@@ -883,6 +972,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_ids(argv[1:])
     elif cmd == "refs":
         _cmd_refs(argv[1:])
+    elif cmd == "context":
+        _cmd_context(argv[1:])
     elif cmd == "connections":
         _cmd_connections()
     elif cmd == "help" and len(argv) == 1:
@@ -1020,12 +1111,15 @@ class Scopes:
     everything downstream joins on that: the name is the way in, the id is what
     rows hold."""
 
-    def __init__(self, project: str | None = None):
+    def __init__(self, project: str | None = None, include_global: bool = True):
         self.project = project or None
+        self.include_global = bool(include_global)
 
     @classmethod
-    def from_env(cls, project: str | None = None) -> "Scopes":
-        return cls(project=project or os.environ.get("CAPABILITIES_PROJECT") or None)
+    def from_env(cls, project: str | None = None,
+                 include_global: bool = True) -> "Scopes":
+        return cls(project=project or os.environ.get("CAPABILITIES_PROJECT") or None,
+                   include_global=include_global)
 
     def write_target(self, scope: str | None) -> tuple[str, str | None]:
         """Where a write lands, as (scope, project slug). A write never guesses
@@ -1041,7 +1135,8 @@ class Scopes:
         raise StoreError("bad_scope", f"scope {kind!r} must be one of {', '.join(SCOPE_KINDS)}")
 
     def __repr__(self) -> str:
-        return f"Scopes(project={self.project!r})"
+        return (f"Scopes(project={self.project!r}, "
+                f"include_global={self.include_global!r})")
 
 
 
@@ -1322,7 +1417,8 @@ class Store:
         out: list[tuple[str, str | None]] = []
         if project_id:
             out.append(("project", project_id))
-        out.append(("global", None))
+        if scopes.include_global:
+            out.append(("global", None))
         return out
 
     def _target(self, scope: tuple) -> tuple[str, str | None]:
@@ -1343,6 +1439,8 @@ class Store:
 
     @staticmethod
     def _chain_clause(chain: list) -> tuple[str, list]:
+        if not chain:
+            return "0", []
         clause = " OR ".join(["(scope = ? AND COALESCE(project_id,'') = ?)"] * len(chain))
         params: list[Any] = []
         for kind, pid in chain:
@@ -2043,16 +2141,20 @@ class FileRecords(Records):
     mode = "files"
 
     def __init__(self, envelope: Path, global_dir: Path,
-                 project_id: str | None = None, project: str | None = None):
+                 project_id: str | None = None, project: str | None = None,
+                 include_global: bool = True):
         self.envelope, self.global_dir = Path(envelope), Path(global_dir)
         self.project_id, self.project = project_id, project
+        self.include_global = bool(include_global)
         self.source = str(self.envelope)
 
     # -- where a record lives --------------------------------------------------
 
     def _chain(self) -> list[tuple[str, str | None, Path]]:
-        return [("project", self.project_id, self.envelope),
-                ("global", None, self.global_dir)]
+        chain = [("project", self.project_id, self.envelope)]
+        if self.include_global:
+            chain.append(("global", None, self.global_dir))
+        return chain
 
     @staticmethod
     def _load(path: Path) -> Any:
@@ -2263,6 +2365,8 @@ class FileRecords(Records):
         because the key loses case and underscores on the way in."""
         found: dict[str, Path] = {}
         for prefix, shape, suffix in DOCUMENT_LOCATIONS:
+            if prefix == "script" and capability != "automations":
+                continue
             folder = root / shape.format(cap=capability)
             if not folder.is_dir():
                 continue
@@ -2306,8 +2410,13 @@ class FileRecords(Records):
         if path is None:
             path = self._new_document_path(capability, key)
         if base is not None and path.is_file():
-            live = hashlib.sha256(path.read_text().encode()).hexdigest()[:HASH_LENGTH]
-            if live != base:
+            current = path.read_text()
+            live = hashlib.sha256(current.encode()).hexdigest()[:HASH_LENGTH]
+            # In files mode `context edit` deliberately hands out the truth,
+            # not a copy. By put-time the live hash is therefore expected to
+            # differ from the checkout hash; equality of the submitted body and
+            # the file proves the edit landed at the path the adapter named.
+            if live != base and current != body:
                 raise StoreError(
                     "stale_edit",
                     f"{path} is {live} now, not {base} as it was when the edit began",
@@ -2365,7 +2474,7 @@ def records_mode(envelope: Path | str) -> tuple[str, str]:
 
 
 def open_records(envelope: Path | str, global_dir: Path | str,
-                 url: str | None = None) -> Records:
+                 url: str | None = None, project_only: bool = False) -> Records:
     """The adapter this project's configuration is read and written through."""
     envelope, global_dir = Path(envelope), Path(global_dir)
     mode, source = records_mode(envelope)
@@ -2376,7 +2485,8 @@ def open_records(envelope: Path | str, global_dir: Path | str,
         pass
     slug, project_id = identity.get("slug"), identity.get("id")
     if mode == "files":
-        adapter = FileRecords(envelope, global_dir, project_id, slug)
+        adapter = FileRecords(envelope, global_dir, project_id, slug,
+                              include_global=not project_only)
         adapter.source = source if source == "CAPABILITIES_STORE_MODE" else str(envelope)
         return adapter
     if not slug:
@@ -2385,7 +2495,8 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                          "in the store but declares no slug to read them under",
                          "run `capabilities init` in the project")
     store = open_store(url)
-    return StoreRecords(store, Scopes(project=slug), ("project", slug))
+    return StoreRecords(store, Scopes(project=slug, include_global=not project_only),
+                        ("project", slug))
 
 # <<< contract: store <<<
 
@@ -2439,19 +2550,6 @@ def _connections_composed() -> dict:
         "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
                         for cid, entry in effective.items()},
     }
-
-
-def _store_source_label() -> str:
-    """What the report names as the origin of store-resolved values. A store URL
-    may carry a password, so the credential is stripped rather than masked —
-    `connections` prints this, and a report is not a place a secret appears."""
-    url = os.environ.get("CAPABILITIES_STORE_URL") or "?"
-    if "://" not in url:
-        return f"store(sqlite:{url})"
-    scheme, rest = url.split("://", 1)
-    if "@" in rest:
-        rest = rest.split("@", 1)[1]
-    return f"store({scheme}://{rest.split('?', 1)[0]})"
 
 
 def _connections_registry() -> tuple[dict | None, Path | str | None]:
@@ -2988,22 +3086,17 @@ def _service_context_path(root: Path) -> Path:
 
 def _service_settings(root: Path) -> dict:
     try:
-        data = json.loads(_service_settings_path(root).read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+        return {key: row["value"] for key, row in
+                _records().resolve(NAME, "setting").items()}
+    except StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
 
 
 def _service_settings_strict(root: Path, *, check_worker: bool) -> dict:
     path = _service_settings_path(root)
-    if not path.is_file():
+    data = _service_settings(root)
+    if not data:
         _die(6, "service_not_initialized", "run `slack service init` first")
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError) as exc:
-        _die(6, "bad_service_settings", f"cannot read {path}: {exc}")
-    if not isinstance(data, dict):
-        _die(6, "bad_service_settings", f"{path} must contain a JSON object")
 
     import importlib.util
 
@@ -3101,26 +3194,26 @@ def cmd_service_init(flag: str | None) -> None:
     target = _service_dir(root)
     target.mkdir(parents=True, exist_ok=True)
     written = []
-    for name, dst in (
-        ("settings.json", _service_settings_path(root)),
-        ("context.md", _service_context_path(root)),
-    ):
-        if not dst.exists():
-            src = _service_template(name)
-            if not src.is_file():
-                _die(
-                    3,
-                    "service_bundle_missing",
-                    f"missing bundled template: {src}",
-                    "reinstall slack from the source bundle",
-                )
-            content = src.read_text()
-            if name == "settings.json" and flag:
-                data = json.loads(content)
-                data["connection"] = flag
-                content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-            dst.write_text(content)
-            written.append(str(dst))
+    adapter = _records()
+    settings_template = _service_template("settings.json")
+    context_template = _service_template("context.md")
+    missing = [str(path) for path in (settings_template, context_template)
+               if not path.is_file()]
+    if missing:
+        _die(3, "service_bundle_missing", "Slack service templates are missing",
+             "reinstall slack from the source bundle; missing: " + ", ".join(missing))
+    if not _service_settings(root):
+        settings = json.loads(settings_template.read_text())
+        if flag:
+            settings["connection"] = flag
+        for key, value in settings.items():
+            adapter.set(NAME, "setting", key, value, actor="slack service init")
+        written.append(f"{adapter.source}:slack/settings")
+    if adapter.document_read(NAME, "context") is None:
+        adapter.document_put(NAME, "context", context_template.read_text(),
+                             author="slack service init",
+                             media_type="text/markdown")
+        written.append(f"{adapter.source}:slack/context")
     _emit(
         {
             "initialized": NAME,
@@ -3143,13 +3236,13 @@ def cmd_service_status(flag: str | None) -> None:
     running = _pid_matches_service(pid)
     _emit(
         {
-            "initialized": _service_settings_path(root).exists(),
+            "initialized": bool(_service_settings(root)),
             "running": running,
             "pid": pid if running else None,
             "ready": running and (state / "ready.json").is_file(),
             "connection": cid,
             "state_dir": str(state),
-            "settings": str(_service_settings_path(root)),
+            "settings": _records().collection_source(NAME, "setting"),
             "log_file": str(state / "daemon.log"),
             "inbox": str(state / "inbox.jsonl"),
         }
@@ -3190,14 +3283,15 @@ def cmd_service_doctor(flag: str | None) -> None:
                 "team": identity.get("team"),
             },
             "socket_mode": "app token accepted",
-            "settings": str(_service_settings_path(root)),
-            "initialized": _service_settings_path(root).exists(),
+            "settings": _records().collection_source(NAME, "setting"),
+            "initialized": bool(_service_settings(root)),
         }
     )
 
 
 def _service_env(root: Path, cid: str, state: Path, bot: str, app: str) -> dict:
     env = dict(os.environ)
+    env["CAPABILITIES_PROJECT_ENVELOPE"] = str(_project_capabilities_dir(root))
     env["SLACK_SERVICE_PROJECT_ROOT"] = str(root)
     env["SLACK_SERVICE_SETTINGS"] = str(_service_settings_path(root))
     env["SLACK_SERVICE_CONTEXT"] = str(_service_context_path(root))
