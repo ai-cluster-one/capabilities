@@ -1037,9 +1037,7 @@ def _store_document(key):
         return None
     try:
         with _store.open_store() as st:
-            doc = st.document_read(NAME, key, _store.Scopes(
-                project=identity["slug"],
-                instance=os.environ.get("CAPABILITIES_INSTANCE") or None))
+            doc = st.context_read(NAME, key, _store.Scopes(project=identity["slug"]))
     except _store.StoreError as e:
         log(f"store: cannot read document {key!r}: {e.message}")
         return None

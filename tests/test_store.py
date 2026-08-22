@@ -32,6 +32,10 @@ _PG_DSN = os.environ.get("STORE_TEST_PG")
 _BACKENDS = ["sqlite"] + (["postgres"] if _PG_DSN else [])
 
 
+MARVIN_ID = "3f1c9b4e-0000-4d92-9a11-0c5e8f2d6a44"
+OTHER_ID = "3f1c9b4e-1111-4d92-9a11-111111111111"
+
+
 @pytest.fixture(params=_BACKENDS)
 def store(request, tmp_path):
     if request.param == "sqlite":
@@ -42,24 +46,39 @@ def store(request, tmp_path):
             s._execute("DROP SCHEMA public CASCADE")
             s._execute("CREATE SCHEMA public")
     s.migrate()
+    # A record scoped to a project needs the project to exist; rows refer to it
+    # by id, and there is no id until someone claims the slug.
+    s.project_register(MARVIN_ID, "marvin")
     yield s
     s.close()
 
 
 @pytest.fixture()
 def scopes():
-    return Scopes(project="marvin", instance="kz-mbp")
+    return Scopes(project="marvin")
 
 
 # --- scope model -------------------------------------------------------------
 
-def test_chain_is_highest_first(scopes):
-    assert scopes.chain() == [("instance", "kz-mbp"), ("project", "marvin"), ("global", "")]
+def test_chain_is_highest_first(store, scopes):
+    assert store._chain(scopes) == [("project", MARVIN_ID), ("global", None)]
 
 
-def test_chain_skips_absent_scopes():
-    assert Scopes().chain() == [("global", "")]
-    assert Scopes(project="marvin").chain() == [("project", "marvin"), ("global", "")]
+def test_chain_skips_a_project_nobody_registered(store):
+    assert store._chain(Scopes()) == [("global", None)]
+    assert store._chain(Scopes(project="never-claimed")) == [("global", None)]
+
+
+def test_the_global_scope_takes_no_project(store):
+    with pytest.raises(StoreError) as exc:
+        store.config_set("telegram", "setting", "a", 1, ("global", "marvin"))
+    assert exc.value.slug == "bad_scope"
+
+
+def test_writing_to_an_unregistered_project_is_refused(store):
+    with pytest.raises(StoreError) as exc:
+        store.config_set("telegram", "setting", "a", 1, ("project", "ghost"))
+    assert exc.value.slug == "unknown_project"
 
 
 def test_write_target_refuses_a_scope_it_has_no_name_for():
@@ -68,10 +87,9 @@ def test_write_target_refuses_a_scope_it_has_no_name_for():
     assert exc.value.slug == "no_project_scope"
 
 
-def test_global_scope_takes_no_name(store):
-    with pytest.raises(StoreError) as exc:
-        store.config_set("telegram", "setting", "a", 1, ("global", "oops"))
-    assert exc.value.slug == "bad_scope"
+def test_write_target_names_the_two_scopes_there_are():
+    assert Scopes(project="marvin").write_target("project") == ("project", "marvin")
+    assert Scopes(project="marvin").write_target("global") == ("global", None)
 
 
 # --- MERGE: rule 17, an absent higher entry inherits the lower ---------------
@@ -85,13 +103,12 @@ def test_merge_inherits_per_key(store, scopes):
     assert store.config_get("telegram", "setting", "voice", scopes) == "on"
 
 
-def test_merge_lets_instance_beat_project(store, scopes):
+def test_a_project_beats_global(store, scopes):
     store.config_set("telegram", "setting", "model", "sol", ("global", ""))
     store.config_set("telegram", "setting", "model", "terra", ("project", "marvin"))
-    store.config_set("telegram", "setting", "model", "local", ("instance", "kz-mbp"))
 
-    assert store.config_get("telegram", "setting", "model", scopes) == "local"
-    assert store.config_origin("telegram", "setting", "model", scopes) == ("instance", "kz-mbp")
+    assert store.config_get("telegram", "setting", "model", scopes) == "terra"
+    assert store.config_origin("telegram", "setting", "model", scopes) == ("project", MARVIN_ID)
 
 
 def test_policy_gate_merges_like_the_file_gate_did(store, scopes):
@@ -127,7 +144,7 @@ def test_first_falls_through_an_empty_scope(store, scopes, isolated_collection):
     store.config_set("telegram", isolated_collection, "kz", {"api_id": 1}, ("global", ""))
     resolved = store.config_resolve("telegram", isolated_collection, scopes)
     assert set(resolved) == {"kz"}
-    assert resolved["kz"]["scope_kind"] == "global"
+    assert resolved["kz"]["scope"] == "global"
 
 
 def test_the_two_semantics_disagree_on_the_same_data(store, scopes, isolated_collection):
@@ -155,8 +172,8 @@ def test_a_project_grants_write_without_restating_the_identity(store, scopes):
     effective = store.connections_effective("mailbox", scopes)
     assert effective["marvin"]["allow_write"] is True
     assert effective["marvin"]["value"] == MARVIN_BOX          # identity untouched
-    assert effective["marvin"]["scope"] == ("global", "")      # and still global
-    assert effective["marvin"]["grant_scope"] == ("project", "marvin")
+    assert effective["marvin"]["scope"] == ("global", None)      # and still global
+    assert effective["marvin"]["grant_scope"] == ("project", MARVIN_ID)
 
 
 def test_a_project_can_disable_a_globally_declared_connection(store, scopes):
@@ -176,7 +193,7 @@ def test_a_project_only_connection_lives_beside_the_global_ones(store, scopes):
 
     effective = store.connections_effective("mailbox", scopes)
     assert set(effective) == {"marvin", "client"}
-    assert effective["client"]["scope"] == ("project", "marvin")
+    assert effective["client"]["scope"] == ("project", MARVIN_ID)
 
 
 def test_a_project_may_replace_a_global_identity_whole(store, scopes):
@@ -214,7 +231,7 @@ def test_a_grant_aimed_at_nothing_is_reported_rather_than_dropped(store, scopes)
     assert set(store.connections_effective("mailbox", scopes)) == {"marvin"}
     orphans = store.grant_orphans("mailbox", scopes)
     assert [o["key"] for o in orphans] == ["marvni"]
-    assert orphans[0]["scope"] == ("project", "marvin")
+    assert orphans[0]["scope"] == ("project", MARVIN_ID)
 
 
 def test_a_grant_that_lands_is_not_reported_as_an_orphan(store, scopes):
@@ -286,10 +303,9 @@ def test_a_project_without_an_id_is_refused(store):
 
 # --- EXACT: rule 16, state does not cascade ----------------------------------
 
-def test_state_does_not_fall_back_to_a_lower_scope(store):
+def test_state_does_not_fall_back_to_another_scope(store):
     store.state_set("telegram", "cursor", 42, ("project", "marvin"))
     assert store.state_get("telegram", "cursor", ("project", "marvin")) == 42
-    assert store.state_get("telegram", "cursor", ("instance", "kz-mbp")) is None
     assert store.state_get("telegram", "cursor", ("global", "")) is None
 
 
@@ -452,134 +468,132 @@ def test_sqlite_stores_json_as_text(tmp_path):
     assert isinstance(raw, str) and json.loads(raw) == {"a": 1}
 
 
-# --- documents: saving is not deploying --------------------------------------
+# --- context: saving is not deploying ----------------------------------------
 
 def test_a_version_is_addressed_by_its_content(store, scopes):
-    a = store.document_put("telegram", "voice-agent", "you are terse", ("global", ""))
-    b = store.document_put("telegram", "voice-agent", "you are terse", ("global", ""))
-    c = store.document_put("telegram", "voice-agent", "you are verbose", ("global", ""))
+    a = store.context_put("telegram", "voice-agent", "you are terse", ("global", ""))
+    b = store.context_put("telegram", "voice-agent", "you are terse", ("global", ""))
+    c = store.context_put("telegram", "voice-agent", "you are verbose", ("global", ""))
     assert a == b and a != c
-    assert len(store.document_versions("telegram", "voice-agent", scopes)) == 2
-
-
-def test_saving_a_new_version_changes_nothing_until_the_pin_moves(store, scopes):
-    """The whole reason this is safe to hold executable text in."""
-    first = store.document_put("telegram", "voice-agent", "you are terse", ("global", ""))
-    store.document_pin("telegram", "voice-agent", first, ("global", ""))
-    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "you are terse"
-
-    second = store.document_put("telegram", "voice-agent", "you are verbose", ("global", ""))
-    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "you are terse"
-
-    store.document_pin("telegram", "voice-agent", second, ("global", ""))
-    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "you are verbose"
-
-
-def test_rolling_back_is_moving_the_pin(store, scopes):
-    first = store.document_put("telegram", "voice-agent", "v1", ("global", ""))
-    second = store.document_put("telegram", "voice-agent", "v2", ("global", ""))
-    store.document_pin("telegram", "voice-agent", second, ("global", ""))
-    store.document_pin("telegram", "voice-agent", first, ("global", ""), actor="kz")
-    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "v1"
-    assert store.revisions("telegram", "document", "voice-agent")[0]["actor"] == "kz"
-
-
-def test_a_project_runs_its_own_version_of_a_global_document(store, scopes):
-    """Falls out of keeping the pin in `config`: scoping and merge come free."""
-    stable = store.document_put("telegram", "voice-agent", "stable", ("global", ""))
-    trial = store.document_put("telegram", "voice-agent", "trial", ("global", ""))
-    store.document_pin("telegram", "voice-agent", stable, ("global", ""))
-    store.document_pin("telegram", "voice-agent", trial, ("project", "marvin"))
-
-    assert store.document_read("telegram", "voice-agent", scopes)["body"] == "trial"
-    assert store.document_read("telegram", "voice-agent", Scopes())["body"] == "stable"
-
-
-def test_an_unpinned_document_reads_as_absent(store, scopes):
-    store.document_put("telegram", "voice-agent", "drafted, never deployed", ("global", ""))
-    assert store.document_read("telegram", "voice-agent", scopes) is None
-
-
-def test_pinning_a_version_that_was_never_recorded_is_refused(store):
-    with pytest.raises(StoreError) as exc:
-        store.document_pin("telegram", "voice-agent", "0" * 12, ("global", ""))
-    assert exc.value.slug == "unknown_version"
-
-
-def test_a_body_survives_exactly(store, scopes):
-    body = "#!/usr/bin/env python3\nprint('héllo')\n\n\ttabbed\n"
-    digest = store.document_put("automations", "upstream-watch", body, ("global", ""), media_type="text/x-python")
-    store.document_pin("automations", "upstream-watch", digest, ("project", "marvin"))
-    got = store.document_read("automations", "upstream-watch", scopes)
-    assert got["body"] == body
-    assert got["media_type"] == "text/x-python"
-    assert got["scope"] == ("project", "marvin")
-
-
-def test_history_omits_the_bodies_it_lists(store, scopes):
-    store.document_put("telegram", "voice-agent", "x" * 5000, ("global", ""))
-    entry = store.document_versions("telegram", "voice-agent", scopes)[0]
-    assert entry["bytes"] == 5000 and "body" not in entry
-
-
-def test_a_reference_is_a_document_like_any_other(store, scopes):
-    """What `refs` reads in store mode: pinned versions only, drafts invisible."""
-    body = "---\nname: Project Telegram Session\ndescription: how to wire it\n---\n\nbody\n"
-    digest = store.document_put("telegram", "reference.project-session", body, ("global", ""), media_type="text/markdown")
-    assert store.document_read("telegram", "reference.project-session", scopes) is None
-    store.document_pin("telegram", "reference.project-session", digest, ("project", "marvin"))
-    assert store.document_read("telegram", "reference.project-session", scopes)["body"] == body
-    assert store.document_keys("telegram", scopes) == ["reference.project-session"]
+    assert len(store.context_versions("telegram", "voice-agent", scopes)) == 2
 
 
 def test_a_version_name_is_short_enough_to_read(store):
-    digest = store.document_put("telegram", "voice-agent", "text", ("global", ""))
+    digest = store.context_put("telegram", "voice-agent", "text", ("global", ""))
     assert len(digest) == SCHEMA_HASH_LENGTH
     assert digest == hashlib.sha256(b"text").hexdigest()[:SCHEMA_HASH_LENGTH]
 
 
+def test_saving_a_version_changes_nothing_until_it_is_activated(store, scopes):
+    """The whole reason this is safe to hold executable text in."""
+    first = store.context_put("telegram", "voice-agent", "terse", ("global", ""))
+    store.context_activate("telegram", "voice-agent", first, ("global", ""))
+    assert store.context_read("telegram", "voice-agent", scopes)["body"] == "terse"
+
+    store.context_put("telegram", "voice-agent", "verbose", ("global", ""))
+    assert store.context_read("telegram", "voice-agent", scopes)["body"] == "terse"
+
+
+def test_activating_puts_the_new_version_in_force(store, scopes):
+    first = store.context_put("telegram", "voice-agent", "terse", ("global", ""))
+    second = store.context_put("telegram", "voice-agent", "verbose", ("global", ""))
+    store.context_activate("telegram", "voice-agent", first, ("global", ""))
+    store.context_activate("telegram", "voice-agent", second, ("global", ""))
+    assert store.context_read("telegram", "voice-agent", scopes)["body"] == "verbose"
+
+
+def test_exactly_one_version_is_active_and_the_database_says_so(store, scopes):
+    first = store.context_put("telegram", "voice-agent", "one", ("global", ""))
+    second = store.context_put("telegram", "voice-agent", "two", ("global", ""))
+    store.context_activate("telegram", "voice-agent", first, ("global", ""))
+    store.context_activate("telegram", "voice-agent", second, ("global", ""))
+    active = [v for v in store.context_versions("telegram", "voice-agent", scopes) if v["active"]]
+    assert [v["hash"] for v in active] == [second]
+
+
+def test_rolling_back_is_activating_the_older_version(store, scopes):
+    first = store.context_put("telegram", "voice-agent", "v1", ("global", ""))
+    second = store.context_put("telegram", "voice-agent", "v2", ("global", ""))
+    store.context_activate("telegram", "voice-agent", second, ("global", ""))
+    store.context_activate("telegram", "voice-agent", first, ("global", ""), actor="kz")
+    assert store.context_read("telegram", "voice-agent", scopes)["body"] == "v1"
+    assert store.revisions("telegram", "context", "voice-agent")[0]["actor"] == "kz"
+
+
+def test_a_project_inherits_the_globally_active_version(store, scopes):
+    shared = store.context_put("telegram", "voice-agent", "the shared one", ("global", ""))
+    store.context_activate("telegram", "voice-agent", shared, ("global", ""))
+    got = store.context_read("telegram", "voice-agent", scopes)
+    assert got["body"] == "the shared one"
+    assert got["scope"] == ("global", None)
+
+
+def test_a_projects_own_version_wins_over_the_global_one(store, scopes):
+    shared = store.context_put("telegram", "voice-agent", "shared", ("global", ""))
+    store.context_activate("telegram", "voice-agent", shared, ("global", ""))
+    own = store.context_put("telegram", "voice-agent", "ours", ("project", "marvin"))
+    store.context_activate("telegram", "voice-agent", own, ("project", "marvin"))
+
+    assert store.context_read("telegram", "voice-agent", scopes)["body"] == "ours"
+    assert store.context_read("telegram", "voice-agent", Scopes())["body"] == "shared"
+
+
+def test_one_projects_drafts_stay_out_of_anothers_history(store, scopes):
+    """Without a scope on the row, every project's versions of the same key
+    would pool under one name and each would read the others' history."""
+    store.project_register(OTHER_ID, "client")
+    store.context_put("telegram", "voice-agent", "marvin's", ("project", "marvin"))
+    store.context_put("telegram", "voice-agent", "client's", ("project", "client"))
+
+    assert len(store.context_versions("telegram", "voice-agent", scopes)) == 1
+    assert len(store.context_versions("telegram", "voice-agent", Scopes(project="client"))) == 1
+
+
+def test_a_version_from_another_scope_cannot_be_activated(store):
+    """Activation names a version in its own scope: a project running someone
+    else's text would be a copy nobody made deliberately."""
+    theirs = store.context_put("telegram", "voice-agent", "theirs", ("global", ""))
+    with pytest.raises(StoreError) as exc:
+        store.context_activate("telegram", "voice-agent", theirs, ("project", "marvin"))
+    assert exc.value.slug == "unknown_version"
+
+
+def test_an_unactivated_item_reads_as_absent(store, scopes):
+    store.context_put("telegram", "voice-agent", "drafted, never deployed", ("global", ""))
+    assert store.context_read("telegram", "voice-agent", scopes) is None
+
+
+def test_a_body_survives_exactly(store, scopes):
+    body = "#!/usr/bin/env python3\nprint('héllo')\n\n\ttabbed\n"
+    digest = store.context_put("automations", "upstream-watch", body, ("project", "marvin"),
+                               media_type="text/x-python", activate=True)
+    got = store.context_read("automations", "upstream-watch", scopes)
+    assert got["body"] == body and got["hash"] == digest
+    assert got["media_type"] == "text/x-python"
+    assert got["scope"] == ("project", MARVIN_ID)
+
+
+def test_history_omits_the_bodies_it_lists(store, scopes):
+    store.context_put("telegram", "voice-agent", "x" * 5000, ("global", ""))
+    entry = store.context_versions("telegram", "voice-agent", scopes)[0]
+    assert entry["bytes"] == 5000 and "body" not in entry
+
+
+def test_a_reference_is_context_like_any_other(store, scopes):
+    body = "---\nname: Project Telegram Session\ndescription: how to wire it\n---\n\nbody\n"
+    store.context_put("telegram", "reference.project-session", body, ("project", "marvin"),
+                      media_type="text/markdown", activate=True)
+    assert store.context_read("telegram", "reference.project-session", scopes)["body"] == body
+    assert store.context_keys("telegram", scopes) == ["reference.project-session"]
+
+
 def test_a_truncated_hash_naming_different_text_is_refused(store):
     """What makes twelve characters safe is that a clash is loud, not unlikely."""
-    digest = store.document_put("telegram", "voice-agent", "original", ("global", ""))
+    digest = store.context_put("telegram", "voice-agent", "original", ("global", ""))
     with store.transaction():
         store._execute(
-            "UPDATE documents SET body = ? WHERE capability = ? AND key = ? AND hash = ?",
+            "UPDATE context SET body = ? WHERE capability = ? AND key = ? AND hash = ?",
             ("tampered", "telegram", "voice-agent", digest))
     with pytest.raises(StoreError) as exc:
-        store.document_put("telegram", "voice-agent", "original", ("global", ""))
+        store.context_put("telegram", "voice-agent", "original", ("global", ""))
     assert exc.value.slug == "hash_collision"
-
-
-def test_one_projects_drafts_stay_out_of_anothers_history(store):
-    """The hole this closes: without a scope on the body, every project's
-    versions of the same key pooled under one name."""
-    mine = Scopes(project="marvin")
-    theirs = Scopes(project="client")
-    store.document_put("telegram", "voice-agent", "marvin's draft", ("project", "marvin"))
-    store.document_put("telegram", "voice-agent", "client's draft", ("project", "client"))
-
-    assert [v["bytes"] for v in store.document_versions("telegram", "voice-agent", mine)] == [14]
-    assert store.document_versions("telegram", "voice-agent", theirs)[0]["scope"] == \
-        ("project", "client")
-    assert len(store.document_versions("telegram", "voice-agent", theirs)) == 1
-
-
-def test_a_project_pins_a_global_version_without_copying_it(store):
-    """The chain still reaches down, so sharing a prompt costs no duplication."""
-    mine = Scopes(project="marvin")
-    shared = store.document_put("telegram", "voice-agent", "the shared one", ("global", ""))
-    store.document_pin("telegram", "voice-agent", shared, ("project", "marvin"), scopes=mine)
-
-    got = store.document_read("telegram", "voice-agent", mine)
-    assert got["body"] == "the shared one"
-    assert got["version_scope"] == ("global", "")     # the text stayed where it was
-    assert got["scope"] == ("project", "marvin")      # the decision is the project's
-
-
-def test_a_version_from_another_project_cannot_be_pinned(store):
-    store.document_put("telegram", "voice-agent", "theirs", ("project", "client"))
-    digest = store.document_put("telegram", "voice-agent", "theirs", ("project", "client"))
-    with pytest.raises(StoreError) as exc:
-        store.document_pin("telegram", "voice-agent", digest, ("project", "marvin"),
-                           scopes=Scopes(project="marvin"))
-    assert exc.value.slug == "unknown_version"
