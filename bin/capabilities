@@ -4215,6 +4215,18 @@ def cmd_sync_contract(check_only: bool) -> None:
             changed.append({"capability": capdir.name, "regions": stamped})
             if not check_only:
                 script.write_text(new_text)
+        # A bundled service is several files that import each other, so it takes
+        # the store as a module rather than a fence. It gets one when its own CLI
+        # carries the store tier: a capability using the store from the command
+        # line and not from its daemon would be a split brain, not a choice.
+        service_dir = capdir / "service"
+        if service_dir.is_dir() and _split_region(new_text, "store") is not None:
+            module = service_dir / "store.py"
+            canonical_body = (_ASSET_ROOT / _REGION_SOURCE_REL["store"]).read_text()
+            if not module.is_file() or module.read_text() != canonical_body:
+                changed.append({"capability": capdir.name, "service_module": "store.py"})
+                if not check_only:
+                    module.write_text(canonical_body)
     if check_only:
         _emit({"preamble": str(_PREAMBLE), "drift": changed, "ok": not changed})
         if changed:

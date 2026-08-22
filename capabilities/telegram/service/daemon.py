@@ -976,12 +976,79 @@ GEMINI_SECRET_ENV = ((CONNECTION_ENTRY or {}).get("gemini_secret_env")
                      or "GOOGLE_API_KEY")
 
 
-def read_voice_context():
-    """The voice channel's own system prompt, owned by the project."""
+NAME = "telegram"
+
+
+def _document_key(path):
+    """The document key a service file corresponds to, by the one convention
+    the import follows: `context.md` is `context`, `context/<x>.md` is
+    `context.<x>`, and anything else is its own stem."""
     try:
-        return VOICE_CONTEXT_FILE.read_text().strip()
+        rel = Path(path).resolve().relative_to(SERVICE_DIR.resolve())
+    except (OSError, ValueError):
+        rel = Path(path)
+    stem = rel.stem.replace("_", "-").lower()
+    if rel.parent.name == "context":
+        return f"context.{stem}"
+    return stem
+
+
+def read_service_document(path):
+    """Prose the daemon serves at request time — the soft-gate context, a
+    channel's own context, the voice prompt.
+
+    Where the project keeps its records in the store this reads the pinned
+    version, so an edit reaches every host at once and a draft reaches none.
+    Where it does not, it reads the file. Nothing falls back between them: a
+    project on the store that cannot reach it must not quietly serve a stale
+    file it has no way to report serving."""
+    mode, _why = _store_mode()
+    if mode == "db":
+        doc = _store_document(_document_key(path))
+        return (doc or "").strip()
+    try:
+        return Path(path).read_text().strip()
     except OSError:
         return ""
+
+
+def _store_mode():
+    identity = _project_identity_file()
+    override = os.environ.get("CAPABILITIES_STORE_MODE")
+    if override in ("files", "db"):
+        return override, "CAPABILITIES_STORE_MODE"
+    return (identity.get("store", "files") if identity else "files"), "project.json"
+
+
+def _project_identity_file():
+    try:
+        return json.loads((PROJECT_CAPABILITIES_DIR / "project.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _store_document(key):
+    identity = _project_identity_file() or {}
+    if not identity.get("slug"):
+        return None
+    try:
+        import store as _store
+    except ImportError:
+        return None
+    try:
+        with _store.open_store() as st:
+            doc = st.document_read(NAME, key, _store.Scopes(
+                project=identity["slug"],
+                instance=os.environ.get("CAPABILITIES_INSTANCE") or None))
+    except _store.StoreError as e:
+        log(f"store: cannot read document {key!r}: {e.message}")
+        return None
+    return doc["body"] if doc else None
+
+
+def read_voice_context():
+    """The voice channel's own system prompt, owned by the project."""
+    return read_service_document(VOICE_CONTEXT_FILE)
 
 
 def voice_call_readiness():
@@ -2728,11 +2795,8 @@ def _channel_context_from_policy(policy):
     path = _service_context_path(context_file)
     if context_file and path is None:
         parts.append(f"[channel context file ignored: {context_file}]")
-    elif path and path.exists():
-        try:
-            text = path.read_text().strip()
-        except OSError as e:
-            text = f"[channel context file unreadable: {context_file}: {e}]"
+    elif path and (_store_mode()[0] == "db" or path.exists()):
+        text = read_service_document(path)
         if text:
             parts.append(text)
     elif context_file:
@@ -2798,7 +2862,7 @@ def build_prompt(tail, state=None):
     # An exclusive channel answers with its own prose alone. The service context
     # goes with the room's, which is the point of the mode and the cost of it.
     context = ("" if st.get("context_exclusive")
-               else (CONTEXT_FILE.read_text().strip() if CONTEXT_FILE.exists() else ""))
+               else read_service_document(CONTEXT_FILE))
     channel_context = (st.get("channel_context") or "").strip()
     progress_command = None
     if st.get("chat_id") is not None:
