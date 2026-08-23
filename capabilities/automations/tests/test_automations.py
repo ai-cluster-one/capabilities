@@ -621,3 +621,88 @@ def test_the_ledger_counts_per_automation_within_the_project(tmp_path):
     assert led.has_active("nightly", ["pending"]) is True
     assert led.running() == 0
     st.close()
+
+
+# --- a store whose runs table predates the nullable automation reference ------
+
+def _stale_store(tmp_path):
+    """A store as it stands on a machine whose `runs` table was created before
+    the automation reference was allowed to be empty."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import store as store_mod
+    import runtime as rt
+
+    st = store_mod.SQLiteStore.open(str(tmp_path / "stale.db"))
+    st.migrate()
+    st.project_register("11111111-2222-3333-4444-555555555555", "marvin")
+    stale = [step.replace("automation_id     TEXT REFERENCES automations(id),",
+                          "automation_id     TEXT NOT NULL REFERENCES automations(id),")
+             for step in rt.STORE_MIGRATIONS]
+    st.migrate(rt.STORE_NAMESPACE, rt.STORE_VERSION, stale)
+    st._conn.commit()
+    return st, rt
+
+
+def test_a_stale_runs_table_is_named_by_the_defect_check(tmp_path):
+    st, rt = _stale_store(tmp_path)
+    assert rt.runs_schema_defect(st) == "automation_id"
+    st.close()
+
+
+def test_repairing_the_runs_table_keeps_its_rows_and_widens_the_column(tmp_path):
+    st, rt = _stale_store(tmp_path)
+    project_id = st._project_id("marvin")
+    automation_id = rt.store_upsert(st, "project", project_id, {
+        "slug": "nightly", "name": None, "description": None, "enabled": 1,
+        "script_key": "script.nightly", "schedule": "0 3 * * *", "every_seconds": None,
+        "timeout_seconds": 300.0, "max_parallel": 1, "max_pending": 1,
+        "overlap": "skip", "retries": 0, "arguments": [], "environments": [],
+    })
+    st._conn.commit()
+    _claim(st, project_id, automation_id, "marvin:production:nightly:2026-08-23T03:00:00+00:00")
+
+    outcome = rt.repair_runs_schema(st)
+    assert outcome["repaired"] is True
+    assert outcome["rows_preserved"] == 1
+    assert rt.runs_schema_defect(st) is None
+    assert st._execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+    indexes = {row[0] for row in st._execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'runs'")}
+    assert {"runs_status_idx", "runs_automation_idx"} <= indexes
+    st.close()
+
+
+def test_repairing_a_healthy_runs_table_changes_nothing(tmp_path):
+    st, _project_id, _automation_id = _store_with_automation(tmp_path)
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import runtime as rt
+    assert rt.repair_runs_schema(st)["repaired"] is False
+    st.close()
+
+
+def test_a_run_the_schema_cannot_hold_fails_loudly(tmp_path):
+    """The failure this replaces was silent: the scheduler read `None` as
+    someone else's claim and dropped the firing."""
+    import sqlite3 as _sqlite3
+    st, rt = _stale_store(tmp_path)
+    project_id = st._project_id("marvin")
+    ledger = rt.RunLedger(st._conn, project_id, "production")
+    with pytest.raises(_sqlite3.IntegrityError):
+        ledger.claim(None, "nightly", tmp_path, trigger="manual")
+    st.close()
+
+
+def test_a_dedupe_collision_still_yields_rather_than_raising(tmp_path):
+    st, project_id, automation_id = _store_with_automation(tmp_path)
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import runtime as rt
+    ledger = rt.RunLedger(st._conn, project_id, "production")
+    dedupe = "marvin:production:nightly:2026-08-23T03:00:00+00:00"
+    assert ledger.claim(automation_id, "nightly", tmp_path,
+                        trigger="schedule", dedupe_key=dedupe) is not None
+    assert ledger.claim(automation_id, "nightly", tmp_path,
+                        trigger="schedule", dedupe_key=dedupe) is None
+    st.close()

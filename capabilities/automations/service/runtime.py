@@ -718,8 +718,20 @@ class RunLedger:
             self.db.commit()
         except sqlite3.IntegrityError:
             self.db.rollback()
-            return None
+            if dedupe_key is not None and self._dedupe_taken(dedupe_key):
+                return None
+            raise
         return self.get(run_id)
+
+    def _dedupe_taken(self, dedupe_key: str) -> bool:
+        """Whether the key is already on a row, which is the only integrity
+        failure this insert is allowed to treat as someone else's win. Anything
+        else -- a column this store still declares NOT NULL, a reference it
+        cannot satisfy -- is a schema the code no longer matches, and a run that
+        vanishes quietly is worse than one that fails loudly."""
+        row = self.db.execute("SELECT 1 FROM runs WHERE dedupe_key = ? LIMIT 1",
+                              (dedupe_key,)).fetchone()
+        return row is not None
 
     def update(self, run_id: str, **columns: Any) -> None:
         assignments = ", ".join(f"{name} = ?" for name in columns)
@@ -727,6 +739,61 @@ class RunLedger:
         self.db.execute(f"UPDATE runs SET {assignments}" + clause,
                         tuple(list(columns.values()) + params + [run_id]))
         self.db.commit()
+
+
+def runs_schema_defect(store) -> str | None:
+    """The name of a column this store still declares NOT NULL that the code
+    expects to leave empty, or None when the table matches.
+
+    `runs.automation_id` is empty for a project that declares its automations in
+    a file: there is no row for it to point at. A store first created before
+    that was true still carries the old NOT NULL, and `CREATE TABLE IF NOT
+    EXISTS` never revisits a table that already exists, so the constraint
+    outlives the release that relaxed it and no run can be recorded at all.
+    """
+    try:
+        columns = store._execute("PRAGMA table_info(runs)").fetchall()
+    except Exception:
+        return None
+    for column in columns:
+        name, notnull = column[1], column[3]
+        if name == "automation_id" and notnull:
+            return name
+    return None
+
+
+def repair_runs_schema(store) -> dict[str, Any]:
+    """Rebuild `runs` so the automation reference may be empty, keeping rows.
+
+    This is a repair, not a migration: `migrate()` refuses a step that drops or
+    renames, because a host on an older release shares this database and has to
+    survive whatever a newer one does to it. Widening a column is safe for that
+    older host -- it simply never writes an empty one -- but SQLite cannot widen
+    in place, and the rebuild that does it is exactly the shape the guard
+    refuses to take on trust. So it is asked for deliberately, once, by someone
+    who has read what it will do.
+    """
+    defect = runs_schema_defect(store)
+    if defect is None:
+        return {"repaired": False, "reason": "runs already allows an empty automation reference"}
+    create = [step for step in STORE_MIGRATIONS
+              if "CREATE TABLE IF NOT EXISTS runs " in " ".join(step.split())]
+    indexes = [step for step in STORE_MIGRATIONS
+               if "CREATE INDEX" in step.upper() and " ON RUNS " in " ".join(step.split()).upper()]
+    with store.transaction():
+        store._execute("ALTER TABLE runs RENAME TO runs_pre_repair")
+        for step in create:
+            store._execute(step.format(**store._ddl_subs()))
+        columns = [row[1] for row in store._execute("PRAGMA table_info(runs)").fetchall()]
+        names = ", ".join(columns)
+        store._execute(f"INSERT INTO runs ({names}) SELECT {names} FROM runs_pre_repair")
+        moved = store._execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        # The old table's indexes carry its name and go down with it, so they are
+        # rebuilt from the same steps that declare them rather than left missing.
+        store._execute("DROP TABLE runs_pre_repair")
+        for step in indexes:
+            store._execute(step.format(**store._ddl_subs()))
+    return {"repaired": True, "column": defect, "rows_preserved": moved}
 
 
 def _automation_uuid(store, project_id: str | None, slug: str) -> str | None:

@@ -12,7 +12,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "1495c4a9e828a420e6f951a1283e70b72645433d11bf80fcc693aeee86bb5bfa",
+      "payload_sha256": "2c4425fd9482f34c0735c1c208d2a0914859e6c5536f89538b45eacbc1c2f6eb",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "callva": {

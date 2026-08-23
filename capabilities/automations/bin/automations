@@ -21,8 +21,11 @@ Scripts:
 
 Commands:
   automations help
-  automations doctor
-      Validate config, scripts, state storage, and daemon status.
+  automations doctor [--repair]
+      Validate config, scripts, state storage, and daemon status. Reports a
+      store whose `runs` table predates the nullable automation reference,
+      which stops a file-declared automation recording any run. `--repair`
+      rebuilds that table in place, keeping every row.
   automations list
       List configured automations and whether they apply to this environment.
   automations run <automation-id>
@@ -2890,7 +2893,7 @@ def service_status(root: Path) -> dict[str, Any]:
     }
 
 
-def cmd_doctor() -> dict[str, Any]:
+def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     root = _root_required()
     runtime, config = _load(root)
     state = _state_path(root)
@@ -2898,14 +2901,21 @@ def cmd_doctor() -> dict[str, Any]:
     missing_scripts = [
         item["script"] for item in config["automations"] if not item["script_path"].is_file()
     ]
+    schema_defect = None
+    repaired = None
     try:
         store, _ledger = runtime.open_ledger(root, config)
-        store.close()
+        try:
+            if repair:
+                repaired = runtime.repair_runs_schema(store)
+            schema_defect = runtime.runs_schema_defect(store)
+        finally:
+            store.close()
     except Exception as exc:
         _die(5, "state_unavailable", f"the store is unavailable: {exc}")
     status = service_status(root)
-    return {
-        "ok": not missing_scripts,
+    result = {
+        "ok": not missing_scripts and schema_defect is None,
         "project": str(root),
         "environment": config["engine"]["environment"],
         "namespace": config["engine"]["namespace"],
@@ -2913,6 +2923,19 @@ def cmd_doctor() -> dict[str, Any]:
         "missing_scripts": missing_scripts,
         "service": status,
     }
+    if repaired is not None:
+        result["repaired"] = repaired
+    if schema_defect is not None:
+        result["schema_defect"] = {
+            "table": "runs",
+            "column": schema_defect,
+            "message": (
+                f"this store still declares runs.{schema_defect} NOT NULL, so a project "
+                "declaring its automations in a file cannot record a run"
+            ),
+            "hint": "run `automations doctor --repair` to rebuild the table, keeping its rows",
+        }
+    return result
 
 
 def cmd_list() -> dict[str, Any]:
@@ -3294,7 +3317,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog=NAME, add_help=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("help", add_help=False)
-    sub.add_parser("doctor", add_help=False)
+    doctor_parser = sub.add_parser("doctor", add_help=False)
+    doctor_parser.add_argument("--repair", action="store_true")
     sub.add_parser("list", add_help=False)
     run = sub.add_parser("run", add_help=False)
     run.add_argument("automation_id")
@@ -3335,7 +3359,7 @@ def main() -> None:
     if args.cmd == "help":
         _cmd_help()
     elif args.cmd == "doctor":
-        result = cmd_doctor()
+        result = cmd_doctor(repair=getattr(args, "repair", False))
         _emit(result)
         if not result["ok"]:
             raise SystemExit(6)
