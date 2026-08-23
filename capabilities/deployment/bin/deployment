@@ -3888,7 +3888,7 @@ def _launchd_status(label: str) -> dict:
     """What launchd itself says, asked at use time rather than assumed."""
     installed = (Path.home() / "Library" / "LaunchAgents" / f"{label}.plist")
     state = {"label": label, "installed": installed.is_file(),
-             "loaded": False, "pid": None, "last_exit_status": None}
+             "loaded": False, "pid": None, "last_exit_status": None, "program": None}
     if sys.platform != "darwin":
         return state
     try:
@@ -3906,6 +3906,8 @@ def _launchd_status(label: str) -> dict:
             state["pid"] = stripped.split("=", 1)[1].strip()
         elif stripped.startswith("last exit code = "):
             state["last_exit_status"] = stripped.split("=", 1)[1].strip()
+        elif stripped.startswith("program = "):
+            state["program"] = stripped.split("=", 1)[1].strip()
     return state
 
 
@@ -4551,6 +4553,13 @@ def _host_next_payload(root: Path, runtime: dict, target_name: str | None) -> di
         f"not end up beside one: {', '.join(f'`{name} service stop`' for name in services) or 'none declared'}."
         " That verb reaches a daemon it started itself; once launchd owns one,"
         " the switch below is launchctl.",
+        "Take down any earlier copy of these agents and remove the installed"
+        f" file, not only the job. macOS records the program an agent runs when"
+        " the file appears in `" + str(library) + "` and keeps that record"
+        " across a reload, so an agent whose program changed keeps running -"
+        " and listing itself - under the old one until the file goes away:",
+        *[f"`launchctl bootout gui/$UID {library / f'{label}.plist'} 2>/dev/null;"
+          f" rm -f {library / f'{label}.plist'}`" for label in labels],
         f"Link the compiled agents into `{library}`:",
         *[f"`ln -sf {agents_dir / f'{label}.plist'} {library / f'{label}.plist'}`"
           for label in labels],
@@ -4868,6 +4877,16 @@ def cmd_doctor(args) -> None:
                     findings.append({
                         "severity": "warning", "path": status["label"],
                         "message": "agent is installed but not loaded into launchd"})
+                else:
+                    expected = str(_host_agents_dir(root, compiled) / f"{prefix}-{name}")
+                    if status["program"] and status["program"] != expected:
+                        findings.append({
+                            "severity": "warning", "path": status["label"],
+                            "message": f"agent runs {status['program']!r} but the "
+                                       f"compiled agent names {expected!r}; "
+                                       "re-register it, because reloading alone "
+                                       "leaves the old program in place",
+                            "hint": "run `deployment next` for the re-registration steps"})
         else:
             artifact_paths, overlays = _artifact_paths(root, compiled)
             compose = artifact_paths["compose"]

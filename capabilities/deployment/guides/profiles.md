@@ -47,6 +47,21 @@ image or give it its own Compose service. A host has no image to fold into, so
 both modes render the same thing: one supervised process per service.
 `disabled` still means the CLI is installed and the service does not run.
 
+**The program carries the project's name.** A host agent does not run a
+capability's CLI directly; each service compiles a launcher beside its plist,
+named `<project>-<service>`, and the job names that. macOS lists a background
+item by the basename of the program its job names, never by the job's label, so
+without this every project supervising the same capability appears under one
+indistinguishable name and nobody can tell which project a switch belongs to.
+
+**Changing the program means re-registering, not reloading.** macOS records the
+program when the agent file appears in `~/Library/LaunchAgents`, and keeps that
+record across `bootout` and `bootstrap`. An agent whose compiled program
+changed therefore keeps listing itself under the old one until the installed
+file is removed and put back. `deployment doctor` compares what launchd holds
+against what the compiler names and reports the difference; `deployment next`
+prints the sequence that clears it.
+
 **Secrets stay out of the artifact.** A container reads its environment from a
 `.env` the operator fills. A host agent gets no such file: every capability
 already resolves its own credentials through the cascade at run time, so a

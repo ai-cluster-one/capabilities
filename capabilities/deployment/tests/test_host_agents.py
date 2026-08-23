@@ -222,7 +222,7 @@ def test_doctor_reports_an_agent_that_was_never_installed(tmp_path: Path) -> Non
     report = json.loads(proc.stdout)
     assert report["host_agents"] == [
         {"label": "project.telegram", "installed": False, "loaded": False,
-         "pid": None, "last_exit_status": None}]
+         "pid": None, "last_exit_status": None, "program": None}]
     assert any("not installed" in finding["message"]
                for finding in report["findings"])
 
@@ -293,3 +293,24 @@ def test_a_command_missing_from_this_machine_is_refused(tmp_path: Path) -> None:
     report = json.loads(proc.stdout)
     assert any("not on PATH here" in finding["message"]
                for finding in report["findings"])
+
+
+def test_next_removes_the_installed_agent_before_relinking(tmp_path: Path) -> None:
+    """macOS records an agent's program when the file appears and keeps that
+    record across a reload, so a changed program only reaches the background
+    list once the installed file has gone away and come back."""
+    root, env = _host_project(tmp_path, ("telegram",))
+    _sync(root, env)
+    proc = _run(root, env, "next", "--json")
+    steps = " ".join(json.loads(proc.stdout)["provider_steps"])
+    assert "rm -f" in steps
+    assert steps.index("bootout") < steps.index("rm -f") < steps.index("ln -sf")
+    assert steps.index("ln -sf") < steps.index("bootstrap")
+
+
+def test_doctor_reports_the_program_launchd_holds(tmp_path: Path) -> None:
+    """Without it there is nothing to compare the compiled agent against."""
+    root, env = _host_project(tmp_path, ("telegram",))
+    _sync(root, env)
+    report = json.loads(_run(root, env, "doctor").stdout)
+    assert "program" in report["host_agents"][0]
