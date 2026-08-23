@@ -2595,6 +2595,7 @@ def _dev_live_inputs(session: dict) -> dict:
     """Resolve Telegram live policy, connection, state and process-only inputs."""
     project = _dev_project(session)
     assert project is not None
+    envelope = _project_capabilities_dir(project).resolve()
     project_caps, _global_caps = _policy_views(project)
     gate = project_caps.get("telegram")
     if not isinstance(gate, dict) or gate.get("enabled") is not True:
