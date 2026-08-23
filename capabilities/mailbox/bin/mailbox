@@ -107,7 +107,13 @@ Commands:
   mailbox send --to A [--to B ...] --subject S
         [--body TEXT | --body-file F | -]     Send a message. Body from
         [--cc A ...] [--attach FILE ...]      --body, a file, or stdin.
-        [--in-reply-to MESSAGE-ID]
+        [--html MARKUP|F|- | --html-file F]   --html/--html-file adds an HTML
+        [--in-reply-to MESSAGE-ID]            alternative beside that body, so
+                                              the message carries both and each
+                                              client shows the one it can. The
+                                              plain body is never derived from
+                                              the markup: a caller sending HTML
+                                              supplies the text it replaces.
                                               Saves the exact MIME message in
                                               the server's Sent folder. If SMTP
                                               succeeds but that copy fails, the
@@ -3391,7 +3397,8 @@ def _folder_has_message_id(mb: MailBox, folder: str, message_id: str) -> bool:
 
 
 def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
-             body: str, attach: list[str], in_reply_to: str | None) -> dict:
+             body: str, attach: list[str], in_reply_to: str | None,
+             html: str | None = None) -> dict:
     sent_at = datetime.now().astimezone()
     msg = EmailMessage()
     msg["From"] = cfg["user"]
@@ -3405,6 +3412,11 @@ def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
     msg["Date"] = format_datetime(sent_at)
     msg["Message-ID"] = make_msgid(domain=cfg["user"].rsplit("@", 1)[-1])
     msg.set_content(body)
+    if html is not None:
+        # multipart/alternative: the plain body stays the message for a reader
+        # or a client that will not render HTML, and it is never generated from
+        # the markup — a caller that sends HTML supplies the text it replaces.
+        msg.add_alternative(html, subtype="html")
     for f in attach:
         p = Path(f)
         if not p.exists():
@@ -3479,6 +3491,7 @@ def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
             pass
 
     result = {"sent": True, "to": to, "cc": cc, "subject": subject,
+              "html": html is not None,
               "message_id": str(msg["Message-ID"]),
               "attachments": [Path(f).name for f in attach],
               "sent_copy": copy_result}
@@ -3602,6 +3615,10 @@ def main() -> None:
     sp.add_argument("--subject", required=True)
     sp.add_argument("--body", default=None)
     sp.add_argument("--body-file", default=None, help="file path or '-' for stdin")
+    sp.add_argument("--html", default=None,
+                    help="HTML alternative: markup, a file path, or '-' for stdin")
+    sp.add_argument("--html-file", default=None,
+                    help="HTML alternative from a file path or '-' for stdin")
     sp.add_argument("--attach", action="append", default=[])
     sp.add_argument("--in-reply-to", default=None)
 
@@ -3645,7 +3662,15 @@ def main() -> None:
         _emit(cmd_seen(cfg, args.uid, args.folder, args.unsee))
     elif args.cmd == "send":
         body = args.body if args.body is not None else _read_body(args.body_file)
-        _emit(cmd_send(cfg, args.to, args.cc, args.subject, body, args.attach, args.in_reply_to))
+        if args.html is not None and args.html_file is not None:
+            _die(6, "ambiguous_html", "pass either --html or --html-file, not both")
+        html = None
+        if args.html is not None:
+            html = _read_body(args.html)
+        elif args.html_file is not None:
+            html = _read_body(args.html_file)
+        _emit(cmd_send(cfg, args.to, args.cc, args.subject, body, args.attach,
+                       args.in_reply_to, html))
 
 
 if __name__ == "__main__":

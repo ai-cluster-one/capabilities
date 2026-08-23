@@ -82,7 +82,7 @@
     },
     "mailbox": {
       "path": "capabilities/mailbox",
-      "payload_sha256": "0b8b191faff07d51d50520a45267a93d161411855c629e224259d74593685e5c",
+      "payload_sha256": "3cde4cba06e798101e3378ac8c0b073e34525ef910df71ba5055d45da5483b35",
       "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, and send."
     },
     "notion": {
