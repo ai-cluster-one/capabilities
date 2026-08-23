@@ -65,7 +65,7 @@ from pathlib import Path
 
 import telethon
 from telethon import TelegramClient, events
-from telethon.tl.functions.phone import GetGroupCallChainBlocksRequest
+from telethon.tl.functions.phone import GetGroupCallChainBlocksRequest, GetGroupCallRequest
 from telethon.tl.types import InputGroupCallInviteMessage, MessageActionConferenceCall, MessageActionInviteToGroupCall, MessageService, UpdateNewMessage
 
 import pytgcalls
@@ -84,9 +84,11 @@ from pytgcalls.types.raw import AudioParameters
 # Import shared call recording helpers (same directory)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from call_recording_helpers import (
+    display_duration,
     finalize_mp3_capture,
     iso_utc,
     send_recording_to_chat,
+    trailing_silence_start,
     write_metadata,
 )
 import voice_agent
@@ -128,6 +130,19 @@ CONFERENCE_CHAIN_SETTLE_STEP = 2.0
 CONFERENCE_CHAIN_SETTLE_MIN = 4.0
 CONFERENCE_CHAIN_SETTLE_BUDGET = 12.0
 CONFERENCE_EMPTY_ANSWERS = 2
+# What a process that died mid-call leaves behind, and what the next one makes
+# of it. The capture stops at the moment of death, so its own last-modified time
+# is when the call was still being recorded: a restart that lands inside the
+# rejoin window is the same call still going, and one that lands outside it is
+# history. launchd and the container both come back in seconds, so the window
+# only has to be wider than that, not wide enough to walk back into a call the
+# caller has since finished and forgotten.
+RECOVERY_REJOIN_WINDOW = 180.0
+# Trailing quiet longer than this is treated as the room after the call rather
+# than a pause in it, and is cut off the recovered audio. What is left has to
+# be worth a message; below that the recovery is recorded and nothing is sent.
+RECOVERY_TAIL_SILENCE = 10.0
+RECOVERY_MIN_AUDIO_SECONDS = 5.0
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
@@ -774,8 +789,21 @@ async def settle_conference_chain(invite_msg_id, block, waited, read_block):
             seen_at = time.monotonic()
 
 
+def _capture_bytes(record):
+    """Size of the MP3 a record says its capture was writing, 0 when there is none."""
+    source = _as_mapping(_as_mapping(record.get("audio")).get("source"))
+    path = source.get("path")
+    if not path:
+        return 0
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
+
+
 def reconcile_orphaned_recordings():
-    """Settle recordings a previous process left open.
+    """Settle recordings a previous process left open, and hold the ones that
+    still have audio for recovery.
 
     A call recording is closed by the process that opened it, so one that ends
     with the process — a restart, a crash, the stuck conference this was written
@@ -783,12 +811,21 @@ def reconcile_orphaned_recordings():
     such rows had accumulated by 2026-08-21, and each one makes `stop_reason`
     less trustworthy as evidence about how calls actually end.
 
-    The audio is left exactly where it is. Nothing is delivered: an abandoned
-    capture is mostly the silence that followed the call, and guessing otherwise
-    would put an hour of it into a chat.
+    Settling one is not throwing it away. Until 2026-08-23 nothing was ever
+    delivered from here, on the reasoning that an abandoned capture is mostly
+    the silence that followed the call — true of a conference that outlived its
+    call, and false of the one that day, where a segfault took the process and
+    the capture ends mid-sentence with no trailing silence at all. Twenty-six
+    minutes of conversation were on disk and marked skipped. So the capture is
+    kept for `recover_interrupted_recordings`, which cuts the silence by
+    measuring it rather than by assuming it, and `stop_reason` still says
+    `process_ended` however that ends.
+
+    Returns the records held for recovery, newest last.
     """
     folder = CONNECTION_STATE_DIR / "calls" / "recordings"
     settled = 0
+    held = []
     for path in sorted(folder.glob("*.json")):
         try:
             record = json.loads(path.read_text())
@@ -801,17 +838,238 @@ def reconcile_orphaned_recordings():
         record["status"] = "interrupted"
         record["stop_reason"] = "process_ended"
         record.setdefault("recording_ended_at", None)
+        recoverable = _capture_bytes(record) > 0
         delivery = record.get("delivery")
         if isinstance(delivery, dict) and delivery.get("status") == "pending":
-            delivery["status"] = "skipped"
-            delivery["error"] = "interrupted"
+            delivery["status"] = "pending_recovery" if recoverable else "skipped"
+            delivery["error"] = None if recoverable else "interrupted"
         try:
             path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
             settled += 1
         except OSError:
             continue
+        if recoverable and _as_mapping(record.get("delivery")).get(
+                "status") == "pending_recovery":
+            held.append(path)
     if settled:
-        log(f"calls: settled {settled} recording(s) left open by a previous process")
+        log(f"calls: settled {settled} recording(s) left open by a previous "
+            f"process; {len(held)} still hold audio")
+    return held
+
+
+async def conference_participants(client, invite_msg_id):
+    """How many people Telegram still lists in the conference behind an invite.
+
+    Asked through the invite message and not through the chat. A conference
+    grown out of a p2p call is keyed by the caller's user id, and a user peer
+    carries no group call to resolve from, so a process that never joined this
+    conference has no other handle on it — which is exactly the process asking.
+
+    Returns None when the question could not be put, which is not the same
+    answer as nobody, and a count of everyone including this account when it
+    could. A conference that has ended answers 0 rather than failing.
+    """
+    try:
+        result = await client(GetGroupCallRequest(
+            call=InputGroupCallInviteMessage(msg_id=int(invite_msg_id)),
+            limit=1))
+    except Exception as exc:
+        log(f"call: could not ask whether the conference behind invite "
+            f"{invite_msg_id} is still up ({type(exc).__name__}: {exc})")
+        return None
+    return int(getattr(getattr(result, "call", None),
+                       "participants_count", 0) or 0)
+
+
+async def recover_interrupted_recordings(client, held, rejoin=None):
+    """Deliver what a process that died mid-call had already recorded, and walk
+    back into the call if it is still going.
+
+    Two things are true of a capture whose process was killed and only one of
+    them is obvious. It is unfinished — nothing converted it, so the MP3 is all
+    there is. It is also usually complete enough to be worth having: the segfault
+    on 2026-08-23 landed twenty-six minutes into a conference and the audio runs
+    to the last second before it, with no trailing silence to cut. The capture
+    that motivated the old throw-everything-away rule is the other shape, a
+    conference that outlived its call and went on encoding an empty room, and
+    the two are told apart by measuring the silence at the end rather than by
+    assuming it is there.
+
+    The rejoin is attempted before the conversion, because it is the half with
+    a deadline; delivery of a recording that has already survived a crash can
+    wait the few seconds ffmpeg takes.
+    """
+    for path in held:
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        try:
+            await _recover_one_recording(client, path, record, rejoin)
+        except Exception as exc:
+            log(f"call: recovering {path.stem} failed — {_short_error(exc)}")
+
+
+def _interrupted_by(subject=True):
+    """How this recording lost its process, in the words the caller gets.
+
+    A crash and a restart both leave `process_ended` on the record, and the
+    difference is only knowable from the health file the previous process left
+    behind, so it is answered once at startup and quoted here. `subject` picks
+    between a sentence of its own and the tail of somebody else's."""
+    verb = "упал" if PREVIOUS_EXIT["unclean"] else "перезапустился"
+    return f"Я {verb} во время звонка" if subject else f"{verb} во время звонка"
+
+
+async def _recover_one_recording(client, path, record, rejoin):
+    """One interrupted recording: back into the call if it is still up, then
+    convert what was captured and send it."""
+    destination = record.get("caller_id") or record.get("chat_id")
+    capture = Path(_as_mapping(_as_mapping(record.get("audio"))
+                               .get("source")).get("path") or "")
+    output = Path(_as_mapping(record.get("audio")).get("path") or "")
+    if not capture.exists() or not output.name:
+        return
+    try:
+        stopped_ago = max(0.0, time.time() - capture.stat().st_mtime)
+    except OSError:
+        stopped_ago = None
+    log(f"call: recovering {record.get('mode')} recording {path.stem} — "
+        f"capture stopped "
+        f"{'unknown' if stopped_ago is None else f'{stopped_ago:.0f}s'} ago")
+
+    invite_msg_id = record.get("conference_invite_msg_id")
+    rejoined = False
+    if (rejoin is not None and record.get("mode") == "conference"
+            and invite_msg_id and destination
+            and stopped_ago is not None
+            and stopped_ago <= RECOVERY_REJOIN_WINDOW):
+        present = await conference_participants(client, invite_msg_id)
+        if present:
+            log(f"call: the conference behind invite {invite_msg_id} still "
+                f"lists {present} participant(s) — going back in")
+            rejoined = await rejoin(int(destination), int(invite_msg_id))
+            if rejoined:
+                with contextlib.suppress(Exception):
+                    await client.send_message(
+                        int(destination),
+                        f"{_interrupted_by()} и вернулся. "
+                        f"Запись до обрыва — следом.")
+        else:
+            log(f"call: the conference behind invite {invite_msg_id} lists "
+                f"{'nobody' if present == 0 else 'unknown'} — not going back in")
+    elif record.get("mode") == "conference" and stopped_ago is not None \
+            and stopped_ago > RECOVERY_REJOIN_WINDOW:
+        log(f"call: not going back into {path.stem} — its capture stopped "
+            f"{stopped_ago / 60:.0f}min ago, longer than the rejoin window")
+
+    trim_to = await trailing_silence_start(
+        capture, minimum=RECOVERY_TAIL_SILENCE)
+    if trim_to is not None:
+        log(f"call: {path.stem} ends in silence from {trim_to:.0f}s — "
+            f"cutting it off the recovered audio")
+    if trim_to is not None and trim_to < RECOVERY_MIN_AUDIO_SECONDS:
+        # Everything before the silence is shorter than a call. Converting it
+        # would ask ffmpeg for a clip of nothing and then have to explain the
+        # empty file it got back.
+        record.update({
+            "status": "recovered",
+            "recording_ended_at": record.get("recording_ended_at") or iso_utc(),
+            "duration_seconds": trim_to,
+            "recovered_at": iso_utc(),
+        })
+        record["audio"]["conversion"].update({
+            "status": "skipped", "error": "only_silence"})
+        record["delivery"].update({
+            "status": "skipped", "error": "audio_not_received"})
+        write_metadata(path, record)
+        log(f"call: {path.stem} holds {trim_to:.1f}s before it went quiet — "
+            f"not delivered")
+        return
+    finalized = await finalize_mp3_capture(
+        capture, output, keep_source=True, trim_to=trim_to)
+    duration = finalized.get("duration_seconds") or trim_to or 0.0
+    record.update({
+        "status": ("recovered" if finalized["status"] == "complete"
+                   else "conversion_failed"),
+        "recording_ended_at": record.get("recording_ended_at") or iso_utc(),
+        "duration_seconds": duration,
+        "recovered_at": iso_utc(),
+    })
+    record["audio"]["bytes"] = finalized["output_bytes"]
+    record["audio"]["settled"] = finalized["status"] == "complete"
+    record["audio"]["source"].update({
+        "bytes": finalized["source_bytes"],
+        "retained": finalized["source_retained"],
+    })
+    record["audio"]["conversion"].update({
+        "status": finalized["status"],
+        "error": finalized["error"],
+    })
+    if trim_to is not None:
+        record["audio"]["trimmed_tail_silence_from_seconds"] = round(trim_to, 3)
+
+    delivery = record["delivery"]
+    if finalized["status"] != "complete":
+        delivery.update({"status": "failed", "error": finalized["error"]})
+        write_metadata(path, record)
+        log(f"call: recovered audio for {path.stem} would not convert — "
+            f"{finalized['error']}")
+        return
+    if duration < RECOVERY_MIN_AUDIO_SECONDS:
+        delivery.update({"status": "skipped", "error": "audio_not_received"})
+        write_metadata(path, record)
+        log(f"call: recovered audio for {path.stem} is {duration:.1f}s — "
+            f"not delivered")
+        return
+    write_metadata(path, record)
+    if not delivery.get("enabled") or not destination:
+        return
+    await send_recording_to_chat(
+        client, int(destination), output, path, record,
+        emit_event_fn=lambda event, **fields: log(
+            f"call-delivery: {event} {fields}"),
+        caption=f"Запись звонка · {display_duration(duration)} · "
+                f"оборвана: {_interrupted_by(subject=False)}")
+    log(f"call: recovered recording delivered to {destination}")
+
+
+# What the process before this one did on its way out, as far as this one can
+# tell. Set once at startup and read by the recovery, which has to say whether a
+# recording was cut off by a crash or by a restart and cannot tell from the
+# recording alone — both leave `process_ended` behind.
+PREVIOUS_EXIT = {"unclean": False, "state": None, "pid": None}
+
+
+def report_unclean_exit():
+    """Say so when the process before this one did not stop on purpose.
+
+    A clean stop writes `stopped` into the health file on its way out, so a
+    file still claiming `healthy` or `starting` is a process that was killed —
+    a segfault in the media stack, an OOM, a pulled plug. Nothing recovers from
+    this; it exists because the alternative is what happened on 2026-08-23,
+    where a crash mid-conference was indistinguishable from a restart until
+    someone went looking in the system's crash reports.
+
+    Called before the first health write of this process, which overwrites what
+    it reads.
+    """
+    try:
+        previous = json.loads(HEALTH_FILE.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(previous, dict):
+        return
+    state = previous.get("state")
+    PREVIOUS_EXIT.update({"state": state, "pid": previous.get("pid")})
+    if state in (None, "stopped"):
+        return
+    PREVIOUS_EXIT["unclean"] = True
+    log(f"daemon: the previous process (pid {previous.get('pid')}) left its "
+        f"health at {state!r} with no stop — it was killed, not stopped; "
+        f"last sync {previous.get('updated_at')}")
 
 
 def write_health(state=None, **updates):
@@ -3784,7 +4042,7 @@ async def run_session(client):
     log(f"direct messages: mode={DIRECT_MESSAGE_MODE}; default_role={DIRECT_DEFAULT_ROLE}")
     log(f"allowed: {allowed_labels}")
     log(f"allowed groups: {allowed_group_labels}; group aliases: {list(DEFAULT_GROUP_ALIASES)}")
-    reconcile_orphaned_recordings()
+    interrupted_recordings = reconcile_orphaned_recordings()
     routes = _route_map()
     if routes:
         log("worker routes: " + "; ".join(
@@ -4879,6 +5137,10 @@ async def run_session(client):
     has_p2p_recording = bool(users["allowed_callers"])
     has_voice_agent = bool(voice_users)
     has_p2p_calls = has_p2p_recording or has_voice_agent
+    # Set by the call listener when it is the one that can walk back into a
+    # conference; left None on a box that only watches group calls, where the
+    # group watcher finds its own way back.
+    rejoin_conference = None
     has_group_recording = bool(groups["auto"] or groups["on_request"])
 
     if has_p2p_calls or has_group_recording:
@@ -5033,6 +5295,11 @@ async def run_session(client):
                 "connection": CONNECTION,
                 "caller_id": str(caller_id),
                 "mode": mode,
+                # The one handle that can reach this conference again. A
+                # conference grown out of a p2p call is keyed by the caller's
+                # user id, which resolves to nothing in a process that did not
+                # join it, so a restart has no way back in without this.
+                "conference_invite_msg_id": getattr(call_config, "conference", None),
                 "started_at": iso_utc(started_at),
                 "recording_started_at": None,
                 "recording_ended_at": None,
@@ -6717,6 +6984,40 @@ async def run_session(client):
             features.append(f"groups(auto={len(auto_groups)}, on_request={len(on_request_groups)})")
         log(f"call listener: started on daemon client; {', '.join(features)}")
 
+        async def rejoin_conference_after_crash(caller_id: int,
+                                                invite_msg_id: int) -> bool:
+            """Take the invite back into a conference this account was dropped
+            from, on the same path the invite itself takes.
+
+            The invite id is added to the seen set before the join and not
+            after: catch-up can hand the service message that carries it to the
+            live handler as news, and two joins on one invite is worse than
+            none."""
+            if voice_call_busy() or active_recording["task"] is not None:
+                log(f"call: not going back into the conference from {caller_id}"
+                    f" — the recorder is already busy")
+                return False
+            try:
+                call_config = CallConfig(conference=invite_msg_id)
+            except TypeError:
+                return False
+            seen_invite_ids.add(invite_msg_id)
+            await start_call_recording(caller_id, "conference", call_config)
+            task = active_recording["task"]
+            if task is not None:
+                with contextlib.suppress(Exception):
+                    await task
+            return active_recording["caller_id"] == caller_id
+
+        rejoin_conference = rejoin_conference_after_crash
+
+    if interrupted_recordings:
+        # Detached: a recovery converts minutes of audio and may sit through a
+        # conference join, and none of that is a reason for the daemon to be
+        # deaf to messages meanwhile.
+        asyncio.create_task(recover_interrupted_recordings(
+            client, interrupted_recordings, rejoin_conference))
+
     log("live — reacting in real time. Ctrl-C to stop.")
     sync_task = asyncio.create_task(periodic_sync())
     disconnected_task = asyncio.create_task(client.run_until_disconnected())
@@ -6866,6 +7167,7 @@ async def main():
         backoff = 2                                 # the connection-namespace dir may not exist yet (fresh volume)
         PID_FILE.write_text(f"{os.getpid()}\n")
         wrote_pid = True
+        report_unclean_exit()
         write_health("starting", last_error=None)
         if call_recorder_command() is not None:
             call_recorder_task = asyncio.create_task(supervise_call_recorder())

@@ -243,6 +243,9 @@ class TelegramClient:
     (functions_pkg / "phone.py").write_text(
         "class GetGroupCallChainBlocksRequest:\n"
         "    def __init__(self, *args, **kwargs): pass\n"
+        "\n\n"
+        "class GetGroupCallRequest:\n"
+        "    def __init__(self, *args, **kwargs): pass\n"
     )
     (fake_tl / "types.py").write_text("""
 class InputGroupCallInviteMessage:

@@ -92,6 +92,12 @@ class GetGroupCallChainBlocksRequest:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.__dict__.update(kwargs)
+
+
+class GetGroupCallRequest:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.__dict__.update(kwargs)
 """.lstrip()
     )
     errors = package / "errors"
@@ -4781,6 +4787,333 @@ class OrphanedRecordingTests(unittest.IsolatedAsyncioTestCase):
             daemon.reconcile_orphaned_recordings()
 
             self.assertEqual(json.loads(stuck.read_text())["status"], "interrupted")
+
+
+class InterruptedRecordingRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """A process killed mid-call leaves audio behind. What the next process does
+    with it is the difference between losing a call and delivering it late."""
+
+    def write(self, daemon, name, *, capture_bytes=None, capture_age=0.0,
+              **fields):
+        folder = daemon.CONNECTION_STATE_DIR / "calls" / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{name}.json"
+        output = folder / f"{name}.ogg"
+        capture = folder / f"{name}.mp3"
+        if capture_bytes is not None:
+            capture.write_bytes(b"x" * capture_bytes)
+            if capture_age:
+                stamp = time.time() - capture_age
+                os.utime(capture, (stamp, stamp))
+        record = {
+            "status": "recording",
+            "stop_reason": None,
+            "mode": "conference",
+            "caller_id": "4242",
+            "conference_invite_msg_id": 99,
+            "audio": {
+                "path": str(output),
+                "bytes": 0,
+                "settled": False,
+                "source": {"path": str(capture), "bytes": 0, "retained": False},
+                "conversion": {"status": "pending", "error": None},
+            },
+            "delivery": {"enabled": True, "status": "pending", "error": None},
+        }
+        record.update(fields)
+        path.write_text(json.dumps(record) + "\n")
+        return path
+
+    def stub_conversion(self, daemon, *, duration=90.0, silence_from=None):
+        async def trailing_silence_start(_capture, **_kwargs):
+            return silence_from
+
+        async def finalize_mp3_capture(_capture, output, **_kwargs):
+            output.write_bytes(b"ogg")
+            return {"status": "complete", "error": None, "output_bytes": 3,
+                    "source_bytes": 1024, "source_retained": True,
+                    "duration_seconds": duration}
+
+        daemon.trailing_silence_start = trailing_silence_start
+        daemon.finalize_mp3_capture = finalize_mp3_capture
+
+    def stub_delivery(self, daemon):
+        sent = []
+
+        async def send_recording_to_chat(_client, chat_id, output, _path,
+                                         metadata, **kwargs):
+            metadata["delivery"].update({"status": "sent", "message_id": 1})
+            sent.append((chat_id, output, kwargs.get("caption")))
+
+        daemon.send_recording_to_chat = send_recording_to_chat
+        return sent
+
+    def client(self, participants):
+        class Client:
+            def __init__(self):
+                self.messages = []
+
+            async def __call__(self, _request):
+                if participants is None:
+                    raise RuntimeError("no answer")
+                return SimpleNamespace(
+                    call=SimpleNamespace(participants_count=participants))
+
+            async def send_message(self, chat_id, text):
+                self.messages.append((chat_id, text))
+                return SimpleNamespace(id=1)
+
+        return Client()
+
+    async def test_a_capture_with_audio_is_held_for_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = self.write(daemon, "held", capture_bytes=2048)
+
+            held = daemon.reconcile_orphaned_recordings()
+
+            record = json.loads(path.read_text())
+            self.assertEqual(record["status"], "interrupted")
+            self.assertEqual(record["stop_reason"], "process_ended")
+            self.assertEqual(record["delivery"]["status"], "pending_recovery")
+            self.assertEqual(held, [path])
+
+    async def test_a_capture_with_no_audio_is_still_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = self.write(daemon, "empty", capture_bytes=0)
+
+            held = daemon.reconcile_orphaned_recordings()
+
+            record = json.loads(path.read_text())
+            self.assertEqual(record["delivery"]["status"], "skipped")
+            self.assertEqual(record["delivery"]["error"], "interrupted")
+            self.assertEqual(held, [])
+
+    async def test_a_recovered_recording_is_converted_and_delivered(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = self.write(daemon, "call", capture_bytes=4096)
+            held = daemon.reconcile_orphaned_recordings()
+            self.stub_conversion(daemon, duration=1595.8)
+            sent = self.stub_delivery(daemon)
+
+            await daemon.recover_interrupted_recordings(
+                self.client(0), held, rejoin=None)
+
+            record = json.loads(path.read_text())
+            self.assertEqual(record["status"], "recovered")
+            self.assertEqual(record["stop_reason"], "process_ended")
+            self.assertEqual(record["duration_seconds"], 1595.8)
+            self.assertTrue(record["audio"]["settled"])
+            self.assertEqual(len(sent), 1)
+            self.assertIn("26:36", sent[0][2])
+            self.assertIn("оборвана", sent[0][2])
+
+    async def test_trailing_silence_is_cut_off_what_is_sent(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = self.write(daemon, "quiet", capture_bytes=4096)
+            held = daemon.reconcile_orphaned_recordings()
+            self.stub_conversion(daemon, duration=120.0, silence_from=120.0)
+            self.stub_delivery(daemon)
+
+            await daemon.recover_interrupted_recordings(
+                self.client(0), held, rejoin=None)
+
+            record = json.loads(path.read_text())
+            self.assertEqual(
+                record["audio"]["trimmed_tail_silence_from_seconds"], 120.0)
+
+    async def test_a_capture_that_is_only_silence_is_never_converted(self):
+        """The shape the old throw-it-away rule was written for: a conference
+        that outlived its call and encoded an empty room."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = self.write(daemon, "silent", capture_bytes=4096)
+            held = daemon.reconcile_orphaned_recordings()
+            converted = []
+
+            async def trailing_silence_start(_capture, **_kwargs):
+                return 0.4
+
+            async def finalize_mp3_capture(*args, **kwargs):
+                converted.append(args)
+                raise AssertionError("nothing here is worth converting")
+
+            daemon.trailing_silence_start = trailing_silence_start
+            daemon.finalize_mp3_capture = finalize_mp3_capture
+            sent = self.stub_delivery(daemon)
+
+            await daemon.recover_interrupted_recordings(
+                self.client(0), held, rejoin=None)
+
+            record = json.loads(path.read_text())
+            self.assertEqual(record["audio"]["conversion"]["status"], "skipped")
+            self.assertEqual(record["audio"]["conversion"]["error"], "only_silence")
+            self.assertEqual(record["delivery"]["status"], "skipped")
+            self.assertEqual(record["delivery"]["error"], "audio_not_received")
+            self.assertEqual(converted, [])
+            self.assertEqual(sent, [])
+
+    async def test_a_recording_shorter_than_a_call_is_not_sent(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = self.write(daemon, "blip", capture_bytes=4096)
+            held = daemon.reconcile_orphaned_recordings()
+            self.stub_conversion(daemon, duration=1.2)
+            sent = self.stub_delivery(daemon)
+
+            await daemon.recover_interrupted_recordings(
+                self.client(0), held, rejoin=None)
+
+            record = json.loads(path.read_text())
+            self.assertEqual(record["delivery"]["status"], "skipped")
+            self.assertEqual(record["delivery"]["error"], "audio_not_received")
+            self.assertEqual(sent, [])
+
+    async def test_a_conference_that_still_has_people_is_rejoined(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write(daemon, "live", capture_bytes=4096, capture_age=12.0)
+            held = daemon.reconcile_orphaned_recordings()
+            self.stub_conversion(daemon)
+            self.stub_delivery(daemon)
+            rejoined = []
+
+            async def rejoin(caller_id, invite_msg_id):
+                rejoined.append((caller_id, invite_msg_id))
+                return True
+
+            client = self.client(2)
+            await daemon.recover_interrupted_recordings(client, held, rejoin)
+
+            self.assertEqual(rejoined, [(4242, 99)])
+            self.assertEqual(len(client.messages), 1)
+            self.assertIn("во время звонка и вернулся", client.messages[0][1])
+
+    async def test_a_crash_and_a_restart_are_not_described_the_same_way(self):
+        """Both leave `process_ended` on the record; only the health file the
+        previous process left behind says which one it was."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write(daemon, "call", capture_bytes=4096)
+            held = daemon.reconcile_orphaned_recordings()
+            self.stub_conversion(daemon, duration=90.0)
+            sent = self.stub_delivery(daemon)
+
+            daemon.PREVIOUS_EXIT["unclean"] = True
+            await daemon.recover_interrupted_recordings(
+                self.client(0), held, rejoin=None)
+            self.assertIn("упал во время звонка", sent[-1][2])
+
+            self.write(daemon, "call2", capture_bytes=4096)
+            held = daemon.reconcile_orphaned_recordings()
+            daemon.PREVIOUS_EXIT["unclean"] = False
+            await daemon.recover_interrupted_recordings(
+                self.client(0), held, rejoin=None)
+            self.assertIn("перезапустился во время звонка", sent[-1][2])
+
+    async def test_an_empty_conference_is_not_rejoined(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write(daemon, "over", capture_bytes=4096, capture_age=12.0)
+            held = daemon.reconcile_orphaned_recordings()
+            self.stub_conversion(daemon)
+            self.stub_delivery(daemon)
+            rejoined = []
+
+            async def rejoin(caller_id, invite_msg_id):
+                rejoined.append((caller_id, invite_msg_id))
+                return True
+
+            await daemon.recover_interrupted_recordings(
+                self.client(0), held, rejoin)
+
+            self.assertEqual(rejoined, [])
+
+    async def test_a_call_that_stopped_long_ago_is_not_rejoined(self):
+        """Coming back hours later would walk into a call that has since been
+        held, finished and forgotten."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write(daemon, "old", capture_bytes=4096,
+                       capture_age=daemon.RECOVERY_REJOIN_WINDOW + 60)
+            held = daemon.reconcile_orphaned_recordings()
+            self.stub_conversion(daemon)
+            self.stub_delivery(daemon)
+            rejoined = []
+
+            async def rejoin(caller_id, invite_msg_id):
+                rejoined.append((caller_id, invite_msg_id))
+                return True
+
+            client = self.client(5)
+            await daemon.recover_interrupted_recordings(client, held, rejoin)
+
+            self.assertEqual(rejoined, [])
+
+    async def test_one_broken_recovery_does_not_stop_the_others(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write(daemon, "a-broken", capture_bytes=4096)
+            self.write(daemon, "b-fine", capture_bytes=4096)
+            held = daemon.reconcile_orphaned_recordings()
+            self.stub_conversion(daemon)
+            sent = self.stub_delivery(daemon)
+            calls = itertools.count()
+            original = daemon.finalize_mp3_capture
+
+            async def finalize(capture, output, **kwargs):
+                if next(calls) == 0:
+                    raise RuntimeError("ffmpeg went missing")
+                return await original(capture, output, **kwargs)
+
+            daemon.finalize_mp3_capture = finalize
+
+            await daemon.recover_interrupted_recordings(
+                self.client(0), held, rejoin=None)
+
+            self.assertEqual(len(sent), 1)
+
+
+class UncleanExitTests(unittest.IsolatedAsyncioTestCase):
+    """A crash and a restart look the same from the outside unless the daemon
+    says which one it was."""
+
+    def write_health(self, daemon, **fields):
+        daemon.HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        daemon.HEALTH_FILE.write_text(json.dumps(fields) + "\n")
+
+    async def test_a_process_that_was_killed_is_named_as_killed(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write_health(daemon, state="healthy", pid=4242,
+                              updated_at="2026-08-23T18:17:57+00:00")
+
+            daemon.report_unclean_exit()
+
+            self.assertTrue(any("killed, not stopped" in line
+                                for line in daemon._test_logs))
+            self.assertTrue(daemon.PREVIOUS_EXIT["unclean"])
+
+    async def test_a_clean_stop_is_not_reported_as_a_crash(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write_health(daemon, state="stopped", pid=4242)
+
+            daemon.report_unclean_exit()
+
+            self.assertEqual(daemon._test_logs, [])
+            self.assertFalse(daemon.PREVIOUS_EXIT["unclean"])
+
+    async def test_a_first_run_has_nothing_to_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            daemon.report_unclean_exit()
+
+            self.assertEqual(daemon._test_logs, [])
 
 
 if __name__ == "__main__":

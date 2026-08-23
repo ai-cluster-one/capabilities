@@ -19,6 +19,12 @@ from pathlib import Path
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeFilename
 
+# What a recording's own status has to say before its audio may be sent. A
+# recovered one is finalized by the process that came after the crash rather
+# than by the one that opened it, and is delivered on the same terms; its
+# stop_reason goes on saying which of the two happened.
+DELIVERABLE_STATUSES = ("complete", "recovered")
+
 
 async def probe_audio_duration(path: Path) -> float | None:
     """Return the finalized media duration without making delivery depend on probing."""
@@ -44,12 +50,75 @@ async def probe_audio_duration(path: Path) -> float | None:
     return duration if duration > 0 else None
 
 
+async def trailing_silence_start(path: Path, floor: str = "-45dB",
+                                 minimum: float = 10.0,
+                                 tolerance: float = 1.0) -> float | None:
+    """Where the run of silence that reaches the end of `path` begins.
+
+    A capture closed by its own process ends where the call ended. One closed by
+    the process dying ends wherever the process died, which is either mid-word
+    or minutes into a room nobody left, and only the file can tell those apart.
+    Returns None when the audio does not end in silence at all, so a recovery
+    with nothing to trim trims nothing.
+
+    The last silence is matched against the file's own length rather than read
+    off an unclosed `silence_start`: ffmpeg closes the final stretch of silence
+    at EOF like any other, so an unclosed one never appears and every silence
+    would otherwise look like a pause in the middle.
+    """
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-i", str(path),
+            "-map", "0:a:0",
+            "-af", f"silencedetect=n={floor}:d={minimum:g}",
+            "-f", "null",
+            "-",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+    except OSError:
+        return None
+    if process.returncode != 0:
+        return None
+    started = ended = None
+    for line in stderr.decode(errors="replace").splitlines():
+        if "silence_start:" in line:
+            try:
+                started, ended = float(
+                    line.rsplit("silence_start:", 1)[1].strip()), None
+            except ValueError:
+                started = ended = None
+        elif "silence_end:" in line and started is not None:
+            try:
+                ended = float(line.rsplit("silence_end:", 1)[1]
+                              .split("|", 1)[0].strip())
+            except ValueError:
+                ended = None
+    if started is None:
+        return None
+    if ended is None:
+        return started
+    duration = await probe_audio_duration(path)
+    if duration is None:
+        return None
+    return started if duration - ended <= tolerance else None
+
+
 async def finalize_mp3_capture(capture: Path, output: Path,
-                               keep_source: bool = False) -> dict:
+                               keep_source: bool = False,
+                               trim_to: float | None = None) -> dict:
     """Convert a closed built-in MP3 capture to the final OGG/Opus artifact.
 
     keep_source leaves the MP3 where it was written, so what the capture
-    actually received can be told apart from what the conversion made of it."""
+    actually received can be told apart from what the conversion made of it.
+
+    trim_to cuts the output at that many seconds. Nothing on the live path asks
+    for it: it is how a recovered capture drops the silence it went on writing
+    after everyone had gone."""
     result = {
         "status": "failed",
         "error": None,
@@ -72,6 +141,7 @@ async def finalize_mp3_capture(capture: Path, output: Path,
             "-y",
             "-loglevel", "error",
             "-i", str(capture),
+            *(("-t", f"{trim_to:.3f}") if trim_to and trim_to > 0 else ()),
             "-map", "0:a:0",
             "-codec:a", "libopus",
             "-b:a", "96k",
@@ -230,7 +300,7 @@ async def send_recording_to_chat(
     the caller names none.
     """
     delivery = metadata["delivery"]
-    if metadata.get("status") != "complete":
+    if metadata.get("status") not in DELIVERABLE_STATUSES:
         delivery.update({"status": "skipped", "error": "recording_is_not_complete"})
         write_metadata(metadata_path, metadata)
         return

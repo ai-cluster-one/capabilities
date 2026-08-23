@@ -258,5 +258,159 @@ class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(duration, 638.299479)
 
 
+class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
+    """What a recovered capture ends with decides how much of it is worth
+    sending, and only the audio itself can say."""
+
+    @contextmanager
+    def ffmpeg_saying(self, helpers, stderr, returncode=0, duration=None):
+        class Process:
+            def __init__(self):
+                self.returncode = returncode
+
+            async def communicate(self):
+                return b"", stderr.encode()
+
+        seen = []
+
+        async def fake_exec(*args, **_kwargs):
+            seen.append(args)
+            return Process()
+
+        async def fake_duration(_path):
+            return duration
+
+        original_exec = helpers.asyncio.create_subprocess_exec
+        original_probe = helpers.probe_audio_duration
+        helpers.asyncio.create_subprocess_exec = fake_exec
+        helpers.probe_audio_duration = fake_duration
+        try:
+            yield seen
+        finally:
+            helpers.asyncio.create_subprocess_exec = original_exec
+            helpers.probe_audio_duration = original_probe
+
+    async def test_silence_that_reaches_the_end_reports_where_it_began(self):
+        """ffmpeg closes the last stretch of silence at EOF like any other, so
+        what marks it as trailing is that it ends where the file does."""
+        helpers = import_call_recording_helpers()
+        stderr = (
+            "[silencedetect @ 0x1] silence_start: 12.5\n"
+            "[silencedetect @ 0x1] silence_end: 40.1 | silence_duration: 27.6\n"
+            "[silencedetect @ 0x1] silence_start: 3011.75\n"
+            "[silencedetect @ 0x1] silence_end: 3600 | silence_duration: 588.25\n"
+        )
+        with self.ffmpeg_saying(helpers, stderr, duration=3600.0):
+            start = await helpers.trailing_silence_start(Path("capture.mp3"))
+        self.assertAlmostEqual(start, 3011.75)
+
+    async def test_silence_the_call_came_back_from_is_left_alone(self):
+        helpers = import_call_recording_helpers()
+        stderr = (
+            "[silencedetect @ 0x1] silence_start: 12.5\n"
+            "[silencedetect @ 0x1] silence_end: 40.1 | silence_duration: 27.6\n"
+        )
+        with self.ffmpeg_saying(helpers, stderr, duration=3600.0):
+            start = await helpers.trailing_silence_start(Path("capture.mp3"))
+        self.assertIsNone(start)
+
+    async def test_a_capture_cut_off_mid_speech_has_no_trailing_silence(self):
+        """The 2026-08-23 segfault ended a conference in mid-sentence: nothing
+        to trim, and trimming anything would take conversation off the end."""
+        helpers = import_call_recording_helpers()
+        with self.ffmpeg_saying(helpers, "", duration=1595.8):
+            start = await helpers.trailing_silence_start(Path("capture.mp3"))
+        self.assertIsNone(start)
+
+    async def test_ffmpeg_failing_is_not_read_as_a_silent_tail(self):
+        helpers = import_call_recording_helpers()
+        with self.ffmpeg_saying(helpers, "", returncode=1):
+            start = await helpers.trailing_silence_start(Path("capture.mp3"))
+        self.assertIsNone(start)
+
+    async def test_an_unmeasurable_length_is_not_read_as_a_silent_tail(self):
+        helpers = import_call_recording_helpers()
+        stderr = (
+            "[silencedetect @ 0x1] silence_start: 3011.75\n"
+            "[silencedetect @ 0x1] silence_end: 3600 | silence_duration: 588.25\n"
+        )
+        with self.ffmpeg_saying(helpers, stderr, duration=None):
+            start = await helpers.trailing_silence_start(Path("capture.mp3"))
+        self.assertIsNone(start)
+
+    async def test_a_trim_bounds_the_conversion(self):
+        helpers = import_call_recording_helpers()
+        with tempfile.TemporaryDirectory() as td:
+            capture = Path(td) / "capture.mp3"
+            capture.write_bytes(b"mp3")
+            with self.ffmpeg_saying(helpers, "") as seen:
+                await helpers.finalize_mp3_capture(
+                    capture, Path(td) / "out.ogg", trim_to=3011.75)
+            self.assertIn("-t", seen[0])
+            self.assertEqual(seen[0][seen[0].index("-t") + 1], "3011.750")
+
+    async def test_no_trim_leaves_the_conversion_unbounded(self):
+        helpers = import_call_recording_helpers()
+        with tempfile.TemporaryDirectory() as td:
+            capture = Path(td) / "capture.mp3"
+            capture.write_bytes(b"mp3")
+            with self.ffmpeg_saying(helpers, "") as seen:
+                await helpers.finalize_mp3_capture(
+                    capture, Path(td) / "out.ogg")
+            self.assertNotIn("-t", seen[0])
+
+
+class RecoveredDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_recovered_recording_is_deliverable(self):
+        """It was finalized by the process that came after the crash rather
+        than by the one that opened it, which changes who converted it and not
+        whether it is worth having."""
+        helpers = import_call_recording_helpers()
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "recording.ogg"
+            output.write_bytes(b"ogg")
+            metadata = {
+                "status": "recovered",
+                "duration_seconds": 1595.8,
+                "audio": {"settled": True},
+                "delivery": {"enabled": True},
+            }
+            client = FakeClient()
+            original = helpers.build_voice_waveform
+
+            async def fake_waveform(_path):
+                return b"waveform"
+
+            helpers.build_voice_waveform = fake_waveform
+            try:
+                await helpers.send_recording_to_chat(
+                    client, 4242, output, Path(td) / "recording.json", metadata,
+                    caption="Запись звонка · 26:36 · оборвана")
+            finally:
+                helpers.build_voice_waveform = original
+
+            self.assertEqual(metadata["delivery"]["status"], "sent")
+            self.assertEqual(client.message_calls,
+                             [(4242, "Запись звонка · 26:36 · оборвана")])
+
+    async def test_an_interrupted_recording_is_still_not_deliverable(self):
+        helpers = import_call_recording_helpers()
+        with tempfile.TemporaryDirectory() as td:
+            metadata = {
+                "status": "interrupted",
+                "audio": {"settled": False},
+                "delivery": {"enabled": True},
+            }
+            client = FakeClient()
+            await helpers.send_recording_to_chat(
+                client, 4242, Path(td) / "recording.ogg",
+                Path(td) / "recording.json", metadata)
+
+            self.assertEqual(metadata["delivery"]["status"], "skipped")
+            self.assertEqual(metadata["delivery"]["error"],
+                             "recording_is_not_complete")
+            self.assertEqual(client.file_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
