@@ -84,10 +84,29 @@ def test_every_enabled_service_becomes_one_agent(tmp_path: Path) -> None:
     assert telegram["Label"] == "project.telegram"
     # launchd resolves the program against its own PATH, so it is compiled in.
     assert Path(telegram["ProgramArguments"][0]).is_absolute()
-    assert Path(telegram["ProgramArguments"][0]).name == "telegram"
-    assert telegram["ProgramArguments"][1:] == ["service", "run"]
+    # The name macOS shows is this basename, so it carries the project.
+    assert Path(telegram["ProgramArguments"][0]).name == "project-telegram"
+    assert telegram["ProgramArguments"][1:] == []
     assert telegram["WorkingDirectory"] == str(root)
     assert telegram["RunAtLoad"] is True
+
+
+def test_each_service_gets_a_launcher_named_for_its_project(tmp_path: Path) -> None:
+    """Two projects supervising the same capability are told apart by a person
+    reading a list of background items, which is a list of program names."""
+    root, env = _host_project(tmp_path, ("telegram", "automations"))
+    assert _sync(root, env)["ok"]
+
+    launcher = root / "deployment" / "launchd" / "project-telegram"
+    assert launcher.is_file()
+    assert os.access(launcher, os.X_OK)
+    body = launcher.read_text()
+    assert body.startswith("#!")
+    assert "service run" in body
+    assert body.rstrip().endswith('"$@"')
+
+    plist = _agents(root)["project.telegram.plist"]
+    assert plist["ProgramArguments"] == [str(launcher)]
 
 
 def test_a_deliberate_stop_is_honoured_but_a_crash_is_not(tmp_path: Path) -> None:
