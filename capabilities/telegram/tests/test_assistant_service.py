@@ -4978,10 +4978,10 @@ class InterruptedRecordingRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.write(daemon, "live", capture_bytes=4096, capture_age=12.0)
             held = daemon.reconcile_orphaned_recordings()
             self.stub_conversion(daemon)
-            self.stub_delivery(daemon)
+            sent = self.stub_delivery(daemon)
             rejoined = []
 
-            async def rejoin(caller_id, invite_msg_id):
+            async def rejoin(caller_id, invite_msg_id, continues=None):
                 rejoined.append((caller_id, invite_msg_id))
                 return True
 
@@ -4991,6 +4991,7 @@ class InterruptedRecordingRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rejoined, [(4242, 99)])
             self.assertEqual(len(client.messages), 1)
             self.assertIn("во время звонка и вернулся", client.messages[0][1])
+            self.assertEqual(sent, [], "a rejoined part is not sent on its own")
 
     async def test_a_crash_and_a_restart_are_not_described_the_same_way(self):
         """Both leave `process_ended` on the record; only the health file the
@@ -5023,7 +5024,7 @@ class InterruptedRecordingRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.stub_delivery(daemon)
             rejoined = []
 
-            async def rejoin(caller_id, invite_msg_id):
+            async def rejoin(caller_id, invite_msg_id, continues=None):
                 rejoined.append((caller_id, invite_msg_id))
                 return True
 
@@ -5044,7 +5045,7 @@ class InterruptedRecordingRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.stub_delivery(daemon)
             rejoined = []
 
-            async def rejoin(caller_id, invite_msg_id):
+            async def rejoin(caller_id, invite_msg_id, continues=None):
                 rejoined.append((caller_id, invite_msg_id))
                 return True
 
@@ -5141,46 +5142,80 @@ class DeferredRecoveryTests(unittest.IsolatedAsyncioTestCase):
         daemon.send_recording_to_chat = send_recording_to_chat
         return events
 
-    async def test_nothing_is_converted_or_sent_while_the_rejoined_call_runs(self):
+    async def test_a_rejoined_part_is_handed_on_and_never_sent_on_its_own(self):
+        """It is half a conversation. The recording that carries on from it
+        renders both and sends one file when the call is actually over."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = self.write(daemon, "live")
+            held = daemon.reconcile_orphaned_recordings()
+            events = self.stubs(daemon)
+            handed = []
+
+            async def rejoin(_caller_id, _invite, continues=None):
+                handed.append(continues)
+                return True
+
+            await asyncio.wait_for(daemon.recover_interrupted_recordings(
+                self.client(), held, rejoin, lambda: True), timeout=5)
+
+            self.assertEqual(events, [])
+            self.assertEqual(handed, [path])
+            record = json.loads(path.read_text())
+            self.assertEqual(record["status"], "continued")
+            self.assertEqual(record["delivery"]["status"], "continued")
+
+    async def test_a_handed_on_part_is_not_swept_again(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = self.write(daemon, "live")
+            held = daemon.reconcile_orphaned_recordings()
+            self.stubs(daemon)
+
+            async def rejoin(_caller_id, _invite, continues=None):
+                return True
+
+            await asyncio.wait_for(daemon.recover_interrupted_recordings(
+                self.client(), held, rejoin, lambda: True), timeout=5)
+
+            self.assertEqual(daemon.reconcile_orphaned_recordings(), [])
+            self.assertTrue(path.exists())
+
+    async def test_a_recovery_beside_someone_elses_call_still_waits(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             daemon.RECOVERY_IDLE_POLL = 0.01
-            path = self.write(daemon, "live")
+            self.write(daemon, "other")
             held = daemon.reconcile_orphaned_recordings()
             events = self.stubs(daemon)
             busy = {"value": True}
 
-            async def rejoin(_caller_id, _invite):
-                return True
-
             task = asyncio.create_task(daemon.recover_interrupted_recordings(
-                self.client(), held, rejoin, lambda: busy["value"]))
+                self.client(participants=0), held, None,
+                lambda: busy["value"]))
             for _ in range(20):
                 await asyncio.sleep(0.01)
                 if events:
                     break
             self.assertEqual(events, [], "worked beside a live call")
-            self.assertEqual(
-                json.loads(path.read_text())["delivery"]["status"],
-                "pending_recovery")
 
             busy["value"] = False
             await asyncio.wait_for(task, timeout=5)
 
             self.assertEqual(events, ["measured", "converted", "sent"])
 
-    async def test_a_recovery_that_did_not_rejoin_does_not_wait(self):
+    async def test_a_recovery_with_nothing_running_does_not_wait(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             self.write(daemon, "over")
             held = daemon.reconcile_orphaned_recordings()
             events = self.stubs(daemon)
 
-            async def rejoin(_caller_id, _invite):
+            async def rejoin(_caller_id, _invite, continues=None):
                 raise AssertionError("an empty conference is not rejoined")
 
             await asyncio.wait_for(daemon.recover_interrupted_recordings(
-                self.client(participants=0), held, rejoin, lambda: True),
+                self.client(participants=0), held, rejoin, lambda: False),
                 timeout=5)
 
             self.assertEqual(events, ["measured", "converted", "sent"])
@@ -5259,6 +5294,118 @@ class UnfinishedDeliveryTests(unittest.IsolatedAsyncioTestCase):
                        {"status": "sent", "message_id": 11}, settled=True)
 
             self.assertEqual(daemon.reconcile_orphaned_recordings(), [])
+
+
+class StitchedRecordingTests(unittest.IsolatedAsyncioTestCase):
+    """A call split by a crash is one conversation, and is delivered as one."""
+
+    def part(self, daemon, name, *, started, stopped, continues=None):
+        folder = daemon.CONNECTION_STATE_DIR / "calls" / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{name}.json"
+        capture = folder / f"{name}.mp3"
+        capture.write_bytes(b"x" * 4096)
+        os.utime(capture, (stopped, stopped))
+        record = {
+            "status": "recording", "mode": "conference", "caller_id": "4242",
+            "recording_started_at": datetime.fromtimestamp(
+                started, tz=timezone.utc).isoformat(timespec="seconds"),
+            "continues": str(continues) if continues else None,
+            "audio": {
+                "path": str(folder / f"{name}.ogg"), "bytes": 0,
+                "settled": False,
+                "source": {"path": str(capture), "bytes": 0, "retained": True},
+                "conversion": {"status": "pending", "error": None},
+            },
+            "delivery": {"enabled": True, "status": "pending", "error": None},
+        }
+        path.write_text(json.dumps(record) + "\n")
+        return path, record
+
+    async def test_the_chain_is_gathered_oldest_first_with_the_gap_between(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            base = 1_700_000_000
+            first, _ = self.part(daemon, "one", started=base, stopped=base + 60)
+            second, record = self.part(daemon, "two", started=base + 74,
+                                       stopped=base + 130, continues=first)
+
+            parts = daemon.gather_recording_parts(record, second)
+
+            self.assertEqual([p["path"].stem for p in parts], ["one", "two"])
+            self.assertEqual(parts[0]["gap_before"], 0.0)
+            self.assertAlmostEqual(parts[1]["gap_before"], 14.0, places=1)
+
+    async def test_three_lives_of_one_call_all_land_in_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            base = 1_700_000_000
+            one, _ = self.part(daemon, "one", started=base, stopped=base + 30)
+            two, _ = self.part(daemon, "two", started=base + 40,
+                               stopped=base + 70, continues=one)
+            three, record = self.part(daemon, "three", started=base + 80,
+                                      stopped=base + 110, continues=two)
+
+            parts = daemon.gather_recording_parts(record, three)
+
+            self.assertEqual([p["path"].stem for p in parts],
+                             ["one", "two", "three"])
+
+    async def test_an_absurd_gap_is_not_written_back_as_silence(self):
+        """A machine that was off for a day is not a pause in the call."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            base = 1_700_000_000
+            first, _ = self.part(daemon, "one", started=base, stopped=base + 60)
+            second, record = self.part(daemon, "two", started=base + 90_000,
+                                       stopped=base + 90_060, continues=first)
+
+            parts = daemon.gather_recording_parts(record, second)
+
+            self.assertEqual(parts[1]["gap_before"], daemon.RECOVERY_MAX_GAP)
+
+    async def test_a_part_whose_capture_is_gone_is_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            base = 1_700_000_000
+            first, first_record = self.part(daemon, "one", started=base,
+                                            stopped=base + 60)
+            second, record = self.part(daemon, "two", started=base + 74,
+                                       stopped=base + 130, continues=first)
+            Path(first_record["audio"]["source"]["path"]).unlink()
+
+            parts = daemon.gather_recording_parts(record, second)
+
+            self.assertEqual([p["path"].stem for p in parts], ["two"])
+
+    async def test_a_chain_that_points_at_itself_still_terminates(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            base = 1_700_000_000
+            path, record = self.part(daemon, "loop", started=base,
+                                     stopped=base + 60)
+            record["continues"] = str(path)
+            path.write_text(json.dumps(record) + "\n")
+
+            parts = await asyncio.wait_for(
+                asyncio.to_thread(daemon.gather_recording_parts, record, path),
+                timeout=5)
+
+            self.assertEqual(len(parts), 1)
+
+    async def test_the_caption_names_the_crash_and_what_it_cost(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.PREVIOUS_EXIT["unclean"] = True
+
+            plain = daemon.stitched_caption({}, 95.0)
+            stitched = daemon.stitched_caption(
+                {"stitched_from_parts": 2, "gap_seconds": 14.0}, 140.0)
+
+            self.assertEqual(plain, "Запись звонка · 1:35")
+            self.assertIn("склеена из 2 частей", stitched)
+            self.assertIn("упал во время звонка", stitched)
+            self.assertIn("0:14", stitched)
 
 
 class UncleanExitTests(unittest.IsolatedAsyncioTestCase):

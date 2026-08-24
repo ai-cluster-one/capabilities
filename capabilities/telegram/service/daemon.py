@@ -84,6 +84,7 @@ from pytgcalls.types.raw import AudioParameters
 # Import shared call recording helpers (same directory)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from call_recording_helpers import (
+    concat_captures,
     display_duration,
     finalize_mp3_capture,
     iso_utc,
@@ -148,6 +149,10 @@ RECOVERY_MIN_AUDIO_SECONDS = 5.0
 # purpose: the cost of asking is a wakeup, and the cost of asking too eagerly
 # is the thing the deferral exists to avoid.
 RECOVERY_IDLE_POLL = 5.0
+# The largest hole a stitched recording will write back as silence. A restart
+# takes seconds; anything past this is a machine that was off, and reproducing
+# that as silence would bury the conversation in it.
+RECOVERY_MAX_GAP = 600.0
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
@@ -943,6 +948,115 @@ async def _guarded_recovery(client, path, record, rejoin, call_active):
         log(f"call: recovering {path.stem} failed — {_short_error(exc)}")
 
 
+def gather_recording_parts(record, path):
+    """Every capture belonging to this conversation, oldest first.
+
+    A crash splits one call into a chain of records, each naming the one before
+    it in `continues`. Walking that chain back gives the pieces in order, and
+    the wall-clock hole between two of them — from where one capture stopped
+    being written to when the next started — is what a stitched recording puts
+    back as silence.
+
+    Returns a single-element list when nothing was interrupted, so the caller
+    has one shape to handle either way.
+    """
+    chain = []
+    seen = set()
+    current, current_path = record, Path(path)
+    while len(chain) <= 32:            # a chain longer than this is not real
+        key = str(current_path.resolve() if current_path.is_absolute()
+                  else current_path)
+        if key in seen:
+            # A record naming itself, or a cycle. Visiting one twice would put
+            # its audio into the stitched recording twice.
+            break
+        seen.add(key)
+        chain.append((current, current_path))
+        earlier = current.get("continues")
+        if not earlier:
+            break
+        earlier_path = Path(earlier)
+        try:
+            current = json.loads(earlier_path.read_text())
+        except (OSError, ValueError):
+            log(f"call: {current_path.stem} names a part that cannot be read "
+                f"({earlier_path.name}) — stitching what is left")
+            break
+        if not isinstance(current, dict):
+            break
+        current_path = earlier_path
+    chain.reverse()
+
+    parts = []
+    previous_end = None
+    for member, member_path in chain:
+        capture = Path(_as_mapping(_as_mapping(member.get("audio"))
+                                   .get("source")).get("path") or "")
+        if not capture.exists() or not capture.stat().st_size:
+            continue
+        started = _parse_iso(member.get("recording_started_at"))
+        gap = 0.0
+        if previous_end is not None and started is not None:
+            gap = max(0.0, min(RECOVERY_MAX_GAP,
+                               (started - previous_end).total_seconds()))
+        parts.append({"path": capture, "gap_before": gap,
+                      "record": member, "record_path": member_path})
+        try:
+            previous_end = datetime.fromtimestamp(capture.stat().st_mtime,
+                                                  tz=timezone.utc)
+        except OSError:
+            previous_end = None
+    return parts
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+async def render_recording(parts, output):
+    """Produce the deliverable OGG from however many pieces the call left."""
+    if len(parts) > 1:
+        log(f"call: stitching {len(parts)} parts into {output.name} "
+            f"(gaps: {', '.join(f'{part['gap_before']:.0f}s' for part in parts[1:])})")
+        return await concat_captures(parts, output)
+    return await finalize_mp3_capture(parts[0]["path"], output,
+                                      keep_source=True)
+
+
+def mark_parts_merged(parts, into_path):
+    """Say on each earlier part that its audio now lives in the final one."""
+    for part in parts[:-1]:
+        member, member_path = part["record"], part["record_path"]
+        member["status"] = "merged"
+        member.setdefault("delivery", {}).update({
+            "status": "merged", "error": None})
+        member["merged_into"] = str(into_path)
+        with contextlib.suppress(OSError):
+            write_metadata(member_path, member)
+
+
+def stitched_caption(record, duration):
+    """The line a recording is announced with, naming a crash it survived.
+
+    An unbroken recording keeps the plain caption it always had; one assembled
+    from pieces says so, because a listener who meets an unexplained silence in
+    the middle deserves to know it was a restart and not the conversation."""
+    parts = int(record.get("stitched_from_parts") or 1)
+    line = f"Запись звонка · {display_duration(duration)}"
+    if parts > 1:
+        gap = float(record.get("gap_seconds") or 0)
+        line += (f" · склеена из {parts} частей: "
+                 f"{_interrupted_by(subject=False)}, "
+                 f"пропало {display_duration(gap)}")
+    return line
+
+
 def _interrupted_by(subject=True):
     """How this recording lost its process, in the words the caller gets.
 
@@ -988,7 +1102,8 @@ async def _recover_one_recording(client, path, record, rejoin, call_active):
         if present:
             log(f"call: the conference behind invite {invite_msg_id} still "
                 f"lists {present} participant(s) — going back in")
-            rejoined = await rejoin(int(destination), int(invite_msg_id))
+            rejoined = await rejoin(int(destination), int(invite_msg_id),
+                                    continues=path)
             if rejoined:
                 # One short message, not an upload. Both text sends survived
                 # the 2026-08-24 wedge while the file upload beside them did
@@ -1007,21 +1122,31 @@ async def _recover_one_recording(client, path, record, rejoin, call_active):
         log(f"call: not going back into {path.stem} — its capture stopped "
             f"{stopped_ago / 60:.0f}min ago, longer than the rejoin window")
 
-    if rejoined and call_active is not None:
-        # Everything below is an ffmpeg pass and a file upload, and doing it
-        # here — microseconds after a media session came up — is what wedged
-        # the daemon on 2026-08-24. Three threads sat in PyEval_AcquireThread
-        # while the upload held the interpreter, and the call recorded six
-        # minutes of digital silence before anyone noticed. The deadlock is in
-        # the binding, but walking into it is ours: the live path only ever
-        # delivers a recording once its call is over, and so does this now.
+    if rejoined:
+        # The call is running again and this capture is its first half, so it
+        # is handed to the recording that carries on from it: that one renders
+        # both and sends one file when the call actually ends. Nothing is
+        # converted or uploaded here — doing that microseconds after a media
+        # session came up is what wedged the daemon on 2026-08-24, with three
+        # threads in PyEval_AcquireThread behind an upload holding the
+        # interpreter.
+        # Deliberately not `pending_recovery`: the sweep must not pick this
+        # part up on its own, or a second crash would have both it and the
+        # recording that already contains it rendering the same audio.
+        record["status"] = "continued"
+        record["delivery"].update({"status": "continued", "error": None})
+        write_metadata(path, record)
+        log(f"call: {path.stem} is now the first part of the call it rejoined")
+        return
+
+    if call_active is not None and call_active():
+        # Not our call, but the same hazard: a conversion and an upload beside
+        # any live media session. It can wait.
         record["delivery"]["status"] = "pending_recovery"
         write_metadata(path, record)
-        log(f"call: {path.stem} is converted and sent once the call it "
-            f"rejoined is over")
+        log(f"call: {path.stem} waits for the call in progress to end")
         while call_active():
             await asyncio.sleep(RECOVERY_IDLE_POLL)
-        log(f"call: the call {path.stem} rejoined has ended — delivering it now")
 
     if converted:
         # Converted by a process that died before it finished sending. What is
@@ -1055,8 +1180,21 @@ async def _recover_one_recording(client, path, record, rejoin, call_active):
         log(f"call: {path.stem} holds {trim_to:.1f}s before it went quiet — "
             f"not delivered")
         return
-    finalized = await finalize_mp3_capture(
-        capture, output, keep_source=True, trim_to=trim_to)
+    parts = gather_recording_parts(record, path)
+    if not parts:
+        parts = [{"path": capture, "gap_before": 0.0,
+                  "record": record, "record_path": path}]
+    if len(parts) > 1 and trim_to is None:
+        finalized = await render_recording(parts, output)
+        record["stitched_from_parts"] = len(parts)
+        record["gap_seconds"] = round(
+            sum(part["gap_before"] for part in parts), 3)
+    else:
+        # A trim only ever applies to the piece that was measured, so a capture
+        # with silence to cut is finalized on its own.
+        finalized = await finalize_mp3_capture(
+            capture, output, keep_source=True, trim_to=trim_to)
+        parts = parts[-1:]
     duration = finalized.get("duration_seconds") or trim_to or 0.0
     record.update({
         "status": ("recovered" if finalized["status"] == "complete"
@@ -1091,6 +1229,8 @@ async def _recover_one_recording(client, path, record, rejoin, call_active):
         log(f"call: recovered audio for {path.stem} is {duration:.1f}s — "
             f"not delivered")
         return
+    if len(parts) > 1:
+        mark_parts_merged(parts, path)
     write_metadata(path, record)
     await _deliver_recovered(client, path, record, output, destination,
                              duration)
@@ -1111,8 +1251,10 @@ async def _deliver_recovered(client, path, record, output, destination,
         client, int(destination), output, path, record,
         emit_event_fn=lambda event, **fields: log(
             f"call-delivery: {event} {fields}"),
-        caption=f"Запись звонка · {display_duration(duration)} · "
-                f"оборвана: {_interrupted_by(subject=False)}")
+        caption=(stitched_caption(record, duration)
+                 if record.get("stitched_from_parts") else
+                 f"Запись звонка · {display_duration(duration)} · "
+                 f"оборвана: {_interrupted_by(subject=False)}"))
     log(f"call: recovered recording delivered to {destination}")
 
 
@@ -5367,7 +5509,8 @@ async def run_session(client):
                 await refresh_conference_audio_map(
                     chat_id, f"+{elapsed:g}s after join")
 
-        async def record_call(caller_id: int, mode: str, call_config: CallConfig):
+        async def record_call(caller_id: int, mode: str, call_config: CallConfig,
+                              continues=None):
             output = recording_output(caller_id, mode)
             capture = output.with_suffix(".mp3")
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -5384,6 +5527,11 @@ async def run_session(client):
                 # user id, which resolves to nothing in a process that did not
                 # join it, so a restart has no way back in without this.
                 "conference_invite_msg_id": getattr(call_config, "conference", None),
+                # The record this one carries on from, when a crash split one
+                # call across two processes. What the caller wants is the
+                # conversation, not the pieces it happened to be stored in, so
+                # the last piece is the one that stitches and sends them all.
+                "continues": str(continues) if continues else None,
                 "started_at": iso_utc(started_at),
                 "recording_started_at": None,
                 "recording_ended_at": None,
@@ -5480,7 +5628,8 @@ async def run_session(client):
                 })
                 return
 
-        async def start_call_recording(caller_id: int, mode: str, call_config: CallConfig):
+        async def start_call_recording(caller_id: int, mode: str,
+                                       call_config: CallConfig, continues=None):
             if voice_call_busy():
                 log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
                 return
@@ -5505,7 +5654,8 @@ async def run_session(client):
                 await finalize_call_recording("preempted")
             # A previous call's channels are not this call's silence.
             MEDIA_AUDIO_PEERS.clear()
-            task = asyncio.create_task(record_call(caller_id, mode, call_config))
+            task = asyncio.create_task(
+                record_call(caller_id, mode, call_config, continues))
             active_recording["task"] = task
 
         # --- Gemini Live voice agent (answers a direct call by talking) -------
@@ -6458,10 +6608,25 @@ async def run_session(client):
             recording_ended_at = iso_utc()
             wall_duration = (datetime.now(timezone.utc) - started_at).total_seconds()
 
-            finalized = await finalize_mp3_capture(
-                capture, output, keep_source=mode == "conference")
+            # One call may have been recorded by several processes, each
+            # picking up where a crash left the last. The final piece is the
+            # one that renders them all, so what gets delivered is the
+            # conversation rather than the pieces it was stored in.
+            parts = gather_recording_parts(metadata, metadata_path)
+            if not parts:
+                parts = [{"path": capture, "gap_before": 0.0,
+                          "record": metadata, "record_path": metadata_path}]
+            finalized = await render_recording(parts, output)
+            if mode != "conference" and len(parts) == 1:
+                with contextlib.suppress(OSError):
+                    capture.unlink()
+                finalized["source_retained"] = capture.exists()
             status = "complete" if finalized["status"] == "complete" else "conversion_failed"
             media_duration = finalized.get("duration_seconds") or wall_duration
+            if len(parts) > 1:
+                metadata["stitched_from_parts"] = len(parts)
+                metadata["gap_seconds"] = round(
+                    sum(part["gap_before"] for part in parts), 3)
 
             metadata.update({
                 "status": status,
@@ -6499,6 +6664,8 @@ async def run_session(client):
                 write_metadata(metadata_path, metadata)
                 log(f"call: recording empty (bytes={finalized['output_bytes']}, duration={media_duration:.1f}s) — not delivered")
             else:
+                if finalized["status"] == "complete" and len(parts) > 1:
+                    mark_parts_merged(parts, metadata_path)
                 write_metadata(metadata_path, metadata)
                 # Deliver to caller's direct chat
                 if metadata["delivery"]["enabled"] and finalized["status"] == "complete":
@@ -6509,6 +6676,7 @@ async def run_session(client):
                         metadata_path,
                         metadata,
                         emit_event_fn=lambda event, **fields: log(f"call-delivery: {event} {fields}"),
+                        caption=stitched_caption(metadata, media_duration),
                     )
                     log(f"call: recording delivered to {caller_id}")
                 elif finalized["status"] != "complete":
@@ -7069,7 +7237,8 @@ async def run_session(client):
         log(f"call listener: started on daemon client; {', '.join(features)}")
 
         async def rejoin_conference_after_crash(caller_id: int,
-                                                invite_msg_id: int) -> bool:
+                                                invite_msg_id: int,
+                                                continues=None) -> bool:
             """Take the invite back into a conference this account was dropped
             from, on the same path the invite itself takes.
 
@@ -7086,7 +7255,8 @@ async def run_session(client):
             except TypeError:
                 return False
             seen_invite_ids.add(invite_msg_id)
-            await start_call_recording(caller_id, "conference", call_config)
+            await start_call_recording(caller_id, "conference", call_config,
+                                       continues=continues)
             task = active_recording["task"]
             if task is not None:
                 with contextlib.suppress(Exception):

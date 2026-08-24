@@ -108,6 +108,92 @@ async def trailing_silence_start(path: Path, floor: str = "-45dB",
     return started if duration - ended <= tolerance else None
 
 
+async def concat_captures(parts: list[dict], output: Path) -> dict:
+    """Join the captures a crash split into one OGG/Opus artifact.
+
+    A call that survived a crash left its audio in as many files as it had
+    lives. They are one conversation, and the person who was on it wants one
+    recording, so they are concatenated in order — with the time the daemon was
+    down written in as real silence rather than closed up. Cutting the gap out
+    would slide every later timestamp forward and quietly lie about when things
+    were said; leaving it in costs a quiet stretch and keeps the recording and
+    the wall clock agreeing.
+
+    `parts` is ordered oldest first, each `{"path": Path, "gap_before": float}`.
+    Returns the shape `finalize_mp3_capture` returns, so callers can treat a
+    stitched recording and a single one the same way.
+    """
+    usable = [part for part in parts
+              if Path(part["path"]).exists() and Path(part["path"]).stat().st_size]
+    result = {
+        "status": "failed",
+        "error": None,
+        "source_path": ",".join(str(part["path"]) for part in usable),
+        "source_bytes": sum(Path(part["path"]).stat().st_size for part in usable),
+        "source_retained": True,
+        "output_bytes": 0,
+        "duration_seconds": None,
+        "parts": len(usable),
+    }
+    if not usable:
+        result["error"] = "no_capture_survived"
+        return result
+
+    # Every gap becomes an input of its own, so the concat filter sees one flat
+    # ordered list of streams and the silence lands exactly where the daemon
+    # was missing.
+    inputs: list[str] = []
+    count = 0
+    for part in usable:
+        gap = float(part.get("gap_before") or 0)
+        if gap > 0:
+            inputs += ["-f", "lavfi", "-t", f"{gap:.3f}",
+                       "-i", "anullsrc=r=48000:cl=stereo"]
+            count += 1
+        inputs += ["-i", str(part["path"])]
+        count += 1
+    labels = [f"[{index}:a]" for index in range(count)]
+
+    temporary = output.with_name(f".{output.stem}.{os.getpid()}.tmp.ogg")
+    with contextlib.suppress(OSError):
+        temporary.unlink()
+    filtergraph = f"{''.join(labels)}concat=n={count}:v=0:a=1[out]"
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-loglevel", "error",
+            *inputs,
+            "-filter_complex", filtergraph,
+            "-map", "[out]",
+            "-codec:a", "libopus", "-b:a", "96k", "-vbr", "on",
+            "-application", "voip", "-f", "ogg", str(temporary),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+    except OSError as exc:
+        result["error"] = f"ffmpeg_unavailable: {exc}"[:500]
+        return result
+    if process.returncode != 0:
+        result["error"] = (f"ffmpeg_exit_{process.returncode}: "
+                           f"{stderr.decode(errors='replace').strip()}")[:500]
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        return result
+    if not temporary.exists() or not temporary.stat().st_size:
+        result["error"] = "ogg_output_is_empty"
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        return result
+
+    os.replace(temporary, output)
+    result.update({
+        "status": "complete",
+        "output_bytes": output.stat().st_size,
+        "duration_seconds": await probe_audio_duration(output),
+    })
+    return result
+
+
 async def finalize_mp3_capture(capture: Path, output: Path,
                                keep_source: bool = False,
                                trim_to: float | None = None) -> dict:
