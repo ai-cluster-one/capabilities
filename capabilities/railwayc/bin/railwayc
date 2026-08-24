@@ -76,9 +76,12 @@ CONNECTIONS
   per-connection counterpart of RAILWAYC_EXPECT_PROJECT. "allow_write": false
   makes the connection read-only: every forwarded command that mutates the
   Railway project (up, down, redeploy, restart, add, deploy, domain,
-  environment, init, service, volume, scale, connect, ssh, shell, and
-  `variables --set`) exits 4, and no flag lifts the gate. Writes default to
-  allowed (a project the consumer owns).
+  environment, init, service, scale, connect, ssh, shell, `variables --set`,
+  and every `volume` subcommand except `volume list`) exits 4, and no flag
+  lifts the gate. Reading what protects the project is not a write: `volume
+  list` answers whether a volume exists and how full it is, which a read-only
+  connection is exactly the right credential to ask. Writes default to allowed
+  (a project the consumer owns).
 
   Selection: --connection <id> (accepted anywhere on the command line; consumed
   by railwayc, never forwarded). Unflagged, the registry's "default" pointer
@@ -165,9 +168,15 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {     # forwarded railway commands that mutate the Railway project
     "up", "down", "redeploy", "restart", "add", "deploy", "domain",
-    "environment", "init", "service", "volume", "scale", "connect",
+    "environment", "init", "service", "scale", "connect",
     "ssh", "shell",
-}   # `variables` is gated only with --set (read otherwise) — see deviations.md
+}   # `variables` and `volume` are gated by subcommand, not wholesale — see
+    # deviations.md and READ_SUBCOMMANDS below.
+
+# A verb that both reads and writes is gated on what it was asked to do. The
+# listed subcommand reads; anything else under that verb is a write, so a
+# subcommand this tool has not seen is refused rather than waved through.
+READ_SUBCOMMANDS = {"volume": {"list"}}
 WRITE_DEFAULT = True    # writes stay inside a project the consumer owns
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
@@ -2936,6 +2945,15 @@ def main() -> None:
     allow_write = WRITE_DEFAULT if entry is None else \
         bool(entry.get("allow_write", WRITE_DEFAULT))
     _write_gate(cid, allow_write, verb)
+    if verb in READ_SUBCOMMANDS and not allow_write:
+        sub = next((a for a in cleaned[1:] if not a.startswith("-")), None)
+        if sub not in READ_SUBCOMMANDS[verb]:
+            _die(4, "read_only",
+                 f"connection {cid!r} does not allow writes; `{verb} "
+                 f"{sub or ''}`".rstrip() + " mutates the project",
+                 f"`{verb} " + "`, `".join(sorted(READ_SUBCOMMANDS[verb]))
+                 + "` reads, or ask the user; granting is `allow_write: true` "
+                   "on this connection in connections.json.")
     if verb == "variables" and "--set" in cleaned and not allow_write:
         _die(4, "read_only",
              f"connection {cid!r} does not allow writes; `variables --set` "

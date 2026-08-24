@@ -92,7 +92,7 @@
     },
     "railwayc": {
       "path": "capabilities/railwayc",
-      "payload_sha256": "8c6d4d088fad80d4e51b011c6724ae0fee219fba1447141881564a802038e9d9",
+      "payload_sha256": "bc6541425e62144b4096f756a9ce429033a69e6e08660d6b2e4fad1d295c8fb9",
       "summary": "Credential harness around the official `railway` CLI — resolves a project-scoped Railway token, injects it, and forwards your command straight to `railway` (everything but railwayc's own verbs passes through untouched); the command surface is `railway help`."
     },
     "resend": {
