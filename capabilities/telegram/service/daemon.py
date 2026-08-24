@@ -143,6 +143,11 @@ RECOVERY_REJOIN_WINDOW = 180.0
 # be worth a message; below that the recovery is recorded and nothing is sent.
 RECOVERY_TAIL_SILENCE = 10.0
 RECOVERY_MIN_AUDIO_SECONDS = 5.0
+# How often a deferred recovery asks whether the call it walked back into has
+# ended. Nothing waits on this but the recovery itself, so it is slow on
+# purpose: the cost of asking is a wakeup, and the cost of asking too eagerly
+# is the thing the deferral exists to avoid.
+RECOVERY_IDLE_POLL = 5.0
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
@@ -834,6 +839,18 @@ def reconcile_orphaned_recordings():
         if not isinstance(record, dict):
             continue
         if record.get("status") not in ("joining", "recording"):
+            # A delivery is not finished when the process running it dies. The
+            # record it left says `sending` or is still waiting on a deferred
+            # recovery, and nothing else in the daemon ever looks at those
+            # again, so a recording that was converted and never sent stayed
+            # converted and never sent. Both are carried into this run's
+            # recovery, which re-sends rather than re-converts when the audio
+            # is already settled.
+            if (_as_mapping(record.get("delivery")).get("status")
+                    in ("sending", "pending_recovery")
+                    and (_capture_bytes(record)
+                         or _as_mapping(record.get("audio")).get("settled"))):
+                held.append(path)
             continue
         record["status"] = "interrupted"
         record["stop_reason"] = "process_ended"
@@ -881,7 +898,8 @@ async def conference_participants(client, invite_msg_id):
                        "participants_count", 0) or 0)
 
 
-async def recover_interrupted_recordings(client, held, rejoin=None):
+async def recover_interrupted_recordings(client, held, rejoin=None,
+                                         call_active=None):
     """Deliver what a process that died mid-call had already recorded, and walk
     back into the call if it is still going.
 
@@ -896,9 +914,12 @@ async def recover_interrupted_recordings(client, held, rejoin=None):
     assuming it is there.
 
     The rejoin is attempted before the conversion, because it is the half with
-    a deadline; delivery of a recording that has already survived a crash can
-    wait the few seconds ffmpeg takes.
+    a deadline; a recording that has already survived a crash can wait. When
+    the rejoin succeeds it waits a good deal longer — until that call is over —
+    because converting and uploading beside a live media session is what wedged
+    the daemon on 2026-08-24.
     """
+    pending = []
     for path in held:
         try:
             record = json.loads(path.read_text())
@@ -906,10 +927,20 @@ async def recover_interrupted_recordings(client, held, rejoin=None):
             continue
         if not isinstance(record, dict):
             continue
-        try:
-            await _recover_one_recording(client, path, record, rejoin)
-        except Exception as exc:
-            log(f"call: recovering {path.stem} failed — {_short_error(exc)}")
+        pending.append(_guarded_recovery(client, path, record, rejoin,
+                                         call_active))
+    if pending:
+        # Concurrently, because one of these may sit out a rejoined call that
+        # runs for an hour and the others are not waiting on that.
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _guarded_recovery(client, path, record, rejoin, call_active):
+    """One recovery, whose failure is its own and not the sweep's."""
+    try:
+        await _recover_one_recording(client, path, record, rejoin, call_active)
+    except Exception as exc:
+        log(f"call: recovering {path.stem} failed — {_short_error(exc)}")
 
 
 def _interrupted_by(subject=True):
@@ -923,14 +954,21 @@ def _interrupted_by(subject=True):
     return f"Я {verb} во время звонка" if subject else f"{verb} во время звонка"
 
 
-async def _recover_one_recording(client, path, record, rejoin):
+async def _recover_one_recording(client, path, record, rejoin, call_active):
     """One interrupted recording: back into the call if it is still up, then
     convert what was captured and send it."""
     destination = record.get("caller_id") or record.get("chat_id")
     capture = Path(_as_mapping(_as_mapping(record.get("audio"))
                                .get("source")).get("path") or "")
     output = Path(_as_mapping(record.get("audio")).get("path") or "")
-    if not capture.exists() or not output.name:
+    if not output.name:
+        return
+    # Converted audio is enough on its own. The capture is what a conversion
+    # reads, and a record whose delivery is all that went unfinished may have
+    # had its MP3 cleaned up long ago.
+    converted = bool(record["audio"].get("settled") and output.exists()
+                     and output.stat().st_size)
+    if not converted and not capture.exists():
         return
     try:
         stopped_ago = max(0.0, time.time() - capture.stat().st_mtime)
@@ -952,6 +990,10 @@ async def _recover_one_recording(client, path, record, rejoin):
                 f"lists {present} participant(s) — going back in")
             rejoined = await rejoin(int(destination), int(invite_msg_id))
             if rejoined:
+                # One short message, not an upload. Both text sends survived
+                # the 2026-08-24 wedge while the file upload beside them did
+                # not, and saying nothing until the call ends would leave the
+                # caller wondering what just happened for its whole length.
                 with contextlib.suppress(Exception):
                     await client.send_message(
                         int(destination),
@@ -964,6 +1006,31 @@ async def _recover_one_recording(client, path, record, rejoin):
             and stopped_ago > RECOVERY_REJOIN_WINDOW:
         log(f"call: not going back into {path.stem} — its capture stopped "
             f"{stopped_ago / 60:.0f}min ago, longer than the rejoin window")
+
+    if rejoined and call_active is not None:
+        # Everything below is an ffmpeg pass and a file upload, and doing it
+        # here — microseconds after a media session came up — is what wedged
+        # the daemon on 2026-08-24. Three threads sat in PyEval_AcquireThread
+        # while the upload held the interpreter, and the call recorded six
+        # minutes of digital silence before anyone noticed. The deadlock is in
+        # the binding, but walking into it is ours: the live path only ever
+        # delivers a recording once its call is over, and so does this now.
+        record["delivery"]["status"] = "pending_recovery"
+        write_metadata(path, record)
+        log(f"call: {path.stem} is converted and sent once the call it "
+            f"rejoined is over")
+        while call_active():
+            await asyncio.sleep(RECOVERY_IDLE_POLL)
+        log(f"call: the call {path.stem} rejoined has ended — delivering it now")
+
+    if converted:
+        # Converted by a process that died before it finished sending. What is
+        # unfinished is the delivery, so that is what is retried; converting
+        # again would only rewrite the same bytes.
+        log(f"call: {path.stem} was already converted — retrying its delivery")
+        await _deliver_recovered(client, path, record, output, destination,
+                                 record.get("duration_seconds") or 0.0)
+        return
 
     trim_to = await trailing_silence_start(
         capture, minimum=RECOVERY_TAIL_SILENCE)
@@ -1025,6 +1092,19 @@ async def _recover_one_recording(client, path, record, rejoin):
             f"not delivered")
         return
     write_metadata(path, record)
+    await _deliver_recovered(client, path, record, output, destination,
+                             duration)
+
+
+async def _deliver_recovered(client, path, record, output, destination,
+                             duration):
+    """Send a recovered recording, saying in its caption what cut it short.
+
+    Reached twice: once by a recovery that just converted the audio, and once
+    by one that found it already converted and only the sending unfinished.
+    Both want the same message, and `send_recording_to_chat` is what decides
+    whether a record is in a state that may be sent at all."""
+    delivery = record["delivery"]
     if not delivery.get("enabled") or not destination:
         return
     await send_recording_to_chat(
@@ -5141,6 +5221,10 @@ async def run_session(client):
     # conference; left None on a box that only watches group calls, where the
     # group watcher finds its own way back.
     rejoin_conference = None
+    # Answers "is a call running right now" for the deferred recovery. Left
+    # None where no call listener exists, which is also where nothing can be
+    # rejoined and so nothing is ever deferred.
+    call_in_progress = None
     has_group_recording = bool(groups["auto"] or groups["on_request"])
 
     if has_p2p_calls or has_group_recording:
@@ -7011,12 +7095,20 @@ async def run_session(client):
 
         rejoin_conference = rejoin_conference_after_crash
 
+        def call_in_progress_now():
+            return (active_recording["caller_id"] is not None
+                    or active_recording["task"] is not None
+                    or voice_call_busy())
+
+        call_in_progress = call_in_progress_now
+
     if interrupted_recordings:
         # Detached: a recovery converts minutes of audio and may sit through a
         # conference join, and none of that is a reason for the daemon to be
         # deaf to messages meanwhile.
         asyncio.create_task(recover_interrupted_recordings(
-            client, interrupted_recordings, rejoin_conference))
+            client, interrupted_recordings, rejoin_conference,
+            call_in_progress))
 
     log("live — reacting in real time. Ctrl-C to stop.")
     sync_task = asyncio.create_task(periodic_sync())

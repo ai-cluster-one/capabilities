@@ -5077,6 +5077,190 @@ class InterruptedRecordingRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(sent), 1)
 
 
+class DeferredRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """Converting and uploading beside a live media session wedged the daemon
+    on 2026-08-24, so a recovery that walks back into a call waits for it."""
+
+    def write(self, daemon, name, **fields):
+        folder = daemon.CONNECTION_STATE_DIR / "calls" / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{name}.json"
+        output = folder / f"{name}.ogg"
+        capture = folder / f"{name}.mp3"
+        capture.write_bytes(b"x" * 4096)
+        record = {
+            "status": "recording", "stop_reason": None, "mode": "conference",
+            "caller_id": "4242", "conference_invite_msg_id": 99,
+            "audio": {
+                "path": str(output), "bytes": 0, "settled": False,
+                "source": {"path": str(capture), "bytes": 0, "retained": False},
+                "conversion": {"status": "pending", "error": None},
+            },
+            "delivery": {"enabled": True, "status": "pending", "error": None},
+        }
+        record.update(fields)
+        path.write_text(json.dumps(record) + "\n")
+        return path
+
+    def client(self, participants=3):
+        class Client:
+            def __init__(self):
+                self.messages = []
+
+            async def __call__(self, _request):
+                return SimpleNamespace(
+                    call=SimpleNamespace(participants_count=participants))
+
+            async def send_message(self, chat_id, text):
+                self.messages.append((chat_id, text))
+                return SimpleNamespace(id=1)
+
+        return Client()
+
+    def stubs(self, daemon):
+        events = []
+
+        async def trailing_silence_start(_capture, **_kwargs):
+            events.append("measured")
+            return None
+
+        async def finalize_mp3_capture(_capture, output, **_kwargs):
+            events.append("converted")
+            output.write_bytes(b"ogg")
+            return {"status": "complete", "error": None, "output_bytes": 3,
+                    "source_bytes": 4096, "source_retained": True,
+                    "duration_seconds": 90.0}
+
+        async def send_recording_to_chat(_client, _chat, _out, _path, metadata,
+                                         **_kwargs):
+            events.append("sent")
+            metadata["delivery"].update({"status": "sent", "message_id": 5})
+
+        daemon.trailing_silence_start = trailing_silence_start
+        daemon.finalize_mp3_capture = finalize_mp3_capture
+        daemon.send_recording_to_chat = send_recording_to_chat
+        return events
+
+    async def test_nothing_is_converted_or_sent_while_the_rejoined_call_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.RECOVERY_IDLE_POLL = 0.01
+            path = self.write(daemon, "live")
+            held = daemon.reconcile_orphaned_recordings()
+            events = self.stubs(daemon)
+            busy = {"value": True}
+
+            async def rejoin(_caller_id, _invite):
+                return True
+
+            task = asyncio.create_task(daemon.recover_interrupted_recordings(
+                self.client(), held, rejoin, lambda: busy["value"]))
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                if events:
+                    break
+            self.assertEqual(events, [], "worked beside a live call")
+            self.assertEqual(
+                json.loads(path.read_text())["delivery"]["status"],
+                "pending_recovery")
+
+            busy["value"] = False
+            await asyncio.wait_for(task, timeout=5)
+
+            self.assertEqual(events, ["measured", "converted", "sent"])
+
+    async def test_a_recovery_that_did_not_rejoin_does_not_wait(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write(daemon, "over")
+            held = daemon.reconcile_orphaned_recordings()
+            events = self.stubs(daemon)
+
+            async def rejoin(_caller_id, _invite):
+                raise AssertionError("an empty conference is not rejoined")
+
+            await asyncio.wait_for(daemon.recover_interrupted_recordings(
+                self.client(participants=0), held, rejoin, lambda: True),
+                timeout=5)
+
+            self.assertEqual(events, ["measured", "converted", "sent"])
+
+
+class UnfinishedDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    """A delivery is not finished when the process running it dies, and until
+    2026-08-24 nothing ever looked at one again."""
+
+    def write(self, daemon, name, delivery, **audio):
+        folder = daemon.CONNECTION_STATE_DIR / "calls" / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{name}.json"
+        output = folder / f"{name}.ogg"
+        capture = folder / f"{name}.mp3"
+        record = {
+            "status": "recovered", "stop_reason": "process_ended",
+            "mode": "conference", "caller_id": "4242",
+            "duration_seconds": 54.0,
+            "audio": {
+                "path": str(output), "bytes": 0, "settled": False,
+                "source": {"path": str(capture), "bytes": 0, "retained": False},
+                "conversion": {"status": "complete", "error": None},
+            },
+            "delivery": dict({"enabled": True}, **delivery),
+        }
+        record["audio"].update(audio)
+        if record["audio"]["settled"]:
+            output.write_bytes(b"ogg")
+        else:
+            capture.write_bytes(b"x" * 4096)
+        path.write_text(json.dumps(record) + "\n")
+        return path
+
+    async def test_a_delivery_stuck_at_sending_is_carried_into_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = self.write(daemon, "stuck",
+                              {"status": "sending", "message_id": None},
+                              settled=True)
+
+            held = daemon.reconcile_orphaned_recordings()
+
+            self.assertEqual(held, [path])
+
+    async def test_an_already_converted_recording_is_resent_not_reconverted(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write(daemon, "stuck",
+                       {"status": "sending", "message_id": None}, settled=True)
+            held = daemon.reconcile_orphaned_recordings()
+            sent = []
+
+            async def finalize_mp3_capture(*_args, **_kwargs):
+                raise AssertionError("the audio was already converted")
+
+            async def send_recording_to_chat(_client, chat_id, _out, _path,
+                                             metadata, **kwargs):
+                sent.append((chat_id, kwargs.get("caption")))
+                metadata["delivery"].update({"status": "sent", "message_id": 9})
+
+            daemon.finalize_mp3_capture = finalize_mp3_capture
+            daemon.send_recording_to_chat = send_recording_to_chat
+
+            await daemon.recover_interrupted_recordings(
+                None, held, rejoin=None, call_active=None)
+
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0][0], 4242)
+            self.assertIn("0:54", sent[0][1])
+
+    async def test_a_finished_delivery_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.write(daemon, "done",
+                       {"status": "sent", "message_id": 11}, settled=True)
+
+            self.assertEqual(daemon.reconcile_orphaned_recordings(), [])
+
+
 class UncleanExitTests(unittest.IsolatedAsyncioTestCase):
     """A crash and a restart look the same from the outside unless the daemon
     says which one it was."""
