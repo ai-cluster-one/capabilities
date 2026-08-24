@@ -79,7 +79,9 @@ def test_every_enabled_service_becomes_one_agent(tmp_path: Path) -> None:
     assert result["ok"], result["findings"]
 
     agents = _agents(root)
-    assert sorted(agents) == ["project.automations.plist", "project.telegram.plist"]
+    assert sorted(agents) == ["project.automations.plist",
+                              "project.telegram.plist",
+                              "project.watchdog.plist"]
     telegram = agents["project.telegram.plist"]
     assert telegram["Label"] == "project.telegram"
     # launchd resolves the program against its own PATH, so it is compiled in.
@@ -203,16 +205,20 @@ def test_next_hands_over_launchctl_and_keeps_manual_control(tmp_path: Path) -> N
     proc = _run(root, env, "next", "--json")
     assert proc.returncode == 0, proc.stderr
     payload = json.loads(proc.stdout)
-    assert payload["host_agents"] == ["project.telegram"]
+    # The watchdog is handed over with the rest: an agent nobody loaded is an
+    # agent that never restarts anything.
+    assert payload["host_agents"] == ["project.telegram", "project.watchdog"]
     assert any("launchctl bootstrap" in step for step in payload["provider_steps"])
     assert any("service stop" in step for step in payload["provider_steps"])
     control = payload["manual_control"]
-    assert control["restart"] == ["launchctl kickstart -k gui/$UID/project.telegram"]
+    assert control["restart"] == [
+        "launchctl kickstart -k gui/$UID/project.telegram",
+        "launchctl kickstart -k gui/$UID/project.watchdog"]
     # launchctl is the switch for a job launchd owns; `service stop` only
     # reaches a daemon the capability started itself.
-    assert control["stop"] == ["launchctl kill TERM gui/$UID/project.telegram"]
-    assert control["start"] == ["launchctl kickstart gui/$UID/project.telegram"]
-    assert control["remove"] == ["launchctl bootout gui/$UID/project.telegram"]
+    assert control["stop"][0] == "launchctl kill TERM gui/$UID/project.telegram"
+    assert control["start"][0] == "launchctl kickstart gui/$UID/project.telegram"
+    assert control["remove"][0] == "launchctl bootout gui/$UID/project.telegram"
 
 
 def test_doctor_reports_an_agent_that_was_never_installed(tmp_path: Path) -> None:
@@ -314,3 +320,78 @@ def test_doctor_reports_the_program_launchd_holds(tmp_path: Path) -> None:
     _sync(root, env)
     report = json.loads(_run(root, env, "doctor").stdout)
     assert "program" in report["host_agents"][0]
+
+
+def test_the_watchdog_is_scheduled_rather_than_supervised(tmp_path: Path) -> None:
+    """It looks and exits. Keeping it alive would be a busy loop, and running
+    it at load would judge services that are still coming up."""
+    root, env = _host_project(tmp_path, ("telegram",))
+    assert _sync(root, env)["ok"]
+
+    plist = _agents(root)["project.watchdog.plist"]
+    assert plist["Label"] == "project.watchdog"
+    assert plist["StartInterval"] == 60
+    assert "KeepAlive" not in plist
+    assert plist["RunAtLoad"] is False
+    assert plist["WorkingDirectory"] == str(root)
+
+    launcher = root / "deployment" / "launchd" / "project-watchdog"
+    assert plist["ProgramArguments"] == [str(launcher)]
+    assert "watchdog" in launcher.read_text()
+
+
+def test_the_watchdog_can_reach_the_doctors_it_has_to_run(tmp_path: Path) -> None:
+    """launchd hands a job a bare environment, and a watchdog that cannot run
+    a probe would quietly never restart anything."""
+    root, env = _host_project(tmp_path, ("telegram",))
+    assert _sync(root, env)["ok"]
+
+    path = _agents(root)["project.watchdog.plist"]["EnvironmentVariables"]["PATH"]
+    telegram = shutil.which("telegram")
+    if telegram:
+        assert str(Path(telegram).parent) in path.split(os.pathsep)
+
+
+def test_a_watchdog_turned_off_before_the_first_sync_is_never_written(
+        tmp_path: Path) -> None:
+    root, env = _host_project(tmp_path, ("telegram",))
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime.setdefault("compiler", {}).setdefault("host", {})["watchdog"] = {
+        "enabled": False}
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    _run(root, env, "sync", "--adopt")
+    assert "project.watchdog.plist" not in _agents(root)
+
+
+def test_turning_the_watchdog_off_says_the_agent_is_still_there(
+        tmp_path: Path) -> None:
+    """sync writes and never deletes, so an agent already loaded goes on
+    running - and a person who thinks they turned it off should be told."""
+    root, env = _host_project(tmp_path, ("telegram",))
+    assert _sync(root, env)["ok"]
+    assert "project.watchdog.plist" in _agents(root)
+
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["compiler"]["host"]["watchdog"] = {"enabled": False}
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    proc = _run(root, env, "sync", "--adopt")
+    report = json.loads(proc.stdout)
+    messages = [f["message"] for f in report["findings"]]
+    assert any("watchdog is disabled but its agent is still here" in m
+               for m in messages), messages
+
+
+def test_a_declared_interval_reaches_the_agent(tmp_path: Path) -> None:
+    root, env = _host_project(tmp_path, ("telegram",))
+    assert _sync(root, env)["ok"]
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["compiler"]["host"]["watchdog"] = {"interval_seconds": 180}
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    _run(root, env, "sync", "--adopt")
+    assert _agents(root)["project.watchdog.plist"]["StartInterval"] == 180

@@ -68,6 +68,17 @@ USAGE
       --adopt explicitly replaces unmarked files at the runtime-declared
       managed artifact paths; external artifacts and overlays are never written.
 
+  deployment watchdog [--dry-run]
+      One pass over the launchd agents this project supervises: ask each
+      service's declared doctor whether it still works, and restart the ones
+      that answer no. A supervisor restarts what died; this is for what is
+      alive and doing nothing, which it cannot see. Two consecutive bad
+      answers are required before a restart, and a cooldown keeps a service
+      that a restart does not fix from being restarted every interval.
+      `deployment sync` installs this as its own launchd agent on the
+      host-agents profile; run it by hand with --dry-run to see what it would
+      do. Settings live under `compiler.host.watchdog` in runtime.json.
+
   deployment doctor [--target <name>]
       Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
       references. Reports provider readiness as local facts only: whether the
@@ -187,6 +198,19 @@ PROFILES = ("generic", "agent-box", "host-agents")
 CONTAINER_PROFILES = ("agent-box",)
 HOST_PROFILES = ("host-agents",)
 HOST_SUPERVISORS = ("launchd",)
+# A supervisor restarts a process that died. It cannot see one that is alive
+# and doing nothing — the shape a deadlock leaves behind, where the process
+# sits in the list at 0% CPU and answers nobody. Each service already declares
+# the command that proves it works, so the watchdog asks that, and asks twice
+# before acting: one bad answer is a service that is still starting or a probe
+# that timed out, and restarting on it would be worse than the silence.
+WATCHDOG_DEFAULTS = {
+    "enabled": True,
+    "interval_seconds": 60,
+    "failures_before_restart": 2,
+    "probe_timeout_seconds": 30,
+    "restart_cooldown_seconds": 300,
+}
 PROVIDERS = ("coolify", "dockerhost", "manual")
 PROVIDER_CAPABILITIES = {"coolify": "coolify", "dockerhost": "dockerhost"}
 
@@ -2825,6 +2849,23 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[
     return active, embedded, findings, migrated
 
 
+def _watchdog_config(raw) -> dict:
+    """The watchdog's settings, with anything unusable falling back to default."""
+    config = dict(WATCHDOG_DEFAULTS)
+    if not isinstance(raw, dict):
+        return config
+    if isinstance(raw.get("enabled"), bool):
+        config["enabled"] = raw["enabled"]
+    for key, low, high in (("interval_seconds", 20, 3600),
+                           ("failures_before_restart", 1, 10),
+                           ("probe_timeout_seconds", 5, 300),
+                           ("restart_cooldown_seconds", 0, 86400)):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+            config[key] = value
+    return config
+
+
 def _compiler_config(runtime: dict) -> dict:
     """Normalized compiler layout. Missing fields retain the original root layout."""
     defaults = {
@@ -2836,7 +2877,8 @@ def _compiler_config(runtime: dict) -> dict:
         },
         "compose_overlays": [],
         "container": {"agent_home": "/home/agent", "project_root": "/app"},
-        "host": {"supervisor": "launchd", "agents_dir": "deployment/launchd"},
+        "host": {"supervisor": "launchd", "agents_dir": "deployment/launchd",
+                 "watchdog": dict(WATCHDOG_DEFAULTS)},
         "build_args": {},
     }
     raw = runtime.get("compiler")
@@ -2868,6 +2910,7 @@ def _compiler_config(runtime: dict) -> dict:
             host["agents_dir"] = raw_host["agents_dir"]
         if isinstance(raw_host.get("label_prefix"), str) and raw_host["label_prefix"].strip():
             host["label_prefix"] = raw_host["label_prefix"].strip()
+        host["watchdog"] = _watchdog_config(raw_host.get("watchdog"))
     overlays = raw.get("compose_overlays")
     raw_build_args = raw.get("build_args")
     build_args = ({key: value for key, value in raw_build_args.items()
@@ -3863,8 +3906,14 @@ def _host_artifact_texts(root: Path, runtime: dict,
             "message": "launchd agents are compiled here but only load on macOS",
         })
     agents_dir = _host_agents_dir(root, runtime)
+    # The watchdog runs each service's doctor, so those have to resolve from
+    # the agent's PATH too — launchd hands a job nothing, and a watchdog that
+    # cannot run a probe silently never restarts anything.
+    probe_commands = [service["deploy"].get("doctor") or []
+                      for service in services.values()]
     search_path = _launchd_search_path(
-        [service["deploy"]["command"] for service in services.values()])
+        [service["deploy"]["command"] for service in services.values()]
+        + probe_commands + [[NAME]])
     texts: dict[Path, str] = {}
     for name, service in sorted(services.items()):
         command = service["deploy"]["command"]
@@ -3881,7 +3930,56 @@ def _host_artifact_texts(root: Path, runtime: dict,
         path = agents_dir / f"{prefix}.{name}.plist"
         texts[path] = _mark_generated(
             path, _launchd_plist(root, runtime, name, service, search_path, launcher))
+    watchdog = host["watchdog"]
+    stale_watchdog = agents_dir / f"{_host_label_prefix(runtime, root)}.watchdog.plist"
+    if not watchdog["enabled"] and stale_watchdog.is_file():
+        # sync writes artifacts and never deletes them, so a watchdog turned
+        # off in the declaration keeps running from the agent already loaded.
+        findings.append({
+            "severity": "warning", "path": _rel(root, stale_watchdog),
+            "message": "the watchdog is disabled but its agent is still here; "
+                       f"run `launchctl bootout gui/$UID/"
+                       f"{_host_label_prefix(runtime, root)}.watchdog` and "
+                       "delete this file"})
+    if services and watchdog["enabled"]:
+        prefix = _host_label_prefix(runtime, root)
+        launcher = agents_dir / f"{prefix}-watchdog"
+        texts[launcher] = _mark_generated(
+            launcher, _host_launcher_text(_launchd_program([NAME, "watchdog"])))
+        path = agents_dir / f"{prefix}.watchdog.plist"
+        texts[path] = _mark_generated(
+            path, _watchdog_plist(root, runtime, search_path, launcher))
     return texts, findings
+
+
+def _watchdog_plist(root: Path, runtime: dict, search_path: str,
+                    launcher: Path) -> str:
+    """The one agent that is scheduled rather than supervised.
+
+    `StartInterval` and no `KeepAlive`: this job is meant to run, look, and
+    exit, so launchd restarting it on exit would be a busy loop. `RunAtLoad` is
+    off because a load happens right after `deployment sync`, when the services
+    it watches are still coming up and a probe would judge them unfairly."""
+    prefix = _host_label_prefix(runtime, root)
+    agents_dir = _host_agents_dir(root, runtime)
+    body = {
+        "Label": f"{prefix}.watchdog",
+        "ProgramArguments": [str(launcher)],
+        "WorkingDirectory": str(root),
+        "EnvironmentVariables": {"PATH": search_path},
+        "RunAtLoad": False,
+        "StartInterval": _compiler_config(runtime)["host"]["watchdog"]["interval_seconds"],
+        "ProcessType": "Background",
+        "StandardOutPath": str(agents_dir / "watchdog.out.log"),
+        "StandardErrorPath": str(agents_dir / "watchdog.err.log"),
+    }
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+             '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+             '<plist version="1.0">']
+    lines += _plist_fragment(body, 0)
+    lines.append("</plist>")
+    return "\n".join(lines) + "\n"
 
 
 def _launchd_status(label: str) -> dict:
@@ -3909,6 +4007,151 @@ def _launchd_status(label: str) -> dict:
         elif stripped.startswith("program = "):
             state["program"] = stripped.split("=", 1)[1].strip()
     return state
+
+
+def _watchdog_state_path(root: Path, runtime: dict) -> Path:
+    return _host_agents_dir(root, runtime) / ".watchdog-state.json"
+
+
+def _read_watchdog_state(path: Path) -> dict:
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _probe_service(command: list[str], root: Path, timeout: int) -> dict:
+    """Ask a service's own declared doctor whether it is working.
+
+    Exit status is the contract, and a body that says `ok: false` is honoured
+    too, because a capability may report a sick service without failing the
+    command. A probe that does not answer within the timeout counts as sick:
+    the wedge this exists for takes the whole interpreter down with it, and a
+    doctor that talks to the service will hang exactly as hard.
+    """
+    if not command:
+        return {"ok": None, "detail": "no doctor declared"}
+    try:
+        result = subprocess.run(command, cwd=str(root), capture_output=True,
+                                text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "detail": f"doctor did not answer in {timeout}s"}
+    except OSError as exc:
+        return {"ok": None, "detail": f"cannot run doctor: {exc}"[:200]}
+    if result.returncode != 0:
+        return {"ok": False, "detail": f"doctor exited {result.returncode}"}
+    try:
+        body = json.loads(result.stdout)
+    except ValueError:
+        return {"ok": True, "detail": "doctor exited 0"}
+    if isinstance(body, dict) and body.get("ok") is False:
+        return {"ok": False, "detail": "doctor reported ok=false"}
+    return {"ok": True, "detail": "doctor reported ok"}
+
+
+def _kickstart(label: str) -> dict:
+    try:
+        result = subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"restarted": False, "detail": f"{type(exc).__name__}: {exc}"[:200]}
+    if result.returncode != 0:
+        return {"restarted": False,
+                "detail": (result.stderr or result.stdout).strip()[:200]}
+    return {"restarted": True, "detail": "launchctl kickstart -k"}
+
+
+def cmd_watchdog(dry_run: bool, now: float | None = None) -> dict:
+    """One pass over the supervised services, restarting any that stopped working.
+
+    Deliberately one pass and not a loop: launchd owns the schedule through
+    `StartInterval`, so the watchdog is a job like any other and a machine that
+    reboots does not need it started by hand.
+    """
+    root = _root()
+    runtime = _load_runtime(root)
+    host = _compiler_config(runtime)["host"]
+    config = host["watchdog"]
+    report = {"profile": runtime.get("profile"), "supervisor": host["supervisor"],
+              "enabled": config["enabled"], "dry_run": dry_run, "services": []}
+    if str(runtime.get("profile") or "") not in HOST_PROFILES:
+        report["skipped"] = "watchdog supervises host agents only"
+        return report
+    if not config["enabled"]:
+        report["skipped"] = "watchdog disabled in deployment/runtime.json"
+        return report
+
+    services = (runtime.get("services") or {})
+    state_path = _watchdog_state_path(root, runtime)
+    state = _read_watchdog_state(state_path)
+    prefix = _host_label_prefix(runtime, root)
+    stamp = time.time() if now is None else now
+
+    for name in sorted(services):
+        service = services[name]
+        if not isinstance(service, dict):
+            continue
+        label = f"{prefix}.{name}"
+        entry = {"service": name, "label": label, "action": "none"}
+        launchd = _launchd_status(label)
+        entry["loaded"] = launchd["loaded"]
+        if not launchd["loaded"]:
+            entry["detail"] = "not loaded; a person has not started this agent"
+            report["services"].append(entry)
+            continue
+        if not launchd["pid"]:
+            # Between restarts. launchd owns that, and stepping in would race it.
+            entry["detail"] = "no pid; launchd is already restarting it"
+            state.pop(name, None)
+            report["services"].append(entry)
+            continue
+
+        probe = _probe_service(list(service.get("doctor") or []), root,
+                               config["probe_timeout_seconds"])
+        entry.update({"ok": probe["ok"], "detail": probe["detail"]})
+        if probe["ok"] is not False:
+            state.pop(name, None)
+            report["services"].append(entry)
+            continue
+
+        record = state.get(name) if isinstance(state.get(name), dict) else {}
+        failures = int(record.get("failures") or 0) + 1
+        entry["failures"] = failures
+        last_restart = float(record.get("last_restart") or 0)
+        if failures < config["failures_before_restart"]:
+            entry["action"] = "watching"
+            state[name] = {"failures": failures, "last_restart": last_restart}
+        elif stamp - last_restart < config["restart_cooldown_seconds"]:
+            # Restarting again this soon would mean the restart is not the fix,
+            # and a loop of them buries the evidence of whatever is.
+            entry["action"] = "cooling down"
+            entry["detail"] += (f"; last restart "
+                                f"{int(stamp - last_restart)}s ago")
+            state[name] = {"failures": failures, "last_restart": last_restart}
+        elif dry_run:
+            entry["action"] = "would restart"
+            state[name] = {"failures": failures, "last_restart": last_restart}
+        else:
+            outcome = _kickstart(label)
+            entry["action"] = "restarted" if outcome["restarted"] else "restart failed"
+            entry["detail"] += f"; {outcome['detail']}"
+            state[name] = ({"failures": 0, "last_restart": stamp}
+                           if outcome["restarted"] else
+                           {"failures": failures, "last_restart": last_restart})
+        report["services"].append(entry)
+
+    if not dry_run:
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        except OSError as exc:
+            # Losing the count costs one extra probe before a restart, which is
+            # not worth failing a watchdog pass over.
+            report["state_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    report["state_file"] = str(state_path)
+    return report
 
 
 def _desired_state(root: Path, runtime: dict) -> tuple[dict, dict[Path, str],
@@ -4548,6 +4791,10 @@ def _host_next_payload(root: Path, runtime: dict, target_name: str | None) -> di
             optional_env.update(x for x in (service.get("optional_env") or [])
                                 if isinstance(x, str))
     labels = [f"{prefix}.{name}" for name in services]
+    # The watchdog is an agent like the rest: it has to be linked and loaded,
+    # or the thing that restarts a wedged service is itself never running.
+    if services and _compiler_config(runtime)["host"]["watchdog"]["enabled"]:
+        labels.append(f"{prefix}.watchdog")
     apply_steps = [
         "Stop any copy of these services you started by hand, so launchd does "
         f"not end up beside one: {', '.join(f'`{name} service stop`' for name in services) or 'none declared'}."
@@ -4581,7 +4828,9 @@ def _host_next_payload(root: Path, runtime: dict, target_name: str | None) -> di
                        for label in labels],
         "apply_title": "Hand Them To launchd",
         "provider_steps": apply_steps,
-        "first_run": [f"{name} doctor" for name in services],
+        "first_run": [f"{name} doctor" for name in services]
+                     + (["deployment watchdog --dry-run"]
+                        if f"{prefix}.watchdog" in labels else []),
         "check_commands": [f"launchctl print gui/$UID/{label}" for label in labels]
                           + ["deployment doctor"],
         "manual_control": {
@@ -4918,6 +5167,11 @@ def cmd_doctor(args) -> None:
         sys.exit(6)
 
 
+def cmd_watchdog_command(args) -> None:
+    report = cmd_watchdog(bool(getattr(args, "dry_run", False)))
+    _emit(report)
+
+
 def cmd_runtime(args) -> None:
     _emit(_load_runtime(_root()))
 
@@ -5024,6 +5278,10 @@ def main(argv: list[str] | None = None) -> None:
     p_doctor = sub.add_parser("doctor", add_help=False)
     p_doctor.add_argument("--target")
     p_doctor.set_defaults(fn=cmd_doctor)
+
+    p_watchdog = sub.add_parser("watchdog", add_help=False)
+    p_watchdog.add_argument("--dry-run", action="store_true")
+    p_watchdog.set_defaults(fn=cmd_watchdog_command)
 
     sub.add_parser("runtime", add_help=False).set_defaults(fn=cmd_runtime)
 
