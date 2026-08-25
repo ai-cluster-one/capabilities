@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -345,6 +346,41 @@ def load_effective_config(root: Path, config_path: Path,
     if _store_mode(root)[0] == "db":
         return load_config_from_store(root, state_dir)
     return load_config(root, config_path)
+
+
+# The daemon reads its configuration once, at startup, and a scheduler is the
+# kind of process nobody looks at while it is right. So it writes down what it
+# read, and `doctor` compares: a declaration that changed after the daemon
+# loaded it stops being an invisible fact and becomes a failing health answer,
+# which whatever supervises the daemon already knows how to act on.
+DAEMON_FINGERPRINT_FILE = "daemon.fingerprint"
+
+
+def config_fingerprint(config: dict[str, Any]) -> str:
+    """Twelve hex characters standing for everything a person declared.
+
+    `environment` and `namespace` are excluded deliberately: both are taken
+    from the process environment, so a daemon started under one and a doctor
+    invoked under another would disagree about them permanently, and every
+    comparison would report a change that no restart could ever settle. What
+    remains is the declaration itself, which is what a restart actually
+    reloads."""
+    engine = {key: value for key, value in config["engine"].items()
+              if key not in {"environment", "namespace"}}
+    material = {"version": config["version"], "engine": engine,
+                "automations": config["automations"], "agents": config["agents"]}
+    # `default=str` is here for the resolved script paths, which are the one
+    # non-primitive the normalised config carries.
+    text = json.dumps(material, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def read_config_fingerprint(state_dir: Path) -> str | None:
+    """What the running daemon recorded, or None if it recorded nothing."""
+    try:
+        return (state_dir / DAEMON_FINGERPRINT_FILE).read_text().strip() or None
+    except OSError:
+        return None
 
 
 def _store_mode(root: Path) -> tuple[str, str]:
@@ -1194,12 +1230,16 @@ class Daemon:
 
         lock_path = self.state_dir / "daemon.lock"
         pid_path = self.state_dir / "daemon.pid"
+        fingerprint_path = self.state_dir / DAEMON_FINGERPRINT_FILE
         lock = lock_path.open("a+")
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError(f"another automations daemon holds {lock_path}") from exc
         pid_path.write_text(f"{os.getpid()}\n")
+        # Written behind the lock and beside the pid, because it answers for the
+        # same process: which configuration the daemon still running loaded.
+        fingerprint_path.write_text(config_fingerprint(self.config) + "\n")
         self.recover()
 
         def stop(_signum: int, _frame: Any) -> None:
@@ -1216,6 +1256,7 @@ class Daemon:
         finally:
             self.shutdown()
             pid_path.unlink(missing_ok=True)
+            fingerprint_path.unlink(missing_ok=True)
             self.store.close()
             lock.close()
 

@@ -2,7 +2,9 @@
 
 Run `automations doctor` after configuration changes. It validates the config, script paths, shared records store, environment selection, and bundled runtime.
 
-The daemon reads configuration at startup. Restart the service after changing schedules, limits, environment selectors, or script declarations.
+The daemon reads configuration at startup, so a change to schedules, limits, environment selectors, or script declarations reaches it only through a restart.
+
+It records what it read. `automations doctor` compares that against the configuration declared now and fails with `config_stale` while a running daemon is scheduling a superseded one, so the gap is a health answer rather than something an operator has to remember. Under a supervisor that restarts a service its health check rejects, the restart follows from the same answer and no one has to notice at all.
 
 Use `automations service run` as the foreground process under Docker Compose or another process supervisor. `automations service start` and `stop` are local conveniences. Inspect work through `automations runs`, `automations show`, and `automations logs`; cancellation and retry are explicit CLI operations.
 

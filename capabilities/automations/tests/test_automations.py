@@ -326,6 +326,77 @@ retries = 1
         self.assertNotEqual(reported, "MISSING")
         self.assertTrue(os.access(reported, os.X_OK), reported)
 
+    def test_config_fingerprint_ignores_the_process_environment(self) -> None:
+        # The daemon and whatever asks it for a health answer need not share an
+        # environment, and if the fingerprint moved with one they would disagree
+        # permanently: a stale verdict no restart could ever clear.
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        before = os.environ.get("AUTOMATIONS_ENVIRONMENT")
+        try:
+            os.environ["AUTOMATIONS_ENVIRONMENT"] = "production"
+            production = RUNTIME.config_fingerprint(
+                RUNTIME.load_config(self.root, config_path))
+            os.environ["AUTOMATIONS_ENVIRONMENT"] = "development"
+            development = RUNTIME.config_fingerprint(
+                RUNTIME.load_config(self.root, config_path))
+        finally:
+            if before is None:
+                os.environ.pop("AUTOMATIONS_ENVIRONMENT", None)
+            else:
+                os.environ["AUTOMATIONS_ENVIRONMENT"] = before
+        self.assertEqual(production, development)
+
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "added"
+environments = ["test"]
+script = "capabilities/automations/scripts/job.py"
+""")
+        self.assertNotEqual(
+            production,
+            RUNTIME.config_fingerprint(RUNTIME.load_config(self.root, config_path)),
+        )
+
+    def test_doctor_fails_while_the_daemon_runs_a_superseded_configuration(self) -> None:
+        self.cli("service", "start")
+        self.assertTrue(json.loads(self.cli("doctor").stdout)["ok"])
+
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "added-after-start"
+environments = ["test"]
+script = "capabilities/automations/scripts/job.py"
+schedule = "0 3 * * *"
+""")
+
+        probe = self.cli("service", "doctor", check=False)
+        self.assertEqual(probe.returncode, 6)
+        report = json.loads(probe.stdout)
+        self.assertFalse(report["ok"])
+        self.assertIn("config_stale", report)
+        self.assertNotEqual(report["config_stale"]["loaded"],
+                            report["config_stale"]["current"])
+
+        # Restarting is the whole remedy: the answer goes clean again on its own.
+        self.cli("service", "stop", "--timeout", "5", "--force")
+        self.cli("service", "start")
+        self.assertTrue(json.loads(self.cli("doctor").stdout)["ok"])
+
+    def test_doctor_stays_quiet_about_configuration_while_stopped(self) -> None:
+        # A stopped daemon is not running the wrong declaration; it is not
+        # running one at all, and saying otherwise would restart nothing.
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "added-while-stopped"
+environments = ["test"]
+script = "capabilities/automations/scripts/job.py"
+""")
+        report = json.loads(self.cli("doctor").stdout)
+        self.assertTrue(report["ok"])
+        self.assertNotIn("config_stale", report)
+
     def test_manual_run_history_and_logs(self) -> None:
         doctor = json.loads(self.cli("doctor").stdout)
         self.assertTrue(doctor["ok"])

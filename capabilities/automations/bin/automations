@@ -22,10 +22,13 @@ Scripts:
 Commands:
   automations help
   automations doctor [--repair]
-      Validate config, scripts, state storage, and daemon status. Reports a
-      store whose `runs` table predates the nullable automation reference,
-      which stops a file-declared automation recording any run. `--repair`
-      rebuilds that table in place, keeping every row.
+      Validate config, scripts, state storage, and daemon status. Fails with
+      `config_stale` when the running daemon loaded a configuration that has
+      changed since, because a daemon reads its declaration once and a
+      supervisor cannot see that it went out of date. Reports a store whose
+      `runs` table predates the nullable automation reference, which stops a
+      file-declared automation recording any run. `--repair` rebuilds that
+      table in place, keeping every row.
   automations list
       List configured automations and whether they apply to this environment.
   automations run <automation-id>
@@ -2662,7 +2665,7 @@ def _legacy_state_path(root: Path) -> Path:
 
 LEGACY_REGENERATED = {
     "automations.db", "automations.db-shm", "automations.db-wal",
-    "daemon.lock", "daemon.pid", "scripts",
+    "daemon.lock", "daemon.pid", "daemon.fingerprint", "scripts",
 }
 
 
@@ -2914,8 +2917,29 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     except Exception as exc:
         _die(5, "state_unavailable", f"the store is unavailable: {exc}")
     status = service_status(root)
+    # A daemon that is alive is not thereby current: it loaded its declaration
+    # once, at startup, and every edit since is something it has never seen.
+    # Nothing else in the system can notice that, so the health answer does.
+    config_stale = None
+    if status["running"]:
+        loaded = runtime.read_config_fingerprint(state)
+        current = runtime.config_fingerprint(config)
+        if loaded != current:
+            config_stale = {
+                "loaded": loaded,
+                "current": current,
+                "message": (
+                    "the running daemon did not record which configuration it "
+                    "loaded, so it cannot be shown to be running the current one"
+                    if loaded is None else
+                    "the running daemon loaded a configuration that has changed "
+                    "since; the automations declared now are not the ones it "
+                    "is scheduling"
+                ),
+                "hint": "restart the service so the daemon reloads its configuration",
+            }
     result = {
-        "ok": not missing_scripts and schema_defect is None,
+        "ok": not missing_scripts and schema_defect is None and config_stale is None,
         "project": str(root),
         "environment": config["engine"]["environment"],
         "namespace": config["engine"]["namespace"],
@@ -2923,6 +2947,8 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
         "missing_scripts": missing_scripts,
         "service": status,
     }
+    if config_stale is not None:
+        result["config_stale"] = config_stale
     if repaired is not None:
         result["repaired"] = repaired
     if schema_defect is not None:
