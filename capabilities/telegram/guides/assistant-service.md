@@ -27,7 +27,7 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
    - Review `authority.roles`: this request-scoped hard gate limits which capability CLIs a worker may invoke for each sender role.
    - Set group `aliases` / `address_aliases` if the assistant should react to names other than the default.
    - Set a group's `call_recording.mode` to `auto`, `on_request`, or `disabled`. Recording is opt-in per group and defaults to `disabled`.
-   - Set a group's `voice_transcription.mode` to `auto` to transcribe all voice notes from participants (unaddressed voices are echoed without creating worker jobs). Defaults to `disabled`.
+   - Set a group's `voice_transcription.mode` to `auto` to transcribe all voice messages and video notes from participants (unaddressed spoken media are echoed without creating worker jobs). Defaults to `disabled`.
    - Choose `defaults.worker`: `codex`, `claude`, or `stub`.
 
 4. Ensure the selected connection can send replies:
@@ -278,7 +278,7 @@ An answered call needs a Gemini API key, in the environment variable the selecte
 
 ## Voice Transcription
 
-Voice notes addressed to the assistant are always transcribed in both direct messages and groups. Groups may additionally enable ambient voice transcription:
+Voice messages and video notes addressed to the assistant are always transcribed in both direct messages and groups. Groups may additionally enable ambient transcription:
 
 ```json
 {
@@ -295,12 +295,12 @@ Voice notes addressed to the assistant are always transcribed in both direct mes
 }
 ```
 
-- `auto`: All Telegram voice notes from participants are transcribed and echoed to the chat. In groups, the echo is sent as a Telegram reply to the original voice message (Telegram's reply preview shows sender attribution), and the echo content itself contains only the blockquoted transcript. In direct messages, the echo uses the "Твоё сообщение:" prefix. After transcription, the transcript is checked against the same configured assistant name/username/group-alias matching semantics used for text messages. If the spoken transcript names the assistant (e.g., "Marvin" or "Assistant"), the voice note is treated as an addressed assistant request and dispatches a worker. If the transcript does not name the assistant, it is echoed without creating a worker job. Voices already addressed via Telegram-level mention/reply dispatch as normal regardless of transcript content. In conversation history provided to workers, voice echoes are attributed to the original sender via the reply relationship, not to the assistant.
-- `disabled`: Only voice notes addressed to the assistant are transcribed. This is the default.
+- `auto`: All Telegram voice messages and video notes from participants are transcribed and echoed to the chat. In groups, the echo is sent as a Telegram reply to the original spoken-media message (Telegram's reply preview shows sender attribution), and the echo content itself contains only the blockquoted transcript. In direct messages, the echo uses the "Твоё сообщение:" prefix. After transcription, the transcript is checked against the same configured assistant name/username/group-alias matching semantics used for text messages. If the spoken transcript names the assistant (e.g., "Marvin" or "Assistant"), the media message is treated as an addressed assistant request and dispatches a worker. If the transcript does not name the assistant, it is echoed without creating a worker job. Spoken media already addressed via Telegram-level mention/reply dispatch as normal regardless of transcript content. In conversation history provided to workers, these echoes are attributed to the original sender via the reply relationship, not to the assistant.
+- `disabled`: Only spoken media addressed to the assistant are transcribed. This is the default.
 
 Runtime overrides are available per channel via `/set voice-transcription auto|disabled`.
 
-Transcription failures produce a fallback message. The daemon reserves ownership before transcription so duplicate deliveries and restart catch-up cannot transcribe the same voice note twice.
+Transcription failures produce a fallback message. The daemon reserves ownership before transcription so duplicate deliveries and restart catch-up cannot transcribe the same spoken-media message twice.
 
 ## Channel Context
 

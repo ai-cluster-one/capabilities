@@ -267,17 +267,20 @@ def import_daemon(tmp: Path, service_settings: dict, *,
 
 
 class Message:
-    def __init__(self, message_id: int, *, text: str = "hello", voice: bool = False):
+    def __init__(self, message_id: int, *, text: str = "hello", voice: bool = False,
+                 video_note: bool = False):
         self.id = message_id
         self.sender_id = 777
-        self.text = "" if voice else text
+        self.text = "" if voice or video_note else text
         self.raw_text = self.text
         self.message = self.text
         self.voice = voice
         self.audio = False
-        self.video_note = False
+        self.video_note = video_note
         self.photo = False
-        self.file = SimpleNamespace(mime_type="audio/ogg", name=None) if voice else None
+        self.file = (SimpleNamespace(
+            mime_type="audio/ogg" if voice else "video/mp4", name=None)
+            if voice or video_note else None)
         self.out = False
         self.downloads = 0
         self.is_reply = False
@@ -2489,6 +2492,47 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reg["-200"]["jobs"], {})
             await self.stop_session(client, task)
 
+    async def test_ambient_video_note_transcript_dispatches_through_voice_path(self):
+        """A video note naming the assistant becomes the worker's text request."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"voice_transcription": {"mode": "auto"}}
+            }
+            daemon = import_daemon(Path(td), service_settings)
+            daemon.save_register({"-200": {"last_processed_message_id": 0}})
+
+            message = Message(4011, video_note=True)
+            message.sender_id = 888
+            message.mentioned = False
+
+            async def fake_get_sender():
+                return SimpleNamespace(first_name="Ambient", last_name="Video", username=None)
+            message.get_sender = fake_get_sender
+
+            client = FakeClient([message])
+            transcriptions = []
+            requests = []
+            daemon.deepgram_transcribe = lambda audio, mime: transcriptions.append((audio, mime)) or "Assistant, handle this video note"
+            daemon.WORKERS["stub"] = lambda _chat, _tail, state, _procs: (
+                requests.append(state["current_request"]["text"])
+                or successful_result())
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            event = Event(message, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(lambda: daemon.load_register()["-200"]["last_processed_message_id"] == 4011)
+
+            self.assertEqual(transcriptions, [(b"voice", "video/mp4")])
+            self.assertEqual(message.downloads, 1)
+            self.assertEqual(client.send_attempts, 2)
+            self.assertIn("Assistant, handle this video note", client.sent[0]["text"])
+            self.assertEqual(requests, ["Assistant, handle this video note"])
+            self.assertEqual(daemon.load_register()["-200"]["jobs"], {})
+            await self.stop_session(client, task)
+
     async def test_addressed_voice_in_group_uses_sender_attributed_format(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()
@@ -2632,7 +2676,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reg["-200"]["jobs"], {})
             await self.stop_session(client, task)
 
-    async def test_ambient_voice_catch_up_does_not_duplicate(self):
+    async def test_ambient_video_note_catch_up_does_not_duplicate(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()
             service_settings["allowed_groups"] = {
@@ -2641,7 +2685,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             daemon = import_daemon(Path(td), service_settings)
             daemon.save_register({"-200": {"last_processed_message_id": 0}})
 
-            message = Message(404, voice=True)
+            message = Message(404, video_note=True)
             message.sender_id = 888
             message.mentioned = False
 

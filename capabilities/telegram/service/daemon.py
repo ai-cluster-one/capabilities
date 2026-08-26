@@ -2079,9 +2079,9 @@ def _is_spoken_media(message):
     )
 
 
-def _is_telegram_voice_note(message):
-    """True for Telegram voice notes specifically (not arbitrary audio files)."""
-    return bool(getattr(message, "voice", False))
+def _is_voice_or_video_note(message):
+    """True for Telegram's voice messages and circular video notes."""
+    return bool(getattr(message, "voice", False) or getattr(message, "video_note", False))
 
 
 def _voice_transcription_mode(policy, reg, key):
@@ -2181,8 +2181,8 @@ async def _event_access(event, me, reg):
     """Gate 1: the door. Determines if a message should be processed.
 
     Returns access dict with kind/policy, or None to ignore. For groups with
-    voice_transcription auto, unaddressed Telegram voice notes are admitted as
-    ambient (transcribe + echo, no worker dispatch).
+    voice_transcription auto, unaddressed Telegram voice and video notes are
+    admitted as ambient spoken media (transcribe + echo, no worker dispatch).
     """
     sender_id = str(event.sender_id) if event.sender_id is not None else None
     if getattr(event, "is_private", False):
@@ -2196,7 +2196,7 @@ async def _event_access(event, me, reg):
     addressed = await _message_addresses_me(event.message, me, policy)
     if addressed:
         return {"kind": "group", "group_key": group_key, "policy": policy, "addressed": True}
-    if (_is_telegram_voice_note(event.message)
+    if (_is_voice_or_video_note(event.message)
             and _voice_transcription_mode(policy, reg, key) == "auto"):
         return {"kind": "group", "group_key": group_key, "policy": policy, "addressed": False, "ambient_voice": True}
     return None
@@ -5077,7 +5077,7 @@ async def run_session(client):
                 if group_policy is not None:
                     addressed = await _message_addresses_me(m, me, group_policy)
                     is_ambient_voice = (not addressed
-                                        and _is_telegram_voice_note(m)
+                                        and _is_voice_or_video_note(m)
                                         and _voice_transcription_mode(
                                             group_policy, reg, message_key) == "auto")
                     if not addressed and not is_ambient_voice:

@@ -23,7 +23,7 @@ The assistant does not have durable memory unless the project explicitly provide
 
 - Non-voice media may appear as `[attachment: <name> | msg <id>]`. Treat it as a lazy handle, not the file. Use `telegram download <chat_id> <msgid>` only when you actually need the file.
 - To react when the requester explicitly asks, use `telegram react <chat_id> <msgid> <emoji>`; to send a local media file, use `telegram send-media <chat_id> <path> [--caption TEXT] [--reply-to MSG_ID]`. Both are external writes: only use the current chat when the request authorizes it.
-- Voice notes addressed to you are transcribed and echoed as ordinary conversation text. In groups with `voice_transcription` mode set to `auto`, unaddressed voice notes from other participants are also transcribed and visible in the chat. If the transcript of such an ambient voice names the assistant using a configured alias (e.g., "Marvin", "Assistant"), it becomes an addressed assistant request exactly as if that text had been typed. Otherwise, it is echoed without creating an assistant request.
+- Voice messages and video notes addressed to you are transcribed and echoed as ordinary conversation text. In groups with `voice_transcription` mode set to `auto`, unaddressed voice messages and video notes from other participants are also transcribed and visible in the chat. If the transcript of such media names the assistant using a configured alias (e.g., "Marvin", "Assistant"), it becomes an addressed assistant request exactly as if that text had been typed. Otherwise, it is echoed without creating an assistant request.
 
 ## Progress Messages
 
