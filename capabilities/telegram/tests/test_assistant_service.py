@@ -4533,21 +4533,21 @@ def _chunks(text, limit):
 
 
 class MediaStackLogTests(unittest.IsolatedAsyncioTestCase):
-    """Whatever the media stack does emit is routed into the daemon's log, but
-    the daemon does not lower the bar for what it emits."""
+    """What the media stack says about a call is routed into the daemon's log,
+    at a level the daemon chooses rather than the one the import leaves."""
 
-    async def test_the_media_logger_is_routed_but_not_claimed(self):
+    async def test_the_media_logger_is_routed_and_claimed(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             media = logging.getLogger("ntgcalls")
 
             self.assertTrue(any(isinstance(h, daemon._MediaStackLog)
                                 for h in media.handlers))
-            # Left where the import put it. Claiming it back at INFO is what
-            # puts the stack's own log thread into the interpreter on every
-            # line, and that thread was one of three waiting on the GIL when
-            # the daemon wedged on 2026-08-22.
-            self.assertEqual(media.level, logging.NOTSET)
+            # Importing pytgcalls leaves this at CRITICAL, which is silence for
+            # everything worth reading. Claiming it is what the ntgcalls pin
+            # buys: the stack's log thread enters the interpreter on every line,
+            # and only from b19 does it do so without a native lock held.
+            self.assertEqual(media.level, logging.INFO)
 
     async def test_a_repeated_condition_is_collapsed_not_dropped(self):
         with tempfile.TemporaryDirectory() as td:

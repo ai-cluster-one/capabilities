@@ -4,7 +4,7 @@
 # dependencies = [
 #     "telethon==1.43.2",
 #     "py-tgcalls==3.0.0.dev5",
-#     "ntgcalls==3.0.0b16",
+#     "ntgcalls==3.0.0b19",
 #     "google-genai>=1.36.0",
 # ]
 # ///
@@ -13,6 +13,9 @@
 # ntgcalls is pinned explicitly because inbound audio arrives only from b15 on
 # (ntgcalls#52). dev5 is the first release carrying the three defects this
 # capability used to work around: pytgcalls/pytgcalls#334, #335 and #336.
+# b19 is the first release carrying the fixes for ntgcalls#61 - a conference
+# SIGSEGV when an incoming audio channel is removed - and ntgcalls#62, the
+# lock-order inversion that wedged the whole interpreter beside a live call.
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
 
@@ -736,22 +739,19 @@ class _MediaStackLog(logging.Handler):
             log(f"call-media[{record.levelname.lower()}]: {message}")
 
 
-# The level the import leaves behind is the level that stands. Importing
-# pytgcalls raises this logger from NOTSET to CRITICAL, and claiming it back at
-# INFO — which is what made the 2026-08-19/21 call failures readable at all —
-# puts the media stack's own log thread into the interpreter on every line it
-# emits. On 2026-08-22 that thread was one of three sitting in
-# PyEval_AcquireThread while a Python thread held the GIL inside a blocking
-# ntgcalls call, and the daemon was wedged for seventeen minutes. The deadlock
-# is in the binding and not in this handler, but this is the one side of it
-# under local control, so the level is left alone and the question of whether
-# that is enough is answered by whether conferences stop wedging.
+# The level the import leaves behind is not the level that stands. Importing
+# pytgcalls raises this logger from NOTSET to CRITICAL, so the media stack falls
+# silent unless the level is claimed back — and that log is what made the
+# 2026-08-19/21 call failures readable at all.
 #
-# The handler stays attached: anything the stack considers critical still gets
-# through, and it costs nothing when nothing is emitted. Raise the level here to
-# read the media stack again, knowing what it widens.
+# Claiming it puts the stack's own log thread into the interpreter on every line
+# it emits, which is what the ntgcalls pin in the header above buys: from b19 on,
+# a callback into Python is no longer made while a native lock is held
+# (ntgcalls#62). Under anything older that thread can wedge the whole process,
+# so lowering the pin means giving this line up with it.
 _media_log = logging.getLogger("ntgcalls")
 _media_log.addHandler(_MediaStackLog())
+_media_log.setLevel(logging.INFO)
 
 
 async def settle_conference_chain(invite_msg_id, block, waited, read_block):

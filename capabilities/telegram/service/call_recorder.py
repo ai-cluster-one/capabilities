@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "py-tgcalls==3.0.0.dev5",
-#     "ntgcalls==3.0.0b16",
+#     "ntgcalls==3.0.0b19",
 #     "telethon==1.43.2",
 # ]
 # ///
@@ -12,6 +12,9 @@
 # ntgcalls is pinned explicitly because inbound audio arrives only from b15 on
 # (ntgcalls#52). dev5 is the first release carrying the three defects this
 # capability used to work around: pytgcalls/pytgcalls#334, #335 and #336.
+# b19 is the first release carrying the fixes for ntgcalls#61 - a conference
+# SIGSEGV when an incoming audio channel is removed - and ntgcalls#62, the
+# lock-order inversion that wedged the whole interpreter beside a live call.
 """Record an existing Telegram group voice chat through a full MTProto account.
 
 This is a bundled engine helper, not a public capability executable.  The
