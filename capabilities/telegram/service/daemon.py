@@ -112,8 +112,14 @@ CONFERENCE_CHAIN_INTERVAL = 0.5
 # and how often its size is checked.
 CAPTURE_STALL_TIMEOUT = 8.0
 CAPTURE_STALL_INTERVAL = 1.0
-# When to re-ask who is in a conference, as seconds after the join.
+# When to re-ask who is in a conference, as seconds after the join, and how
+# long one such question may take. The question is a cache-clearing round trip
+# that should answer in well under a second; on 2026-08-27 the first one never
+# answered at all, and because the loop awaits it the remaining three were
+# never asked, so a 190s conference recorded 15s of digital silence. A bounded
+# question fails visibly and leaves the later ones their turn.
 CONFERENCE_AUDIO_MAP_RETRIES = (2.0, 3.0, 5.0, 10.0)
+CONFERENCE_AUDIO_MAP_TIMEOUT = 3.0
 CONFERENCE_PEER_INTERVAL = 2.0
 # Silence is not absence. A call can be quiet for minutes and must not be cut
 # short for it, so the absence of incoming audio is only the cheap hint that
@@ -5489,8 +5495,13 @@ async def run_session(client):
                 log(f"call: audio map — participant cache not cleared "
                     f"({type(exc).__name__}: {exc})")
             try:
-                await calls._handle_request_participants(chat_id)
+                await asyncio.wait_for(
+                    calls._handle_request_participants(chat_id),
+                    CONFERENCE_AUDIO_MAP_TIMEOUT)
                 log(f"call: conference audio map refreshed ({reason})")
+            except asyncio.TimeoutError:
+                log(f"call: conference audio map refresh timed out after "
+                    f"{CONFERENCE_AUDIO_MAP_TIMEOUT:g}s ({reason})")
             except Exception as exc:
                 log(f"call: conference audio map refresh failed ({reason}) — "
                     f"{type(exc).__name__}: {exc}")
@@ -5499,15 +5510,16 @@ async def run_session(client):
             """Re-ask a few times over the first seconds of a conference.
 
             A participant who is still being admitted when the join completes
-            carries no stream to map yet."""
-            elapsed = 0.0
+            carries no stream to map yet. Each attempt names the clock rather
+            than the schedule, so one that spent its timeout says when it ran."""
+            joined_at = time.monotonic()
             for delay in CONFERENCE_AUDIO_MAP_RETRIES:
                 await asyncio.sleep(delay)
-                elapsed += delay
                 if active_recording["caller_id"] != chat_id:
                     return
                 await refresh_conference_audio_map(
-                    chat_id, f"+{elapsed:g}s after join")
+                    chat_id,
+                    f"+{time.monotonic() - joined_at:.0f}s after join")
 
         async def record_call(caller_id: int, mode: str, call_config: CallConfig,
                               continues=None):
