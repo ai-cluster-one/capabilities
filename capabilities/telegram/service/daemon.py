@@ -755,9 +755,56 @@ class _MediaStackLog(logging.Handler):
 # a callback into Python is no longer made while a native lock is held
 # (ntgcalls#62). Under anything older that thread can wedge the whole process,
 # so lowering the pin means giving this line up with it.
+#
+# INFO is what a normal call is read at. DEBUG is what a call under
+# investigation is read at, and the sink honours the level whenever it is
+# set, so this is a setting rather than an edit: `defaults.media_log_level`
+# in the service settings, applied here and again on every reload.
 _media_log = logging.getLogger("ntgcalls")
 _media_log.addHandler(_MediaStackLog())
-_media_log.setLevel(logging.INFO)
+
+MEDIA_LOG_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+    "critical": logging.CRITICAL,
+}
+MEDIA_LOG_LEVEL_DEFAULT = "info"
+
+
+def media_log_level(name):
+    """Resolve a configured media log level, or None if it names nothing.
+
+    A level is the one thing here that can be wrong without anything else
+    breaking, so a name the sink does not know is refused rather than
+    guessed at."""
+    return MEDIA_LOG_LEVELS.get(str(name or "").strip().lower())
+
+
+def apply_media_log_level():
+    """Claim the media stack's logger back at the configured level.
+
+    Importing pytgcalls raises this logger from NOTSET to CRITICAL, so the
+    level is claimed on start and after every settings reload. Anything but
+    the default says so in the log, because a call read at DEBUG looks like
+    a different daemon to whoever reads it next."""
+    defaults = globals().get("DEFAULTS")
+    configured = (defaults.get("media_log_level")
+                  if isinstance(defaults, dict) else None)
+    level = media_log_level(configured)
+    if level is None:
+        if configured:
+            log(f"call-media: unknown media_log_level {configured!r}; "
+                f"reading the media stack at {MEDIA_LOG_LEVEL_DEFAULT}")
+        level = MEDIA_LOG_LEVELS[MEDIA_LOG_LEVEL_DEFAULT]
+    elif _media_log.level != level:
+        log(f"call-media: reading the media stack at "
+            f"{logging.getLevelName(level).lower()}")
+    _media_log.setLevel(level)
+
+
+apply_media_log_level()
 
 
 async def settle_conference_chain(invite_msg_id, block, waited, read_block):
@@ -1430,6 +1477,7 @@ def reload_runtime_settings():
             "instruction": "The settings were not changed. Tell the caller why.",
         }
     _publish_runtime_settings(runtime)
+    apply_media_log_level()
     SETTINGS_GENERATION += 1
     routes = _route_map()
     write_health(

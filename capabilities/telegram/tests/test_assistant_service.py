@@ -4700,6 +4700,40 @@ class AudioPeerTrackingTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(daemon.MEDIA_AUDIO_PEERS)
 
 
+class MediaLogLevelTests(unittest.TestCase):
+    """The media stack is read at the level the settings ask for."""
+
+    def test_the_default_reads_the_media_stack_at_info(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertEqual(daemon._media_log.level, logging.INFO)
+
+    def test_a_call_under_investigation_can_be_read_at_debug(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td),
+                                   settings(media_log_level="debug"))
+
+            self.assertEqual(daemon._media_log.level, logging.DEBUG)
+
+    def test_a_level_the_sink_does_not_know_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td)
+
+            # Refused, not guessed at: an unreadable level would otherwise
+            # decide silently how much of a failing call is recorded.
+            self.assertIsNone(daemon.media_log_level("verbose"))
+            with self.assertRaisesRegex(Exception, "must be one of"):
+                daemon.validate_settings(
+                    {"connection": "test", "assistant_name": "Assistant",
+                     "direct_messages": {"mode": "anyone",
+                                         "default_role": "direct_user"},
+                     "allowed_users": {}, "allowed_groups": {},
+                     "defaults": {"media_log_level": "verbose"}},
+                    root, root)
+
+
 class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
     """A conference still being built is waited out, not refused outright."""
 

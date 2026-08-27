@@ -8,6 +8,9 @@ TOP_LEVEL = {
     "allowed_groups", "control", "authority", "defaults",
 }
 WORKERS = {"claude", "codex", "stub"}
+# What the media stack may be read at. A call under investigation is read at
+# debug; anything a normal call needs is at info.
+MEDIA_LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
 DIRECT_MODES = {"allowed_users", "anyone", "all", "open", "public"}
 VOICE_MODES = {"disabled", "enabled", "auto", "on"}
 VOICE_TOOLS = {"agent_task", "send_to_chat", "run_capability",
@@ -428,6 +431,7 @@ def _defaults(value, path, project_root, service_dir):
         "assistant_name", "tail_size", "sync_interval", "sync_stale_after",
         "debounce", "worker_timeout", "progress_after", "max_parallel_jobs",
         "max_attempts", "group_aliases", "worker", "workers", "voice_agent",
+        "media_log_level",
     }
     _unknown(value, allowed, path)
     if "assistant_name" in value:
@@ -449,6 +453,9 @@ def _defaults(value, path, project_root, service_dir):
         _string_list(value["group_aliases"], f"{path}.group_aliases")
     if "worker" in value:
         _enum(value["worker"], WORKERS, f"{path}.worker")
+    if "media_log_level" in value:
+        _enum(value["media_log_level"], MEDIA_LOG_LEVELS,
+              f"{path}.media_log_level")
     if "workers" in value:
         _workers(value["workers"], f"{path}.workers")
     if "voice_agent" in value:
