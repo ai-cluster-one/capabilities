@@ -116,16 +116,6 @@ def rule_scope(rule):
     return None
 
 
-# The verbs that only read. A daemon-launched turn may point one of these at
-# another connection where the sender's role names it; everything else - and
-# every verb that leaves the system - stays on the account that received the
-# message.
-CROSS_CONNECTION_READ_COMMANDS = {
-    "chats", "read", "search", "topics", "download", "export",
-    "whoami", "doctor", "connections",
-}
-
-
 def flag_value(argv, flag):
     """(present, value) for `--flag V` and `--flag=V`."""
     args = list(argv[1:])
@@ -137,52 +127,16 @@ def flag_value(argv, flag):
     return False, None
 
 
-def granted_connections(ctx):
-    """The connections this request's role may read, named by its telegram rule."""
-    if not ctx:
-        return set()
-    rule = telegram_rule(ctx)
-    if not isinstance(rule, dict):
-        return set()
-    named = rule.get("connections")
-    if not isinstance(named, list):
-        return set()
-    return {str(item).strip() for item in named if str(item).strip()}
-
-
-def authorize_connection(argv):
-    """Decide whether this turn may name another Telegram connection.
-
-    Reading someone else's account is a grant, never a side effect of holding
-    a capability: the role's own telegram rule lists the connections it
-    reaches, and the reachable set is therefore exactly what the project
-    declared. Returns True when the command was authorized against a
-    connection other than the one that received the message.
+def names_another_connection(argv):
+    """Whether this command is aimed at a connection other than the one that
+    received the message. Whether it may be is the CLI's own decision: it owns
+    the grant and is the last thing standing between a request and an account.
     """
     present, requested = flag_value(argv, "--connection")
-    if not present:
+    if not present or not requested:
         return False
-    if not requested:
-        fail("worker_send_invalid", "--connection needs a value")
     authorized = os.environ.get("TELEGRAM_AUTHORIZED_CONNECTION", "").strip()
-    if authorized and requested == authorized:
-        return False
-    command, _ = parse_command_and_chat(argv)
-    if command not in CROSS_CONNECTION_READ_COMMANDS:
-        fail("worker_scope_denied",
-             "--connection cannot be overridden for "
-             f"`{command}` inside a Telegram worker request" if command else
-             "--connection cannot be overridden inside a Telegram worker request",
-             "only read verbs reach another account; anything that leaves the "
-             "system stays on the account that received the message",
-             exit_code=4)
-    if requested not in granted_connections(auth_context()):
-        fail("worker_scope_denied",
-             f"this request does not reach the Telegram connection {requested!r}",
-             "name it under authority.roles.<role>.allowed_capabilities."
-             "telegram.connections in the service settings",
-             exit_code=4)
-    return True
+    return bool(authorized) and requested != authorized
 
 
 def parse_command_and_chat(argv):
@@ -264,7 +218,7 @@ def main():
                 fail("worker_scope_denied",
                      f"{forbidden} cannot be overridden inside a Telegram worker request",
                      exit_code=4)
-    cross_connection = authorize_connection(sys.argv) if daemon_turn else False
+    cross_connection = names_another_connection(sys.argv) if daemon_turn else False
     if write_progress(sys.argv):
         return 0
     enforce_current_chat_scope(sys.argv)

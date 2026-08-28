@@ -2683,27 +2683,68 @@ def open_records(envelope: Path | str, global_dir: Path | str,
 # <<< contract: store <<<
 
 
+# The verbs that only read. A service request may point one of these at another
+# connection the sender's role names; everything else, and everything that
+# leaves the system, stays on the account that received the request.
+_CROSS_CONNECTION_READ_COMMANDS = {
+    "chats", "read", "search", "topics", "download", "export",
+    "whoami", "doctor", "connections",
+}
+
+
+def _granted_connections(ctx: dict) -> set[str]:
+    """The connections this request's role may read, per its telegram rule."""
+    caps = ctx.get("allowed_capabilities") or {}
+    if not isinstance(caps, dict):
+        return set()
+    rule = caps.get("telegram", caps.get("*"))
+    if not isinstance(rule, dict):
+        return set()
+    named = rule.get("connections")
+    if not isinstance(named, list):
+        return set()
+    return {str(item).strip() for item in named if str(item).strip()}
+
+
 def _auth_connection_gate(connection_flag: str | None,
-                          session_flag: str | None) -> tuple[str | None, str | None]:
-    """Pin Telegram service workers to the daemon's own connection/session.
+                          session_flag: str | None,
+                          command: str | None = None
+                          ) -> tuple[str | None, str | None]:
+    """Pin Telegram service workers to the daemon's own connection, unless the
+    request's own authority names another one to read.
 
     A service authority context names the connection that received the request.
-    Workers must not switch to another project connection or substitute an
-    arbitrary session file, even when their role may otherwise use Telegram.
-    Ordinary CLI use has no authority context and remains unchanged.
+    A worker must not substitute an arbitrary session file, and must not send
+    through another account whatever else its role may do. Reading a second
+    account is a grant the role carries, so the reachable set is exactly what
+    the project declared. Ordinary CLI use has no authority context and remains
+    unchanged.
     """
     ctx = _auth_context()
     if not ctx or ctx.get("source") != "telegram":
         return connection_flag, session_flag
     allowed = str(ctx.get("connection") or "").strip()
+    crossing = False
     if allowed and connection_flag and connection_flag != allowed:
-        _die(4, "connection_scope_denied",
-             "telegram connection is fixed for this service request",
-             f"requested={connection_flag}; allowed={allowed}")
+        if command not in _CROSS_CONNECTION_READ_COMMANDS:
+            _die(4, "connection_scope_denied",
+                 "telegram connection is fixed for this service request",
+                 f"requested={connection_flag}; allowed={allowed}; "
+                 "only read verbs reach another account")
+        if connection_flag not in _granted_connections(ctx):
+            _die(4, "connection_scope_denied",
+                 f"this request does not reach the telegram connection {connection_flag!r}",
+                 "name it under authority.roles.<role>.allowed_capabilities."
+                 "telegram.connections in the service settings")
+        crossing = True
     worker_session = os.environ.get("TELEGRAM_WORKER_SESSION")
     if session_flag and session_flag != worker_session:
         _die(4, "session_scope_denied",
              "telegram session override is not allowed for this service request")
+    if crossing:
+        # The worker session belongs to the receiving account; a granted read
+        # runs on its own connection's session instead.
+        return connection_flag, None
     return allowed or connection_flag, session_flag
 
 
@@ -5073,7 +5114,9 @@ def main() -> None:
             connection_flag = a.split("=", 1)[1]; i += 1; continue
         cleaned.append(a); i += 1
 
-    connection_flag, session_flag = _auth_connection_gate(connection_flag, session_flag)
+    service_command = next((item for item in cleaned if not item.startswith("-")), None)
+    connection_flag, session_flag = _auth_connection_gate(
+        connection_flag, session_flag, service_command)
 
     args = p.parse_args(cleaned)
 

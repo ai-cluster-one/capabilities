@@ -422,8 +422,8 @@ class OutboundActionsTests(unittest.TestCase):
             shim.main()
         return calls
 
-    def test_worker_reads_a_granted_second_connection(self):
-        """Reach into another account is a grant the sender's role carries."""
+    def test_worker_drops_its_session_when_it_names_another_connection(self):
+        """One account is never read through another account's session."""
         shim = import_worker_shim()
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._cross_connection_env(tmpdir, grant=["principal"])
@@ -434,34 +434,6 @@ class OutboundActionsTests(unittest.TestCase):
         self.assertIn("--connection", args)
         # The receiving account's session must not be handed to another account.
         self.assertNotIn("--session", args)
-
-    def test_worker_refuses_a_second_connection_without_a_grant(self):
-        shim = import_worker_shim()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = self._cross_connection_env(tmpdir)
-            with mock.patch.dict(os.environ, env, clear=False), \
-                    mock.patch.object(
-                        sys, "argv",
-                        ["telegram", "read", "555", "--connection", "principal"]):
-                with self.assertRaises(SystemExit) as stopped:
-                    shim.main()
-        self.assertEqual(stopped.exception.code, 4)
-
-    def test_worker_refuses_to_send_through_a_granted_connection(self):
-        """A grant reaches reads only; anything that leaves the system stays put."""
-        shim = import_worker_shim()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = self._cross_connection_env(tmpdir, grant=["principal"])
-            for argv in (
-                ["telegram", "send", "555", "hi", "--connection", "principal"],
-                ["telegram", "send-media", "555", "a.jpg", "--connection=principal"],
-                ["telegram", "react", "555", "9", "\U0001f44d", "--connection", "principal"],
-            ):
-                with mock.patch.dict(os.environ, env, clear=False), \
-                        mock.patch.object(sys, "argv", argv):
-                    with self.assertRaises(SystemExit) as stopped:
-                        shim.main()
-                self.assertEqual(stopped.exception.code, 4)
 
     def test_worker_keeps_its_own_session_when_it_names_its_own_connection(self):
         shim = import_worker_shim()
@@ -486,6 +458,78 @@ class OutboundActionsTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as stopped:
                     shim.main()
         self.assertEqual(stopped.exception.code, 4)
+
+    # --- the CLI owns the cross-connection policy -------------------------
+
+    def _service_context(self, grant=None, connection="assistant"):
+        rule = {"allow": True}
+        if grant is not None:
+            rule["connections"] = grant
+        return json.dumps({
+            "version": 1,
+            "source": "telegram",
+            "connection": connection,
+            "chat_id": "-1001",
+            "sender_role": "supervisor",
+            "allowed_capabilities": {"*": True, "telegram": rule},
+        })
+
+    def test_service_request_reads_a_granted_second_connection(self):
+        cli = import_cli()
+        env = {"CAPABILITIES_AUTH_CONTEXT": self._service_context(grant=["principal"]),
+               "TELEGRAM_WORKER_SESSION": "/tmp/assistant-session"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            connection, session = cli._auth_connection_gate(
+                "principal", None, "read")
+        self.assertEqual(connection, "principal")
+        # The receiving account's session must not be used to read another.
+        self.assertIsNone(session)
+
+    def test_service_request_refuses_an_ungranted_connection(self):
+        cli = import_cli()
+        env = {"CAPABILITIES_AUTH_CONTEXT": self._service_context()}
+        with mock.patch.dict(os.environ, env, clear=False):
+            with self.assertRaises(SystemExit) as stopped:
+                cli._auth_connection_gate("principal", None, "read")
+        self.assertEqual(stopped.exception.code, 4)
+
+    def test_service_request_refuses_to_send_through_a_granted_connection(self):
+        """A grant reaches reads only; anything that leaves the system stays put."""
+        cli = import_cli()
+        env = {"CAPABILITIES_AUTH_CONTEXT": self._service_context(grant=["principal"])}
+        for command in ("send", "send-media", "react"):
+            with mock.patch.dict(os.environ, env, clear=False):
+                with self.assertRaises(SystemExit) as stopped:
+                    cli._auth_connection_gate("principal", None, command)
+            self.assertEqual(stopped.exception.code, 4)
+
+    def test_service_request_keeps_its_own_connection_and_session(self):
+        cli = import_cli()
+        env = {"CAPABILITIES_AUTH_CONTEXT": self._service_context(grant=["principal"]),
+               "TELEGRAM_WORKER_SESSION": "/tmp/assistant-session"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            connection, session = cli._auth_connection_gate(
+                "assistant", "/tmp/assistant-session", "read")
+        self.assertEqual(connection, "assistant")
+        self.assertEqual(session, "/tmp/assistant-session")
+
+    def test_service_request_refuses_a_session_path(self):
+        """A session names a file rather than a declared connection."""
+        cli = import_cli()
+        env = {"CAPABILITIES_AUTH_CONTEXT": self._service_context(grant=["principal"]),
+               "TELEGRAM_WORKER_SESSION": "/tmp/assistant-session"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            with self.assertRaises(SystemExit) as stopped:
+                cli._auth_connection_gate("principal", "/tmp/elsewhere", "read")
+        self.assertEqual(stopped.exception.code, 4)
+
+    def test_ordinary_cli_use_is_untouched_by_the_gate(self):
+        cli = import_cli()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CAPABILITIES_AUTH_CONTEXT", None)
+            self.assertEqual(
+                cli._auth_connection_gate("principal", "/tmp/anywhere", "send"),
+                ("principal", "/tmp/anywhere"))
 
     def _worker_env(self, outbox):
         return {
