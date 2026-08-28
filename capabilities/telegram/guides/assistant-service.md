@@ -92,9 +92,36 @@ The accepted schema is deliberately finite:
 - Defaults: `assistant_name`, `tail_size`, `sync_interval`, `sync_stale_after`, `debounce`, `worker_timeout`, `progress_after`, `max_parallel_jobs`, `max_attempts`, `group_aliases`, `worker`, `workers`, `voice_agent`, and `media_log_level`.
 - `media_log_level` decides how much of the media stack reaches the daemon log: `info` is what a normal call is read at, `debug` is what a call under investigation is read at, and the level applies on start and on every reload. Importing pytgcalls mutes that logger, so this setting is the only thing that speaks for it.
 - Worker policy: `model`; Claude also accepts `effort`; Codex accepts `reasoning_effort` and `service_tier`. Voice defaults accept `worker`, `workers`, `model`, `voice`, `greeting`, `history`, `timezone`, `progress_interval`, `recording_caption`, and `prompt_file`.
-- Control policies contain `commands`; authority policies contain `allowed_capabilities` or `capabilities`. Capability rules accept booleans/`*`, verb lists, or `allow`/`deny`/`enabled`/`scope`/`verbs` objects.
+- Control policies contain `commands`; authority policies contain `allowed_capabilities` or `capabilities`. Capability rules accept booleans/`*`, verb lists, or `allow`/`deny`/`enabled`/`scope`/`verbs`/`connections` objects.
 
 IDs must have the correct sign (users positive, groups negative, topics positive), context paths must resolve inside the Telegram service directory, and numeric settings use the bounds named by `/set help` or the shipped template. A `project` route is checked for shape at load and for reachability at dispatch, as described under Worker Project Routing. There is no permissive/legacy mode.
+
+### Reading a second account
+
+A worker turn runs on the account that received the message, and that is the only account it reaches by default. Naming another connection is refused, and so is `--session`, which points at a file rather than a declared connection and would therefore reach any account on the machine.
+
+A project that connects more than one account can grant a role the ones it may read:
+
+```json
+{
+  "authority": {
+    "roles": {
+      "supervisor": {
+        "allowed_capabilities": {
+          "*": true,
+          "telegram": {"allow": true, "connections": ["principal-personal"]}
+        }
+      }
+    }
+  }
+}
+```
+
+The grant is deliberately narrow, because the hazard is not the flag but who holds it. A group member who may address the assistant would otherwise be able to ask, from a group, for something that lives in a private account - so reach is a property of the sender's role, named in the project's own settings, and the reachable set is exactly what the project declared.
+
+- Only read verbs cross: `chats`, `read`, `search`, `topics`, `download`, `export`, `whoami`, `doctor`, `connections`. Anything that leaves the system - `send`, `send-media`, `react` - stays on the account that received the message whatever the grant says.
+- A granted connection is read through its own session. The worker session belongs to the receiving account and is left out, so one account is never read through another's session.
+- The connection must exist in the project's registry and its own `allow_write` still governs it; a read-only connection stays read-only.
 
 ## State Layout
 

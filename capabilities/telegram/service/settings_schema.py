@@ -172,7 +172,7 @@ def _capability_rule(value, path):
         _string_list(value, path)
         return
     value = _object(value, path)
-    allowed = {"allow", "deny", "enabled", "scope", "verbs"}
+    allowed = {"allow", "deny", "enabled", "scope", "verbs", "connections"}
     _unknown(value, allowed, path)
     for key in ("allow", "deny", "enabled"):
         if key in value:
@@ -181,6 +181,8 @@ def _capability_rule(value, path):
         _string(value["scope"], f"{path}.scope", nonempty=True)
     if "verbs" in value:
         _string_list(value["verbs"], f"{path}.verbs")
+    if "connections" in value:
+        _string_list(value["connections"], f"{path}.connections")
 
 
 def _capabilities(value, path):

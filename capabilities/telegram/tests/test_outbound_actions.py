@@ -391,6 +391,102 @@ class OutboundActionsTests(unittest.TestCase):
             ("react", "-1001"),
         )
 
+    def _cross_connection_env(self, tmpdir, grant=None):
+        env = {
+            "TELEGRAM_PROGRESS_OUTBOX": str(Path(tmpdir) / "outbox.jsonl"),
+            "TELEGRAM_AUTHORIZED_CHAT_ID": "-1001",
+            "TELEGRAM_AUTHORIZED_CONNECTION": "assistant",
+            "TELEGRAM_WORKER_SESSION": str(Path(tmpdir) / "worker-session"),
+            "TELEGRAM_REAL_TELEGRAM": "/usr/bin/true",
+        }
+        rule = {"allow": True}
+        if grant is not None:
+            rule["connections"] = grant
+        context = {
+            "version": 1,
+            "connection": "assistant",
+            "chat_id": "-1001",
+            "sender_role": "supervisor",
+            "allowed_capabilities": {"*": True, "telegram": rule},
+        }
+        env["CAPABILITIES_AUTH_CONTEXT"] = json.dumps(context)
+        return env
+
+    def _run_shim(self, shim, env, argv):
+        """Run the shim's main() with exec captured rather than performed."""
+        calls = []
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(shim.os, "execvp",
+                                  lambda program, args: calls.append((program, args))):
+            shim.main()
+        return calls
+
+    def test_worker_reads_a_granted_second_connection(self):
+        """Reach into another account is a grant the sender's role carries."""
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir, grant=["principal"])
+            calls = self._run_shim(
+                shim, env, ["telegram", "read", "555", "--connection", "principal"])
+        self.assertEqual(len(calls), 1)
+        _, args = calls[0]
+        self.assertIn("--connection", args)
+        # The receiving account's session must not be handed to another account.
+        self.assertNotIn("--session", args)
+
+    def test_worker_refuses_a_second_connection_without_a_grant(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir)
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(
+                        sys, "argv",
+                        ["telegram", "read", "555", "--connection", "principal"]):
+                with self.assertRaises(SystemExit) as stopped:
+                    shim.main()
+        self.assertEqual(stopped.exception.code, 4)
+
+    def test_worker_refuses_to_send_through_a_granted_connection(self):
+        """A grant reaches reads only; anything that leaves the system stays put."""
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir, grant=["principal"])
+            for argv in (
+                ["telegram", "send", "555", "hi", "--connection", "principal"],
+                ["telegram", "send-media", "555", "a.jpg", "--connection=principal"],
+                ["telegram", "react", "555", "9", "\U0001f44d", "--connection", "principal"],
+            ):
+                with mock.patch.dict(os.environ, env, clear=False), \
+                        mock.patch.object(sys, "argv", argv):
+                    with self.assertRaises(SystemExit) as stopped:
+                        shim.main()
+                self.assertEqual(stopped.exception.code, 4)
+
+    def test_worker_keeps_its_own_session_when_it_names_its_own_connection(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir, grant=["principal"])
+            calls = self._run_shim(
+                shim, env, ["telegram", "read", "555", "--connection", "assistant"])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--session", calls[0][1])
+
+    def test_worker_refuses_a_session_path_on_a_daemon_turn(self):
+        """A session path names a file, so no grant can make it safe."""
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir, grant=["principal"])
+            env.pop("TELEGRAM_PROGRESS_OUTBOX")
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(
+                        sys, "argv",
+                        ["telegram", "read", "555", "--session", "/tmp/elsewhere"]):
+                os.environ.pop("TELEGRAM_PROGRESS_OUTBOX", None)
+                with self.assertRaises(SystemExit) as stopped:
+                    shim.main()
+        self.assertEqual(stopped.exception.code, 4)
+
     def _worker_env(self, outbox):
         return {
             "TELEGRAM_PROGRESS_OUTBOX": str(outbox),

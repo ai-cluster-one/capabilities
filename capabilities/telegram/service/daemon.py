@@ -1984,6 +1984,8 @@ def _authority_summary(ctx):
                 detail.append(f"scope={rule['scope']}")
             if rule.get("verbs"):
                 detail.append("verbs=" + ",".join(map(str, rule["verbs"])))
+            if rule.get("connections"):
+                detail.append("connections=" + ",".join(map(str, rule["connections"])))
             bits.append(f"{name} ({'; '.join(detail)})" if detail else name)
     return ", ".join(bits) if bits else "no capabilities"
 
