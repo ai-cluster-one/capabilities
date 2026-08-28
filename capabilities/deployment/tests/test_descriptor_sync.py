@@ -158,7 +158,11 @@ def test_embedded_service_merges_contract_into_agent(tmp_path: Path) -> None:
     assert "telegram_state:/home/agent/.local/state/telegram" in compose
     assert "command=telegram service run" in (root / "supervisord.conf").read_text()
     assert "exec /usr/bin/supervisord -c /app/supervisord.conf" in (root / "entrypoint.sh").read_text()
-    assert "python3 supervisor" in (root / "Dockerfile").read_text()
+    dockerfile = (root / "Dockerfile").read_text()
+    assert "python3 procps supervisor" in dockerfile
+    # A declared mount is created in the image, so a fresh named volume inherits
+    # the agent's ownership instead of arriving owned by root.
+    assert '"$HOME/.local/state/telegram"' in dockerfile
 
 
 def test_runtime_capability_exclusions_only_trim_image_lock(tmp_path: Path) -> None:

@@ -3120,7 +3120,8 @@ fi
 
 
 def _dockerfile_template(has_contextkit: bool, compiler: dict,
-                         entrypoint_rel: str, with_supervisor: bool = False) -> str:
+                         entrypoint_rel: str, with_supervisor: bool = False,
+                         mounts: list[str] | None = None) -> str:
     agent_home = compiler["container"]["agent_home"]
     project_root = compiler["container"]["project_root"]
     username = Path(agent_home).name
@@ -3157,11 +3158,21 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
         )
         capabilities_init_and_doctor = ""
     supervisor_package = " supervisor" if with_supervisor else ""
+    # Every declared mount is created here: a fresh named volume inherits the
+    # ownership of whatever the image left at its mount point, so a directory the
+    # image never made arrives owned by root and the agent cannot write into it.
+    state_dirs = ["$HOME/.local/state", "$HOME/.claude", "$HOME/.codex"]
+    for target in mounts or []:
+        resolved = target.replace(agent_home, "$HOME", 1) if target.startswith(
+            agent_home) else target
+        if resolved not in state_dirs:
+            state_dirs.append(resolved)
+    state_mkdir = " ".join(f'"{d}"' for d in state_dirs)
     return f"""# Agent box: project brain + agent CLIs + capability CLIs.
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-        ca-certificates curl git openssh-client ripgrep file ffmpeg python3{supervisor_package} \\
+        ca-certificates curl git openssh-client ripgrep file ffmpeg python3 procps{supervisor_package} \\
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
@@ -3199,7 +3210,7 @@ RUN set -eux; \\
     test -x "$HOME/.local/bin/codex" && test -x "$HOME/.local/bin/codex-code-mode-host"; \\
     rm -f /tmp/codex-package.tgz
 
-RUN uv python install 3.11
+RUN uv python install 3.13
 {contextkit_install}
 COPY --chown=${{USERNAME}}:${{USERNAME}} . {project_root}
 
@@ -3227,8 +3238,9 @@ RUN while read -r name; do \\
       "$name" help >/dev/null 2>&1 || true; \\
     done < {lock_path}
 
-# Capability service state is mounted at descriptor-declared targets.
-RUN mkdir -p "$HOME/.local/state" "$HOME/.claude" "$HOME/.codex" {project_root}/capabilities
+# Capability service state is mounted at descriptor-declared targets. Each one is
+# created here so a fresh named volume inherits the agent's ownership.
+RUN mkdir -p {state_mkdir} {project_root}/capabilities
 {contextkit_build}
 ENTRYPOINT [{json.dumps(entrypoint_path)}]
 """
@@ -3712,7 +3724,9 @@ def _artifact_texts(root: Path, runtime: dict,
         "dockerignore": _dockerignore_template(has_contextkit),
         "env_example": _env_example_template(runtime, active, has_contextkit),
         "dockerfile": _dockerfile_template(
-            has_contextkit, compiler, entrypoint_rel, bool(supervisor_config)),
+            has_contextkit, compiler, entrypoint_rel, bool(supervisor_config),
+            mounts=[v["mount"] for v in (runtime.get("volumes") or {}).values()
+                    if isinstance(v, dict) and isinstance(v.get("mount"), str)]),
         "entrypoint": _entrypoint_template(project_name, supervisor_config),
     }
     if supervisor_path is not None:
