@@ -378,9 +378,9 @@ schedule = "0 3 * * *"
         self.assertNotEqual(report["config_stale"]["loaded"],
                             report["config_stale"]["current"])
 
-        # Restarting is the whole remedy: the answer goes clean again on its own.
-        self.cli("service", "stop", "--timeout", "5", "--force")
-        self.cli("service", "start")
+        # Reloading is the whole remedy: the answer goes clean again without
+        # stopping anything.
+        self.cli("service", "reload")
         self.assertTrue(json.loads(self.cli("doctor").stdout)["ok"])
 
     def test_doctor_stays_quiet_about_configuration_while_stopped(self) -> None:
@@ -447,6 +447,79 @@ script = "capabilities/automations/scripts/job.py"
         mounts = {item["name"]: item for item in service["deploy"]["mounts"]}
         self.assertEqual(mounts["automations_state"]["target"],
                          "{agent_home}/.local/state/capabilities/projects")
+
+    def test_service_reload_publishes_an_edited_declaration_without_restarting(self) -> None:
+        self.cli("service", "start")
+        pid = json.loads(self.cli("service", "status").stdout)["pid"]
+
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "added-after-start"
+environments = ["test"]
+script = "capabilities/automations/scripts/job.py"
+schedule = "0 3 * * *"
+""")
+        self.assertFalse(json.loads(self.cli("service", "doctor", check=False).stdout)["ok"])
+
+        published = json.loads(self.cli("service", "reload").stdout)
+        self.assertTrue(published["reloaded"])
+        # The same process took it up. A new pid here would mean the daemon was
+        # replaced, which is the thing a reload exists to avoid.
+        self.assertEqual(published["pid"], pid)
+        self.assertTrue(json.loads(self.cli("service", "doctor").stdout)["ok"])
+        self.assertEqual(json.loads(self.cli("service", "status").stdout)["pid"], pid)
+
+        # Asking again is not an error and does not signal a daemon that is
+        # already current.
+        again = json.loads(self.cli("service", "reload").stdout)
+        self.assertFalse(again["reloaded"])
+
+    def test_service_reload_refuses_a_declaration_that_does_not_load(self) -> None:
+        self.cli("service", "start")
+        pid = json.loads(self.cli("service", "status").stdout)["pid"]
+        state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
+        loaded = RUNTIME.read_config_fingerprint(state)
+
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        good = config_path.read_text()
+        config_path.write_text(good + "\nthis is not toml [[[\n")
+
+        refused = self.cli("service", "reload", check=False)
+        self.assertEqual(refused.returncode, 6)
+        self.assertIn("invalid_config", refused.stderr)
+        # A daemon scheduling work correctly is not disturbed by an edit that
+        # cannot be read. Liveness is asked of the process itself, because every
+        # verb that would answer it also has to read the file that is broken.
+        os.kill(pid, 0)
+        self.assertEqual(RUNTIME.read_config_fingerprint(state), loaded)
+
+        # And once the file parses again it is the same daemon that answers.
+        config_path.write_text(good)
+        self.assertEqual(json.loads(self.cli("service", "status").stdout)["pid"], pid)
+
+    def test_service_reload_leaves_running_work_alone(self) -> None:
+        self.cli("service", "start")
+        queued = json.loads(self.cli("run", "slow").stdout)
+        run_id = queued["run"]["id"]
+        self.wait_status(run_id, {"running"})
+
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "added-mid-flight"
+environments = ["test"]
+script = "capabilities/automations/scripts/job.py"
+schedule = "0 4 * * *"
+""")
+        self.assertTrue(json.loads(self.cli("service", "reload").stdout)["reloaded"])
+
+        # This is the whole difference between reloading and restarting: work
+        # already dispatched finishes under the declaration that started it.
+        row = self.wait_status(run_id, {"running"})
+        self.assertEqual(row["status"], "running")
+        self.cli("cancel", run_id)
+        self.wait_status(run_id, {"canceled"})
 
     def test_cancel_running_job(self) -> None:
         self.cli("service", "start")

@@ -54,6 +54,13 @@ Commands:
   automations service doctor|run|start|stop|status|logs
       Manage the bundled scheduler service. `run` stays in the foreground for
       Docker Compose; `start` is the local background convenience.
+  automations service reload [--timeout SEC]
+      Publish an edited configuration to the daemon already running, without
+      stopping the jobs it is running. The configuration is validated first, and
+      a daemon that rejects it keeps the one it has. Returns once the daemon
+      publishes the new declaration as loaded, so a success is demonstrated
+      rather than assumed. Changing the state root or the records backend still
+      needs a real restart.
 
 Environment:
   AUTOMATIONS_ENVIRONMENT  Active environment selector (default: development).
@@ -136,7 +143,7 @@ POST_INSTALL: list = []
 SERVICE = {
     "name": "scheduler",
     "summary": "Project-local scheduler, store-backed queue, and subprocess workers.",
-    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
+    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
     "config": "capabilities/automations/service/config.toml",
     "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/automations",
     "deploy": {
@@ -3085,6 +3092,59 @@ def cmd_service_start() -> dict[str, Any]:
     return out
 
 
+def cmd_service_reload(timeout: float) -> dict[str, Any]:
+    """Publish an edited declaration to the daemon already running.
+
+    The declaration is loaded here first: asking a healthy daemon to take up a
+    file that does not parse is a question worth refusing before it is asked.
+
+    Only the daemon is signalled, never its process group, because its children
+    are jobs in flight and reloading is precisely the operation that leaves them
+    alone. Confirmation is the fingerprint the daemon publishes for the
+    declaration it has loaded: when that reaches the one computed here, the swap
+    demonstrably happened. A daemon that rejects the new declaration keeps the
+    old one and its fingerprint with it, so this reports a timeout rather than a
+    success it cannot show.
+    """
+    runtime = _runtime_module()
+    root = _root_required()
+    state = _state_path(root)
+    pid = _read_pid(state / "daemon.pid")
+    if not _pid_alive(pid):
+        _die(5, "service_not_running", "no automations daemon is running",
+             "start it with `automations service start`")
+    try:
+        config = runtime.load_effective_config(root, _config_path(root), state)
+    except runtime.ConfigError as exc:
+        _die(6, "invalid_config", str(exc),
+             "the daemon keeps the declaration it has; repair config.toml and retry")
+    target = runtime.config_fingerprint(config)
+    declared = len(runtime.automation_map(config))
+    if runtime.read_config_fingerprint(state) == target:
+        return {"reloaded": False, "running": True, "pid": pid,
+                "automations": declared,
+                "reason": "the daemon already runs this declaration"}
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except ProcessLookupError:
+        _die(5, "service_not_running", "automations daemon exited before the reload")
+    except PermissionError as exc:
+        _die(6, "service_reload_failed", f"cannot signal daemon process {pid}: {exc}")
+
+    deadline = time.time() + max(timeout, 0.0)
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            _die(5, "service_reload_failed", "automations daemon exited during the reload",
+                 "inspect `automations service logs`")
+        if runtime.read_config_fingerprint(state) == target:
+            return {"reloaded": True, "running": True, "pid": pid,
+                    "automations": declared}
+        time.sleep(0.1)
+    _die(5, "service_reload_failed",
+         f"the daemon did not publish the new declaration within {timeout:g}s",
+         "it may have rejected it; inspect `automations service logs`")
+
+
 def cmd_service_stop(timeout: float, force: bool) -> dict[str, Any]:
     root = _root_required()
     state = _state_path(root)
@@ -3374,6 +3434,8 @@ def main() -> None:
     service_sub.add_parser("doctor", add_help=False)
     service_sub.add_parser("run", add_help=False)
     service_sub.add_parser("start", add_help=False)
+    reload_parser = service_sub.add_parser("reload", add_help=False)
+    reload_parser.add_argument("--timeout", type=float, default=20.0)
     stop = service_sub.add_parser("stop", add_help=False)
     stop.add_argument("--timeout", type=float, default=15.0)
     stop.add_argument("--force", action="store_true")
@@ -3423,6 +3485,8 @@ def main() -> None:
             cmd_service_run()
         elif args.service_cmd == "start":
             _emit(cmd_service_start())
+        elif args.service_cmd == "reload":
+            _emit(cmd_service_reload(args.timeout))
         elif args.service_cmd == "stop":
             _emit(cmd_service_stop(args.timeout, args.force))
         elif args.service_cmd == "status":

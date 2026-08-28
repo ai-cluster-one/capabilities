@@ -965,6 +965,8 @@ class Daemon:
         self.by_id = automation_map(self.config)
         self.children: dict[str, Child] = {}
         self.stop_requested = False
+        self.reload_requested = False
+        self.reload_error: str | None = None
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "runs").mkdir(parents=True, exist_ok=True)
         self.store, self.runs = open_ledger(self.root, self.config)
@@ -1225,6 +1227,41 @@ class Daemon:
                              summary="daemon stopped", pid=None)
             del self.children[run_id]
 
+    def reload_declaration(self, fingerprint_path: Path) -> None:
+        """Take up a declaration edited since start, without dropping work.
+
+        A daemon reads its declaration once, so everything written after it
+        started is declared and not in force. This closes that gap between two
+        ticks, which is the only moment at which nothing is being decided.
+
+        The new declaration is proved loadable before it replaces anything, so a
+        malformed edit leaves a healthy daemon scheduling exactly what it already
+        had. Children are subprocesses held by run id and the swap does not touch
+        them: work already dispatched finishes under the declaration that started
+        it, which is the whole reason to reload rather than restart.
+
+        The published fingerprint moves last and only on success, so nothing can
+        report itself current while running something else.
+        """
+        try:
+            config = load_effective_config(self.root, self.config_path, self.state_dir)
+        except Exception as exc:
+            self.reload_error = str(exc)
+            sys.stderr.write(
+                f"automations daemon: reload rejected, keeping the loaded "
+                f"configuration: {exc}\n"
+            )
+            sys.stderr.flush()
+            return
+        self.config = config
+        self.by_id = automation_map(config)
+        self.reload_error = None
+        fingerprint_path.write_text(config_fingerprint(config) + "\n")
+        sys.stderr.write(
+            f"automations daemon: reloaded, {len(self.by_id)} automations declared\n"
+        )
+        sys.stderr.flush()
+
     def run(self) -> None:
         import fcntl
 
@@ -1245,10 +1282,17 @@ class Daemon:
         def stop(_signum: int, _frame: Any) -> None:
             self.stop_requested = True
 
+        def reload(_signum: int, _frame: Any) -> None:
+            self.reload_requested = True
+
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
+        signal.signal(signal.SIGHUP, reload)
         try:
             while not self.stop_requested:
+                if self.reload_requested:
+                    self.reload_requested = False
+                    self.reload_declaration(fingerprint_path)
                 self.reap()
                 self.schedule_due(utc_now())
                 self.dispatch()

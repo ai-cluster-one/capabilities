@@ -235,7 +235,7 @@ POST_INSTALL: list = []
 SERVICE = {
     "name": "assistant",
     "summary": "Project-local Telegram assistant daemon using the bundled service engine.",
-    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs",
+    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",
               "migrate-ownership"],
     "config": "capabilities/telegram/service",
     "state": "<connection-state>/service",

@@ -2,9 +2,9 @@
 
 Run `automations doctor` after configuration changes. It validates the config, script paths, shared records store, environment selection, and bundled runtime.
 
-The daemon reads configuration at startup, so a change to schedules, limits, environment selectors, or script declarations reaches it only through a restart.
+The daemon reads configuration at startup, so a change to schedules, limits, environment selectors, or script declarations is declared and not yet in force. `automations service reload` closes that gap: the configuration is validated before it replaces anything, a daemon that rejects it keeps the one it is running, and jobs already dispatched finish under the declaration that started them. Reaching for a restart instead ends that work for no reason. Changing the state root or the records backend is what a reload genuinely cannot do, and still needs one.
 
-It records what it read. `automations doctor` compares that against the configuration declared now and fails with `config_stale` while a running daemon is scheduling a superseded one, so the gap is a health answer rather than something an operator has to remember. Under a supervisor that restarts a service its health check rejects, the restart follows from the same answer and no one has to notice at all.
+It records what it read. `automations doctor` compares that against the configuration declared now and fails with `config_stale` while a running daemon is scheduling a superseded one, so the gap is a health answer rather than something an operator has to remember. The same answer is what a caller waits on: a reload returns when the daemon publishes the fingerprint of the declaration it has taken up, so nothing reports itself current while running something else. A job cannot restart its own scheduler - stopping the program stops the process group it is running in - but it can reload it, which is the other reason the verb exists.
 
 Use `automations service run` as the foreground process under Docker Compose or another process supervisor. `automations service start` and `stop` are local conveniences. Inspect work through `automations runs`, `automations show`, and `automations logs`; cancellation and retry are explicit CLI operations.
 

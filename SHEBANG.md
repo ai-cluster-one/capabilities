@@ -313,6 +313,22 @@ def _gate() -> None:
 
 The gate is a **guardrail, not a security boundary** — project resolution remains cwd-based. A malformed policy is a configuration error and operational absence is closed. The exit-4 envelope routes the scope decision to the human. Bundled service `init`, `start`, and `run` additionally require explicit project enable: inherited global availability grants CLI use, not ownership of a project daemon. This rule lives once in the preamble: `_gate()` applies it only when the executable declares a `SERVICE` manifest surface, so each service implements its lifecycle without repeating policy logic and domain commands merely named `service` remain ordinary CLI verbs.
 
+## Bundled services
+
+A capability that ships a service declares it in the manifest (`SERVICE`) and owns its lifecycle under `<name> service ...`. Which verbs it offers is the capability's business, with one exception fixed by doctrine: a service that takes a declaration ships `reload`.
+
+The daemon holds its declaration in memory and read the file once, so the file and the process part company the moment either moves. Three mechanics keep that honest.
+
+**The running process publishes what it loaded.** Beside its pid file and behind the same lock, the daemon writes a fingerprint of the declaration it adopted and removes it on exit. `doctor` compares that against the declaration on disk and fails while the two differ, so *the process is running* and *the process is current* stay separate answers.
+
+**Reload is signalled, never restarted.** `<name> service reload` loads and validates the declaration first: asking a healthy daemon to adopt a file that does not parse is refused before it is asked, naming the parse error. It then sends `SIGHUP` to the daemon alone and never to its process group, because the group is exactly where in-flight work lives. The daemon takes the request at a point in its loop where nothing is being decided, re-reads, validates again, and swaps only on success; a rejection leaves the previous declaration scheduling and is reported on the service log. The published fingerprint moves last, and only on success, so nothing can report itself current while running something else.
+
+**The caller waits for evidence.** `reload` returns when the published fingerprint reaches the one it computed and times out otherwise, so a success is demonstrated rather than assumed and a silent rejection cannot read as one. A daemon already holding the declaration is not signalled at all.
+
+This is also what lets a service be corrected from inside itself. A job cannot restart the program it runs under - stopping a program stops the process group the job is in, so it dies before the restart lands - but it can reload it, because a reload is the one operation that deliberately leaves the group alone.
+
+What a reload cannot change belongs in the verb's own help rather than in the caller's memory: an identity the process authenticated as, a state root, a records backend. Those need a restart, and saying which is part of shipping the verb.
+
 ## The credential cascade
 
 Every executable resolves the values named by an explicit connection through the same deterministic cascade, first non-empty wins, so secrets can move from laptop files to deployment environment without changing the declared identity:
