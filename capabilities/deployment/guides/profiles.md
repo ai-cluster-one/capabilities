@@ -19,7 +19,14 @@ file. Changing what the services run *on* is a profile.
 `agent-box` compiles a container. `deployment sync` writes a Dockerfile, a
 Compose file, an entrypoint, an env example, and - when services are embedded -
 a Supervisor configuration that runs them as one PID 1. Every embedded service
-shares one image and one set of mounts.
+shares one image and one set of mounts. The project is copied into the image at
+build time.
+
+`agent-box-checkout` compiles the same container and fills it differently. The
+image carries tools and the boot path and no project at all; the checkout
+arrives at run time on a volume. Everything else about it - the Compose file,
+the embedded services, the Supervisor configuration, the mounts - is what
+`agent-box` produces.
 
 `host-agents` compiles supervised processes on the machine itself. There is no
 image and no Compose file. `sync` writes one launchd agent per service into
@@ -29,6 +36,65 @@ next` prints the `launchctl` steps that hand them over.
 `generic` declares a runtime without compiling anything. Use it when the
 project describes its shape for a reader and something outside this capability
 executes it.
+
+## What changes between a baked body and a checkout body
+
+Both container profiles build the same box. They disagree about one thing: where
+the project comes from, and therefore what a redeploy costs.
+
+**Where the body lives.** `agent-box` copies the project into the image, so the
+running container's filesystem is a build artifact and a rebuild replaces it.
+`agent-box-checkout` leaves `compiler.container.project_root` an empty mount
+point and declares an `agent_body` volume over it. On a first boot the entrypoint
+clones `AGENT_REPO_URL` at `AGENT_REPO_BRANCH` into that volume. On every boot
+after, a populated volume is left exactly as it is: what was committed there
+outranks anything the image believes.
+
+**What a redeploy costs.** This is the whole decision. Under `agent-box` a
+rebuild is how a change reaches the box, and anything the agent wrote inside the
+container is gone with the old image. Under `agent-box-checkout` the body
+survives the rebuild, and a change reaches the box through Git instead. Pick the
+checkout profile when the thing inside the box writes to its own project and
+that writing has to last - an assistant whose repository is its memory. Pick
+`agent-box` when the project is input the box only reads, which is the ordinary
+case and the simpler one.
+
+**What still comes from the image.** `deployment/capabilities.lock` is compiled
+from the effective project gate on the workstation and copied into the image, so
+under both profiles adding a capability needs an image rebuild rather than a
+push. Only the project travels through Git.
+
+**When initialization runs.** Host bindings, capability wiring, and compiled
+context are build artifacts of a checkout. `agent-box` makes them at build time
+against the copy it holds. `agent-box-checkout` has nothing to make them against
+until the volume is mounted, so its entrypoint runs `capabilities init`, and
+where ContextKit is bound `contextkit init`, `install-hooks` and `build`, on
+every boot. That costs boot time and needs the network at start; in exchange the
+bindings always describe the checkout actually running. It also writes into the
+checkout, which is now a working tree someone may be committing: a project on
+this profile has to ignore its generated host bindings, or every boot shows up
+as a change.
+
+**Where the boot inputs sit.** A volume mounted at the project root hides
+anything the image left underneath it, so the checkout profile copies the lock,
+the entrypoint, and the Supervisor configuration to `/opt/agent` and reads them
+from there. They are copied into one directory, so their file names must differ.
+The generated `.dockerignore` narrows the build context to exactly those files.
+
+**What the box needs told.** `AGENT_REPO_URL` is required, and Compose passes
+only declared keys, so an undeclared one never reaches the entrypoint and a
+fresh volume has nothing to clone - `deployment doctor` refuses that runtime
+rather than letting the first boot discover it. A private repository also needs
+`GIT_DEPLOY_KEY_B64`. `AGENT_REPO_BRANCH` defaults to `main`.
+
+The repository is still needed wherever the image is built: the Compose build
+context is the project, even though the running container clones its own copy.
+What the checkout profile removes is the project from the *image*, not from the
+build.
+
+**Two writers, one branch.** A box that commits its own body and a person who
+commits the same repository are two writers, and nothing in this capability
+arbitrates between them. That belongs to whatever runs inside the box.
 
 ## What changes between a container and a host
 

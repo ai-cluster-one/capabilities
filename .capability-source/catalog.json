@@ -37,7 +37,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "5a421ab656273f6846673c97b44bbea504bd8c99ece51545e0bb2b7edfbea2a6",
+      "payload_sha256": "bd7f070ad08dfd585b2ac006140df25d805817a7c2b019b0557fa41a5cdc9bb8",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into supervised processes on the machine itself, and describe the targets they deploy to."
     },
     "directo": {
