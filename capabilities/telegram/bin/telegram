@@ -4488,6 +4488,24 @@ def cmd_jobs_stop(job_id: str, chat: str | None, topic_id: str | None,
         register.store.close()
 
 
+def cmd_jobs_submit(job_id: str, chat: str | None, topic_id: str | None,
+                    confirmed: bool, actor_id: str | None = None) -> dict:
+    if not confirmed:
+        _die(6, "active_jobs_unconfirmed",
+             "submitting needs confirmation that the active jobs were read",
+             "read `telegram jobs active`, and if this outcome is not already "
+             "among them pass --confirm-active-jobs-checked")
+    root = _service_project_root()
+    module, register = _open_job_register(root)
+    try:
+        _require_job(register, module, job_id, chat, topic_id, actor_id)
+        return _job_row(register.submit(job_id, actor_id=actor_id))
+    except module.JobError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    finally:
+        register.store.close()
+
+
 def cmd_jobs_resume(job_id: str, chat: str | None, topic_id: str | None,
                     actor_id: str | None = None) -> dict:
     root = _service_project_root()
@@ -5329,7 +5347,8 @@ def main() -> None:
 
     jlist = job_scope(jb.add_parser("list", help="jobs in this project's register"),
                       needs_id=False)
-    jlist.add_argument("--state", choices=["waiting", "running", "stopped"],
+    jlist.add_argument("--state",
+                       choices=["draft", "waiting", "running", "stopped"],
                        help="what the job is doing")
     jlist.add_argument("--outcome",
                        choices=["succeeded", "failed", "cancelled",
@@ -5347,6 +5366,11 @@ def main() -> None:
     jreg.add_argument("--model")
     jreg.add_argument("--requested-by", help="the operator whose authority it carries")
     jreg.add_argument("--origin-message-id")
+    jsubmit = job_scope(jb.add_parser(
+        "submit", help="hand a draft to the runner"))
+    jsubmit.add_argument("--confirm-active-jobs-checked", action="store_true",
+                         dest="confirm_active_jobs_checked",
+                         help="you read `jobs active` and this outcome is not there")
     jamend = job_scope(jb.add_parser(
         "amend", help="continue a job with added context, keeping its session"))
     jamend.add_argument("text", help="what changed, in the operator's terms")
@@ -5465,6 +5489,9 @@ def main() -> None:
             _emit(cmd_jobs_amend(args.id, args.text, chat, topic, actor))
         elif args.jobs_cmd == "stop":
             _emit(cmd_jobs_stop(args.id, chat, topic, actor))
+        elif args.jobs_cmd == "submit":
+            _emit(cmd_jobs_submit(args.id, chat, topic,
+                                  args.confirm_active_jobs_checked, actor))
         elif args.jobs_cmd == "resume":
             _emit(cmd_jobs_resume(args.id, chat, topic, actor))
         return

@@ -36,6 +36,18 @@ def job_settings(**overrides):
     return base
 
 
+
+def queued(register, **payload):
+    """Register and hand over in one step.
+
+    Registering opens a draft so a dialogue turn can still ask questions about
+    it. These tests are about what the runner does with work already handed
+    over, so they submit as they register.
+    """
+    row = register.register(**payload)
+    return register.submit(row["id"])
+
+
 class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def stop_session(self, client, task):
@@ -118,7 +130,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                 if registered is None:
                     store, cli = self.as_cli(daemon)
                     try:
-                        cli.register(
+                        queued(cli, 
                             channel_key=state["channel_key"], requested_by="777",
                             description="reconcile the ledger", engine="stub",
                             origin_message_id=state["current_request"]["message_id"])
@@ -159,7 +171,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            row = register.register(channel_key="123", requested_by="777",
+            row = queued(register, channel_key="123", requested_by="777",
                                     description="reconcile the ledger",
                                     engine="stub")
             seen = {}
@@ -184,14 +196,18 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Registered jobs", seen["prompt"])
             self.assertIn("jobs active", seen["prompt"])
             self.assertIn("jobs list --state stopped --limit 5", seen["prompt"])
-            self.assertIn("separate queries", seen["prompt"])
-            self.assertIn("At the start of every turn", seen["prompt"])
-            self.assertIn("multi-step research", seen["prompt"])
+            self.assertIn("`active` answers that question", seen["prompt"])
+            self.assertIn("jobs submit", seen["prompt"])
+            self.assertIn("the choice is yours", seen["prompt"])
             self.assertIn("With one active job", seen["prompt"])
-            self.assertIn("With several active jobs", seen["prompt"])
-            self.assertIn("database recency by itself", seen["prompt"])
-            self.assertIn("preceding exchange named several jobs", seen["prompt"])
-            self.assertIn("make no ledger change", seen["prompt"])
+            self.assertIn("With several", seen["prompt"])
+            self.assertIn("recency alone selects nothing", seen["prompt"])
+            self.assertIn("leave the register as it is", seen["prompt"])
+            # The surface is offered, never ordered: the block names no reading
+            # order and sets no threshold above which delegating is required.
+            self.assertNotIn("At the start of every turn", seen["prompt"])
+            self.assertNotIn("15 seconds", seen["prompt"].split(
+                "--- Registered jobs ---")[1])
             self.assertNotIn(row["id"], seen["prompt"],
                              "the list is asked for, not handed over")
             self.assertNotIn("open_jobs", seen["state"])
@@ -206,9 +222,9 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            mine = register.register(channel_key="123", requested_by="777",
+            mine = queued(register, channel_key="123", requested_by="777",
                                      description="mine", engine="stub")
-            elsewhere = register.register(channel_key="999", requested_by="777",
+            elsewhere = queued(register, channel_key="999", requested_by="777",
                                           description="somebody else's",
                                           engine="stub")
             listed = [r["id"] for r in register.open_jobs("123")]
@@ -242,7 +258,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
             for label in ("first", "second", "third"):
-                register.register(channel_key="123", requested_by="777",
+                queued(register, channel_key="123", requested_by="777",
                                   description=label, engine="stub")
             release = asyncio.Event()
             started = []
@@ -277,7 +293,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td, worker="codex")
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            register.register(channel_key="123", requested_by="777",
+            queued(register, channel_key="123", requested_by="777",
                               description="the stub one", engine="stub")
             seen = []
 
@@ -302,7 +318,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td, worker="codex")
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            register.register(channel_key="123", requested_by="777",
+            queued(register, channel_key="123", requested_by="777",
                               description="pinned model", engine="codex",
                               model="gpt-pinned")
             seen = []
@@ -324,7 +340,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            row = register.register(channel_key="123", requested_by="777",
+            row = queued(register, channel_key="123", requested_by="777",
                                     description="durable delivery", engine="stub")
             runs = []
 
@@ -364,7 +380,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            row = register.register(channel_key="123", requested_by="777",
+            row = queued(register, channel_key="123", requested_by="777",
                                     description="reconcile the ledger",
                                     engine="stub")
             running = asyncio.Event()
@@ -419,7 +435,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            row = register.register(channel_key="123", requested_by="777",
+            row = queued(register, channel_key="123", requested_by="777",
                                     description="do not start", engine="stub")
             before_popen = asyncio.Event()
             release = asyncio.Event()
@@ -460,9 +476,9 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            blocker = register.register(channel_key="123", requested_by="777",
+            blocker = queued(register, channel_key="123", requested_by="777",
                                         description="the long one", engine="stub")
-            victim = register.register(channel_key="123", requested_by="777",
+            victim = queued(register, channel_key="123", requested_by="777",
                                        description="drop this one", engine="stub")
             hold = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -499,7 +515,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            row = register.register(channel_key="123", requested_by="777",
+            row = queued(register, channel_key="123", requested_by="777",
                                     description="the long one", engine="stub")
             runs = []
             running = asyncio.Event()
@@ -545,9 +561,9 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            first = register.register(channel_key="123", requested_by="777",
+            first = queued(register, channel_key="123", requested_by="777",
                                       description="first", engine="stub")
-            second = register.register(channel_key="123", requested_by="777",
+            second = queued(register, channel_key="123", requested_by="777",
                                        description="second", engine="stub")
 
             def worker(chat, tail, state=None, procs=None):
@@ -575,7 +591,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            row = register.register(channel_key="123", requested_by="777",
+            row = queued(register, channel_key="123", requested_by="777",
                                     description="interrupted work", engine="stub")
             running = register.claim_next(
                 owner_id="dead-daemon", owner_host=daemon.JOB_OWNER_HOST,
@@ -615,7 +631,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
-            row = register.register(channel_key="123", requested_by="777",
+            row = queued(register, channel_key="123", requested_by="777",
                                     description="survive the restart", engine="stub")
             runs = []
             running = asyncio.Event()

@@ -185,6 +185,7 @@ def import_daemon(tmp: Path, service_settings: dict, *,
                   connection_extra: dict | None = None,
                   voice_context: str | None = None,
                   worker_context: str | None = None,
+                  jobs_prompt: str | None = None,
                   project_env: dict | None = None,
                   store: bool = False):
     """Import one daemon against a throwaway project.
@@ -213,6 +214,8 @@ def import_daemon(tmp: Path, service_settings: dict, *,
     context_file.write_text("test context\n")
     if worker_context is not None:
         worker_context_file.write_text(worker_context)
+    if jobs_prompt is not None:
+        (service_dir / "jobs.md").write_text(jobs_prompt)
     if voice_context is not None:
         voice_context_file.write_text(voice_context)
     if project_env:
@@ -640,11 +643,14 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                         description="Count every topic",
                         engine="stub",
                     )
+                    # The handoff is the submit, so the turn does both before
+                    # it signals: a draft would never reach the runner.
+                    row = register.submit(row["id"])
                 finally:
                     store.close()
                 Path(state["progress_outbox"]).write_text(
                     json.dumps({
-                        "event": "job_registered",
+                        "event": "job_submitted",
                         "job_id": row["id"],
                         "description": row["description"],
                     }) + "\n" + json.dumps({"text": "Counting every topic."}) + "\n")
@@ -4677,6 +4683,50 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 daemon._channel_context([policy, daemon._topic_policy(policy, 7)]),
                 ("room prose\n\nlane prose", True))
+
+    async def test_the_shipped_jobs_prompt_is_served_when_a_project_has_none(self):
+        """A project inherits the wording until it decides to own it."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            prompt = daemon.build_prompt(
+                [], {"chat_id": 5, "jobs_available": True})
+            self.assertIn("--- Registered jobs ---", prompt)
+            self.assertIn("the choice is yours", prompt)
+            self.assertIn("jobs submit", prompt)
+
+    async def test_a_project_jobs_prompt_replaces_the_shipped_one(self):
+        """The wording is prose a project iterates on without a release, so its
+        own file is the prompt rather than an addition to it."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(),
+                jobs_prompt="ask me about work with {{TELEGRAM_JOBS_COMMAND}} active\n")
+            prompt = daemon.build_prompt(
+                [], {"chat_id": 5, "jobs_available": True})
+            self.assertIn("ask me about work with", prompt)
+            self.assertIn("jobs active", prompt)
+            self.assertNotIn("the choice is yours", prompt)
+
+    async def test_a_channel_without_delegation_is_told_nothing_about_jobs(self):
+        """A room that must answer synchronously is not offered the register at
+        all: no verbs, and nothing about work it cannot start."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.assertTrue(daemon._delegation_allowed(None))
+            self.assertFalse(daemon._delegation_allowed(
+                {"delegation": {"mode": "disabled"}}))
+            self.assertTrue(daemon._delegation_allowed(
+                {"delegation": {"mode": "allowed"}}))
+            prompt = daemon.build_prompt(
+                [], {"chat_id": 5, "jobs_available": False})
+            self.assertNotIn("--- Registered jobs ---", prompt)
+            self.assertNotIn("jobs submit", prompt)
+
+    async def test_a_channel_default_can_close_delegation_for_every_room(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(delegation={"mode": "disabled"}))
+            self.assertFalse(daemon._delegation_allowed(None))
 
     async def test_an_exclusive_prompt_answers_without_the_service_context(self):
         with tempfile.TemporaryDirectory() as td:

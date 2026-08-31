@@ -610,7 +610,7 @@ class OutboundActionsTests(unittest.TestCase):
                     shim.enforce_job_scope(["telegram", "jobs", "active"])
         self.assertEqual(stopped.exception.code, 4)
 
-    def test_worker_job_registration_is_attributed_and_signals_the_handoff(self):
+    def test_worker_job_registration_is_attributed_without_a_handoff(self):
         shim = import_worker_shim()
         with tempfile.TemporaryDirectory() as td:
             outbox = Path(td) / "progress.jsonl"
@@ -621,18 +621,18 @@ class OutboundActionsTests(unittest.TestCase):
                 "description": "Count every topic",
                 "state": "waiting",
             }
-            completed = types.SimpleNamespace(
-                returncode=0, stdout=json.dumps(row) + "\n", stderr="")
+            # Registering is an ordinary passthrough now: no result to read and
+            # nothing to signal, so the shim hands the process straight over.
             with mock.patch.dict(os.environ, env, clear=False), \
                     mock.patch.object(
                         sys, "argv", ["telegram", "jobs", "register",
                                       "Count every topic"]), \
-                    mock.patch.object(shim.subprocess, "run",
-                                      return_value=completed) as run, \
+                    mock.patch.object(shim.os, "execvp") as execvp, \
                     mock.patch.object(sys, "stdout"):
-                self.assertEqual(shim.main(), 0)
+                shim.main()
 
-            invoked = run.call_args.args[0]
+            invoked = [execvp.call_args.args[0]] + list(
+                execvp.call_args.args[1])[1:]
             self.assertEqual(invoked, [
                 "/real/telegram", "jobs", "register", "Count every topic",
                 "--chat", "-1001", "--topic-id", "77",
@@ -640,23 +640,50 @@ class OutboundActionsTests(unittest.TestCase):
                 "--origin-message-id", "88", "--engine", "codex",
                 "--model", "gpt-test",
             ])
+            # Registering only opens a draft. The turn that wrote it still has
+            # questions to ask, so nothing tells the daemon to end it yet.
+            self.assertFalse(outbox.exists())
+
+    def test_worker_job_submit_signals_the_handoff(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as td:
+            outbox = Path(td) / "progress.jsonl"
+            env = self._worker_env(outbox)
+            env["TELEGRAM_REAL_TELEGRAM"] = "/real/telegram"
+            row = {"id": "job-123", "description": "Count every topic",
+                   "state": "waiting"}
+            completed = types.SimpleNamespace(
+                returncode=0, stdout=json.dumps(row) + "\n", stderr="")
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(
+                        sys, "argv", ["telegram", "jobs", "submit", "job-123",
+                                      "--confirm-active-jobs-checked"]), \
+                    mock.patch.object(shim.subprocess, "run",
+                                      return_value=completed) as run, \
+                    mock.patch.object(sys, "stdout"):
+                self.assertEqual(shim.main(), 0)
+
+            invoked = run.call_args.args[0]
+            self.assertEqual(invoked[0], "/real/telegram")
+            self.assertIn("--chat", invoked)
+            self.assertIn("-1001", invoked)
             event = json.loads(outbox.read_text())
-            self.assertEqual(event["event"], "job_registered")
+            self.assertEqual(event["event"], "job_submitted")
             self.assertEqual(event["job_id"], "job-123")
             self.assertEqual(event["description"], "Count every topic")
 
-    def test_failed_worker_job_registration_does_not_signal_a_handoff(self):
+    def test_failed_worker_job_submit_does_not_signal_a_handoff(self):
         shim = import_worker_shim()
         with tempfile.TemporaryDirectory() as td:
             outbox = Path(td) / "progress.jsonl"
             completed = types.SimpleNamespace(
-                returncode=6, stdout="", stderr="bad registration\n")
+                returncode=6, stdout="", stderr="bad submit\n")
             with mock.patch.object(shim.subprocess, "run", return_value=completed), \
                     mock.patch.object(sys, "stdout"), \
                     mock.patch.object(sys, "stderr"):
                 self.assertEqual(
-                    shim.run_job_register(["telegram", "jobs", "register", "x"],
-                                          str(outbox)),
+                    shim.run_job_handoff(["telegram", "jobs", "submit", "x"],
+                                         str(outbox)),
                     6)
             self.assertFalse(outbox.exists())
 

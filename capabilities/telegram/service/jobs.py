@@ -229,10 +229,15 @@ STORE_MIGRATION_STEPS = {
 # them behaving differently: `quota` is resumed by the runner when the pause
 # lifts, `interrupted` by the configured recovery policy, and the rest only by
 # somebody asking. It says nothing while the job is waiting or running.
+# A job is written before it is handed over. `draft` is that gap made explicit:
+# the row exists, so a description can be corrected and material added to it,
+# and no runner will take it, because the runner claims `waiting` and nothing
+# else. Submitting is the single act that ends the writing and begins the work.
+DRAFT = "draft"
 WAITING = "waiting"
 RUNNING = "running"
 STOPPED = "stopped"
-STATES = (WAITING, RUNNING, STOPPED)
+STATES = (DRAFT, WAITING, RUNNING, STOPPED)
 
 SUCCEEDED = "succeeded"
 FAILED = "failed"
@@ -565,7 +570,7 @@ class JobRegister:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)",
                     (job_id, self.project_id, self.environment, self.surface,
                      str(channel_key), str(requested_by), origin,
-                     description, engine, model, WAITING, now, now))
+                     description, engine, model, DRAFT, now, now))
         except Exception:
             # The unique origin index is the concurrent-delivery fence. If the
             # other registrar won, return that one durable identity; otherwise
@@ -922,6 +927,11 @@ class JobRegister:
             # The amendment row is durable intent. Only the daemon that owns
             # this exact attempt may stop its process and transition the job.
             return self.get(job_id, actor_id=actor_id)
+        if current["state"] == DRAFT:
+            # Amending a draft is the draft being written. Continuing it is
+            # what `submit` is for, and doing it here would hand a job over
+            # at the very moment somebody said it was not right yet.
+            return self.get(job_id, actor_id=actor_id)
         if (current["state"] == STOPPED and current.get("engine") != "stub"
                 and not current.get("session_id")):
             # No checkpoint means continuing may repeat work already performed.
@@ -1123,6 +1133,23 @@ class JobRegister:
                        now if delivered else None, now]
                       + params + [job_id, "delivering", delivery_token, owner_id]))
         return self.get(job_id) if cur.rowcount else None
+
+    def submit(self, job_id: str, *, actor_id: str | None = None) -> dict[str, Any] | None:
+        """Hand a draft over to the runner.
+
+        The one transition that ends authoring and begins work. It is
+        conditional on the row still being a draft, so a second submit of the
+        same job is refused rather than silently restarting work already in
+        flight, and a job that has moved on is left exactly where it is.
+        """
+        row = self.get(job_id, actor_id=actor_id)
+        if row is None:
+            return None
+        if row["state"] != DRAFT:
+            raise JobError("job_not_draft",
+                           f"job {job_id} is {row['state']}, not a draft",
+                           "only a draft is submitted; amend or resume the rest")
+        return self._actor_update(job_id, actor_id, state=WAITING)
 
     def resume(self, job_id: str, *, actor_id: str | None = None) -> dict[str, Any] | None:
         """Make sure this job is on its way, from wherever it is.

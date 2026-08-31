@@ -265,6 +265,9 @@ CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_CONTEXT")
                     or SERVICE_DIR / "context.md")
 WORKER_CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_WORKER_CONTEXT")
                            or SERVICE_DIR / "worker.md")
+# The jobs block is prose, not code: a project iterates on the wording in its
+# own `jobs.md` and the capability ships the one every project starts from.
+JOBS_PROMPT_TEMPLATE = Path(__file__).resolve().parent / "templates" / "jobs.md"
 
 
 _RECORDS = None
@@ -450,6 +453,12 @@ def _runtime_settings(settings, project_layout=None):
     voice_context_file = Path(voice_prompt_file)
     if not voice_context_file.is_absolute():
         voice_context_file = SERVICE_DIR / voice_context_file
+    jobs_prompt_file = Path(
+        os.environ.get("TELEGRAM_SERVICE_JOBS_PROMPT")
+        or (defaults.get("jobs") or {}).get("prompt_file")
+        or "jobs.md")
+    if not jobs_prompt_file.is_absolute():
+        jobs_prompt_file = SERVICE_DIR / jobs_prompt_file
     assistant_name = str(
         settings.get("assistant_name") or defaults.get("assistant_name") or "Assistant")
     default_worker = str(
@@ -500,6 +509,7 @@ def _runtime_settings(settings, project_layout=None):
         "VOICE_RECORDING_CAPTION": str(voice_defaults.get("recording_caption") or "").strip(),
         "VOICE_PROGRESS_INTERVAL": voice_progress_interval,
         "VOICE_CONTEXT_FILE": voice_context_file,
+        "JOBS_PROMPT_FILE": jobs_prompt_file,
         "ASSISTANT_NAME": assistant_name,
         "DEFAULT_GROUP_ALIASES": group_aliases or (assistant_name,),
         "DEFAULT_WORKER": default_worker,
@@ -1632,6 +1642,24 @@ def _document_key(path):
     return stem
 
 
+def jobs_prompt_text():
+    """The jobs block this project serves, or the one the capability ships.
+
+    A project keeps its own `jobs.md` beside its settings when it wants to
+    iterate on the wording without a release; until it has one, the shipped
+    template is the prompt. Neither is a fallback for a store that cannot be
+    read: `read_service_document` still raises for that, and an empty file is
+    an empty block rather than a silent return to the default.
+    """
+    text = read_service_document(JOBS_PROMPT_FILE)
+    if Path(JOBS_PROMPT_FILE).exists():
+        return text
+    try:
+        return JOBS_PROMPT_TEMPLATE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return text
+
+
 def read_service_document(path):
     """Prose the daemon serves at request time — the soft-gate context, a
     project's worker extension, a channel's own context, the voice prompt.
@@ -2204,6 +2232,23 @@ def _is_spoken_media(message):
 def _is_voice_or_video_note(message):
     """True for Telegram's voice messages and circular video notes."""
     return bool(getattr(message, "voice", False) or getattr(message, "video_note", False))
+
+
+def _delegation_allowed(policy, sender_id=None):
+    """Whether this channel may hand work to a runner.
+
+    Delegation is on where nothing says otherwise, because a job is ordinary
+    work and most channels want it. A channel that must answer synchronously -
+    a room where the assistant only talks to a client - turns it off, and then
+    the register is not offered to that turn at all: no verbs, no block, and
+    nothing in the prompt about work it cannot start.
+    """
+    for source in (policy, ALLOWED.get(str(sender_id)) if sender_id else None,
+                   DEFAULTS):
+        mode = ((source or {}).get("delegation") or {}).get("mode")
+        if mode is not None:
+            return str(mode).strip().lower() in ("allowed", "on", "enabled", "auto")
+    return True
 
 
 def _voice_transcription_mode(policy, reg, key):
@@ -3573,45 +3618,10 @@ def build_prompt(tail, state=None):
     jobs_block = ""
     if st.get("jobs_available"):
         jobs_command = f'{WORKER_BIN / "telegram"} jobs'
-        jobs_block = (
-            "--- Registered jobs ---\n"
-            "People speak naturally; never require them to say job, queue, async, "
-            "or an id. At the start of every turn, always read every in-flight job "
-            f"with `{jobs_command} active`. Then read only recent resumable history "
-            f"with `{jobs_command} list --state stopped --limit 5`. Keep these as "
-            "separate queries: a long-running job must never disappear behind newer "
-            "completed rows. Then decide in this order:\n"
-            "1. If this is a status question about existing work, report only what "
-            "the ledger and conversation establish. Do not start another task.\n"
-            "2. If it corrects, narrows, supplies material for, or adds a constraint "
-            "to existing work, amend that job and briefly acknowledge it. Do not "
-            "perform the amendment in this dialogue turn.\n"
-            "3. Otherwise decide whether the new request can be responsibly completed "
-            "in this dialogue turn. Register it before doing substantive work when it "
-            "needs multi-step research, several sources or actions, implementation, "
-            "waiting or monitoring, or is otherwise likely to take more than about "
-            f"15 seconds: `{jobs_command} register \"<one-line outcome>\"`. "
-            "Use that command exactly as shown; the worker wrapper supplies the "
-            "authorized chat, requester, origin message, worker, and model. Then only "
-            "say that the work is underway; do not promise a duration. Answer directly "
-            "only when the useful final answer is genuinely available now.\n"
-            "Resolve references naturally. An explicit id or reply target wins. With "
-            "one active job, elliptical follow-ups such as 'how is it going?', 'and "
-            "also include...', or 'no, use the other one' refer to it unless they are "
-            "clearly standalone. With several active jobs, use a unique semantic "
-            "match or an immediately preceding exchange that explicitly concerned "
-            "one of them; database recency by itself never selects a job. If the "
-            "preceding exchange named several jobs, bare words such as 'it', 'there', "
-            "or 'also' are ambiguous. Without a reply, id, subject, or conversational "
-            "antecedent that names exactly one active job, ask which work the person "
-            "means and make no ledger change instead "
-            "of guessing or creating a duplicate. A separate requested outcome is a new "
-            f"job. Amend with `{jobs_command} amend <id> \"<what changed>\"`. "
-            "Natural requests to pause, stop, cancel, continue, or resume existing work "
-            f"map to `{jobs_command} stop <id>` and `{jobs_command} resume <id>`. "
-            "Stopped jobs are resumable and may be the subject of a status, amendment, "
-            "or continuation. Apply the same unique-reference rule: if several jobs fit, "
-            "ask which one and do not amend, stop, resume, or register anything.\n\n")
+        body = jobs_prompt_text().replace(
+            "{{TELEGRAM_JOBS_COMMAND}}", jobs_command).strip()
+        if body:
+            jobs_block = "--- Registered jobs ---\n" + body + "\n\n"
     if st.get("quota_pause"):
         jobs_block += f"Queue paused: {st['quota_pause']}\n\n"
     request_block = ""
@@ -4818,7 +4828,7 @@ async def run_session(client):
                 item = json.loads(line)
             except ValueError:
                 continue
-            if item.get("event") == "job_registered":
+            if item.get("event") == "job_submitted":
                 if handoff is not None:
                     handoff["job"] = {
                         "id": item.get("job_id"),
@@ -5139,7 +5149,8 @@ async def run_session(client):
                      "authority": authority,
                      "authority_context": authority_context,
                      "progress_outbox": str(progress_outbox),
-                     "jobs_available": jobs_available(),
+                     "jobs_available": (jobs_available() and _delegation_allowed(
+                         group_policy, job.get("sender_id"))),
                      "quota_pause": quota_pause_notice(),
                      "worker_session": worker_session,
                      "cancel_event": cancel_event,

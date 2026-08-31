@@ -18,6 +18,9 @@ WORKERS = {"claude", "codex", "stub"}
 MEDIA_LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
 DIRECT_MODES = {"allowed_users", "anyone", "all", "open", "public"}
 VOICE_MODES = {"disabled", "enabled", "auto", "on"}
+# Whether a channel may hand work to a runner. Off means the register is not
+# offered to that turn at all, so the channel always answers synchronously.
+DELEGATION_MODES = {"allowed", "disabled", "on", "enabled", "auto"}
 VOICE_TOOLS = {"agent_task", "send_to_chat", "run_capability",
                "read_project_file", "reload_service"}
 VOICE_SESSION_MODES = {"carry", "fresh"}
@@ -353,7 +356,8 @@ def _overlay(value, path, project_root, service_dir):
 def _participant(value, path, project_root, service_dir, *, member=False):
     value = _object(value, path)
     allowed = {
-        "name", "username", "role", "may_address", "control", "authority",
+        "name", "username", "role", "may_address", "delegation",
+        "control", "authority",
         "allowed_capabilities", "capabilities", "context", "context_file",
         "context_mode", "call_recording", "voice_agent", "project",
     }
@@ -371,6 +375,8 @@ def _participant(value, path, project_root, service_dir, *, member=False):
         _string_list(value["address_aliases"], f"{path}.address_aliases")
     if "control" in value:
         _control_rule(value["control"], f"{path}.control")
+    if "delegation" in value:
+        _delegation(value["delegation"], f"{path}.delegation")
     if "authority" in value:
         _authority_policy(value["authority"], f"{path}.authority")
     for key in ("allowed_capabilities", "capabilities"):
@@ -392,7 +398,8 @@ def _group(value, path, project_root, service_dir):
     allowed = {
         "name", "role", "member_role", "aliases", "address_aliases", "mentions",
         "require_reference", "members", "agent_dialogue", "worker_timeout",
-        "voice_transcription", "call_recording", "control", "authority",
+        "voice_transcription", "call_recording", "delegation",
+        "control", "authority",
         "allowed_capabilities", "capabilities", "context", "context_file",
         "context_mode", "project", "topics",
     }
@@ -426,6 +433,8 @@ def _group(value, path, project_root, service_dir):
         if "reset_on_human_message" in policy:
             _boolean(policy["reset_on_human_message"],
                      f"{path}.agent_dialogue.reset_on_human_message")
+    if "delegation" in value:
+        _delegation(value["delegation"], f"{path}.delegation")
     if "voice_transcription" in value:
         policy = _object(value["voice_transcription"], f"{path}.voice_transcription")
         _unknown(policy, {"mode"}, f"{path}.voice_transcription")
@@ -447,6 +456,13 @@ def _group(value, path, project_root, service_dir):
     _overlay(value, path, project_root, service_dir)
 
 
+def _delegation(value, path):
+    policy = _object(value, path)
+    _unknown(policy, {"mode"}, path)
+    if "mode" in policy:
+        _enum(policy["mode"], DELEGATION_MODES, f"{path}.mode")
+
+
 def _defaults(value, path, project_root, service_dir):
     value = _object(value, path)
     allowed = {
@@ -454,12 +470,20 @@ def _defaults(value, path, project_root, service_dir):
         "debounce", "worker_timeout", "progress_after",
         "max_parallel_dialogue", "max_parallel_jobs", "job_poll_interval",
         "job_recovery", "max_attempts", "group_aliases", "worker", "workers",
-        "voice_agent",
+        "voice_agent", "jobs", "delegation",
         "media_log_level",
     }
     _unknown(value, allowed, path)
     if "assistant_name" in value:
         _string(value["assistant_name"], f"{path}.assistant_name", nonempty=True)
+    if "delegation" in value:
+        _delegation(value["delegation"], f"{path}.delegation")
+    if "jobs" in value:
+        jobs = _object(value["jobs"], f"{path}.jobs")
+        _unknown(jobs, {"prompt_file"}, f"{path}.jobs")
+        if "prompt_file" in jobs:
+            _safe_service_path(jobs["prompt_file"], f"{path}.jobs.prompt_file",
+                               project_root, service_dir)
     numeric = {
         "tail_size": (1, 500, True),
         "sync_interval": (0.01, 3600, False),

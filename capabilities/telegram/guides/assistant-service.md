@@ -95,7 +95,7 @@ The accepted schema is deliberately finite:
 - Group policy: `name`, `role`/`member_role`, `aliases`/`address_aliases`/`mentions`, `require_reference`, `members`, `agent_dialogue`, `worker_timeout`, `voice_transcription`, `call_recording`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `context_mode`, `project`, and `topics`.
 - `topics`: keyed by forum topic ID, each entry accepting `project`, `context`, `context_file`, and `context_mode`. A topic carries no authority tier: it inherits its group's rights and can neither narrow nor widen them.
 - Top level: `connection`, `environment`, `assistant_name`, `direct_messages`, `allowed_users`, `allowed_groups`, `control`, `authority`, and `defaults`.
-- Defaults: `assistant_name`, `tail_size`, `sync_interval`, `sync_stale_after`, `debounce`, `worker_timeout`, `progress_after`, `max_parallel_dialogue`, `max_parallel_jobs`, `job_poll_interval`, `job_recovery`, `max_attempts`, `group_aliases`, `worker`, `workers`, `voice_agent`, and `media_log_level`.
+- Defaults: `assistant_name`, `tail_size`, `sync_interval`, `sync_stale_after`, `debounce`, `worker_timeout`, `progress_after`, `max_parallel_dialogue`, `max_parallel_jobs`, `job_poll_interval`, `job_recovery`, `max_attempts`, `group_aliases`, `worker`, `workers`, `voice_agent`, `jobs`, `delegation`, and `media_log_level`.
 - `media_log_level` decides how much of the media stack reaches the daemon log: `info` is what a normal call is read at, `debug` is what a call under investigation is read at, and the level applies on start and on every reload. Importing pytgcalls mutes that logger, so this setting is the only thing that speaks for it.
 - Worker policy: `model`; Claude also accepts `effort`; Codex accepts `reasoning_effort` and `service_tier`. Voice defaults accept `worker`, `workers`, `model`, `voice`, `greeting`, `history`, `timezone`, `progress_interval`, `recording_caption`, and `prompt_file`.
 - Control policies contain `commands`; authority policies contain `allowed_capabilities` or `capabilities`. Capability rules accept booleans/`*`, verb lists, or `allow`/`deny`/`enabled`/`scope`/`verbs`/`connections` objects.
@@ -218,13 +218,15 @@ A **dialogue turn** answers in the channel and is expected to finish while the p
 
 A **registered job** is work that outlives the sentence that asked for it. It is a row in `tg_worker_jobs` in the shared capabilities store, drained by the job runner in arrival order within `max_parallel_jobs` slots for the whole daemon. `job_poll_interval` is how often the runner looks.
 
-Successful registration is a hard handoff, not only a prompt convention. The dialogue worker gets a brief grace period to return its natural acknowledgement; if it keeps working, the daemon ends that duplicate turn without reporting an error while the registered worker continues independently.
+Registering opens a **draft**: the row exists and no runner takes it, so the dialogue turn can ask what the request left open and amend the description before any work starts. Submitting is the handoff, and it is a hard one rather than a prompt convention. The dialogue worker gets a brief grace period after the submit to return its natural acknowledgement; if it keeps working, the daemon ends that duplicate turn without reporting an error while the submitted worker continues independently.
+
+`submit` requires `--confirm-active-jobs-checked`. The flag is a promise the tool cannot verify, and it is asked for at the one moment the check is worth making: a new outcome is about to join work already in flight.
 
 ### State and outcome
 
 A job answers two questions, and only one of them changes what anything does.
 
-`state` is the whole of the runner's interest: **`waiting`** for a slot, **`running`** in one, or **`stopped`** in neither. Nothing else is a state, because nothing else changes what may happen next — the session is the checkpoint, so work that stopped for any reason at all continues from where it stopped, and a job that never started continues by starting. There is no `finished`: it would differ from `stopped` only in the label, and the label has a column of its own.
+`state` is the whole of the runner's interest: **`draft`** while it is still being written, **`waiting`** for a slot, **`running`** in one, or **`stopped`** in neither. A draft is invisible to the runner, which claims `waiting` and nothing else. Nothing else is a state, because nothing else changes what may happen next — the session is the checkpoint, so work that stopped for any reason at all continues from where it stopped, and a job that never started continues by starting. There is no `finished`: it would differ from `stopped` only in the label, and the label has a column of its own.
 
 `outcome` is that label — why a stopped job stopped: **`succeeded`**, **`failed`**, **`cancelled`** (somebody asked), **`interrupted`** (the daemon restarted under it), **`quota`** (the subscription is spent). Each value earns its place by behaving differently: `quota` is continued by the runner when the pause lifts, `interrupted` by the `job_recovery` policy, the rest only when somebody asks. It says nothing while the job is waiting or running.
 
@@ -238,6 +240,7 @@ telegram jobs active [--chat C] [--topic-id T]
 telegram jobs show <id>
 telegram jobs register "<one line>" --chat C --requested-by U [--engine E]
 telegram jobs amend <id> "<what changed>"
+telegram jobs submit <id> --confirm-active-jobs-checked
 telegram jobs stop <id>
 telegram jobs resume <id>
 ```
@@ -252,13 +255,19 @@ This wrapper is not an OS security boundary. Text workers currently run with ful
 
 ### What the worker is told, and what it asks for
 
-The prompt names the surface; it does not carry a snapshot of it. The queue moves while a turn is being written, so a list pasted in at dispatch is already stale when it is read. At the start of every dialogue turn the worker runs `telegram jobs active` as an unbounded view of in-flight work, then `telegram jobs list --state stopped --limit 5` for recent resumable history. Keeping these reads separate prevents an old long-running job from disappearing behind newer completed rows. Their authenticated actor scope returns only jobs requested by the person whose message created this turn.
+The prompt names the surface; it does not carry a snapshot of it. The queue moves while a turn is being written, so a list pasted in at dispatch is already stale when it is read. `telegram jobs active` is an unbounded view of in-flight work and `telegram jobs list --state stopped --limit 5` is recent resumable history; they stay separate reads so an old long-running job cannot disappear behind newer completed rows. Their authenticated actor scope returns only jobs requested by the person whose message created this turn.
 
-People never have to name the mechanism. The dialogue worker applies this order to ordinary language:
+The block describes the choice and leaves it to the worker: answer in this turn, or hand the work to a runner that outlives it. It names what each costs — a dialogue answer keeps the context already built and survives nothing, a submitted job survives restart, quota and amendment but opens a fresh rollout and holds a slot — and it sets no threshold in seconds, because whether work is long is usually learned by starting it.
 
-1. A question about ongoing work reads and reports its existing state; it does not create work.
-2. A correction, new constraint, or additional material for ongoing work amends that row; it is not executed inside the dialogue turn.
-3. A genuinely new request is registered before substantive work when it requires multi-step research, several sources or actions, implementation, waiting or monitoring, or otherwise likely exceeds roughly fifteen seconds. The dialogue turn then acknowledges it and ends. A final answer that is genuinely available now stays a dialogue answer.
+The register is one source beside the conversation and the project's own body and record layer. It holds jobs and begins where the queue began on that host, so work finished before that, or done outside a job, is only in the record layer. The block says so, because a worker that treats an empty register as an empty history reports work as undone.
+
+People never have to name the mechanism, and never hear it either: the register, its states and its ids are internal on both sides, and work in flight is described in the first person as the assistant's own.
+
+The prompt itself is prose the daemon serves at request time, not a string in the code. `service/templates/jobs.md` is what the capability ships; a project that wants to iterate on the wording keeps its own `service/jobs.md`, or names another file in `defaults.jobs.prompt_file`, and that file replaces the shipped one. `{{TELEGRAM_JOBS_COMMAND}}` in either is rewritten to the shim path.
+
+### Turning delegation off
+
+A channel that must always answer synchronously — a room where the assistant only talks to a client — sets `delegation.mode` to `disabled` on that user or group, or in `defaults` for every channel. The register is then not offered to those turns at all: no block, no verbs, and nothing in the prompt about work they cannot start. Delegation is on where nothing says otherwise.
 
 Reference resolution remains prompt judgement because conversation meaning cannot be reduced to a channel lock. An explicit id or reply target wins. With one active job, an elliptical status question or continuation binds to it unless it is clearly standalone. With several, the worker uses either a unique semantic match or an immediately preceding exchange explicitly about one job; database recency alone never selects one. If the preceding exchange named several jobs, bare references such as “it”, “there” or “also” are ambiguous, so the worker asks a short clarification and makes no ledger write first. It does not guess or create a duplicate. A separate requested outcome is a new job.
 

@@ -41,11 +41,49 @@ class RegisterCase(unittest.TestCase):
             store, self.envelope, "development", url=self.url)
         self.addCleanup(self.store.close)
 
-    def register(self, reg=None, **overrides):
+    def register(self, reg=None, submit=True, **overrides):
+        """A job most tests want in the queue. Registering opens a draft, so
+        unless a test is about drafting it is submitted here."""
         payload = {"channel_key": "-100:7", "requested_by": "42",
                    "description": "reconcile the ledger", "engine": "codex"}
         payload.update(overrides)
-        return (reg or self.reg).register(**payload)
+        target = reg or self.reg
+        row = target.register(**payload)
+        if submit and row["state"] == jobs.DRAFT:
+            return target.submit(row["id"])
+        return row
+
+    # -- drafting ------------------------------------------------------------
+
+    def test_registering_opens_a_draft_no_runner_takes(self):
+        """The gap between writing a job and handing it over is the point: a
+        description arrives incomplete, and the turn that wrote it needs room
+        to ask before a runner starts on it."""
+        row = self.register(submit=False)
+        self.assertEqual(row["state"], jobs.DRAFT)
+        self.assertIsNone(self.reg.claim_next(
+            owner_id="daemon-a", owner_host="host-a", max_parallel=4))
+
+    def test_submitting_a_draft_queues_it(self):
+        row = self.register(submit=False)
+        submitted = self.reg.submit(row["id"])
+        self.assertEqual(submitted["state"], jobs.WAITING)
+        claimed = self.reg.claim_next(
+            owner_id="daemon-a", owner_host="host-a", max_parallel=4)
+        self.assertEqual(claimed["id"], row["id"])
+
+    def test_a_draft_takes_amendments_before_it_is_handed_over(self):
+        row = self.register(submit=False)
+        self.reg.stage_amendment(row["id"], "only the closed invoices")
+        self.reg.amend(row["id"])
+        self.assertEqual(self.reg.get(row["id"])["state"], jobs.DRAFT)
+        self.assertEqual(self.reg.submit(row["id"])["state"], jobs.WAITING)
+
+    def test_only_a_draft_is_submitted(self):
+        row = self.register()
+        with self.assertRaises(jobs.JobError) as refused:
+            self.reg.submit(row["id"])
+        self.assertEqual(refused.exception.slug, "job_not_draft")
 
     # -- identity and isolation ----------------------------------------------
 
