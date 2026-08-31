@@ -4,10 +4,16 @@ import shutil
 import subprocess
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[3]
-SCRIPT = REPO / "capabilities" / "slack" / "bin" / "slack"
-MANAGER = REPO / "bin" / "capabilities"
-BUNDLE = SCRIPT.parent.parent
+CAPABILITY = Path(__file__).resolve().parents[1]
+SOURCE_REPO = Path(__file__).resolve().parents[3]
+SOURCE_SCRIPT = SOURCE_REPO / "capabilities" / "slack" / "bin" / "slack"
+SCRIPT = SOURCE_SCRIPT if SOURCE_SCRIPT.is_file() else CAPABILITY / "slack"
+BUNDLE = SCRIPT.parent.parent if SCRIPT == SOURCE_SCRIPT else CAPABILITY
+REPO = SOURCE_REPO if SOURCE_SCRIPT.is_file() else CAPABILITY.parent
+MANAGER = next((path for path in (
+    SOURCE_REPO / "bin" / "capabilities",
+    CAPABILITY.parent / ".manager" / "capabilities")
+    if path.is_file()), Path(shutil.which("capabilities") or "capabilities"))
 
 
 def _env(tmp_path, project):

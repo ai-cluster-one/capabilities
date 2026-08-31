@@ -10,7 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-MAIL_BIN = Path(__file__).parent.parent / "bin" / "macmail"
+CAPABILITY = Path(__file__).resolve().parents[1]
+MAIL_BIN = next((path for path in (
+    CAPABILITY / "bin" / "macmail", CAPABILITY / "macmail")
+    if path.is_file()), CAPABILITY / "bin" / "macmail")
 
 
 def test_run_jxa_has_timeout_handler():

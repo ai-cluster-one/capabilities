@@ -3347,6 +3347,17 @@ def _channel_context_from_policy(policy):
         # is worth telling the room about.
         if (doc["body"] or "").strip():
             parts.append(doc["body"].strip())
+    elif path and path.is_file():
+        # `context_file` historically accepted any Markdown path under the
+        # service directory. The records adapter has canonical locations of
+        # its own; keep the schema's wider, already-published promise for
+        # file-backed projects instead of calling an existing file "missing".
+        try:
+            text = path.read_text().strip()
+        except OSError:
+            text = ""
+        if text:
+            parts.append(text)
     elif context_file:
         parts.append(f"[channel context file missing: {context_file}]")
     return "\n\n".join(parts).strip()
@@ -3476,8 +3487,7 @@ def build_prompt(tail, state=None):
                    if req.get("reply_to") else "as a plain direct message"))))
     pu = st.get("prev_usage")
     if pu:
-        lines.append(f"Previous turn (rough context scale): input ~{pu.get('input')} tok., "
-                     f"output {pu.get('output')} tok.")
+        lines.append("Previous turn usage: " + _usage_summary(pu) + ".")
     if progress_command and progress_command not in context \
             and progress_command not in channel_context:
         lines.append(
@@ -3917,6 +3927,94 @@ def worker_stub(chat, tail, state=None, procs=None):
                                      "session_id": None}}
 
 
+def _usage_summary(usage):
+    """All token classes a worker reports, without turning unknown into zero."""
+    values = usage or {}
+
+    def pick(*names):
+        for name in names:
+            if values.get(name) is not None:
+                return values[name]
+        return None
+
+    fields = (
+        ("in", pick("input", "input_tokens")),
+        ("out", pick("output", "output_tokens")),
+        ("cache_r", pick("cache_read", "cache_read_input_tokens",
+                         "cached_input_tokens")),
+        ("cache_w", pick("cache_write", "cache_creation_input_tokens")),
+    )
+    return " ".join(f"{name}={'?' if value is None else value}"
+                    for name, value in fields)
+
+
+def _first_json_document(output, answer_keys):
+    """Return the first JSON object carrying a harness answer key.
+
+    Claude hooks may write their own JSON documents to stdout before or after
+    the headless result. Those documents are part of the host protocol, not a
+    reason to discard a completed worker answer.
+    """
+    decoder = json.JSONDecoder()
+    text = output or ""
+    index = 0
+    skipped = []
+    answer = None
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except ValueError as exc:
+            if answer is not None:
+                skipped.append("non-json trailing output")
+                break
+            raise RuntimeError(
+                "worker stdout carried malformed output before its answer") from exc
+        if answer is None and isinstance(value, dict) \
+                and any(key in value for key in answer_keys):
+            answer = value
+        else:
+            skipped.append(",".join(sorted(value)[:3])
+                           if isinstance(value, dict) else type(value).__name__)
+        index = end
+    if answer is not None:
+        if skipped:
+            log("worker stdout carried foreign output alongside the answer: "
+                + "; ".join(skipped))
+        return answer
+    detail = f" (saw: {'; '.join(skipped)})" if skipped else ""
+    raise RuntimeError("worker stdout carried no answer document" + detail)
+
+
+def _normalize_delivered(text):
+    return " ".join(str(text or "").split())
+
+
+def _progress_already_delivered(delivered, reply):
+    """True when the final reply only repeats progress already sent to chat."""
+    candidate = _normalize_delivered(reply)
+    if not candidate:
+        return False
+    for sent in delivered or ():
+        if candidate == sent:
+            return True
+        if len(sent) >= 160 and candidate.startswith(sent):
+            return True
+    return False
+
+
+async def _cancel_recording_task(task):
+    """Stop a preempted recorder before its conference chain can settle."""
+    if task is None or task is asyncio.current_task():
+        return
+    task.cancel()
+    with contextlib.suppress(Exception, asyncio.CancelledError):
+        await task
+
+
 def worker_claude(chat, tail, state=None, procs=None):
     """Headless `claude -p`. --output-format json carries the reply (.result) plus
     usage / cost / model / session metadata in one object. --dangerously-skip-permissions gives
@@ -3941,9 +4039,11 @@ def worker_claude(chat, tail, state=None, procs=None):
     if rc != 0:
         detail = (err.strip() or out.strip() or f"exit {rc}")[:500]
         raise RuntimeError(f"claude worker failed: {detail}")
-    obj = json.loads(out)
+    obj = _first_json_document(out, ("result", "is_error", "subtype"))
     reply = (obj.get("result") or "").strip()
     if obj.get("is_error") or not reply:
+        log("claude worker produced no answer; "
+            + _usage_summary(obj.get("usage")))
         raise RuntimeError(f"claude worker error: {str(obj.get('subtype') or obj.get('result'))[:160]}")
     u = obj.get("usage") or {}
     meta = {"harness": "claude",
@@ -4458,7 +4558,7 @@ async def run_session(client):
         return True
 
     async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset,
-                             mark=None):
+                             mark=None, delivered=None):
         path = Path(outbox)
         if not path.exists():
             return offset
@@ -4480,21 +4580,25 @@ async def run_session(client):
             _, _ = await send_channel_message(
                 ent_id, text, is_direct,
                 reply_to=None if is_direct else reply_to, mark=mark)
+            if delivered is not None:
+                delivered.append(_normalize_delivered(text))
             log(f"{key}: progress job msg={reply_to or 'direct'} «{text[:80]}»")
         return offset
 
     async def pump_progress(key, outbox, ent_id, is_direct, reply_to, stop_event,
-                            mark=None):
+                            mark=None, delivered=None):
         offset = 0
         while not stop_event.is_set():
             offset = await drain_progress(
-                key, outbox, ent_id, is_direct, reply_to, offset, mark=mark)
+                key, outbox, ent_id, is_direct, reply_to, offset, mark=mark,
+                delivered=delivered)
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=1)
             except asyncio.TimeoutError:
                 pass
         await drain_progress(
-            key, outbox, ent_id, is_direct, reply_to, offset, mark=mark)
+            key, outbox, ent_id, is_direct, reply_to, offset, mark=mark,
+            delivered=delivered)
 
     def reserve_job(key, message, group_policy, is_direct, reason, chat_id=None):
         """Persist ownership of a message before any transcription or other await.
@@ -4581,7 +4685,12 @@ async def run_session(client):
         row["last_processed_message_id"] = max(message_id, row.get("last_processed_message_id", 0))
         if meta:
             tok = (meta or {}).get("tokens", {})
-            row["last_usage"] = {"input": tok.get("input"), "output": tok.get("output")}
+            row["last_usage"] = {
+                "input": tok.get("input"),
+                "output": tok.get("output"),
+                "cache_read": tok.get("cache_read"),
+                "cache_write": tok.get("cache_write"),
+            }
         if status in ("done", "error", "stopped"):
             _job_map(reg, key).pop(_job_id(message_id), None)
         save_register(reg)
@@ -4707,6 +4816,7 @@ async def run_session(client):
         future = None
         progress_task = None
         progress_stop = None
+        progress_delivered = []
         worker_session = None
         authority_context = None
         participants = [{"name": job.get("sender_name"), "role": job.get("sender_role")}]
@@ -4783,13 +4893,21 @@ async def run_session(client):
             progress_stop = asyncio.Event()
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
-                              delivery_reply_id, progress_stop, mark=answer_mark))
+                              delivery_reply_id, progress_stop, mark=answer_mark,
+                              delivered=progress_delivered))
             future = loop.run_in_executor(None, WORKERS[s["worker"]], key, tail, state, procs)
             async with client.action(ent_id, "typing"):
                 done, _ = await asyncio.wait({future}, timeout=float(s["worker_timeout"]))
                 if not done:
                     raise WorkerTimedOut
                 result = await future
+            # Drain the outbox before deciding whether the final answer is a
+            # duplicate of a progress message. Otherwise a last-moment send can
+            # race the worker result and still be delivered twice.
+            progress_stop.set()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(progress_task, timeout=5)
+            progress_task = None
             if closing:
                 retry_job(key, job, "session closed before worker reply was delivered")
                 return
@@ -4798,6 +4916,14 @@ async def run_session(client):
                 log(f"{key}: completed silently job msg={job.get('message_id')} · "
                     f"{meta.get('harness')}/{meta.get('model') or '?'}")
                 mark_job_finished(key, job, "done", meta=meta)
+                return
+
+            if _progress_already_delivered(progress_delivered, reply):
+                echoed_meta = dict(meta)
+                echoed_meta["suppressed_reason"] = "progress_echo"
+                log(f"{key}: suppressed reply already sent as progress "
+                    f"job msg={job.get('message_id')}")
+                mark_job_finished(key, job, "done", meta=echoed_meta)
                 return
             
             # Discover and send Codex-generated images
@@ -4831,11 +4957,10 @@ async def run_session(client):
                     ent_id, reply, is_direct, reply_to=delivery_reply_id,
                     mark=answer_mark)
             
-            tok = meta.get("tokens", {})
             cost = f" ${meta['cost_usd']:.4f}" if meta.get("cost_usd") else ""
             log(f"{key}: replied job msg={job.get('message_id')} «{reply[:80]}» · "
                 f"{meta.get('harness')}/{meta.get('model') or '?'}"
-                f" · in={tok.get('input')} out={tok.get('output')} cache_r={tok.get('cache_read')}{cost}")
+                f" · {_usage_summary(meta.get('tokens'))}{cost}")
             mark_job_finished(
                 key, job, "done", meta=meta, reply_message_id=getattr(sent, "id", None))
         except WorkerTimedOut:
@@ -5713,6 +5838,8 @@ async def run_session(client):
                 # recording it holds has had no audio at all.
                 log(f"call: preempting a deserted recording for {mode} "
                     f"from {caller_id}")
+                preempted_task = active_recording["task"]
+                await _cancel_recording_task(preempted_task)
                 await finalize_call_recording("preempted")
             # A previous call's channels are not this call's silence.
             MEDIA_AUDIO_PEERS.clear()

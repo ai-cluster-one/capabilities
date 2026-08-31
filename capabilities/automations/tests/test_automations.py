@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import pytest
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,9 +18,14 @@ from datetime import datetime, timezone
 
 
 CAPABILITY = Path(__file__).resolve().parents[1]
-CLI = CAPABILITY / "bin" / "automations"
+CLI = next((path for path in (
+    CAPABILITY / "bin" / "automations", CAPABILITY / "automations")
+    if path.is_file()), CAPABILITY / "bin" / "automations")
 RUNTIME_PATH = CAPABILITY / "service" / "runtime.py"
-MANAGER = CAPABILITY.parents[1] / "bin" / "capabilities"
+MANAGER = next((path for path in (
+    CAPABILITY.parents[1] / "bin" / "capabilities",
+    CAPABILITY.parents[1] / ".manager" / "capabilities")
+    if path.is_file()), Path(shutil.which("capabilities") or "capabilities"))
 
 SPEC = importlib.util.spec_from_file_location("automations_runtime_test", RUNTIME_PATH)
 if SPEC is None or SPEC.loader is None:

@@ -6,10 +6,23 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-CLI = Path(__file__).parents[1] / "bin" / "signoz"
+CAPABILITY = Path(__file__).resolve().parents[1]
+CLI = next((path for path in (
+    CAPABILITY / "bin" / "signoz", CAPABILITY / "signoz")
+    if path.is_file()), CAPABILITY / "bin" / "signoz")
 module = types.ModuleType("signoz_capability")
 module.__file__ = str(CLI)
 exec(compile(CLI.read_text(), str(CLI), "exec"), module.__dict__)
+
+
+@pytest.fixture(autouse=True)
+def isolate_records_adapter():
+    """Each test supplies a different temporary project through the environment."""
+    module._RECORDS = None
+    yield
+    if module._RECORDS is not None:
+        module._RECORDS.close()
+    module._RECORDS = None
 
 
 def connection(**overrides):

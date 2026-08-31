@@ -993,7 +993,9 @@ import sqlite3
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime as _store_datetime
+from datetime import timedelta as _store_timedelta
+from datetime import timezone as _store_timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -1071,17 +1073,17 @@ class StoreError(Exception):
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return _store_datetime.now(_store_timezone.utc).isoformat(timespec="seconds")
 
 
 def _now_exact() -> str:
     """Microsecond resolution, for the one place order matters. A revision log
     read newest-first used to break ties on a monotonic integer id; a uuid does
     not order, so the timestamp has to carry the ordering itself."""
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    return _store_datetime.now(_store_timezone.utc).isoformat(timespec="microseconds")
 
 
-def _check(name: str, value: str, pattern: re.Pattern) -> str:
+def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
@@ -1338,7 +1340,7 @@ class Store:
         Refuses a step that drops or narrows, because two hosts on different
         capability versions share this database and the older one must survive
         the newer one's migration."""
-        _check("namespace", namespace, CAPABILITY_RE)
+        _store_check("namespace", namespace, CAPABILITY_RE)
         with self.transaction():
             self._execute(_DDL[0].format(**self._ddl_subs()))
             cur = self._execute("SELECT version FROM store_meta WHERE namespace = ?", (namespace,))
@@ -1456,7 +1458,7 @@ class Store:
         """The whole collection as the capability should see it, each entry
         carrying the scope it came from so `connections` can report resolution
         without a second query."""
-        _check("capability", capability, CAPABILITY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         semantics = self._semantics(collection)
         if semantics == EXACT:
             raise StoreError("bad_collection",
@@ -1494,7 +1496,7 @@ class Store:
     def config_list(self, capability: str, collection: str,
                     scope: tuple | None = None) -> list[dict[str, Any]]:
         """Every stored row, unresolved — the view for editing rather than use."""
-        _check("capability", capability, CAPABILITY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         self._semantics(collection)
         sql = ("SELECT id, scope, project_id, capability, collection, key, value, "
                "note, updated_at, updated_by FROM config WHERE capability = ? AND collection = ?")
@@ -1529,8 +1531,8 @@ class Store:
                    note: str | None = None) -> str:
         """Write one entry at one scope and record the revision. Returns the
         row's id. A write always names its scope; nothing infers one."""
-        _check("capability", capability, CAPABILITY_RE)
-        _check("key", key, KEY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("key", key, KEY_RE)
         self._semantics(collection)
         kind, pid = self._target(scope)
         with self.transaction():
@@ -1559,7 +1561,7 @@ class Store:
 
     def config_delete(self, capability: str, collection: str, key: str,
                       scope: tuple, actor: str | None = None) -> bool:
-        _check("capability", capability, CAPABILITY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         self._semantics(collection)
         kind, pid = self._target(scope)
         with self.transaction():
@@ -1656,8 +1658,8 @@ class Store:
         """Record a version and return its hash. Saving is not deploying: this
         changes nothing that runs unless `activate` says so, or until
         `context_activate` names the hash later."""
-        _check("capability", capability, CAPABILITY_RE)
-        _check("key", key, KEY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("key", key, KEY_RE)
         kind, pid = self._target(scope)
         if not isinstance(body, str):
             raise StoreError("bad_context", "a context body must be text")
@@ -1761,7 +1763,7 @@ class Store:
         second machine joins a project it already belongs to. A slug held by a
         different id is refused: that is another project, and taking its label
         would take its rows."""
-        _check("slug", slug, CAPABILITY_RE)
+        _store_check("slug", slug, CAPABILITY_RE)
         if not isinstance(project_id, str) or not project_id.strip():
             raise StoreError("bad_project_id", "a project id is required",
                              "generate one once and keep it in the project's own config")
@@ -1836,7 +1838,7 @@ class Store:
     def state_get(self, capability: str, key: str, scope: tuple) -> Any:
         """Rule 16: state is read at exactly the scope that minted it. A
         project's state is not a fallback for an instance's, so no cascade."""
-        _check("capability", capability, CAPABILITY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         kind, pid = self._target(scope)
         row = self._execute(
             "SELECT value, expires_at FROM state WHERE scope = ? AND COALESCE(project_id,'') = ? "
@@ -1848,13 +1850,13 @@ class Store:
 
     def state_set(self, capability: str, key: str, value: Any, scope: tuple,
                   ttl_seconds: int | None = None) -> None:
-        _check("capability", capability, CAPABILITY_RE)
-        _check("key", key, KEY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("key", key, KEY_RE)
         kind, pid = self._target(scope)
         expires = None
         if ttl_seconds is not None:
-            expires = (datetime.now(timezone.utc)
-                       + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+            expires = (_store_datetime.now(_store_timezone.utc)
+                       + _store_timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
         with self.transaction():
             existing = self._execute(
                 "SELECT id FROM state WHERE scope = ? AND COALESCE(project_id,'') = ? "
@@ -2273,7 +2275,7 @@ class FileRecords(Records):
         return entry.get("note") if isinstance(entry, dict) else None
 
     def resolve(self, capability: str, collection: str) -> dict[str, dict[str, Any]]:
-        _check("capability", capability, CAPABILITY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         semantics = Store._semantics(collection)
         out: dict[str, dict[str, Any]] = {}
         for scope, pid, root in self._chain():
@@ -2296,7 +2298,7 @@ class FileRecords(Records):
 
     def resolve_scope(self, capability: str, collection: str,
                       scope: str) -> dict[str, dict[str, Any]]:
-        _check("capability", capability, CAPABILITY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         if scope == "project":
             root, pid = self.envelope, self.project_id
         elif scope == "global":
@@ -2346,8 +2348,8 @@ class FileRecords(Records):
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
             scope: str | None = None) -> None:
-        _check("capability", capability, CAPABILITY_RE)
-        _check("key", key, KEY_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("key", key, KEY_RE)
         Store._semantics(collection)
         target_scope = scope or "project"
         if target_scope not in SCOPE_KINDS:

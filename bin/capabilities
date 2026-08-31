@@ -224,7 +224,7 @@ VERIFICATION VERBS
         contract/preamble.py. Exit 0 pass, 7 failures (incl. drift) found.
   sync-contract [--check]
         Stamp the canonical shared helpers from contract/preamble.py into the
-        fenced regions (`capability core`, `connections`) of every
+        fenced regions (`capability core`, `store`, `connections`) of every
         capabilities/*/bin/*. The manager never participates. Idempotent.
         --check reports drift and exits 7 without writing.
   selfcheck
@@ -387,7 +387,8 @@ _REPO_ROOT = _MANAGER_DIR.parent
 _ASSET_ROOT = _REPO_ROOT if (_REPO_ROOT / "contract" / "preamble.py").is_file() \
     else _MANAGER_DIR
 _PREAMBLE = _ASSET_ROOT / "contract" / "preamble.py"
-_CONTRACT_REGIONS = ("capability core", "connections", "store")
+_CONTRACT_REGIONS = ("capability core", "store", "connections")
+_REQUIRED_CONTRACT_REGIONS = ("capability core", "store")
 # A region names the file it is canonical in. The store tier lives apart from
 # the preamble because it is large enough to test on its own, and a body that
 # can be imported is a body that can be tested; the preamble's cannot, since its
@@ -1408,8 +1409,9 @@ def _activate_payload(name: str, stage: Path) -> Path:
 def _payload_sha256(reg: Path) -> str:
     h = hashlib.sha256()
     skip = {"meta.json", "stub", "manifest.json"}
+    cache_dirs = {"__pycache__", ".pytest_cache", ".ruff_cache"}
     for path in sorted(p for p in reg.rglob("*") if p.is_file()):
-        if (path.name in skip or "__pycache__" in path.parts
+        if (path.name in skip or cache_dirs.intersection(path.parts)
                 or path.suffix in {".pyc", ".pyo", ".session"}
                 or path.name.endswith((".session-journal", ".session-wal", ".session-shm"))):
             continue
@@ -3668,6 +3670,13 @@ def _gate_scope(project: bool, global_: bool) -> str:
     return "project" if project else "global"
 
 
+def _gate_source(adapter, root: Path, scope: str) -> str:
+    """Name the exact policy file, or the database that owns the rows."""
+    if adapter.mode != "files":
+        return adapter.source
+    return str(_gate_file(root) if scope == "project" else GLOBAL_GATE_FILE)
+
+
 def _refresh_after_gate(root: Path | None, result: dict, enabled: bool = False) -> None:
     if root is None:
         return
@@ -3694,7 +3703,7 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False) -> None:
         try:
             adapter.set("capabilities", "policy", name, {"enabled": enabled},
                         actor="capabilities", scope=scope)
-            gate_source = adapter.source
+            gate_source = _gate_source(adapter, root, scope)
         except _store_module().StoreError as exc:
             _die(6, exc.slug, exc.message, exc.hint)
         finally:
@@ -3731,7 +3740,7 @@ def _inherit_gate(name: str, scope: str) -> None:
         adapter = _records_for(root)
         try:
             removed = adapter.delete("capabilities", "policy", name, scope=scope)
-            gate_source = adapter.source
+            gate_source = _gate_source(adapter, root, scope)
         except _store_module().StoreError as exc:
             _die(6, exc.slug, exc.message, exc.hint)
         finally:
@@ -4434,6 +4443,23 @@ def _split_region(text: str, region: str) -> tuple[str, str, str] | None:
     return text[:interior_start], text[interior_start:ci], text[ci:]
 
 
+def _insert_contract_region(text: str, region: str, interior: str) -> str:
+    """Insert a newly required region at its canonical tier boundary."""
+    if region != "store":
+        raise ValueError(f"no insertion rule for contract region {region!r}")
+    anchor = _split_region(text, "capability core")
+    if anchor is None:
+        raise ValueError("cannot insert store without capability core")
+    _, close_m = _fence_markers("capability core")
+    close_at = text.find(close_m)
+    line_end = text.find("\n", close_at)
+    if line_end == -1:
+        line_end = len(text)
+    open_m, close_m = _fence_markers(region)
+    block = f"\n{open_m}\n{interior}{close_m}\n"
+    return text[:line_end + 1] + block + text[line_end + 1:]
+
+
 def _canonical_regions() -> dict[str, str]:
     """The canonical interior text of each region, read from the file that owns it."""
     out: dict[str, str] = {}
@@ -4451,8 +4477,7 @@ def _canonical_regions() -> dict[str, str]:
 
 
 def _contract_drift(text: str, canonical: dict[str, str]) -> list[str]:
-    """Regions whose interior differs from canonical. Absent regions are not
-    drift; a malformed fence is reported as its own labelled drift."""
+    """Required, malformed, or byte-different canonical regions."""
     out: list[str] = []
     for region, canon in canonical.items():
         try:
@@ -4460,7 +4485,9 @@ def _contract_drift(text: str, canonical: dict[str, str]) -> list[str]:
         except ValueError as e:
             out.append(f"{region} ({e})")
             continue
-        if split is not None and split[1] != canon:
+        if split is None and region in _REQUIRED_CONTRACT_REGIONS:
+            out.append(f"{region} (missing)")
+        elif split is not None and split[1] != canon:
             out.append(region)
     return out
 
@@ -4488,6 +4515,13 @@ def cmd_sync_contract(check_only: bool) -> None:
             except ValueError as e:
                 _die(7, "bad_fence", f"{capdir.name}: {e}")
             if split is None:
+                if region in _REQUIRED_CONTRACT_REGIONS:
+                    try:
+                        new_text = _insert_contract_region(
+                            new_text, region, canonical[region])
+                    except ValueError as e:
+                        _die(7, "bad_fence", f"{capdir.name}: {e}")
+                    stamped.append(region)
                 continue
             head, interior, tail = split
             if interior != canonical[region]:
@@ -4547,8 +4581,11 @@ def _audit_script(
 
     if _PREAMBLE.is_file():
         for region in _contract_drift(script_text, _canonical_regions()):
+            source_region = region.split(" (", 1)[0]
+            source = _REGION_SOURCE_REL.get(
+                source_region, "contract/preamble.py")
             failures.append(
-                f"contract-drift: {region} differs from contract/preamble.py "
+                f"contract-drift: {region} differs from {source} "
                 f"— run `capabilities sync-contract`")
 
     # doctor gates on the shared resolution before any round-trip: a
@@ -6557,10 +6594,17 @@ def cmd_source_sync(source_id: str) -> None:
         updated = source_text
         regions = []
         for region, body in canonical.items():
-            split = _split_region(updated, region)
+            try:
+                split = _split_region(updated, region)
+            except ValueError as e:
+                _die(7, "bad_fence", f"{capdir.name}: {e}")
             if split is None:
-                if region == "capability core":
-                    _die(7, "contract_missing", f"{capdir.name}: missing generated core region")
+                if region in _REQUIRED_CONTRACT_REGIONS:
+                    try:
+                        updated = _insert_contract_region(updated, region, body)
+                    except ValueError as e:
+                        _die(7, "contract_missing", f"{capdir.name}: {e}")
+                    regions.append(region)
                 continue
             head, interior, tail = split
             if interior != body:

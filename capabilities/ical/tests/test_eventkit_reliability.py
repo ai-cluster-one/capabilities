@@ -10,7 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-ICAL_BIN = Path(__file__).parent.parent / "bin" / "ical"
+CAPABILITY = Path(__file__).resolve().parents[1]
+ICAL_BIN = next((path for path in (
+    CAPABILITY / "bin" / "ical", CAPABILITY / "ical")
+    if path.is_file()), CAPABILITY / "bin" / "ical")
 
 
 def test_run_jxa_has_timeout_handler():

@@ -9,7 +9,10 @@ from pathlib import Path
 import click
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "simplbooks"
+CAPABILITY = Path(__file__).resolve().parents[1]
+SCRIPT = next((path for path in (
+    CAPABILITY / "bin" / "simplbooks", CAPABILITY / "simplbooks")
+    if path.is_file()), CAPABILITY / "bin" / "simplbooks")
 
 
 def _load_module():

@@ -15,7 +15,10 @@ from urllib.parse import parse_qs, urlencode
 
 import httpx
 
-SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "instagram"
+CAPABILITY = Path(__file__).resolve().parents[1]
+SCRIPT = next((path for path in (
+    CAPABILITY / "bin" / "instagram", CAPABILITY / "instagram")
+    if path.is_file()), CAPABILITY / "bin" / "instagram")
 
 
 def _load_module():

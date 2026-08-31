@@ -87,6 +87,31 @@ def test_manager_and_generated_scaffold_each_have_one_pep723_block(tmp_path):
     assert generated.splitlines().count("# /// script") == 1
 
 
+def test_source_catalog_ignores_runtime_cache_directories(tmp_path):
+    env = _env(tmp_path)
+    initialized = json.loads(_run(env, "source", "init", "personal").stdout)
+    workspace = Path(initialized["path"])
+    created = json.loads(_run(
+        env, "new", "demo", "--source", "personal").stdout)
+    capdir = Path(created["path"])
+    _run(env, "source", "index", "personal")
+    catalog_path = workspace / ".capability-source" / "catalog.json"
+    before = json.loads(catalog_path.read_text())["capabilities"]["demo"] \
+        ["payload_sha256"]
+
+    cache = capdir / ".pytest_cache" / "v" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "nodeids").write_text('["demo"]\n')
+    bytecode = capdir / "bin" / "__pycache__"
+    bytecode.mkdir()
+    (bytecode / "demo.pyc").write_bytes(b"runtime cache")
+    _run(env, "source", "index", "personal")
+
+    after = json.loads(catalog_path.read_text())["capabilities"]["demo"] \
+        ["payload_sha256"]
+    assert after == before
+
+
 def test_custom_authoring_refuses_a_different_marked_checkout(tmp_path):
     env = _env(tmp_path)
     initialized = json.loads(_run(env, "source", "init", "personal").stdout)
@@ -177,6 +202,36 @@ def test_authoring_workspace_is_canonical_and_install_is_strict(tmp_path):
     _run(env, "source", "index", "personal")
     assert json.loads(_run(
         env, "source", "check", "personal").stdout)["ok"] is True
+
+
+def test_source_sync_inserts_a_new_required_contract_region(tmp_path):
+    env = _env(tmp_path)
+    _run(env, "source", "init", "personal")
+    created = json.loads(_run(
+        env, "new", "legacy", "--source", "personal", "--core-only").stdout)
+    script = Path(created["executable"])
+    text = script.read_text()
+    start = text.index("# >>> contract: store")
+    close = "# <<< contract: store <<<"
+    end = text.index(close, start) + len(close)
+    while end < len(text) and text[end] == "\n":
+        end += 1
+    script.write_text(
+        text[:start] + text[end:] +
+        "\n\ndef _check(a, b, c, d, e):\n"
+        "    return (a, b, c, d, e)\n")
+
+    synced = json.loads(_run(env, "source", "sync", "personal").stdout)
+
+    assert {"capability": "legacy", "regions": ["store"]} in synced["stamped"]
+    repaired = script.read_text()
+    assert repaired.index("# >>> contract: capability core") < \
+        repaired.index("# >>> contract: store")
+    assert "def _store_check(" in repaired
+    assert "def _check(a, b, c, d, e):" in repaired
+    _run(env, "source", "index", "personal")
+    checked = json.loads(_run(env, "source", "check", "personal").stdout)
+    assert checked["ok"] is True
 
 
 def test_remote_source_catalog_search_and_install(tmp_path):

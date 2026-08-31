@@ -185,6 +185,7 @@ def test_global_policy_is_inherited_and_project_policy_overrides(tmp_path: Path)
     global_gate = tmp_path / "config" / "capabilities" / "settings.json"
     assert json.loads(global_gate.read_text())["capabilities"]["asana"]["enabled"] is True
     assert global_result["scope"] == "global"
+    assert global_result["gate"] == str(global_gate)
     # This isolated test registry has no installed entries; effective enabled is
     # still reported as an enabled-not-installed policy declaration.
     assert "asana" in listing["enabled_not_installed"]

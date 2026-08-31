@@ -8,7 +8,10 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "askproject"
+CAPABILITY = Path(__file__).resolve().parents[1]
+SCRIPT = next((path for path in (
+    CAPABILITY / "bin" / "askproject", CAPABILITY / "askproject")
+    if path.is_file()), CAPABILITY / "bin" / "askproject")
 
 
 def _load_cli():

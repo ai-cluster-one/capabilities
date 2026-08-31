@@ -11,7 +11,10 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-_coolify_path = Path(__file__).parent.parent / "bin" / "coolify"
+_capability = Path(__file__).resolve().parents[1]
+_coolify_path = next((path for path in (
+    _capability / "bin" / "coolify", _capability / "coolify")
+    if path.is_file()), _capability / "bin" / "coolify")
 _code = _coolify_path.read_text()
 coolify_module = types.ModuleType("coolify_management")
 coolify_module.__file__ = str(_coolify_path)

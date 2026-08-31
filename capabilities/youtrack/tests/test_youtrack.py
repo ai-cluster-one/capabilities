@@ -11,7 +11,10 @@ from pathlib import Path
 import pytest
 
 
-CLI = Path(__file__).parents[1] / "bin" / "youtrack"
+CAPABILITY = Path(__file__).resolve().parents[1]
+CLI = next((path for path in (
+    CAPABILITY / "bin" / "youtrack", CAPABILITY / "youtrack")
+    if path.is_file()), CAPABILITY / "bin" / "youtrack")
 
 
 def _source_tree():

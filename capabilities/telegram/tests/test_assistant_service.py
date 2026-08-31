@@ -529,6 +529,31 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                                 for line in daemon._test_logs))
             await self.stop_session(client, task)
 
+    async def test_final_reply_is_suppressed_when_progress_already_delivered_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            def echoing_worker(_chat, _tail, state=None, _procs=None):
+                Path(state["progress_outbox"]).write_text(json.dumps({
+                    "text": "The answer is ready."
+                }) + "\n")
+                return successful_result("The answer is ready.")
+
+            daemon.WORKERS["stub"] = echoing_worker
+            message = Message(91, text="Assistant, answer this")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 91)
+
+            self.assertEqual(len(client.sent), 1)
+            self.assertIn("The answer is ready.", client.sent[0]["text"])
+            self.assertTrue(any("suppressed reply already sent as progress" in line
+                                for line in daemon._test_logs))
+            await self.stop_session(client, task)
+
     async def test_prompt_uses_compact_timestamps_and_reply_topology(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
@@ -2322,7 +2347,9 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_telethon_compatibility_version_is_pinned_across_bundle(self):
         expected = '"telethon==1.43.2"'
         for path in (
-            TELEGRAM_DIR / "bin" / "telegram",
+            next((candidate for candidate in (
+                TELEGRAM_DIR / "bin" / "telegram", TELEGRAM_DIR / "telegram")
+                if candidate.is_file()), TELEGRAM_DIR / "bin" / "telegram"),
             TELEGRAM_DIR / "service" / "daemon.py",
             TELEGRAM_DIR / "service" / "call_recorder.py",
         ):
@@ -3880,6 +3907,94 @@ class VoicePromptIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("compiled_context", source)
 
 
+class WorkerResultParsingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claude_answer_survives_hook_documents_on_both_sides(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            answer = {"result": "finished", "usage": {}, "session_id": "abc"}
+            stdout = "\n".join((
+                json.dumps({"hook": "session-start"}),
+                json.dumps(answer),
+                json.dumps({"metrics": {"fire_index": 7}}),
+            ))
+
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
+                result = daemon.worker_claude("123", [], {}, {})
+
+            self.assertEqual(result["reply"], "finished")
+            self.assertTrue(any("foreign output" in line
+                                for line in daemon._test_logs))
+
+    async def test_hook_output_without_an_answer_is_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            with self.assertRaisesRegex(RuntimeError, r"no answer document.*metrics"):
+                daemon._first_json_document(
+                    json.dumps({"metrics": {"fire_index": 7}}),
+                    ("result", "is_error", "subtype"))
+
+    async def test_usage_summary_names_every_class_and_keeps_unknown_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertEqual(
+                daemon._usage_summary({
+                    "input_tokens": 2,
+                    "output_tokens": 3,
+                    "cache_read_input_tokens": 5,
+                    "cache_creation_input_tokens": 7,
+                }),
+                "in=2 out=3 cache_r=5 cache_w=7")
+            self.assertEqual(
+                daemon._usage_summary({"input": 2, "output": 3}),
+                "in=2 out=3 cache_r=? cache_w=?")
+
+    async def test_claude_error_logs_the_usage_that_was_still_billed(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            stdout = json.dumps({
+                "result": "", "is_error": True, "subtype": "failed",
+                "usage": {"input_tokens": 2, "output_tokens": 3,
+                          "cache_read_input_tokens": 5,
+                          "cache_creation_input_tokens": 7},
+            })
+
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
+                with self.assertRaisesRegex(RuntimeError, "failed"):
+                    daemon.worker_claude("123", [], {}, {})
+
+            self.assertTrue(any("in=2 out=3 cache_r=5 cache_w=7" in line
+                                for line in daemon._test_logs))
+
+    async def test_previous_usage_in_the_prompt_includes_cache_classes(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            prompt = daemon.build_prompt([], {"prev_usage": {
+                "input": 2, "output": 3, "cache_read": 5, "cache_write": 7}})
+
+            self.assertIn("in=2 out=3 cache_r=5 cache_w=7", prompt)
+
+
+class ProgressEchoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_final_reply_that_repeats_progress_is_suppressed(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertTrue(daemon._progress_already_delivered(
+                [daemon._normalize_delivered("Answer is ready.\nDone.")],
+                "Answer is ready. Done."))
+            self.assertFalse(daemon._progress_already_delivered(
+                [daemon._normalize_delivered("Checking the logs")],
+                "The service was restarted."))
+            long_progress = "A" * 180
+            self.assertTrue(daemon._progress_already_delivered(
+                [long_progress], long_progress + " Additional detail."))
+
+
 class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
     """A call keeps the worker session its last finished task ran in, so the
     next task builds on what that one found instead of rediscovering it."""
@@ -4414,6 +4529,19 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(claimed, ("lane prose", True))
             self.assertEqual(inherited, ("room prose\n\nquiet lane", False))
 
+    async def test_an_existing_legacy_context_path_is_not_reported_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            topic = daemon.SERVICE_DIR / "topics" / "hq-briefings.md"
+            topic.parent.mkdir(parents=True, exist_ok=True)
+            topic.write_text("briefing prose\n")
+
+            context = daemon._channel_context_from_policy(
+                {"context_file": "topics/hq-briefings.md"})
+
+            self.assertEqual(context, "briefing prose")
+            self.assertNotIn("missing", context)
+
     async def test_an_exclusive_room_still_lets_its_topics_speak(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), self.group(
@@ -4865,6 +4993,24 @@ class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
 class OrphanedRecordingTests(unittest.IsolatedAsyncioTestCase):
     """A recording is closed by the process that opened it, so one that outlives
     its process is not still running."""
+
+    async def test_a_preempted_recording_task_cannot_keep_running(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            cancelled = asyncio.Event()
+
+            async def recorder():
+                try:
+                    await asyncio.Future()
+                finally:
+                    cancelled.set()
+
+            task = asyncio.create_task(recorder())
+            await asyncio.sleep(0)
+            await daemon._cancel_recording_task(task)
+
+            self.assertTrue(task.cancelled())
+            self.assertTrue(cancelled.is_set())
 
     def write(self, daemon, name, **fields):
         folder = daemon.CONNECTION_STATE_DIR / "calls" / "recordings"

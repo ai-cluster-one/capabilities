@@ -12,25 +12,28 @@ one and fails on drift. There is no per-function override mechanism — after th
 deviation pre-clean the common set is uniform, so each fence is all-or-nothing and
 the drift-check is strict.
 
-TWO TIERS
-=========
-The preamble has two independent fenced regions:
+THREE TIERS
+===========
+The contract has three fenced regions; the store tier is canonical in
+`contract/store.py` because it is also imported by bundled services:
 
   - **capability core** — the capability declaration surface (summary/manifest,
     references, guide, ids) plus the file/project/IO plumbing. EVERY capability
-    carries it, connection-bearing or not. A capability with no connections takes
-    the core fence and stops; that absence is not a deviation, just an absence.
+    carries it, connection-bearing or not.
+
+  - **store** — the records adapter used by identifiers, policy, settings and
+    operational state. EVERY capability carries it because core calls into it.
 
   - **connections** — the credential cascade and connection resolver. Only a
     capability that implements connections carries this fence. Omitting it is the
     normal state for a connection-less capability.
 
 A capability's archetype (API / CLI-wrapper / web-session) lives in the connections
-tier; a core-only capability has no archetype because it has no connection.
+tier; a connection-less capability has no archetype because it has no connection.
 
 WHAT EACH CAPABILITY MUST DEFINE *ABOVE* THE FENCES (the vendored blocks read
 these module-level names; they are the only coupling):
-    core:        NAME, SUMMARY, SCOPE, DOCS_BASE, STATE,
+    core/store:  NAME, SUMMARY, SCOPE, DOCS_BASE, STATE,
                  POST_INSTALL, _CONFIG_HOME, _STATE_HOME
     connections: CREDENTIALS_ENV, CRED_KEYS, WRITE_VERBS, WRITE_DEFAULT
     plus the stdlib imports the helpers use: os, sys, json, Path, NoReturn.

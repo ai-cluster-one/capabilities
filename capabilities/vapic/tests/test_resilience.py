@@ -18,8 +18,10 @@ from pathlib import Path
 from typing import Iterator
 
 
-REPO = Path(__file__).resolve().parents[3]
-VAPIC = REPO / "capabilities" / "vapic" / "bin" / "vapic"
+CAPABILITY = Path(__file__).resolve().parents[1]
+VAPIC = next((path for path in (
+    CAPABILITY / "bin" / "vapic", CAPABILITY / "vapic")
+    if path.is_file()), CAPABILITY / "bin" / "vapic")
 SECRET = "vapic-test-secret-token"
 
 

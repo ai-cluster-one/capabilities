@@ -14,6 +14,7 @@ import json
 import importlib.machinery
 import importlib.util
 import os
+import runpy
 import shutil
 import signal
 import subprocess
@@ -415,6 +416,12 @@ def test_install_from_source_script_installs_bundle() -> None:
         assert (cap_home / "telegram" / "telegram").is_file()
         assert not (cap_home / "telegram" / "bin").exists()
         assert (cap_home / "telegram" / "service" / "templates" / "settings.json").is_file()
+        test_globals = runpy.run_path(
+            str(cap_home / "telegram" / "tests" / "test_outbound_actions.py"),
+            run_name="installed_telegram_test_probe",
+        )
+        assert test_globals["CLI_PATH"].resolve() == \
+            (cap_home / "telegram" / "telegram").resolve()
         meta = json.loads((cap_home / "telegram" / "meta.json").read_text())
         assert meta["source_type"] == "directory"
         assert meta["source"] == str(TELEGRAM_BUNDLE)

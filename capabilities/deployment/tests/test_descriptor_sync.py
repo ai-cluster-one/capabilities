@@ -11,15 +11,26 @@ import pytest
 
 
 CAP_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(CAP_ROOT.parent / "contract"))
+CONTRACT = next((path for path in (
+    CAP_ROOT.parent / "contract", CAP_ROOT / ".manager" / "contract")
+    if path.is_dir()), CAP_ROOT.parent / "contract")
+sys.path.insert(0, str(CONTRACT))
 import store as S  # noqa: E402
 
-DEPLOYMENT = CAP_ROOT / "deployment" / "bin" / "deployment"
 SERVICE_CAPABILITIES = ("telegram", "automations", "slack")
 
 
+def _script(name: str) -> Path:
+    root = CAP_ROOT / name
+    return next((path for path in (root / "bin" / name, root / name)
+                 if path.is_file()), root / "bin" / name)
+
+
+DEPLOYMENT = _script("deployment")
+
+
 def _manifest(name: str) -> dict:
-    script = CAP_ROOT / name / "bin" / name
+    script = _script(name)
     proc = subprocess.run(
         [str(script), "manifest", "--json"], capture_output=True,
         text=True, timeout=30, check=True,

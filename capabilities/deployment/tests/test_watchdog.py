@@ -18,7 +18,10 @@ import pytest
 
 
 CAP_ROOT = Path(__file__).resolve().parents[2]
-DEPLOYMENT = CAP_ROOT / "deployment" / "bin" / "deployment"
+CAPABILITY = CAP_ROOT / "deployment"
+DEPLOYMENT = next((path for path in (
+    CAPABILITY / "bin" / "deployment", CAPABILITY / "deployment")
+    if path.is_file()), CAPABILITY / "bin" / "deployment")
 
 
 def _module():

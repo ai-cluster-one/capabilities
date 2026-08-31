@@ -10,8 +10,18 @@ import unittest
 from pathlib import Path
 
 
-DEPLOYMENT = Path(__file__).resolve().parents[1] / "bin" / "deployment"
-AUTOMATIONS = Path(__file__).resolve().parents[2] / "automations" / "bin" / "automations"
+CAPABILITY = Path(__file__).resolve().parents[1]
+CAP_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _script(name: str) -> Path:
+    root = CAPABILITY if name == "deployment" else CAP_ROOT / name
+    return next((path for path in (root / "bin" / name, root / name)
+                 if path.is_file()), root / "bin" / name)
+
+
+DEPLOYMENT = _script("deployment")
+AUTOMATIONS = _script("automations")
 
 
 class DeploymentAutomationsTests(unittest.TestCase):

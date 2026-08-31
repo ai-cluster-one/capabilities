@@ -16,12 +16,20 @@ from pathlib import Path
 
 
 CAP_ROOT = Path(__file__).resolve().parents[2]
-DEPLOYMENT = CAP_ROOT / "deployment" / "bin" / "deployment"
 SERVICE_CAPABILITIES = ("telegram", "automations")
 
 
+def _script(name: str) -> Path:
+    root = CAP_ROOT / name
+    return next((path for path in (root / "bin" / name, root / name)
+                 if path.is_file()), root / "bin" / name)
+
+
+DEPLOYMENT = _script("deployment")
+
+
 def _manifest(name: str) -> dict:
-    script = CAP_ROOT / name / "bin" / name
+    script = _script(name)
     proc = subprocess.run(
         [str(script), "manifest", "--json"], capture_output=True,
         text=True, timeout=30, check=True,

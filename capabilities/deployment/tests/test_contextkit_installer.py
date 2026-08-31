@@ -19,7 +19,10 @@ from pathlib import Path
 from typing import Any
 
 # Use local deployment binary from the repo
-DEPLOYMENT_BIN = Path(__file__).parent.parent / "bin" / "deployment"
+CAPABILITY = Path(__file__).resolve().parents[1]
+DEPLOYMENT_BIN = next((path for path in (
+    CAPABILITY / "bin" / "deployment", CAPABILITY / "deployment")
+    if path.is_file()), CAPABILITY / "bin" / "deployment")
 
 
 def run_cmd(cmd: list[str], cwd: Path) -> dict[str, Any]:

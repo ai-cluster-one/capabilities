@@ -10,7 +10,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "mailbox"
+CAPABILITY = Path(__file__).resolve().parents[1]
+SCRIPT = next((path for path in (
+    CAPABILITY / "bin" / "mailbox", CAPABILITY / "mailbox")
+    if path.is_file()), CAPABILITY / "bin" / "mailbox")
 
 
 def _load_module():

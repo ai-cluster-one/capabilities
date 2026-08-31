@@ -19,7 +19,9 @@ from pathlib import Path
 
 
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
-CLI_PATH = TELEGRAM_DIR / "bin" / "telegram"
+CLI_PATH = next((path for path in (
+    TELEGRAM_DIR / "bin" / "telegram", TELEGRAM_DIR / "telegram")
+    if path.is_file()), TELEGRAM_DIR / "bin" / "telegram")
 WORKER_SHIM_PATH = TELEGRAM_DIR / "service" / "worker-bin" / "telegram"
 
 
