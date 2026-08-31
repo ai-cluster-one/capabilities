@@ -97,6 +97,7 @@ def _release_source_repo(tmp_path: Path) -> tuple[Path, Path]:
                  "ROUTINES.md"):
         shutil.copy2(REPO / name, source / name)
     shutil.copytree(REPO / "contract", source / "contract")
+    shutil.copytree(REPO / "guides", source / "guides")
     shutil.copytree(
         REPO / "capabilities" / "askproject",
         source / "capabilities" / "askproject",
@@ -728,6 +729,78 @@ def test_dev_finish_releases_commit_syncs_checkout_and_removes_session(tmp_path)
     assert not worktree.exists()
     listed = json.loads(_run(env, "dev", "list").stdout)
     assert listed["sessions"] == []
+
+
+def test_dev_finish_publishes_and_activates_a_complete_manager_release(tmp_path):
+    source, remote = _release_source_repo(tmp_path)
+    env = _env(tmp_path)
+    started = json.loads(_run(
+        env,
+        "dev", "start", "manager",
+        "--source", str(source),
+        "--no-project",
+        "--session", "manager-release",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    candidate_manager = worktree / "bin" / "capabilities"
+    candidate_manager.write_text(
+        candidate_manager.read_text() + "\n# Manager release fixture.\n")
+    _git(worktree, "add", "bin/capabilities")
+    indexed = subprocess.run(
+        [str(candidate_manager),
+         "source", "index", "official", "--staged"],
+        cwd=worktree, env=env, text=True, capture_output=True, timeout=300,
+        check=False,
+    )
+    assert indexed.returncode == 0, indexed.stderr
+    candidate = _commit_all(worktree, "Prepare manager release candidate")
+
+    finished = json.loads(_run(
+        env, "dev", "finish", "manager-release").stdout)
+
+    release = finished["release"]
+    manager_update = release["manager_update"]
+    active = Path(manager_update["symlink"]).resolve()
+    assert release["commit"] == candidate
+    assert release["verification_profile"] == "manager"
+    assert manager_update["self_update"] == "updated"
+    assert active == Path(manager_update["manager"])
+    assert active.parents[1].parent.name == "releases"
+    assert json.loads(Path(manager_update["release_manifest"]).read_text())["schema"] \
+        == "capabilities.manager-release.v1"
+    invoked = subprocess.run(
+        [str(active), "list"], cwd=source, env=env, text=True,
+        capture_output=True, timeout=300, check=False,
+    )
+    assert invoked.returncode == 0, invoked.stderr
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() == candidate
+    assert not worktree.exists()
+
+
+def test_dev_check_rejects_a_stale_staged_manager_release_manifest(tmp_path):
+    source, _remote = _release_source_repo(tmp_path)
+    env = _env(tmp_path)
+    started = json.loads(_run(
+        env,
+        "dev", "start", "manager",
+        "--source", str(source),
+        "--no-project",
+        "--session", "stale-manager-manifest",
+    ).stdout)
+    worktree = Path(started["source_worktree"])
+    manager = worktree / "bin" / "capabilities"
+    manager.write_text(manager.read_text() + "\n# Stale manifest fixture.\n")
+    _git(worktree, "add", "bin/capabilities")
+
+    checked = _run(
+        env, "dev", "check", "stale-manager-manifest", check=False)
+
+    assert checked.returncode == 7
+    report = json.loads(checked.stdout)
+    assert report["ok"] is False
+    assert "manager-release" in report["failures"]
+    assert "source index official --staged" in \
+        report["failures"]["manager-release"][0]
 
 
 def test_dev_finish_refuses_dirty_main_before_publication(tmp_path):

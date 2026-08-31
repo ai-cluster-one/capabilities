@@ -16,4 +16,7 @@ The official integration checkout is registered from the primary checkout with:
 ```
 
 A source repository is recognized by `capabilities.repo.json`, its vendored
-`contract/`, and generated `.capability-source/catalog.json`.
+`contract/`, and generated `.capability-source/catalog.json`. The official
+manager source additionally carries generated
+`.capability-source/manager-release.json`; `source index official` updates both
+files from the same intended source tree.

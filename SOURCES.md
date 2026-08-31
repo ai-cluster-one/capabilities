@@ -119,8 +119,11 @@ capabilities/
     deviations.md   optional
 .capability-source/
   catalog.json       generated
+  manager-release.json  generated for the official manager source
 ```
 
 The executable manifest remains the source of truth. `catalog.json` is only a
 generated discovery index and is rejected when its summaries or payload hashes
-are stale.
+are stale. In the official source, `manager-release.json` is also generated: it
+binds the incoming manager and its complete runtime/authoring asset set to
+SHA-256 hashes so `self-update` can stage the whole release before activation.

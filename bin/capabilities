@@ -75,8 +75,10 @@ MACHINE VERBS
         Refresh the manager itself and re-point its PATH symlink (install.sh is
         the first-install bootstrap). By default fetch the canonical source;
         --from installs the manager and release assets from a local checkout.
-        No-op when already current. The manager is not a capability, so it has
-        no registry entry or snapshots.
+        The incoming release manifest owns the asset list and hashes; the whole
+        release is verified and staged before one atomic symlink switch. No-op
+        when already current. The manager is not a capability, so it has no
+        registry entry or snapshots.
   list
         Installed capabilities with summaries and explicit project/global gate,
         effective state, the scope that supplied it, and — in a project — the
@@ -410,6 +412,9 @@ _MANAGER_RUNTIME_ASSETS = tuple(
     f"guides/{topic}.md" for topic in _MANAGER_GUIDE_TOPICS
 )
 _MANAGER_RELEASE_ASSETS = _AUTHORING_ASSETS + _MANAGER_RUNTIME_ASSETS
+MANAGER_RELEASE_SCHEMA = "capabilities.manager-release.v1"
+MANAGER_RELEASE_MANIFEST_REL = ".capability-source/manager-release.json"
+MANAGER_EXECUTABLE_REL = "bin/capabilities"
 
 # ---------------------------------------------------------------- I/O contract
 
@@ -1580,63 +1585,315 @@ def cmd_update(name: str | None) -> None:
     _emit({"updated": results})
 
 
+def _manager_release_manifest_bytes(manifest: dict) -> bytes:
+    return (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n").encode()
+
+
+def _valid_release_relpath(value: object) -> bool:
+    if not isinstance(value, str) or not value \
+            or not re.fullmatch(r"[A-Za-z0-9._/-]+", value):
+        return False
+    path = Path(value)
+    return (not path.is_absolute() and value == path.as_posix()
+            and all(part not in ("", ".", "..") for part in path.parts))
+
+
+def _validate_manager_release_manifest(manifest: object) -> list[str]:
+    problems: list[str] = []
+    if not isinstance(manifest, dict):
+        return ["release manifest is not a JSON object"]
+    if manifest.get("schema") != MANAGER_RELEASE_SCHEMA:
+        problems.append(
+            f"release manifest schema must be {MANAGER_RELEASE_SCHEMA!r}")
+    manager = manifest.get("manager")
+    if not isinstance(manager, dict):
+        problems.append("release manifest manager is not an object")
+    else:
+        if manager.get("path") != MANAGER_EXECUTABLE_REL:
+            problems.append(
+                f"release manifest manager.path must be {MANAGER_EXECUTABLE_REL!r}")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(manager.get("sha256") or "")):
+            problems.append("release manifest manager.sha256 is invalid")
+    assets = manifest.get("assets")
+    if not isinstance(assets, dict) or not assets:
+        problems.append("release manifest assets must be a non-empty object")
+    else:
+        valid_paths = [MANAGER_EXECUTABLE_REL, MANAGER_RELEASE_MANIFEST_REL]
+        for rel, digest in assets.items():
+            if not _valid_release_relpath(rel) or rel == MANAGER_EXECUTABLE_REL \
+                    or rel == MANAGER_RELEASE_MANIFEST_REL:
+                problems.append(f"release manifest asset path is invalid: {rel!r}")
+            else:
+                valid_paths.append(rel)
+            if not re.fullmatch(r"[0-9a-f]{64}", str(digest or "")):
+                problems.append(f"release manifest hash is invalid: {rel!r}")
+        for index, left in enumerate(valid_paths):
+            left_parts = tuple(part.casefold() for part in Path(left).parts)
+            for right in valid_paths[index + 1:]:
+                right_parts = tuple(part.casefold() for part in Path(right).parts)
+                shorter = min(len(left_parts), len(right_parts))
+                if left_parts[:shorter] == right_parts[:shorter]:
+                    problems.append(
+                        f"release manifest paths conflict: {left!r} and {right!r}")
+    return problems
+
+
+def _manager_release_payload(root: Path) -> tuple[dict | None, list[str]]:
+    """Expected manifest for a source carrying the official manager."""
+    manager = root / MANAGER_EXECUTABLE_REL
+    manifest_path = root / MANAGER_RELEASE_MANIFEST_REL
+    if not manager.is_file():
+        return (None, [f"{MANAGER_RELEASE_MANIFEST_REL} exists without a manager"]
+                if manifest_path.exists() else [])
+    missing = [rel for rel in _MANAGER_RELEASE_ASSETS
+               if not (root / rel).is_file()]
+    if missing:
+        return None, ["manager release assets are missing: " + ", ".join(missing)]
+    payload = {
+        "schema": MANAGER_RELEASE_SCHEMA,
+        "manager": {
+            "path": MANAGER_EXECUTABLE_REL,
+            "sha256": _sha256(manager),
+        },
+        "assets": {
+            rel: _sha256(root / rel) for rel in _MANAGER_RELEASE_ASSETS
+        },
+    }
+    problems = _validate_manager_release_manifest(payload)
+    if problems:
+        return None, [
+            "generated manager release manifest is invalid: "
+            + "; ".join(problems)
+        ]
+    return payload, []
+
+
+def _manager_release_parts(
+    manifest: object, source: str
+) -> tuple[dict, str, dict[str, str]]:
+    problems = _validate_manager_release_manifest(manifest)
+    if problems:
+        _die(5, "manager_release_invalid",
+             "incoming manager release manifest is invalid",
+             f"{source}: {'; '.join(problems)}")
+    assert isinstance(manifest, dict)
+    manager = manifest["manager"]
+    return manifest, manager["path"], dict(manifest["assets"])
+
+
+def _verify_manager_release_bytes(
+    manifest: dict, content: bytes, assets: dict[str, bytes], source: str
+) -> None:
+    expected_assets = manifest["assets"]
+    if set(assets) != set(expected_assets):
+        missing = sorted(set(expected_assets) - set(assets))
+        extra = sorted(set(assets) - set(expected_assets))
+        _die(5, "manager_release_incomplete",
+             "incoming manager release files do not match its manifest",
+             f"{source}: missing={missing}, extra={extra}")
+    actual = hashlib.sha256(content).hexdigest()
+    if actual != manifest["manager"]["sha256"]:
+        _die(5, "manager_release_hash_mismatch",
+             "incoming manager executable failed its release hash",
+             f"{source}: expected {manifest['manager']['sha256']}, got {actual}")
+    for rel, body in assets.items():
+        actual = hashlib.sha256(body).hexdigest()
+        if actual != expected_assets[rel]:
+            _die(5, "manager_release_hash_mismatch",
+                 f"incoming manager asset failed its release hash: {rel}",
+                 f"{source}: expected {expected_assets[rel]}, got {actual}")
+
+
+def _manager_release_from_root(
+    root: Path, source: str
+) -> tuple[bytes, dict[str, bytes], dict]:
+    manifest_path = root / MANAGER_RELEASE_MANIFEST_REL
+    manifest = _read_json(manifest_path)
+    if manifest is None:
+        _die(5, "manager_release_missing",
+             f"incoming manager release has no {MANAGER_RELEASE_MANIFEST_REL}",
+             f"{source}: index the release with `capabilities source index official`")
+    manifest, manager_rel, asset_hashes = _manager_release_parts(
+        manifest, str(manifest_path))
+    try:
+        content = (root / manager_rel).read_bytes()
+        assets = {rel: (root / rel).read_bytes() for rel in asset_hashes}
+    except OSError as exc:
+        _die(5, "manager_release_incomplete",
+             f"incoming manager release file cannot be read: {exc}", source)
+    _verify_manager_release_bytes(manifest, content, assets, source)
+    return content, assets, manifest
+
+
+def _manager_release_from_remote(httpx) -> tuple[bytes, dict[str, bytes], dict, str]:
+    manifest_url = f"{SOURCE.rstrip('/')}/{MANAGER_RELEASE_MANIFEST_REL}"
+
+    def fetch(url: str, label: str) -> bytes:
+        try:
+            response = httpx.get(url, follow_redirects=True, timeout=30.0)
+        except httpx.HTTPError as exc:
+            _die(5, "network_error", f"{label} fetch failed: {exc}", url)
+        if response.status_code != 200:
+            _die(5, "server_error",
+                 f"{label} fetch returned {response.status_code}", url)
+        return response.content
+
+    raw_manifest = fetch(manifest_url, "manager release manifest")
+    try:
+        parsed = json.loads(raw_manifest)
+    except ValueError as exc:
+        _die(5, "manager_release_invalid",
+             f"incoming manager release manifest is not JSON: {exc}", manifest_url)
+    manifest, manager_rel, asset_hashes = _manager_release_parts(
+        parsed, manifest_url)
+    content = fetch(f"{SOURCE.rstrip('/')}/{manager_rel}", "manager executable")
+    assets = {
+        rel: fetch(f"{SOURCE.rstrip('/')}/{rel}", f"manager asset {rel}")
+        for rel in asset_hashes
+    }
+    _verify_manager_release_bytes(manifest, content, assets, manifest_url)
+    return content, assets, manifest, manifest_url
+
+
 def _activate_manager_release(
-    content: bytes, assets: dict[str, bytes], source: str
+    content: bytes, assets: dict[str, bytes], source: str, manifest: dict
 ) -> dict:
-    """Install already-verified manager bytes and their authoring kit."""
+    """Stage one verified versioned release, then atomically switch PATH."""
     if b"uv run" not in content.split(b"\n", 1)[0]:
         _die(5, "server_error", "manager payload does not look executable", source)
-    manager = CAP_HOME / ".manager" / "capabilities"
-    before = _sha256(manager) if manager.exists() and not manager.is_symlink() else None
+    _verify_manager_release_bytes(manifest, content, assets, source)
+    manifest_bytes = _manager_release_manifest_bytes(manifest)
+    release_id = hashlib.sha256(manifest_bytes).hexdigest()
+    releases = CAP_HOME / ".manager" / "releases"
+    release = releases / release_id
+    manager_rel = manifest["manager"]["path"]
+    manager = release / manager_rel
+    files = {manager_rel: content, **assets,
+             MANAGER_RELEASE_MANIFEST_REL: manifest_bytes}
+    try:
+        releases.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _die(5, "manager_release_stage_failed",
+             "could not prepare the manager release store", str(exc))
+    release_repaired = False
+    if release.exists():
+        mismatched = []
+        for rel, body in files.items():
+            target = release / rel
+            try:
+                matches = target.is_file() and target.read_bytes() == body
+            except OSError:
+                matches = False
+            if not matches:
+                mismatched.append(rel)
+        if mismatched:
+            _die(5, "manager_release_corrupt",
+                 "an existing staged manager release is incomplete or corrupt",
+                 f"{release}: {', '.join(mismatched)}")
+        try:
+            executable = manager.stat().st_mode \
+                & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            if not executable:
+                manager.chmod(
+                    manager.stat().st_mode
+                    | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                release_repaired = True
+        except OSError as exc:
+            _die(5, "manager_release_corrupt",
+                 "the staged manager release is not executable", str(exc))
+    else:
+        try:
+            stage = Path(tempfile.mkdtemp(
+                prefix=".manager-release-", dir=releases))
+        except OSError as exc:
+            _die(5, "manager_release_stage_failed",
+                 "could not create a temporary manager release", str(exc))
+        try:
+            try:
+                for rel, body in files.items():
+                    target = stage / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(body)
+                staged_manager = stage / manager_rel
+                staged_manager.chmod(
+                    staged_manager.stat().st_mode
+                    | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                stage.rename(release)
+            except OSError as exc:
+                _die(5, "manager_release_stage_failed",
+                     "could not publish the staged manager release", str(exc))
+        finally:
+            if stage.exists():
+                shutil.rmtree(stage, ignore_errors=True)
+
+    link = _bin_dir() / "capabilities"
+    previous = None
+    try:
+        previous = link.resolve(strict=True)
+    except OSError:
+        legacy = CAP_HOME / ".manager" / "capabilities"
+        if legacy.is_file():
+            previous = legacy
+    try:
+        before = _sha256(previous) \
+            if previous is not None and previous.is_file() else None
+        manager_target = manager.resolve(strict=True)
+    except OSError as exc:
+        _die(5, "manager_release_corrupt",
+             "the complete manager release cannot be read", str(exc))
     after = hashlib.sha256(content).hexdigest()
-    if before != after:
-        manager.parent.mkdir(parents=True, exist_ok=True)
-        if manager.is_symlink() or manager.exists():
-            manager.unlink()
-        manager.write_bytes(content)
-        manager.chmod(manager.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    for rel, body in assets.items():
-        target = manager.parent / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(body)
-    link = _symlink("capabilities", manager)
-    return {
-        "self_update": "already current" if before == after else "updated",
+    link_changed = previous != manager_target or before != after
+    changed = release_repaired or link_changed
+    result = {
+        "self_update": "updated" if changed else "already current",
         "manager": str(manager),
+        "release": release_id,
+        "release_manifest": str(release / MANAGER_RELEASE_MANIFEST_REL),
         "sha256_before": before,
         "sha256_after": after,
         "symlink": str(link),
         "source": source,
         "manager_assets": sorted(assets),
     }
+    if not link_changed:
+        return result
+    temporary_link = link.with_name(
+        f".{link.name}.manager-release-{secrets.token_hex(8)}")
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        temporary_link.symlink_to(manager)
+        os.replace(temporary_link, link)
+    except OSError as exc:
+        _die(5, "manager_release_activate_failed",
+             "the complete manager release was staged but could not be activated",
+             str(exc))
+    finally:
+        try:
+            temporary_link.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return result
 
 
 def cmd_self_update(from_ref: str | None = None) -> None:
     """Refresh the installed manager itself from the canonical source.
 
     The manager is not a capability — it has no registry entry, no snapshots,
-    no gate. It lives at CAP_HOME/.manager/capabilities, symlinked onto PATH.
-    install.sh is the first-install bootstrap; this is the ongoing update, a
-    discoverable verb rather than a remembered curl one-liner. Idempotent:
-    a no-op (with "already current") when the installed bytes match canonical.
+    no gate. Versioned releases live under CAP_HOME/.manager/releases, with one
+    atomic PATH symlink selecting the complete active release. install.sh is the
+    first-install bootstrap; this is the ongoing update, a discoverable verb
+    rather than a remembered curl one-liner. Idempotent when the complete
+    release manifest already names the active target.
     """
     with _manager_mutation_guard():
         if from_ref:
             source_root = Path(from_ref).expanduser().resolve()
-            manager_source = (source_root / "bin" / "capabilities"
-                              if source_root.is_dir() else source_root)
             asset_root = source_root if source_root.is_dir() else source_root.parent.parent
-            if not manager_source.is_file():
-                _die(3, "not_found", f"no manager script at {manager_source}")
-            missing = [rel for rel in _MANAGER_RELEASE_ASSETS
-                       if not (asset_root / rel).is_file()]
-            if missing:
-                _die(3, "not_found", "local manager release assets are incomplete",
-                     ", ".join(missing))
-            assets = {rel: (asset_root / rel).read_bytes()
-                      for rel in _MANAGER_RELEASE_ASSETS}
+            content, assets, manifest = _manager_release_from_root(
+                asset_root, f"local:{source_root}")
             _emit(_activate_manager_release(
-                manager_source.read_bytes(), assets, f"local:{source_root}"))
+                content, assets, f"local:{source_root}", manifest))
             return
         httpx = _httpx()
         checkout_result = None
@@ -1648,26 +1905,8 @@ def cmd_self_update(from_ref: str | None = None) -> None:
             if common.parent.resolve() == checkout:
                 checkout_result = cmd_source_register_checkout(
                     OFFICIAL_SOURCE_ID, emit_result=False)
-        url = f"{SOURCE}/bin/capabilities"
-        try:
-            resp = httpx.get(url, follow_redirects=True, timeout=30.0)
-        except httpx.HTTPError as e:
-            _die(5, "network_error", f"fetch failed: {e}", url)
-        if resp.status_code != 200:
-            _die(5, "server_error", f"fetch returned {resp.status_code}", url)
-        content = resp.content
-        assets: dict[str, bytes] = {}
-        for rel in _MANAGER_RELEASE_ASSETS:
-            asset_url = f"{SOURCE}/{rel}"
-            try:
-                asset_resp = httpx.get(asset_url, follow_redirects=True, timeout=30.0)
-            except httpx.HTTPError as e:
-                _die(5, "network_error", f"authoring asset fetch failed: {e}", asset_url)
-            if asset_resp.status_code != 200:
-                _die(5, "server_error",
-                     f"authoring asset fetch returned {asset_resp.status_code}", asset_url)
-            assets[rel] = asset_resp.content
-        result = _activate_manager_release(content, assets, url)
+        content, assets, manifest, source = _manager_release_from_remote(httpx)
+        result = _activate_manager_release(content, assets, source, manifest)
         if checkout_result is not None:
             result["official_checkout"] = checkout_result
         _emit(result)
@@ -2330,12 +2569,22 @@ def cmd_dev_check(session_id: str) -> None:
             catalog_baseline=_catalog_at_ref(source_root, head),
             audit=False,
         )
-        if "catalog" in staged_report["failures"]:
+        stale_generated = {
+            key for key in ("catalog", "manager-release")
+            if key in staged_report["failures"]
+        }
+        if stale_generated:
             source_id = session["source"].get("id") or OFFICIAL_SOURCE_ID
-            failures.setdefault("catalog", []).append(
-                "staged catalogue is stale; run exactly: "
+            command = (
                 f"cd {shlex.quote(str(source_root))} && "
-                f"./bin/capabilities source index {shlex.quote(str(source_id))} --staged")
+                f"./bin/capabilities source index "
+                f"{shlex.quote(str(source_id))} --staged")
+            if "catalog" in stale_generated:
+                failures.setdefault("catalog", []).append(
+                    f"staged catalogue is stale; run exactly: {command}")
+            if "manager-release" in stale_generated:
+                failures.setdefault("manager-release", []).append(
+                    f"staged manager release manifest is stale; run exactly: {command}")
     descendant = _dev_git(source_root, "merge-base", "--is-ancestor", base, head).returncode == 0
     publication_ready = not status and head != base and descendant
     immutable = None
@@ -5624,6 +5873,16 @@ def _source_snapshot_report(
                 audit=audit,
             )
         )
+        manager_release_expected, manager_release_problems = \
+            _manager_release_payload(snapshot)
+        manager_release_current = _read_json(
+            snapshot / MANAGER_RELEASE_MANIFEST_REL)
+        if manager_release_problems:
+            failures.setdefault("manager-release", []).extend(
+                manager_release_problems)
+        elif manager_release_current != manager_release_expected:
+            failures.setdefault("manager-release", []).append(
+                "generated manager release manifest does not describe this Git tree")
         manager = snapshot / "bin" / "capabilities"
         if manager_selfcheck and manager.is_file():
             rc, _out, err = _run_script(
@@ -5643,13 +5902,17 @@ def _source_snapshot_report(
         "failures": failures,
         "expected": expected,
         "current": current,
+        "manager_release_expected": manager_release_expected,
+        "manager_release_current": manager_release_current,
+        "manager_release_problems": manager_release_problems,
         "ok": not contract_failures and not failures,
     }
 
 
 def _source_change_scope(changed_paths: list[str]) -> tuple[bool, set[str]]:
     manager_changed = any(
-        path == "bin/capabilities" or path in _MANAGER_RELEASE_ASSETS
+        path in ("bin/capabilities", MANAGER_RELEASE_MANIFEST_REL)
+        or path in _MANAGER_RELEASE_ASSETS
         for path in changed_paths
     )
     changed_capabilities = {
@@ -5735,8 +5998,11 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
         # while deriving the replacement. Contract or capability failures are.
         non_catalog_failures = {
             key: value for key, value in report["failures"].items()
-            if key != "catalog"
+            if key not in ("catalog", "manager-release")
         }
+        if report["manager_release_problems"]:
+            non_catalog_failures["manager-release"] = \
+                report["manager_release_problems"]
         if report["contract"] or non_catalog_failures:
             _emit({
                 "source": source_id,
@@ -5749,7 +6015,14 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
             sys.exit(7)
         path = root / ".capability-source" / "catalog.json"
         _write_json(path, report["expected"])
-        added = _dev_git(root, "add", "--", str(path.relative_to(root)))
+        generated = [path]
+        manager_release_path = root / MANAGER_RELEASE_MANIFEST_REL
+        if report["manager_release_expected"] is not None:
+            _write_json(
+                manager_release_path, report["manager_release_expected"])
+            generated.append(manager_release_path)
+        added = _dev_git(
+            root, "add", "--", *(str(item.relative_to(root)) for item in generated))
         if added.returncode != 0:
             _die(
                 6,
@@ -5778,12 +6051,36 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
                 },
             })
             sys.exit(7)
+        staged_manager_release = _dev_git(
+            root, "show", f":{MANAGER_RELEASE_MANIFEST_REL}")
+        try:
+            staged_manager_release_value = json.loads(
+                staged_manager_release.stdout) \
+                if staged_manager_release.returncode == 0 else None
+        except ValueError:
+            staged_manager_release_value = None
+        if staged_manager_release_value != report["manager_release_expected"]:
+            _emit({
+                "source": source_id,
+                "basis": "staged",
+                "tree": final_tree,
+                "ok": False,
+                "contract": [],
+                "failures": {
+                    "manager-release": [
+                        "staged manager release manifest differs from generated output"]
+                },
+            })
+            sys.exit(7)
         _emit({
             "source": source_id,
             "basis": "staged",
             "tree": final_tree,
             "indexed": sorted(report["expected"]["capabilities"]),
             "catalog": str(path),
+            "manager_release_manifest": (
+                str(manager_release_path)
+                if report["manager_release_expected"] is not None else None),
             "staged": True,
             "verification_profile": (
                 "manager" if manager_changed
@@ -5801,8 +6098,20 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
         sys.exit(7)
     path = root / ".capability-source" / "catalog.json"
     _write_json(path, catalog)
+    manager_release, manager_release_problems = _manager_release_payload(root)
+    if manager_release_problems:
+        _emit({"source": source_id, "ok": False,
+               "contract": contract_failures,
+               "failures": {"manager-release": manager_release_problems}})
+        sys.exit(7)
+    manager_release_path = root / MANAGER_RELEASE_MANIFEST_REL
+    if manager_release is not None:
+        _write_json(manager_release_path, manager_release)
     _emit({"source": source_id, "indexed": sorted(catalog["capabilities"]),
-           "catalog": str(path), "ok": True})
+           "catalog": str(path),
+           "manager_release_manifest": (
+               str(manager_release_path) if manager_release is not None else None),
+           "ok": True})
 
 
 def cmd_source_check(source_id: str) -> None:
@@ -5817,6 +6126,14 @@ def cmd_source_check(source_id: str) -> None:
     if current != expected:
         failures.setdefault("catalog", []).append(
             f"generated catalog is stale — run `capabilities source index {source_id}`")
+    manager_release, manager_release_problems = _manager_release_payload(root)
+    if manager_release_problems:
+        failures.setdefault("manager-release", []).extend(
+            manager_release_problems)
+    elif _read_json(root / MANAGER_RELEASE_MANIFEST_REL) != manager_release:
+        failures.setdefault("manager-release", []).append(
+            "generated manager release manifest is stale — run "
+            f"`capabilities source index {source_id}`")
     ok = not contract_failures and not failures
     _emit({"source": source_id, "root": str(root), "ok": ok,
            "contract": contract_failures, "failures": failures,
@@ -6320,14 +6637,12 @@ def _source_release(
         _regen_skills()
     manager_update = None
     if manager_changed and source_id == OFFICIAL_SOURCE_ID:
-        assets = {
-            rel: (repo / rel).read_bytes()
-            for rel in _MANAGER_RELEASE_ASSETS
-        }
+        content, assets, manifest = _manager_release_from_root(
+            repo, f"git:{remote_url}@{candidate}")
         manager_update = _activate_manager_release(
-            (repo / "bin" / "capabilities").read_bytes(),
-            assets,
+            content, assets,
             f"git:{remote_url}@{candidate}",
+            manifest,
         )
     final_local = _dev_git_value(repo, "rev-parse", "HEAD")
     if final_local != candidate:

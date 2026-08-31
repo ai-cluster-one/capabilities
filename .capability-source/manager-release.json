@@ -1,0 +1,24 @@
+{
+  "assets": {
+    "DOCTRINE.md": "f05395a934228687a4121fe13e92f1b38f33530e5ab98e0d6a50035e1ceab515",
+    "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
+    "SHEBANG.md": "57cbc5ba144f1d1098a0b0d817fd986402839f520b8e7ca0e2bd2951e63e94e4",
+    "SOURCES.md": "8e8b7f1f500b8ebe3d1abb2874616071e8142c69b897110be5cbc0f0194b0085",
+    "TEMPLATE.md": "7072f124f29efcf0a1910678d2796b9408c39f6b69fe4b255a97e34dc83d1d8f",
+    "contract/preamble.py": "e06da1afbc9d15297cb7f75771c0209d70a1ed6339160221b01865109dfc2d4f",
+    "contract/store.py": "8bf781584e9f91db4ff5510c1465cb4d710097378ac9e5d03bd6955bff5d6e5a",
+    "guides/authoring.md": "3b12c12aa60cecb6dc96994d95b37fa8901be7f920fee7f8be3dc2a3b6e947b9",
+    "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
+    "guides/contract.md": "72408b3b5d035b15f9d98b5a5dc3d558870f391ed254b8c5f017656be75a13f4",
+    "guides/dev.md": "6479732c7c459693287145089a28b595e8fd6785456f1768cfbc49dda5cfd3d4",
+    "guides/grooming.md": "a3ed64a86c4c0efbd2232cb42521f556452ffb1d1211f9599203360916b317bc",
+    "guides/publishing.md": "afe771c3d708ce65092a2e63ccf8360966ce0149c268275bac70e3ee8c46ebf8",
+    "guides/repositories.md": "0ec2af6dfc92d20aa283fecab82b7888fb22b2480541cbb597e9a52f680ec2f4",
+    "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09"
+  },
+  "manager": {
+    "path": "bin/capabilities",
+    "sha256": "8510fc2448420bceebe1b566945d391c6087ea58137439f4d6271ed705486b9f"
+  },
+  "schema": "capabilities.manager-release.v1"
+}
