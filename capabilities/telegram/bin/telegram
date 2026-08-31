@@ -4287,6 +4287,204 @@ def _service_wanted_connection(root: Path, connection_flag: str | None) -> str |
     return str(value) if value else None
 
 
+# --- registered jobs ----------------------------------------------------------
+#
+# The register is a table in the shared store, so this reads and writes it
+# directly rather than asking the daemon. That is what makes the surface usable
+# at all: the person looking at a stuck queue is at a terminal, and the worker
+# deciding whether a message amends running work is a subprocess — neither is
+# the daemon, and neither should have to be.
+#
+# The daemon still owns the acts that touch a live process. `cancel`, `stop` and
+# `amend` record what was asked for; the runner reads the register on its next
+# tick and does the stopping. That is the same asynchrony the register was built
+# around, applied to one more caller.
+
+def _service_jobs() -> Path:
+    return _service_bundle_dir() / "service" / "jobs.py"
+
+
+def _jobs_module():
+    path = _service_jobs()
+    _require_service_bundle_files(path)
+    spec = importlib.util.spec_from_file_location("telegram_service_jobs", path)
+    if spec is None or spec.loader is None:
+        _die(3, "service_bundle_missing", f"cannot load the bundled job register: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _job_environment(root: Path) -> str:
+    """Which half of the machine this queue belongs to.
+
+    Read the same way the daemon reads it, from the same settings, so a person
+    asking about the queue and the daemon draining it are never looking at two
+    different ones.
+    """
+    value = os.environ.get("TELEGRAM_ENVIRONMENT")
+    if not value:
+        try:
+            value = (_service_settings(root) or {}).get("environment")
+        except SystemExit:
+            raise
+        except Exception:
+            value = None
+    return str(value or "development").strip()
+
+
+def _open_job_register(root: Path):
+    module = _jobs_module()
+    try:
+        _store, register = module.open_register(
+            sys.modules[__name__], _project_capabilities_dir(root),
+            _job_environment(root))
+        return module, register
+    except module.JobError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+
+
+def _job_channel_key(chat: str | None, topic_id: str | None) -> str | None:
+    if not chat:
+        return None
+    return f"{chat}:{topic_id}" if topic_id else str(chat)
+
+
+def _job_row(view: dict) -> dict:
+    """One row as this CLI reports it.
+
+    The stored columns, with the flag turned into the sentence it stands for:
+    "stop_requested=1, state=running" is two halves a reader has to assemble,
+    and "stopping" is not.
+    """
+    row = dict(view)
+    row["stopping"] = bool(row.pop("stop_requested", 0))
+    return row
+
+
+def _require_job(register, module, job_id: str, chat: str | None,
+                 topic_id: str | None) -> dict:
+    row = register.get(job_id)
+    if row is None:
+        _die(2, "job_not_found", f"no job {job_id} in this project's register",
+             "run `telegram jobs list` to see the ids")
+    key = _job_channel_key(chat, topic_id)
+    if key is not None and row["channel_key"] != key:
+        _die(4, "job_scope_denied",
+             f"job {job_id} belongs to channel {row['channel_key']}, not {key}")
+    return row
+
+
+def cmd_jobs_list(chat: str | None, topic_id: str | None, state: str | None,
+                  outcome: str | None, limit: int, active_only: bool) -> dict:
+    root = _service_project_root()
+    module, register = _open_job_register(root)
+    try:
+        key = _job_channel_key(chat, topic_id)
+        if active_only:
+            rows = (register.open_jobs(key) if key else sorted(
+                (row for live in (module.WAITING, module.RUNNING)
+                 for row in register.list(state=live, limit=limit)),
+                key=lambda r: (r["created_at"], r["id"])))[:limit]
+        else:
+            rows = register.list(limit=limit, state=state, outcome=outcome,
+                                 channel_key=key)
+        return {"environment": register.environment,
+                "channel_key": key,
+                "counts": register.counts(),
+                "slots_in_use": register.running(),
+                "jobs": [_job_row(row) for row in rows]}
+    finally:
+        register.store.close()
+
+
+def cmd_jobs_show(job_id: str, chat: str | None, topic_id: str | None) -> dict:
+    root = _service_project_root()
+    module, register = _open_job_register(root)
+    try:
+        row = _require_job(register, module, job_id, chat, topic_id)
+        out = _job_row(row)
+        # The staged text is the one thing a reader cannot get anywhere else:
+        # it has been written but not yet delivered to the session.
+        out["pending_amendment"] = register.pending_amendment(job_id)
+        return out
+    finally:
+        register.store.close()
+
+
+def cmd_jobs_register(description: str, chat: str | None, topic_id: str | None,
+                      engine: str | None, requested_by: str | None,
+                      origin_message_id: str | None) -> dict:
+    root = _service_project_root()
+    key = _job_channel_key(chat, topic_id)
+    if not key:
+        _die(6, "no_channel", "a job needs the channel it reports into",
+             "pass --chat <chat-id> (and --topic-id for a forum topic)")
+    if not requested_by:
+        _die(6, "no_requester",
+             "a job needs the operator whose authority it carries",
+             "pass --requested-by <telegram-user-id>")
+    module, register = _open_job_register(root)
+    try:
+        settings = _service_settings(root) or {}
+        chosen = engine or (settings.get("defaults") or {}).get("worker") or "stub"
+        return _job_row(register.register(
+            channel_key=key, requested_by=requested_by, description=description,
+            engine=chosen, origin_message_id=origin_message_id))
+    except module.JobError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    finally:
+        register.store.close()
+
+
+def cmd_jobs_amend(job_id: str, text: str, chat: str | None,
+                   topic_id: str | None) -> dict:
+    root = _service_project_root()
+    module, register = _open_job_register(root)
+    try:
+        row = _require_job(register, module, job_id, chat, topic_id)
+        register.stage_amendment(job_id, text)
+        if row["state"] != module.RUNNING:
+            # Nothing is running, so nothing has to be stopped: the text is
+            # consumed when the job is next dispatched, and a stopped job goes
+            # back to waiting because being amended is a reason to continue.
+            register.amend(job_id)
+        return {"id": job_id, "amendment": "staged",
+                "pending_amendment": register.pending_amendment(job_id),
+                "instruction": ("Say the correction is folded into the job that "
+                                "already exists. Do not register a new one.")}
+    finally:
+        register.store.close()
+
+
+def cmd_jobs_stop(job_id: str, chat: str | None, topic_id: str | None) -> dict:
+    root = _service_project_root()
+    module, register = _open_job_register(root)
+    try:
+        row = _require_job(register, module, job_id, chat, topic_id)
+        if register.request_stop(job_id) is None:
+            _die(6, "job_stopped",
+                 f"job {job_id} is already stopped ({row['outcome']})",
+                 "`telegram jobs resume` continues it")
+        return {"id": job_id, "stopping": True,
+                "instruction": ("Stopping is asynchronous: the runner ends the "
+                                "process on its next tick. The job keeps its "
+                                "session and its place, and `telegram jobs "
+                                "resume` continues it from there.")}
+    finally:
+        register.store.close()
+
+
+def cmd_jobs_resume(job_id: str, chat: str | None, topic_id: str | None) -> dict:
+    root = _service_project_root()
+    module, register = _open_job_register(root)
+    try:
+        _require_job(register, module, job_id, chat, topic_id)
+        return _job_row(register.resume(job_id))
+    finally:
+        register.store.close()
+
+
 def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     root = _service_project_root()
     _require_service_envelope(root)
@@ -5088,6 +5286,44 @@ def main() -> None:
     pt.add_argument("--force", action="store_true", help="re-transcribe even if already filled")
     pt.add_argument("--model", default="nova-3", help="Deepgram model (default: nova-3)")
 
+    pjobs = sub.add_parser(
+        "jobs", help="the register of work that outlives a conversation")
+    jb = pjobs.add_subparsers(dest="jobs_cmd", required=True)
+
+    def job_scope(parser, *, needs_id=True):
+        if needs_id:
+            parser.add_argument("id", help="the job id, from `jobs list`")
+        parser.add_argument("--chat", help="restrict to one chat id")
+        parser.add_argument("--topic-id", help="restrict to one forum topic")
+        return parser
+
+    jlist = job_scope(jb.add_parser("list", help="jobs in this project's register"),
+                      needs_id=False)
+    jlist.add_argument("--state", choices=["waiting", "running", "stopped"],
+                       help="what the job is doing")
+    jlist.add_argument("--outcome",
+                       choices=["succeeded", "failed", "cancelled",
+                                "interrupted", "quota"],
+                       help="why a stopped job stopped")
+    jlist.add_argument("--limit", type=int, default=50)
+    jactive = job_scope(jb.add_parser(
+        "active", help="only what is waiting or running"), needs_id=False)
+    jactive.add_argument("--limit", type=int, default=50)
+    job_scope(jb.add_parser("show", help="one job in full, staged text included"))
+    jreg = job_scope(jb.add_parser(
+        "register", help="enter one task into the queue"), needs_id=False)
+    jreg.add_argument("description", help="one line, in the operator's terms")
+    jreg.add_argument("--engine", choices=["codex", "claude", "stub"])
+    jreg.add_argument("--requested-by", help="the operator whose authority it carries")
+    jreg.add_argument("--origin-message-id")
+    jamend = job_scope(jb.add_parser(
+        "amend", help="continue a job with added context, keeping its session"))
+    jamend.add_argument("text", help="what changed, in the operator's terms")
+    job_scope(jb.add_parser(
+        "stop", help="stop the work; it keeps its session and its place"))
+    job_scope(jb.add_parser(
+        "resume", help="continue stopped work, whatever stopped it"))
+
     psvc = sub.add_parser("service", help="manage the bundled assistant service")
     svc = psvc.add_subparsers(dest="service_cmd", required=True)
     svc.add_parser("init", help="create project-local service settings/context")
@@ -5147,6 +5383,27 @@ def main() -> None:
         return
     if args.cmd == "transcribe":      # connection-independent: a local file + Deepgram
         _emit(cmd_transcribe(args.json_path, args.force, args.model))
+        return
+    if args.cmd == "jobs":
+        # The register is a table, not a session: this reaches the store and
+        # never opens Telegram, so it runs before any connection is loaded.
+        chat, topic = args.chat, args.topic_id
+        if args.jobs_cmd == "list":
+            _emit(cmd_jobs_list(chat, topic, args.state, args.outcome,
+                                args.limit, False))
+        elif args.jobs_cmd == "active":
+            _emit(cmd_jobs_list(chat, topic, None, None, args.limit, True))
+        elif args.jobs_cmd == "show":
+            _emit(cmd_jobs_show(args.id, chat, topic))
+        elif args.jobs_cmd == "register":
+            _emit(cmd_jobs_register(args.description, chat, topic, args.engine,
+                                    args.requested_by, args.origin_message_id))
+        elif args.jobs_cmd == "amend":
+            _emit(cmd_jobs_amend(args.id, args.text, chat, topic))
+        elif args.jobs_cmd == "stop":
+            _emit(cmd_jobs_stop(args.id, chat, topic))
+        elif args.jobs_cmd == "resume":
+            _emit(cmd_jobs_resume(args.id, chat, topic))
         return
     if args.cmd == "service":
         if args.service_cmd == "init":

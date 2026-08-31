@@ -83,6 +83,39 @@ def write_progress(argv):
     return True
 
 
+def enforce_job_scope(argv):
+    """A worker reads and moves the jobs of its own channel, and no others.
+
+    `jobs` is a store surface rather than an outbox one: the register is a
+    table, so the real CLI answers a read directly and records an ask directly,
+    and nothing has to round-trip through the daemon to be seen. What the shim
+    still owns is the scope — the authorized chat and topic are pinned here so
+    a turn cannot list or touch another room's work.
+    """
+    args = list(argv[1:])
+    if args[:1] != ["jobs"]:
+        return
+    allowed_chat, allowed_topic, allowed_connection = worker_scope()
+    if not allowed_chat:
+        fail("worker_authority_missing",
+             "the daemon did not provide an authorized Telegram chat scope",
+             exit_code=4)
+    for forbidden in ("--chat", "--channel", "--all-channels"):
+        if forbidden in args or any(item.startswith(forbidden + "=") for item in args):
+            fail("worker_scope_denied",
+                 f"{forbidden} cannot be overridden inside a Telegram worker request",
+                 f"this turn is scoped to chat {allowed_chat}", exit_code=4)
+
+
+def job_scope_arguments():
+    """The scope the shim adds to every worker `jobs` call."""
+    allowed_chat, allowed_topic, _ = worker_scope()
+    args = ["--chat", allowed_chat]
+    if allowed_topic:
+        args += ["--topic-id", allowed_topic]
+    return args
+
+
 def auth_context():
     raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
     if not raw:
@@ -224,6 +257,7 @@ def main():
     # action; the CLI applies the role grant and the connection write gate.
     if not cross_connection and write_progress(sys.argv):
         return 0
+    enforce_job_scope(sys.argv)
     enforce_current_chat_scope(sys.argv)
     real = os.environ.get("TELEGRAM_REAL_TELEGRAM")
     if not real:
@@ -235,7 +269,10 @@ def main():
     # account through the other's session, so it is left out entirely.
     if worker_session and "--session" not in sys.argv[1:] and not cross_connection:
         args.extend(["--session", worker_session])
-    os.execvp(real, args + sys.argv[1:])
+    passthrough = list(sys.argv[1:])
+    if passthrough[:1] == ["jobs"]:
+        passthrough += job_scope_arguments()
+    os.execvp(real, args + passthrough)
 
 
 if __name__ == "__main__":

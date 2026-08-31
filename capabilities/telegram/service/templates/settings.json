@@ -1,5 +1,6 @@
 {
   "connection": null,
+  "environment": "production",
   "assistant_name": "Assistant",
   "direct_messages": {
     "mode": "allowed_users",
@@ -50,7 +51,10 @@
     "debounce": 5,
     "worker_timeout": 120,
     "progress_after": 15,
-    "max_parallel_jobs": 2,
+    "max_parallel_dialogue": 1,
+    "max_parallel_jobs": 1,
+    "job_poll_interval": 2,
+    "job_recovery": "requeue",
     "group_aliases": ["Assistant"],
     "worker": "stub",
     "workers": {

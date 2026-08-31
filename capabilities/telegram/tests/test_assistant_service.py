@@ -184,10 +184,26 @@ class AudioParameters:
 def import_daemon(tmp: Path, service_settings: dict, *,
                   connection_extra: dict | None = None,
                   voice_context: str | None = None,
-                  project_env: dict | None = None):
+                  project_env: dict | None = None,
+                  store: bool = False):
+    """Import one daemon against a throwaway project.
+
+    `store` gives that project the identity and the store the job register
+    needs. Configuration stays in files: where a project keeps its settings and
+    where its queue lives are different questions, and the register answers the
+    second one the same way whatever the first says. Without it the register
+    cannot open, and the daemon keeps answering with the job class off — the
+    degradation every other test here exercises.
+    """
     project = tmp / "project"
     service_dir = project / "capabilities" / "telegram" / "service"
     service_dir.mkdir(parents=True)
+    if store:
+        (project / "capabilities" / "project.json").write_text(json.dumps({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "slug": "testproject",
+            "store": "files",
+        }) + "\n")
     settings_file = service_dir / "settings.json"
     context_file = service_dir / "context.md"
     voice_context_file = service_dir / "voice-agent.md"
@@ -242,6 +258,10 @@ def import_daemon(tmp: Path, service_settings: dict, *,
             "TELEGRAM_SERVICE_SETTINGS": str(settings_file),
             "TELEGRAM_SERVICE_STATE_DIR": str(tmp / "service-state"),
         })
+        if store:
+            os.environ["CAPABILITIES_STORE_URL"] = str(tmp / "store.sqlite3")
+        else:
+            os.environ.pop("CAPABILITIES_STORE_URL", None)
         os.environ.pop("TELEGRAM_SERVICE_VOICE_CONTEXT", None)
         if voice_context is not None:
             os.environ["TELEGRAM_SERVICE_VOICE_CONTEXT"] = str(voice_context_file)
@@ -496,6 +516,46 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["reply"], "")
             self.assertEqual(result["meta"]["session_id"], "thread-1")
             self.assertEqual(result["meta"]["tokens"]["output"], 0)
+
+    async def test_the_reported_codex_failure_is_the_one_codex_gave(self):
+        """codex prints a routine line to stderr on every run and reports its
+        actual refusal as a protocol event. Reading the first stderr line named
+        stdin as the cause of every failure, including an exhausted quota."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            api_error = json.dumps({
+                "type": "error", "status": 429,
+                "error": {"type": "usage_limit_reached",
+                          "message": "You've hit your usage limit."}})
+            stdout = "\n".join([
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps({"type": "item.completed", "item": {
+                    "id": "item_0", "type": "error",
+                    "message": "Model metadata not found; using fallback."}}),
+                json.dumps({"type": "error", "message": api_error}),
+                json.dumps({"type": "turn.failed", "error": {"message": api_error}}),
+            ])
+            stderr = ("Reading additional input from stdin...\n"
+                      "2026-08-30T16:03:12Z ERROR codex_models_manager: cache miss\n")
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(1, stdout, stderr)):
+                with self.assertRaisesRegex(RuntimeError, "hit your usage limit"):
+                    daemon.worker_codex("123", [], {}, {})
+            reason = daemon.codex_failure_reason(stdout, stderr, 1)
+            self.assertNotIn("stdin", reason)
+            self.assertTrue(daemon.is_quota_exhausted(reason))
+
+    async def test_a_codex_failure_with_no_events_still_skips_the_routine_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            reason = daemon.codex_failure_reason(
+                "", "Reading additional input from stdin...\nauth token expired\n", 1)
+            self.assertEqual(reason, "auth token expired")
+            self.assertEqual(
+                daemon.codex_failure_reason(
+                    "", "Reading additional input from stdin...\n", 7),
+                "exit 7")
+            self.assertFalse(daemon.is_quota_exhausted("auth token expired"))
 
     async def test_codex_empty_final_without_completion_remains_an_error(self):
         with tempfile.TemporaryDirectory() as td:

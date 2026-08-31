@@ -95,6 +95,7 @@ from call_recording_helpers import (
     trailing_silence_start,
     write_metadata,
 )
+import jobs
 import voice_agent
 from settings_schema import validate_settings
 sys.path.pop(0)
@@ -289,6 +290,40 @@ def _records():
     return _RECORDS
 
 
+# Where the register lives, read once at launch. Every other location this
+# daemon uses is resolved at import and then fixed for the life of the process,
+# and the store is no different: a value re-read on each open is a value that
+# can change under a running daemon, which is how a queue ends up split across
+# two databases nobody chose.
+STORE_URL = os.environ.get("CAPABILITIES_STORE_URL") or None
+
+_JOB_STORE = None
+_JOB_REGISTER = None
+
+
+def job_register():
+    """The job register this daemon drains, opened once.
+
+    The connection belongs to the thread that opened it, which is the event
+    loop: every read and write below happens there, and the workers that do the
+    long work never touch it.
+    """
+    global _JOB_STORE, _JOB_REGISTER
+    if _JOB_REGISTER is None:
+        _JOB_STORE, _JOB_REGISTER = jobs.open_register(
+            _records_module(), PROJECT_CAPABILITIES_DIR, ENVIRONMENT,
+            url=STORE_URL)
+    return _JOB_REGISTER
+
+
+def close_job_register():
+    global _JOB_STORE, _JOB_REGISTER
+    if _JOB_STORE is not None:
+        with contextlib.suppress(Exception):
+            _JOB_STORE.close()
+    _JOB_STORE, _JOB_REGISTER = None, None
+
+
 def _read_project_layout(reload_file=False):
     """Validate the launcher-owned absolute project layout snapshot."""
     raw = os.environ.get("TELEGRAM_SERVICE_PROJECT_LAYOUT", "").strip()
@@ -427,6 +462,15 @@ def _runtime_settings(settings, project_layout=None):
             return float(default)
 
     sync_interval = positive_seconds("sync_interval", 20)
+    # Which half of the machine this daemon is. It reaches the job queue as a
+    # filter, so a development daemon can never take a production job off the
+    # shared store, and the process environment wins because a daemon and a
+    # doctor started under one must not disagree about which they are.
+    environment = str(os.environ.get("TELEGRAM_ENVIRONMENT")
+                      or settings.get("environment") or "development").strip()
+    if not jobs.ENVIRONMENT_RE.fullmatch(environment):
+        raise SettingsError(
+            f"settings.environment must match {jobs.ENVIRONMENT_RE.pattern}")
     aliases = defaults.get("group_aliases")
     if aliases is None:
         group_aliases = (assistant_name,)
@@ -457,6 +501,12 @@ def _runtime_settings(settings, project_layout=None):
         "SYNC_STALE_AFTER": max(
             sync_interval * 2, positive_seconds("sync_stale_after", 60)),
         "PROJECT_LAYOUT": project_layout if project_layout is not None else PROJECT_LAYOUT,
+        "ENVIRONMENT": environment,
+        # The job class is a property of the daemon, not of one conversation:
+        # the queue it drains is shared by every channel this service serves.
+        "MAX_PARALLEL_JOBS": max(1, int(defaults.get("max_parallel_jobs", 1) or 1)),
+        "JOB_POLL_INTERVAL": positive_seconds("job_poll_interval", 2, minimum=0.05),
+        "JOB_RECOVERY": str(defaults.get("job_recovery") or "requeue").strip().lower(),
     }
 
 
@@ -635,6 +685,11 @@ PID_FILE = SERVICE_STATE_DIR / "daemon.pid"
 LOG_FILE = SERVICE_STATE_DIR / "daemon.log"
 HEALTH_FILE = SERVICE_STATE_DIR / "health.json"
 PROGRESS_DIR = SERVICE_STATE_DIR / "progress"
+# How long a queue paused by an exhausted subscription waits before trying
+# again. The engine reports that the limit is reached, not when it lifts, so
+# this is a retry interval rather than a promise — and the dialogue worker says
+# it in those terms.
+QUOTA_RETRY_SECONDS = 300.0
 WORKER_SESSION_DIR = SERVICE_STATE_DIR / "worker-sessions"
 # The worker session each caller is carrying, by caller. Deliberately not under
 # worker-sessions/, which holds copies of the Telegram account session — a
@@ -2789,7 +2844,8 @@ def channel_settings(reg, key):
         "debounce": s.get("debounce", DEFAULTS.get("debounce", 3)),
         "worker_timeout": s.get("worker_timeout", configured_timeout),
         "progress_after": s.get("progress_after", DEFAULTS.get("progress_after", 15)),
-        "max_parallel_jobs": s.get("max_parallel_jobs", DEFAULTS.get("max_parallel_jobs", 2)),
+        "max_parallel_dialogue": s.get(
+            "max_parallel_dialogue", DEFAULTS.get("max_parallel_dialogue", 1)),
         "max_attempts": s.get("max_attempts", DEFAULTS.get("max_attempts", 3)),
         "worker": worker,
         "worker_settings": cfg,
@@ -3303,7 +3359,7 @@ def _settings_summary(s):
         f"debounce={s.get('debounce')}s",
         f"timeout={s.get('worker_timeout')}s",
         f"progress_after={s.get('progress_after')}s",
-        f"parallel={s.get('max_parallel_jobs')}",
+        f"dialogue={s.get('max_parallel_dialogue')}",
         f"max_attempts={s.get('max_attempts')}",
     ]
     if s.get("worker") == "claude":
@@ -3494,6 +3550,22 @@ def build_prompt(tail, state=None):
             f"Progress: for work longer than about 15 seconds, send one short line "
             f"with {progress_command} before going deep.")
     block = ("--- Channel state ---\n" + "\n".join(lines) + "\n\n") if lines else ""
+    jobs_block = ""
+    if st.get("jobs_available"):
+        jobs_command = f'{WORKER_BIN / "telegram"} jobs'
+        jobs_block = (
+            "--- Registered jobs ---\n"
+            "Work that will outlive this conversation is a job, not an answer. "
+            f"Read what is already in flight for this channel with `{jobs_command} "
+            "active` before deciding — the queue moves while a turn is being "
+            "written, so it is asked for when it is needed rather than handed "
+            "over at the start. A message that changes work already running is "
+            f"an amendment (`{jobs_command} amend <id> \"<what changed>\"`), not a "
+            f"second request; a genuinely new task is `{jobs_command} register "
+            "\"<one line>\"`, answered by saying it is queued without promising a "
+            "duration.\n\n")
+    if st.get("quota_pause"):
+        jobs_block += f"Queue paused: {st['quota_pause']}\n\n"
     request_block = ""
     if req:
         request_lines = [
@@ -3513,7 +3585,7 @@ def build_prompt(tail, state=None):
         ])
         request_block = "\n".join(request_lines)
     history = _format_conversation(tail)
-    return f"{context}\n\n{channel_context}{block}{request_block}--- Conversation ---\n{history}"
+    return (f"{context}\n\n{channel_context}{block}{jobs_block}{request_block}--- Conversation ---\n{history}")
 
 
 def message_tail_text(m):
@@ -4080,6 +4152,101 @@ def _codex_meta(stdout, model):
             "cost_usd": None, "duration_ms": None, "session_id": thread_id}
 
 
+# Lines codex prints on every run, fatal or not. The first of them is what the
+# service used to report as the cause of a failure, so a refusal the model
+# actually gave arrived as a note about stdin.
+CODEX_ROUTINE_STDERR = (
+    "Reading additional input from stdin...",
+)
+
+
+def _unwrap_engine_message(text):
+    """The sentence inside an engine error, when the engine wrapped one.
+
+    Codex forwards the provider's HTTP error verbatim, so `message` is often a
+    JSON document whose own `error.message` is the only part a person can read.
+    """
+    value = (text or "").strip()
+    for _ in range(3):
+        if not (value.startswith("{") and value.endswith("}")):
+            break
+        try:
+            obj = json.loads(value)
+        except ValueError:
+            break
+        if not isinstance(obj, dict):
+            break
+        inner = obj.get("error")
+        if isinstance(inner, dict) and inner.get("message"):
+            value = str(inner["message"]).strip()
+            continue
+        if isinstance(inner, str) and inner.strip():
+            value = inner.strip()
+            continue
+        if obj.get("message"):
+            value = str(obj["message"]).strip()
+            continue
+        break
+    return value
+
+
+def codex_failure_reason(stdout, stderr, rc):
+    """Why a codex run failed, taken from where codex actually says so.
+
+    The protocol carries the refusal — `turn.failed`, then a top-level `error`
+    event — while stderr carries routine chatter that happens to come first.
+    Reporting stderr's first line therefore named the wrong cause every time,
+    and a run stopped by an exhausted quota read as a note about stdin. The
+    order below is the order of authority: the turn's own verdict, then any
+    fatal event, then whatever stderr had left once the routine lines are gone.
+    """
+    fatal, events, items = None, [], []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "turn.failed":
+            error = event.get("error")
+            message = error.get("message") if isinstance(error, dict) else error
+            if message:
+                fatal = str(message)
+        elif kind == "error" and event.get("message"):
+            events.append(str(event["message"]))
+        elif kind in ("item.completed", "item.started"):
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "error" and item.get("message"):
+                items.append(str(item["message"]))
+    for candidate in (fatal, events[-1] if events else None, items[-1] if items else None):
+        if candidate:
+            return _unwrap_engine_message(candidate)
+    residue = [line for line in (stderr or "").splitlines()
+               if line.strip() and line.strip() not in CODEX_ROUTINE_STDERR]
+    if residue:
+        return residue[-1].strip()
+    return f"exit {rc}"
+
+
+# What an engine says when the subscription is spent rather than when the work
+# is wrong. A paused queue and a failed job are different states, and the only
+# thing that separates them is this sentence.
+QUOTA_EXHAUSTED_RE = re.compile(
+    r"usage limit|rate.?limit|quota|too many requests|\b429\b|insufficient_quota"
+    r"|limit reached|limit will reset|resets? (at|in)\b",
+    re.IGNORECASE,
+)
+
+
+def is_quota_exhausted(reason):
+    return bool(QUOTA_EXHAUSTED_RE.search(str(reason or "")))
+
+
 def _codex_turn_completed(stdout):
     """True only when Codex's JSONL protocol confirms a successful turn end."""
     for line in stdout.splitlines():
@@ -4172,7 +4339,8 @@ def worker_codex(chat, tail, state=None, procs=None):
             cancel_event=(state or {}).get("cancel_event"),
             on_line=(state or {}).get("on_worker_line"))
         if rc != 0:
-            raise RuntimeError(f"codex worker failed: {err.strip()[:200]}")
+            raise RuntimeError(
+                f"codex worker failed: {codex_failure_reason(stdout_txt, err, rc)[:500]}")
         reply = Path(out).read_text().strip()
         if not reply:
             if _codex_turn_completed(stdout_txt):
@@ -4436,8 +4604,10 @@ async def run_session(client):
     pruned = _prune_all_jobs(reg)
     if recovered or pruned:
         save_register(reg)
-    # Per-chat concurrency is capped by max_parallel_jobs. The unit of work is an
-    # addressed Telegram message, persisted in register.jobs and deduped by message id.
+    # The dialogue class: one addressed Telegram message is one unit of work,
+    # persisted in register.jobs, deduped by message id, and capped per chat by
+    # max_parallel_dialogue. Long work is not here — it is a row in the job
+    # register, drained by the job runner against its own budget.
     busy, timers, runners = set(), {}, {}
     procs, stopping = {}, set()   # live worker per chat + chats whose worker /stop just killed
     closing = False
@@ -4878,6 +5048,8 @@ async def run_session(client):
                      "authority": authority,
                      "authority_context": authority_context,
                      "progress_outbox": str(progress_outbox),
+                     "jobs_available": jobs_available(),
+                     "quota_pause": quota_pause_notice(),
                      "worker_session": worker_session,
                      "cancel_event": cancel_event,
                      "project_dir": project_dir,
@@ -5042,7 +5214,7 @@ async def run_session(client):
         try:
             while not closing:
                 s = channel_settings(reg, key)
-                limit = max(1, int(s.get("max_parallel_jobs") or 1))
+                limit = max(1, int(s.get("max_parallel_dialogue") or 1))
                 queued = _queued_jobs(reg, key)
                 while queued and len(active) < limit:
                     job = queued.pop(0)
@@ -5133,6 +5305,347 @@ async def run_session(client):
                 mark_job_finished(key, job, "stopped", error="/stop")
                 stopped = True
         return "Stopped." if stopped else "Nothing is running right now."
+
+    # --- the job class -------------------------------------------------------
+    #
+    # The second budget. The dialogue class above answers while the person is
+    # still there; this drains the register, oldest first, inside its own slot
+    # count. Neither can starve the other, which is the whole reason the two
+    # were separated: at one shared slot a twelve-minute task blocked every
+    # quick question, and above one a burst of corrections forked into twins.
+
+    job_tasks = {}        # asyncio task -> job id
+    job_procs = {}        # job id -> the proc key its process group is under
+    job_cancels = {}      # job id -> the cancel event its worker thread reads
+    job_futures = {}      # job id -> the executor future running it
+    # Jobs being amended right now. Stopping the process and recording the
+    # amendment cannot be one instant, and in between them the worker's own
+    # failure arrives — so the intent is held here, where the handler that reads
+    # it can tell "stopped so it could be continued" from "stopped because it
+    # broke". Without it an amendment lands as a failed job.
+    amending = set()
+    stopping_jobs = set()
+    quota = {"until": None, "reason": None}
+
+    def jobs_available():
+        """Whether the register can be reached at all. A store that is not
+        there is a reason to keep answering, not a reason to stop."""
+        try:
+            job_register()
+            return True
+        except Exception:
+            return False
+
+    def quota_pause_notice():
+        until = quota["until"]
+        if not until or time.time() >= until:
+            return None
+        resumes = datetime.fromtimestamp(until, timezone.utc).astimezone()
+        return (f"{quota['reason']} Queued work waits and is not retried into "
+                f"the wall; the queue resumes at {resumes:%H:%M}.")
+
+    def enter_quota_pause(reason):
+        quota["until"] = time.time() + QUOTA_RETRY_SECONDS
+        quota["reason"] = str(reason)[:200]
+        log(f"jobs: queue paused until "
+            f"{datetime.fromtimestamp(quota['until'], timezone.utc):%H:%M:%S}Z — "
+            f"{quota['reason']}")
+
+    def leave_quota_pause():
+        if not quota["until"] or time.time() < quota["until"]:
+            return
+        quota["until"], quota["reason"] = None, None
+        try:
+            register = job_register()
+        except Exception:
+            return
+        for row in register.list(outcome=jobs.QUOTA, limit=200):
+            register.resume(row["id"])
+            log(f"jobs: {row['id']} waiting again after the quota pause")
+
+    def job_sender(row, group_policy):
+        sender_id = str(row.get("requested_by") or "")
+        member = (group_policy or {}).get("members", {}).get(sender_id, {})
+        allowed = ALLOWED.get(sender_id, {})
+        return {
+            "id": sender_id,
+            "name": allowed.get("name") or member.get("name") or sender_id,
+            "role": sender_role_for(sender_id, group_policy, group_policy is None),
+        }
+
+    # -- the asks the register carries ----------------------------------------
+    #
+    # Cancel, stop and amend all arrive as rows, not as messages: whoever wrote
+    # them — a dialogue worker, a person at a terminal, another machine — is
+    # gone by the time they are acted on. The daemon is the only process that
+    # can act, because it is the one holding the process groups, so it reads
+    # them off the register on every tick.
+
+    async def honour_asks(register):
+        for row in register.stop_pending():
+            if row["state"] == jobs.RUNNING:
+                stopping_jobs.add(row["id"])
+                await stop_job_process(row, "stopped by request")
+                stopping_jobs.discard(row["id"])
+            register.stop(row["id"], jobs.CANCELLED, error="stopped by request")
+            log(f"{row['channel_key']}: stopped job {row['id']}; it keeps its "
+                f"session and `jobs resume` continues it")
+        for row in register.amend_pending():
+            amending.add(row["id"])
+            try:
+                await stop_job_process(row, "amended")
+                register.amend(row["id"])
+            finally:
+                amending.discard(row["id"])
+            log(f"{row['channel_key']}: amended job {row['id']}; continuing "
+                f"session {row.get('session_id') or '(not yet opened)'}")
+
+    # -- running one registered job -------------------------------------------
+
+    async def stop_job_process(row, reason):
+        """Stop one job without touching its neighbours. The session is the
+        checkpoint, so nothing the turn had already established is lost."""
+        job_id = row["id"]
+        proc_key = job_procs.get(job_id)
+        cancel_event = job_cancels.get(job_id)
+        if proc_key is None or cancel_event is None:
+            return False
+        await terminate_worker(proc_key, job_futures.get(job_id), cancel_event, reason)
+        return True
+
+    async def report_job(row, text, mark=None):
+        key = row["channel_key"]
+        ent_id = await registered_chat_ref(key)
+        if ent_id is None:
+            log(f"{key}: cannot report job {row['id']}; the channel is unreachable")
+            return None
+        chat_id, topic_id = _channel_identity(key)
+        _, group_policy = _group_policy(chat_id)
+        is_direct = group_policy is None
+        reply_to = None
+        if row.get("origin_message_id"):
+            with contextlib.suppress(TypeError, ValueError):
+                reply_to = int(row["origin_message_id"])
+        if not is_direct and reply_to is None and topic_id is not None:
+            reply_to = int(topic_id)
+        sent, _ = await send_channel_message(
+            ent_id, text, is_direct, reply_to=reply_to, force_reply=True, mark=mark)
+        return sent
+
+    async def run_job_row(row):
+        """One registered job, from its own slot.
+
+        The shape mirrors a dialogue turn deliberately — same tail, same
+        authority, same routing, same progress channel — because the difference
+        between the two classes is when the answer is owed, not how the work is
+        done.
+        """
+        job_id = row["id"]
+        key = row["channel_key"]
+        chat_id, topic_id = _channel_identity(key)
+        _, group_policy = _group_policy(chat_id)
+        is_direct = group_policy is None
+        s = channel_settings(reg, key)
+        # The row's engine, not the channel's current one. Resumption is
+        # engine-specific: a job registered under codex and continued under
+        # claude has no session to continue, which is the whole reason the
+        # register records the engine at all.
+        engine = row["engine"] if row["engine"] in WORKERS else s["worker"]
+        if engine != s["worker"]:
+            cfg = _worker_settings(reg.get(key, {}), engine)
+            s = {**s, "worker": engine, "worker_settings": cfg,
+                 "model": cfg.get("model"), **_worker_flags(engine, cfg)}
+        register = job_register()
+        sender = job_sender(row, group_policy)
+        amendments = register.take_amendment(job_id)
+        resume_session = row.get("session_id") if amendments else None
+        origin_id = None
+        if row.get("origin_message_id"):
+            with contextlib.suppress(TypeError, ValueError):
+                origin_id = int(row["origin_message_id"])
+
+        # The synthetic dialogue job the shared helpers read. It holds the same
+        # fields they always read; what it does not hold is a place in the
+        # watermark register, because this unit of work is a row elsewhere.
+        job = {
+            "message_id": origin_id,
+            "chat_id": chat_id,
+            "channel_key": key,
+            "topic_id": topic_id,
+            "topic_title": None,
+            "sender_id": sender["id"],
+            "sender_name": sender["name"],
+            "sender_role": sender["role"],
+            "kind": "text",
+            "text": row["description"],
+        }
+
+        proc_key = f"job:{job_id}"
+        cancel_event = threading.Event()
+        job_procs[job_id], job_cancels[job_id] = proc_key, cancel_event
+        future = None
+        progress_task = progress_stop = None
+        worker_session = authority_context = None
+        participants = [{"name": sender["name"], "role": sender["role"]}]
+        try:
+            ent_id = await registered_chat_ref(key)
+            if ent_id is None:
+                raise RouteUnavailable(f"channel {key} is unreachable")
+            tail, participants = await build_tail_and_participants(
+                key, ent_id, s, group_policy, is_direct, job)
+            delivery_reply_id = origin_id
+            if not is_direct and delivery_reply_id is None and topic_id is not None:
+                delivery_reply_id = int(topic_id)
+            request_text = "\n\n".join([row["description"], *amendments])
+            current_request = {
+                "message_id": origin_id,
+                "sender_id": sender["id"],
+                "sender_name": sender["name"],
+                "sender_role": sender["role"],
+                "kind": "registered job",
+                "text": request_text,
+                "reply_to": delivery_reply_id,
+                "delivery": ("the final answer is posted into this channel when "
+                             "the job finishes, as a reply to the request"),
+            }
+            PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+            progress_outbox = PROGRESS_DIR / f"job-{_safe_file_part(job_id)}.jsonl"
+            with contextlib.suppress(OSError):
+                progress_outbox.unlink()
+            worker_session = prepare_worker_session(key, f"job-{job_id}")
+            authority = _authority_policy_for(job, group_policy, is_direct)
+            route_value, route_label = _route_for(job, group_policy, is_direct)
+            project_dir = (_route_target(route_value, route_label)
+                           if route_value else PROJECT_ROOT)
+            channel_context, context_exclusive = _channel_context([
+                _as_mapping(ALLOWED.get(sender["id"])) if is_direct else group_policy,
+                _topic_policy(group_policy, topic_id),
+            ])
+            if authority is not None:
+                authority_context = write_authority_context(authority, f"job-{job_id}")
+            state = {"now": now_display(), "chat_id": chat_id,
+                     "channel_key": key, "connection": CONNECTION,
+                     "chat_type": "private" if is_direct else "group",
+                     "chat_name": (group_policy or {}).get("name"),
+                     "topic_id": topic_id, "topic_title": None,
+                     "harness": s["worker"], "participants": participants,
+                     "settings": s, "messages": len(tail),
+                     "history_chars": sum(len(m["text"]) for m in tail),
+                     "channel_context": channel_context,
+                     "context_exclusive": context_exclusive,
+                     "current_request": current_request,
+                     "registered_job": {"id": job_id,
+                                        "description": row["description"],
+                                        "amendments": row["amendments"]},
+                     "authority": authority,
+                     "authority_context": authority_context,
+                     "progress_outbox": str(progress_outbox),
+                     "worker_session": worker_session,
+                     "cancel_event": cancel_event,
+                     "resume_session": resume_session,
+                     "project_dir": project_dir,
+                     "proc_key": proc_key}
+            routed = "" if project_dir == PROJECT_ROOT else f" project={project_dir}"
+            log(f"{key}: dispatch job {job_id} worker={s['worker']} "
+                f"model={s['model'] or 'default'} attempt={row['attempt']}"
+                f"{' resumed' if resume_session else ''}{routed}")
+            loop = asyncio.get_running_loop()
+            progress_stop = asyncio.Event()
+            progress_task = asyncio.create_task(
+                pump_progress(key, str(progress_outbox), ent_id, is_direct,
+                              delivery_reply_id, progress_stop))
+            future = loop.run_in_executor(
+                None, WORKERS[s["worker"]], key, tail, state, procs)
+            job_futures[job_id] = future
+            result = await future
+            reply, meta = result["reply"], result["meta"]
+            register.stop(job_id, jobs.SUCCEEDED, exit_code=0,
+                          session_id=meta.get("session_id"),
+                          model=meta.get("model"))
+            if not result.get("silent") and reply:
+                await report_job(row, reply)
+            tok = meta.get("tokens", {})
+            log(f"{key}: finished job {job_id} · {meta.get('harness')}/"
+                f"{meta.get('model') or '?'} · in={tok.get('input')} "
+                f"out={tok.get('output')}")
+        except asyncio.CancelledError:
+            await terminate_worker(proc_key, future, cancel_event, "job task cancelled")
+            register.stop(job_id, jobs.INTERRUPTED,
+                          error="job task cancelled before completion")
+            raise
+        except Exception as exc:
+            await terminate_worker(proc_key, future, cancel_event, "job failed")
+            current = register.get(job_id)
+            reason = _short_error(exc, limit=480)
+            if job_id in stopping_jobs or (
+                    current is not None and current["stop_requested"]):
+                # The runner records the stop itself, once the process is gone.
+                log(f"{key}: job {job_id} stopped; `jobs resume` continues it")
+                await report_job(row, f"Stopped: «{row['description']}». "
+                                      "It keeps its place and can be continued.")
+            elif job_id in amending or (current is not None
+                                        and current["state"] == jobs.WAITING):
+                # An amendment took the row back into the queue while the
+                # process was being stopped. That is the amendment working, not
+                # a failure, and the runner will pick it up again.
+                log(f"{key}: job {job_id} stopped for an amendment")
+            elif is_quota_exhausted(reason):
+                register.stop(job_id, jobs.QUOTA, error=reason)
+                enter_quota_pause(reason)
+                await report_job(row, quota_pause_notice() or reason)
+            elif closing:
+                register.stop(job_id, jobs.INTERRUPTED, error=reason)
+                log(f"{key}: job {job_id} interrupted by session close: {reason}")
+            else:
+                register.stop(job_id, jobs.FAILED, error=reason)
+                log(f"{key}: job {job_id} failed: {reason}")
+                is_supervisor = any(p.get("role") == "supervisor"
+                                    for p in participants)
+                await report_job(row, (
+                    f"Job failed: «{row['description']}»\n{reason}" if is_supervisor
+                    else f"«{row['description']}» could not be completed. "
+                         "Please tell an administrator."))
+        finally:
+            if progress_stop is not None:
+                progress_stop.set()
+            if progress_task is not None:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(progress_task, timeout=5)
+            cleanup_worker_session(worker_session)
+            if authority_context:
+                with contextlib.suppress(OSError):
+                    Path(authority_context).unlink()
+            release_worker_proc(proc_key)
+            job_procs.pop(job_id, None)
+            job_cancels.pop(job_id, None)
+            job_futures.pop(job_id, None)
+
+    async def job_runner():
+        """Watch the register and, while there is a free slot, take the oldest
+        queued job of this project and environment.
+
+        No estimation, no priority, no classes of size: order is arrival order,
+        and preemption is something the operator asks for explicitly.
+        """
+        while not closing:
+            try:
+                register = job_register()
+                await honour_asks(register)
+                leave_quota_pause()
+                while (quota["until"] is None
+                       and len(job_tasks) < MAX_PARALLEL_JOBS):
+                    candidate = register.next_waiting()
+                    if candidate is None:
+                        break
+                    claimed = register.start(candidate["id"])
+                    if claimed is None:
+                        continue
+                    task = asyncio.create_task(run_job_row(claimed))
+                    job_tasks[task] = claimed["id"]
+                    task.add_done_callback(lambda t: job_tasks.pop(t, None))
+            except Exception as exc:
+                log(f"jobs: runner tick failed: {_short_error(exc)}")
+            await asyncio.sleep(JOB_POLL_INTERVAL)
 
     async def echo_voice_message(message, chat_id, key, is_direct, group_policy=None,
                                  sender_name=None):
@@ -7469,7 +7982,28 @@ async def run_session(client):
             client, interrupted_recordings, rejoin_conference,
             call_in_progress))
 
+    # A row that claims to be running names a process this daemon no longer has.
+    # Recording that is what keeps the register honest across a box restart;
+    # whether the work then waits for inspection or is queued as a fresh attempt
+    # is the configured recovery policy's call.
+    try:
+        register = job_register()
+        interrupted = register.interrupt_active("service restarted while job was running")
+        for row in interrupted:
+            if JOB_RECOVERY == "requeue":
+                register.resume(row["id"])
+        if interrupted:
+            log(f"jobs: {len(interrupted)} interrupted "
+                f"{'continued as a fresh attempt' if JOB_RECOVERY == 'requeue' else 'kept for inspection'}")
+        counts = register.counts()
+        log(f"jobs: register ready — environment={ENVIRONMENT} "
+            f"slots={MAX_PARALLEL_JOBS} {counts or 'empty'}")
+    except Exception as exc:
+        log(f"jobs: register unavailable, the job class is off this session: "
+            f"{_short_error(exc)}")
+
     log("live — reacting in real time. Ctrl-C to stop.")
+    job_runner_task = asyncio.create_task(job_runner())
     sync_task = asyncio.create_task(periodic_sync())
     disconnected_task = asyncio.create_task(client.run_until_disconnected())
     try:
@@ -7500,7 +8034,7 @@ async def run_session(client):
                 await flush_call_summary()
             except Exception as exc:
                 log(f"voice: session-close summary flush failed — {_short_error(exc)}")
-        cleanup_tasks = [sync_task, disconnected_task]
+        cleanup_tasks = [sync_task, disconnected_task, job_runner_task]
         if group_watcher_task is not None:
             cleanup_tasks.append(group_watcher_task)
         for task in cleanup_tasks:
@@ -7520,7 +8054,17 @@ async def run_session(client):
         if pending_runners:
             await asyncio.gather(*pending_runners, return_exceptions=True)
         runners.clear()
+        pending_jobs = list(job_tasks)
+        for task in pending_jobs:
+            task.cancel()
+        if pending_jobs:
+            await asyncio.gather(*pending_jobs, return_exceptions=True)
+        job_tasks.clear()
         kill_all_workers("session closing cleanup")
+        # The register's connection belongs to the thread that opened it, and a
+        # reconnect opens a new session. Closing it here means the next one
+        # opens its own rather than inheriting one from a session that ended.
+        close_job_register()
 
 
 async def stop_call_recorder_process(process, reason):

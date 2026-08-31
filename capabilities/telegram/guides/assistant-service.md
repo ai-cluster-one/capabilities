@@ -89,7 +89,8 @@ The accepted schema is deliberately finite:
 - User/member policy: display `name`/`username`, `role`, `may_address`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `context_mode`, `project`, `call_recording`, and `voice_agent`; group members additionally accept `kind` and `address_aliases`.
 - Group policy: `name`, `role`/`member_role`, `aliases`/`address_aliases`/`mentions`, `require_reference`, `members`, `agent_dialogue`, `worker_timeout`, `voice_transcription`, `call_recording`, `control`, `authority`, `allowed_capabilities` (or `capabilities`), `context`/`context_file`, `context_mode`, `project`, and `topics`.
 - `topics`: keyed by forum topic ID, each entry accepting `project`, `context`, `context_file`, and `context_mode`. A topic carries no authority tier: it inherits its group's rights and can neither narrow nor widen them.
-- Defaults: `assistant_name`, `tail_size`, `sync_interval`, `sync_stale_after`, `debounce`, `worker_timeout`, `progress_after`, `max_parallel_jobs`, `max_attempts`, `group_aliases`, `worker`, `workers`, `voice_agent`, and `media_log_level`.
+- Top level: `connection`, `environment`, `assistant_name`, `direct_messages`, `allowed_users`, `allowed_groups`, `control`, `authority`, and `defaults`.
+- Defaults: `assistant_name`, `tail_size`, `sync_interval`, `sync_stale_after`, `debounce`, `worker_timeout`, `progress_after`, `max_parallel_dialogue`, `max_parallel_jobs`, `job_poll_interval`, `job_recovery`, `max_attempts`, `group_aliases`, `worker`, `workers`, `voice_agent`, and `media_log_level`.
 - `media_log_level` decides how much of the media stack reaches the daemon log: `info` is what a normal call is read at, `debug` is what a call under investigation is read at, and the level applies on start and on every reload. Importing pytgcalls mutes that logger, so this setting is the only thing that speaks for it.
 - Worker policy: `model`; Claude also accepts `effort`; Codex accepts `reasoning_effort` and `service_tier`. Voice defaults accept `worker`, `workers`, `model`, `voice`, `greeting`, `history`, `timezone`, `progress_interval`, `recording_caption`, and `prompt_file`.
 - Control policies contain `commands`; authority policies contain `allowed_capabilities` or `capabilities`. Capability rules accept booleans/`*`, verb lists, or `allow`/`deny`/`enabled`/`scope`/`verbs`/`connections` objects.
@@ -189,9 +190,9 @@ or merged.
 
 - Direct messages are accepted according to `direct_messages.mode` and `allowed_users`.
 - Group messages are accepted only for `allowed_groups` and only when addressed by mention, reply, or configured alias unless the group policy sets `require_reference` to `false`.
-- Each addressed message becomes its own queued job.
+- Each addressed message becomes its own queued dialogue job, capped per channel by `max_parallel_dialogue`.
 - A Codex turn that exits successfully with `turn.completed` and an intentionally empty final answer completes silently: the job is marked done and nothing is posted to Telegram. An empty result without that protocol completion remains a worker error.
-- The worker tail is a compact Tallinn-time timeline. Forum-topic messages automatically use a topic-specific channel key and fetch/filter only that topic; interleaved topics never share a tail, watermark, debounce, retry, progress, or parallel-job slot. Ordinary groups and direct chats keep whole-chat behavior. Each message keeps its Telegram id and in-window reply topology.
+- The worker tail is a compact Tallinn-time timeline. Forum-topic messages automatically use a topic-specific channel key and fetch/filter only that topic; interleaved topics never share a tail, watermark, debounce, retry, progress, or dialogue slot. Ordinary groups and direct chats keep whole-chat behavior. Each message keeps its Telegram id and in-window reply topology.
 - The daemon performs protocol catch-up plus bounded watermark reconciliation when a Telegram session connects and at the configured sync interval. This recovers messages received while it was down and update packets the MTProto client could not deserialize.
 - `telegram service status` reports update-stream health from `health.json`; a live PID with a stale sync watermark is not reported as healthy.
 - `telegram service reload` applies policy and worker/voice defaults without disconnecting an active call. Prompt files are already read per request or call; reload is for `settings.json`.
@@ -203,6 +204,68 @@ or merged.
 - Workers can be `codex`, `claude`, or `stub`; `/set` and `/status` in Telegram adjust or inspect per-channel runtime settings when `control.roles` allows the sender role to run that command.
 - Worker subprocesses run in dedicated process groups. Timeout, task cancellation, reconnect, and incomplete post-worker delivery all terminate that group and move the persisted job to a terminal error or startup-retry state.
 - The daemon supervises its media recorder when at least one allowed group opts in. The recorder joins muted and uses PyTgCalls' built-in `RecordStream` for the complete joined interval. That supported path captures MP3; after Marvin leaves, FFmpeg converts the closed capture to the final OGG/Opus artifact. The source MP3 is removed only after successful conversion and is retained if conversion fails. The JSON sidecar stores the group, Telegram call id, joined interval, trigger, and participant state changes. It does not create a call or transcribe audio.
+
+## Registered Jobs
+
+Two classes of work run side by side, with separate budgets and one ledger.
+
+A **dialogue turn** answers in the channel and is expected to finish while the person is still there. Its unit is the addressed message, its record is the watermark register, and `max_parallel_dialogue` caps how many one channel runs at once.
+
+A **registered job** is work that outlives the sentence that asked for it. It is a row in `tg_worker_jobs` in the shared capabilities store, drained by the job runner in arrival order within `max_parallel_jobs` slots for the whole daemon. `job_poll_interval` is how often the runner looks.
+
+### State and outcome
+
+A job answers two questions, and only one of them changes what anything does.
+
+`state` is the whole of the runner's interest: **`waiting`** for a slot, **`running`** in one, or **`stopped`** in neither. Nothing else is a state, because nothing else changes what may happen next — the session is the checkpoint, so work that stopped for any reason at all continues from where it stopped, and a job that never started continues by starting. There is no `finished`: it would differ from `stopped` only in the label, and the label has a column of its own.
+
+`outcome` is that label — why a stopped job stopped: **`succeeded`**, **`failed`**, **`cancelled`** (somebody asked), **`interrupted`** (the daemon restarted under it), **`quota`** (the subscription is spent). Each value earns its place by behaving differently: `quota` is continued by the runner when the pause lifts, `interrupted` by the `job_recovery` policy, the rest only when somebody asks. It says nothing while the job is waiting or running.
+
+### The verb surface
+
+The register is a table, so `telegram jobs` reads and writes it directly rather than asking the daemon. That is what makes it usable at all: the person looking at a stuck queue is at a terminal, and the worker deciding whether a message amends running work is a subprocess — neither is the daemon.
+
+```
+telegram jobs list [--state S] [--outcome O] [--chat C] [--topic-id T] [--limit N]
+telegram jobs active [--chat C] [--topic-id T]
+telegram jobs show <id>
+telegram jobs register "<one line>" --chat C --requested-by U [--engine E]
+telegram jobs amend <id> "<what changed>"
+telegram jobs stop <id>
+telegram jobs resume <id>
+```
+
+**One way to halt work and one way to continue it.** There is no second pair for the stop that is meant to be final, because every stop is continuable: what a caller decides is not whether the work can come back — it always can — but whether anybody asks it to. `stop` and `resume` are asks about a direction rather than transitions, so both are idempotent and neither refuses a state: resuming work that is already moving withdraws a stop nobody wants any more.
+
+Both are asynchronous. `stop`, and the staged text behind `amend`, record what was asked; the runner holds the process groups and acts on the next tick. A read reports an unlanded ask as `stopping: true`, because a flag and a state are two halves of one sentence.
+
+Inside a worker turn the same commands run through the shim, which pins `--chat` and `--topic-id` to the authorized channel and refuses any attempt to name another. There is no daemon round-trip and no separate grammar.
+
+### What the worker is told, and what it asks for
+
+The prompt names the surface; it does not carry a snapshot of it. The queue moves while a turn is being written, so a list pasted in at dispatch is already stale when it is read — the worker runs `telegram jobs active` at the moment it needs to know. Attribution is still a judgement made in the prompt rather than a mechanism, and a wrong one degrades to a redundant new job.
+
+### Amendment keeps the row
+
+A correction is not a new request. `amend` stages the added context against the job; the runner stops that job's process group, counts the amendment, and continues the same engine session by its id. Nothing marks the intent separately — the staged text being there *is* the intent, and it is consumed when the job is next dispatched. Amending stopped work brings it back to `waiting` for the same reason: being corrected is a reason to continue. Stopping loses nothing the turn had established, because the session is the checkpoint.
+
+### What the row holds
+
+References, never content: what was asked, whose authority it carries, which channel it reports into, how long it waited, and why it stopped. `session_id` names the rollout, `log_path` names the process output, `engine` names what must run it — a job registered under one engine is continued under that engine, because resumption is engine-specific. `effort` and `service_tier` are deliberately absent; the session's own `turn_context` already records them.
+
+### Isolation is a correctness condition
+
+Every queue read is filtered by `project_id`, `environment` and `surface`, so one project can never take another's work and a development daemon can never take a production job off a store they share. `environment` is settings' own top-level key, overridden by `TELEGRAM_ENVIRONMENT`.
+
+### Restart, quota, reporting
+
+On start, rows claiming to be running stop with outcome `interrupted` and their surviving process groups are terminated. `job_recovery` decides what happens next: `requeue` continues them as a fresh attempt, `inspect` leaves them for a person to look at.
+
+When the engine reports the subscription spent, the running job stops with outcome `quota`, the queue stops taking new work, and nothing is retried into the wall. The dialogue worker is told, in words, including when the queue tries again.
+
+A job reports into its own channel, as a reply to the originating message. Progress lines use the same outbox a dialogue turn does.
+
+The register needs the store. Where a project keeps its *configuration* is a separate question, answered by `project.json`; a queue lives in the store either way. Without a project identity the register cannot open, the job class is off for the session, and the conversation is unaffected.
 
 ## Group Call Recording
 

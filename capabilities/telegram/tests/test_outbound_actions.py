@@ -568,6 +568,33 @@ class OutboundActionsTests(unittest.TestCase):
             "TELEGRAM_AUTHORIZED_CONNECTION": "8200881535",
         }
 
+    def test_worker_jobs_are_pinned_to_the_authorized_channel(self):
+        """`jobs` reaches the register directly, so what the shim owns is the
+        scope: the authorized chat and topic are appended, and a turn that names
+        another one is refused before the real CLI is reached."""
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as td:
+            outbox = Path(td) / "progress.jsonl"
+            with mock.patch.dict(os.environ, self._worker_env(outbox), clear=False):
+                shim.enforce_job_scope(["telegram", "jobs", "active"])
+                self.assertEqual(shim.job_scope_arguments(),
+                                 ["--chat", "-1001", "--topic-id", "77"])
+                for denied in (["telegram", "jobs", "active", "--chat", "-9999"],
+                               ["telegram", "jobs", "list", "--all-channels"],
+                               ["telegram", "jobs", "list", "--chat=-9999"]):
+                    with self.assertRaises(SystemExit) as stopped:
+                        shim.enforce_job_scope(denied)
+                    self.assertEqual(stopped.exception.code, 4)
+            self.assertFalse(outbox.exists())
+
+    def test_worker_jobs_without_an_authorized_chat_are_refused(self):
+        shim = import_worker_shim()
+        with mock.patch.dict(os.environ, {"TELEGRAM_AUTHORIZED_CHAT_ID": ""},
+                             clear=False):
+            with self.assertRaises(SystemExit) as stopped:
+                shim.enforce_job_scope(["telegram", "jobs", "active"])
+        self.assertEqual(stopped.exception.code, 4)
+
     def test_worker_send_rejects_unknown_flag_after_text_before_outbox(self):
         shim = import_worker_shim()
         with tempfile.TemporaryDirectory() as td:

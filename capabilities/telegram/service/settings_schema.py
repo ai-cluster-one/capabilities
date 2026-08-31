@@ -1,12 +1,17 @@
 """Strict, dependency-free validation for Telegram assistant settings."""
 
+import re
 from pathlib import Path
 
 
 TOP_LEVEL = {
-    "connection", "assistant_name", "direct_messages", "allowed_users",
-    "allowed_groups", "control", "authority", "defaults",
+    "connection", "environment", "assistant_name", "direct_messages",
+    "allowed_users", "allowed_groups", "control", "authority", "defaults",
 }
+# Which half of the machine this daemon is. The same box runs development and
+# production, and the job queue is filtered by this: without it a development
+# job is eligible for a production runner.
+ENVIRONMENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.IGNORECASE)
 WORKERS = {"claude", "codex", "stub"}
 # What the media stack may be read at. A call under investigation is read at
 # debug; anything a normal call needs is at info.
@@ -24,6 +29,9 @@ CALL_GROUP_MODES = {
 CALL_USER_MODES = {"disabled", "off", "enabled", "auto", "on"}
 CONTROL_COMMANDS = {"status", "set", "reload", "stop", "help", "*"}
 CONTEXT_MODES = {"extend", "exclusive"}
+# What becomes of work a restart interrupted: kept for inspection, or
+# queued as a fresh attempt.
+JOB_RECOVERY = {"inspect", "requeue"}
 
 
 def _fail(path, message):
@@ -443,8 +451,10 @@ def _defaults(value, path, project_root, service_dir):
     value = _object(value, path)
     allowed = {
         "assistant_name", "tail_size", "sync_interval", "sync_stale_after",
-        "debounce", "worker_timeout", "progress_after", "max_parallel_jobs",
-        "max_attempts", "group_aliases", "worker", "workers", "voice_agent",
+        "debounce", "worker_timeout", "progress_after",
+        "max_parallel_dialogue", "max_parallel_jobs", "job_poll_interval",
+        "job_recovery", "max_attempts", "group_aliases", "worker", "workers",
+        "voice_agent",
         "media_log_level",
     }
     _unknown(value, allowed, path)
@@ -457,7 +467,9 @@ def _defaults(value, path, project_root, service_dir):
         "debounce": (0, 300, False),
         "worker_timeout": (0.01, 3600, False),
         "progress_after": (0, 3600, False),
+        "max_parallel_dialogue": (1, 32, True),
         "max_parallel_jobs": (1, 32, True),
+        "job_poll_interval": (0.05, 300, False),
         "max_attempts": (1, 20, True),
     }
     for key, (minimum, maximum, integer) in numeric.items():
@@ -470,6 +482,8 @@ def _defaults(value, path, project_root, service_dir):
     if "media_log_level" in value:
         _enum(value["media_log_level"], MEDIA_LOG_LEVELS,
               f"{path}.media_log_level")
+    if "job_recovery" in value:
+        _enum(value["job_recovery"], JOB_RECOVERY, f"{path}.job_recovery")
     if "workers" in value:
         _workers(value["workers"], f"{path}.workers")
     if "voice_agent" in value:
@@ -483,6 +497,11 @@ def validate_settings(settings, project_root, service_dir):
     _unknown(settings, TOP_LEVEL, "settings")
     if "connection" in settings:
         _string(settings["connection"], "settings.connection", nullable=True, nonempty=True)
+    if "environment" in settings:
+        _string(settings["environment"], "settings.environment", nonempty=True)
+        if not ENVIRONMENT_RE.fullmatch(settings["environment"]):
+            _fail("settings.environment",
+                  f"must match {ENVIRONMENT_RE.pattern}")
     if "assistant_name" in settings:
         _string(settings["assistant_name"], "settings.assistant_name", nonempty=True)
     if "direct_messages" in settings:
