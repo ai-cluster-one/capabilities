@@ -472,6 +472,52 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             hold.set()
             await self.stop_session(client, task)
 
+    async def test_an_orderly_restart_requeues_the_live_job_on_its_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            row = register.register(channel_key="123", requested_by="777",
+                                    description="survive the restart", engine="stub")
+            runs = []
+            running = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def worker(chat, tail, state=None, procs=None):
+                runs.append(state.get("resume_session"))
+                if len(runs) == 1:
+                    state["on_worker_line"](json.dumps({
+                        "type": "thread.started", "thread_id": "thread-1"}))
+                    loop.call_soon_threadsafe(running.set)
+                    state["cancel_event"].wait(timeout=8)
+                    raise RuntimeError("worker process group killed")
+                return successful_result("continued")
+
+            daemon.WORKERS["stub"] = worker
+            first_client = FakeClient([])
+            first = asyncio.create_task(daemon.run_session(first_client))
+            await first_client.started.wait()
+            await asyncio.wait_for(running.wait(), timeout=6)
+            self.assertEqual(register.get(row["id"])["session_id"], "thread-1")
+
+            await self.stop_session(first_client, first)
+            register = daemon.job_register()
+            interrupted = register.get(row["id"])
+            self.assertEqual(interrupted["state"], daemon.jobs.WAITING)
+            self.assertIsNone(interrupted["outcome"])
+            self.assertEqual(interrupted["session_id"], "thread-1")
+
+            second_client = FakeClient([])
+            second = asyncio.create_task(daemon.run_session(second_client))
+            await second_client.started.wait()
+            await wait_until(lambda: len(runs) == 2, timeout=6)
+            await wait_until(
+                lambda: register.get(row["id"])["outcome"] == daemon.jobs.SUCCEEDED,
+                timeout=6)
+            self.assertEqual(runs, [None, "thread-1"])
+            self.assertEqual(register.get(row["id"])["attempt"], 2)
+            await self.stop_session(second_client, second)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5600,6 +5600,14 @@ async def run_session(client):
             await terminate_worker(proc_key, future, cancel_event, "job task cancelled")
             register.stop(job_id, jobs.INTERRUPTED,
                           error="job task cancelled before completion")
+            # A session shutdown is an interruption of the runner, not a
+            # request to stop this job.  Put it back where the next daemon can
+            # claim it, preserving the rollout checkpoint written above.  An
+            # explicit `jobs stop` takes the exception path instead and remains
+            # stopped until somebody resumes it.
+            if closing and JOB_RECOVERY == "requeue":
+                register.resume(job_id)
+                log(f"{key}: job {job_id} interrupted by session close; requeued")
             raise
         except Exception as exc:
             await terminate_worker(proc_key, future, cancel_event, "job failed")
