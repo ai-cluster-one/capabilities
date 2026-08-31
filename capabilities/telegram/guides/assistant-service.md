@@ -218,6 +218,8 @@ A **dialogue turn** answers in the channel and is expected to finish while the p
 
 A **registered job** is work that outlives the sentence that asked for it. It is a row in `tg_worker_jobs` in the shared capabilities store, drained by the job runner in arrival order within `max_parallel_jobs` slots for the whole daemon. `job_poll_interval` is how often the runner looks.
 
+Successful registration is a hard handoff, not only a prompt convention. The dialogue worker gets a brief grace period to return its natural acknowledgement; if it keeps working, the daemon ends that duplicate turn without reporting an error while the registered worker continues independently.
+
 ### State and outcome
 
 A job answers two questions, and only one of them changes what anything does.

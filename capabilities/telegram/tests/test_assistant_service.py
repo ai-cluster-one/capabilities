@@ -618,6 +618,64 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                                 for line in daemon._test_logs))
             await self.stop_session(client, task)
 
+    async def test_registered_job_hard_handoff_ends_a_duplicate_dialogue_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(worker_timeout=2), store=True)
+            daemon.DIALOGUE_HANDOFF_GRACE_SECONDS = 0.02
+            message = Message(92, text="Do a long count")
+            client = FakeClient([message])
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                if state["current_request"]["kind"] == "registered job":
+                    return successful_result("count complete")
+                store, register = daemon.jobs.open_register(
+                    daemon._records_module(), daemon.PROJECT_CAPABILITIES_DIR,
+                    daemon.ENVIRONMENT, url=daemon.STORE_URL)
+                try:
+                    row = register.register(
+                        channel_key=state["channel_key"],
+                        requested_by=state["current_request"]["sender_id"],
+                        origin_message_id=state["current_request"]["message_id"],
+                        description="Count every topic",
+                        engine="stub",
+                    )
+                finally:
+                    store.close()
+                Path(state["progress_outbox"]).write_text(
+                    json.dumps({
+                        "event": "job_registered",
+                        "job_id": row["id"],
+                        "description": row["description"],
+                    }) + "\n" + json.dumps({"text": "Counting every topic."}) + "\n")
+                while not state["cancel_event"].wait(0.005):
+                    pass
+                raise RuntimeError("dialogue worker was handed off")
+
+            daemon.WORKERS["stub"] = worker
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 92)
+
+            def durable_job_succeeded():
+                rows = daemon.job_register().list(limit=1)
+                return bool(rows and rows[0]["outcome"] == "succeeded")
+
+            await wait_until(durable_job_succeeded)
+            await wait_until(
+                lambda: any(item["text"] == "count complete"
+                            for item in client.sent))
+
+            texts = [item["text"] for item in client.sent]
+            self.assertIn("Counting every topic.", texts)
+            self.assertIn("count complete", texts)
+            self.assertFalse(any("Worker error" in text for text in texts))
+            self.assertTrue(any("handed off to durable job" in line
+                                for line in daemon._test_logs))
+            await self.stop_session(client, task)
+
     async def test_prompt_uses_compact_timestamps_and_reply_topology(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())

@@ -4628,6 +4628,12 @@ class WorkerTimedOut(Exception):
     """The worker future exceeded its configured deadline without being cancelled."""
 
 
+# A dialogue turn gets a brief chance to return its natural acknowledgement
+# after it registers durable work.  Past this point it is a duplicate executor,
+# not a dialogue worker, so the daemon ends it without reporting an error.
+DIALOGUE_HANDOFF_GRACE_SECONDS = 8
+
+
 async def run_session(client):
     await client.connect()
     if not await client.is_user_authorized():
@@ -4796,7 +4802,7 @@ async def run_session(client):
         return True
 
     async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset,
-                             mark=None, delivered=None):
+                             mark=None, delivered=None, handoff=None):
         path = Path(outbox)
         if not path.exists():
             return offset
@@ -4812,6 +4818,14 @@ async def run_session(client):
                 item = json.loads(line)
             except ValueError:
                 continue
+            if item.get("event") == "job_registered":
+                if handoff is not None:
+                    handoff["job"] = {
+                        "id": item.get("job_id"),
+                        "description": item.get("description"),
+                    }
+                    handoff["event"].set()
+                continue
             text = str(item.get("text") or "").strip()
             if not text or text in ("-", ".", "..."):
                 continue
@@ -4824,19 +4838,19 @@ async def run_session(client):
         return offset
 
     async def pump_progress(key, outbox, ent_id, is_direct, reply_to, stop_event,
-                            mark=None, delivered=None):
+                            mark=None, delivered=None, handoff=None):
         offset = 0
         while not stop_event.is_set():
             offset = await drain_progress(
                 key, outbox, ent_id, is_direct, reply_to, offset, mark=mark,
-                delivered=delivered)
+                delivered=delivered, handoff=handoff)
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=1)
             except asyncio.TimeoutError:
                 pass
         await drain_progress(
             key, outbox, ent_id, is_direct, reply_to, offset, mark=mark,
-            delivered=delivered)
+            delivered=delivered, handoff=handoff)
 
     def reserve_job(key, message, group_policy, is_direct, reason, chat_id=None):
         """Persist ownership of a message before any transcription or other await.
@@ -5062,6 +5076,8 @@ async def run_session(client):
         progress_task = None
         progress_stop = None
         progress_delivered = []
+        handoff = {"event": asyncio.Event(), "job": None}
+        handoff_wait = None
         worker_session = None
         authority_context = None
         participants = [{"name": job.get("sender_name"), "role": job.get("sender_role")}]
@@ -5141,12 +5157,43 @@ async def run_session(client):
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
                               delivery_reply_id, progress_stop, mark=answer_mark,
-                              delivered=progress_delivered))
+                              delivered=progress_delivered, handoff=handoff))
             future = loop.run_in_executor(None, WORKERS[s["worker"]], key, tail, state, procs)
+            handoff_wait = asyncio.create_task(handoff["event"].wait())
             async with client.action(ent_id, "typing"):
-                done, _ = await asyncio.wait({future}, timeout=float(s["worker_timeout"]))
+                done, _ = await asyncio.wait(
+                    {future, handoff_wait}, timeout=float(s["worker_timeout"]),
+                    return_when=asyncio.FIRST_COMPLETED)
                 if not done:
                     raise WorkerTimedOut
+                if future not in done:
+                    done, _ = await asyncio.wait(
+                        {future}, timeout=DIALOGUE_HANDOFF_GRACE_SECONDS)
+                    if future not in done:
+                        registered = handoff.get("job") or {}
+                        await terminate_worker(
+                            proc_key, future, cancel_event,
+                            f"durable job {registered.get('id') or 'registered'} took over")
+                        progress_stop.set()
+                        with contextlib.suppress(Exception, asyncio.CancelledError):
+                            await asyncio.wait_for(progress_task, timeout=5)
+                        progress_task = None
+                        if not progress_delivered:
+                            acknowledgement = str(
+                                registered.get("description") or job.get("text") or "").strip()
+                            if acknowledgement:
+                                _, _ = await send_channel_message(
+                                    ent_id, f"▶ {acknowledgement}", is_direct,
+                                    reply_to=delivery_reply_id, mark=answer_mark)
+                        mark_job_finished(
+                            key, job, "done", meta={
+                                "harness": s["worker"],
+                                "model": s.get("model"),
+                                "handoff_job_id": registered.get("id"),
+                            })
+                        log(f"{key}: dialogue job msg={job.get('message_id')} handed off "
+                            f"to durable job {registered.get('id') or '?'}")
+                        return
                 result = await future
             # Drain the outbox before deciding whether the final answer is a
             # duplicate of a progress message. Otherwise a last-moment send can
@@ -5247,6 +5294,8 @@ async def run_session(client):
             await fail_job(key, ent_id, job, is_direct, participants, e)
             return
         finally:
+            if handoff_wait is not None:
+                handoff_wait.cancel()
             if progress_stop is not None:
                 progress_stop.set()
             if progress_task is not None:

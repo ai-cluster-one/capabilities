@@ -607,25 +607,58 @@ class OutboundActionsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TELEGRAM_AUTHORIZED_CHAT_ID": ""},
                              clear=False):
             with self.assertRaises(SystemExit) as stopped:
-                shim.enforce_job_scope(["telegram", "jobs", "active"])
+                    shim.enforce_job_scope(["telegram", "jobs", "active"])
         self.assertEqual(stopped.exception.code, 4)
 
-    def test_worker_job_registration_gets_authenticated_attribution(self):
+    def test_worker_job_registration_is_attributed_and_signals_the_handoff(self):
         shim = import_worker_shim()
         with tempfile.TemporaryDirectory() as td:
             outbox = Path(td) / "progress.jsonl"
             env = self._worker_env(outbox)
-            env["TELEGRAM_REAL_TELEGRAM"] = "/usr/bin/true"
-            calls = self._run_shim(
-                shim, env, ["telegram", "jobs", "register", "collect evidence"])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1], [
-            "/usr/bin/true", "jobs", "register", "collect evidence",
-            "--chat", "-1001", "--topic-id", "77",
-            "--actor", "777", "--requested-by", "777",
-            "--origin-message-id", "88", "--engine", "codex",
-            "--model", "gpt-test",
-        ])
+            env["TELEGRAM_REAL_TELEGRAM"] = "/real/telegram"
+            row = {
+                "id": "job-123",
+                "description": "Count every topic",
+                "state": "waiting",
+            }
+            completed = types.SimpleNamespace(
+                returncode=0, stdout=json.dumps(row) + "\n", stderr="")
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(
+                        sys, "argv", ["telegram", "jobs", "register",
+                                      "Count every topic"]), \
+                    mock.patch.object(shim.subprocess, "run",
+                                      return_value=completed) as run, \
+                    mock.patch.object(sys, "stdout"):
+                self.assertEqual(shim.main(), 0)
+
+            invoked = run.call_args.args[0]
+            self.assertEqual(invoked, [
+                "/real/telegram", "jobs", "register", "Count every topic",
+                "--chat", "-1001", "--topic-id", "77",
+                "--actor", "777", "--requested-by", "777",
+                "--origin-message-id", "88", "--engine", "codex",
+                "--model", "gpt-test",
+            ])
+            event = json.loads(outbox.read_text())
+            self.assertEqual(event["event"], "job_registered")
+            self.assertEqual(event["job_id"], "job-123")
+            self.assertEqual(event["description"], "Count every topic")
+
+    def test_failed_worker_job_registration_does_not_signal_a_handoff(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as td:
+            outbox = Path(td) / "progress.jsonl"
+            completed = types.SimpleNamespace(
+                returncode=6, stdout="", stderr="bad registration\n")
+            with mock.patch.object(shim.subprocess, "run", return_value=completed), \
+                    mock.patch.object(sys, "stdout"), \
+                    mock.patch.object(sys, "stderr"):
+                self.assertEqual(
+                    shim.run_job_register(["telegram", "jobs", "register", "x"],
+                                          str(outbox)),
+                    6)
+            self.assertFalse(outbox.exists())
 
     def test_worker_send_rejects_unknown_flag_after_text_before_outbox(self):
         shim = import_worker_shim()
