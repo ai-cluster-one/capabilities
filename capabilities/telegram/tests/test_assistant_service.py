@@ -1886,6 +1886,54 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stranger["sender_role"], "direct_user")
         self.assertEqual(stranger["allowed_capabilities"], {"routine": True})
 
+    async def test_connection_authority_accepts_read_and_write_grants(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td)
+            base = {"connection": "test", "assistant_name": "Assistant",
+                    "direct_messages": {"mode": "anyone",
+                                        "default_role": "direct_user"},
+                    "allowed_users": {}, "allowed_groups": {}}
+
+            def validated(connections):
+                return daemon.validate_settings({
+                    **base,
+                    "authority": {"roles": {"supervisor": {
+                        "allowed_capabilities": {"telegram": {
+                            "connections": connections}}}}},
+                }, root, root)
+
+            validated(["personal"])
+            validated({"personal": {}})
+            validated({"personal": {"allow_write": True}})
+            with self.assertRaisesRegex(Exception, "allow_write.*must be a boolean"):
+                validated({"personal": {"allow_write": "yes"}})
+            with self.assertRaisesRegex(Exception, "unsupported property"):
+                validated({"personal": {"write": True}})
+
+    async def test_connection_write_grant_stays_with_the_requesters_role(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings()
+            service_settings["authority"] = {"roles": {
+                "supervisor": {"allowed_capabilities": {"telegram": {
+                    "connections": {"personal": {"allow_write": True}}}}},
+                "group_member": {"allowed_capabilities": {"telegram": {
+                    "connections": ["personal"]}}},
+            }}
+            daemon = import_daemon(Path(td), service_settings)
+
+            supervisor = daemon._authority_policy_for(
+                {"sender_role": "supervisor", "sender_id": 1}, None, True)
+            member = daemon._authority_policy_for(
+                {"sender_role": "group_member", "sender_id": 2}, None, True)
+
+            self.assertEqual(
+                supervisor["allowed_capabilities"]["telegram"]["connections"],
+                {"personal": {"allow_write": True}})
+            self.assertEqual(
+                member["allowed_capabilities"]["telegram"]["connections"],
+                ["personal"])
+
     async def test_voice_task_worker_policy_falls_back_to_the_projects_own(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(

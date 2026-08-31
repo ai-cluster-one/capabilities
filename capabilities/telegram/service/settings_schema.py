@@ -182,7 +182,19 @@ def _capability_rule(value, path):
     if "verbs" in value:
         _string_list(value["verbs"], f"{path}.verbs")
     if "connections" in value:
-        _string_list(value["connections"], f"{path}.connections")
+        connections = value["connections"]
+        if isinstance(connections, list):
+            _string_list(connections, f"{path}.connections")
+        else:
+            connections = _object(connections, f"{path}.connections")
+            for connection, grant in connections.items():
+                _string(connection, f"{path}.connections key", nonempty=True)
+                grant = _object(grant, f"{path}.connections.{connection}")
+                _unknown(grant, {"allow_write"},
+                         f"{path}.connections.{connection}")
+                if "allow_write" in grant:
+                    _boolean(grant["allow_write"],
+                             f"{path}.connections.{connection}.allow_write")
 
 
 def _capabilities(value, path):

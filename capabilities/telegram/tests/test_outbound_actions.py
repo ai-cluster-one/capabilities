@@ -493,8 +493,8 @@ class OutboundActionsTests(unittest.TestCase):
                 cli._auth_connection_gate("principal", None, "read")
         self.assertEqual(stopped.exception.code, 4)
 
-    def test_service_request_refuses_to_send_through_a_granted_connection(self):
-        """A grant reaches reads only; anything that leaves the system stays put."""
+    def test_legacy_connection_list_remains_read_only(self):
+        """The original list grants reads and never grows write authority."""
         cli = import_cli()
         env = {"CAPABILITIES_AUTH_CONTEXT": self._service_context(grant=["principal"])}
         for command in ("send", "send-media", "react"):
@@ -502,6 +502,33 @@ class OutboundActionsTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as stopped:
                     cli._auth_connection_gate("principal", None, command)
             self.assertEqual(stopped.exception.code, 4)
+
+    def test_service_request_writes_through_an_explicitly_writable_connection(self):
+        cli = import_cli()
+        grant = {"principal": {"allow_write": True}}
+        env = {"CAPABILITIES_AUTH_CONTEXT": self._service_context(grant=grant)}
+        for command in ("send", "send-media", "react"):
+            with mock.patch.dict(os.environ, env, clear=False):
+                connection, session = cli._auth_connection_gate(
+                    "principal", None, command)
+            self.assertEqual(connection, "principal")
+            self.assertIsNone(session)
+
+    def test_service_request_refuses_write_without_the_role_write_grant(self):
+        cli = import_cli()
+        env = {"CAPABILITIES_AUTH_CONTEXT": self._service_context(
+            grant={"principal": {}})}
+        with mock.patch.dict(os.environ, env, clear=False):
+            with self.assertRaises(SystemExit) as stopped:
+                cli._auth_connection_gate("principal", None, "send")
+        self.assertEqual(stopped.exception.code, 4)
+
+    def test_connection_write_gate_still_has_the_last_word(self):
+        cli = import_cli()
+        with self.assertRaises(SystemExit) as stopped:
+            cli._write_gate("principal", False, "send")
+        self.assertEqual(stopped.exception.code, 4)
+        cli._write_gate("principal", True, "send")
 
     def test_service_request_keeps_its_own_connection_and_session(self):
         cli = import_cli()
@@ -564,13 +591,29 @@ class OutboundActionsTests(unittest.TestCase):
         shim = import_worker_shim()
         with tempfile.TemporaryDirectory() as td:
             outbox = Path(td) / "progress.jsonl"
-            for flag in ("--topic=99", "--session=/tmp/other", "--connection=other"):
+            for flag in ("--topic=99", "--session=/tmp/other"):
                 argv = ["telegram", "send", "-1001", "hello", flag]
                 with mock.patch.dict(os.environ, self._worker_env(outbox), clear=False), \
                      mock.patch.object(sys, "argv", argv):
                     with self.assertRaises(SystemExit) as stopped:
                         shim.main()
                 self.assertEqual(stopped.exception.code, 4)
+            self.assertFalse(outbox.exists())
+
+    def test_cross_connection_send_bypasses_the_daemon_outbox(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as td:
+            outbox = Path(td) / "progress.jsonl"
+            env = self._worker_env(outbox)
+            env["TELEGRAM_REAL_TELEGRAM"] = "/usr/bin/true"
+            calls = self._run_shim(
+                shim, env,
+                ["telegram", "send", "555", "hello", "--topic=99",
+                 "--connection", "principal"])
+            self.assertEqual(len(calls), 1)
+            self.assertIn("--connection", calls[0][1])
+            self.assertIn("--topic=99", calls[0][1])
+            self.assertNotIn("--session", calls[0][1])
             self.assertFalse(outbox.exists())
 
     def test_worker_send_queues_only_the_authorized_scope(self):

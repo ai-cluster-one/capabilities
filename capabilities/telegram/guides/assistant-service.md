@@ -96,11 +96,11 @@ The accepted schema is deliberately finite:
 
 IDs must have the correct sign (users positive, groups negative, topics positive), context paths must resolve inside the Telegram service directory, and numeric settings use the bounds named by `/set help` or the shipped template. A `project` route is checked for shape at load and for reachability at dispatch, as described under Worker Project Routing. There is no permissive/legacy mode.
 
-### Reading a second account
+### Using a second account
 
 A worker turn runs on the account that received the message, and that is the only account it reaches by default. Naming another connection is refused, and so is `--session`, which points at a file rather than a declared connection and would therefore reach any account on the machine.
 
-A project that connects more than one account can grant a role the ones it may read:
+A project that connects more than one account can grant a role the ones it may read. The original list form is read-only:
 
 ```json
 {
@@ -117,11 +117,35 @@ A project that connects more than one account can grant a role the ones it may r
 }
 ```
 
+To let that role write through one of those accounts, use the object form and grant the connection explicitly:
+
+```json
+{
+  "authority": {
+    "roles": {
+      "supervisor": {
+        "allowed_capabilities": {
+          "telegram": {
+            "connections": {
+              "principal-personal": {"allow_write": true}
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The role grant and the connection's own `allow_write` are independent gates; both must be true for `send`, `send-media`, or `react`. Omitting `allow_write`, setting it to false, or using the legacy list keeps that role read-only. A role with no entry for the connection cannot reach it at all.
+
 The grant is deliberately narrow, because the hazard is not the flag but who holds it. A group member who may address the assistant would otherwise be able to ask, from a group, for something that lives in a private account - so reach is a property of the sender's role, named in the project's own settings, and the reachable set is exactly what the project declared.
 
-- Only read verbs cross: `chats`, `read`, `search`, `topics`, `download`, `export`, `whoami`, `doctor`, `connections`. Anything that leaves the system - `send`, `send-media`, `react` - stays on the account that received the message whatever the grant says.
-- A granted connection is read through its own session. The worker session belongs to the receiving account and is left out, so one account is never read through another's session.
-- The connection must exist in the project's registry and its own `allow_write` still governs it; a read-only connection stays read-only.
+- Read verbs cross whenever the role names the connection: `chats`, `read`, `search`, `topics`, `download`, `export`, `whoami`, `doctor`, `connections`.
+- Write verbs cross only with the role's explicit `allow_write: true`: `send`, `send-media`, `react`.
+- A granted action uses the selected connection's own session. The worker session belongs to the receiving account and is left out, so one account is never used through another's session.
+- Login and service-control verbs never cross, and a worker still cannot name an arbitrary `--session` path.
+- The connection must exist in the project's registry and its own `allow_write` still governs it; a read-only connection stays read-only regardless of the role grant.
 
 ## State Layout
 

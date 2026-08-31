@@ -201,14 +201,15 @@ def main():
                 fail("worker_scope_denied",
                      f"{forbidden} cannot be overridden inside a Telegram worker request",
                      exit_code=4)
-    if os.environ.get("TELEGRAM_PROGRESS_OUTBOX"):
+    cross_connection = names_another_connection(sys.argv) if daemon_turn else False
+    if os.environ.get("TELEGRAM_PROGRESS_OUTBOX") and not cross_connection:
         for forbidden in ("--topic", "--thread"):
             if forbidden in sys.argv[1:] or any(
                     item.startswith(forbidden + "=") for item in sys.argv[1:]):
                 fail("worker_scope_denied",
                      f"{forbidden} cannot be overridden inside a Telegram worker request",
                      exit_code=4)
-    elif os.environ.get("TELEGRAM_AUTHORIZED_TOPIC_ID"):
+    elif os.environ.get("TELEGRAM_AUTHORIZED_TOPIC_ID") and not cross_connection:
         # A daemon-authorized worker inherits the topic from its authority
         # context, so naming another one is a destination substitution even
         # when the chat matches.
@@ -218,8 +219,10 @@ def main():
                 fail("worker_scope_denied",
                      f"{forbidden} cannot be overridden inside a Telegram worker request",
                      exit_code=4)
-    cross_connection = names_another_connection(sys.argv) if daemon_turn else False
-    if write_progress(sys.argv):
+    # A send on the receiving account is a progress/final-delivery write owned by
+    # the daemon. A send on a granted second connection is a real capability
+    # action; the CLI applies the role grant and the connection write gate.
+    if not cross_connection and write_progress(sys.argv):
         return 0
     enforce_current_chat_scope(sys.argv)
     real = os.environ.get("TELEGRAM_REAL_TELEGRAM")
