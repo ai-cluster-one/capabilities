@@ -251,7 +251,7 @@ People never have to name the mechanism. The dialogue worker applies this order 
 2. A correction, new constraint, or additional material for ongoing work amends that row; it is not executed inside the dialogue turn.
 3. A genuinely new request is registered before substantive work when it requires multi-step research, several sources or actions, implementation, waiting or monitoring, or otherwise likely exceeds roughly fifteen seconds. The dialogue turn then acknowledges it and ends. A final answer that is genuinely available now stays a dialogue answer.
 
-Reference resolution remains prompt judgement because conversation meaning cannot be reduced to a channel lock. An explicit id or reply target wins. With one active job, an elliptical status question or continuation binds to it unless it is clearly standalone. With several, the worker uses a unique semantic match and asks a short clarification when none exists; it does not guess or create a duplicate. A separate requested outcome is a new job.
+Reference resolution remains prompt judgement because conversation meaning cannot be reduced to a channel lock. An explicit id or reply target wins. With one active job, an elliptical status question or continuation binds to it unless it is clearly standalone. With several, the worker uses a unique semantic match and asks a short clarification when none exists; recency and bare references such as “it”, “there” or “also” never count as a match, and no ledger write happens before clarification. It does not guess or create a duplicate. A separate requested outcome is a new job.
 
 ### Amendment keeps the row
 

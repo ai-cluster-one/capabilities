@@ -174,6 +174,8 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("multi-step research", seen["prompt"])
             self.assertIn("With one active job", seen["prompt"])
             self.assertIn("With several active jobs", seen["prompt"])
+            self.assertIn("recency and bare words", seen["prompt"])
+            self.assertIn("make no ledger change", seen["prompt"])
             self.assertNotIn(row["id"], seen["prompt"],
                              "the list is asked for, not handed over")
             self.assertNotIn("open_jobs", seen["state"])

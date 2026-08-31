@@ -3576,8 +3576,10 @@ def build_prompt(tail, state=None):
             "one active job, elliptical follow-ups such as 'how is it going?', 'and "
             "also include...', or 'no, use the other one' refer to it unless they are "
             "clearly standalone. With several active jobs, use the unique semantic "
-            "match; if none is unique, ask which work the person means instead of "
-            "guessing or creating a duplicate. A separate requested outcome is a new "
+            "match; recency and bare words such as 'it', 'there', or 'also' are never "
+            "a match. Without a reply, id, or subject that names exactly one active "
+            "job, ask which work the person means and make no ledger change instead "
+            "of guessing or creating a duplicate. A separate requested outcome is a new "
             f"job. Amend with `{jobs_command} amend <id> \"<what changed>\"`.\n\n")
     if st.get("quota_pause"):
         jobs_block += f"Queue paused: {st['quota_pause']}\n\n"
