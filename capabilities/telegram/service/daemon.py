@@ -23,7 +23,8 @@ This engine is shipped in the installed telegram capability bundle. A project
 keeps only its policy/config under capabilities/telegram/service/:
   settings.json — connection, direct_messages, allowed_users, allowed_groups,
                   defaults
-  context.md    — soft-gate prompt injected into every worker turn
+  context.md     — service-level soft-gate prompt injected into text workers
+  worker.md      — optional project-specific text-worker prompt extension
   voice-agent.md — system prompt for a direct call answered by voice
 
 Runtime state follows the selected Telegram connection:
@@ -262,6 +263,8 @@ SETTINGS_FILE = Path(os.environ.get("TELEGRAM_SERVICE_SETTINGS")
                      or SERVICE_DIR / "settings.json")
 CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_CONTEXT")
                     or SERVICE_DIR / "context.md")
+WORKER_CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_WORKER_CONTEXT")
+                           or SERVICE_DIR / "worker.md")
 
 
 _RECORDS = None
@@ -1628,7 +1631,7 @@ def _document_key(path):
 
 def read_service_document(path):
     """Prose the daemon serves at request time — the soft-gate context, a
-    channel's own context, the voice prompt.
+    project's worker extension, a channel's own context, the voice prompt.
 
     The adapter answers from wherever this project keeps its records, and the
     daemon is not told which. Nothing falls back between them: a project on the
@@ -1648,6 +1651,11 @@ def _service_document(path):
 def read_voice_context():
     """The voice channel's own system prompt, owned by the project."""
     return read_service_document(VOICE_CONTEXT_FILE)
+
+
+def read_worker_context():
+    """Optional project prose appended to every fresh text-worker prompt."""
+    return read_service_document(WORKER_CONTEXT_FILE)
 
 
 def voice_call_readiness():
@@ -3467,17 +3475,26 @@ def resumed_prompt(st):
 
 
 def build_prompt(tail, state=None):
-    """Assemble the worker prompt: soft-gate context (context.md) + the daemon-resolved channel
-    state (time, channel/harness, participants + roles, active settings, context-window size,
-    previous-turn token usage) + the live tail. State is assembled here and passed in, so the
-    worker reads its situation from the context, not by inferring it from chat history."""
+    """Assemble the worker prompt: service context + optional project worker
+    context + daemon-resolved channel state and request + the live tail. State
+    is assembled here and passed in, so the worker reads its situation from the
+    context rather than inferring it from chat history."""
     st = state or {}
     if st.get("resume_session") and not st.get("resume_reanchor"):
         return resumed_prompt(st)
-    # An exclusive channel answers with its own prose alone. The service context
-    # goes with the room's, which is the point of the mode and the cost of it.
-    context = ("" if st.get("context_exclusive")
-               else read_service_document(CONTEXT_FILE))
+    # An exclusive channel answers with its own prose alone. Both project-level
+    # prose layers go with the room's, which is the point of the mode and its
+    # declared cost. The daemon-owned job protocol below is structural and is
+    # never removed by a channel's prose choice.
+    if st.get("context_exclusive"):
+        context = ""
+    else:
+        service_context = read_service_document(CONTEXT_FILE)
+        worker_context = read_worker_context()
+        worker_block = ("--- Project worker context ---\n" + worker_context
+                        if worker_context else "")
+        context = "\n\n".join(
+            part for part in (service_context, worker_block) if part)
     channel_context = (st.get("channel_context") or "").strip()
     progress_command = None
     if st.get("chat_id") is not None:

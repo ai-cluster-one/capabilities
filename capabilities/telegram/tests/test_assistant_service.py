@@ -184,6 +184,7 @@ class AudioParameters:
 def import_daemon(tmp: Path, service_settings: dict, *,
                   connection_extra: dict | None = None,
                   voice_context: str | None = None,
+                  worker_context: str | None = None,
                   project_env: dict | None = None,
                   store: bool = False):
     """Import one daemon against a throwaway project.
@@ -206,9 +207,12 @@ def import_daemon(tmp: Path, service_settings: dict, *,
         }) + "\n")
     settings_file = service_dir / "settings.json"
     context_file = service_dir / "context.md"
+    worker_context_file = service_dir / "worker.md"
     voice_context_file = service_dir / "voice-agent.md"
     settings_file.write_text(json.dumps(service_settings) + "\n")
     context_file.write_text("test context\n")
+    if worker_context is not None:
+        worker_context_file.write_text(worker_context)
     if voice_context is not None:
         voice_context_file.write_text(voice_context)
     if project_env:
@@ -4618,14 +4622,22 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_exclusive_prompt_answers_without_the_service_context(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
+            daemon = import_daemon(
+                Path(td), settings(), worker_context="project worker prose\n")
             state = {"chat_id": 5, "channel_context": "lane prose"}
 
             extend = daemon.build_prompt([], state)
             exclusive = daemon.build_prompt([], {**state, "context_exclusive": True})
 
             self.assertIn("test context", extend)
+            self.assertIn("--- Project worker context ---", extend)
+            self.assertIn("project worker prose", extend)
+            self.assertLess(extend.index("test context"),
+                            extend.index("project worker prose"))
+            self.assertLess(extend.index("project worker prose"),
+                            extend.index("lane prose"))
             self.assertNotIn("test context", exclusive)
+            self.assertNotIn("project worker prose", exclusive)
             self.assertIn("lane prose", exclusive)
 
     async def test_the_progress_channel_survives_an_exclusive_prompt(self):

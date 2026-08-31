@@ -30,6 +30,11 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
    - Set a group's `voice_transcription.mode` to `auto` to transcribe all voice messages and video notes from participants (unaddressed spoken media are echoed without creating worker jobs). Defaults to `disabled`.
    - Choose `defaults.worker`: `codex`, `claude`, or `stub`.
 
+   Optionally edit `capabilities/telegram/service/worker.md` when this project
+   needs additional instructions for every Telegram text worker. It extends the
+   daemon-owned worker protocol; it does not replace it and does not affect the
+   voice agent.
+
 4. Ensure the selected connection can send replies:
 
    ```json
@@ -425,9 +430,9 @@ Runtime overrides are available per channel via `/set voice-transcription auto|d
 
 Transcription failures produce a fallback message. The daemon reserves ownership before transcription so duplicate deliveries and restart catch-up cannot transcribe the same spoken-media message twice.
 
-## Channel Context
+## Worker and Channel Context
 
-The global soft prompt lives in `capabilities/telegram/service/context.md`. Group policies may add a channel-specific overlay with either a markdown file or a short inline string. File paths are relative to `capabilities/telegram/service/`.
+The service soft prompt lives in `capabilities/telegram/service/context.md`. An optional project-wide text-worker extension lives in `capabilities/telegram/service/worker.md`. The daemon's required job protocol remains in the capability code, so a capability update updates that protocol while each project can add its own working guidance without forking it. Group policies may then add a channel-specific overlay with either a markdown file or a short inline string. File paths are relative to `capabilities/telegram/service/`.
 
 ```json
 {
@@ -448,13 +453,13 @@ The global soft prompt lives in `capabilities/telegram/service/context.md`. Grou
 
 A forum topic may add its own overlay under its group's `topics` map, and a direct sender may add one on their `allowed_users` entry. Topic prose follows room prose rather than replacing it, so a topic says what is specific to its lane while the room keeps saying what is true everywhere in it.
 
-The prompt order is: global `context.md`, channel context overlay, daemon channel state, current request, then the recent conversation tail. Channel context is a soft behavior layer only; access control still belongs to `control.roles` and tool access still belongs to `authority.roles`.
+The prompt order is: service `context.md`, optional project `worker.md`, channel context overlay, daemon channel state and job protocol, current request, then the recent conversation tail. `worker.md` and channel context are soft behavior layers only; access control still belongs to `control.roles` and tool access still belongs to `authority.roles`. A resumed Codex session already holds these layers, so edits reach a new session or the next full re-anchor rather than being repeated on every continuation.
 
 ### Exclusive channel prose
 
 `context_mode` decides whether a level's prose joins what came before it or stands alone. It accepts `extend`, the default, and `exclusive`, and it may be declared on a group, on a topic entry, and on a direct sender.
 
-Exclusivity cuts every layer above the level that declares it, and never a layer below. A topic set to `exclusive` answers with its own prose alone — the room's overlay and the global `context.md` both drop away. A group set to `exclusive` drops `context.md` while its topics still add their own lines on top of the room's.
+Exclusivity cuts every prose layer above the level that declares it, and never a layer below. A topic set to `exclusive` answers with its own prose alone — the room's overlay, service `context.md`, and project `worker.md` all drop away. A group set to `exclusive` drops both project-level documents while its topics still add their own lines on top of the room's. The daemon-owned job protocol and resolved request state remain.
 
 ```json
 {
@@ -473,7 +478,7 @@ Exclusivity cuts every layer above the level that declares it, and never a layer
 }
 ```
 
-An exclusive channel takes over everything `context.md` was saying: who the assistant is, how it is addressed, how it introduces itself, how it treats history, and when to report progress. Write those into the channel's own prose, or the channel will not have them.
+An exclusive channel takes over everything `context.md` and `worker.md` were saying: who the assistant is, how it is addressed, how it introduces itself, how it treats history, project-specific working guidance, and when to report progress. Write those into the channel's own prose, or the channel will not have them.
 
 What exclusivity never removes is the daemon-resolved state that a worker needs to answer at all — the channel and its id, participants and roles, active settings, tool authority, delivery, and the progress command for this request. The progress command is a fact about the request rather than prose, so it is stated in the channel state block whenever the prose does not already name it, and prose naming it in either spelling is rewritten to the real command wherever that prose came from.
 
