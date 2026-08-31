@@ -24,7 +24,7 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
    - Add `allowed_users` and `allowed_groups`.
    - Add optional per-channel `context_file` or short inline `context` entries when a chat needs its own soft prompt overlay.
    - Review `control.roles`: this hard gate limits who may run service control commands such as `/set`, `/reload`, and `/stop`.
-   - Review `authority.roles`: this request-scoped hard gate limits which capability CLIs a worker may invoke for each sender role.
+   - Review `authority.roles`: this request-scoped supported-path gate limits which capability CLIs a worker may invoke for each sender role; the trust boundary is documented under Tool Authority below.
    - Set group `aliases` / `address_aliases` if the assistant should react to names other than the default.
    - Set a group's `call_recording.mode` to `auto`, `on_request`, or `disabled`. Recording is opt-in per group and defaults to `disabled`.
    - Set a group's `voice_transcription.mode` to `auto` to transcribe all voice messages and video notes from participants (unaddressed spoken media are echoed without creating worker jobs). Defaults to `disabled`.
@@ -246,11 +246,11 @@ Both are asynchronous. `stop`, and the staged text behind `amend`, record what w
 
 Inside a worker turn the same commands run through the shim, which pins channel, topic and actor to the daemon-authenticated request and refuses substitutions. For `register`, it also pins origin message, effective channel worker and model; the model neither repeats nor chooses identity or execution configuration. The real CLI independently reapplies those environment scopes, so accidentally reaching it instead of the shim does not silently become an operator-wide job mutation.
 
-This wrapper is not an OS security boundary. Text workers currently run with full host access and can deliberately unset their environment or invoke code around the CLI. The hard boundaries remain the capability policy, request authority, connection `allow_write`, and service role grants. Actor/channel checks make the supported job command surface fail closed and prevent accidental bypass; they do not turn an unrestricted worker process into a sandbox.
+This wrapper is not an OS security boundary. Text workers currently run with full host access and a hostile same-OS process can deliberately unset its daemon-issued scope or invoke code around the CLI. Actor, channel, environment and role checks make the supported shim/CLI path fail closed and prevent accidental authority crossover; they do not turn an unrestricted worker process into a sandbox. For external writes, the hard gates are capability policy and the selected connection's `allow_write`; service role authority is an additional supported-path grant, not a defence against a hostile process with the same Unix access.
 
 ### What the worker is told, and what it asks for
 
-The prompt names the surface; it does not carry a snapshot of it. The queue moves while a turn is being written, so a list pasted in at dispatch is already stale when it is read — the worker runs `telegram jobs list --limit 20` at the start of every dialogue turn. That includes stopped, resumable work needed for natural “continue it” and status follow-ups. Its authenticated actor scope returns only jobs requested by the person whose message created this turn.
+The prompt names the surface; it does not carry a snapshot of it. The queue moves while a turn is being written, so a list pasted in at dispatch is already stale when it is read. At the start of every dialogue turn the worker runs `telegram jobs active` as an unbounded view of in-flight work, then `telegram jobs list --state stopped --limit 5` for recent resumable history. Keeping these reads separate prevents an old long-running job from disappearing behind newer completed rows. Their authenticated actor scope returns only jobs requested by the person whose message created this turn.
 
 People never have to name the mechanism. The dialogue worker applies this order to ordinary language:
 
@@ -262,7 +262,7 @@ Reference resolution remains prompt judgement because conversation meaning canno
 
 ### Amendment keeps the row
 
-A correction is not a new request. `amend` appends one immutable amendment row and therefore increments the count once per user addition, not once per runner batch. The runner claims those rows without deleting them and acknowledges them only when the engine accepts the attempt; a concurrent append or crash cannot erase one. It stops the current process group and continues the same engine session by its id. Amending stopped work brings it back to `waiting` for the same reason: being corrected is a reason to continue.
+A correction is not a new request. `amend` appends one immutable amendment row and therefore increments the count once per user addition, not once per runner batch. The current attempt owner claims those rows without deleting them and acknowledges them only when the engine accepts that exact attempt; another daemon can observe the intent but cannot steal it or transition the row. The owner stops and confirms its process group before releasing the slot and continuing the same engine session. If an engine has exposed no resumable checkpoint, notably Claude before its final JSON, the job remains stopped with the amendment pending until somebody explicitly decides to resume it; it is never replayed automatically.
 
 ### What the row holds
 
@@ -274,11 +274,11 @@ Every ordinary queue read, ID lookup, write and claim is filtered by `project_id
 
 ### Restart, quota, reporting
 
-Each attempt carries an owner, fencing token, renewable lease, PID and process group. Shared slot rows enforce `max_parallel_jobs` across overlapping daemons. A healthy lease is left alone; an expired locally-owned process group is terminated before its slot is reused, and a stale completion cannot overwrite a newer attempt. Automatic `requeue` is limited to a locally-owned attempt with a safe checkpoint (a persisted Codex session, or the test stub). Claude exposes its session only in the final JSON, so an interrupted Claude attempt is deliberately stopped for inspection instead of being replayed with uncertain side effects.
+Each attempt carries an owner, fencing token, renewable lease, PID and process group. Shared slot rows enforce `max_parallel_jobs` across overlapping daemons. Renewal requires the exact row and slot in one transaction. Expiry reconciliation matches the observed owner, token and expiry, stops a locally-owned process group while its slot is still held, then fences the row and releases that exact slot in the same transaction. A stale observer or completion therefore cannot overwrite a renewed or newer attempt. Automatic `requeue` is limited to a locally-owned attempt with a safe checkpoint (a persisted Codex session, or the test stub). Claude exposes its session only in the final JSON, so an interrupted Claude attempt is deliberately stopped for inspection instead of being replayed with uncertain side effects.
 
 When the engine reports the subscription spent, the running job stops with outcome `quota` and a durable `resume_at`; restart reconstructs the queue pause from that timestamp and resumes due quota work without retrying into the wall.
 
-A job records execution completion and result before delivery. A separate durable delivery state retries an unavailable Telegram channel after restart without running the worker again. It reports into its own channel, as a reply to the originating message. Progress lines use the same outbox a dialogue turn does.
+A job records execution completion and result before delivery. A separate durable delivery state retries an unavailable Telegram channel after restart without running the worker again, and an owner/token lease permits only one concurrent sender. Delivery is intentionally at least once: if Telegram accepts a send and the daemon crashes before persisting its acknowledgement, the result may be repeated after the lease expires because this path does not persist a stable Telegram `random_id`. That rare crash-window duplicate is an accepted limitation; the execution itself is not repeated. Results report into their own channel as replies to the originating message. Progress lines use the same outbox a dialogue turn does.
 
 The register needs the store. Where a project keeps its *configuration* is a separate question, answered by `project.json`; a queue lives in the store either way. Without a project identity the register cannot open, the job class is off for the session, and the conversation is unaffected.
 
@@ -571,7 +571,7 @@ Service control commands are handled by the daemon before a worker job exists, s
 
 ## Tool Authority
 
-The service creates a per-job `CAPABILITIES_AUTH_CONTEXT` file for workers when `settings.json` declares an `authority` policy. Capability CLIs read this file before resolving credentials; an unlisted capability exits with policy refusal (`exit 4`). This is a hard gate for normal capability use, while `context.md` remains soft behavioral guidance.
+The service creates a per-job `CAPABILITIES_AUTH_CONTEXT` file for workers when `settings.json` declares an `authority` policy. Capability CLIs read this file before resolving credentials; an unlisted capability exits with policy refusal (`exit 4`). This is a fail-closed authorization gate on the supported capability path, while `context.md` remains soft behavioral guidance. It is not an OS sandbox: a hostile process with the same unrestricted Unix access can bypass the supported path. Capability policy and connection `allow_write` remain the hard gates for external writes.
 
 Role policies live under `authority.roles.<role>.allowed_capabilities`:
 

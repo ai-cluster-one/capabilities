@@ -182,7 +182,9 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await client.handler(Event(message))
             await wait_until(lambda: "prompt" in seen, timeout=6)
             self.assertIn("Registered jobs", seen["prompt"])
-            self.assertIn("jobs list --limit 20", seen["prompt"])
+            self.assertIn("jobs active", seen["prompt"])
+            self.assertIn("jobs list --state stopped --limit 5", seen["prompt"])
+            self.assertIn("separate queries", seen["prompt"])
             self.assertIn("At the start of every turn", seen["prompt"])
             self.assertIn("multi-step research", seen["prompt"])
             self.assertIn("With one active job", seen["prompt"])
@@ -534,9 +536,20 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             register = daemon.job_register()
             row = register.register(channel_key="123", requested_by="777",
                                     description="interrupted work", engine="stub")
-            register.start(row["id"], pid=999999)
-            register.update(row["id"], lease_expires_at="2000-01-01T00:00:00+00:00",
-                            owner_host=daemon.JOB_OWNER_HOST)
+            running = register.claim_next(
+                owner_id="dead-daemon", owner_host=daemon.JOB_OWNER_HOST,
+                max_parallel=1)
+            register.attach_process(
+                row["id"], running["attempt_token"], "dead-daemon",
+                pid=999999, pgid=999999)
+            expired = "2000-01-01T00:00:00+00:00"
+            with register.store.transaction():
+                register.store._execute(
+                    "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
+                    (expired, row["id"]))
+                register.store._execute(
+                    "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                    (expired, row["id"]))
             hold = asyncio.Event()
             loop = asyncio.get_running_loop()
 

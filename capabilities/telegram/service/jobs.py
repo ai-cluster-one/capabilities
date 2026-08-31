@@ -54,12 +54,12 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from uuid import uuid4
 
 
 STORE_NAMESPACE = "telegram"
-STORE_VERSION = 2
+STORE_VERSION = 3
 
 # Portable DDL, in the same dialect the core tier writes: a timestamp is TEXT
 # holding an ISO instant and a flag is INTEGER, because those are the two
@@ -191,7 +191,26 @@ STORE_MIGRATIONS = [
         UNIQUE (project_id, environment, surface, job_id)
     )
     """,
+    # Version 3: delivery is itself a leased single-consumer operation.
+    """
+    ALTER TABLE tg_worker_jobs ADD COLUMN delivery_owner TEXT
+    """,
+    """
+    ALTER TABLE tg_worker_jobs ADD COLUMN delivery_token TEXT
+    """,
+    """
+    ALTER TABLE tg_worker_jobs ADD COLUMN delivery_lease_expires_at TEXT
+    """,
 ]
+
+# Store.migrate applies the supplied body as one version step. Keep each
+# additive generation separate so an upgrade from v2 does not replay v2's
+# ALTER TABLE statements before adding v3.
+STORE_MIGRATION_STEPS = {
+    1: STORE_MIGRATIONS[:4],
+    2: STORE_MIGRATIONS[4:-3],
+    3: STORE_MIGRATIONS[-3:],
+}
 
 # WHAT A JOB IS DOING, AND WHY IT IS DOING THAT
 # =============================================
@@ -283,7 +302,10 @@ def open_register(store_module, envelope: Path, environment: str,
     try:
         store.migrate()
         store.project_register(identity["id"], slug)
-        store.migrate(STORE_NAMESPACE, STORE_VERSION, STORE_MIGRATIONS)
+        for version in range(1, STORE_VERSION + 1):
+            if store.schema_version(STORE_NAMESPACE) < version:
+                store.migrate(
+                    STORE_NAMESPACE, version, STORE_MIGRATION_STEPS[version])
     except store_module.StoreError as exc:
         store.close()
         raise JobError("store_unavailable",
@@ -475,6 +497,36 @@ class JobRegister:
         return self._rows("delivery_state = ?", ("pending",),
                           order="execution_finished_at, id", limit=limit)
 
+    def claim_deliveries(self, owner_id: str, *, limit: int = 20,
+                         lease_seconds: float = 30) -> list[dict[str, Any]]:
+        """Lease results to one sender. Delivery is deliberately at-least-once."""
+        now = iso()
+        until = (datetime.now(timezone.utc)
+                 + timedelta(seconds=max(1.0, lease_seconds))).isoformat(
+                     timespec="microseconds")
+        claimed: list[str] = []
+        with self.store.transaction():
+            rows = self.store._execute(
+                "SELECT id FROM tg_worker_jobs WHERE project_id = ? AND environment = ? "
+                "AND surface = ? AND (delivery_state = ? OR (delivery_state = ? "
+                "AND delivery_lease_expires_at <= ?)) ORDER BY execution_finished_at, id LIMIT ?",
+                (self.project_id, self.environment, self.surface, "pending",
+                 "delivering", now, max(1, int(limit)))).fetchall()
+            for (job_id,) in rows:
+                token = str(uuid4())
+                clause, params = self._where(
+                    "id = ?", "(delivery_state = ? OR (delivery_state = ? "
+                    "AND delivery_lease_expires_at <= ?))")
+                cur = self.store._execute(
+                    "UPDATE tg_worker_jobs SET delivery_state = ?, delivery_owner = ?, "
+                    "delivery_token = ?, delivery_lease_expires_at = ?, "
+                    "delivery_attempts = delivery_attempts + 1, updated_at = ?" + clause,
+                    tuple(["delivering", owner_id, token, until, now] + params
+                          + [job_id, "pending", "delivering", now]))
+                if cur.rowcount == 1:
+                    claimed.append(job_id)
+        return [row for job_id in claimed if (row := self.get(job_id)) is not None]
+
     # -- writes ---------------------------------------------------------------
 
     def register(self, *, channel_key: str, requested_by: str, description: str,
@@ -590,10 +642,6 @@ class JobRegister:
         token = str(uuid4())
         try:
             with self.store.transaction():
-                self.store._execute(
-                    "DELETE FROM tg_worker_job_slots WHERE project_id = ? AND "
-                    "environment = ? AND surface = ? AND lease_expires_at <= ?",
-                    (self.project_id, self.environment, self.surface, now))
                 used = {int(r[0]) for r in self.store._execute(
                     "SELECT slot FROM tg_worker_job_slots WHERE project_id = ? AND "
                     "environment = ? AND surface = ?",
@@ -635,26 +683,28 @@ class JobRegister:
             raise
         return self.get(job_id)
 
-    def attach_process(self, job_id: str, attempt_token: str, *, pid: int,
+    def attach_process(self, job_id: str, attempt_token: str, owner_id: str, *, pid: int,
                        pgid: int | None = None) -> bool:
-        clause, params = self._where("id = ?", "state = ?", "attempt_token = ?")
+        clause, params = self._where(
+            "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
         with self.store.transaction():
             cur = self.store._execute(
                 "UPDATE tg_worker_jobs SET pid = ?, pgid = ?, updated_at = ?" + clause,
                 tuple([int(pid), int(pgid or pid), iso()] + params
-                      + [job_id, RUNNING, attempt_token]))
+                      + [job_id, RUNNING, attempt_token, owner_id]))
         return bool(cur.rowcount)
 
-    def update_attempt(self, job_id: str, attempt_token: str,
+    def update_attempt(self, job_id: str, attempt_token: str, owner_id: str,
                        **columns: Any) -> dict[str, Any] | None:
         columns.setdefault("updated_at", iso())
-        clause, params = self._where("id = ?", "state = ?", "attempt_token = ?")
+        clause, params = self._where(
+            "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
         assignments = ", ".join(f"{name} = ?" for name in columns)
         with self.store.transaction():
             cur = self.store._execute(
                 f"UPDATE tg_worker_jobs SET {assignments}" + clause,
                 tuple(list(columns.values()) + params
-                      + [job_id, RUNNING, attempt_token]))
+                      + [job_id, RUNNING, attempt_token, owner_id]))
         return self.get(job_id) if cur.rowcount else None
 
     def renew(self, job_id: str, attempt_token: str, owner_id: str,
@@ -664,24 +714,75 @@ class JobRegister:
                      timespec="microseconds")
         clause, params = self._where(
             "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
+        try:
+            with self.store.transaction():
+                cur = self.store._execute(
+                    "UPDATE tg_worker_jobs SET lease_expires_at = ?, updated_at = ?" + clause,
+                    tuple([until, iso()] + params
+                          + [job_id, RUNNING, attempt_token, owner_id]))
+                if cur.rowcount != 1:
+                    raise JobError("lease_lost", f"job {job_id} no longer owns its attempt")
+                slot = self.store._execute(
+                    "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE project_id = ? "
+                    "AND environment = ? AND surface = ? AND job_id = ? AND owner_id = ? "
+                    "AND attempt_token = ?",
+                    (until, self.project_id, self.environment, self.surface, job_id,
+                     owner_id, attempt_token))
+                if slot.rowcount != 1:
+                    raise JobError("lease_lost", f"job {job_id} no longer owns its slot")
+        except JobError:
+            return False
+        return True
+
+    def fence_expired_attempt(
+            self, row: dict[str, Any], reason: str,
+            before_release: Callable[[], None] | None = None) -> dict[str, Any] | None:
+        """Stop exactly the expired attempt observed by a reconciler.
+
+        The row transition and slot release are one transaction. If its owner
+        renewed either record after the snapshot, no predicate matches and the
+        slot remains unavailable.
+        """
+        job_id = row["id"]
+        token = row.get("attempt_token")
+        owner = row.get("lease_owner")
+        observed = row.get("lease_expires_at")
+        if not token or not owner or not observed:
+            return None
+        now = iso()
+        clause, params = self._where(
+            "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?",
+            "lease_expires_at = ?", "lease_expires_at <= ?")
         with self.store.transaction():
             cur = self.store._execute(
-                "UPDATE tg_worker_jobs SET lease_expires_at = ?, updated_at = ?" + clause,
-                tuple([until, iso()] + params + [job_id, RUNNING, attempt_token, owner_id]))
-            self.store._execute(
-                "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE project_id = ? "
-                "AND environment = ? AND surface = ? AND job_id = ? AND owner_id = ? "
-                "AND attempt_token = ?",
-                (until, self.project_id, self.environment, self.surface, job_id,
-                 owner_id, attempt_token))
-        return bool(cur.rowcount)
-
-    def release_claim(self, job_id: str, attempt_token: str) -> None:
-        with self.store.transaction():
-            self.store._execute(
+                "UPDATE tg_worker_jobs SET state = ?, outcome = ?, pid = NULL, pgid = NULL, "
+                "stop_requested = 0, finished_at = ?, execution_finished_at = ?, "
+                "error = ?, lease_expires_at = NULL, updated_at = ?" + clause,
+                tuple([STOPPED, INTERRUPTED, now, now, str(reason)[:500], now]
+                      + params + [job_id, RUNNING, token, owner, observed, now]))
+            if cur.rowcount != 1:
+                return None
+            # A local process group must be stopped while the exact attempt is
+            # fenced and its slot is still held. SQLite's BEGIN IMMEDIATE and
+            # PostgreSQL's row update keep renew/claim from crossing this
+            # callback; only after it returns may the slot become reusable.
+            if before_release is not None:
+                before_release()
+            slot = self.store._execute(
                 "DELETE FROM tg_worker_job_slots WHERE project_id = ? AND environment = ? "
-                "AND surface = ? AND job_id = ? AND attempt_token = ?",
-                (self.project_id, self.environment, self.surface, job_id, attempt_token))
+                "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ? "
+                "AND lease_expires_at = ?",
+                (self.project_id, self.environment, self.surface, job_id,
+                 owner, token, observed))
+            if slot.rowcount != 1:
+                raise JobError("slot_mismatch", f"job {job_id} expired without its exact slot")
+            self.store._execute(
+                "UPDATE tg_worker_job_amendments SET state = ?, claim_token = NULL, "
+                "claimed_at = NULL WHERE project_id = ? AND environment = ? AND surface = ? "
+                "AND job_id = ? AND state = ? AND claim_token = ?",
+                ("pending", self.project_id, self.environment, self.surface,
+                 job_id, "claimed", token))
+        return self.get(job_id)
 
     # -- the amendment hand-off -----------------------------------------------
 
@@ -733,40 +834,50 @@ class JobRegister:
     def has_pending_amendment(self, job_id: str) -> bool:
         return bool(self._amendment_rows(job_id, ("pending",)))
 
-    def claim_amendments(self, job_id: str, attempt_token: str) -> list[dict[str, Any]]:
+    def _lock_attempt(self, job_id: str, attempt_token: str, owner_id: str) -> bool:
+        """Lock one exact attempt and its slot in the common row-then-slot order."""
+        lock = " FOR UPDATE" if self.store.dialect == "postgres" else ""
+        job = self.store._execute(
+            "SELECT 1 FROM tg_worker_jobs WHERE project_id = ? AND environment = ? "
+            "AND surface = ? AND id = ? AND state = ? AND attempt_token = ? "
+            "AND lease_owner = ?" + lock,
+            (self.project_id, self.environment, self.surface, job_id, RUNNING,
+             attempt_token, owner_id)).fetchone()
+        if not job:
+            return False
+        slot = self.store._execute(
+            "SELECT 1 FROM tg_worker_job_slots WHERE project_id = ? AND environment = ? "
+            "AND surface = ? AND job_id = ? AND attempt_token = ? AND owner_id = ?" + lock,
+            (self.project_id, self.environment, self.surface, job_id,
+             attempt_token, owner_id)).fetchone()
+        return bool(slot)
+
+    def claim_amendments(self, job_id: str, attempt_token: str,
+                         owner_id: str) -> list[dict[str, Any]]:
         """Claim pending additions without deleting them.
 
         A crash leaves immutable rows behind. A later attempt may reclaim them;
         only an explicit engine-acceptance acknowledgement removes them from
         the pending view.
         """
-        job = self.get(job_id)
-        if job is None:
-            return []
-        if (job["state"] == RUNNING
-                and job.get("attempt_token") != attempt_token):
-            return []
         now = iso()
         with self.store.transaction():
+            if not self._lock_attempt(job_id, attempt_token, owner_id):
+                return []
             self.store._execute(
                 "UPDATE tg_worker_job_amendments SET state = ?, claim_token = ?, "
                 "claimed_at = ? WHERE project_id = ? AND environment = ? AND surface = ? "
                 "AND job_id = ? AND state = ?",
                 ("claimed", attempt_token, now, self.project_id, self.environment,
                  self.surface, job_id, "pending"))
-            # Claims left by an attempt which no longer owns the job are safe
-            # to hand to the current attempt again; they were never acked.
-            self.store._execute(
-                "UPDATE tg_worker_job_amendments SET claim_token = ?, claimed_at = ? "
-                "WHERE project_id = ? AND environment = ? AND surface = ? AND job_id = ? "
-                "AND state = ? AND claim_token <> ?",
-                (attempt_token, now, self.project_id, self.environment, self.surface,
-                 job_id, "claimed", attempt_token))
         return [row for row in self._amendment_rows(job_id, ("claimed",))
                 if row["claim_token"] == attempt_token]
 
-    def ack_amendments(self, job_id: str, attempt_token: str) -> int:
+    def ack_amendments(self, job_id: str, attempt_token: str,
+                       owner_id: str) -> int:
         with self.store.transaction():
+            if not self._lock_attempt(job_id, attempt_token, owner_id):
+                return 0
             cur = self.store._execute(
                 "UPDATE tg_worker_job_amendments SET state = ?, acked_at = ? WHERE "
                 "project_id = ? AND environment = ? AND surface = ? AND job_id = ? "
@@ -776,11 +887,20 @@ class JobRegister:
         return int(cur.rowcount or 0)
 
     def take_amendment(self, job_id: str) -> list[str]:
-        """Compatibility helper for operator/tests; claim and acknowledge atomically."""
-        token = str(uuid4())
-        claimed = self.claim_amendments(job_id, token)
-        self.ack_amendments(job_id, token)
-        return [row["text"] for row in claimed]
+        """Operator compatibility for idle jobs only; runners use claim/ack."""
+        row = self.get(job_id)
+        if row is None or row["state"] == RUNNING:
+            return []
+        pending = self._amendment_rows(job_id, ("pending",))
+        if not pending:
+            return []
+        ids = [item["id"] for item in pending]
+        with self.store.transaction():
+            self.store._execute(
+                f"UPDATE tg_worker_job_amendments SET state = ?, acked_at = ? WHERE "
+                f"id IN ({self._marks(ids)}) AND state = ?",
+                ("acked", iso(), *ids, "pending"))
+        return [item["text"] for item in pending]
 
     def amend(self, job_id: str, text: str | None = None,
               *, actor_id: str | None = None) -> dict[str, Any] | None:
@@ -795,6 +915,15 @@ class JobRegister:
             return None
         if text:
             self.stage_amendment(job_id, text, actor_id=actor_id)
+        if current["state"] == RUNNING:
+            # The amendment row is durable intent. Only the daemon that owns
+            # this exact attempt may stop its process and transition the job.
+            return self.get(job_id, actor_id=actor_id)
+        if (current["state"] == STOPPED and current.get("engine") != "stub"
+                and not current.get("session_id")):
+            # No checkpoint means continuing may repeat work already performed.
+            # Keep the addition pending until an explicit resume decision.
+            return self.get(job_id, actor_id=actor_id)
         now = iso()
         predicates = ["id = ?"]
         values: list[Any] = [job_id]
@@ -810,12 +939,48 @@ class JobRegister:
             "exit_code = NULL, finished_at = NULL, execution_finished_at = NULL, "
             "resume_at = NULL, result_text = NULL, result_silent = 0, "
             "delivery_state = NULL, delivery_attempts = 0, delivery_error = NULL, "
-            "delivered_at = NULL, updated_at = ?" + clause,
+            "delivered_at = NULL, delivery_owner = NULL, delivery_token = NULL, "
+            "delivery_lease_expires_at = NULL, updated_at = ?" + clause,
             tuple([WAITING, now] + params + values))
-            self.store._execute(
+        return self.get(job_id)
+
+    def finish_amendment(self, job_id: str, attempt_token: str,
+                         owner_id: str) -> dict[str, Any] | None:
+        """Transition an amended attempt after its owner stopped the process."""
+        now = iso()
+        clause, params = self._where(
+            "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
+        with self.store.transaction():
+            current = self.store._execute(
+                "SELECT engine, session_id FROM tg_worker_jobs" + clause,
+                tuple(params + [job_id, RUNNING, attempt_token, owner_id])).fetchone()
+            if not current:
+                return None
+            safe = current[0] == "stub" or bool(current[1])
+            state, outcome = (WAITING, None) if safe else (STOPPED, INTERRUPTED)
+            error = None if safe else (
+                "amendment is pending but this attempt exposed no resumable checkpoint")
+            cur = self.store._execute(
+                "UPDATE tg_worker_jobs SET state = ?, outcome = ?, pid = NULL, pgid = NULL, "
+                "stop_requested = 0, error = ?, lease_expires_at = NULL, finished_at = ?, "
+                "updated_at = ?" + clause,
+                tuple([state, outcome, error, None if safe else now, now]
+                      + params + [job_id, RUNNING, attempt_token, owner_id]))
+            if cur.rowcount != 1:
+                return None
+            slot = self.store._execute(
                 "DELETE FROM tg_worker_job_slots WHERE project_id = ? AND environment = ? "
-                "AND surface = ? AND job_id = ?",
-                (self.project_id, self.environment, self.surface, job_id))
+                "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ?",
+                (self.project_id, self.environment, self.surface, job_id,
+                 owner_id, attempt_token))
+            if slot.rowcount != 1:
+                raise JobError("slot_mismatch", f"job {job_id} lost its owned slot")
+            self.store._execute(
+                "UPDATE tg_worker_job_amendments SET state = ?, claim_token = NULL, "
+                "claimed_at = NULL WHERE project_id = ? AND environment = ? AND surface = ? "
+                "AND job_id = ? AND state = ? AND claim_token = ?",
+                ("pending", self.project_id, self.environment, self.surface,
+                 job_id, "claimed", attempt_token))
         return self.get(job_id)
 
     # -- stopping and continuing ----------------------------------------------
@@ -847,11 +1012,21 @@ class JobRegister:
                 tuple([iso()] + params + values))
         return self.get(job_id, actor_id=actor_id) if cur.rowcount else None
 
+    def cancel_waiting(self, job_id: str, *, error: str,
+                       result_text: str | None = None) -> dict[str, Any] | None:
+        row = self.get(job_id)
+        if row is None or row["state"] != WAITING or not row["stop_requested"]:
+            return None
+        return self.stop(job_id, CANCELLED, error=error, result_text=result_text,
+                         expected_state=WAITING, require_stop_requested=True)
+
     def stop(self, job_id: str, outcome: str, *, exit_code: int | None = None,
              error: str | None = None, session_id: str | None = None,
              model: str | None = None, attempt_token: str | None = None,
+             owner_id: str | None = None,
              resume_at: str | None = None, result_text: str | None = None,
-             result_silent: bool = False) -> dict[str, Any] | None:
+             result_silent: bool = False, expected_state: str | None = None,
+             require_stop_requested: bool = False) -> dict[str, Any] | None:
         """Land a stop, whatever caused it — the work finishing counts."""
         if outcome not in OUTCOMES:
             raise JobError("bad_outcome",
@@ -874,16 +1049,34 @@ class JobRegister:
             columns["result_silent"] = 1 if result_silent else 0
             columns["delivery_state"] = "delivered" if result_silent else "pending"
             columns["delivered_at"] = iso() if result_silent else None
+            columns["delivery_owner"] = None
+            columns["delivery_token"] = None
+            columns["delivery_lease_expires_at"] = None
         if session_id is not None:
             columns["session_id"] = session_id
         if model is not None:
             columns["model"] = model
         columns["updated_at"] = iso()
+        if attempt_token is None and expected_state is None:
+            current = self.get(job_id)
+            if (current is not None and current["state"] == RUNNING
+                    and current.get("lease_owner")):
+                raise JobError(
+                    "attempt_fence_required",
+                    "a leased running attempt may only be completed by its exact owner")
         predicates = ["id = ?"]
         values: list[Any] = [job_id]
         if attempt_token is not None:
-            predicates += ["state = ?", "attempt_token = ?"]
-            values += [RUNNING, attempt_token]
+            if not owner_id:
+                raise JobError("no_attempt_owner",
+                               "a fenced attempt completion requires its lease owner")
+            predicates += ["state = ?", "attempt_token = ?", "lease_owner = ?"]
+            values += [RUNNING, attempt_token, owner_id]
+        elif expected_state is not None:
+            predicates.append("state = ?")
+            values.append(expected_state)
+        if require_stop_requested:
+            predicates.append("stop_requested = 1")
         clause, params = self._where(*predicates)
         assignments = ", ".join(f"{name} = ?" for name in columns)
         with self.store.transaction():
@@ -897,24 +1090,35 @@ class JobRegister:
                 slot_params: list[Any] = [self.project_id, self.environment,
                                           self.surface, job_id]
                 if attempt_token is not None:
-                    slot_sql += " AND attempt_token = ?"
-                    slot_params.append(attempt_token)
-                self.store._execute(slot_sql, slot_params)
+                    slot_sql += " AND attempt_token = ? AND owner_id = ?"
+                    slot_params += [attempt_token, owner_id]
+                slot = self.store._execute(slot_sql, slot_params)
+                if attempt_token is not None and slot.rowcount != 1:
+                    raise JobError("slot_mismatch", f"job {job_id} lost its owned slot")
+                if attempt_token is not None:
+                    self.store._execute(
+                        "UPDATE tg_worker_job_amendments SET state = ?, claim_token = NULL, "
+                        "claimed_at = NULL WHERE project_id = ? AND environment = ? "
+                        "AND surface = ? AND job_id = ? AND state = ? AND claim_token = ?",
+                        ("pending", self.project_id, self.environment, self.surface,
+                         job_id, "claimed", attempt_token))
         return self.get(job_id) if cur.rowcount else None
 
-    def mark_delivery(self, job_id: str, *, delivered: bool,
-                      error: str | None = None) -> dict[str, Any] | None:
+    def finish_delivery(self, job_id: str, delivery_token: str, owner_id: str,
+                        *, delivered: bool,
+                        error: str | None = None) -> dict[str, Any] | None:
         now = iso()
-        clause, params = self._where("id = ?", "delivery_state = ?")
+        clause, params = self._where(
+            "id = ?", "delivery_state = ?", "delivery_token = ?", "delivery_owner = ?")
         with self.store.transaction():
             cur = self.store._execute(
-                "UPDATE tg_worker_jobs SET delivery_state = ?, "
-                "delivery_attempts = delivery_attempts + 1, delivery_error = ?, "
-                "delivered_at = ?, updated_at = ?" + clause,
+                "UPDATE tg_worker_jobs SET delivery_state = ?, delivery_error = ?, "
+                "delivered_at = ?, delivery_owner = NULL, delivery_token = NULL, "
+                "delivery_lease_expires_at = NULL, updated_at = ?" + clause,
                 tuple(["delivered" if delivered else "pending",
                        None if delivered else str(error or "delivery failed")[:500],
                        now if delivered else None, now]
-                      + params + [job_id, "pending"]))
+                      + params + [job_id, "delivering", delivery_token, owner_id]))
         return self.get(job_id) if cur.rowcount else None
 
     def resume(self, job_id: str, *, actor_id: str | None = None) -> dict[str, Any] | None:
@@ -942,7 +1146,8 @@ class JobRegister:
             attempt_token=None, lease_owner=None, lease_expires_at=None,
             resume_at=None, result_text=None, result_silent=0,
             delivery_state=None, delivery_attempts=0, delivery_error=None,
-            delivered_at=None)
+            delivered_at=None, delivery_owner=None, delivery_token=None,
+            delivery_lease_expires_at=None)
 
     def _actor_update(self, job_id: str, actor_id: str | None,
                       **columns: Any) -> dict[str, Any] | None:
@@ -961,11 +1166,10 @@ class JobRegister:
         return self.get(job_id, actor_id=actor_id) if cur.rowcount else None
 
     def interrupt_active(self, reason: str) -> list[dict[str, Any]]:
-        """On daemon start, a row that claims to be running names a process that
-        is not. Recording that is what keeps the register honest across a box
-        restart; whether the work is then continued is the recovery policy's
-        call, not this method's."""
-        rows = self.active()
+        """Compatibility helper which fences only attempts already expired."""
+        rows = self.expired_active()
+        interrupted = []
         for row in rows:
-            self.stop(row["id"], INTERRUPTED, error=reason)
-        return rows
+            if self.fence_expired_attempt(row, reason) is not None:
+                interrupted.append(row)
+        return interrupted

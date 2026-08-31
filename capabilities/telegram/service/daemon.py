@@ -3576,9 +3576,11 @@ def build_prompt(tail, state=None):
         jobs_block = (
             "--- Registered jobs ---\n"
             "People speak naturally; never require them to say job, queue, async, "
-            "or an id. At the start of every turn, read what is already in flight "
-            "or resumable with "
-            f"`{jobs_command} list --limit 20`, then decide in this order:\n"
+            "or an id. At the start of every turn, always read every in-flight job "
+            f"with `{jobs_command} active`. Then read only recent resumable history "
+            f"with `{jobs_command} list --state stopped --limit 5`. Keep these as "
+            "separate queries: a long-running job must never disappear behind newer "
+            "completed rows. Then decide in this order:\n"
             "1. If this is a status question about existing work, report only what "
             "the ledger and conversation establish. Do not start another task.\n"
             "2. If it corrects, narrows, supplies material for, or adds a constraint "
@@ -5018,14 +5020,21 @@ async def run_session(client):
         cancel_event.set()
         kill_worker_proc(proc_key, reason)
         if future is None:
-            return
+            return False
         try:
             await asyncio.wait_for(asyncio.shield(future), timeout=5)
         except asyncio.TimeoutError:
             kill_worker_proc(proc_key, f"{reason}; worker future did not settle")
             log(f"{proc_key}: worker future did not settle within 5s ({reason})")
+            try:
+                await asyncio.wait_for(asyncio.shield(future), timeout=1)
+            except asyncio.TimeoutError:
+                return False
+            except (Exception, asyncio.CancelledError):
+                pass
         except (Exception, asyncio.CancelledError):
             pass
+        return True
 
     async def run_one_job(key, ent_id, job):
         s = channel_settings(reg, key)
@@ -5457,24 +5466,40 @@ async def run_session(client):
 
     async def honour_asks(register):
         for row in register.stop_pending():
-            if row["state"] == jobs.RUNNING:
+            message = f"Stopped: «{row['description']}». It keeps its place and can be continued."
+            if row["state"] == jobs.WAITING:
+                stopped = register.cancel_waiting(
+                    row["id"], error="stopped by request", result_text=message)
+            elif row.get("lease_owner") == JOB_OWNER_ID:
                 stopping_jobs.add(row["id"])
-                await stop_job_process(row, "stopped by request")
-                stopping_jobs.discard(row["id"])
-            register.stop(
-                row["id"], jobs.CANCELLED, error="stopped by request",
-                result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
-            log(f"{row['channel_key']}: stopped job {row['id']}; it keeps its "
-                f"session and `jobs resume` continues it")
+                try:
+                    process_stopped = await stop_job_process(row, "stopped by request")
+                    stopped = (register.stop(
+                        row["id"], jobs.CANCELLED, error="stopped by request",
+                        attempt_token=row["attempt_token"], owner_id=JOB_OWNER_ID,
+                        result_text=message) if process_stopped else None)
+                finally:
+                    stopping_jobs.discard(row["id"])
+            else:
+                stopped = None
+            if stopped is not None:
+                log(f"{row['channel_key']}: stopped job {row['id']}; it keeps its "
+                    f"session and `jobs resume` continues it")
         for row in register.amend_pending():
+            if row.get("lease_owner") != JOB_OWNER_ID:
+                continue
             amending.add(row["id"])
             try:
-                await stop_job_process(row, "amended")
-                register.amend(row["id"])
+                process_stopped = await stop_job_process(row, "amended")
+                amended = (register.finish_amendment(
+                    row["id"], row["attempt_token"], JOB_OWNER_ID)
+                    if process_stopped else None)
             finally:
                 amending.discard(row["id"])
-            log(f"{row['channel_key']}: amended job {row['id']}; continuing "
-                f"session {row.get('session_id') or '(not yet opened)'}")
+            if amended is not None:
+                log(f"{row['channel_key']}: amended job {row['id']}; "
+                    f"{'continuing' if amended['state'] == jobs.WAITING else 'kept stopped'} "
+                    f"session {row.get('session_id') or '(not yet opened)'}")
 
     async def reconcile_expired_attempts(register, reason="worker lease expired"):
         """Fence dead owners without touching a healthy overlapping daemon."""
@@ -5482,15 +5507,17 @@ async def run_session(client):
         for row in register.expired_active():
             local_owner = row.get("owner_host") == JOB_OWNER_HOST
             pgid = row.get("pgid") or row.get("pid")
-            if local_owner and pgid:
+
+            def stop_local_group():
+                if not (local_owner and pgid):
+                    return
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(int(pgid), signal.SIGTERM)
-                await asyncio.sleep(0)
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(int(pgid), signal.SIGKILL)
-            stopped = register.stop(
-                row["id"], jobs.INTERRUPTED,
-                attempt_token=row.get("attempt_token"), error=reason)
+
+            stopped = register.fence_expired_attempt(
+                row, reason, before_release=stop_local_group)
             if stopped is None:
                 continue
             interrupted.append(row)
@@ -5508,8 +5535,8 @@ async def run_session(client):
         cancel_event = job_cancels.get(job_id)
         if proc_key is None or cancel_event is None:
             return False
-        await terminate_worker(proc_key, job_futures.get(job_id), cancel_event, reason)
-        return True
+        return await terminate_worker(
+            proc_key, job_futures.get(job_id), cancel_event, reason)
 
     async def report_job(row, text, mark=None):
         key = row["channel_key"]
@@ -5532,17 +5559,23 @@ async def run_session(client):
 
     async def deliver_job_results(register):
         """Drain execution results independently from execution itself."""
-        for row in register.pending_deliveries(limit=20):
+        for row in register.claim_deliveries(
+                JOB_OWNER_ID, limit=20,
+                lease_seconds=max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3)):
+            delivery_token = row["delivery_token"]
             try:
                 sent = await report_job(row, row.get("result_text") or "")
                 if sent is None:
-                    register.mark_delivery(
-                        row["id"], delivered=False, error="channel is unreachable")
+                    register.finish_delivery(
+                        row["id"], delivery_token, JOB_OWNER_ID,
+                        delivered=False, error="channel is unreachable")
                 else:
-                    register.mark_delivery(row["id"], delivered=True)
+                    register.finish_delivery(
+                        row["id"], delivery_token, JOB_OWNER_ID, delivered=True)
             except Exception as exc:
-                register.mark_delivery(
-                    row["id"], delivered=False, error=_short_error(exc, limit=480))
+                register.finish_delivery(
+                    row["id"], delivery_token, JOB_OWNER_ID, delivered=False,
+                    error=_short_error(exc, limit=480))
                 log(f"{row['channel_key']}: job {row['id']} result delivery failed; retrying")
 
     async def run_job_row(row):
@@ -5577,7 +5610,8 @@ async def run_session(client):
         attempt_token = row.get("attempt_token")
         if not attempt_token:
             raise RuntimeError(f"job {job_id} has no attempt ownership token")
-        amendment_rows = register.claim_amendments(job_id, attempt_token)
+        amendment_rows = register.claim_amendments(
+            job_id, attempt_token, JOB_OWNER_ID)
         amendments = [item["text"] for item in amendment_rows]
         # The session is the checkpoint for every continuation, not only for an
         # amendment.  A manual resume and startup recovery must pick up the same
@@ -5653,7 +5687,7 @@ async def run_session(client):
 
             async def persist_process(pid, pgid):
                 return register.attach_process(
-                    job_id, attempt_token, pid=pid, pgid=pgid)
+                    job_id, attempt_token, JOB_OWNER_ID, pid=pid, pgid=pgid)
 
             def remember_worker_process(pid, pgid):
                 accepted = asyncio.run_coroutine_threadsafe(
@@ -5679,9 +5713,11 @@ async def run_session(client):
                     if (current is None or current["state"] != jobs.RUNNING
                             or current.get("attempt_token") != attempt_token):
                         return
-                    register.update_attempt(job_id, attempt_token, session_id=thread_id)
+                    register.update_attempt(
+                        job_id, attempt_token, JOB_OWNER_ID, session_id=thread_id)
                     if amendment_rows and not amendments_acked["value"]:
-                        register.ack_amendments(job_id, attempt_token)
+                        register.ack_amendments(
+                            job_id, attempt_token, JOB_OWNER_ID)
                         amendments_acked["value"] = True
                     log(f"{key}: job {job_id} opened session {thread_id}")
 
@@ -5725,23 +5761,24 @@ async def run_session(client):
             result = await future
             reply, meta = result["reply"], result["meta"]
             if amendment_rows and not amendments_acked["value"]:
-                register.ack_amendments(job_id, attempt_token)
+                register.ack_amendments(job_id, attempt_token, JOB_OWNER_ID)
                 amendments_acked["value"] = True
             current_after_run = register.get(job_id)
             if current_after_run is not None and current_after_run.get("stop_requested"):
                 register.stop(
                     job_id, jobs.CANCELLED, attempt_token=attempt_token,
+                    owner_id=JOB_OWNER_ID,
                     error="stopped by request",
                     result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
                 return
             if register.has_pending_amendment(job_id):
-                register.amend(job_id)
+                register.finish_amendment(job_id, attempt_token, JOB_OWNER_ID)
                 log(f"{key}: job {job_id} finished while a newer amendment arrived; continuing")
                 return
             finished = register.stop(
                 job_id, jobs.SUCCEEDED, exit_code=0,
                 session_id=meta.get("session_id"), model=meta.get("model"),
-                attempt_token=attempt_token, result_text=reply,
+                attempt_token=attempt_token, owner_id=JOB_OWNER_ID, result_text=reply,
                 result_silent=bool(result.get("silent") or not reply))
             if finished is None:
                 log(f"{key}: stale completion ignored for job {job_id}")
@@ -5751,16 +5788,19 @@ async def run_session(client):
                 f"{meta.get('model') or '?'} · in={tok.get('input')} "
                 f"out={tok.get('output')}")
         except asyncio.CancelledError:
-            await terminate_worker(proc_key, future, cancel_event, "job task cancelled")
-            register.stop(job_id, jobs.INTERRUPTED, attempt_token=attempt_token,
-                          error="job task cancelled before completion")
+            process_stopped = await terminate_worker(
+                proc_key, future, cancel_event, "job task cancelled")
+            if process_stopped:
+                register.stop(job_id, jobs.INTERRUPTED, attempt_token=attempt_token,
+                              owner_id=JOB_OWNER_ID,
+                              error="job task cancelled before completion")
             # A session shutdown is an interruption of the runner, not a
             # request to stop this job.  Put it back where the next daemon can
             # claim it, preserving the rollout checkpoint written above.  An
             # explicit `jobs stop` takes the exception path instead and remains
             # stopped until somebody resumes it.
             current = register.get(job_id) or row
-            if (closing and JOB_RECOVERY == "requeue"
+            if (process_stopped and closing and JOB_RECOVERY == "requeue"
                     and safe_job_recovery(current)):
                 register.resume(job_id)
                 log(f"{key}: job {job_id} interrupted by session close; requeued")
@@ -5780,16 +5820,17 @@ async def run_session(client):
                 # process was being stopped. That is the amendment working, not
                 # a failure, and the runner will pick it up again.
                 if current is not None and current["state"] == jobs.RUNNING:
-                    register.amend(job_id)
+                    register.finish_amendment(job_id, attempt_token, JOB_OWNER_ID)
                 log(f"{key}: job {job_id} stopped for an amendment")
             elif is_quota_exhausted(reason):
                 resume_at = enter_quota_pause(reason)
                 register.stop(job_id, jobs.QUOTA, error=reason,
-                              attempt_token=attempt_token, resume_at=resume_at,
+                              attempt_token=attempt_token, owner_id=JOB_OWNER_ID,
+                              resume_at=resume_at,
                               result_text=quota_pause_notice() or reason)
             elif closing:
                 register.stop(job_id, jobs.INTERRUPTED, error=reason,
-                              attempt_token=attempt_token)
+                              attempt_token=attempt_token, owner_id=JOB_OWNER_ID)
                 current = register.get(job_id) or row
                 if JOB_RECOVERY == "requeue" and safe_job_recovery(current):
                     register.resume(job_id)
@@ -5801,7 +5842,8 @@ async def run_session(client):
                                 else f"«{row['description']}» could not be completed. "
                                      "Please tell an administrator.")
                 register.stop(job_id, jobs.FAILED, error=reason,
-                              attempt_token=attempt_token, result_text=failure_text)
+                              attempt_token=attempt_token, owner_id=JOB_OWNER_ID,
+                              result_text=failure_text)
                 log(f"{key}: job {job_id} failed: {reason}")
         finally:
             if progress_stop is not None:
@@ -5814,7 +5856,6 @@ async def run_session(client):
                 with contextlib.suppress(OSError):
                     Path(authority_context).unlink()
             release_worker_proc(proc_key)
-            register.release_claim(job_id, attempt_token)
             job_procs.pop(job_id, None)
             job_cancels.pop(job_id, None)
             job_futures.pop(job_id, None)
@@ -5829,6 +5870,11 @@ async def run_session(client):
         while not closing:
             try:
                 register = job_register()
+                for active_row in register.active():
+                    if active_row.get("lease_owner") == JOB_OWNER_ID:
+                        register.renew(active_row["id"], active_row["attempt_token"],
+                                       JOB_OWNER_ID,
+                                       max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
                 await reconcile_expired_attempts(register)
                 await honour_asks(register)
                 durable_quota = register.quota_until()
@@ -5841,11 +5887,6 @@ async def run_session(client):
                             "A worker exhausted its quota.")
                 leave_quota_pause()
                 await deliver_job_results(register)
-                for active_row in register.active():
-                    if active_row.get("lease_owner") == JOB_OWNER_ID:
-                        register.renew(active_row["id"], active_row["attempt_token"],
-                                       JOB_OWNER_ID,
-                                       max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
                 while (quota["until"] is None
                        and len(job_tasks) < MAX_PARALLEL_JOBS):
                     claimed = register.claim_next(
