@@ -298,35 +298,32 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                     finally:
                         store.close()
                     return successful_result("noted, folding that in")
-                runs.append(state["current_request"]["text"])
+                runs.append({"text": state["current_request"]["text"],
+                             "resume": state.get("resume_session")})
                 if len(runs) == 1:
+                    state["on_worker_line"](json.dumps({
+                        "type": "thread.started", "thread_id": "thread-1"}))
                     loop.call_soon_threadsafe(running.set)
                     state["cancel_event"].wait(timeout=8)
                     raise RuntimeError("worker process group killed")
                 return successful_result("the ledger is reconciled")
 
             daemon.WORKERS["stub"] = worker
-            result = {"session": "thread-1"}
-            original_start = register.start
-
-            def start(job_id, **kwargs):
-                kwargs.setdefault("session_id", result["session"])
-                return original_start(job_id, **kwargs)
-
-            with mock.patch.object(register, "start", start):
-                client = FakeClient([])
-                task = asyncio.create_task(daemon.run_session(client))
-                await client.started.wait()
-                await asyncio.wait_for(running.wait(), timeout=6)
-                message = Message(70, text="Assistant, not that account")
-                client.messages.append(message)
-                await client.handler(Event(message))
-                await wait_until(lambda: len(runs) == 2, timeout=8)
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await asyncio.wait_for(running.wait(), timeout=6)
+            self.assertEqual(register.get(row["id"])["session_id"], "thread-1")
+            message = Message(70, text="Assistant, not that account")
+            client.messages.append(message)
+            await client.handler(Event(message))
+            await wait_until(lambda: len(runs) == 2, timeout=8)
 
             self.assertEqual(len(register.list()), 1, "an amendment is not a new row")
             after = register.get(row["id"])
             self.assertEqual(after["amendments"], 1)
-            self.assertIn("not that account, the other one", runs[1])
+            self.assertIn("not that account, the other one", runs[1]["text"])
+            self.assertEqual(runs[1]["resume"], "thread-1")
             self.assertEqual(after["session_id"], "thread-1")
             self.assertEqual(after["outcome"], daemon.jobs.SUCCEEDED)
             await self.stop_session(client, task)
@@ -384,34 +381,32 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             loop = asyncio.get_running_loop()
 
             def worker(chat, tail, state=None, procs=None):
-                runs.append(state["current_request"]["text"])
+                runs.append({"text": state["current_request"]["text"],
+                             "resume": state.get("resume_session")})
                 if len(runs) == 1:
+                    state["on_worker_line"](json.dumps({
+                        "type": "thread.started", "thread_id": "thread-1"}))
                     loop.call_soon_threadsafe(running.set)
                     state["cancel_event"].wait(timeout=8)
                     raise RuntimeError("worker process group killed")
                 return successful_result("done")
 
-            original_start = register.start
-
-            def start(job_id, **kwargs):
-                kwargs.setdefault("session_id", "thread-1")
-                return original_start(job_id, **kwargs)
-
             daemon.WORKERS["stub"] = worker
-            with mock.patch.object(register, "start", start):
-                client = FakeClient([])
-                task = asyncio.create_task(daemon.run_session(client))
-                await client.started.wait()
-                await asyncio.wait_for(running.wait(), timeout=6)
-                register.request_stop(row["id"])
-                await wait_until(
-                    lambda: register.get(row["id"])["outcome"] == daemon.jobs.CANCELLED,
-                    timeout=8)
-                paused = register.get(row["id"])
-                self.assertEqual(paused["session_id"], "thread-1")
-                self.assertEqual(len(runs), 1, "a paused job is not retried")
-                register.resume(row["id"])
-                await wait_until(lambda: len(runs) == 2, timeout=8)
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await asyncio.wait_for(running.wait(), timeout=6)
+            self.assertEqual(register.get(row["id"])["session_id"], "thread-1")
+            register.request_stop(row["id"])
+            await wait_until(
+                lambda: register.get(row["id"])["outcome"] == daemon.jobs.CANCELLED,
+                timeout=8)
+            paused = register.get(row["id"])
+            self.assertEqual(paused["session_id"], "thread-1")
+            self.assertEqual(len(runs), 1, "a paused job is not retried")
+            register.resume(row["id"])
+            await wait_until(lambda: len(runs) == 2, timeout=8)
+            self.assertEqual(runs[1]["resume"], "thread-1")
             self.assertEqual(register.get(row["id"])["outcome"],
                              daemon.jobs.SUCCEEDED)
             self.assertEqual(len(register.list()), 1,

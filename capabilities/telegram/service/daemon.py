@@ -5458,7 +5458,10 @@ async def run_session(client):
         register = job_register()
         sender = job_sender(row, group_policy)
         amendments = register.take_amendment(job_id)
-        resume_session = row.get("session_id") if amendments else None
+        # The session is the checkpoint for every continuation, not only for an
+        # amendment.  A manual resume and startup recovery must pick up the same
+        # rollout too.
+        resume_session = row.get("session_id")
         origin_id = None
         if row.get("origin_message_id"):
             with contextlib.suppress(TypeError, ValueError):
@@ -5523,6 +5526,31 @@ async def run_session(client):
             ])
             if authority is not None:
                 authority_context = write_authority_context(authority, f"job-{job_id}")
+            loop = asyncio.get_running_loop()
+            opened_session = {"id": row.get("session_id")}
+
+            def remember_worker_session(line):
+                """Persist a Codex rollout as soon as it opens.
+
+                The output pump runs in the executor thread while the store
+                connection belongs to this event loop.  Schedule the write back
+                onto the loop so an amendment, stop, or daemon restart seconds
+                later already has the checkpoint it must continue.
+                """
+                thread_id = codex_thread_started(line)
+                if not thread_id or thread_id == opened_session["id"]:
+                    return
+                opened_session["id"] = thread_id
+
+                def persist():
+                    current = register.get(job_id)
+                    if current is None or current["state"] != jobs.RUNNING:
+                        return
+                    register.update(job_id, session_id=thread_id)
+                    log(f"{key}: job {job_id} opened session {thread_id}")
+
+                loop.call_soon_threadsafe(persist)
+
             state = {"now": now_display(), "chat_id": chat_id,
                      "channel_key": key, "connection": CONNECTION,
                      "chat_type": "private" if is_direct else "group",
@@ -5541,6 +5569,7 @@ async def run_session(client):
                      "authority_context": authority_context,
                      "progress_outbox": str(progress_outbox),
                      "worker_session": worker_session,
+                     "on_worker_line": remember_worker_session,
                      "cancel_event": cancel_event,
                      "resume_session": resume_session,
                      "project_dir": project_dir,
@@ -5549,7 +5578,6 @@ async def run_session(client):
             log(f"{key}: dispatch job {job_id} worker={s['worker']} "
                 f"model={s['model'] or 'default'} attempt={row['attempt']}"
                 f"{' resumed' if resume_session else ''}{routed}")
-            loop = asyncio.get_running_loop()
             progress_stop = asyncio.Event()
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
