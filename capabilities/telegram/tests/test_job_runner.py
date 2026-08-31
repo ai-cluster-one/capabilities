@@ -170,6 +170,10 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await wait_until(lambda: "prompt" in seen, timeout=6)
             self.assertIn("Registered jobs", seen["prompt"])
             self.assertIn("jobs active", seen["prompt"])
+            self.assertIn("At the start of every turn", seen["prompt"])
+            self.assertIn("multi-step research", seen["prompt"])
+            self.assertIn("With one active job", seen["prompt"])
+            self.assertIn("With several active jobs", seen["prompt"])
             self.assertNotIn(row["id"], seen["prompt"],
                              "the list is asked for, not handed over")
             self.assertNotIn("open_jobs", seen["state"])

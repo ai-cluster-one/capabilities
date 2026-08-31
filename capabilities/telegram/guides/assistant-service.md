@@ -243,7 +243,15 @@ Inside a worker turn the same commands run through the shim, which pins `--chat`
 
 ### What the worker is told, and what it asks for
 
-The prompt names the surface; it does not carry a snapshot of it. The queue moves while a turn is being written, so a list pasted in at dispatch is already stale when it is read — the worker runs `telegram jobs active` at the moment it needs to know. Attribution is still a judgement made in the prompt rather than a mechanism, and a wrong one degrades to a redundant new job.
+The prompt names the surface; it does not carry a snapshot of it. The queue moves while a turn is being written, so a list pasted in at dispatch is already stale when it is read — the worker runs `telegram jobs active` at the start of every dialogue turn.
+
+People never have to name the mechanism. The dialogue worker applies this order to ordinary language:
+
+1. A question about ongoing work reads and reports its existing state; it does not create work.
+2. A correction, new constraint, or additional material for ongoing work amends that row; it is not executed inside the dialogue turn.
+3. A genuinely new request is registered before substantive work when it requires multi-step research, several sources or actions, implementation, waiting or monitoring, or otherwise likely exceeds roughly fifteen seconds. The dialogue turn then acknowledges it and ends. A final answer that is genuinely available now stays a dialogue answer.
+
+Reference resolution remains prompt judgement because conversation meaning cannot be reduced to a channel lock. An explicit id or reply target wins. With one active job, an elliptical status question or continuation binds to it unless it is clearly standalone. With several, the worker uses a unique semantic match and asks a short clarification when none exists; it does not guess or create a duplicate. A separate requested outcome is a new job.
 
 ### Amendment keeps the row
 
