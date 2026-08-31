@@ -211,6 +211,8 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await client.handler(Event(message))
             await wait_until(lambda: "env" in seen, timeout=6)
             self.assertEqual(seen["env"]["TELEGRAM_AUTHORIZED_CHAT_ID"], "123")
+            self.assertEqual(seen["env"]["TELEGRAM_AUTHORIZED_REQUESTER_ID"], "777")
+            self.assertEqual(seen["env"]["TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID"], "62")
             self.assertNotIn("TELEGRAM_JOB_OUTBOX", seen["env"])
             await self.stop_session(client, task)
 

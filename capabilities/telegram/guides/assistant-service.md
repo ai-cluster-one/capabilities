@@ -239,7 +239,7 @@ telegram jobs resume <id>
 
 Both are asynchronous. `stop`, and the staged text behind `amend`, record what was asked; the runner holds the process groups and acts on the next tick. A read reports an unlanded ask as `stopping: true`, because a flag and a state are two halves of one sentence.
 
-Inside a worker turn the same commands run through the shim, which pins `--chat` and `--topic-id` to the authorized channel and refuses any attempt to name another. There is no daemon round-trip and no separate grammar.
+Inside a worker turn the same commands run through the shim, which pins `--chat` and `--topic-id` to the authorized channel and refuses any attempt to name another. For `register`, it also supplies `--requested-by` and `--origin-message-id` from the daemon-authenticated current request; the model neither repeats nor chooses identity. There is no daemon round-trip and no separate grammar.
 
 ### What the worker is told, and what it asks for
 

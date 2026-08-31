@@ -566,6 +566,8 @@ class OutboundActionsTests(unittest.TestCase):
             "TELEGRAM_AUTHORIZED_CHAT_ID": "-1001",
             "TELEGRAM_AUTHORIZED_TOPIC_ID": "77",
             "TELEGRAM_AUTHORIZED_CONNECTION": "8200881535",
+            "TELEGRAM_AUTHORIZED_REQUESTER_ID": "777",
+            "TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID": "88",
         }
 
     def test_worker_jobs_are_pinned_to_the_authorized_channel(self):
@@ -577,11 +579,19 @@ class OutboundActionsTests(unittest.TestCase):
             outbox = Path(td) / "progress.jsonl"
             with mock.patch.dict(os.environ, self._worker_env(outbox), clear=False):
                 shim.enforce_job_scope(["telegram", "jobs", "active"])
-                self.assertEqual(shim.job_scope_arguments(),
+                self.assertEqual(shim.job_scope_arguments(
+                                     ["telegram", "jobs", "active"]),
                                  ["--chat", "-1001", "--topic-id", "77"])
+                self.assertEqual(shim.job_scope_arguments(
+                                     ["telegram", "jobs", "register", "work"]),
+                                 ["--chat", "-1001", "--topic-id", "77",
+                                  "--requested-by", "777",
+                                  "--origin-message-id", "88"])
                 for denied in (["telegram", "jobs", "active", "--chat", "-9999"],
                                ["telegram", "jobs", "list", "--all-channels"],
-                               ["telegram", "jobs", "list", "--chat=-9999"]):
+                               ["telegram", "jobs", "list", "--chat=-9999"],
+                               ["telegram", "jobs", "register", "work",
+                                "--requested-by", "999"]):
                     with self.assertRaises(SystemExit) as stopped:
                         shim.enforce_job_scope(denied)
                     self.assertEqual(stopped.exception.code, 4)
@@ -594,6 +604,21 @@ class OutboundActionsTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as stopped:
                 shim.enforce_job_scope(["telegram", "jobs", "active"])
         self.assertEqual(stopped.exception.code, 4)
+
+    def test_worker_job_registration_gets_authenticated_attribution(self):
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as td:
+            outbox = Path(td) / "progress.jsonl"
+            env = self._worker_env(outbox)
+            env["TELEGRAM_REAL_TELEGRAM"] = "/usr/bin/true"
+            calls = self._run_shim(
+                shim, env, ["telegram", "jobs", "register", "collect evidence"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], [
+            "/usr/bin/true", "jobs", "register", "collect evidence",
+            "--chat", "-1001", "--topic-id", "77",
+            "--requested-by", "777", "--origin-message-id", "88",
+        ])
 
     def test_worker_send_rejects_unknown_flag_after_text_before_outbox(self):
         shim = import_worker_shim()

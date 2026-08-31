@@ -3568,6 +3568,8 @@ def build_prompt(tail, state=None):
             "needs multi-step research, several sources or actions, implementation, "
             "waiting or monitoring, or is otherwise likely to take more than about "
             f"15 seconds: `{jobs_command} register \"<one-line outcome>\"`. Then only "
+            "Use that command exactly as shown; the worker wrapper supplies the "
+            "authorized chat, requester, and origin message. "
             "say that the work is underway; do not promise a duration. Answer directly "
             "only when the useful final answer is genuinely available now.\n"
             "Resolve references naturally. An explicit id or reply target wins. With "
@@ -3722,6 +3724,10 @@ def worker_env(state=None):
     if st.get("connection") is not None:
         env["TELEGRAM_AUTHORIZED_CONNECTION"] = str(st["connection"])
     req = st.get("current_request") or {}
+    if req.get("sender_id") is not None:
+        env["TELEGRAM_AUTHORIZED_REQUESTER_ID"] = str(req["sender_id"])
+    if req.get("message_id") is not None:
+        env["TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID"] = str(req["message_id"])
     if req.get("reply_to"):
         env["TELEGRAM_PROGRESS_REPLY_TO"] = str(req["reply_to"])
     return env
