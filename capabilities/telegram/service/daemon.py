@@ -3575,10 +3575,13 @@ def build_prompt(tail, state=None):
             "Resolve references naturally. An explicit id or reply target wins. With "
             "one active job, elliptical follow-ups such as 'how is it going?', 'and "
             "also include...', or 'no, use the other one' refer to it unless they are "
-            "clearly standalone. With several active jobs, use the unique semantic "
-            "match; recency and bare words such as 'it', 'there', or 'also' are never "
-            "a match. Without a reply, id, or subject that names exactly one active "
-            "job, ask which work the person means and make no ledger change instead "
+            "clearly standalone. With several active jobs, use a unique semantic "
+            "match or an immediately preceding exchange that explicitly concerned "
+            "one of them; database recency by itself never selects a job. If the "
+            "preceding exchange named several jobs, bare words such as 'it', 'there', "
+            "or 'also' are ambiguous. Without a reply, id, subject, or conversational "
+            "antecedent that names exactly one active job, ask which work the person "
+            "means and make no ledger change instead "
             "of guessing or creating a duplicate. A separate requested outcome is a new "
             f"job. Amend with `{jobs_command} amend <id> \"<what changed>\"`.\n\n")
     if st.get("quota_pause"):
