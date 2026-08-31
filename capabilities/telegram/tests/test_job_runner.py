@@ -414,6 +414,47 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     # -- cancellation ---------------------------------------------------------
 
+    async def test_stop_between_claim_and_popen_lands_cancelled(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            row = register.register(channel_key="123", requested_by="777",
+                                    description="do not start", engine="stub")
+            before_popen = asyncio.Event()
+            release = asyncio.Event()
+            worker_calls = []
+
+            def worker(*_args, **_kwargs):
+                worker_calls.append(True)
+                return successful_result("should not run")
+
+            daemon.WORKERS["stub"] = worker
+            client = FakeClient([])
+            original_get_input_entity = client.get_input_entity
+
+            async def delayed_get_input_entity(chat_id):
+                current = register.get(row["id"])
+                if (current is not None and current["state"] == daemon.jobs.RUNNING
+                        and not release.is_set()):
+                    before_popen.set()
+                    await release.wait()
+                return await original_get_input_entity(chat_id)
+
+            client.get_input_entity = delayed_get_input_entity
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await asyncio.wait_for(before_popen.wait(), timeout=6)
+            register.request_stop(row["id"])
+            release.set()
+            await wait_until(
+                lambda: register.get(row["id"])["outcome"] == daemon.jobs.CANCELLED,
+                timeout=6)
+            after = register.get(row["id"])
+            self.assertEqual(after["state"], daemon.jobs.STOPPED)
+            self.assertEqual(worker_calls, [], "no worker/Popen starts after the stop")
+            await self.stop_session(client, task)
+
     async def test_a_waiting_job_is_stopped_on_request(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)

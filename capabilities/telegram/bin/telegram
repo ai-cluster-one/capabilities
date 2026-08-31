@@ -4463,6 +4463,8 @@ def cmd_jobs_amend(job_id: str, text: str, chat: str | None,
                     job_id, actor_id=actor_id),
                 "instruction": ("Say the correction is folded into the job that "
                                 "already exists. Do not register a new one.")}
+    except module.JobError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
     finally:
         register.store.close()
 
@@ -4493,6 +4495,8 @@ def cmd_jobs_resume(job_id: str, chat: str | None, topic_id: str | None,
     try:
         _require_job(register, module, job_id, chat, topic_id, actor_id)
         return _job_row(register.resume(job_id, actor_id=actor_id))
+    except module.JobError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
     finally:
         register.store.close()
 

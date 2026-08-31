@@ -240,7 +240,7 @@ telegram jobs stop <id>
 telegram jobs resume <id>
 ```
 
-**One way to halt work and one way to continue it.** There is no second pair for the stop that is meant to be final, because every stop is continuable: what a caller decides is not whether the work can come back — it always can — but whether anybody asks it to. `stop` and `resume` are asks about a direction rather than transitions, so both are idempotent and neither refuses a state: resuming work that is already moving withdraws a stop nobody wants any more.
+**One way to halt work and one way to continue it.** There is no second pair for the stop that is meant to be final, because every stop is continuable: what a caller decides is not whether the work can come back — it always can — but whether anybody asks it to. `stop` and `resume` are asks about a direction rather than transitions, so both are idempotent; resuming work that is already moving withdraws a stop nobody wants any more. The one temporary refusal is a stopped result still `pending` or `delivering`: resume and amend wait until that durable payload has been delivered instead of erasing it to start another attempt.
 
 Both are asynchronous. `stop`, and the staged text behind `amend`, record what was asked; the runner holds the process groups and acts on the next tick. A read reports an unlanded ask as `stopping: true`, because a flag and a state are two halves of one sentence.
 

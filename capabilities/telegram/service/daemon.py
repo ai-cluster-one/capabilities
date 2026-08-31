@@ -5755,6 +5755,15 @@ async def run_session(client):
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
                               delivery_reply_id, progress_stop))
+            current_before_start = register.get(job_id)
+            if (current_before_start is not None
+                    and current_before_start.get("stop_requested")):
+                register.stop(
+                    job_id, jobs.CANCELLED, attempt_token=attempt_token,
+                    owner_id=JOB_OWNER_ID, require_stop_requested=True,
+                    error="stopped by request",
+                    result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
+                return
             future = loop.run_in_executor(
                 None, WORKERS[s["worker"]], key, tail, state, procs)
             job_futures[job_id] = future
@@ -5806,12 +5815,18 @@ async def run_session(client):
                 log(f"{key}: job {job_id} interrupted by session close; requeued")
             raise
         except Exception as exc:
-            await terminate_worker(proc_key, future, cancel_event, "job failed")
+            process_stopped = await terminate_worker(
+                proc_key, future, cancel_event, "job failed")
             current = register.get(job_id)
             reason = _short_error(exc, limit=480)
             if job_id in stopping_jobs or (
                     current is not None and current["stop_requested"]):
-                # The runner records the stop itself, once the process is gone.
+                if future is None or process_stopped:
+                    register.stop(
+                        job_id, jobs.CANCELLED, attempt_token=attempt_token,
+                        owner_id=JOB_OWNER_ID, require_stop_requested=True,
+                        error="stopped by request",
+                        result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
                 log(f"{key}: job {job_id} stopped; `jobs resume` continues it")
             elif job_id in amending or (current is not None
                                         and current["state"] == jobs.WAITING) \

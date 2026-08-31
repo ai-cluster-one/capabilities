@@ -802,8 +802,10 @@ class JobRegister:
                         *, actor_id: str | None = None) -> str | None:
         """Append one user correction atomically and count exactly that row."""
         text = str(text or "").strip()
-        if not text or self.get(job_id, actor_id=actor_id) is None:
+        current = self.get(job_id, actor_id=actor_id)
+        if not text or current is None:
             return None
+        self._refuse_while_delivering(current, "amend")
         amendment_id, now = str(uuid4()), iso()
         predicates = ["id = ?"]
         values: list[Any] = [job_id]
@@ -913,6 +915,7 @@ class JobRegister:
         current = self.get(job_id, actor_id=actor_id)
         if current is None:
             return None
+        self._refuse_while_delivering(current, "amend")
         if text:
             self.stage_amendment(job_id, text, actor_id=actor_id)
         if current["state"] == RUNNING:
@@ -1135,6 +1138,7 @@ class JobRegister:
         row = self.get(job_id, actor_id=actor_id)
         if row is None:
             return None
+        self._refuse_while_delivering(row, "resume")
         if row["state"] != STOPPED:
             if not row["stop_requested"]:
                 return row
@@ -1148,6 +1152,15 @@ class JobRegister:
             delivery_state=None, delivery_attempts=0, delivery_error=None,
             delivered_at=None, delivery_owner=None, delivery_token=None,
             delivery_lease_expires_at=None)
+
+    @staticmethod
+    def _refuse_while_delivering(row: dict[str, Any], action: str) -> None:
+        if row.get("delivery_state") not in ("pending", "delivering"):
+            return
+        raise JobError(
+            "result_delivery_pending",
+            f"cannot {action} job {row['id']} until its existing result is delivered",
+            "wait for result delivery, then try again")
 
     def _actor_update(self, job_id: str, actor_id: str | None,
                       **columns: Any) -> dict[str, Any] | None:

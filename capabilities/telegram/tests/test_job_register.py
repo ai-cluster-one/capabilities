@@ -625,6 +625,42 @@ class RegisterCase(unittest.TestCase):
             row["id"], first[0]["delivery_token"], "sender-a", delivered=True
         )["delivery_state"], "delivered")
 
+    def test_resume_cannot_discard_a_pending_result(self):
+        row = self.register()
+        running = self.reg.claim_next(
+            owner_id="daemon-a", owner_host="host-a", max_parallel=1)
+        self.reg.stop(row["id"], jobs.SUCCEEDED,
+                      attempt_token=running["attempt_token"], owner_id="daemon-a",
+                      result_text="deliver this first")
+        with self.assertRaises(jobs.JobError) as caught:
+            self.reg.resume(row["id"])
+        self.assertEqual(caught.exception.slug, "result_delivery_pending")
+        after = self.reg.get(row["id"])
+        self.assertEqual((after["state"], after["delivery_state"], after["result_text"]),
+                         (jobs.STOPPED, "pending", "deliver this first"))
+        self.assertEqual([item["id"] for item in self.reg.claim_deliveries("sender-a")],
+                         [row["id"]])
+
+    def test_amend_cannot_discard_a_claimed_delivery(self):
+        row = self.register()
+        running = self.reg.claim_next(
+            owner_id="daemon-a", owner_host="host-a", max_parallel=1)
+        self.reg.stop(row["id"], jobs.SUCCEEDED,
+                      attempt_token=running["attempt_token"], owner_id="daemon-a",
+                      result_text="deliver this first")
+        delivery = self.reg.claim_deliveries("sender-a")[0]
+        with self.assertRaises(jobs.JobError) as caught:
+            self.reg.amend(row["id"], "one more thing")
+        self.assertEqual(caught.exception.slug, "result_delivery_pending")
+        after = self.reg.get(row["id"])
+        self.assertEqual((after["delivery_state"], after["delivery_token"],
+                          after["result_text"], after["amendments"]),
+                         ("delivering", delivery["delivery_token"],
+                          "deliver this first", 0))
+        delivered = self.reg.finish_delivery(
+            row["id"], delivery["delivery_token"], "sender-a", delivered=True)
+        self.assertEqual(delivered["delivery_state"], "delivered")
+
     def test_old_active_job_is_not_hidden_by_newer_history(self):
         active = self.register(description="long running")
         self.reg.start(active["id"])
