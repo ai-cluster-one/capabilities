@@ -302,6 +302,9 @@ STORE_URL = os.environ.get("CAPABILITIES_STORE_URL") or None
 
 _JOB_STORE = None
 _JOB_REGISTER = None
+JOB_OWNER_HOST = os.uname().nodename
+JOB_OWNER_ID = f"{JOB_OWNER_HOST}:{os.getpid()}:{time.time_ns()}"
+JOB_LEASE_SECONDS = 30.0
 
 
 def job_register():
@@ -3574,7 +3577,8 @@ def build_prompt(tail, state=None):
             "--- Registered jobs ---\n"
             "People speak naturally; never require them to say job, queue, async, "
             "or an id. At the start of every turn, read what is already in flight "
-            f"with `{jobs_command} active`, then decide in this order:\n"
+            "or resumable with "
+            f"`{jobs_command} list --limit 20`, then decide in this order:\n"
             "1. If this is a status question about existing work, report only what "
             "the ledger and conversation establish. Do not start another task.\n"
             "2. If it corrects, narrows, supplies material for, or adds a constraint "
@@ -3584,9 +3588,9 @@ def build_prompt(tail, state=None):
             "in this dialogue turn. Register it before doing substantive work when it "
             "needs multi-step research, several sources or actions, implementation, "
             "waiting or monitoring, or is otherwise likely to take more than about "
-            f"15 seconds: `{jobs_command} register \"<one-line outcome>\"`. Then only "
+            f"15 seconds: `{jobs_command} register \"<one-line outcome>\"`. "
             "Use that command exactly as shown; the worker wrapper supplies the "
-            "authorized chat, requester, and origin message. "
+            "authorized chat, requester, origin message, worker, and model. Then only "
             "say that the work is underway; do not promise a duration. Answer directly "
             "only when the useful final answer is genuinely available now.\n"
             "Resolve references naturally. An explicit id or reply target wins. With "
@@ -3600,7 +3604,12 @@ def build_prompt(tail, state=None):
             "antecedent that names exactly one active job, ask which work the person "
             "means and make no ledger change instead "
             "of guessing or creating a duplicate. A separate requested outcome is a new "
-            f"job. Amend with `{jobs_command} amend <id> \"<what changed>\"`.\n\n")
+            f"job. Amend with `{jobs_command} amend <id> \"<what changed>\"`. "
+            "Natural requests to pause, stop, cancel, continue, or resume existing work "
+            f"map to `{jobs_command} stop <id>` and `{jobs_command} resume <id>`. "
+            "Stopped jobs are resumable and may be the subject of a status, amendment, "
+            "or continuation. Apply the same unique-reference rule: if several jobs fit, "
+            "ask which one and do not amend, stop, resume, or register anything.\n\n")
     if st.get("quota_pause"):
         jobs_block += f"Queue paused: {st['quota_pause']}\n\n"
     request_block = ""
@@ -3750,6 +3759,13 @@ def worker_env(state=None):
         env["TELEGRAM_AUTHORIZED_REQUESTER_ID"] = str(req["sender_id"])
     if req.get("message_id") is not None:
         env["TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID"] = str(req["message_id"])
+    settings = st.get("settings") or {}
+    if settings.get("worker"):
+        env["TELEGRAM_AUTHORIZED_JOB_ENGINE"] = str(settings["worker"])
+    if settings.get("model"):
+        env["TELEGRAM_AUTHORIZED_JOB_MODEL"] = str(settings["model"])
+    else:
+        env.pop("TELEGRAM_AUTHORIZED_JOB_MODEL", None)
     if req.get("reply_to"):
         env["TELEGRAM_PROGRESS_REPLY_TO"] = str(req["reply_to"])
     return env
@@ -4006,7 +4022,7 @@ def _stream_worker_proc(proc, on_line):
 
 
 def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None,
-                    cwd=None):
+                    on_start=None, cwd=None):
     """Run a worker subprocess in its own process group (start_new_session) and register it in
     the caller's `procs` map until the async job finalizes, so /stop can SIGKILL the whole group —
     claude/codex spawn children, so killing the group, not just the lone parent, is what stops
@@ -4021,6 +4037,13 @@ def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None,
                             stderr=subprocess.PIPE, text=True, start_new_session=True,
                             cwd=str(cwd or PROJECT_ROOT), env=env)
     procs[chat] = proc
+    if on_start is not None:
+        try:
+            on_start(proc.pid, proc.pid)
+        except Exception:
+            _kill_process_group(proc)
+            proc.wait()
+            raise
     # Cancellation can race with Popen. Register first, then honor a cancellation
     # that arrived while the process was being created so no late process escapes.
     if cancel_event is not None and cancel_event.is_set():
@@ -4148,6 +4171,7 @@ def worker_claude(chat, tail, state=None, procs=None):
     rc, out, err = run_worker_proc(
         proc_key, cmd, procs, env=worker_env(state),
         cancel_event=(state or {}).get("cancel_event"),
+        on_start=(state or {}).get("on_worker_start"),
         cwd=(state or {}).get("project_dir"))
     if rc != 0:
         detail = (err.strip() or out.strip() or f"exit {rc}")[:500]
@@ -4378,7 +4402,8 @@ def worker_codex(chat, tail, state=None, procs=None):
             proc_key, cmd, procs, env=worker_env(state),
             cwd=(state or {}).get("project_dir"),
             cancel_event=(state or {}).get("cancel_event"),
-            on_line=(state or {}).get("on_worker_line"))
+            on_line=(state or {}).get("on_worker_line"),
+            on_start=(state or {}).get("on_worker_start"))
         if rc != 0:
             raise RuntimeError(
                 f"codex worker failed: {codex_failure_reason(stdout_txt, err, rc)[:500]}")
@@ -5389,18 +5414,22 @@ async def run_session(client):
         quota["until"] = time.time() + QUOTA_RETRY_SECONDS
         quota["reason"] = str(reason)[:200]
         log(f"jobs: queue paused until "
-            f"{datetime.fromtimestamp(quota['until'], timezone.utc):%H:%M:%S}Z — "
-            f"{quota['reason']}")
+               f"{datetime.fromtimestamp(quota['until'], timezone.utc):%H:%M:%S}Z — "
+               f"{quota['reason']}")
+        return datetime.fromtimestamp(quota["until"], timezone.utc).isoformat(
+            timespec="microseconds")
 
     def leave_quota_pause():
-        if not quota["until"] or time.time() < quota["until"]:
+        if quota["until"] and time.time() < quota["until"]:
             return
         quota["until"], quota["reason"] = None, None
         try:
             register = job_register()
         except Exception:
             return
-        for row in register.list(outcome=jobs.QUOTA, limit=200):
+        for row in register.self_resuming():
+            if row.get("outcome") != jobs.QUOTA:
+                continue
             register.resume(row["id"])
             log(f"jobs: {row['id']} waiting again after the quota pause")
 
@@ -5413,6 +5442,10 @@ async def run_session(client):
             "name": allowed.get("name") or member.get("name") or sender_id,
             "role": sender_role_for(sender_id, group_policy, group_policy is None),
         }
+
+    def safe_job_recovery(row):
+        return (row.get("engine") == "stub"
+                or (row.get("engine") == "codex" and bool(row.get("session_id"))))
 
     # -- the asks the register carries ----------------------------------------
     #
@@ -5428,7 +5461,9 @@ async def run_session(client):
                 stopping_jobs.add(row["id"])
                 await stop_job_process(row, "stopped by request")
                 stopping_jobs.discard(row["id"])
-            register.stop(row["id"], jobs.CANCELLED, error="stopped by request")
+            register.stop(
+                row["id"], jobs.CANCELLED, error="stopped by request",
+                result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
             log(f"{row['channel_key']}: stopped job {row['id']}; it keeps its "
                 f"session and `jobs resume` continues it")
         for row in register.amend_pending():
@@ -5440,6 +5475,28 @@ async def run_session(client):
                 amending.discard(row["id"])
             log(f"{row['channel_key']}: amended job {row['id']}; continuing "
                 f"session {row.get('session_id') or '(not yet opened)'}")
+
+    async def reconcile_expired_attempts(register, reason="worker lease expired"):
+        """Fence dead owners without touching a healthy overlapping daemon."""
+        interrupted = []
+        for row in register.expired_active():
+            local_owner = row.get("owner_host") == JOB_OWNER_HOST
+            pgid = row.get("pgid") or row.get("pid")
+            if local_owner and pgid:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(int(pgid), signal.SIGTERM)
+                await asyncio.sleep(0)
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(int(pgid), signal.SIGKILL)
+            stopped = register.stop(
+                row["id"], jobs.INTERRUPTED,
+                attempt_token=row.get("attempt_token"), error=reason)
+            if stopped is None:
+                continue
+            interrupted.append(row)
+            if JOB_RECOVERY == "requeue" and local_owner and safe_job_recovery(row):
+                register.resume(row["id"])
+        return interrupted
 
     # -- running one registered job -------------------------------------------
 
@@ -5473,6 +5530,21 @@ async def run_session(client):
             ent_id, text, is_direct, reply_to=reply_to, force_reply=True, mark=mark)
         return sent
 
+    async def deliver_job_results(register):
+        """Drain execution results independently from execution itself."""
+        for row in register.pending_deliveries(limit=20):
+            try:
+                sent = await report_job(row, row.get("result_text") or "")
+                if sent is None:
+                    register.mark_delivery(
+                        row["id"], delivered=False, error="channel is unreachable")
+                else:
+                    register.mark_delivery(row["id"], delivered=True)
+            except Exception as exc:
+                register.mark_delivery(
+                    row["id"], delivered=False, error=_short_error(exc, limit=480))
+                log(f"{row['channel_key']}: job {row['id']} result delivery failed; retrying")
+
     async def run_job_row(row):
         """One registered job, from its own slot.
 
@@ -5496,9 +5568,17 @@ async def run_session(client):
             cfg = _worker_settings(reg.get(key, {}), engine)
             s = {**s, "worker": engine, "worker_settings": cfg,
                  "model": cfg.get("model"), **_worker_flags(engine, cfg)}
+        if row.get("model") is not None:
+            s = {**s, "model": row["model"],
+                 "worker_settings": {**(s.get("worker_settings") or {}),
+                                     "model": row["model"]}}
         register = job_register()
         sender = job_sender(row, group_policy)
-        amendments = register.take_amendment(job_id)
+        attempt_token = row.get("attempt_token")
+        if not attempt_token:
+            raise RuntimeError(f"job {job_id} has no attempt ownership token")
+        amendment_rows = register.claim_amendments(job_id, attempt_token)
+        amendments = [item["text"] for item in amendment_rows]
         # The session is the checkpoint for every continuation, not only for an
         # amendment.  A manual resume and startup recovery must pick up the same
         # rollout too.
@@ -5569,6 +5649,17 @@ async def run_session(client):
                 authority_context = write_authority_context(authority, f"job-{job_id}")
             loop = asyncio.get_running_loop()
             opened_session = {"id": row.get("session_id")}
+            amendments_acked = {"value": False}
+
+            async def persist_process(pid, pgid):
+                return register.attach_process(
+                    job_id, attempt_token, pid=pid, pgid=pgid)
+
+            def remember_worker_process(pid, pgid):
+                accepted = asyncio.run_coroutine_threadsafe(
+                    persist_process(pid, pgid), loop).result(timeout=5)
+                if not accepted:
+                    raise RuntimeError("job attempt lost ownership before process start")
 
             def remember_worker_session(line):
                 """Persist a Codex rollout as soon as it opens.
@@ -5585,9 +5676,13 @@ async def run_session(client):
 
                 def persist():
                     current = register.get(job_id)
-                    if current is None or current["state"] != jobs.RUNNING:
+                    if (current is None or current["state"] != jobs.RUNNING
+                            or current.get("attempt_token") != attempt_token):
                         return
-                    register.update(job_id, session_id=thread_id)
+                    register.update_attempt(job_id, attempt_token, session_id=thread_id)
+                    if amendment_rows and not amendments_acked["value"]:
+                        register.ack_amendments(job_id, attempt_token)
+                        amendments_acked["value"] = True
                     log(f"{key}: job {job_id} opened session {thread_id}")
 
                 loop.call_soon_threadsafe(persist)
@@ -5611,6 +5706,7 @@ async def run_session(client):
                      "progress_outbox": str(progress_outbox),
                      "worker_session": worker_session,
                      "on_worker_line": remember_worker_session,
+                     "on_worker_start": remember_worker_process,
                      "cancel_event": cancel_event,
                      "resume_session": resume_session,
                      "project_dir": project_dir,
@@ -5628,25 +5724,44 @@ async def run_session(client):
             job_futures[job_id] = future
             result = await future
             reply, meta = result["reply"], result["meta"]
-            register.stop(job_id, jobs.SUCCEEDED, exit_code=0,
-                          session_id=meta.get("session_id"),
-                          model=meta.get("model"))
-            if not result.get("silent") and reply:
-                await report_job(row, reply)
+            if amendment_rows and not amendments_acked["value"]:
+                register.ack_amendments(job_id, attempt_token)
+                amendments_acked["value"] = True
+            current_after_run = register.get(job_id)
+            if current_after_run is not None and current_after_run.get("stop_requested"):
+                register.stop(
+                    job_id, jobs.CANCELLED, attempt_token=attempt_token,
+                    error="stopped by request",
+                    result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
+                return
+            if register.has_pending_amendment(job_id):
+                register.amend(job_id)
+                log(f"{key}: job {job_id} finished while a newer amendment arrived; continuing")
+                return
+            finished = register.stop(
+                job_id, jobs.SUCCEEDED, exit_code=0,
+                session_id=meta.get("session_id"), model=meta.get("model"),
+                attempt_token=attempt_token, result_text=reply,
+                result_silent=bool(result.get("silent") or not reply))
+            if finished is None:
+                log(f"{key}: stale completion ignored for job {job_id}")
+                return
             tok = meta.get("tokens", {})
             log(f"{key}: finished job {job_id} · {meta.get('harness')}/"
                 f"{meta.get('model') or '?'} · in={tok.get('input')} "
                 f"out={tok.get('output')}")
         except asyncio.CancelledError:
             await terminate_worker(proc_key, future, cancel_event, "job task cancelled")
-            register.stop(job_id, jobs.INTERRUPTED,
+            register.stop(job_id, jobs.INTERRUPTED, attempt_token=attempt_token,
                           error="job task cancelled before completion")
             # A session shutdown is an interruption of the runner, not a
             # request to stop this job.  Put it back where the next daemon can
             # claim it, preserving the rollout checkpoint written above.  An
             # explicit `jobs stop` takes the exception path instead and remains
             # stopped until somebody resumes it.
-            if closing and JOB_RECOVERY == "requeue":
+            current = register.get(job_id) or row
+            if (closing and JOB_RECOVERY == "requeue"
+                    and safe_job_recovery(current)):
                 register.resume(job_id)
                 log(f"{key}: job {job_id} interrupted by session close; requeued")
             raise
@@ -5658,30 +5773,36 @@ async def run_session(client):
                     current is not None and current["stop_requested"]):
                 # The runner records the stop itself, once the process is gone.
                 log(f"{key}: job {job_id} stopped; `jobs resume` continues it")
-                await report_job(row, f"Stopped: «{row['description']}». "
-                                      "It keeps its place and can be continued.")
             elif job_id in amending or (current is not None
-                                        and current["state"] == jobs.WAITING):
+                                        and current["state"] == jobs.WAITING) \
+                    or register.has_pending_amendment(job_id):
                 # An amendment took the row back into the queue while the
                 # process was being stopped. That is the amendment working, not
                 # a failure, and the runner will pick it up again.
+                if current is not None and current["state"] == jobs.RUNNING:
+                    register.amend(job_id)
                 log(f"{key}: job {job_id} stopped for an amendment")
             elif is_quota_exhausted(reason):
-                register.stop(job_id, jobs.QUOTA, error=reason)
-                enter_quota_pause(reason)
-                await report_job(row, quota_pause_notice() or reason)
+                resume_at = enter_quota_pause(reason)
+                register.stop(job_id, jobs.QUOTA, error=reason,
+                              attempt_token=attempt_token, resume_at=resume_at,
+                              result_text=quota_pause_notice() or reason)
             elif closing:
-                register.stop(job_id, jobs.INTERRUPTED, error=reason)
+                register.stop(job_id, jobs.INTERRUPTED, error=reason,
+                              attempt_token=attempt_token)
+                current = register.get(job_id) or row
+                if JOB_RECOVERY == "requeue" and safe_job_recovery(current):
+                    register.resume(job_id)
                 log(f"{key}: job {job_id} interrupted by session close: {reason}")
             else:
-                register.stop(job_id, jobs.FAILED, error=reason)
+                failure_text = (f"Job failed: «{row['description']}»\n{reason}"
+                                if any(p.get("role") == "supervisor"
+                                       for p in participants)
+                                else f"«{row['description']}» could not be completed. "
+                                     "Please tell an administrator.")
+                register.stop(job_id, jobs.FAILED, error=reason,
+                              attempt_token=attempt_token, result_text=failure_text)
                 log(f"{key}: job {job_id} failed: {reason}")
-                is_supervisor = any(p.get("role") == "supervisor"
-                                    for p in participants)
-                await report_job(row, (
-                    f"Job failed: «{row['description']}»\n{reason}" if is_supervisor
-                    else f"«{row['description']}» could not be completed. "
-                         "Please tell an administrator."))
         finally:
             if progress_stop is not None:
                 progress_stop.set()
@@ -5693,6 +5814,7 @@ async def run_session(client):
                 with contextlib.suppress(OSError):
                     Path(authority_context).unlink()
             release_worker_proc(proc_key)
+            register.release_claim(job_id, attempt_token)
             job_procs.pop(job_id, None)
             job_cancels.pop(job_id, None)
             job_futures.pop(job_id, None)
@@ -5707,16 +5829,32 @@ async def run_session(client):
         while not closing:
             try:
                 register = job_register()
+                await reconcile_expired_attempts(register)
                 await honour_asks(register)
+                durable_quota = register.quota_until()
+                if durable_quota:
+                    with contextlib.suppress(ValueError):
+                        quota["until"] = max(
+                            quota["until"] or 0,
+                            datetime.fromisoformat(durable_quota).timestamp())
+                        quota["reason"] = quota["reason"] or (
+                            "A worker exhausted its quota.")
                 leave_quota_pause()
+                await deliver_job_results(register)
+                for active_row in register.active():
+                    if active_row.get("lease_owner") == JOB_OWNER_ID:
+                        register.renew(active_row["id"], active_row["attempt_token"],
+                                       JOB_OWNER_ID,
+                                       max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
                 while (quota["until"] is None
                        and len(job_tasks) < MAX_PARALLEL_JOBS):
-                    candidate = register.next_waiting()
-                    if candidate is None:
-                        break
-                    claimed = register.start(candidate["id"])
+                    claimed = register.claim_next(
+                        owner_id=JOB_OWNER_ID, owner_host=JOB_OWNER_HOST,
+                        max_parallel=MAX_PARALLEL_JOBS,
+                        lease_seconds=max(JOB_LEASE_SECONDS,
+                                          JOB_POLL_INTERVAL * 3))
                     if claimed is None:
-                        continue
+                        break
                     task = asyncio.create_task(run_job_row(claimed))
                     job_tasks[task] = claimed["id"]
                     task.add_done_callback(lambda t: job_tasks.pop(t, None))
@@ -8059,19 +8197,21 @@ async def run_session(client):
             client, interrupted_recordings, rejoin_conference,
             call_in_progress))
 
-    # A row that claims to be running names a process this daemon no longer has.
-    # Recording that is what keeps the register honest across a box restart;
-    # whether the work then waits for inspection or is queued as a fresh attempt
-    # is the configured recovery policy's call.
+    # Reconcile attempts owned by a daemon that is gone. A local orphan is
+    # terminated before its slot can be reused; a foreign-host attempt cannot
+    # be proved dead here and is stopped for inspection rather than duplicated.
     try:
         register = job_register()
-        interrupted = register.interrupt_active("service restarted while job was running")
-        for row in interrupted:
-            if JOB_RECOVERY == "requeue":
-                register.resume(row["id"])
+        durable_quota = register.quota_until()
+        if durable_quota:
+            with contextlib.suppress(ValueError):
+                quota["until"] = datetime.fromisoformat(durable_quota).timestamp()
+                quota["reason"] = "A previous worker exhausted its quota."
+        interrupted = await reconcile_expired_attempts(
+            register, "service found an expired worker lease on startup")
         if interrupted:
             log(f"jobs: {len(interrupted)} interrupted "
-                f"{'continued as a fresh attempt' if JOB_RECOVERY == 'requeue' else 'kept for inspection'}")
+                f"under fenced recovery; only locally-owned checkpointed work was continued")
         counts = register.counts()
         log(f"jobs: register ready — environment={ENVIRONMENT} "
             f"slots={MAX_PARALLEL_JOBS} {counts or 'empty'}")

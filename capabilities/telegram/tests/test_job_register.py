@@ -79,6 +79,31 @@ class RegisterCase(unittest.TestCase):
         with self.assertRaises(jobs.JobError):
             jobs.JobRegister(self.store, self.reg.project_id, "dev/prod")
 
+    def test_version_one_store_expands_to_the_durable_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            envelope = Path(td) / "capabilities"
+            envelope.mkdir()
+            envelope.joinpath("project.json").write_text(json.dumps({
+                "id": "33333333-3333-4333-8333-333333333333",
+                "slug": "upgrade", "store": "db"}))
+            url = str(Path(td) / "upgrade.sqlite3")
+            old = store.open_store(url)
+            old.migrate()
+            old.project_register("33333333-3333-4333-8333-333333333333", "upgrade")
+            old.migrate(jobs.STORE_NAMESPACE, 1, jobs.STORE_MIGRATIONS[:4])
+            old.close()
+            upgraded_store, upgraded = jobs.open_register(
+                store, envelope, "development", url=url)
+            try:
+                row = upgraded.register(
+                    channel_key="1", requested_by="2", description="upgraded",
+                    engine="stub", origin_message_id="3")
+                self.assertIn("attempt_token", row)
+                self.assertIn("delivery_state", row)
+                self.assertEqual(upgraded.store.schema_version("telegram"), 2)
+            finally:
+                upgraded_store.close()
+
     # -- registration ---------------------------------------------------------
 
     def test_registration_lands_queued_with_the_operators_line(self):
@@ -98,6 +123,39 @@ class RegisterCase(unittest.TestCase):
     def test_an_unknown_engine_is_refused(self):
         with self.assertRaises(jobs.JobError):
             self.register(engine="gemini")
+
+    def test_registration_is_idempotent_for_one_telegram_update(self):
+        first = self.register(origin_message_id="91")
+        again = self.register(origin_message_id="91", description="duplicate delivery")
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(len(self.reg.list()), 1)
+        self.assertEqual(again["description"], "reconcile the ledger")
+
+    def test_registered_engine_and_model_are_pinned_together(self):
+        row = self.register(engine="codex", model="gpt-channel")
+        self.assertEqual((row["engine"], row["model"]),
+                         ("codex", "gpt-channel"))
+
+    def test_actor_scope_hides_and_refuses_another_actors_job(self):
+        mine = self.register(requested_by="42")
+        other = self.register(requested_by="99", description="other")
+        self.assertEqual([r["id"] for r in self.reg.list(actor_id="42")],
+                         [mine["id"]])
+        self.assertIsNone(self.reg.get(other["id"], actor_id="42"))
+        self.assertIsNone(self.reg.request_stop(other["id"], actor_id="42"))
+        self.assertIsNone(self.reg.stage_amendment(
+            other["id"], "take it over", actor_id="42"))
+        self.assertEqual(self.reg.get(other["id"])["requested_by"], "99")
+
+    def test_primary_key_reads_and_writes_do_not_cross_environment(self):
+        row = self.register()
+        production = jobs.JobRegister(self.store, self.reg.project_id, "production",
+                                      slug="testproject")
+        self.assertIsNone(production.get(row["id"]))
+        self.assertIsNone(production.update(row["id"], description="crossed"))
+        self.assertIsNone(production.request_stop(row["id"]))
+        self.assertEqual(self.reg.get(row["id"])["description"],
+                         "reconcile the ledger")
 
     # -- arrival order --------------------------------------------------------
 
@@ -120,6 +178,37 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(row["pid"], 4242)
         self.assertEqual(row["model"], "gpt-5.5")
         self.assertIsNotNone(row["started_at"])
+
+    def test_claim_records_owner_pid_and_shared_slot(self):
+        first = self.register(description="first")
+        self.register(description="second")
+        claimed = self.reg.claim_next(owner_id="daemon-a", owner_host="host-a",
+                                      max_parallel=1, lease_seconds=30)
+        self.assertEqual(claimed["id"], first["id"])
+        self.assertTrue(claimed["attempt_token"])
+        peer_store, peer = jobs.open_register(
+            store, self.envelope, "development", url=self.url)
+        self.addCleanup(peer_store.close)
+        self.assertIsNone(peer.claim_next(
+            owner_id="daemon-b", owner_host="host-a", max_parallel=1),
+            "the slot budget is shared by independent daemon connections")
+        self.assertTrue(self.reg.attach_process(
+            claimed["id"], claimed["attempt_token"], pid=4242, pgid=4242))
+        after = self.reg.get(claimed["id"])
+        self.assertEqual((after["pid"], after["pgid"]), (4242, 4242))
+
+    def test_stale_attempt_cannot_overwrite_a_newer_attempt(self):
+        row = self.register()
+        old = self.reg.start(row["id"], owner_id="old")
+        self.reg.stop(row["id"], jobs.INTERRUPTED,
+                      attempt_token=old["attempt_token"])
+        self.reg.resume(row["id"])
+        new = self.reg.start(row["id"], owner_id="new")
+        self.assertIsNone(self.reg.stop(
+            row["id"], jobs.SUCCEEDED, attempt_token=old["attempt_token"]))
+        current = self.reg.get(row["id"])
+        self.assertEqual(current["state"], jobs.RUNNING)
+        self.assertEqual(current["attempt_token"], new["attempt_token"])
 
     # -- the open-jobs list the dialogue worker reads -------------------------
 
@@ -147,7 +236,8 @@ class RegisterCase(unittest.TestCase):
         amended = self.reg.amend(row["id"])
         self.assertEqual(amended["id"], row["id"])
         self.assertEqual(amended["session_id"], "thread-1")
-        self.assertEqual(amended["amendments"], 1)
+        self.assertEqual(amended["amendments"], 0,
+                         "a transition is not a user amendment")
         self.assertEqual(amended["state"], jobs.WAITING)
         self.assertIsNone(amended["pid"])
         resumed = self.reg.start(row["id"], pid=99)
@@ -164,6 +254,33 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(self.reg.take_amendment(row["id"]),
                          ["not that account, the other one", "and hold the invoice"])
         self.assertEqual(self.reg.take_amendment(row["id"]), [])
+        self.assertEqual(self.reg.get(row["id"])["amendments"], 2)
+
+    def test_amendment_survives_claim_until_engine_ack(self):
+        row = self.register()
+        running = self.reg.start(row["id"])
+        self.reg.stage_amendment(row["id"], "keep this")
+        claimed = self.reg.claim_amendments(row["id"], running["attempt_token"])
+        self.assertEqual([r["text"] for r in claimed], ["keep this"])
+        self.assertEqual(self.reg.pending_amendment(row["id"]), ["keep this"])
+        self.assertEqual(self.reg.amend_pending(), [],
+                         "a claimed addition is already in this attempt")
+        self.reg.stop(row["id"], jobs.INTERRUPTED,
+                      attempt_token=running["attempt_token"])
+        self.reg.resume(row["id"])
+        next_attempt = self.reg.start(row["id"])
+        reclaimed = self.reg.claim_amendments(
+            row["id"], next_attempt["attempt_token"])
+        self.assertEqual([r["text"] for r in reclaimed], ["keep this"])
+        self.assertEqual(self.reg.ack_amendments(
+            row["id"], next_attempt["attempt_token"]), 1)
+        self.assertEqual(self.reg.pending_amendment(row["id"]), [])
+
+    def test_amendment_count_is_user_additions_not_transition_batches(self):
+        row = self.register()
+        self.reg.stage_amendment(row["id"], "first")
+        self.reg.stage_amendment(row["id"], "second")
+        self.reg.amend(row["id"])
         self.assertEqual(self.reg.get(row["id"])["amendments"], 2)
 
     def test_an_amendment_is_not_kept_on_the_row(self):
@@ -282,6 +399,34 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(done["error"], "You've hit your usage limit.")
         self.assertEqual(done["exit_code"], 1)
         self.assertIsNotNone(done["finished_at"])
+
+    def test_execution_and_delivery_are_separate_durable_states(self):
+        row = self.register()
+        running = self.reg.start(row["id"])
+        done = self.reg.stop(row["id"], jobs.SUCCEEDED,
+                             attempt_token=running["attempt_token"],
+                             result_text="the durable answer")
+        self.assertEqual(done["outcome"], jobs.SUCCEEDED)
+        self.assertEqual(done["delivery_state"], "pending")
+        self.assertEqual(self.reg.pending_deliveries()[0]["result_text"],
+                         "the durable answer")
+        reopened_store, reopened = jobs.open_register(
+            store, self.envelope, "development", url=self.url)
+        self.addCleanup(reopened_store.close)
+        self.assertEqual(reopened.pending_deliveries()[0]["result_text"],
+                         "the durable answer")
+        delivered = reopened.mark_delivery(row["id"], delivered=True)
+        self.assertEqual(delivered["delivery_state"], "delivered")
+        self.assertEqual(self.reg.pending_deliveries(), [])
+
+    def test_quota_resume_time_survives_register_reopen(self):
+        row = self.register()
+        running = self.reg.start(row["id"])
+        future = "2999-01-01T00:00:00.000000+00:00"
+        self.reg.stop(row["id"], jobs.QUOTA,
+                      attempt_token=running["attempt_token"], resume_at=future)
+        self.assertEqual(self.reg.quota_until(), future)
+        self.assertEqual(self.reg.self_resuming(), [])
 
     def test_counts_separate_what_is_moving_from_why_it_stopped(self):
         moving = self.register(description="moving")

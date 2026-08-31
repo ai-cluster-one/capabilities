@@ -244,11 +244,13 @@ telegram jobs resume <id>
 
 Both are asynchronous. `stop`, and the staged text behind `amend`, record what was asked; the runner holds the process groups and acts on the next tick. A read reports an unlanded ask as `stopping: true`, because a flag and a state are two halves of one sentence.
 
-Inside a worker turn the same commands run through the shim, which pins `--chat` and `--topic-id` to the authorized channel and refuses any attempt to name another. For `register`, it also supplies `--requested-by` and `--origin-message-id` from the daemon-authenticated current request; the model neither repeats nor chooses identity. There is no daemon round-trip and no separate grammar.
+Inside a worker turn the same commands run through the shim, which pins channel, topic and actor to the daemon-authenticated request and refuses substitutions. For `register`, it also pins origin message, effective channel worker and model; the model neither repeats nor chooses identity or execution configuration. The real CLI independently reapplies those environment scopes, so accidentally reaching it instead of the shim does not silently become an operator-wide job mutation.
+
+This wrapper is not an OS security boundary. Text workers currently run with full host access and can deliberately unset their environment or invoke code around the CLI. The hard boundaries remain the capability policy, request authority, connection `allow_write`, and service role grants. Actor/channel checks make the supported job command surface fail closed and prevent accidental bypass; they do not turn an unrestricted worker process into a sandbox.
 
 ### What the worker is told, and what it asks for
 
-The prompt names the surface; it does not carry a snapshot of it. The queue moves while a turn is being written, so a list pasted in at dispatch is already stale when it is read — the worker runs `telegram jobs active` at the start of every dialogue turn.
+The prompt names the surface; it does not carry a snapshot of it. The queue moves while a turn is being written, so a list pasted in at dispatch is already stale when it is read — the worker runs `telegram jobs list --limit 20` at the start of every dialogue turn. That includes stopped, resumable work needed for natural “continue it” and status follow-ups. Its authenticated actor scope returns only jobs requested by the person whose message created this turn.
 
 People never have to name the mechanism. The dialogue worker applies this order to ordinary language:
 
@@ -260,23 +262,23 @@ Reference resolution remains prompt judgement because conversation meaning canno
 
 ### Amendment keeps the row
 
-A correction is not a new request. `amend` stages the added context against the job; the runner stops that job's process group, counts the amendment, and continues the same engine session by its id. Nothing marks the intent separately — the staged text being there *is* the intent, and it is consumed when the job is next dispatched. Amending stopped work brings it back to `waiting` for the same reason: being corrected is a reason to continue. Stopping loses nothing the turn had established, because the session is the checkpoint.
+A correction is not a new request. `amend` appends one immutable amendment row and therefore increments the count once per user addition, not once per runner batch. The runner claims those rows without deleting them and acknowledges them only when the engine accepts the attempt; a concurrent append or crash cannot erase one. It stops the current process group and continues the same engine session by its id. Amending stopped work brings it back to `waiting` for the same reason: being corrected is a reason to continue.
 
 ### What the row holds
 
-References, never content: what was asked, whose authority it carries, which channel it reports into, how long it waited, and why it stopped. `session_id` names the rollout, `log_path` names the process output, `engine` names what must run it — a job registered under one engine is continued under that engine, because resumption is engine-specific. `effort` and `service_tier` are deliberately absent; the session's own `turn_context` already records them.
+The rollout trajectory remains in the engine session rather than being copied into the register. Two bounded payloads are durable because they have nowhere else yet: amendments until engine acceptance and the final result until Telegram delivery. The row also records what was asked, whose authority it carries, which channel it reports into, ownership/lease/PID, how long it waited, and why it stopped. `session_id` names the rollout and `engine` plus `model` pin what must continue it. `effort` and `service_tier` remain session-owned.
 
 ### Isolation is a correctness condition
 
-Every queue read is filtered by `project_id`, `environment` and `surface`, so one project can never take another's work and a development daemon can never take a production job off a store they share. `environment` is settings' own top-level key, overridden by `TELEGRAM_ENVIRONMENT`.
+Every ordinary queue read, ID lookup, write and claim is filtered by `project_id`, `environment` and `surface`, so one project can never take another's work and a development worker cannot read or mutate a production job even when it knows the UUID. `environment` is settings' own top-level key, overridden by `TELEGRAM_ENVIRONMENT`.
 
 ### Restart, quota, reporting
 
-On start, rows claiming to be running stop with outcome `interrupted` and their surviving process groups are terminated. `job_recovery` decides what happens next: `requeue` continues them as a fresh attempt, `inspect` leaves them for a person to look at.
+Each attempt carries an owner, fencing token, renewable lease, PID and process group. Shared slot rows enforce `max_parallel_jobs` across overlapping daemons. A healthy lease is left alone; an expired locally-owned process group is terminated before its slot is reused, and a stale completion cannot overwrite a newer attempt. Automatic `requeue` is limited to a locally-owned attempt with a safe checkpoint (a persisted Codex session, or the test stub). Claude exposes its session only in the final JSON, so an interrupted Claude attempt is deliberately stopped for inspection instead of being replayed with uncertain side effects.
 
-When the engine reports the subscription spent, the running job stops with outcome `quota`, the queue stops taking new work, and nothing is retried into the wall. The dialogue worker is told, in words, including when the queue tries again.
+When the engine reports the subscription spent, the running job stops with outcome `quota` and a durable `resume_at`; restart reconstructs the queue pause from that timestamp and resumes due quota work without retrying into the wall.
 
-A job reports into its own channel, as a reply to the originating message. Progress lines use the same outbox a dialogue turn does.
+A job records execution completion and result before delivery. A separate durable delivery state retries an unavailable Telegram channel after restart without running the worker again. It reports into its own channel, as a reply to the originating message. Progress lines use the same outbox a dialogue turn does.
 
 The register needs the store. Where a project keeps its *configuration* is a separate question, answered by `project.json`; a queue lives in the store either way. Without a project identity the register cannot open, the job class is off for the session, and the conversation is unaffected.
 

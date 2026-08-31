@@ -75,6 +75,19 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(register.surface, "telegram")
             self.assertIsNotNone(register.project_id)
 
+    async def test_worker_popen_reports_pid_and_process_group_before_waiting(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            seen = []
+            procs = {}
+            rc, out, err = daemon.run_worker_proc(
+                "job:test", [sys.executable, "-c", "print('ok')"], procs,
+                on_start=lambda pid, pgid: seen.append((pid, pgid)))
+            self.assertEqual((rc, out.strip(), err), (0, "ok", ""))
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0][0], seen[0][1])
+            self.assertGreater(seen[0][0], 0)
+
     async def test_a_project_without_a_store_keeps_answering(self):
         """A register that cannot be opened turns the job class off. It does not
         stop the conversation, which is the half that still works."""
@@ -169,7 +182,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await client.handler(Event(message))
             await wait_until(lambda: "prompt" in seen, timeout=6)
             self.assertIn("Registered jobs", seen["prompt"])
-            self.assertIn("jobs active", seen["prompt"])
+            self.assertIn("jobs list --limit 20", seen["prompt"])
             self.assertIn("At the start of every turn", seen["prompt"])
             self.assertIn("multi-step research", seen["prompt"])
             self.assertIn("With one active job", seen["prompt"])
@@ -280,6 +293,66 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await wait_until(lambda: seen, timeout=6)
             self.assertEqual(seen, ["stub"],
                              "the channel runs codex; this row says stub")
+            await self.stop_session(client, task)
+
+    async def test_a_job_runs_on_the_model_its_row_records(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td, worker="codex")
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            register.register(channel_key="123", requested_by="777",
+                              description="pinned model", engine="codex",
+                              model="gpt-pinned")
+            seen = []
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                seen.append(state["settings"]["model"])
+                return successful_result("done")
+
+            daemon.WORKERS["codex"] = worker
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(lambda: seen, timeout=6)
+            self.assertEqual(seen, ["gpt-pinned"])
+            await self.stop_session(client, task)
+
+    async def test_result_delivery_retries_without_reexecuting_the_job(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            row = register.register(channel_key="123", requested_by="777",
+                                    description="durable delivery", engine="stub")
+            runs = []
+
+            def worker(*_args, **_kwargs):
+                runs.append("run")
+                return successful_result("durable answer")
+
+            daemon.WORKERS["stub"] = worker
+            client = FakeClient([])
+            original_send = client.send_message
+            failures = {"left": 1}
+
+            async def flaky_send(*args, **kwargs):
+                if failures["left"]:
+                    failures["left"] -= 1
+                    raise RuntimeError("Telegram unavailable")
+                return await original_send(*args, **kwargs)
+
+            client.send_message = flaky_send
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(
+                lambda: register.get(row["id"])["delivery_state"] == "delivered",
+                timeout=8)
+            after = register.get(row["id"])
+            self.assertEqual(runs, ["run"])
+            self.assertEqual(after["attempt"], 1)
+            self.assertGreaterEqual(after["delivery_attempts"], 2)
+            self.assertTrue(any(item.get("text") == "durable answer"
+                                for item in client.sent))
             await self.stop_session(client, task)
 
     # -- amendment ------------------------------------------------------------
@@ -462,6 +535,8 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             row = register.register(channel_key="123", requested_by="777",
                                     description="interrupted work", engine="stub")
             register.start(row["id"], pid=999999)
+            register.update(row["id"], lease_expires_at="2000-01-01T00:00:00+00:00",
+                            owner_host=daemon.JOB_OWNER_HOST)
             hold = asyncio.Event()
             loop = asyncio.get_running_loop()
 

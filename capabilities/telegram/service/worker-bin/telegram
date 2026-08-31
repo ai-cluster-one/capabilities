@@ -101,7 +101,8 @@ def enforce_job_scope(argv):
              "the daemon did not provide an authorized Telegram chat scope",
              exit_code=4)
     for forbidden in ("--chat", "--channel", "--all-channels",
-                      "--requested-by", "--origin-message-id"):
+                      "--requested-by", "--origin-message-id", "--actor",
+                      "--engine", "--model"):
         if forbidden in args or any(item.startswith(forbidden + "=") for item in args):
             fail("worker_scope_denied",
                  f"{forbidden} cannot be overridden inside a Telegram worker request",
@@ -114,17 +115,24 @@ def job_scope_arguments(argv):
     args = ["--chat", allowed_chat]
     if allowed_topic:
         args += ["--topic-id", allowed_topic]
+    requester = os.environ.get("TELEGRAM_AUTHORIZED_REQUESTER_ID", "").strip()
+    if not requester:
+        fail("worker_authority_missing",
+             "the daemon did not provide the authorized job requester",
+             exit_code=4)
+    args += ["--actor", requester]
     if list(argv[1:3]) == ["jobs", "register"]:
-        requester = os.environ.get("TELEGRAM_AUTHORIZED_REQUESTER_ID", "").strip()
-        if not requester:
-            fail("worker_authority_missing",
-                 "the daemon did not provide the authorized job requester",
-                 exit_code=4)
         args += ["--requested-by", requester]
         origin = os.environ.get(
             "TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID", "").strip()
         if origin:
             args += ["--origin-message-id", origin]
+        engine = os.environ.get("TELEGRAM_AUTHORIZED_JOB_ENGINE", "").strip()
+        model = os.environ.get("TELEGRAM_AUTHORIZED_JOB_MODEL", "").strip()
+        if engine:
+            args += ["--engine", engine]
+        if model:
+            args += ["--model", model]
     return args
 
 
