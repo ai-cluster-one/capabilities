@@ -3434,11 +3434,27 @@ def _channel_identity(key):
         return raw, None
 
 
+SELF_MARKER = " (you)"
+
+
+def _speaker(name, is_assistant):
+    """One speaker as the worker reads it: this account's own messages carry the
+    marker the conversation header defines, every other participant stands by
+    name alone. The tail is rendered for exactly one reader, so "you" is always
+    this account — and a configured agent peer, whose messages arrive incoming,
+    never picks the marker up."""
+    return f"{name}{SELF_MARKER}" if is_assistant else name
+
+
 def _format_conversation(tail):
     """Render a compact readable timeline without JSON property overhead."""
+    me = globals().get("ASSISTANT_NAME") or "this assistant"
     lines = [
-        ("Reply markers define conversational relationships. Message proximity alone "
-         "does not mean that a message addresses Marvin."),
+        (f"Reply markers define conversational relationships. Message proximity alone "
+         f"does not mean that a message addresses {me}."),
+        # The marker defines itself here because an exclusive channel cuts every
+        # prose layer above this one, and the worker still has to read it.
+        f"A speaker marked{SELF_MARKER} is you; every other name is another participant.",
     ]
     current_date = None
     for message in tail:
@@ -3454,10 +3470,11 @@ def _format_conversation(tail):
         reply = message.get("in_reply_to") or {}
         reply_marker = ""
         if reply.get("id") and reply.get("sender"):
-            target = reply["sender"] + (" (assistant)" if reply.get("is_assistant") else "")
+            target = _speaker(reply["sender"], reply.get("is_assistant"))
             reply_marker = f" | reply to #{reply['id']} by {target}"
         metadata = f"[{identity}{reply_marker}] " if identity or reply_marker else ""
-        lines.append(f'{metadata}{message["sender"]}: {message["text"]}')
+        speaker = _speaker(message["sender"], message.get("is_assistant"))
+        lines.append(f'{metadata}{speaker}: {message["text"]}')
     return "\n".join(lines)
 
 
@@ -3688,7 +3705,7 @@ def build_prompt(tail, state=None):
         ]
         reply = req.get("in_reply_to") or {}
         if reply.get("id") and reply.get("sender"):
-            target = reply["sender"] + (" (assistant)" if reply.get("is_assistant") else "")
+            target = _speaker(reply["sender"], reply.get("is_assistant"))
             request_lines.append(f"Reply to: #{reply['id']} by {target}")
         request_lines.extend([
             "Answer this request only. Other addressed messages in the tail are separate jobs.",

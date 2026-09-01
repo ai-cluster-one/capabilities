@@ -757,6 +757,37 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Reply to: #100 by Юрий", prompt)
             self.assertIn("Message proximity alone", prompt)
 
+    async def test_prompt_marks_the_assistants_own_lines_as_yours(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            me = daemon.ASSISTANT_NAME
+            tail = [
+                {"id": 200, "date": "2026-09-01", "time": "14:32",
+                 "sender": me, "is_assistant": True, "text": "смотрю"},
+                {"id": 201, "date": "2026-09-01", "time": "14:33",
+                 "sender": "S0L0M0N", "is_assistant": False, "text": "я тоже",
+                 "in_reply_to": {"id": 200, "sender": me, "is_assistant": True}},
+            ]
+            prompt = daemon.build_prompt(tail, {"current_request": {
+                "message_id": 201,
+                "sender_name": "S0L0M0N",
+                "sender_role": "agent",
+                "kind": "text",
+                "text": "я тоже",
+                "in_reply_to": tail[1]["in_reply_to"],
+            }})
+
+            self.assertIn(f"[14:32 #200] {me} (you): смотрю", prompt)
+            self.assertIn(f"reply to #200 by {me} (you)", prompt)
+            self.assertIn(f"Reply to: #200 by {me} (you)", prompt)
+            # Another configured agent arrives incoming and stays by name alone.
+            self.assertIn("] S0L0M0N: я тоже", prompt)
+            self.assertNotIn("S0L0M0N (you)", prompt)
+            # The marker defines itself for a channel that cuts the prose above it.
+            self.assertIn("marked (you) is you", prompt)
+            self.assertIn(f"addresses {me}.", prompt)
+            self.assertNotIn("(assistant)", prompt)
+
     async def test_live_tail_resolves_reply_author_only_inside_window(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()
