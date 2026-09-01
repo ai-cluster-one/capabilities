@@ -4490,7 +4490,7 @@ def cmd_jobs_discard(job_id: str, chat: str | None, topic_id: str | None,
         return {"id": job_id, "discarded": True,
                 "description": row["description"]}
     finally:
-        register.close()
+        register.store.close()
 
 
 def cmd_jobs_stop(job_id: str, chat: str | None, topic_id: str | None,
