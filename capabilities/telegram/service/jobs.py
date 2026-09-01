@@ -1025,6 +1025,30 @@ class JobRegister:
                 tuple([iso()] + params + values))
         return self.get(job_id, actor_id=actor_id) if cur.rowcount else None
 
+    def discard(self, job_id: str, *, actor_id: str | None = None) -> dict[str, Any] | None:
+        """Drop a draft that is never going to be submitted.
+
+        This is not the second half of stopping. A draft holds no session and
+        no work: nothing has run, so there is no checkpoint to keep and nothing
+        to continue. What it holds is a line in the register that every turn is
+        told to read before submitting, so a draft somebody thought better of
+        is noise in exactly the surface a turn has to look at. Only a draft can
+        be discarded; work that has started stops and stays continuable.
+        """
+        row = self.get(job_id, actor_id=actor_id)
+        if row is None or row["state"] != DRAFT:
+            return None
+        predicates = ["id = ?", "state = ?"]
+        values: list[Any] = [job_id, DRAFT]
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            values.append(str(actor_id))
+        clause, params = self._where(*predicates)
+        with self.store.transaction():
+            cur = self.store._execute(
+                "DELETE FROM tg_worker_jobs" + clause, tuple(params + values))
+        return row if cur.rowcount else None
+
     def cancel_waiting(self, job_id: str, *, error: str,
                        result_text: str | None = None) -> dict[str, Any] | None:
         row = self.get(job_id)

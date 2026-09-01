@@ -16,6 +16,8 @@ The register is one source beside the ones you already have - this conversation,
 
 A registered job waits as a draft until you submit it, and the time between the two is yours. Use it: ask the person what the request leaves open, add what you learn to the draft, and submit when its one-line outcome says what will actually be delivered.
 
+If the answer turns out to be that no work is wanted after all, discard the draft in the same turn rather than leaving it. Every turn is told to read what is already waiting before it submits, so a draft nobody meant is noise in exactly the place a turn has to look.
+
 Submitting opens a fresh start. What you found in this turn does not travel with it, so carry what matters in the outcome line and in what you add before you submit.
 
 A separate requested outcome is a new job. A correction, a narrowing, or added material for work already in flight belongs to the job already running.

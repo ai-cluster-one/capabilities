@@ -4473,6 +4473,26 @@ def cmd_jobs_amend(job_id: str, text: str, chat: str | None,
         register.store.close()
 
 
+def cmd_jobs_discard(job_id: str, chat: str | None, topic_id: str | None,
+                     actor_id: str | None = None) -> dict:
+    root = _service_project_root()
+    module, register = _open_job_register(root)
+    try:
+        row = _require_job(register, module, job_id, chat, topic_id, actor_id)
+        if row["state"] != module.DRAFT:
+            _die(6, "job_not_a_draft",
+                 f"job {job_id} is {row['state']}, not a draft",
+                 "only a draft can be discarded; work that has started is "
+                 "stopped with `telegram jobs stop` and stays continuable")
+        if register.discard(job_id, actor_id=actor_id) is None:
+            _die(6, "job_not_discarded", f"job {job_id} was not discarded",
+                 "re-read it with `telegram jobs show`")
+        return {"id": job_id, "discarded": True,
+                "description": row["description"]}
+    finally:
+        register.close()
+
+
 def cmd_jobs_stop(job_id: str, chat: str | None, topic_id: str | None,
                   actor_id: str | None = None) -> dict:
     root = _service_project_root()
@@ -5386,6 +5406,8 @@ def main() -> None:
         "amend", help="continue a job with added context, keeping its session"))
     jamend.add_argument("text", help="what changed, in the operator's terms")
     job_scope(jb.add_parser(
+        "discard", help="drop a draft nobody is going to submit"))
+    job_scope(jb.add_parser(
         "stop", help="stop the work; it keeps its session and its place"))
     job_scope(jb.add_parser(
         "resume", help="continue stopped work, whatever stopped it"))
@@ -5510,6 +5532,8 @@ def main() -> None:
                                     args.model))
         elif args.jobs_cmd == "amend":
             _emit(cmd_jobs_amend(args.id, args.text, chat, topic, actor))
+        elif args.jobs_cmd == "discard":
+            _emit(cmd_jobs_discard(args.id, chat, topic, actor))
         elif args.jobs_cmd == "stop":
             _emit(cmd_jobs_stop(args.id, chat, topic, actor))
         elif args.jobs_cmd == "submit":

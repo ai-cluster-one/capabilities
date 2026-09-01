@@ -562,6 +562,25 @@ class RegisterCase(unittest.TestCase):
         self.reg.stop(row["id"], jobs.SUCCEEDED)
         self.assertEqual(self.reg.resume(row["id"])["state"], jobs.WAITING)
 
+    def test_a_draft_can_be_discarded_and_nothing_else_can(self):
+        """A draft holds no session and no work, so dropping it keeps nothing
+        back. Anything that has started stops instead and stays continuable -
+        discard is not a second way to end work, it is a way to unsay a line
+        that every turn is told to read before submitting."""
+        draft = self.register(submit=False)
+        self.assertEqual(draft["state"], jobs.DRAFT)
+        discarded = self.reg.discard(draft["id"])
+        self.assertEqual(discarded["id"], draft["id"])
+        self.assertIsNone(self.reg.get(draft["id"]))
+        self.assertIsNone(self.reg.discard(draft["id"]),
+                          "discarding twice is not an error, it is a no-op")
+
+        started = self.register()
+        self.reg.start(started["id"])
+        self.assertIsNone(self.reg.discard(started["id"]))
+        self.assertIsNotNone(self.reg.get(started["id"]),
+                             "work that has started is stopped, never dropped")
+
     def test_an_unknown_outcome_is_refused(self):
         row = self.register()
         with self.assertRaises(jobs.JobError):

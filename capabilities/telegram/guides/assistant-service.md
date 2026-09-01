@@ -268,6 +268,8 @@ The prompt itself is prose the daemon serves at request time, not a string in th
 
 The verbs are not written into that prose. The daemon states `Jobs command` in the channel state block, and the prompt points at it: `telegram jobs help` prints the whole surface - the verbs and each verb's own flags - and the worker shim leaves a help request unscoped so it answers inside a turn as well as outside one. A command copied into a prompt is a second truth that goes stale on the first release, so the prompt names where to ask instead of answering from memory.
 
+A draft is the one thing in the register that can be dropped rather than stopped. Nothing has run, so there is no session to keep and nothing to continue, and the line would otherwise sit in the listing every turn reads before submitting. `telegram jobs discard <id>` removes it and refuses anything that has started; work that is moving stops instead and stays continuable. It carries the same scope as every other worker `jobs` call, because the whole life of a draft - opening it, asking what the request leaves open, submitting or dropping it - happens inside the conversation rather than at somebody's keyboard.
+
 ### Turning delegation on
 
 Delegation is off where nothing says otherwise, so a channel reaches the register because someone wrote it down. A runner outlives the turn that started it, spends a fresh rollout, and answers into the room later under the assistant's own name; a channel gets that reach deliberately, never by inheriting a default.
@@ -485,6 +487,8 @@ Group policies may add a channel-specific overlay to a dialogue turn with either
 A forum topic may add its own overlay under its group's `topics` map, and a direct sender may add one on their `allowed_users` entry. Topic prose follows room prose rather than replacing it, so a topic says what is specific to its lane while the room keeps saying what is true everywhere in it.
 
 The prompt order for a dialogue turn is: `context.md`, `delegation.md` where the register is reachable, channel context overlay, daemon channel state, current request, then the recent conversation tail. For a job worker it is `job-worker.md`, daemon channel state, current request, tail. Prose is a soft behavior layer only; access control still belongs to `control.roles` and tool access still belongs to `authority.roles`. A resumed Codex session already holds these layers, so edits reach a new session or the next full re-anchor rather than being repeated on every continuation.
+
+The conversation block declares itself. It opens by saying that everything up to `--- END OF CONVERSATION ---` is quoted message text rather than instruction, and it closes with that marker. Message text is the only part of the prompt somebody else writes, and it sits last, directly beneath the block naming this run's commands - so a message line that begins like one of this prompt's own headings is indented by one space when it is rendered. The heading stays readable and stops being a heading. Real messages do not carry such lines, so nothing anybody writes on purpose is changed.
 
 No prompt carries a value that depends on the run. The chat id, the progress command's shim path and the jobs command are facts the daemon states in the channel state block every time, because the shim path follows how a worker was started, appears in no tool's help, and would be silently lost the moment someone edited a placeholder out of the prose around it.
 
