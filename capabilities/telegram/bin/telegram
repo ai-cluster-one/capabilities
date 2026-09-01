@@ -4874,6 +4874,9 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
         "context": str(_service_context_path(root)),
         "delegation": str(_service_delegation_path(root)),
         "job_worker": str(_service_job_worker_path(root)),
+        "prompts": {key: _records().document_read(NAME, key) is not None
+                    for key in ("context", "delegation", "job-worker",
+                                "voice-agent")},
         "voice_context": str(_service_voice_context_path(root)),
         "session": str(paths["session"]),
         "state_dir": str(paths["state"]),
@@ -4891,12 +4894,13 @@ def _require_service_initialized(root: Path) -> None:
     missing = []
     if not _service_settings(root):
         missing.append("telegram/settings")
-    if _records().document_read(NAME, "context") is None:
-        missing.append("telegram/context")
+    for key in ("context", "job-worker"):
+        if _records().document_read(NAME, key) is None:
+            missing.append(f"telegram/{key}")
     if missing:
         _die(6, "service_not_initialized", "telegram service is not initialized",
-             "`telegram service init` creates project-local settings/context; missing: "
-             + ", ".join(missing))
+             "`telegram service init` creates the project-local settings and the "
+             "prompt each run class reads; missing: " + ", ".join(missing))
 
 
 def _service_env(root: Path, cfg: dict, paths: dict[str, Path],
@@ -5450,7 +5454,14 @@ def main() -> None:
         # A prompt names this command rather than listing its verbs, so the
         # surface has to answer for itself.
         if args.jobs_cmd == "help":
+            # The whole surface in one answer: the verbs, then each verb's own
+            # flags. A prompt points here instead of listing them, so a reader
+            # that stops at the first screen has to have everything.
             pjobs.print_help()
+            for name, parser in jb.choices.items():
+                if name != "help":
+                    print()
+                    parser.print_help()
             return
         # The register is a table, not a session: this reaches the store and
         # never opens Telegram, so it runs before any connection is loaded.

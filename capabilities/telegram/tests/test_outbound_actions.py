@@ -572,6 +572,22 @@ class OutboundActionsTests(unittest.TestCase):
             "TELEGRAM_AUTHORIZED_JOB_MODEL": "gpt-test",
         }
 
+    def test_a_jobs_help_request_is_not_scoped(self):
+        """The prompts name this command instead of listing the verbs, so it has
+        to answer inside a worker. Its parsers take no chat, no topic and no
+        actor, and appending them turns the one discoverable surface into an
+        argument error."""
+        shim = import_worker_shim()
+        for asking in (["jobs", "help"],
+                       ["jobs", "-h"],
+                       ["jobs", "submit", "-h"],
+                       ["jobs", "register", "--help"]):
+            self.assertTrue(shim._is_jobs_help(asking), asking)
+        for acting in (["jobs", "active"],
+                       ["jobs", "register", "help me with this"],
+                       ["jobs", "show", "12"]):
+            self.assertFalse(shim._is_jobs_help(acting), acting)
+
     def test_worker_jobs_are_pinned_to_the_authorized_channel(self):
         """`jobs` reaches the register directly, so what the shim owns is the
         scope: the authorized chat and topic are appended, and a turn that names

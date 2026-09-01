@@ -266,7 +266,7 @@ People never have to name the mechanism, and never hear it either: the register,
 
 The prompt itself is prose the daemon serves at request time, not a string in the code. It is `service/delegation.md`, which belongs to the project: `telegram service init` seeds it from the shipped template, and after that the project owns the wording. The daemon adds no prose of its own, so a project that deletes the file delegates without being told about it.
 
-The verbs are not written into that prose. The daemon states `Jobs command` in the channel state block, and the prompt points at it: `telegram jobs help` prints the whole surface, and each verb answers `-h` for its own flags. A command copied into a prompt is a second truth that goes stale on the first release, so the prompt names where to ask instead of answering from memory.
+The verbs are not written into that prose. The daemon states `Jobs command` in the channel state block, and the prompt points at it: `telegram jobs help` prints the whole surface - the verbs and each verb's own flags - and the worker shim leaves a help request unscoped so it answers inside a turn as well as outside one. A command copied into a prompt is a second truth that goes stale on the first release, so the prompt names where to ask instead of answering from memory.
 
 ### Turning delegation on
 

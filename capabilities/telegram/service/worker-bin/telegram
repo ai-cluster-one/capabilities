@@ -110,6 +110,17 @@ def enforce_job_scope(argv):
                  f"this turn is scoped to chat {allowed_chat}", exit_code=4)
 
 
+def _is_jobs_help(passthrough):
+    """Whether a `jobs` call is asking for the surface rather than acting on it.
+
+    A help request takes no chat, no actor and no job: the parsers that answer
+    it accept none of the flags the shim adds, so adding them turns the one
+    command the prompts name into an argument error. Both spellings count -
+    the `help` verb, and `-h` on any verb."""
+    return (passthrough[1:2] == ["help"]
+            or any(item in ("-h", "--help") for item in passthrough[1:]))
+
+
 def job_scope_arguments(argv):
     """The scope and attribution the shim adds to a worker `jobs` call."""
     allowed_chat, allowed_topic, _ = worker_scope()
@@ -326,7 +337,7 @@ def main():
     if worker_session and "--session" not in sys.argv[1:] and not cross_connection:
         args.extend(["--session", worker_session])
     passthrough = list(sys.argv[1:])
-    if passthrough[:1] == ["jobs"]:
+    if passthrough[:1] == ["jobs"] and not _is_jobs_help(passthrough):
         passthrough += job_scope_arguments(sys.argv)
     if passthrough[:2] == ["jobs", "submit"]:
         return run_job_handoff(
