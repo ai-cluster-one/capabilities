@@ -196,21 +196,17 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await client.started.wait()
             await client.handler(Event(message))
             await wait_until(lambda: "prompt" in seen, timeout=6)
-            self.assertIn("Registered jobs", seen["prompt"])
-            self.assertIn("jobs active", seen["prompt"])
-            self.assertIn("jobs list --state stopped --limit 5", seen["prompt"])
-            self.assertIn("`active` answers that question", seen["prompt"])
-            self.assertIn("jobs submit", seen["prompt"])
-            self.assertIn("the choice is yours", seen["prompt"])
-            self.assertIn("With one active job", seen["prompt"])
-            self.assertIn("With several", seen["prompt"])
-            self.assertIn("recency alone selects nothing", seen["prompt"])
-            self.assertIn("leave the register as it is", seen["prompt"])
-            # The surface is offered, never ordered: the block names no reading
-            # order and sets no threshold above which delegating is required.
-            self.assertNotIn("At the start of every turn", seen["prompt"])
-            self.assertNotIn("15 seconds", seen["prompt"].split(
-                "--- Registered jobs ---")[1])
+            self.assertIn(f'Jobs command: {daemon.WORKER_BIN / "telegram"} jobs',
+                          seen["prompt"])
+            # The surface is named, never snapshotted. A verb copied into a
+            # prompt is a second truth that goes stale on the first release,
+            # so the prompt points at the command and the command answers.
+            self.assertNotIn("jobs submit", seen["prompt"])
+            self.assertNotIn("--state stopped", seen["prompt"])
+            # Nowhere in the whole prompt is a run asked to judge elapsed time,
+            # which is the one thing it cannot measure. The earlier form of this
+            # check read one slice of the prompt and missed a line outside it.
+            self.assertNotIn("15 seconds", seen["prompt"])
             self.assertNotIn(row["id"], seen["prompt"],
                              "the list is asked for, not handed over")
             self.assertNotIn("open_jobs", seen["state"])
@@ -244,9 +240,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await wait_until(lambda: "prompt" in seen, timeout=6)
 
             self.assertFalse(seen["state"]["jobs_available"])
-            self.assertNotIn("--- Registered jobs ---", seen["prompt"])
-            self.assertNotIn("jobs submit", seen["prompt"])
-            self.assertNotIn("the choice is yours", seen["prompt"])
+            self.assertNotIn("Jobs command:", seen["prompt"])
             # Silence closes the register, not the channel.
             await wait_until(
                 lambda: any(item["text"] == "answered here"

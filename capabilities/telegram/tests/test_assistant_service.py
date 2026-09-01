@@ -184,8 +184,8 @@ class AudioParameters:
 def import_daemon(tmp: Path, service_settings: dict, *,
                   connection_extra: dict | None = None,
                   voice_context: str | None = None,
-                  worker_context: str | None = None,
-                  jobs_prompt: str | None = None,
+                  delegation: str | None = None,
+                  job_worker: str | None = None,
                   project_env: dict | None = None,
                   store: bool = False):
     """Import one daemon against a throwaway project.
@@ -208,14 +208,13 @@ def import_daemon(tmp: Path, service_settings: dict, *,
         }) + "\n")
     settings_file = service_dir / "settings.json"
     context_file = service_dir / "context.md"
-    worker_context_file = service_dir / "worker.md"
     voice_context_file = service_dir / "voice-agent.md"
     settings_file.write_text(json.dumps(service_settings) + "\n")
     context_file.write_text("test context\n")
-    if worker_context is not None:
-        worker_context_file.write_text(worker_context)
-    if jobs_prompt is not None:
-        (service_dir / "jobs.md").write_text(jobs_prompt)
+    if delegation is not None:
+        (service_dir / "delegation.md").write_text(delegation)
+    if job_worker is not None:
+        (service_dir / "job-worker.md").write_text(job_worker)
     if voice_context is not None:
         voice_context_file.write_text(voice_context)
     if project_env:
@@ -953,10 +952,8 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 "-200": {"aliases": ["Assistant"]},
             }
             daemon = import_daemon(Path(td), service_settings)
-            context_template = (
-                TELEGRAM_DIR / "service" / "templates" / "context.md").read_text()
-            daemon.CONTEXT_FILE.write_text(context_template.replace(
-                "{{TELEGRAM_PROGRESS_COMMAND}}", "telegram send <chat_id> <text>"))
+            daemon.CONTEXT_FILE.write_text(
+                (TELEGRAM_DIR / "service" / "templates" / "context.md").read_text())
             daemon.save_register({})
             captured = {}
 
@@ -991,13 +988,8 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
             command = (
                 f'{daemon.WORKER_BIN / "telegram"} send -200 "<one short line>"')
-            self.assertIn(f"`{command}`", captured["prompt"])
+            self.assertIn(f"Progress command: {command}", captured["prompt"])
             self.assertNotIn("`telegram send <chat_id> <text>`", captured["prompt"])
-            daemon.CONTEXT_FILE.write_text(context_template)
-            self.assertIn(
-                f"`{command}`",
-                daemon.build_prompt(captured["tail"], captured["state"]),
-            )
             self.assertEqual(captured["env"]["TELEGRAM_AUTHORIZED_TOPIC_ID"], "10")
             self.assertCountEqual(
                 [(item["text"], item.get("reply_to")) for item in client.sent],
@@ -4762,28 +4754,53 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
                 daemon._channel_context([policy, daemon._topic_policy(policy, 7)]),
                 ("room prose\n\nlane prose", True))
 
-    async def test_the_shipped_jobs_prompt_is_served_when_a_project_has_none(self):
-        """A project inherits the wording until it decides to own it."""
+    async def test_a_project_without_delegation_prose_still_gets_the_command(self):
+        """The wording is the project's to write and the command is the
+        daemon's to state. A project that has not written the first still gets
+        the second, and no wording is invented on its behalf."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             prompt = daemon.build_prompt(
                 [], {"chat_id": 5, "jobs_available": True})
-            self.assertIn("--- Registered jobs ---", prompt)
-            self.assertIn("the choice is yours", prompt)
-            self.assertIn("jobs submit", prompt)
+            self.assertIn(f'Jobs command: {daemon.WORKER_BIN / "telegram"} jobs',
+                          prompt)
+            self.assertNotIn("job worker", prompt)
 
-    async def test_a_project_jobs_prompt_replaces_the_shipped_one(self):
-        """The wording is prose a project iterates on without a release, so its
-        own file is the prompt rather than an addition to it."""
+    async def test_delegation_prose_follows_the_register(self):
+        """A turn is told it can hand work off exactly where it can, and the
+        prose joins the dialogue's own context rather than standing as a block
+        of its own."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(), delegation="hand it to a job worker\n")
+            offered = daemon.build_prompt(
+                [], {"chat_id": 5, "jobs_available": True})
+            withheld = daemon.build_prompt(
+                [], {"chat_id": 5, "jobs_available": False})
+            self.assertIn("test context", offered)
+            self.assertIn("hand it to a job worker", offered)
+            self.assertLess(offered.index("test context"),
+                            offered.index("hand it to a job worker"))
+            self.assertNotIn("hand it to a job worker", withheld)
+
+    async def test_a_job_worker_reads_its_own_prompt_and_nothing_else(self):
+        """A worker handed a job is not in the conversation. The dialogue's
+        prose is about answering people, and a room's overlay is about how to
+        carry yourself in a room this run never speaks in."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(
                 Path(td), settings(),
-                jobs_prompt="ask me about work with {{TELEGRAM_JOBS_COMMAND}} active\n")
-            prompt = daemon.build_prompt(
-                [], {"chat_id": 5, "jobs_available": True})
-            self.assertIn("ask me about work with", prompt)
-            self.assertIn("jobs active", prompt)
-            self.assertNotIn("the choice is yours", prompt)
+                delegation="delegation prose\n",
+                job_worker="you were handed work\n")
+            prompt = daemon.build_prompt([], {
+                "chat_id": 5, "channel_context": "lane prose",
+                "jobs_available": True,
+                "registered_job": {"id": "job-1", "attempt": 1}})
+            self.assertIn("you were handed work", prompt)
+            self.assertIn("Run: registered job job-1", prompt)
+            self.assertNotIn("test context", prompt)
+            self.assertNotIn("lane prose", prompt)
+            self.assertNotIn("delegation prose", prompt)
 
     async def test_a_channel_without_delegation_is_told_nothing_about_jobs(self):
         """A channel reaches the register only where something says so: silence
@@ -4797,8 +4814,7 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
                 {"delegation": {"mode": "allowed"}}))
             prompt = daemon.build_prompt(
                 [], {"chat_id": 5, "jobs_available": False})
-            self.assertNotIn("--- Registered jobs ---", prompt)
-            self.assertNotIn("jobs submit", prompt)
+            self.assertNotIn("Jobs command:", prompt)
 
     async def test_a_channel_default_can_open_delegation_for_every_room(self):
         """`defaults` opens every channel at once, and a room closes itself
@@ -4819,22 +4835,21 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_exclusive_prompt_answers_without_the_service_context(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(
-                Path(td), settings(), worker_context="project worker prose\n")
-            state = {"chat_id": 5, "channel_context": "lane prose"}
+                Path(td), settings(), delegation="delegation prose\n")
+            state = {"chat_id": 5, "channel_context": "lane prose",
+                     "jobs_available": True}
 
             extend = daemon.build_prompt([], state)
             exclusive = daemon.build_prompt([], {**state, "context_exclusive": True})
 
             self.assertIn("test context", extend)
-            self.assertIn("--- Project worker context ---", extend)
-            self.assertIn("project worker prose", extend)
             self.assertLess(extend.index("test context"),
-                            extend.index("project worker prose"))
-            self.assertLess(extend.index("project worker prose"),
                             extend.index("lane prose"))
             self.assertNotIn("test context", exclusive)
-            self.assertNotIn("project worker prose", exclusive)
             self.assertIn("lane prose", exclusive)
+            # Delegation describes a capability this requester either has or
+            # has not; a room's choice about prose does not take it away.
+            self.assertIn("delegation prose", exclusive)
 
     async def test_the_progress_channel_survives_an_exclusive_prompt(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4849,17 +4864,23 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
                 # forget to carry.
                 self.assertIn(command, daemon.build_prompt([], state))
 
-    async def test_prose_naming_the_progress_command_is_rewritten_wherever_it_sits(self):
+    async def test_the_daemon_states_run_values_rather_than_filling_prose(self):
+        """Prose carries no value that depends on the run. The shim path
+        follows how this worker was started and appears in no tool's help, and
+        a placeholder is only as reliable as the last person to edit the file
+        around it - so the daemon states it every time and leaves prose alone."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             shim = str(daemon.WORKER_BIN / "telegram")
 
             prompt = daemon.build_prompt([], {
                 "chat_id": 5, "context_exclusive": True,
-                "channel_context": "Report with telegram send <chat_id> <text> first."})
+                "channel_context": "Report before you go deep."})
 
-            self.assertIn(f"Report with {shim} send 5", prompt)
-            self.assertNotIn("<chat_id>", prompt)
+            self.assertIn(f'Progress command: {shim} send 5 "<one short line>"',
+                          prompt)
+            self.assertIn("Report before you go deep.", prompt)
+            self.assertNotIn("{{", prompt)
 
     async def test_the_schema_admits_only_the_two_context_modes(self):
         with tempfile.TemporaryDirectory() as td:

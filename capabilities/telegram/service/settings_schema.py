@@ -470,7 +470,7 @@ def _defaults(value, path, project_root, service_dir):
         "debounce", "worker_timeout", "progress_after",
         "max_parallel_dialogue", "max_parallel_jobs", "job_poll_interval",
         "job_recovery", "max_attempts", "group_aliases", "worker", "workers",
-        "voice_agent", "jobs", "delegation",
+        "voice_agent", "delegation",
         "media_log_level",
     }
     _unknown(value, allowed, path)
@@ -478,12 +478,6 @@ def _defaults(value, path, project_root, service_dir):
         _string(value["assistant_name"], f"{path}.assistant_name", nonempty=True)
     if "delegation" in value:
         _delegation(value["delegation"], f"{path}.delegation")
-    if "jobs" in value:
-        jobs = _object(value["jobs"], f"{path}.jobs")
-        _unknown(jobs, {"prompt_file"}, f"{path}.jobs")
-        if "prompt_file" in jobs:
-            _safe_service_path(jobs["prompt_file"], f"{path}.jobs.prompt_file",
-                               project_root, service_dir)
     numeric = {
         "tail_size": (1, 500, True),
         "sync_interval": (0.01, 3600, False),

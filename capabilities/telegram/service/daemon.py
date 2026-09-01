@@ -30,8 +30,11 @@ This engine is shipped in the installed telegram capability bundle. A project
 keeps only its policy/config under capabilities/telegram/service/:
   settings.json — connection, direct_messages, allowed_users, allowed_groups,
                   defaults
-  context.md     — service-level soft-gate prompt injected into text workers
-  worker.md      — optional project-specific text-worker prompt extension
+  context.md     — the whole prompt a dialogue turn runs on
+  delegation.md  — added to it wherever the job register is reachable for the
+                   requester, so a turn is told about handing work off only
+                   where it can
+  job-worker.md  — the whole prompt a job worker runs on, on its own
   voice-agent.md — system prompt for a direct call answered by voice
 
 Runtime state follows the selected Telegram connection:
@@ -279,13 +282,18 @@ PROJECT_CAPABILITIES_DIR = _project_capabilities_dir()
 SERVICE_DIR = PROJECT_CAPABILITIES_DIR / "telegram" / "service"
 SETTINGS_FILE = Path(os.environ.get("TELEGRAM_SERVICE_SETTINGS")
                      or SERVICE_DIR / "settings.json")
+# One prompt per run class, each owned whole by the project. A dialogue turn
+# reads context.md, and delegation.md after it wherever the register is
+# reachable for this requester. A job worker reads job-worker.md and nothing
+# else. The capability seeds these files at init and never injects prose of its
+# own at run time, so the file an author is looking at is the prompt the model
+# receives.
 CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_CONTEXT")
                     or SERVICE_DIR / "context.md")
-WORKER_CONTEXT_FILE = Path(os.environ.get("TELEGRAM_SERVICE_WORKER_CONTEXT")
-                           or SERVICE_DIR / "worker.md")
-# The jobs block is prose, not code: a project iterates on the wording in its
-# own `jobs.md` and the capability ships the one every project starts from.
-JOBS_PROMPT_TEMPLATE = Path(__file__).resolve().parent / "templates" / "jobs.md"
+DELEGATION_FILE = Path(os.environ.get("TELEGRAM_SERVICE_DELEGATION")
+                       or SERVICE_DIR / "delegation.md")
+JOB_WORKER_FILE = Path(os.environ.get("TELEGRAM_SERVICE_JOB_WORKER")
+                       or SERVICE_DIR / "job-worker.md")
 
 
 _RECORDS = None
@@ -471,12 +479,6 @@ def _runtime_settings(settings, project_layout=None):
     voice_context_file = Path(voice_prompt_file)
     if not voice_context_file.is_absolute():
         voice_context_file = SERVICE_DIR / voice_context_file
-    jobs_prompt_file = Path(
-        os.environ.get("TELEGRAM_SERVICE_JOBS_PROMPT")
-        or (defaults.get("jobs") or {}).get("prompt_file")
-        or "jobs.md")
-    if not jobs_prompt_file.is_absolute():
-        jobs_prompt_file = SERVICE_DIR / jobs_prompt_file
     assistant_name = str(
         settings.get("assistant_name") or defaults.get("assistant_name") or "Assistant")
     default_worker = str(
@@ -527,7 +529,6 @@ def _runtime_settings(settings, project_layout=None):
         "VOICE_RECORDING_CAPTION": str(voice_defaults.get("recording_caption") or "").strip(),
         "VOICE_PROGRESS_INTERVAL": voice_progress_interval,
         "VOICE_CONTEXT_FILE": voice_context_file,
-        "JOBS_PROMPT_FILE": jobs_prompt_file,
         "ASSISTANT_NAME": assistant_name,
         "DEFAULT_GROUP_ALIASES": group_aliases or (assistant_name,),
         "DEFAULT_WORKER": default_worker,
@@ -1691,22 +1692,21 @@ def _document_key(path):
     return stem
 
 
-def jobs_prompt_text():
-    """The jobs block this project serves, or the one the capability ships.
+def read_delegation_context():
+    """The prose a dialogue turn is given when the register is reachable for
+    this requester: that work can be handed to a job worker, and on what
+    signal. A project that has no such file delegates without prose about it."""
+    return read_service_document(DELEGATION_FILE)
 
-    A project keeps its own `jobs.md` beside its settings when it wants to
-    iterate on the wording without a release; until it has one, the shipped
-    template is the prompt. Neither is a fallback for a store that cannot be
-    read: `read_service_document` still raises for that, and an empty file is
-    an empty block rather than a silent return to the default.
-    """
-    text = read_service_document(JOBS_PROMPT_FILE)
-    if Path(JOBS_PROMPT_FILE).exists():
-        return text
-    try:
-        return JOBS_PROMPT_TEMPLATE.read_text(encoding="utf-8").strip()
-    except OSError:
-        return text
+
+def read_job_worker_context():
+    """The whole prompt a job worker runs on.
+
+    It is not layered over the dialogue's context. A worker handed a job
+    answers to the job rather than to the room, so the prose about answering
+    people is not its prose, and it reads one file the way a call reads one
+    file."""
+    return read_service_document(JOB_WORKER_FILE)
 
 
 def read_service_document(path):
@@ -1731,11 +1731,6 @@ def _service_document(path):
 def read_voice_context():
     """The voice channel's own system prompt, owned by the project."""
     return read_service_document(VOICE_CONTEXT_FILE)
-
-
-def read_worker_context():
-    """Optional project prose appended to every fresh text-worker prompt."""
-    return read_service_document(WORKER_CONTEXT_FILE)
 
 
 def voice_call_readiness():
@@ -3630,26 +3625,23 @@ def build_prompt(tail, state=None):
     # prose layers go with the room's, which is the point of the mode and its
     # declared cost. The daemon-owned job protocol below is structural and is
     # never removed by a channel's prose choice.
-    if st.get("context_exclusive"):
-        context = ""
+    if (st.get("registered_job") or {}).get("id"):
+        # A job worker is handed work, not a conversation. Its own file is the
+        # whole of its prose: the dialogue's context is about answering people,
+        # and a room's overlay is about how to carry yourself in a room this
+        # run does not speak in.
+        context = read_job_worker_context()
+        channel_context = ""
     else:
-        service_context = read_service_document(CONTEXT_FILE)
-        worker_context = read_worker_context()
-        worker_block = ("--- Project worker context ---\n" + worker_context
-                        if worker_context else "")
-        context = "\n\n".join(
-            part for part in (service_context, worker_block) if part)
-    channel_context = (st.get("channel_context") or "").strip()
-    progress_command = None
-    if st.get("chat_id") is not None:
-        progress_command = (
-            f'{WORKER_BIN / "telegram"} send {st["chat_id"]} "<one short line>"')
-        # Prose that names the progress command in either spelling is rewritten
-        # to the shim path, wherever the prose came from.
-        context, channel_context = (
-            text.replace("{{TELEGRAM_PROGRESS_COMMAND}}", progress_command).replace(
-                "telegram send <chat_id> <text>", progress_command)
-            for text in (context, channel_context))
+        context = "" if st.get("context_exclusive") else read_service_document(CONTEXT_FILE)
+        # Delegation prose describes a capability that either exists for this
+        # requester or does not, so it follows the register rather than the
+        # room's prose choice.
+        if st.get("jobs_available"):
+            delegation = read_delegation_context()
+            if delegation:
+                context = f"{context}\n\n{delegation}" if context else delegation
+        channel_context = (st.get("channel_context") or "").strip()
     if channel_context:
         channel_context = "--- Channel-specific context ---\n" + channel_context + "\n\n"
     lines = []
@@ -3707,21 +3699,19 @@ def build_prompt(tail, state=None):
     pu = st.get("prev_usage")
     if pu:
         lines.append("Previous turn usage: " + _usage_summary(pu) + ".")
-    if progress_command and progress_command not in context \
-            and progress_command not in channel_context:
+    # The commands a run may need are facts about this run, not prose: the shim
+    # path depends on how this worker was started and appears in no tool's help,
+    # so the daemon states it every time rather than trusting a prompt to carry
+    # a placeholder someone could delete.
+    if st.get("chat_id") is not None:
         lines.append(
-            f"Progress: for work longer than about 15 seconds, send one short line "
-            f"with {progress_command} before going deep.")
-    block = ("--- Channel state ---\n" + "\n".join(lines) + "\n\n") if lines else ""
-    jobs_block = ""
+            'Progress command: '
+            f'{WORKER_BIN / "telegram"} send {st["chat_id"]} "<one short line>"')
     if st.get("jobs_available"):
-        jobs_command = f'{WORKER_BIN / "telegram"} jobs'
-        body = jobs_prompt_text().replace(
-            "{{TELEGRAM_JOBS_COMMAND}}", jobs_command).strip()
-        if body:
-            jobs_block = "--- Registered jobs ---\n" + body + "\n\n"
+        lines.append(f'Jobs command: {WORKER_BIN / "telegram"} jobs')
     if st.get("quota_pause"):
-        jobs_block += f"Queue paused: {st['quota_pause']}\n\n"
+        lines.append(f"Queue paused: {st['quota_pause']}")
+    block = ("--- Channel state ---\n" + "\n".join(lines) + "\n\n") if lines else ""
     request_block = ""
     if req:
         request_lines = [
@@ -3741,7 +3731,7 @@ def build_prompt(tail, state=None):
         ])
         request_block = "\n".join(request_lines)
     history = _format_conversation(tail)
-    return (f"{context}\n\n{channel_context}{block}{jobs_block}{request_block}--- Conversation ---\n{history}")
+    return (f"{context}\n\n{channel_context}{block}{request_block}--- Conversation ---\n{history}")
 
 
 def message_tail_text(m):

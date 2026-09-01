@@ -30,10 +30,11 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
    - Set a group's `voice_transcription.mode` to `auto` to transcribe all voice messages and video notes from participants (unaddressed spoken media are echoed without creating worker jobs). Defaults to `disabled`.
    - Choose `defaults.worker`: `codex`, `claude`, or `stub`.
 
-   Optionally edit `capabilities/telegram/service/worker.md` when this project
-   needs additional instructions for every Telegram text worker. It extends the
-   daemon-owned worker protocol; it does not replace it and does not affect the
-   voice agent.
+   Edit the prompt files the same command wrote. Each belongs to one run
+   class and each is the whole of that class's prose: `context.md` for a
+   dialogue turn, `delegation.md` for what a turn is told about handing work
+   off, `job-worker.md` for a worker running a job, `voice-agent.md` for a call
+   answered by voice.
 
 4. Ensure the selected connection can send replies:
 
@@ -263,7 +264,9 @@ The register is one source beside the conversation and the project's own body an
 
 People never have to name the mechanism, and never hear it either: the register, its states and its ids are internal on both sides, and work in flight is described in the first person as the assistant's own.
 
-The prompt itself is prose the daemon serves at request time, not a string in the code. `service/templates/jobs.md` is what the capability ships; a project that wants to iterate on the wording keeps its own `service/jobs.md`, or names another file in `defaults.jobs.prompt_file`, and that file replaces the shipped one. `{{TELEGRAM_JOBS_COMMAND}}` in either is rewritten to the shim path.
+The prompt itself is prose the daemon serves at request time, not a string in the code. It is `service/delegation.md`, which belongs to the project: `telegram service init` seeds it from the shipped template, and after that the project owns the wording. The daemon adds no prose of its own, so a project that deletes the file delegates without being told about it.
+
+The verbs are not written into that prose. The daemon states `Jobs command` in the channel state block, and the prompt points at it: `telegram jobs help` prints the whole surface, and each verb answers `-h` for its own flags. A command copied into a prompt is a second truth that goes stale on the first release, so the prompt names where to ask instead of answering from memory.
 
 ### Turning delegation on
 
@@ -447,7 +450,20 @@ Transcription failures produce a fallback message. The daemon reserves ownership
 
 ## Worker and Channel Context
 
-The service soft prompt lives in `capabilities/telegram/service/context.md`. An optional project-wide text-worker extension lives in `capabilities/telegram/service/worker.md`. The daemon's required job protocol remains in the capability code, so a capability update updates that protocol while each project can add its own working guidance without forking it. Group policies may then add a channel-specific overlay with either a markdown file or a short inline string. File paths are relative to `capabilities/telegram/service/`.
+One prompt file per run class, each owned whole by the project and each the entire prose that class receives:
+
+| File | Who reads it |
+|---|---|
+| `context.md` | a dialogue turn answering a message |
+| `delegation.md` | added to `context.md` wherever the job register is reachable for the requester |
+| `job-worker.md` | a worker running a registered job, on its own |
+| `voice-agent.md` | a direct call answered by voice |
+
+`telegram service init` seeds all four from the shipped templates and never touches them again. The capability injects no prose of its own at run time, so the file an author is reading is the prompt the model receives, and a template that improves later reaches new projects rather than rewriting an existing one under it.
+
+A job worker reads `job-worker.md` and nothing else — not `context.md`, not a channel overlay. It answers to the job rather than to the room, so prose about how to carry yourself in a conversation is not its prose.
+
+Group policies may add a channel-specific overlay to a dialogue turn with either a markdown file or a short inline string. File paths are relative to `capabilities/telegram/service/`.
 
 ```json
 {
@@ -468,13 +484,15 @@ The service soft prompt lives in `capabilities/telegram/service/context.md`. An 
 
 A forum topic may add its own overlay under its group's `topics` map, and a direct sender may add one on their `allowed_users` entry. Topic prose follows room prose rather than replacing it, so a topic says what is specific to its lane while the room keeps saying what is true everywhere in it.
 
-The prompt order is: service `context.md`, optional project `worker.md`, channel context overlay, daemon channel state and job protocol, current request, then the recent conversation tail. `worker.md` and channel context are soft behavior layers only; access control still belongs to `control.roles` and tool access still belongs to `authority.roles`. A resumed Codex session already holds these layers, so edits reach a new session or the next full re-anchor rather than being repeated on every continuation.
+The prompt order for a dialogue turn is: `context.md`, `delegation.md` where the register is reachable, channel context overlay, daemon channel state, current request, then the recent conversation tail. For a job worker it is `job-worker.md`, daemon channel state, current request, tail. Prose is a soft behavior layer only; access control still belongs to `control.roles` and tool access still belongs to `authority.roles`. A resumed Codex session already holds these layers, so edits reach a new session or the next full re-anchor rather than being repeated on every continuation.
+
+No prompt carries a value that depends on the run. The chat id, the progress command's shim path and the jobs command are facts the daemon states in the channel state block every time, because the shim path follows how a worker was started, appears in no tool's help, and would be silently lost the moment someone edited a placeholder out of the prose around it.
 
 ### Exclusive channel prose
 
 `context_mode` decides whether a level's prose joins what came before it or stands alone. It accepts `extend`, the default, and `exclusive`, and it may be declared on a group, on a topic entry, and on a direct sender.
 
-Exclusivity cuts every prose layer above the level that declares it, and never a layer below. A topic set to `exclusive` answers with its own prose alone — the room's overlay, service `context.md`, and project `worker.md` all drop away. A group set to `exclusive` drops both project-level documents while its topics still add their own lines on top of the room's. The daemon-owned job protocol and resolved request state remain.
+Exclusivity cuts every prose layer above the level that declares it, and never a layer below. A topic set to `exclusive` answers with its own prose alone — the room's overlay and `context.md` drop away. A group set to `exclusive` drops `context.md` while its topics still add their own lines on top of the room's. Resolved request state remains, and so does `delegation.md`: whether this requester can hand work off is a fact about the register rather than a choice about prose.
 
 ```json
 {
@@ -493,9 +511,9 @@ Exclusivity cuts every prose layer above the level that declares it, and never a
 }
 ```
 
-An exclusive channel takes over everything `context.md` and `worker.md` were saying: who the assistant is, how it is addressed, how it introduces itself, how it treats history, project-specific working guidance, and when to report progress. Write those into the channel's own prose, or the channel will not have them.
+An exclusive channel takes over everything `context.md` was saying: who the assistant is, how it is addressed, how it introduces itself, how it treats history, and when to report progress. Write those into the channel's own prose, or the channel will not have them.
 
-What exclusivity never removes is the daemon-resolved state that a worker needs to answer at all — the channel and its id, participants and roles, active settings, tool authority, delivery, and the progress command for this request. The progress command is a fact about the request rather than prose, so it is stated in the channel state block whenever the prose does not already name it, and prose naming it in either spelling is rewritten to the real command wherever that prose came from.
+What exclusivity never removes is the daemon-resolved state a worker needs to answer at all — the channel and its id, participants and roles, active settings, tool authority, delivery, and the commands this run may need. Those are facts about the request rather than prose, so they are stated in the channel state block every time and no channel can drop them.
 
 ## Worker Project Routing
 

@@ -4184,8 +4184,12 @@ def _service_context_path(root: Path) -> Path:
     return _service_dir(root) / "context.md"
 
 
-def _service_worker_context_path(root: Path) -> Path:
-    return _service_dir(root) / "worker.md"
+def _service_delegation_path(root: Path) -> Path:
+    return _service_dir(root) / "delegation.md"
+
+
+def _service_job_worker_path(root: Path) -> Path:
+    return _service_dir(root) / "job-worker.md"
 
 
 def _service_voice_context_path(root: Path) -> Path:
@@ -4524,16 +4528,14 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     _require_service_envelope(root)
     settings_template = _service_template("settings.json")
     context_template = _service_template("context.md")
-    worker_template = _service_template("worker.md")
+    delegation_template = _service_template("delegation.md")
+    job_worker_template = _service_template("job-worker.md")
     voice_template = _service_template("voice-agent.md")
     _require_service_bundle_files(
-        settings_template, context_template, worker_template, voice_template)
+        settings_template, context_template, delegation_template,
+        job_worker_template, voice_template)
     target = _service_dir(root)
     target.mkdir(parents=True, exist_ok=True)
-    settings_path = _service_settings_path(root)
-    context_path = _service_context_path(root)
-    worker_path = _service_worker_context_path(root)
-    voice_path = _service_voice_context_path(root)
     written = []
     skipped = []
 
@@ -4563,13 +4565,15 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     else:
         skipped.append(f"{adapter.source}:telegram/context")
 
-    if force or adapter.document_read(NAME, "worker") is None:
-        adapter.document_put(NAME, "worker", worker_template.read_text(),
-                             author="telegram service init",
-                             media_type="text/markdown")
-        written.append(f"{adapter.source}:telegram/worker")
-    else:
-        skipped.append(f"{adapter.source}:telegram/worker")
+    for key, template in (("delegation", delegation_template),
+                          ("job-worker", job_worker_template)):
+        if force or adapter.document_read(NAME, key) is None:
+            adapter.document_put(NAME, key, template.read_text(),
+                                 author="telegram service init",
+                                 media_type="text/markdown")
+            written.append(f"{adapter.source}:telegram/{key}")
+        else:
+            skipped.append(f"{adapter.source}:telegram/{key}")
 
     if force or adapter.document_read(NAME, "voice-agent") is None:
         adapter.document_put(NAME, "voice-agent", voice_template.read_text(),
@@ -4868,7 +4872,8 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
         "daemon": str(_service_daemon()),
         "settings": str(_service_settings_path(root)),
         "context": str(_service_context_path(root)),
-        "worker_context": str(_service_worker_context_path(root)),
+        "delegation": str(_service_delegation_path(root)),
+        "job_worker": str(_service_job_worker_path(root)),
         "voice_context": str(_service_voice_context_path(root)),
         "session": str(paths["session"]),
         "state_dir": str(paths["state"]),
@@ -4905,7 +4910,8 @@ def _service_env(root: Path, cfg: dict, paths: dict[str, Path],
     env["CAPABILITIES_PROJECT_ENVELOPE"] = str(envelope)
     env["TELEGRAM_SERVICE_SETTINGS"] = str(_service_settings_path(root))
     env["TELEGRAM_SERVICE_CONTEXT"] = str(_service_context_path(root))
-    env["TELEGRAM_SERVICE_WORKER_CONTEXT"] = str(_service_worker_context_path(root))
+    env["TELEGRAM_SERVICE_DELEGATION"] = str(_service_delegation_path(root))
+    env["TELEGRAM_SERVICE_JOB_WORKER"] = str(_service_job_worker_path(root))
     env["TELEGRAM_SERVICE_VOICE_CONTEXT"] = str(_service_voice_context_path(root))
     account_id = _service_account_id(cfg)
     control = _service_control_paths(account_id)
@@ -5336,6 +5342,7 @@ def main() -> None:
     pjobs = sub.add_parser(
         "jobs", help="the register of work that outlives a conversation")
     jb = pjobs.add_subparsers(dest="jobs_cmd", required=True)
+    jb.add_parser("help", help="print this surface: every verb and its flags")
 
     def job_scope(parser, *, needs_id=True):
         if needs_id:
@@ -5440,6 +5447,11 @@ def main() -> None:
         _emit(cmd_transcribe(args.json_path, args.force, args.model))
         return
     if args.cmd == "jobs":
+        # A prompt names this command rather than listing its verbs, so the
+        # surface has to answer for itself.
+        if args.jobs_cmd == "help":
+            pjobs.print_help()
+            return
         # The register is a table, not a session: this reaches the store and
         # never opens Telegram, so it runs before any connection is loaded.
         chat, topic = args.chat, args.topic_id
