@@ -2286,18 +2286,23 @@ def _is_voice_or_video_note(message):
 def _delegation_allowed(policy, sender_id=None):
     """Whether this channel may hand work to a runner.
 
-    Delegation is on where nothing says otherwise, because a job is ordinary
-    work and most channels want it. A channel that must answer synchronously -
-    a room where the assistant only talks to a client - turns it off, and then
-    the register is not offered to that turn at all: no verbs, no block, and
-    nothing in the prompt about work it cannot start.
+    Delegation is off where nothing says otherwise. A runner outlives the turn
+    that started it, spends a fresh rollout, and answers into the room later
+    under the assistant's own name - so a channel gets that reach because
+    someone wrote it down, never because a default carried it in. The narrower
+    setting is the safe one to arrive at by silence.
+
+    A channel that wants the register says so - on the group, on the user, or
+    in `defaults` for every channel at once. Where nothing does, the register
+    is not offered to that turn at all: no verbs, no block, and nothing in the
+    prompt about work it cannot start.
     """
     for source in (policy, ALLOWED.get(str(sender_id)) if sender_id else None,
                    DEFAULTS):
         mode = ((source or {}).get("delegation") or {}).get("mode")
         if mode is not None:
             return str(mode).strip().lower() in ("allowed", "on", "enabled", "auto")
-    return True
+    return False
 
 
 def _voice_transcription_mode(policy, reg, key):

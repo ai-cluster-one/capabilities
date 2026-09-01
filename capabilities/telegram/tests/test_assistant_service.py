@@ -4708,11 +4708,11 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("the choice is yours", prompt)
 
     async def test_a_channel_without_delegation_is_told_nothing_about_jobs(self):
-        """A room that must answer synchronously is not offered the register at
-        all: no verbs, and nothing about work it cannot start."""
+        """A channel reaches the register only where something says so: silence
+        offers no verbs, and nothing about work it cannot start."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            self.assertTrue(daemon._delegation_allowed(None))
+            self.assertFalse(daemon._delegation_allowed(None))
             self.assertFalse(daemon._delegation_allowed(
                 {"delegation": {"mode": "disabled"}}))
             self.assertTrue(daemon._delegation_allowed(
@@ -4721,6 +4721,16 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
                 [], {"chat_id": 5, "jobs_available": False})
             self.assertNotIn("--- Registered jobs ---", prompt)
             self.assertNotIn("jobs submit", prompt)
+
+    async def test_a_channel_default_can_open_delegation_for_every_room(self):
+        """`defaults` opens every channel at once, and a room closes itself
+        again under it — the nearer setting is the one that decides."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(delegation={"mode": "allowed"}))
+            self.assertTrue(daemon._delegation_allowed(None))
+            self.assertFalse(daemon._delegation_allowed(
+                {"delegation": {"mode": "disabled"}}))
 
     async def test_a_channel_default_can_close_delegation_for_every_room(self):
         with tempfile.TemporaryDirectory() as td:

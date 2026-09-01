@@ -168,7 +168,10 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         dispatch is stale by the time it is read. The worker is told where to
         ask instead."""
         with tempfile.TemporaryDirectory() as td:
-            daemon = self.daemon_with_store(td)
+            # The block is offered where delegation is turned on, so a test
+            # about what the block says turns it on.
+            daemon = self.daemon_with_store(
+                td, delegation={"mode": "allowed"})
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
             row = queued(register, channel_key="123", requested_by="777",
@@ -213,6 +216,41 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("open_jobs", seen["state"])
             self.assertNotIn("job_outbox", seen["state"])
             hold.set()
+            await self.stop_session(client, task)
+
+    async def test_a_reachable_register_is_still_not_offered_by_default(self):
+        """A live register is not the same as permission to use it. Where
+        nothing turns delegation on, the turn is told nothing about the queue
+        and answers where it stands - the store being openable changes neither
+        half."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            self.assertTrue(daemon.job_register() is not None,
+                            "the fixture's register must be reachable")
+            seen = {}
+
+            def worker(chat, tail, state=None, procs=None):
+                seen["state"] = dict(state or {})
+                seen["prompt"] = daemon.build_prompt(tail, state)
+                return successful_result("answered here")
+
+            daemon.WORKERS["stub"] = worker
+            message = Message(62, text="Assistant, what's the status")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(lambda: "prompt" in seen, timeout=6)
+
+            self.assertFalse(seen["state"]["jobs_available"])
+            self.assertNotIn("--- Registered jobs ---", seen["prompt"])
+            self.assertNotIn("jobs submit", seen["prompt"])
+            self.assertNotIn("the choice is yours", seen["prompt"])
+            # Silence closes the register, not the channel.
+            await wait_until(
+                lambda: any(item["text"] == "answered here"
+                            for item in client.sent), timeout=6)
             await self.stop_session(client, task)
 
     async def test_a_worker_turn_reaches_only_its_own_channels_jobs(self):
@@ -377,7 +415,10 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_amendment_keeps_the_row_and_continues_the_session(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = self.daemon_with_store(td)
+            # The block is offered where delegation is turned on, so a test
+            # about what the block says turns it on.
+            daemon = self.daemon_with_store(
+                td, delegation={"mode": "allowed"})
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
             row = queued(register, channel_key="123", requested_by="777",

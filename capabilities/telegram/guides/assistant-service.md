@@ -265,9 +265,11 @@ People never have to name the mechanism, and never hear it either: the register,
 
 The prompt itself is prose the daemon serves at request time, not a string in the code. `service/templates/jobs.md` is what the capability ships; a project that wants to iterate on the wording keeps its own `service/jobs.md`, or names another file in `defaults.jobs.prompt_file`, and that file replaces the shipped one. `{{TELEGRAM_JOBS_COMMAND}}` in either is rewritten to the shim path.
 
-### Turning delegation off
+### Turning delegation on
 
-A channel that must always answer synchronously — a room where the assistant only talks to a client — sets `delegation.mode` to `disabled` on that user or group, or in `defaults` for every channel. The register is then not offered to those turns at all: no block, no verbs, and nothing in the prompt about work they cannot start. Delegation is on where nothing says otherwise.
+Delegation is off where nothing says otherwise, so a channel reaches the register because someone wrote it down. A runner outlives the turn that started it, spends a fresh rollout, and answers into the room later under the assistant's own name; a channel gets that reach deliberately, never by inheriting a default.
+
+Set `delegation.mode` to `allowed` on a group, on a user, or in `defaults` to open every channel at once; the first of those three that names a mode decides. Setting it to `disabled` closes a channel again under a `defaults` that opened them all — a room where the assistant only talks to a client. Where nothing names a mode, the register is not offered to those turns at all: no block, no verbs, and nothing in the prompt about work they cannot start.
 
 Reference resolution remains prompt judgement because conversation meaning cannot be reduced to a channel lock. An explicit id or reply target wins. With one active job, an elliptical status question or continuation binds to it unless it is clearly standalone. With several, the worker uses either a unique semantic match or an immediately preceding exchange explicitly about one job; database recency alone never selects one. If the preceding exchange named several jobs, bare references such as “it”, “there” or “also” are ambiguous, so the worker asks a short clarification and makes no ledger write first. It does not guess or create a duplicate. A separate requested outcome is a new job.
 
