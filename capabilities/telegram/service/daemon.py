@@ -3,8 +3,8 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "telethon==1.43.2",
-#     "py-tgcalls==3.0.0.dev5",
-#     "ntgcalls==3.0.0b19",
+#     "py-tgcalls==3.0.0.dev6",
+#     "ntgcalls==3.0.0b20",
 #     "google-genai>=1.36.0",
 # ]
 # ///
@@ -12,10 +12,17 @@
 # CallConfig(conference=<invite message id>), which 2.x does not accept.
 # ntgcalls is pinned explicitly because inbound audio arrives only from b15 on
 # (ntgcalls#52). dev5 is the first release carrying the three defects this
-# capability used to work around: pytgcalls/pytgcalls#334, #335 and #336.
-# b19 is the first release carrying the fixes for ntgcalls#61 - a conference
-# SIGSEGV when an incoming audio channel is removed - and ntgcalls#62, the
+# capability used to work around: pytgcalls/pytgcalls#334, #335 and #336, and
+# dev6 adds pytgcalls#332: the library now waits for the conference chain on
+# its own and raises ConferenceChainNotReady instead of reading an empty answer
+# as a request to create a conference of its own.
+# b19 carried the first fix for ntgcalls#61 - a conference SIGSEGV when an
+# incoming audio channel is removed - and the fix for ntgcalls#62, the
 # lock-order inversion that wedged the whole interpreter beside a live call.
+# b20 carries the second fix for #61, on the data races in the incoming channel
+# maps, which is the one aimed at what actually triggers the fault here: a
+# participant whose channel is torn down and rebuilt over and over. b19 still
+# faulted on 2026-08-31, on a call with 26 such cycles in eighteen minutes.
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
 
@@ -142,6 +149,17 @@ CONFERENCE_CHAIN_SETTLE_STEP = 2.0
 CONFERENCE_CHAIN_SETTLE_MIN = 4.0
 CONFERENCE_CHAIN_SETTLE_BUDGET = 12.0
 CONFERENCE_EMPTY_ANSWERS = 2
+# A join carries the block the chain ended on when it was read, and Telegram
+# refuses it with CONF_WRITE_CHAIN_INVALID once the chain has moved past it.
+# The block is not stale in any way this account can see beforehand - on
+# 2026-08-31 invite 2367 read a 412-byte block in 0.1s, was refused, and the
+# same caller's next invite forty-five seconds later joined on a 508-byte one.
+# So the answer is to read the chain again and offer what it ends on now, which
+# is cheap; what it must not do is loop, because each attempt writes to the
+# chain it is trying to catch.
+CONFERENCE_JOIN_CHAIN_RETRIES = 2
+CONFERENCE_JOIN_CHAIN_RETRY_DELAY = 1.0
+CONFERENCE_CHAIN_INVALID = "CONF_WRITE_CHAIN_INVALID"
 # What a process that died mid-call leaves behind, and what the next one makes
 # of it. The capture stops at the moment of death, so its own last-modified time
 # is when the call was still being recorded: a restart that lands inside the
@@ -876,6 +894,37 @@ def apply_media_log_level():
 
 
 apply_media_log_level()
+
+
+async def join_conference_on_a_current_chain(prepare, join, leave,
+                                             attempts=None, delay=None):
+    """Join a conference, answering a refused chain by reading it again.
+
+    Every attempt reads the chain first, so a second one offers the block the
+    conference ends on at that moment rather than the block the server has
+    already refused. Only that refusal is retried: every other failure is the
+    call not being joinable at all, and asking again would spend the seconds the
+    caller is still waiting in. The previous attempt is left before the next one
+    starts, because the failed join is what the account has to stop being part
+    of before it can join as anything else.
+    """
+    if attempts is None:
+        attempts = CONFERENCE_JOIN_CHAIN_RETRIES + 1
+    if delay is None:
+        delay = CONFERENCE_JOIN_CHAIN_RETRY_DELAY
+    for attempt in range(1, attempts + 1):
+        await prepare()
+        try:
+            return await join()
+        except Exception as exc:
+            if CONFERENCE_CHAIN_INVALID not in str(exc) or attempt == attempts:
+                raise
+            log(f"call: conference join refused — the chain moved past the "
+                f"block it was offered ({CONFERENCE_CHAIN_INVALID}); reading it "
+                f"again, attempt {attempt + 1} of {attempts}")
+            with contextlib.suppress(Exception):
+                await leave()
+            await asyncio.sleep(delay)
 
 
 async def settle_conference_chain(invite_msg_id, block, waited, read_block):
@@ -6417,8 +6466,6 @@ async def run_session(client):
             return (STATE_HOME / "telegram" / CONNECTION / "calls" / "recordings"
                     / f"{timestamp}-{mode}-{caller_id}.ogg")
 
-        library_last_block = calls._app._bind_client.get_conference_last_block
-
         async def read_chain_last_block(invite_msg_id: int):
             """Ask once for the last block of a conference's chain."""
             result = await client(GetGroupCallChainBlocksRequest(
@@ -6428,24 +6475,16 @@ async def run_session(client):
                       for b in getattr(u, "blocks", None) or []]
             return blocks[-1] if blocks else None
 
-        async def conference_last_block(chat_id: int, invite_msg_id=None):
+        async def conference_last_block(invite_msg_id: int):
             """Wait for the last block of a conference's chain to exist.
 
             Joining an E2EE conference means deriving a block from the chain the
-            other participants already signed. The invite arrives before that
-            chain has anything in it — a conference grown out of a running 1:1
-            call is still being built when its service message lands — and the
-            library reads the chain exactly once, then reads an empty answer as
-            a request to create a new conference and invite the caller into it.
-            Reading until a block appears is what makes the join reachable.
-
-            Only a read made against an invite is corrected here. The library
-            asks for this chain on its own path too, without an invite, and
-            answers that from the cached call — forcing an invite request there
-            costs a direct call its answer, because the failure retries beneath
-            it outlive the window to pick the call up."""
-            if not invite_msg_id:
-                return await library_last_block(chat_id, invite_msg_id)
+            other participants already signed, and the invite arrives before
+            that chain has anything in it: a conference grown out of a running
+            1:1 call is still being built when its service message lands.
+            Reading until a block appears is what makes the join reachable, and
+            what a chain that never fills means is decided by the caller of
+            this."""
             deadline = time.monotonic() + CONFERENCE_CHAIN_TIMEOUT
             started = time.monotonic()
             reads = 0
@@ -6463,9 +6502,15 @@ async def run_session(client):
                     return None
                 await asyncio.sleep(CONFERENCE_CHAIN_INTERVAL)
 
-        # The join runs inside the library, so the corrected reader has to be the
-        # one it calls.
-        calls._app._bind_client.get_conference_last_block = conference_last_block
+        # The library's own reader is left alone. Until py-tgcalls dev6 it read
+        # the chain exactly once and took an empty answer as a request to create
+        # a conference of its own, so this account replaced it with the waiting
+        # reader above; dev6 waits on its own, half a second at a time, and
+        # raises ConferenceChainNotReady instead. Keeping ours underneath that
+        # loop would nest one wait inside the other - up to twice
+        # CallConfig.timeout attempts, each holding for CONFERENCE_CHAIN_TIMEOUT
+        # - which is minutes of a join nobody is still waiting through. The wait
+        # that matters happens before the join, in require_conference_chain.
 
         async def require_conference_chain(caller_id: int, invite_msg_id: int):
             """Join a conference only on a chain that has stopped moving.
@@ -6482,7 +6527,7 @@ async def run_session(client):
             """
             started = time.monotonic()
             try:
-                block = await conference_last_block(caller_id, invite_msg_id)
+                block = await conference_last_block(invite_msg_id)
             except Exception as exc:
                 raise RuntimeError(
                     f"conference chain unreadable for invite {invite_msg_id} — "
@@ -6609,8 +6654,16 @@ async def run_session(client):
 
             try:
                 if mode == "conference":
-                    await require_conference_chain(caller_id, call_config.conference)
-                await calls.record(caller_id, RecordStream(capture), config=call_config)
+                    await join_conference_on_a_current_chain(
+                        prepare=lambda: require_conference_chain(
+                            caller_id, call_config.conference),
+                        join=lambda: calls.record(
+                            caller_id, RecordStream(capture),
+                            config=call_config),
+                        leave=lambda: calls.leave_call(caller_id))
+                else:
+                    await calls.record(caller_id, RecordStream(capture),
+                                       config=call_config)
                 metadata["status"] = "recording"
                 metadata["recording_started_at"] = iso_utc()
                 write_metadata(metadata_path, metadata)
@@ -6628,14 +6681,26 @@ async def run_session(client):
                     # Two different things go wrong here and the caller can act
                     # on only one of them. A conference that never came into
                     # existence is not one this account failed to join.
-                    notice = (
-                        "Конференция не создалась — Telegram не довёл перевод "
-                        "звонка в групповой, это у него бывает через раз. "
-                        "Я в неё не заходил. Перезвони и позови снова."
-                        if "empty" in str(exc) else
-                        "Не подключился к конференции: она всё ещё собиралась, "
-                        "я подождал сколько мог. Позови ещё раз через "
-                        "несколько секунд.")
+                    # A chain that never filled is named by this account's own
+                    # pre-check and, if it empties between that and the join, by
+                    # the library's ConferenceChainNotReady.
+                    if ("empty" in str(exc)
+                            or type(exc).__name__ == "ConferenceChainNotReady"):
+                        notice = (
+                            "Конференция не создалась — Telegram не довёл "
+                            "перевод звонка в групповой, это у него бывает "
+                            "через раз. Я в неё не заходил. Перезвони и позови "
+                            "снова.")
+                    elif CONFERENCE_CHAIN_INVALID in str(exc):
+                        notice = (
+                            "Не смог зайти в конференцию: Telegram отклонил "
+                            "вход, конференция менялась быстрее, чем я успевал "
+                            "зайти. Позови ещё раз.")
+                    else:
+                        notice = (
+                            "Не подключился к конференции: она всё ещё "
+                            "собиралась, я подождал сколько мог. Позови ещё раз "
+                            "через несколько секунд.")
                     with contextlib.suppress(Exception):
                         await client.send_message(caller_id, notice)
                 metadata.update({

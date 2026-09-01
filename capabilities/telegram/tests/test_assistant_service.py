@@ -5170,6 +5170,80 @@ class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("went empty", str(caught.exception))
 
 
+class ConferenceJoinChainRetryTests(unittest.IsolatedAsyncioTestCase):
+    """A join Telegram refuses because the chain moved past the block it was
+    offered is given the block that chain ends on now."""
+
+    REFUSAL = ("BadRequestError: RPCError 400: CONF_WRITE_CHAIN_INVALID "
+               "(caused by JoinGroupCallRequest)")
+
+    def parts(self, daemon, refusals, other=None):
+        """A join refused `refusals` times, and the counters to prove it."""
+        daemon.CONFERENCE_JOIN_CHAIN_RETRY_DELAY = 0.0
+        counts = {"prepare": 0, "join": 0, "leave": 0}
+
+        async def prepare():
+            counts["prepare"] += 1
+
+        async def join():
+            counts["join"] += 1
+            if other is not None:
+                raise RuntimeError(other)
+            if counts["join"] <= refusals:
+                raise RuntimeError(self.REFUSAL)
+            return "joined"
+
+        async def leave():
+            counts["leave"] += 1
+
+        return prepare, join, leave, counts
+
+    async def test_a_refused_chain_is_read_again_and_joined(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            prepare, join, leave, counts = self.parts(daemon, 1)
+
+            result = await daemon.join_conference_on_a_current_chain(
+                prepare, join, leave)
+
+            self.assertEqual("joined", result)
+            # The chain is read again before the second attempt, which is the
+            # whole point: the refused block is not offered twice.
+            self.assertEqual(2, counts["prepare"])
+            self.assertEqual(2, counts["join"])
+            self.assertEqual(1, counts["leave"])
+            self.assertTrue(any("moved past the block" in line
+                                for line in daemon._test_logs))
+
+    async def test_a_chain_that_keeps_refusing_is_given_up_on(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            prepare, join, leave, counts = self.parts(daemon, 99)
+
+            with self.assertRaises(RuntimeError) as caught:
+                await daemon.join_conference_on_a_current_chain(
+                    prepare, join, leave)
+
+            self.assertIn("CONF_WRITE_CHAIN_INVALID", str(caught.exception))
+            self.assertEqual(daemon.CONFERENCE_JOIN_CHAIN_RETRIES + 1,
+                             counts["join"])
+
+    async def test_any_other_failure_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            prepare, join, leave, counts = self.parts(
+                daemon, 0, other="conference chain empty for invite 2367")
+
+            with self.assertRaises(RuntimeError):
+                await daemon.join_conference_on_a_current_chain(
+                    prepare, join, leave)
+
+            # A caller is waiting through every one of these attempts, so a
+            # failure the retry cannot address costs them nothing extra.
+            self.assertEqual(1, counts["join"])
+            self.assertEqual(0, counts["leave"])
+
+
 class OrphanedRecordingTests(unittest.IsolatedAsyncioTestCase):
     """A recording is closed by the process that opened it, so one that outlives
     its process is not still running."""
