@@ -3593,6 +3593,31 @@ def resumed_prompt(st):
     return "\n".join(lines)
 
 
+def _run_mode(st):
+    """One line naming the class of this run, in facts only.
+
+    The classes share their shape deliberately - same tail, same authority, same
+    progress channel - so nothing else in the prompt tells them apart, and a run
+    that cannot tell them apart is left inferring its own situation from chat
+    history. A registered job names the id it was submitted under and the message
+    it was registered from, because those are what tie it to the exchange that
+    started it. What any of this means for behaviour belongs to the prompts.
+    """
+    job = st.get("registered_job") or {}
+    if job.get("id"):
+        bits = [f"registered job {job['id']}"]
+        if job.get("attempt"):
+            bits.append(f"attempt {job['attempt']}")
+        if job.get("origin_message_id"):
+            bits.append(f"registered from message #{job['origin_message_id']}")
+        if job.get("amendments"):
+            bits.append(f"{job['amendments']} amendment(s)")
+        return ", ".join(bits)
+    if st.get("voice_task"):
+        return f"voice call task {st['voice_task']}"
+    return "dialogue turn"
+
+
 def build_prompt(tail, state=None):
     """Assemble the worker prompt: service context + optional project worker
     context + daemon-resolved channel state and request + the live tail. State
@@ -3628,6 +3653,8 @@ def build_prompt(tail, state=None):
     if channel_context:
         channel_context = "--- Channel-specific context ---\n" + channel_context + "\n\n"
     lines = []
+    # Which run this is, stated before anything else about it.
+    lines.append("Run: " + _run_mode(st))
     if st.get("now"):
         lines.append(f"Time: {st['now']}")
     if st.get("chat_id"):
@@ -5897,7 +5924,9 @@ async def run_session(client):
                      "current_request": current_request,
                      "registered_job": {"id": job_id,
                                         "description": row["description"],
-                                        "amendments": row["amendments"]},
+                                        "amendments": row["amendments"],
+                                        "attempt": row.get("attempt"),
+                                        "origin_message_id": row.get("origin_message_id")},
                      "authority": authority,
                      "authority_context": authority_context,
                      "progress_outbox": str(progress_outbox),
@@ -6946,6 +6975,7 @@ async def run_session(client):
                              },
                              "authority": authority,
                              "authority_context": authority_context,
+                             "voice_task": task_id,
                              "progress_outbox": str(progress_outbox),
                              "on_worker_line": (_offer_stage if on_progress is not None
                                                 else None),
