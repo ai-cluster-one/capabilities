@@ -15,6 +15,11 @@
       "payload_sha256": "0f2ffd0f7f6b6c7f966ec505da48efc1dee1965e7c3ad451ff12c639aff9b6cf",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
+    "calendar": {
+      "path": "capabilities/calendar",
+      "payload_sha256": "4490a48c2b23abcd02b952280d756e0f3f31a5751bed4bee14c37fa5434a5f1e",
+      "summary": "CalDAV CLI for remote calendars — list calendars, read, search and check busy blocks, and book events on a principal."
+    },
     "callva": {
       "path": "capabilities/callva",
       "payload_sha256": "cc795daa5cad48898a4d484081b8396dabdad0971a8dba2e8694efa3e8113a8a",
