@@ -3127,11 +3127,11 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
     if required:
         lines += ["# Required by active capability services."]
         lines += [f"{key}=" for key in sorted(required)]
+    if required and optional:
         lines.append("")
     if optional:
         lines += ["# Optional capability-service settings."]
         lines += [f"{key}={optional[key]}" for key in sorted(optional)]
-        lines.append("")
     return "\n".join(lines) + "\n"
 
 

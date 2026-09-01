@@ -194,3 +194,11 @@ def test_the_image_name_is_stated_once(tmp_path: Path) -> None:
         assignments = [line for line in (root / ".env.example").read_text().splitlines()
                        if line.startswith("AGENT_IMAGE=")]
         assert assignments == ["AGENT_IMAGE=agent-box"], (profile, assignments)
+
+
+def test_env_example_ends_with_exactly_one_newline(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env, "agent-box-checkout")
+    body = (root / ".env.example").read_text()
+    assert body.endswith("\n")
+    assert not body.endswith("\n\n")
