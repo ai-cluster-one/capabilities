@@ -4432,6 +4432,34 @@ def discover_codex_images(thread_id):
     return images
 
 
+# A project's session hook is what keeps generated context level with the body it
+# is compiled from, and the engine runs one only against persisted hook trust.
+# Granting that trust is an interactive act, so a daemon never has it, and the
+# refusal is silent: the hook is skipped and the turn answers from whatever the
+# last interactive run left on disk. The bypass gives away nothing here - the
+# same command already runs with approvals and sandbox off, so a hook can do
+# nothing this turn could not do anyway.
+_CODEX_HOOK_TRUST = None
+
+
+def codex_hook_trust():
+    """The bypass flag, asked of the engine once rather than assumed.
+
+    An engine that predates the flag exits on it before reaching the model, which
+    would take every turn with it, so support is read from its own help and the
+    answer is kept for the life of the process."""
+    global _CODEX_HOOK_TRUST
+    if _CODEX_HOOK_TRUST is None:
+        flag = "--dangerously-bypass-hook-trust"
+        try:
+            offered = subprocess.run(["codex", "exec", "--help"],
+                                     capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            offered = ""
+        _CODEX_HOOK_TRUST = [flag] if flag in offered else []
+    return _CODEX_HOOK_TRUST
+
+
 def worker_codex(chat, tail, state=None, procs=None):
     """Headless `codex exec`. Full access (bypass
     approvals+sandbox) mirrors the claude worker's; --skip-git-repo-check because /app is not
@@ -4449,10 +4477,12 @@ def worker_codex(chat, tail, state=None, procs=None):
             cmd = ["codex", "exec", "resume", str(resume_session),
                    build_prompt(tail, state),
                    "--dangerously-bypass-approvals-and-sandbox",
+                   *codex_hook_trust(),
                    "--skip-git-repo-check", "--json", "-o", out]
         else:
             cmd = ["codex", "exec", build_prompt(tail, state),
                    "--dangerously-bypass-approvals-and-sandbox",
+                   *codex_hook_trust(),
                    "--skip-git-repo-check", "--json", "--color", "never", "-o", out]
         model = ((state or {}).get("settings") or {}).get("model")
         if model:

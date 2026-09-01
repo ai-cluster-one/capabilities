@@ -524,6 +524,53 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["meta"]["session_id"], "thread-1")
             self.assertEqual(result["meta"]["tokens"]["output"], 0)
 
+    async def test_codex_is_told_to_run_the_hooks_no_daemon_can_have_trusted(self):
+        """Hook trust is granted interactively, so a daemon never holds any, and
+        a project's session hook is skipped in silence without the bypass."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            stdout = "\n".join([
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps({"type": "turn.completed", "usage": {}}),
+            ])
+            seen = {}
+
+            def capture(_key, cmd, *_args, **_kwargs):
+                seen["cmd"] = cmd
+                return (0, stdout, "")
+
+            with mock.patch.object(
+                    daemon.subprocess, "run",
+                    return_value=SimpleNamespace(
+                        stdout="  --dangerously-bypass-hook-trust\n")):
+                with mock.patch.object(daemon, "run_worker_proc", side_effect=capture):
+                    daemon.worker_codex("123", [], {}, {})
+
+            self.assertIn("--dangerously-bypass-hook-trust", seen["cmd"])
+
+    async def test_an_engine_that_never_heard_of_the_bypass_is_not_given_it(self):
+        """The flag reaches the model only on engines that know it; an older one
+        exits on an unknown argument and would take every turn with it."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            stdout = "\n".join([
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps({"type": "turn.completed", "usage": {}}),
+            ])
+            seen = {}
+
+            def capture(_key, cmd, *_args, **_kwargs):
+                seen["cmd"] = cmd
+                return (0, stdout, "")
+
+            with mock.patch.object(
+                    daemon.subprocess, "run",
+                    return_value=SimpleNamespace(stdout="  --skip-git-repo-check\n")):
+                with mock.patch.object(daemon, "run_worker_proc", side_effect=capture):
+                    daemon.worker_codex("123", [], {}, {})
+
+            self.assertNotIn("--dangerously-bypass-hook-trust", seen["cmd"])
+
     async def test_the_reported_codex_failure_is_the_one_codex_gave(self):
         """codex prints a routine line to stderr on every run and reports its
         actual refusal as a protocol event. Reading the first stderr line named
