@@ -585,7 +585,12 @@ class OutboundActionsTests(unittest.TestCase):
             self.assertTrue(shim._is_jobs_help(asking), asking)
         for acting in (["jobs", "active"],
                        ["jobs", "register", "help me with this"],
-                       ["jobs", "show", "12"]):
+                       ["jobs", "show", "12"],
+                       # Only the verb slot and the flag right after it are
+                       # read. Anything further along is text somebody wrote,
+                       # and it does not get to decide whether a call is scoped.
+                       ["jobs", "register", "--", "-h"],
+                       ["jobs", "amend", "12", "--help"]):
             self.assertFalse(shim._is_jobs_help(acting), acting)
 
     def test_worker_jobs_are_pinned_to_the_authorized_channel(self):

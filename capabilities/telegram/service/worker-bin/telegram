@@ -115,10 +115,14 @@ def _is_jobs_help(passthrough):
 
     A help request takes no chat, no actor and no job: the parsers that answer
     it accept none of the flags the shim adds, so adding them turns the one
-    command the prompts name into an argument error. Both spellings count -
-    the `help` verb, and `-h` on any verb."""
+    command the prompts name into an argument error.
+
+    Only the two positions a help request can occupy are read - the verb slot
+    and the flag slot right after it - never the whole line. Everything further
+    along is an argument someone wrote, and whether the shim scopes a call is
+    not a decision to take from text a person supplied."""
     return (passthrough[1:2] == ["help"]
-            or any(item in ("-h", "--help") for item in passthrough[1:]))
+            or any(item in ("-h", "--help") for item in passthrough[1:3]))
 
 
 def job_scope_arguments(argv):
