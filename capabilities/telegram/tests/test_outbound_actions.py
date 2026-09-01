@@ -593,6 +593,31 @@ class OutboundActionsTests(unittest.TestCase):
                        ["jobs", "amend", "12", "--help"]):
             self.assertFalse(shim._is_jobs_help(acting), acting)
 
+    def test_the_scope_goes_where_it_parses(self):
+        """A description starting with a dash travels after `--`, and everything
+        after that marker is positional. Scope appended to the tail would arrive
+        as extra positional arguments and kill the call, so it goes in right
+        after the verb, ahead of anything the requester wrote."""
+        shim = import_worker_shim()
+        with mock.patch.dict(os.environ, self._worker_env(Path("/dev/null")),
+                             clear=False):
+            self.assertEqual(
+                shim.scoped_jobs_argv(["jobs", "register", "--", "-h"],
+                                      ["telegram", "jobs", "register", "--", "-h"]),
+                ["jobs", "register", "--chat", "-1001", "--topic-id", "77",
+                 "--actor", "777", "--requested-by", "777",
+                 "--origin-message-id", "88", "--engine", "codex",
+                 "--model", "gpt-test", "--", "-h"])
+            self.assertEqual(
+                shim.scoped_jobs_argv(["jobs", "show", "12"],
+                                      ["telegram", "jobs", "show", "12"]),
+                ["jobs", "show", "--chat", "-1001", "--topic-id", "77",
+                 "--actor", "777", "12"])
+            # A help request is never scoped, so it is never reordered either.
+            self.assertEqual(shim.scoped_jobs_argv(["jobs", "help"],
+                                                   ["telegram", "jobs", "help"]),
+                             ["jobs", "help"])
+
     def test_worker_jobs_are_pinned_to_the_authorized_channel(self):
         """`jobs` reaches the register directly, so what the shim owns is the
         scope: the authorized chat and topic are appended, and a turn that names
@@ -654,12 +679,15 @@ class OutboundActionsTests(unittest.TestCase):
 
             invoked = [execvp.call_args.args[0]] + list(
                 execvp.call_args.args[1])[1:]
+            # The scope sits between the verb and what the requester wrote, so
+            # a description passed after `--` still parses as a description.
             self.assertEqual(invoked, [
-                "/real/telegram", "jobs", "register", "Count every topic",
+                "/real/telegram", "jobs", "register",
                 "--chat", "-1001", "--topic-id", "77",
                 "--actor", "777", "--requested-by", "777",
                 "--origin-message-id", "88", "--engine", "codex",
                 "--model", "gpt-test",
+                "Count every topic",
             ])
             # Registering only opens a draft. The turn that wrote it still has
             # questions to ask, so nothing tells the daemon to end it yet.

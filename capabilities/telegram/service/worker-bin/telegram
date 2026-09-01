@@ -125,6 +125,19 @@ def _is_jobs_help(passthrough):
             or any(item in ("-h", "--help") for item in passthrough[1:3]))
 
 
+def scoped_jobs_argv(passthrough, argv):
+    """A worker `jobs` call with this turn's scope put where it parses.
+
+    The scope goes in right after the verb rather than at the end. A description
+    that begins with a dash is passed after `--`, and everything following that
+    marker is positional - so flags appended to the tail arrive as extra
+    positional arguments and the call dies on them instead of running scoped.
+    """
+    if passthrough[:1] != ["jobs"] or _is_jobs_help(passthrough):
+        return passthrough
+    return passthrough[:2] + job_scope_arguments(argv) + passthrough[2:]
+
+
 def job_scope_arguments(argv):
     """The scope and attribution the shim adds to a worker `jobs` call."""
     allowed_chat, allowed_topic, _ = worker_scope()
@@ -341,8 +354,7 @@ def main():
     if worker_session and "--session" not in sys.argv[1:] and not cross_connection:
         args.extend(["--session", worker_session])
     passthrough = list(sys.argv[1:])
-    if passthrough[:1] == ["jobs"] and not _is_jobs_help(passthrough):
-        passthrough += job_scope_arguments(sys.argv)
+    passthrough = scoped_jobs_argv(passthrough, sys.argv)
     if passthrough[:2] == ["jobs", "submit"]:
         return run_job_handoff(
             args + passthrough, os.environ.get("TELEGRAM_PROGRESS_OUTBOX"))
