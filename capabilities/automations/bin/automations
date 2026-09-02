@@ -85,9 +85,11 @@ Agents:
   `sonnet`, `opus` and `haiku` ship with the capability and a project adds its
   own, including codex profiles, under [agents.workers.<name>]. A profile names
   engine, model, effort, mode and timeout_seconds. `mode = "read"` fences the
-  turn to reading the project; `mode = "write"` lets it change files, which a
-  scheduled job does unattended, so it is declared per profile and never the
-  shipped default.
+  turn to reading the project; `mode = "write"` lets it change files; `mode =
+  "act"` drops the sandbox entirely, for a worker whose job is to operate tools
+  that reach the network and write outside the project. Neither of the last two
+  is a shipped default: a scheduled job runs unattended, so the authority it
+  holds is declared per profile and read at a glance.
 
 I/O contract:
   Success is JSON on stdout. Failure is {"error": {"code", "message", "hint"?}}
@@ -3226,8 +3228,20 @@ def _agent_command(profile: dict[str, Any], root: Path, schema: Path | None,
                "-C", str(root),
                "--skip-git-repo-check",
                "--json",
-               "-o", str(answer_file),
-               "-s", "read-only" if profile["mode"] == "read" else "workspace-write"]
+               "-o", str(answer_file)]
+    if profile["mode"] == "act":
+        # A worker that operates tools rather than files needs the machine those
+        # tools run on: a CLI reaches the network, writes a session file outside
+        # the project, and warms a package cache in the user's home. Codex's
+        # workspace sandbox permits none of that, and refuses silently enough
+        # that the turn reports success having done nothing. So `act` drops the
+        # sandbox, which is the authority the assistant's own daemons already
+        # run with - and it is a separate mode precisely so that declaring
+        # `write` for a file-editing job never hands out the machine by
+        # accident.
+        command += ["--dangerously-bypass-approvals-and-sandbox"]
+    else:
+        command += ["-s", "read-only" if profile["mode"] == "read" else "workspace-write"]
     if profile["effort"]:
         command += ["-c", f"model_reasoning_effort={profile['effort']}"]
     if profile["service_tier"]:

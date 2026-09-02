@@ -26,7 +26,7 @@ FINAL_STATUSES = ("succeeded", "failed", "canceled", "interrupted", "skipped")
 ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 AGENT_ENGINES = ("claude", "codex")
-AGENT_MODES = ("read", "write")
+AGENT_MODES = ("read", "write", "act")
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 AGENT_KEYS = frozenset(
     {"engine", "model", "effort", "mode", "timeout_seconds", "service_tier"}
