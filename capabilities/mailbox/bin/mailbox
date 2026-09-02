@@ -105,8 +105,12 @@ Commands:
   mailbox move <uid> --to-folder F            Move a message to another folder
         [--folder F]                          (e.g. INBOX -> Archive).
   mailbox send --to A [--to B ...] --subject S
-        [--body TEXT | --body-file F | -]     Send a message. Body from
-        [--cc A ...] [--attach FILE ...]      --body, a file, or stdin.
+        [--body TEXT|- | --body-file F|-]     Send a message. Body from
+        [--cc A ...] [--attach FILE ...]      --body text, a file, or stdin
+                                              ('-' in either flag, or piping
+                                              with neither flag, reads stdin;
+                                              a missing --body-file path is
+                                              refused rather than sent).
         [--html MARKUP|F|- | --html-file F]   --html/--html-file adds an HTML
         [--in-reply-to MESSAGE-ID]            alternative beside that body, so
                                               the message carries both and each
@@ -2861,6 +2865,21 @@ def _read_body(src: str | None) -> str:
     return p.read_text() if p.exists() else src
 
 
+def _resolve_send_body(body: str | None, body_file: str | None) -> str:
+    if body is not None and body_file is not None:
+        _die(6, "ambiguous_body", "pass either --body or --body-file, not both")
+    if body is not None:
+        return sys.stdin.read() if body == "-" else body
+    if body_file is None or body_file == "-":
+        return sys.stdin.read()
+    p = Path(body_file)
+    if not p.exists():
+        _die(6, "body_file_not_found",
+             f"--body-file path does not exist: {body_file}",
+             "pass an existing file, '-' for stdin, or use --body TEXT")
+    return p.read_text()
+
+
 def _safe_filename(name: str | None, uid: str, idx: int, content_type: str) -> str:
     if not name:
         ext = mimetypes.guess_extension(content_type or "") or ".bin"
@@ -3615,7 +3634,7 @@ def main() -> None:
     sp.add_argument("--to", action="append", required=True)
     sp.add_argument("--cc", action="append", default=[])
     sp.add_argument("--subject", required=True)
-    sp.add_argument("--body", default=None)
+    sp.add_argument("--body", default=None, help="body text, or '-' for stdin")
     sp.add_argument("--body-file", default=None, help="file path or '-' for stdin")
     sp.add_argument("--html", default=None,
                     help="HTML alternative: markup, a file path, or '-' for stdin")
@@ -3663,7 +3682,7 @@ def main() -> None:
     elif args.cmd == "seen":
         _emit(cmd_seen(cfg, args.uid, args.folder, args.unsee))
     elif args.cmd == "send":
-        body = args.body if args.body is not None else _read_body(args.body_file)
+        body = _resolve_send_body(args.body, args.body_file)
         if args.html is not None and args.html_file is not None:
             _die(6, "ambiguous_html", "pass either --html or --html-file, not both")
         html = None
