@@ -29,4 +29,10 @@ answer = json.loads(result.stdout)["answer"]
 
 Pass `-` as the prompt and feed it on stdin; a prompt built from evidence outgrows argv quickly. Give `--schema` a JSON Schema file and `answer` arrives as a parsed object, so the script branches on fields rather than reading prose. A turn that answers prose while a schema was required fails rather than returning the one shape the script cannot use.
 
-Keep detection deterministic and delivery in the script. Decide in ordinary code whether anything happened, spawn a turn only when it did, and send the result yourself; handing delivery to the agent lets a judgement be reached and then dropped.
+Delivery stays in the script whatever else moves. Send the result yourself; handing delivery to the agent lets a judgement be reached and then dropped, and a dropped judgement looks exactly like a quiet run.
+
+Where detection sits is decided by the surface, not by taste. A surface that diffs - an API with stable fields, a release feed, a page whose bytes mean something - is compared in ordinary code, and a turn runs only when something moved, so a quiet period costs nothing. A surface that does not diff - a site rewritten between visits, an application that renders through JavaScript and publishes no feed, prose whose meaning is the signal - is read by the agent on every run, because a matcher written against today's markup is a guess about tomorrow's.
+
+Getting that backwards is expensive in both directions. Code against a surface that does not diff goes blind exactly where the answer was, and reports the blindness as silence. An agent against a surface that does diff pays a turn to re-derive what comparing two fields already knew.
+
+The recurring shape of this choice is a monitor; `automations guide monitors` owns what one has to get right.
