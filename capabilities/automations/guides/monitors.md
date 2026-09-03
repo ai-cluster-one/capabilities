@@ -1,57 +1,61 @@
 # Writing a monitor
 
-Use this guide when an automation's job is to watch something and speak only when it matters - an upstream, a market, a page that will announce a date, a system whose health nobody is looking at. A monitor is the most common automation and the easiest to get quietly wrong, because a broken one and a calm one produce the same output: nothing.
+Use this guide when an automation's job is to watch something and speak only when it matters - an upstream, a market, a page that will announce a date, a system nobody is looking at. A monitor is the most common automation and the easiest to get quietly wrong, because a broken one and a calm one produce the same output: nothing.
 
-Everything here assumes the general rules in `automations guide authoring` - profiles, the schema call, and where detection sits for a given surface. This guide is what a monitor adds on top.
+The general rules in `automations guide authoring` still hold - profiles, the agent call, and the mode fence. This guide is what a monitor adds.
 
-## The script owns everything except the looking
+## Two shapes, and how to choose
 
-Give the agent the judgement and keep the machinery, in this order every run: decide whether this run is due, gather or let the agent gather, judge, deduplicate against what was already reported, deliver, then record.
+**Agent-first.** The script decides whether to run, and the turn does everything else: goes and looks, judges what it found against a brief it maintains, sends the message itself, and leaves the brief better than it found it. The script never sees the findings. This is the right default for a monitor somebody asked for in conversation, for anything watching a surface that is written for humans, and for anything running once or twice a day.
 
-The agent never decides whether to send. It reports what it found and whether it believes the owner needs to know; the script compares that against state and makes the call. An agent that both judges and delivers has no witness, and the first thing to disappear is the run where it decided to say nothing.
+**Script-first.** The script gathers, compares against a stored snapshot, and spawns a turn only when something moved, using the turn for judgement and doing the delivery itself. This is right when the surface is a stable machine interface, when runs are frequent enough that a turn per run is real money, or when a later step needs a specific value rather than a message.
 
-Cadence belongs in the script too, not in the schedule alone. Declare the cron at the finest interval the monitor will ever need and let the script narrow it - weekly now, daily in the month that matters, always on a manual run. A run that is not due exits in milliseconds and costs nothing, and the cadence stays readable next to the logic it governs rather than encoded in a cron expression nobody re-reads.
+The pull toward script-first is a developer's instinct and it is usually wrong for a monitor. A field comparison is only as good as the fields somebody thought of, and the finding that matters is regularly the one nobody anticipated - a sale opening through a supporter programme, an announcement that moved to a mailing list, a page that now lives somewhere else. An agent reading the same surface finds those and then writes them into its own brief; a matcher reports that nothing changed.
 
-## The standing brief
+Cost rarely decides it. One turn a day is nothing next to what a missed signal costs, and a monitor is worth building precisely because somebody cares about the thing. Judgement per run stops being reasonable around the frequency where a person would also stop re-reading; below a few times a day, take the agent.
 
-A monitor written once decays, because the thing it watches moves and the instructions do not. Give it a brief: a Markdown file beside the script holding what is already known - what is being watched and why, the criteria that separate a real signal from noise, the sources to check, what has already been reported, and what has not been explored yet.
+Do not split the difference by having the script pre-digest the surface into fields and then ask the turn to bless them. That spends the turn and keeps the blindness.
 
-The agent reads it first and edits it last. That is what turns a monitor from a fixed query into something that gets better at looking: sources it checked get annotated, sources it discovered get added, criteria sharpen whenever the watched thing states its own rules, and closed items leave.
+## Where a gate still belongs in code
 
-This is the one place a monitor may need a write profile. Fence it in the prompt to that single file, and then verify rather than trust: hash the brief before and after the turn, compare against what the answer claimed, and raise the mismatch. A worker that stops maintaining its brief is invisible from the outside - it looks exactly like a period with nothing to report.
+Whatever shape you pick, cadence is the script's. A monitor should declare its schedule at the finest interval it will ever need and narrow it in code - weekly now, daily in the month that matters, hourly once a date is known. A run that is not due exits in milliseconds, and the cadence stays readable next to the logic that governs it rather than encoded in a cron expression nobody re-reads.
 
-## Make the answer a schema, and make it prove itself
+A precise, cheap precondition is worth a gate too: a file that has not changed, a queue that is empty, a season that has not started. Gate on it and skip the turn entirely. This is not the same as detection - it is not asking whether the answer changed, only whether asking is worth anything at all.
 
-Pass `--schema` and require at least four things: whether anything is worth raising, the findings themselves, the message to send, and **which sources were actually reached this run**.
+## Failure has to be louder than silence
 
-That last field is the difference between quiet and blind, and without it the two are the same JSON. A run that reached nothing and found nothing must not be able to report itself the same way as a run that read everything and found nothing.
+This is the one thing that stays in code no matter how much moves under the agent. A worker that died cannot report that it died, and from the outside a dead monitor is indistinguishable from a quiet one.
 
-Require evidence on every finding - a URL, and the sentence that carries the claim - and say in the prompt that a date, a price or a deadline is reported only where it is stated. This is where a monitor is most tempting to a model: the whole job is to come back with a date, and a plausible one is always available. Constrain it in the schema, and prefer an enum over free text wherever the script will branch on the value.
+Count consecutive failures and alert on a threshold matched to the cadence rather than a number that sounds right: a weekly monitor alerting on the second consecutive failure is silent for a fortnight, while at daily cadence the same rule is a day. Say when it recovers, so a fixed source is known to be fixed.
 
-Ask for the message in the schema too, and let the agent write it in the voice its reader expects. Then send that text unchanged. Rewriting the message in code puts the judgement in one place and the wording in another, and they drift.
+Never let a monitor end silently. If it has a window, closing that window is itself an event worth a message - a hard end date sitting in a constant is how a watch dies unnoticed, and the moment it was built for is usually just past it.
 
-## Report a finding once
+## The brief is the monitor
 
-Deduplicate on the finding, not on the run. Give each one a stable key - an id where the source has one, otherwise a hash of the claim itself - and keep the reported keys in state.
+An agent-first monitor keeps its memory in a Markdown file beside the script, and that file is most of the design: what is being watched and why, what counts as a finding and what is noise, the sources, what nobody has explored yet, the history, and a ledger of what has already been reported.
 
-Hashing the claim rather than the page is what makes this work: a page that is edited without changing what it says produces the same key and stays silent, while the same page finally naming a date produces a new one and speaks.
+The turn reads it first and edits it last. That is what stops a monitor decaying: sources it checked get annotated, surfaces it discovered get added, the rules sharpen when the watched thing states its own, and closed items leave. A monitor that cannot edit its own instructions is answering the question somebody asked on day one for as long as it runs.
 
-Baseline the first run. Record what is currently true, send nothing, and mark the state initialised - otherwise a monitor announces the world as it found it on the day it was born.
+The ledger is also how an agent-first monitor deduplicates. It is judgement rather than a hash, and it holds because the turn is told plainly that something already in the ledger is not a finding unless it changed - and then the change is the finding. Keep the ledger honest: a line saying something was reported must mean the person actually received it, or the next run will stay quiet about the thing it never sent.
 
-## A monitor that cannot fail loudly is not a monitor
+Where the script genuinely needs one value out of all this - a date that decides the cadence, a version that decides an upgrade - do not reach for a schema. Agree on one line in the brief, in a fixed shape, and parse that. The agent maintains it as part of the upkeep it is already doing, and anything unparseable is read as absent rather than guessed at.
 
-Count consecutive failures per source and alert on a threshold matched to the cadence, not to a number that sounds right. A weekly monitor alerting on the second consecutive failure is silent for a fortnight; at daily cadence the same rule is a day. Say when it recovers, too, so a fixed source is known to be fixed.
+## Telling the agent how to speak
 
-Never let a monitor end silently. If it has a window, closing that window is itself an event worth a message - a hard end date buried in a constant is how a watch stops without anyone noticing, and the moment it was built for is usually just past it.
+A turn that delivers its own message needs the standards a person would be given: which chat, which language, how long, what to lead with, and that a link belongs in it so the reader can check the claim.
 
-## Follow the event, not the calendar
+Say what silence means. A quiet run reported as quiet is a correct result, and padding trains the reader to stop reading - which breaks the monitor as surely as a crash. One message per run, at most.
 
-The cadence that finds an announcement is not the cadence that catches what the announcement is about. Once a date is known, the monitor's job changes: tighten the interval as the moment approaches, and say so ahead of time rather than only when it arrives.
+Be explicit about evidence. Require the source's own words behind any claim, and forbid reporting an inferred date, price or deadline as a stated one. This is where a monitor is most tempting to a model: the whole job is to come back with the thing, and a plausible version is always available. The reader will plan around whatever arrives, so an invention here is worse than no monitor at all.
 
-Write that transition in when you write the monitor. The run that discovers the date is the one least likely to be watched by a person, and a monitor that keeps its original cadence through it answers the question it was asked and misses the one that was meant.
+## Schemas, and when they earn their place
 
-## What a monitor costs
+`--schema` is for a script that branches on what came back. A monitor whose output is a message to a person is not that, and the schema then buys structure nobody consumes while adding a way to fail.
 
-One turn a day is nothing next to the thing it protects, and this is why an agent-led monitor is usually the right choice at daily cadence and below. Judgement per run stops being reasonable somewhere around the interval where a person would also stop re-reading, so a monitor running every few minutes wants a diff and an alert, not a turn.
+When you do use one, note that a strict engine requires every property to be listed in `required`; express an optional field as a nullable type rather than by leaving it out, or the turn fails before it starts.
 
-Record the cost the turn reports alongside the run's outcome. A monitor whose spend climbs while its findings do not is a prompt that has started searching instead of looking.
+## Proving it
+
+Run the thing once by hand before trusting it to a schedule, and read what it actually did rather than its exit code. The first real run is also the most informative one the monitor will ever have: it is the run that discovers which sources are unreachable, which of them lied about being relevant, and what the brief should have said.
+
+Watch for the failure that looks like success - a turn that came back healthy having reached nothing, because its sandbox refused the network quietly. If a monitor's job is to look outward, its profile has to be one that can, and the way you learn that it is not is by reading the first run rather than the schedule's.

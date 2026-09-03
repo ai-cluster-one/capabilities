@@ -29,7 +29,7 @@ answer = json.loads(result.stdout)["answer"]
 
 Pass `-` as the prompt and feed it on stdin; a prompt built from evidence outgrows argv quickly. Give `--schema` a JSON Schema file and `answer` arrives as a parsed object, so the script branches on fields rather than reading prose. A turn that answers prose while a schema was required fails rather than returning the one shape the script cannot use.
 
-Delivery stays in the script whatever else moves. Send the result yourself; handing delivery to the agent lets a judgement be reached and then dropped, and a dropped judgement looks exactly like a quiet run.
+Decide deliberately who delivers. A script that sends the result itself can prove the judgement was not reached and then dropped; a turn that sends its own message is far more flexible, and pays for it by making a dropped judgement look exactly like a quiet run. Neither is wrong - but a job whose turn delivers owes its caller an alarm on the turn failing, because that is the only remaining difference between working and dead.
 
 Where detection sits is decided by the surface, not by taste. A surface that diffs - an API with stable fields, a release feed, a page whose bytes mean something - is compared in ordinary code, and a turn runs only when something moved, so a quiet period costs nothing. A surface that does not diff - a site rewritten between visits, an application that renders through JavaScript and publishes no feed, prose whose meaning is the signal - is read by the agent on every run, because a matcher written against today's markup is a guess about tomorrow's.
 
