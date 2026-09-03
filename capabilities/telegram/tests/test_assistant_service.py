@@ -5323,6 +5323,167 @@ class ConferenceAudioMapReconcileTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], asked)
 
 
+class ConferenceCoverageTests(unittest.TestCase):
+    """Telegram names every participant and the ssrc each is sending on, so a
+    call that will not record someone can be recognised while it is still
+    running - which is the only point at which the caller can do anything."""
+
+    def person(self, user_id, source, muted=False, muted_by_admin=False):
+        return SimpleNamespace(user_id=user_id, source=source, muted=muted,
+                               muted_by_admin=muted_by_admin)
+
+    def test_a_participant_no_map_names_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            # The 2026-09-03 shape: two people, one stream mapped.
+            missing = daemon.uncovered_participants(
+                [self.person(535123867, 809043215),
+                 self.person(140843228, 1574086102)],
+                mapped=[1574086102],
+                channels={1574086102, 809043215})
+
+            self.assertEqual(1, len(missing))
+            self.assertEqual(535123867, missing[0]["user_id"])
+            self.assertIn("no audio map", missing[0]["why"])
+
+    def test_a_participant_with_no_channel_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            missing = daemon.uncovered_participants(
+                [self.person(535123867, 809043215)],
+                mapped=[809043215],
+                channels={1574086102})
+
+            self.assertEqual(1, len(missing))
+            self.assertIn("no incoming channel", missing[0]["why"])
+
+    def test_a_participant_telegram_gives_no_stream_for_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            missing = daemon.uncovered_participants(
+                [self.person(535123867, 0)],
+                mapped=[1574086102], channels={1574086102})
+
+            self.assertEqual(1, len(missing))
+            self.assertIn("no stream", missing[0]["why"])
+
+    def test_everyone_covered_reports_nobody(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertEqual([], daemon.uncovered_participants(
+                [self.person(535123867, 809043215),
+                 self.person(140843228, 1574086102)],
+                mapped=[809043215, 1574086102],
+                channels={809043215, 1574086102}))
+
+    def test_a_muted_participant_is_not_a_shortfall(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            # Not decoding someone who is not speaking is correct, and a call
+            # that starts with a listener must not read as broken.
+            self.assertEqual([], daemon.uncovered_participants(
+                [self.person(535123867, 0, muted=True),
+                 self.person(140843228, 0, muted_by_admin=True)],
+                mapped=[1574086102], channels={1574086102}))
+
+    def test_an_unreadable_map_convicts_nobody(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertEqual([], daemon.uncovered_participants(
+                [self.person(535123867, 809043215)],
+                mapped=None, channels={1574086102}))
+
+    def test_channels_convict_nobody_while_nothing_feeds_the_tracker(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            # An empty tracker is the media stack being quiet, not a call with
+            # no channels in it, so the map alone decides.
+            self.assertEqual([], daemon.uncovered_participants(
+                [self.person(535123867, 809043215)],
+                mapped=[809043215], channels=set()))
+
+    def test_a_stream_past_two_billion_is_not_a_shortfall(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            ssrc = 3_000_000_000
+            self.assertEqual([], daemon.uncovered_participants(
+                [self.person(535123867, ssrc - (1 << 32))],
+                mapped=[ssrc], channels={ssrc}))
+
+    def test_a_stream_that_comes_back_is_not_three_strikes(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            # An incoming channel is torn down and rebuilt by ordinary muting -
+            # 55 times on one call - so a sample landing in one of those
+            # windows must not accumulate towards a message.
+            gone = [{"user_id": 535123867, "why": "no incoming channel"}]
+            strikes = daemon.coverage_strikes({}, gone)
+            strikes = daemon.coverage_strikes(strikes, gone)
+            self.assertEqual(2, max(strikes.values()))
+
+            strikes = daemon.coverage_strikes(strikes, [])
+            self.assertEqual({}, strikes)
+
+            strikes = daemon.coverage_strikes(strikes, gone)
+            self.assertEqual(1, max(strikes.values()))
+
+    def test_two_people_failing_once_each_is_not_a_shortfall(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            strikes = daemon.coverage_strikes(
+                {}, [{"user_id": 535123867, "why": "x"}])
+            strikes = daemon.coverage_strikes(
+                strikes, [{"user_id": 140843228, "why": "x"}])
+
+            self.assertEqual(1, max(strikes.values()))
+            self.assertLess(max(strikes.values()),
+                            daemon.CONFERENCE_ROSTER_STRIKES)
+
+    def test_one_person_failing_throughout_reaches_the_threshold(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            gone = [{"user_id": 535123867, "why": "их поток ни в одной карте"}]
+
+            strikes = {}
+            for _ in range(daemon.CONFERENCE_ROSTER_STRIKES):
+                strikes = daemon.coverage_strikes(strikes, gone)
+
+            self.assertGreaterEqual(max(strikes.values()),
+                                    daemon.CONFERENCE_ROSTER_STRIKES)
+
+    def test_the_notice_names_the_shortfall_and_what_to_do(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            notice = daemon.conference_shortfall_notice(2, 1)
+
+            self.assertIn("2 человека", notice)
+            self.assertIn("1 человек", notice)
+            self.assertIn("позвони заново", notice)
+            # It arrives while they are mid-conversation.
+            self.assertLess(len(notice), 200)
+
+    def test_the_notice_agrees_with_its_numerals(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertEqual("1 человек", daemon._people(1))
+            self.assertEqual("2 человека", daemon._people(2))
+            self.assertEqual("5 человек", daemon._people(5))
+            self.assertEqual("11 человек", daemon._people(11))
+            self.assertEqual("22 человека", daemon._people(22))
+
+
 class UnsignedSsrcTests(unittest.TestCase):
     """The two sides of the comparison count ssrcs differently."""
 

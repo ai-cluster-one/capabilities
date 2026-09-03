@@ -144,6 +144,33 @@ CONFERENCE_AUDIO_MAP_TIMEOUT = 3.0
 # Telegram does not report is not made to appear by asking again.
 CONFERENCE_AUDIO_MAP_INTERVAL = 5.0
 CONFERENCE_AUDIO_MAP_ATTEMPTS = 5
+# Repairing a half-recorded call after it ends is worth less than saying so
+# while it is still going, because the caller can hang up and start again. What
+# can be said live is structural: Telegram names every participant in the call
+# and the ssrc each one is sending on, so a participant whose ssrc nothing here
+# is decoding is one who will not be on the recording, and that is a fact
+# rather than a threshold.
+#
+# The audio itself cannot be judged live. A recording that lost a speaker is
+# mostly silence over its whole length, but early on it is not distinguishable
+# from a call that simply started quietly: the healthy 45-minute conference of
+# 2026-09-01 sat at 56% silence one minute in and 53% at two, worse at both
+# points than the conference that actually lost someone.
+#
+# Nothing is said before the map has had its settle window, and one
+# participant has to fail three checks in a row before anything is sent. A
+# participant who has just joined is briefly absent from everything, and an
+# incoming channel is torn down and rebuilt constantly by ordinary muting - one
+# call on 2026-09-03 did it 55 times, leaving that stream absent for 9% of the
+# call - so a single sample landing in one of those windows must not become a
+# message. Strikes are counted per participant, so two different people failing
+# one check each never adds up to a shortfall.
+#
+# Muted participants are not counted at all, because not decoding someone who
+# is not speaking is correct.
+CONFERENCE_ROSTER_INTERVAL = 20.0
+CONFERENCE_ROSTER_GRACE = 25.0
+CONFERENCE_ROSTER_STRIKES = 3
 CONFERENCE_PEER_INTERVAL = 2.0
 # Silence is not absence. A call can be quiet for minutes and must not be cut
 # short for it, so the absence of incoming audio is only the cheap hint that
@@ -1061,6 +1088,79 @@ async def reconcile_conference_audio_map(live, channels, mapped, refresh):
             log(f"call: conference audio map still misses {named} — Telegram "
                 f"does not report that stream, so whoever is on it is not "
                 f"being recorded")
+
+
+def coverage_strikes(previous, missing):
+    """Consecutive checks each participant has failed, keyed by user.
+
+    Anyone covered on this pass is simply absent from the result, which is what
+    resets them: a stream that comes back has not failed three times in a row,
+    however many times it failed before."""
+    return {row.get("user_id"): previous.get(row.get("user_id"), 0) + 1
+            for row in missing}
+
+
+def _people(count):
+    """`count` people, agreeing with the Russian numeral."""
+    if 11 <= count % 100 <= 14:
+        return f"{count} человек"
+    if count % 10 == 1:
+        return f"{count} человек"
+    if count % 10 in (2, 3, 4):
+        return f"{count} человека"
+    return f"{count} человек"
+
+
+def conference_shortfall_notice(present, missing):
+    """What the caller reads, mid-call, when the recording is short a voice.
+
+    Short because it arrives while they are talking to someone, and it carries
+    the one thing they can act on rather than what went wrong."""
+    return (f"Записываю не всех: на звонке кроме меня {_people(present)}, "
+            f"а до записи доходит {_people(present - missing)}. Если разговор "
+            f"важный — сбрось и позвони заново.")
+
+
+def uncovered_participants(others, mapped, channels):
+    """Who Telegram lists in this call whose audio nothing here is decoding.
+
+    Telegram names each participant's own ssrc in `source`, which is the same
+    number the audio map is built from and the same one the transport prints
+    when it opens a channel. So the three views can be laid against each other
+    and a participant missing from the last two is one whose voice will not be
+    on the recording.
+
+    Muted participants are left out: not decoding someone who is not speaking
+    is correct, and counting them would make every call that starts with a
+    listener look broken.
+
+    `mapped` of None means the map could not be read, and no channels at all
+    means nothing is feeding the tracker; neither is evidence about anybody, so
+    both answer nobody. Channels are only allowed to convict when the tracker
+    has something in it.
+    """
+    if mapped is None:
+        return []
+    mapped = _ssrc_set(mapped)
+    channels = _ssrc_set(channels)
+    missing = []
+    for participant in others or ():
+        if getattr(participant, "muted", False):
+            continue
+        if getattr(participant, "muted_by_admin", False):
+            continue
+        user = getattr(participant, "user_id", None)
+        source = _unsigned_ssrc(getattr(participant, "source", None))
+        if not source:
+            missing.append({"user_id": user, "source": source,
+                            "why": "Telegram names no stream for them"})
+        elif source not in mapped:
+            missing.append({"user_id": user, "source": source,
+                            "why": "their stream is in no audio map"})
+        elif channels and source not in channels:
+            missing.append({"user_id": user, "source": source,
+                            "why": "no incoming channel carries their stream"})
+    return missing
 
 
 def _capture_bytes(record):
@@ -6827,6 +6927,52 @@ async def run_session(client):
                 refresh=lambda reason: refresh_conference_audio_map(
                     chat_id, reason))
 
+        async def watch_conference_coverage(chat_id: int):
+            """Say, during the call, when it is not recording everyone on it.
+
+            Everything else here repairs a call or explains it afterwards. This
+            one exists so the caller can act while acting is still possible:
+            hang up and start again, rather than find out from the recording
+            that half the conversation is missing.
+
+            It speaks once. A second message about the same call tells the
+            caller nothing they do not already know, and the first one already
+            said the only thing they can act on.
+            """
+            joined_at = time.monotonic()
+            strikes = {}
+            while active_recording["caller_id"] == chat_id:
+                await asyncio.sleep(CONFERENCE_ROSTER_INTERVAL)
+                if active_recording["caller_id"] != chat_id:
+                    return
+                if time.monotonic() - joined_at < CONFERENCE_ROSTER_GRACE:
+                    continue
+                others = await conference_others(chat_id)
+                # None is an unanswerable question and an empty list is a call
+                # this account is alone in; the peer watchdog owns the second.
+                if not others:
+                    strikes = {}
+                    continue
+                audio = conference_audio_map(chat_id)
+                missing = uncovered_participants(
+                    others,
+                    None if audio is None else audio.values(),
+                    MEDIA_AUDIO_PEERS)
+                strikes = coverage_strikes(strikes, missing)
+                if not strikes:
+                    continue
+                if max(strikes.values()) < CONFERENCE_ROSTER_STRIKES:
+                    continue
+                named = "; ".join(
+                    f"{row['user_id']} — {row['why']}" for row in missing)
+                log(f"call: recording {len(others) - len(missing)} of "
+                    f"{len(others)} participant(s) — {named}")
+                with contextlib.suppress(Exception):
+                    await client.send_message(
+                        chat_id, conference_shortfall_notice(
+                            len(others), len(missing)))
+                return
+
         async def record_call(caller_id: int, mode: str, call_config: CallConfig,
                               continues=None):
             output = recording_output(caller_id, mode)
@@ -6914,6 +7060,7 @@ async def run_session(client):
                 if mode == "conference":
                     asyncio.create_task(settle_conference_audio_map(caller_id))
                     asyncio.create_task(watch_conference_audio_map(caller_id))
+                    asyncio.create_task(watch_conference_coverage(caller_id))
                     asyncio.create_task(watch_conference_peers(caller_id))
             except Exception as exc:
                 # A media connection that never reached CONNECTED is reported as
