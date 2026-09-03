@@ -5192,6 +5192,152 @@ class AudioPeerTrackingTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(daemon.MEDIA_AUDIO_PEERS)
 
 
+class ConferenceAudioMapReconcileTests(unittest.IsolatedAsyncioTestCase):
+    """A participant the map never names is decoded by nobody and reaches no
+    recording, so the map is checked against the channels the transport holds.
+
+    The conference this comes from ran eleven minutes on 2026-09-03 and
+    recorded one of its two people: the second channel opened two seconds after
+    the join, the map never learned whose ssrc it was, and the one participant
+    update that would have re-asked arrived before that channel existed.
+    """
+
+    async def reconcile(self, daemon, channels, mapped, ticks=30, answer=None):
+        """Run the reconciler over a bounded number of passes.
+
+        `channels` and `mapped` are the two sides being compared, each a live
+        set the test owns or a callable for a side that changes per pass;
+        `mapped` may be None for a map that cannot be read. `answer` is what a
+        refresh does to the map, so a repair can be scripted.
+        """
+        daemon.CONFERENCE_AUDIO_MAP_INTERVAL = 0.0
+        state = {"ticks": 0}
+        asked = []
+
+        read_channels = channels if callable(channels) else lambda: set(channels)
+
+        def read_map():
+            state["ticks"] += 1
+            if callable(mapped):
+                return mapped()
+            return None if mapped is None else set(mapped)
+
+        async def refresh(reason):
+            asked.append(reason)
+            if answer is not None:
+                answer(mapped, len(asked))
+
+        await daemon.reconcile_conference_audio_map(
+            live=lambda: state["ticks"] < ticks,
+            channels=read_channels,
+            mapped=read_map,
+            refresh=refresh)
+        return asked
+
+    async def test_the_channel_the_map_lost_is_named_and_the_asking_is_bounded(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            # Verbatim from the call: the stable channel is mapped, the one
+            # that opened two seconds later never is.
+            asked = await self.reconcile(
+                daemon, {1574086102, 809043215}, {1574086102})
+
+            self.assertEqual(daemon.CONFERENCE_AUDIO_MAP_ATTEMPTS, len(asked))
+            self.assertIn("809043215", asked[0])
+            # The one that is being recorded is not what the refresh is about.
+            self.assertNotIn("1574086102", asked[0])
+            self.assertIn("attempt 1 of", asked[0])
+            # Asking Telegram again for a stream it does not report is not a
+            # better answer, so the last word is a plain statement of the cost.
+            self.assertTrue(any("still misses 809043215" in line
+                                and "not being recorded" in line
+                                for line in daemon._test_logs))
+
+    async def test_one_pass_of_mismatch_asks_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            # A channel that has only just opened is ahead of the map by
+            # design, and costs no round trip for it.
+            asked = await self.reconcile(
+                daemon, {1574086102, 809043215}, {1574086102}, ticks=1)
+
+            self.assertEqual([], asked)
+
+    async def test_a_mismatch_that_keeps_changing_is_never_asked_about(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            opening = itertools.count(1)
+
+            asked = await self.reconcile(
+                daemon, lambda: {1, next(opening) + 100}, {1})
+
+            self.assertEqual([], asked)
+
+    async def test_a_map_that_catches_up_stops_the_asking(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            mapped = {1574086102}
+
+            def answer(current, asks):
+                current.add(809043215)
+
+            asked = await self.reconcile(
+                daemon, {1574086102, 809043215}, mapped, answer=answer)
+
+            self.assertEqual(1, len(asked))
+            self.assertFalse(any("still misses" in line
+                                 for line in daemon._test_logs))
+
+    async def test_a_map_that_cannot_be_read_is_not_evidence_of_a_lost_stream(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            asked = await self.reconcile(
+                daemon, {1574086102, 809043215}, None)
+
+            self.assertEqual([], asked)
+
+    async def test_no_channels_at_all_asks_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            # Nothing feeds the tracker while the media stack is quiet enough
+            # to carry no channel lines, and an empty set is that, not a call
+            # with nobody in it.
+            asked = await self.reconcile(daemon, set(), {1574086102})
+
+            self.assertEqual([], asked)
+
+    async def test_a_stream_past_two_billion_is_not_read_as_unmapped(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            # Telegram carries the same stream as a signed 32-bit source; the
+            # media stack names it unsigned.
+            ssrc = 3_000_000_000
+            asked = await self.reconcile(
+                daemon, {ssrc}, {ssrc - (1 << 32)})
+
+            self.assertEqual([], asked)
+
+
+class UnsignedSsrcTests(unittest.TestCase):
+    """The two sides of the comparison count ssrcs differently."""
+
+    def test_a_signed_source_becomes_the_number_the_media_stack_prints(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            self.assertEqual(3_000_000_000,
+                             daemon._unsigned_ssrc(3_000_000_000 - (1 << 32)))
+            self.assertEqual(809043215, daemon._unsigned_ssrc(809043215))
+            self.assertIsNone(daemon._unsigned_ssrc(None))
+            self.assertIsNone(daemon._unsigned_ssrc("not a stream"))
+            self.assertEqual({1, 2}, daemon._ssrc_set([1, 2, None]))
+
+
 class MediaLogLevelTests(unittest.TestCase):
     """The media stack is read at the level the settings ask for."""
 

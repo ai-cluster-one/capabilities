@@ -132,6 +132,18 @@ CAPTURE_STALL_INTERVAL = 1.0
 # question fails visibly and leaves the later ones their turn.
 CONFERENCE_AUDIO_MAP_RETRIES = (2.0, 3.0, 5.0, 10.0)
 CONFERENCE_AUDIO_MAP_TIMEOUT = 3.0
+# That schedule covers the join and nothing after it, and on 2026-09-03 a
+# conference spent eleven minutes past it recording one of its two people: the
+# transport opened a second incoming channel two seconds after the join, the
+# map never learned whose ssrc it was, and the one participant update that
+# would have re-asked arrived two seconds before that channel existed. So the
+# map is also reconciled against the channels the transport actually holds, for
+# as long as the call lasts. A mismatch must persist over two ticks before it
+# counts, because a channel that has just opened is briefly ahead of the map by
+# design, and the same mismatch is re-asked only so many times: an ssrc
+# Telegram does not report is not made to appear by asking again.
+CONFERENCE_AUDIO_MAP_INTERVAL = 5.0
+CONFERENCE_AUDIO_MAP_ATTEMPTS = 5
 CONFERENCE_PEER_INTERVAL = 2.0
 # Silence is not absence. A call can be quiet for minutes and must not be cut
 # short for it, so the absence of incoming audio is only the cheap hint that
@@ -971,6 +983,84 @@ async def settle_conference_chain(invite_msg_id, block, waited, read_block):
                 f"{time.monotonic() - seen_at:.1f}s")
             block, digest = fresh, fresh_digest
             seen_at = time.monotonic()
+
+
+def _unsigned_ssrc(value):
+    """One ssrc, as the media stack writes it.
+
+    Telegram carries a participant's audio source as a signed 32-bit int, and
+    the media stack names the same stream unsigned, so any ssrc past 2^31
+    reaches the two sides as two different numbers. Comparing them without this
+    would report every such stream as unmapped, forever, on every call.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number + (1 << 32) if number < 0 else number
+
+
+def _ssrc_set(values):
+    """The ssrcs in one collection, normalised, with anything unreadable left out."""
+    return {ssrc for ssrc in (_unsigned_ssrc(v) for v in values)
+            if ssrc is not None}
+
+
+async def reconcile_conference_audio_map(live, channels, mapped, refresh):
+    """Re-ask for the audio map while the transport holds an unmapped channel.
+
+    The settle schedule covers the join, and after it the map is rebuilt only
+    when Telegram sends a participant update. Someone whose channel opens
+    outside both — later than the schedule, or with no update of their own — is
+    decoded by nobody and reaches no recording, silently, for the rest of the
+    call. On 2026-09-03 that cost eleven minutes of a two-person conference one
+    of its two people.
+
+    The channels are the check. An ssrc the transport holds and the map does
+    not name is a participant going unrecorded right now, and that is the one
+    condition worth a round trip.
+
+    Two ticks of the same mismatch are required, because a channel that has
+    only just opened is legitimately ahead of the map. Repetition is bounded
+    per mismatch: Telegram not reporting an ssrc is an answer, and asking again
+    does not change it. A mismatch that changes starts the budget over, and a
+    map that catches up clears it.
+
+    `mapped` returning None means the map could not be read, which is not the
+    same answer as nobody being mapped; no channels at all means nothing is
+    feeding the tracker and there is nothing to reconcile against. Both are
+    passed over in silence, because neither is evidence of a lost participant.
+    """
+    seen = None
+    attempts = 0
+    while live():
+        await asyncio.sleep(CONFERENCE_AUDIO_MAP_INTERVAL)
+        if not live():
+            return
+        known = mapped()
+        if known is None:
+            continue
+        unmapped = _ssrc_set(channels()) - _ssrc_set(known)
+        if not unmapped:
+            seen = None
+            attempts = 0
+            continue
+        if unmapped != seen:
+            seen = unmapped
+            attempts = 0
+            continue
+        if attempts >= CONFERENCE_AUDIO_MAP_ATTEMPTS:
+            continue
+        attempts += 1
+        named = ",".join(str(ssrc) for ssrc in sorted(unmapped))
+        await refresh(f"unmapped channel {named}, attempt {attempts} of "
+                      f"{CONFERENCE_AUDIO_MAP_ATTEMPTS}")
+        if attempts < CONFERENCE_AUDIO_MAP_ATTEMPTS:
+            continue
+        if unmapped - _ssrc_set(mapped() or ()):
+            log(f"call: conference audio map still misses {named} — Telegram "
+                f"does not report that stream, so whoever is on it is not "
+                f"being recorded")
 
 
 def _capture_bytes(record):
@@ -6638,6 +6728,37 @@ async def run_session(client):
                 log(f"call: conference chain readable — last block "
                     f"{len(block)} bytes in {waited:.1f}s")
 
+        def conference_audio_map(chat_id: int):
+            """The user-to-ssrc map the library last handed the media stack.
+
+            Returns None when it cannot be read, which is not the same answer as
+            an empty map: the readers below treat an unreadable map as "nothing
+            to compare against" rather than as "nobody is mapped"."""
+            try:
+                sources = calls._call_sources.get(chat_id)
+            except Exception:
+                return None
+            audio = getattr(sources, "audio", None)
+            return dict(audio) if isinstance(audio, dict) else None
+
+        def describe_conference_audio_map(chat_id: int):
+            """What the map holds, for the log.
+
+            The refresh used to report only that it had run. That is what made
+            2026-09-03 undiagnosable from the log alone: the map was rebuilt on
+            schedule four times and no line said it had come back a person
+            short."""
+            audio = conference_audio_map(chat_id)
+            if audio is None:
+                return "map unreadable"
+            if not audio:
+                return "map empty"
+            # Named the way the media stack names it, so a map line and a
+            # channel line can be read against each other by eye.
+            return "map " + " ".join(
+                f"{user}:{_unsigned_ssrc(ssrc)}"
+                for user, ssrc in sorted(audio.items()))
+
         async def refresh_conference_audio_map(chat_id: int, reason: str):
             """Rebuild the participant-to-audio-stream map for a live call.
 
@@ -6646,7 +6767,14 @@ async def run_session(client):
             in the snapshot taken as this account joins is never decoded and
             never reaches the recording, and no update follows for someone who
             was already there. Dropping the cached participants forces a real
-            answer rather than the hour-old one."""
+            answer rather than the hour-old one.
+
+            The library's own copy of the last map it sent goes with it. It
+            skips the hand-off whenever a fresh answer equals that copy, which
+            makes a refresh unable to repair a media stack that lost the
+            mapping — the very case a refresh is asked for. Cleared, an answer
+            that names anyone is always handed over; an empty answer still
+            hands over nothing, because there is nothing to hand over."""
             try:
                 cache = calls._app._bind_client._cache
                 cache._call_participants_cache.pop(chat_id)
@@ -6654,10 +6782,15 @@ async def run_session(client):
                 log(f"call: audio map — participant cache not cleared "
                     f"({type(exc).__name__}: {exc})")
             try:
+                calls._call_sources[chat_id].audio = {}
+            except Exception:
+                pass
+            try:
                 await asyncio.wait_for(
                     calls._handle_request_participants(chat_id),
                     CONFERENCE_AUDIO_MAP_TIMEOUT)
-                log(f"call: conference audio map refreshed ({reason})")
+                log(f"call: conference audio map refreshed ({reason}) — "
+                    f"{describe_conference_audio_map(chat_id)}")
             except asyncio.TimeoutError:
                 log(f"call: conference audio map refresh timed out after "
                     f"{CONFERENCE_AUDIO_MAP_TIMEOUT:g}s ({reason})")
@@ -6679,6 +6812,20 @@ async def run_session(client):
                 await refresh_conference_audio_map(
                     chat_id,
                     f"+{time.monotonic() - joined_at:.0f}s after join")
+
+        async def watch_conference_audio_map(chat_id: int):
+            """Keep this call's map answerable for as long as the call lasts."""
+
+            def mapped():
+                audio = conference_audio_map(chat_id)
+                return None if audio is None else set(audio.values())
+
+            await reconcile_conference_audio_map(
+                live=lambda: active_recording["caller_id"] == chat_id,
+                channels=lambda: set(MEDIA_AUDIO_PEERS),
+                mapped=mapped,
+                refresh=lambda reason: refresh_conference_audio_map(
+                    chat_id, reason))
 
         async def record_call(caller_id: int, mode: str, call_config: CallConfig,
                               continues=None):
@@ -6766,6 +6913,7 @@ async def run_session(client):
                 asyncio.create_task(watch_capture_stall(caller_id, capture))
                 if mode == "conference":
                     asyncio.create_task(settle_conference_audio_map(caller_id))
+                    asyncio.create_task(watch_conference_audio_map(caller_id))
                     asyncio.create_task(watch_conference_peers(caller_id))
             except Exception as exc:
                 # A media connection that never reached CONNECTED is reported as
