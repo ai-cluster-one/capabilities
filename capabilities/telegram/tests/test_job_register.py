@@ -53,6 +53,20 @@ class RegisterCase(unittest.TestCase):
             return target.submit(row["id"])
         return row
 
+    # -- the channel a job reports into --------------------------------------
+
+    def test_a_topic_key_round_trips(self):
+        """The key is written by whoever registers the job and read back by the
+        daemon delivering the answer. A shape that does not survive that trip
+        strands a finished job: the row says nothing is wrong with it, and the
+        channel it names cannot be resolved."""
+        key = jobs.channel_key(-1001, 77)
+        self.assertEqual(jobs.channel_identity(key), ("-1001", 77))
+
+    def test_a_key_without_a_topic_is_the_chat_itself(self):
+        self.assertEqual(jobs.channel_key(-1001), "-1001")
+        self.assertEqual(jobs.channel_identity("-1001"), ("-1001", None))
+
     # -- drafting ------------------------------------------------------------
 
     def test_registering_opens_a_draft_no_runner_takes(self):

@@ -648,6 +648,20 @@ class OutboundActionsTests(unittest.TestCase):
                     self.assertEqual(stopped.exception.code, 4)
             self.assertFalse(outbox.exists())
 
+    def test_a_registered_topic_key_is_one_the_daemon_can_resolve(self):
+        """The shim pins a forum topic onto every `jobs` call, so the CLI writes
+        the key of a job the daemon has to find its way back to. Both sides ask
+        the register for the spelling; when they disagreed instead, every job
+        registered in a topic finished and then retried delivery forever against
+        a channel nothing could resolve."""
+        cli = import_cli()
+        key = cli._job_channel_key("-1001", "77")
+        self.assertEqual(cli._jobs_module().channel_identity(key), ("-1001", 77))
+        self.assertEqual(cli._job_channel_key("-1001", None), "-1001")
+        with self.assertRaises(SystemExit) as stopped:
+            cli._job_channel_key("-1001", "General")
+        self.assertEqual(stopped.exception.code, 6)
+
     def test_worker_jobs_without_an_authorized_chat_are_refused(self):
         shim = import_worker_shim()
         with mock.patch.dict(os.environ, {"TELEGRAM_AUTHORIZED_CHAT_ID": ""},

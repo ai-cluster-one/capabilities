@@ -61,6 +61,35 @@ from uuid import uuid4
 STORE_NAMESPACE = "telegram"
 STORE_VERSION = 3
 
+# How `channel_key` spells a forum topic. The column is written by whoever
+# registers a job and read back by the daemon that has to find the channel
+# again, so the spelling belongs to the register rather than to either side of
+# it: a key that does not round-trip is a finished job whose answer has nowhere
+# to go, and nothing about the row itself says it is unreachable.
+CHANNEL_TOPIC_MARKER = "#topic:"
+
+
+def channel_key(chat_id: Any, topic_id: Any = None) -> str:
+    """The key for one channel: a chat, or one forum topic inside it."""
+    base = str(chat_id)
+    if topic_id is None:
+        return base
+    return f"{base}{CHANNEL_TOPIC_MARKER}{int(topic_id)}"
+
+
+def channel_identity(key: Any) -> tuple[str, int | None]:
+    """The chat and topic a key names. A key naming no topic answers with the
+    chat alone, and so does one whose topic is not a number — reading it as a
+    chat is what every caller already does with the first half."""
+    raw = str(key)
+    if CHANNEL_TOPIC_MARKER not in raw:
+        return raw, None
+    chat_id, topic = raw.rsplit(CHANNEL_TOPIC_MARKER, 1)
+    try:
+        return chat_id, int(topic)
+    except (TypeError, ValueError):
+        return raw, None
+
 # Portable DDL, in the same dialect the core tier writes: a timestamp is TEXT
 # holding an ISO instant and a flag is INTEGER, because those are the two
 # constructs SQLite and PostgreSQL both spell the same way. `{json}` is the one

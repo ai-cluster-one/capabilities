@@ -3507,7 +3507,6 @@ def _reply_to_message_id(message):
         return None
 
 
-CHANNEL_TOPIC_MARKER = "#topic:"
 GENERAL_TOPIC_ID = 1
 # Two agents share one room, and each side runs a daemon that answers on its
 # own. A request tagged EXTERNAL says its answer is consumed by a live session
@@ -3604,19 +3603,11 @@ def _message_topic_title(message):
 
 
 def _channel_key(chat_id, topic_id=None):
-    base = str(chat_id)
-    return f"{base}{CHANNEL_TOPIC_MARKER}{int(topic_id)}" if topic_id is not None else base
+    return jobs.channel_key(chat_id, topic_id)
 
 
 def _channel_identity(key):
-    raw = str(key)
-    if CHANNEL_TOPIC_MARKER not in raw:
-        return raw, None
-    chat_id, topic = raw.rsplit(CHANNEL_TOPIC_MARKER, 1)
-    try:
-        return chat_id, int(topic)
-    except (TypeError, ValueError):
-        return raw, None
+    return jobs.channel_identity(key)
 
 
 SELF_MARKER = " (you)"

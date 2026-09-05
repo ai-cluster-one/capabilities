@@ -4312,7 +4312,13 @@ def _service_jobs() -> Path:
     return _service_bundle_dir() / "service" / "jobs.py"
 
 
+_JOBS_MODULE = None
+
+
 def _jobs_module():
+    global _JOBS_MODULE
+    if _JOBS_MODULE is not None:
+        return _JOBS_MODULE
     path = _service_jobs()
     _require_service_bundle_files(path)
     spec = importlib.util.spec_from_file_location("telegram_service_jobs", path)
@@ -4320,6 +4326,7 @@ def _jobs_module():
         _die(3, "service_bundle_missing", f"cannot load the bundled job register: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _JOBS_MODULE = module
     return module
 
 
@@ -4353,9 +4360,20 @@ def _open_job_register(root: Path):
 
 
 def _job_channel_key(chat: str | None, topic_id: str | None) -> str | None:
+    """The channel a job reports into, spelled by the register itself.
+
+    The daemon resolves this key back to a chat when it delivers the result, so
+    a key written here in any other shape is a job that finishes and then has
+    nowhere to report.
+    """
     if not chat:
         return None
-    return f"{chat}:{topic_id}" if topic_id else str(chat)
+    topic = str(topic_id).strip() if topic_id is not None else ""
+    try:
+        return _jobs_module().channel_key(chat, topic or None)
+    except (TypeError, ValueError):
+        _die(6, "bad_topic", f"a forum topic is a message id, not {topic!r}",
+             "pass --topic-id <the topic's root message id>")
 
 
 def _job_row(view: dict) -> dict:
