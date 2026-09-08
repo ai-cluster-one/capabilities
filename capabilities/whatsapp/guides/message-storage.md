@@ -2,7 +2,7 @@
 
 How a WhatsApp history is kept, and what a consuming project reads.
 
-Two places hold messages, and the split between them is the point. The **store** is where capture writes: one database per connection under the user state home, holding every chat and message the account has handed over, the material that lets an attachment be fetched later, and the enrichment derived from them. The **export** is what a project reads: a folder per conversation, written on request, holding the messages a project registered and the attachments that came with them.
+Two places hold messages, and the split between them is the point. The **store** is where capture writes: one database per account under the user state home, holding every chat and message the account has handed over, the material that lets an attachment be fetched later, and the enrichment derived from them. The **export** is what a project reads: a folder per conversation, written on request, holding the messages a project registered and the attachments that came with them.
 
 ## The store
 

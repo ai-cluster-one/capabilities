@@ -2,7 +2,7 @@
 
 How a WhatsApp identity is linked, what arrives when, and what each of those arrivals costs.
 
-A connection is one WhatsApp identity, driven by the engine the CLI carries: whatsmeow, compiled into the installed wheel and run in-process, so a consuming project needs nothing beyond the CLI. The credential is the linked-device session itself, minted by pairing into the user state home beside the account's store. A connection may instead name a self-hosted WAHA bridge, in which case the identity is that instance's session and the bridge's own wiring lives on the entry; the verb surface is the same either way.
+A connection is one WhatsApp identity, driven by the engine the CLI carries: whatsmeow, compiled into the installed wheel and run in-process, so a consuming project needs nothing beyond the CLI. The credential is the linked-device session itself, minted by pairing into the user state home beside the account's store, under a folder named for the account rather than for the connection that reached it. A connection may instead name a self-hosted WAHA bridge, in which case the identity is that instance's session and the bridge's own wiring lives on the entry; the verb surface is the same either way.
 
 ## The device
 
@@ -44,4 +44,6 @@ Two clients driving one linked device desync it and can log it out, so an invoca
 
 ## Adding an identity
 
-Adding a second WhatsApp identity is a connection-registry edit plus one pairing ceremony. Each connection keeps its own session and its own store, so two accounts never share a file and several projects consuming one account share one capture instead of each building their own.
+Adding a second WhatsApp identity is a connection-registry edit plus one pairing ceremony. Each account keeps its own session and its own store, so two accounts never share a file.
+
+A connection id is an alias, and the state it reaches is named for the account instead. So renaming an entry keeps the session and the capture it already had, and two entries naming one account arrive at one home rather than building two captures of it — which is what makes several projects consuming one account share one capture. Naming the account is therefore what an in-house entry does before it can pair: the phone number, or a pinned `expected_account_id`. An account's home already written under an older alias is adopted the first time that alias resolves, and one holding a different account is left alone rather than merged.

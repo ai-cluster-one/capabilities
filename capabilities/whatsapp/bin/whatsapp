@@ -50,10 +50,13 @@ Connections
   engine               "whatsmeow" (the default — this CLI's own engine, no
                        server) or "waha" (a self-hosted WAHA bridge).
   number               the account's phone number, digits with country code. The
-                       default for `pair`.
-  expected_account_id  the account this session must be. `pair` reports the value
-                       to bind; a session belonging to a different account is
-                       then refused rather than silently used.
+                       default for `pair`, and what names the account's state
+                       home, so an in-house entry declares it (or pins
+                       expected_account_id) before it can pair.
+  expected_account_id  the account this session must be, and the identity that
+                       names its state home when it is set. `pair` reports the
+                       value to bind; a session belonging to a different account
+                       is then refused rather than silently used.
   device_name          what the entry is called under Linked Devices on the
                        phone. Default: "Capability (<this machine>)".
   initial_sync_days    how far back the one-time pairing burst reaches
@@ -82,10 +85,14 @@ Credentials (4-tier cascade; first non-empty wins)
   flags > project .env(.local) > ~/.config/whatsapp/credentials.env > process env.
         DEEPGRAM_API_KEY   only `whatsapp transcribe` reads it
   The linked-device session is not a configured secret: it is minted by pairing
-  and lives in the user state home, per connection, beside the store.
+  and lives in the user state home, per account, beside the store.
 
 State
-  $XDG_STATE_HOME/whatsapp/<connection>/
+  $XDG_STATE_HOME/whatsapp/<account>/     named for the account, not for the
+                                          connection: an alias can be renamed
+                                          without losing the session or the
+                                          capture, and two aliases for one
+                                          account share one home
         session.db     the engine's own — device, keys, contacts, LID map
         messages.db    chats, messages, enrichment, capture provenance
         raw/           history chunks exactly as received, written before parsing
@@ -2967,8 +2974,18 @@ def _build_cfg(cid: str, entry: dict | None,
         if days < 1:
             return None, {"exit": 6, "code": "bad_sync_days",
                           "message": f"connection {cid!r}: initial_sync_days must be >= 1"}
+        key = cfg["expected_account_id"] or cfg["number"]
+        if not key:
+            return None, {
+                "exit": 6, "code": "no_account_identity",
+                "message": f"connection {cid!r} names no account, and this "
+                           f"engine keeps a capture under the account's own "
+                           f"identity rather than under the connection's name",
+                "hint": "add the account's phone number as `number` (digits "
+                        "with country code), or pin it as expected_account_id"}
         cfg.update({
-            "home": str(_state_dir() / cid),
+            "account_key": key,
+            "home": str(_account_home(key, cid)),
             "device_name": entry.get("device_name") or None,
             "initial_sync_days": days,
         })
@@ -3532,6 +3549,65 @@ def _writing(db):
         db.write_depth -= 1
         if outermost:
             db.execute("COMMIT")
+
+
+def _home_account(home: Path) -> str | None:
+    """Which account a state home already holds, asked of the files themselves.
+
+    The store records the account it was first written for, and the engine's
+    own session records the linked device, so a home populated by either says
+    whose it is without a connection being opened."""
+    store = home / "messages.db"
+    if store.exists():
+        try:
+            with contextlib.closing(
+                    sqlite3.connect(f"file:{store}?mode=ro", uri=True)) as db:
+                row = db.execute(
+                    "SELECT value FROM meta WHERE key = 'account_id'").fetchone()
+            if row and row[0]:
+                return _digits(row[0])
+        except sqlite3.Error:
+            pass
+    session = home / "session.db"
+    if session.exists():
+        try:
+            with contextlib.closing(
+                    sqlite3.connect(f"file:{session}?mode=ro", uri=True)) as db:
+                row = db.execute(
+                    "SELECT jid FROM whatsmeow_device LIMIT 1").fetchone()
+            if row and row[0]:
+                return _digits(str(row[0]).split("@", 1)[0])
+        except sqlite3.Error:
+            pass
+    return None
+
+
+def _account_home(key: str, cid: str) -> Path:
+    """Where one account's capture lives: under the account's own identity.
+
+    A connection id is an alias the consuming project chooses and may rename,
+    while the session and the store belong to the account. Naming the home
+    after the alias made a rename read as an account that had never paired,
+    orphaned the capture under the old name, and let two aliases for one
+    account build two captures of it. Naming it after the account means the
+    alias moves freely, and two aliases for one account arrive at one home —
+    which is what lets several projects share one capture instead of each
+    building its own.
+
+    A home still sitting under an old alias is adopted the first time that
+    alias resolves, and only when it holds this account or holds none at all.
+    One holding somebody else is left exactly where it is: two accounts are
+    never merged into a single file to make a path resolve."""
+    root = _state_dir()
+    home = root / key
+    if home.exists():
+        return home
+    legacy = root / cid
+    if legacy != home and legacy.is_dir() \
+            and _home_account(legacy) in (None, key):
+        with contextlib.suppress(OSError):
+            legacy.rename(home)
+    return home
 
 
 def _connection_home(cfg: dict) -> Path:
@@ -4244,9 +4320,9 @@ class Session:
                  f"the store for connection {self.cfg['id']!r} holds the history "
                  f"of {held['value']}, and this session authorises as "
                  f"{account['id']}",
-                 f"give the new account its own connection id, or move "
-                 f"{Path(self.cfg['home']) / 'messages.db'} aside — one store "
-                 f"holds one account")
+                 f"correct the account this connection names, or move "
+                 f"{Path(self.cfg['home']) / 'messages.db'} aside — a home is "
+                 f"named for one account and a store holds one account")
         if account["id"] and not (held and held["value"]):
             with _writing(self.db):
                 self.db.execute(
