@@ -147,8 +147,8 @@
     },
     "whatsapp": {
       "path": "capabilities/whatsapp",
-      "payload_sha256": "ff2cca6b70455fb4fe29780678bd5799368c316f08fbf025736583ee17feaa7c",
-      "summary": "WhatsApp CLI over a self-hosted WAHA bridge — list chats, read/export a chat's history to JSON with voice/audio + photos, and transcribe voice notes. Run `whatsapp doctor` first to confirm the instance is reachable and the session is linked."
+      "payload_sha256": "9d45ab744fa97966bb32cdf6dac99f2116eec72107fa44e25551bd29b29d210c",
+      "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a local store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {
       "path": "capabilities/windmill",
