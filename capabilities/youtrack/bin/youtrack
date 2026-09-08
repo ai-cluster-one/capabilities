@@ -3111,7 +3111,7 @@ def _flatten_tags(issue):
 #
 # Every write entry must carry the issue-side `$type`; YouTrack rejects the
 # entry outright with "$type is required" and infers nothing from the value
-# shape. The map below is keyed on that $type — measured against IONDEV, see
+# shape. The map below is keyed on that $type — measured against DEV, see
 # .claude/plans/2026-07-27-youtrack-mcp-parity.md.
 #
 # Two traps live here. A `date` field is DateIssueCustomField and its value is
@@ -3132,7 +3132,7 @@ _BY_NAME_MULTI = ("MultiEnumIssueCustomField", "MultiVersionIssueCustomField",
 # project-side one (`SimpleProjectCustomField` for a `date` field) and sending it
 # earns a type mismatch, so this table is the only correct bridge.
 #
-# Measured: 12 of the 14 rows occurring in IONDEV, plus `float` (ION's Story
+# Measured: 12 of the 14 rows occurring in DEV, plus `float` (ACME's Story
 # points). Not measured: `version[1]` was never sent at all, and `build[1]` has
 # never had a valid value accepted — its envelope did reach bundle resolution, so
 # the $type pairing has partial evidence. Do not read those two at the same
@@ -3846,7 +3846,7 @@ def _resolve_tag_id(c, name: str) -> str:
     more than 1000 tags can have a *valid* tag past that page reported as
     unknown here; this deliberately does not paginate to find it.
 
-    Tag names are not guaranteed unique — 17 distinct on ION, but nothing
+    Tag names are not guaranteed unique — 17 distinct on ACME, but nothing
     server-side enforces it — so a collision is refused rather than resolved to
     whichever row a comprehension kept last, mirroring _resolve_link and
     _resolve_group_ids.
@@ -3934,7 +3934,7 @@ def _duration_value(raw: str) -> dict:
 
     Only one of minutes/presentation may be sent — both returns "Conflict in
     period value" — and presentation is chosen because YouTrack owns the period
-    grammar and the workday length (1d = 8h on ION, from project settings).
+    grammar and the workday length (1d = 8h on ACME, from project settings).
 
     A unit-less number is refused. This is deliberately stricter than the
     server, which accepts it and reads it as HOURS: `--duration 90` meaning 90

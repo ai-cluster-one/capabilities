@@ -157,7 +157,7 @@
     },
     "youtrack": {
       "path": "capabilities/youtrack",
-      "payload_sha256": "fc4a189330485aa6a89f240496f19a4985dd106b5058cf0303d1c61b9437931b",
+      "payload_sha256": "bfd7b242358507b4698e9e3b8d218087d3e27e25c8d3dc2666e4378c7de69b2a",
       "summary": "YouTrack CLI for issues (read with links and tags, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, add/remove issue links by direction phrase, tag and untag by tag name, and log and list work items), user and group lookup, project reads and paged custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments)."
     }
   }

@@ -209,7 +209,7 @@ def test_users_find_sends_query_and_paging(tmp_path):
         def do_GET(self):
             self.__class__.requests.append(self.path)
             body = json.dumps([
-                {"id": "1-1", "login": "s.royz", "fullName": "Sergey Royz"},
+                {"id": "1-1", "login": "a.lovelace", "fullName": "Ada Lovelace"},
                 {"id": "1-2", "login": "s.other", "fullName": "Other Person"},
             ]).encode()
             self.send_response(200)
@@ -220,16 +220,16 @@ def test_users_find_sends_query_and_paging(tmp_path):
 
     UsersFindHandler.requests = []
     with serve(UsersFindHandler) as base:
-        result = run_cli(tmp_path, base, "users", "find", "royz",
+        result = run_cli(tmp_path, base, "users", "find", "lovelace",
                          "--limit", "2", "--offset", "5")
     assert result.returncode == 0, result.stderr
     path = UsersFindHandler.requests[0]
     query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
-    assert query["query"] == ["royz"]
+    assert query["query"] == ["lovelace"]
     assert query["$top"] == ["3"]          # limit + 1, so truncation is detectable
     assert query["$skip"] == ["5"]
     payload = json.loads(result.stdout)
-    assert payload["items"][0]["login"] == "s.royz"
+    assert payload["items"][0]["login"] == "a.lovelace"
     assert payload["has_more"] is False    # 2 rows returned for limit 2
 
 
@@ -360,20 +360,20 @@ def test_projects_find_smoke(tmp_path):
 
 
 def test_projects_find_pages_and_envelopes(tmp_path):
-    rows = [{"id": "0-1", "name": "ION", "shortName": "ION"},
-            {"id": "0-6", "name": "ION Development", "shortName": "IONDEV"}]
+    rows = [{"id": "0-1", "name": "ACME", "shortName": "ACME"},
+            {"id": "0-6", "name": "ACME Development", "shortName": "DEV"}]
     handler = _paging_handler(rows)
     with serve(handler) as base:
-        result = run_cli(tmp_path, base, "projects", "find", "ION",
+        result = run_cli(tmp_path, base, "projects", "find", "ACME",
                          "--limit", "2", "--offset", "1")
     assert result.returncode == 0, result.stderr
     assert urllib.parse.urlparse(handler.requests[0]).path == "/api/admin/projects"
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.requests[0]).query)
     assert query["$top"] == ["3"]        # limit + 1, replacing the hardcoded 100
     assert query["$skip"] == ["1"]
-    assert query["query"] == ["ION"]
+    assert query["query"] == ["ACME"]
     payload = json.loads(result.stdout)
-    assert payload["items"][0]["shortName"] == "ION"
+    assert payload["items"][0]["shortName"] == "ACME"
     assert payload["has_more"] is False
 
 
@@ -417,14 +417,14 @@ def test_groups_find_substring_is_optional(tmp_path):
 
 
 def test_groups_members_lists_users(tmp_path):
-    rows = [{"id": "1-1", "login": "s.royz", "fullName": "Sergey Royz",
+    rows = [{"id": "1-1", "login": "a.lovelace", "fullName": "Ada Lovelace",
              "email": "s@example.com"}]
     handler = _paging_handler(rows)
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "groups", "members", "3-4", "--limit", "5")
     assert result.returncode == 0, result.stderr
     assert urllib.parse.urlparse(handler.requests[0]).path == "/api/groups/3-4/users"
-    assert json.loads(result.stdout)["items"][0]["login"] == "s.royz"
+    assert json.loads(result.stdout)["items"][0]["login"] == "a.lovelace"
 
 
 PROJECT_FIELDS_PAYLOAD = [
@@ -433,8 +433,8 @@ PROJECT_FIELDS_PAYLOAD = [
      "bundle": {"id": "b1", "values": [{"name": "Critical"}, {"name": "Normal"}]}},
     {"id": "2", "canBeEmpty": True, "$type": "UserProjectCustomField",
      "field": {"name": "Assignee", "fieldType": {"id": "user[1]", "isMultiValue": False}},
-     "bundle": {"id": "b2", "values": [{"name": "Sergey Royz"}],
-                "aggregatedUsers": [{"login": "s.royz"}, {"login": "j.howell"}]}},
+     "bundle": {"id": "b2", "values": [{"name": "Ada Lovelace"}],
+                "aggregatedUsers": [{"login": "a.lovelace"}, {"login": "t.turing"}]}},
     {"id": "3", "canBeEmpty": True, "$type": "SimpleProjectCustomField",
      "field": {"name": "Points", "fieldType": {"id": "integer", "isMultiValue": False}},
      "bundle": None},
@@ -467,7 +467,7 @@ def test_projects_fields_list_shapes_schema(tmp_path):
         {"name": "Priority", "type": "enum[1]", "multiValue": False,
          "canBeEmpty": False, "values": ["Critical", "Normal"]},
         {"name": "Assignee", "type": "user[1]", "multiValue": False,
-         "canBeEmpty": True, "values": ["s.royz", "j.howell"]},
+         "canBeEmpty": True, "values": ["a.lovelace", "t.turing"]},
         {"name": "Points", "type": "integer", "multiValue": False,
          "canBeEmpty": True, "values": None},
     ]
@@ -524,7 +524,7 @@ NAMELESS_BUNDLE_ENTRIES_PAYLOAD = [
     {"id": "2", "canBeEmpty": True, "$type": "UserProjectCustomField",
      "field": {"name": "Assignee", "fieldType": {"id": "user[1]", "isMultiValue": False}},
      "bundle": {"id": "b2",
-                "aggregatedUsers": [{"id": "nameless-user"}, {"login": "s.royz"}]}},
+                "aggregatedUsers": [{"id": "nameless-user"}, {"login": "a.lovelace"}]}},
 ]
 
 
@@ -547,7 +547,7 @@ def test_projects_fields_list_drops_nameless_bundle_entries(tmp_path):
     parsed = json.loads(result.stdout)["items"]
     assert parsed[0]["values"] == ["Critical"]
     assert None not in parsed[0]["values"]
-    assert parsed[1]["values"] == ["s.royz"]
+    assert parsed[1]["values"] == ["a.lovelace"]
     assert None not in parsed[1]["values"]
 
 
@@ -807,7 +807,7 @@ ISSUE_WITH_FIELDS = {
     "id": "2-1", "idReadable": "DEMO-1", "summary": "s", "description": "d",
     "customFields": [
         {"name": "Assignee", "$type": "SingleUserIssueCustomField",
-         "value": {"login": "s.royz", "name": "Sergey Royz", "id": "1-1"}},
+         "value": {"login": "a.lovelace", "name": "Ada Lovelace", "id": "1-1"}},
         {"name": "State", "$type": "StateIssueCustomField",
          "value": {"name": "Done", "id": "126-37"}},
         {"name": "Points", "$type": "SimpleIssueCustomField", "value": 2},
@@ -819,7 +819,7 @@ ISSUE_WITH_FIELDS = {
          "value": [{"name": "Infrastructure", "id": "124-49"},
                    {"name": "Technical Debt", "id": "124-50"}]},
         {"name": "Requestor", "$type": "MultiUserIssueCustomField",
-         "value": [{"login": "k.shmidt", "name": "Kirill Shmidt", "id": "1-9"}]},
+         "value": [{"login": "g.hopper", "name": "Grace Hopper", "id": "1-9"}]},
         {"name": "Due Date", "$type": "DateIssueCustomField", "value": 1781534028493},
         {"name": "Incident Start Time", "$type": "SimpleIssueCustomField",
          "value": 1781534028493},
@@ -849,13 +849,13 @@ def test_issues_get_flattens_custom_fields(tmp_path):
     body = json.loads(result.stdout)
     assert "customFields" not in body
     assert body["fields"] == {
-        "Assignee": "s.royz",
+        "Assignee": "a.lovelace",
         "State": "Done",
         "Points": 2,
         "Original Estimate": "1d",
         "Acceptance Criteria": "- one\n- two",
         "Work Category": ["Infrastructure", "Technical Debt"],
-        "Requestor": ["k.shmidt"],
+        "Requestor": ["g.hopper"],
         "Due Date": "2026-06-15",
         "Incident Start Time": 1781534028493,
         "Blocked Reason": None,
@@ -1233,9 +1233,9 @@ def test_links_remove_self_link_is_refused_without_any_request(tmp_path, link_ha
     assert link_handler.requests == []
 
 
-_TAGS = [{"id": "6-3", "name": "Question", "owner": {"login": "s.royz"}},
-         {"id": "6-11", "name": "DevOps", "owner": {"login": "s.royz"}},
-         {"id": "6-31", "name": "Data Team", "owner": {"login": "k.shmidt"}}]
+_TAGS = [{"id": "6-3", "name": "Question", "owner": {"login": "a.lovelace"}},
+         {"id": "6-11", "name": "DevOps", "owner": {"login": "a.lovelace"}},
+         {"id": "6-31", "name": "Data Team", "owner": {"login": "g.hopper"}}]
 
 
 def _tag_handler(tags=None, *, delete_status=200, delete_body=None,
@@ -1355,8 +1355,8 @@ def test_tags_unknown_name_does_not_claim_the_tag_does_not_exist(tmp_path):
 
 
 def test_tags_ambiguous_name_is_refused_not_guessed(tmp_path):
-    collide = [{"id": "6-3", "name": "Shared", "owner": {"login": "s.royz"}},
-               {"id": "6-9", "name": "Shared", "owner": {"login": "k.shmidt"}}]
+    collide = [{"id": "6-3", "name": "Shared", "owner": {"login": "a.lovelace"}},
+               {"id": "6-9", "name": "Shared", "owner": {"login": "g.hopper"}}]
     handler = _tag_handler(collide)
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "issues", "tags", "add", "DEMO-1",
@@ -1596,7 +1596,7 @@ def _serve(handler_cls):
 
 # ── issues update: custom-field writes (M2) ──────────────────────────────
 #
-# $type per field mirrors what IONDEV returns on a real issue read, including
+# $type per field mirrors what DEV returns on a real issue read, including
 # the measured traps: `date` is DateIssueCustomField while `date and time` is
 # SimpleIssueCustomField, indistinguishable from `integer` on the issue side.
 UPDATE_FIELD_TYPES = {
@@ -1696,17 +1696,17 @@ def test_update_marshals_owned_field_by_name(tmp_path):
 
 
 def test_update_marshals_user_field_by_login(tmp_path):
-    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Assignee=s.royz")
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Assignee=a.lovelace")
 
     assert result.returncode == 0, result.stderr
-    assert sent_fields(writes)["Assignee"]["value"] == {"login": "s.royz"}
+    assert sent_fields(writes)["Assignee"]["value"] == {"login": "a.lovelace"}
 
 
 def test_update_marshals_multi_user_as_login_list(tmp_path):
-    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Requestor=s.royz")
+    result, writes = run_update(tmp_path, "DEMO-1", "--field", "Requestor=a.lovelace")
 
     assert result.returncode == 0, result.stderr
-    assert sent_fields(writes)["Requestor"]["value"] == [{"login": "s.royz"}]
+    assert sent_fields(writes)["Requestor"]["value"] == [{"login": "a.lovelace"}]
 
 
 def test_update_marshals_multi_enum_as_name_list(tmp_path):
@@ -2082,10 +2082,10 @@ CREATE_TYPE_CASES = [
      "Infrastructure", "MultiEnumIssueCustomField", [{"name": "Infrastructure"}]),
     ("ownedField[1]", "Subsystem", False, ["Ingestion"], None,
      "Ingestion", "SingleOwnedIssueCustomField", {"name": "Ingestion"}),
-    ("user[1]", "Assignee", False, None, ["s.royz", "k.shmidt"],
-     "s.royz", "SingleUserIssueCustomField", {"login": "s.royz"}),
-    ("user[*]", "Requestor", True, None, ["s.royz", "k.shmidt"],
-     "k.shmidt", "MultiUserIssueCustomField", [{"login": "k.shmidt"}]),
+    ("user[1]", "Assignee", False, None, ["a.lovelace", "g.hopper"],
+     "a.lovelace", "SingleUserIssueCustomField", {"login": "a.lovelace"}),
+    ("user[*]", "Requestor", True, None, ["a.lovelace", "g.hopper"],
+     "g.hopper", "MultiUserIssueCustomField", [{"login": "g.hopper"}]),
     ("version[1]", "Release Window", False, ["2026.1"], None,
      "2026.1", "SingleVersionIssueCustomField", {"name": "2026.1"}),
     ("version[*]", "Sprints", True, ["Sprint W13", "Sprint W14"], None,
@@ -2372,7 +2372,7 @@ def test_create_draft_carries_the_full_field_set(tmp_path):
 
 
 def test_create_draft_may_set_state(tmp_path):
-    """State on a draft is settable (measured on ION). Where a project's
+    """State on a draft is settable (measured on ACME). Where a project's
     workflow rejects it that is exit 7, not a refusal the CLI invents."""
     result, writes = run_create(tmp_path, "--summary", "draft me", "--draft",
                                 "--field", "State=Open")
@@ -2878,9 +2878,9 @@ def test_projects_get_returns_a_single_object_not_an_envelope(tmp_path):
         def do_GET(self):
             self.__class__.requests.append(self.path)
             body = json.dumps({
-                "id": "0-1", "name": "ION", "shortName": "ION",
+                "id": "0-1", "name": "ACME", "shortName": "ACME",
                 "description": None, "archived": False,
-                "leader": {"login": "s.royz", "fullName": "Sergey Royz"},
+                "leader": {"login": "a.lovelace", "fullName": "Ada Lovelace"},
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2895,15 +2895,15 @@ def test_projects_get_returns_a_single_object_not_an_envelope(tmp_path):
     payload = json.loads(result.stdout)
     # Single-entity read: no envelope, matching issues get and articles get.
     assert "items" not in payload
-    assert payload["shortName"] == "ION"
-    assert payload["leader"]["login"] == "s.royz"
+    assert payload["shortName"] == "ACME"
+    assert payload["leader"]["login"] == "a.lovelace"
     assert urllib.parse.urlparse(ProjectGetHandler.requests[0]).path == \
         "/api/admin/projects/0-1"
 
 
 def test_searches_list_pages_and_envelopes(tmp_path):
     rows = [{"id": "7-0", "name": "Assigned to me", "query": "for: me",
-             "owner": {"login": "s.royz"}, "visibleFor": {"name": "All Users"}}]
+             "owner": {"login": "a.lovelace"}, "visibleFor": {"name": "All Users"}}]
     handler = _paging_handler(rows)
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "searches", "list", "--limit", "5")
@@ -2915,7 +2915,7 @@ def test_searches_list_pages_and_envelopes(tmp_path):
 
 
 def test_articles_search_sends_the_query_to_the_articles_endpoint(tmp_path):
-    rows = [{"idReadable": "IONDEV-A-36", "summary": "DWH (TimeScale)"}]
+    rows = [{"idReadable": "DEV-A-36", "summary": "DWH (TimeScale)"}]
     handler = _paging_handler(rows)
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "articles", "search", "summary: DWH",
@@ -2928,7 +2928,7 @@ def test_articles_search_sends_the_query_to_the_articles_endpoint(tmp_path):
     assert query["query"] == ["summary: DWH"]
     assert query["$top"] == ["4"]
     payload = json.loads(result.stdout)
-    assert payload["items"][0]["idReadable"] == "IONDEV-A-36"
+    assert payload["items"][0]["idReadable"] == "DEV-A-36"
     assert payload["has_more"] is False
 
 
@@ -3078,14 +3078,14 @@ def _visibility_handler(groups):
 
 
 _GROUPS = [{"id": "3-4", "name": "Administrative Team"},
-           {"id": "3-9", "name": "ION Team"}]
+           {"id": "3-9", "name": "ACME Team"}]
 
 
 def test_comment_permitted_groups_are_sent_as_ids(tmp_path):
     handler = _visibility_handler(_GROUPS)
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
-                         "--text", "hi", "--permitted-groups", "ION Team")
+                         "--text", "hi", "--permitted-groups", "ACME Team")
     assert result.returncode == 0, result.stderr
     post = [r for r in handler.requests if r[0] == "POST"][0]
     # Measured: permittedGroups rejects a name; only an id works.
@@ -3099,12 +3099,12 @@ def test_comment_permitted_users_are_sent_as_logins(tmp_path):
     handler = _visibility_handler(_GROUPS)
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
-                         "--text", "hi", "--permitted-users", "s.royz")
+                         "--text", "hi", "--permitted-users", "a.lovelace")
     assert result.returncode == 0, result.stderr
     post = [r for r in handler.requests if r[0] == "POST"][0]
     assert post[2]["visibility"] == {
         "$type": "LimitedVisibility",
-        "permittedUsers": [{"login": "s.royz"}],
+        "permittedUsers": [{"login": "a.lovelace"}],
     }
     # No group lookup is needed when no group was named.
     assert not any(r[0] == "GET" for r in handler.requests)
@@ -3114,13 +3114,13 @@ def test_comment_visibility_always_carries_the_type(tmp_path):
     handler = _visibility_handler(_GROUPS)
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
-                         "--text", "hi", "--permitted-users", "s.royz",
-                         "--permitted-groups", "ION Team")
+                         "--text", "hi", "--permitted-users", "a.lovelace",
+                         "--permitted-groups", "ACME Team")
     assert result.returncode == 0, result.stderr
     post = [r for r in handler.requests if r[0] == "POST"][0]
     # Measured: omitting $type returns 400 with a type mismatch.
     assert post[2]["visibility"]["$type"] == "LimitedVisibility"
-    assert post[2]["visibility"]["permittedUsers"] == [{"login": "s.royz"}]
+    assert post[2]["visibility"]["permittedUsers"] == [{"login": "a.lovelace"}]
     assert post[2]["visibility"]["permittedGroups"] == [{"id": "3-9"}]
 
 
@@ -3128,9 +3128,9 @@ def test_unknown_group_name_exits_6_with_near_miss_and_no_write(tmp_path):
     handler = _visibility_handler(_GROUPS)
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "issues", "comments", "add", "DEMO-1",
-                         "--text", "hi", "--permitted-groups", "ION Teem")
+                         "--text", "hi", "--permitted-groups", "ACME Teem")
     assert result.returncode == 6
-    assert "ION Team" in result.stderr, "must offer the near-miss"
+    assert "ACME Team" in result.stderr, "must offer the near-miss"
     # The server cannot distinguish a bad name from a name-instead-of-id, so the
     # refusal must happen client-side, before any write.
     assert not any(r[0] == "POST" for r in handler.requests)
@@ -3182,7 +3182,7 @@ _WORK_ITEM = {"id": "162-1", "date": 1784505600000,
               "duration": {"minutes": 90, "presentation": "1h 30m",
                            "$type": "DurationValue"},
               "text": None, "type": None,
-              "author": {"login": "s.royz"}, "created": 1785273759478}
+              "author": {"login": "a.lovelace"}, "created": 1785273759478}
 
 _PROJECT_WORK_TYPES = [{"id": "139-0", "name": "Development"},
                        {"id": "139-1", "name": "Testing"},
@@ -3191,7 +3191,7 @@ _PROJECT_WORK_TYPES = [{"id": "139-0", "name": "Development"},
                        {"id": "139-4", "name": "Support"}]
 
 # Measured 2026-07-28: the instance-wide endpoint lists 6 work-item types on
-# ION, project 0-1 lists 5 — `Review` exists instance-wide and is refused by
+# ACME, project 0-1 lists 5 — `Review` exists instance-wide and is refused by
 # the project. The fixture keeps that asymmetry so a test can tell "resolved
 # against the project's set" apart from "resolved against the instance's".
 _INSTANCE_WORK_TYPES = _PROJECT_WORK_TYPES + [{"id": "139-5", "name": "Review"}]
@@ -3357,7 +3357,7 @@ def test_work_log_type_absent_from_the_project_is_refused_here(tmp_path):
 
 def test_work_log_sends_the_date_as_noon_utc_epoch_ms(tmp_path):
     """The server snaps to 00:00 of the day and whether that snap is UTC or
-    profile-timezone is unmeasurable on ION, so noon is sent for its ~12h of
+    profile-timezone is unmeasurable on ACME, so noon is sent for its ~12h of
     margin. Assert the request, never epoch equality on the round trip."""
     handler = _work_handler()
     with serve(handler) as base:
@@ -3394,7 +3394,7 @@ def test_work_log_flattens_type_and_author(tmp_path):
     login, never emit the whole object (which would leak $type)."""
     item = dict(_WORK_ITEM,
                type={"id": "139-1", "name": "Testing", "$type": "WorkItemType"},
-               author={"login": "s.royz", "$type": "User"})
+               author={"login": "a.lovelace", "$type": "User"})
     handler = _work_handler(post_body=item)
     with serve(handler) as base:
         result = run_cli(tmp_path, base, "issues", "work", "log", "DEMO-1",
@@ -3402,7 +3402,7 @@ def test_work_log_flattens_type_and_author(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["type"] == "Testing"
-    assert payload["author"] == "s.royz"
+    assert payload["author"] == "a.lovelace"
     assert "$type" not in json.dumps(payload)
 
 
