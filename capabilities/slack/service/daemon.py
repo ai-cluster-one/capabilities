@@ -319,6 +319,10 @@ def connect_and_listen(
     max_parallel = int(defaults.get("max_parallel_jobs") or 3)
     workspace_mode = str(defaults.get("workspace_mode") or "read_only")
     worker_home = defaults.get("worker_home")
+    read_roots = [
+        str(Path(path).expanduser().resolve())
+        for path in (defaults.get("read_roots") or [])
+    ]
     if tail_size < 1 or tail_size > 200:
         raise ValueError("tail_size must be between 1 and 200")
     if worker_timeout < 1 or worker_timeout > 3600:
@@ -485,6 +489,7 @@ def connect_and_listen(
                 worker_bin=worker_bin,
                 capability_roots=capability_roots,
                 workspace_mode=workspace_mode,
+                read_roots=read_roots,
             )
             reply = result["reply"]
             post(channel, reply, thread)

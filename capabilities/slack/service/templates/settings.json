@@ -20,6 +20,7 @@
     "worker": "stub",
     "worker_home": null,
     "project": null,
+    "read_roots": [],
     "workspace_mode": "read_only",
     "trusted_ingress": false,
     "tail_size": 30,

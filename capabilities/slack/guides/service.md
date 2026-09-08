@@ -59,7 +59,13 @@ Codex with empty capability authority.
 6. For a real worker, choose `claude` or `codex`, acknowledge trusted ingress,
    configure an owner-only (`0700`) dedicated worker home, and keep the default
    read-only workspace unless writes are intentional.
-7. Run the service doctor before starting it.
+7. To let the worker read material outside the project, list absolute
+   directories in `defaults.read_roots`. Each must exist; the filesystem root,
+   the operator's home directory, any ancestor of it, and the worker home are
+   rejected. Read roots are readable by the Claude worker's tools and sandboxed
+   shell and are never writable in either workspace mode. Codex accepts no read
+   roots: its read-only sandbox already reads the whole filesystem.
+8. Run the service doctor before starting it.
 
 For example, this admits one user as a supervisor and permits automatic
 answers only in one admitted channel. The ids below are placeholders; copy

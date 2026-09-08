@@ -123,6 +123,54 @@ def test_sanitized_worker_env_drops_slack_and_unrelated_secrets():
     assert "DATABASE_URL" not in env
 
 
+def test_sanitized_worker_env_keeps_login_identity_for_keychain_lookup():
+    env = sanitized_worker_env(
+        {"PATH": "/bin", "HOME": "/home/test", "USER": "operator", "LOGNAME": "operator"}
+    )
+    assert env["USER"] == "operator"
+    assert env["LOGNAME"] == "operator"
+
+
+def test_claude_read_roots_are_readable_never_writable(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return 0, '{"result":"ok"}', ""
+
+    monkeypatch.setattr(workers, "run_worker_proc", fake_run)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    for mode in ("read_only", "workspace_write"):
+        workers.worker_claude(
+            "prompt",
+            cwd=".",
+            env={"PATH": "/bin"},
+            timeout=10,
+            workspace_mode=mode,
+            read_roots=[str(docs)],
+        )
+        command = captured["cmd"]
+        settings = json.loads(command[command.index("--settings") + 1])
+        resolved = str(docs.resolve())
+        assert resolved in settings["sandbox"]["filesystem"]["allowRead"]
+        assert resolved in settings["sandbox"]["filesystem"]["denyWrite"]
+        assert settings["permissions"]["additionalDirectories"] == [resolved]
+
+
+def test_claude_without_read_roots_adds_no_permissions_block(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return 0, '{"result":"ok"}', ""
+
+    monkeypatch.setattr(workers, "run_worker_proc", fake_run)
+    workers.worker_claude("prompt", cwd=".", env={"PATH": "/bin"}, timeout=10)
+    settings = json.loads(captured["cmd"][captured["cmd"].index("--settings") + 1])
+    assert "permissions" not in settings
+
+
 def test_claude_uses_permissions_and_explicit_capability_tools(monkeypatch):
     captured = {}
 

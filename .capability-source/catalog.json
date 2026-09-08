@@ -127,7 +127,7 @@
     },
     "slack": {
       "path": "capabilities/slack",
-      "payload_sha256": "cfa0c4341eb6fc71fa99abc71a0908c4d2ceac874b789f3f03f08cb932fe9dfb",
+      "payload_sha256": "0e4d42101a09f4d23b58a0d469bd226c477aea87669dfdaa8140465ad1560d15",
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
     "stripe": {
