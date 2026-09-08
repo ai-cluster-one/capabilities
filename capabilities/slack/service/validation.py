@@ -180,6 +180,7 @@ def validate_settings(settings, *, project_root=None, check_worker=False) -> lis
             "admitted Slack senders can direct the worker inside the configured workspace"
         )
     worker_home = defaults.get("worker_home")
+    resolved_worker_home = None
     if worker != "stub":
         if not isinstance(worker_home, str) or not worker_home.strip():
             problems.append(
@@ -212,6 +213,40 @@ def validate_settings(settings, *, project_root=None, check_worker=False) -> lis
         problems.append(
             f"defaults.workspace_mode must be one of {sorted(WORKSPACE_MODES)}"
         )
+
+    read_roots = _string_list(
+        defaults.get("read_roots", []), "defaults.read_roots", problems
+    )
+    if read_roots and worker == "codex":
+        problems.append(
+            "defaults.read_roots applies to the claude worker only; the codex "
+            "read-only sandbox already reads the whole filesystem"
+        )
+    operator_home = Path.home().resolve()
+    for entry in read_roots:
+        candidate = Path(entry).expanduser()
+        if not candidate.is_absolute():
+            problems.append(f"defaults.read_roots entry must be an absolute path: {entry}")
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_dir():
+            problems.append(f"defaults.read_roots entry does not exist: {entry}")
+            continue
+        if (
+            resolved == Path(resolved.anchor)
+            or resolved == operator_home
+            or resolved in operator_home.parents
+        ):
+            problems.append(
+                "defaults.read_roots entry is overbroad (filesystem root or the "
+                f"operator's home directory): {entry}"
+            )
+        if resolved_worker_home is not None and (
+            resolved == resolved_worker_home or resolved in resolved_worker_home.parents
+        ):
+            problems.append(
+                f"defaults.read_roots entry exposes the worker home: {entry}"
+            )
 
     configured_project = defaults.get("project")
     root = Path(project_root).resolve() if project_root else None

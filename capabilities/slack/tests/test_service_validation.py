@@ -104,6 +104,78 @@ def test_real_worker_home_must_be_private(tmp_path):
     assert any("group or other users" in problem for problem in problems)
 
 
+def _claude_settings(tmp_path):
+    settings = _template()
+    worker_home = tmp_path / "worker-home"
+    worker_home.mkdir(mode=0o700)
+    worker_home.chmod(0o700)
+    settings["defaults"].update(
+        {
+            "worker": "claude",
+            "worker_home": str(worker_home),
+            "trusted_ingress": True,
+        }
+    )
+    return settings, worker_home
+
+
+def _read_root_problems(settings, tmp_path):
+    return [
+        problem
+        for problem in validate_settings(settings, project_root=tmp_path)
+        if "read_roots" in problem
+    ]
+
+
+def test_read_roots_accept_existing_directories(tmp_path):
+    settings, _home = _claude_settings(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    settings["defaults"]["read_roots"] = [str(docs)]
+    assert _read_root_problems(settings, tmp_path) == []
+
+
+def test_read_roots_reject_missing_relative_and_overbroad_paths(tmp_path):
+    settings, _home = _claude_settings(tmp_path)
+    settings["defaults"]["read_roots"] = [
+        str(tmp_path / "missing"),
+        "relative/docs",
+        "/",
+        str(Path.home()),
+        str(Path.home().parent),
+    ]
+    problems = _read_root_problems(settings, tmp_path)
+    assert any("does not exist" in problem for problem in problems)
+    assert any("absolute path" in problem for problem in problems)
+    assert sum("overbroad" in problem for problem in problems) == 3
+
+
+def test_read_roots_reject_worker_home_exposure(tmp_path):
+    settings, worker_home = _claude_settings(tmp_path)
+    settings["defaults"]["read_roots"] = [str(worker_home), str(tmp_path)]
+    problems = _read_root_problems(settings, tmp_path)
+    assert sum("exposes the worker home" in problem for problem in problems) == 2
+
+
+def test_read_roots_must_be_string_list(tmp_path):
+    settings, _home = _claude_settings(tmp_path)
+    settings["defaults"]["read_roots"] = "/tmp"
+    assert any(
+        "list of strings" in problem for problem in _read_root_problems(settings, tmp_path)
+    )
+
+
+def test_codex_rejects_read_roots(tmp_path):
+    settings, _home = _claude_settings(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    settings["defaults"]["worker"] = "codex"
+    settings["defaults"]["read_roots"] = [str(docs)]
+    assert any(
+        "claude worker only" in problem for problem in _read_root_problems(settings, tmp_path)
+    )
+
+
 def test_numeric_limits_are_enforced(tmp_path):
     settings = _template()
     settings["defaults"]["max_parallel_jobs"] = 0

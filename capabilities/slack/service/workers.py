@@ -19,6 +19,10 @@ SAFE_PROCESS_ENV = {
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
     "HOME",
+    # Claude Code keys its macOS Keychain lookup on USER; without it every worker
+    # run reports "Not logged in" even when the worker home is authenticated.
+    "USER",
+    "LOGNAME",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
@@ -124,6 +128,7 @@ def worker_stub(
     worker_bin=None,
     capability_roots=None,
     workspace_mode="read_only",
+    read_roots=None,
 ):
     last = ""
     for line in reversed((prompt or "").splitlines()):
@@ -148,6 +153,7 @@ def worker_claude(
     worker_bin=None,
     capability_roots=None,
     workspace_mode="read_only",
+    read_roots=None,
 ):
     mode = _workspace_mode(workspace_mode)
     available_tools = ["Read", "Glob", "Grep", "Bash"]
@@ -169,14 +175,21 @@ def worker_claude(
     if worker_bin:
         allow_read.append(str(Path(worker_bin).resolve()))
     allow_read.extend(str(Path(path).resolve()) for path in capability_roots or [])
+    # Operator-granted read roots: readable by the sandboxed shell and by the
+    # Read/Glob/Grep tools without prompts, never writable in either workspace mode.
+    roots = sorted({str(Path(path).expanduser().resolve()) for path in read_roots or []})
+    allow_read.extend(roots)
     filesystem = {
         "allowRead": sorted(set(allow_read)),
         "allowWrite": sorted(set(allow_write)),
     }
     if protected_home:
         filesystem["denyRead"] = [str(Path(protected_home).resolve())]
+    deny_write = list(roots)
     if mode == "read_only":
-        filesystem["denyWrite"] = [project]
+        deny_write.append(project)
+    if deny_write:
+        filesystem["denyWrite"] = sorted(set(deny_write))
     strict_settings = {
         "sandbox": {
             "enabled": True,
@@ -187,6 +200,8 @@ def worker_claude(
             "network": {"allowedDomains": sorted(set(network_domains or []))},
         }
     }
+    if roots:
+        strict_settings["permissions"] = {"additionalDirectories": roots}
     denied_tools = [
         "WebFetch",
         "WebSearch",
@@ -264,6 +279,7 @@ def worker_codex(
     worker_bin=None,
     capability_roots=None,
     workspace_mode="read_only",
+    read_roots=None,
 ):
     fd, outpath = tempfile.mkstemp(prefix="slack-codex-", suffix=".txt")
     os.close(fd)
