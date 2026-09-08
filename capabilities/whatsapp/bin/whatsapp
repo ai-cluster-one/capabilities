@@ -109,10 +109,15 @@ Commands
                                        Prints an XXXX-XXXX code to enter on the
                                        phone (Settings → Linked Devices → Link a
                                        Device → "Link with phone number"); --qr
-                                       returns the QR payload instead. Holds the
-                                       connection afterwards to capture the
-                                       one-time history burst, which arrives once
-                                       and is not repeated on reconnect.
+                                       announces a QR reference to render and
+                                       scan instead, refreshing it as it expires.
+                                       Either way the invocation holds the socket
+                                       the code was minted on until the phone
+                                       completes the link — a link cannot complete
+                                       against a client that has exited — and then
+                                       holds it further to capture the one-time
+                                       history burst, which arrives once and is
+                                       not repeated on reconnect.
                                        --days sets the burst window (default: the
                                        connection's initial_sync_days, else 30);
                                        --full asks for everything the phone still
@@ -4024,6 +4029,9 @@ DRAIN_TIMEOUT = 30            # wait for the offline queue's own completion even
 CHUNK_SETTLE = 4.0            # quiet time after the last chunk before moving on
 DRAIN_CEILING = 60            # an ordinary verb's connection, at its longest
 ANSWER_TIMEOUT = 45           # one on-demand history request, answered by the phone
+LINK_TIMEOUT = 600            # the phone's own pace, from code shown to link done
+QR_SCAN_WINDOW = 180          # one QR reference, from minted to expired
+QR_REF_GRACE = 60             # a refreshed reference, given its own window again
 
 
 class Session:
@@ -4138,6 +4146,35 @@ class Session:
                 return True
             if self._logged_out.is_set():
                 return False
+        return False
+
+    def wait_linked(self, timeout: float = LINK_TIMEOUT, *,
+                    echo_qr: bool = False) -> bool:
+        """Wait for the phone to finish linking this device, without leaving.
+
+        A link completes over the socket that minted the code: the phone hands
+        the scan to the server, and the server hands the pairing back to the
+        client still waiting on it. A client that emits its code and exits
+        leaves the phone with nothing to complete against, and the phone
+        reports that as an account that cannot link new devices rather than as
+        a code that is already dead. Staying here is the whole method.
+
+        A QR reference also expires and is replaced, and a caller can only
+        render what it has been told, so every new reference is announced as it
+        arrives and is given a fresh window of its own. A pairing code needs no
+        echo: it stays valid for as long as the phone will accept it."""
+        deadline = time.monotonic() + (QR_SCAN_WINDOW if echo_qr else timeout)
+        ceiling = time.monotonic() + timeout
+        seen = self.qr_payload
+        while time.monotonic() < min(deadline, ceiling):
+            if self._connected.wait(0.5):
+                return True
+            if self._logged_out.is_set():
+                return False
+            if echo_qr and self.qr_payload and self.qr_payload != seen:
+                seen = self.qr_payload
+                _log_qr(seen, refreshed=True)
+                deadline = time.monotonic() + QR_REF_GRACE
         return False
 
     def require_connected(self) -> None:
@@ -4937,6 +4974,20 @@ def _wm_health(cfg: dict) -> None:
     _emit(out)
 
 
+def _log_qr(payload: str, *, refreshed: bool = False) -> None:
+    """Announce one QR reference on the progress stream, greppably.
+
+    The result on stdout cannot carry it: the code has to be rendered and
+    scanned while this invocation still holds the socket, so it is reported as
+    progress and read as the run proceeds."""
+    _log(f"\n  QR: {payload}\n"
+         + ("  The previous reference expired \u2014 render and scan this one.\n"
+            if refreshed else
+            "  Render that value as a QR code and scan it on the phone:\n"
+            "  WhatsApp \u2192 Settings \u2192 Linked Devices \u2192 Link a Device.\n"
+            "  This invocation stays connected until the link completes.\n"))
+
+
 def _wm_pair(cfg: dict, args) -> None:
     """Link this machine as a companion device and hold the connection open for
     the history burst.
@@ -4997,25 +5048,20 @@ def _wm_pair(cfg: dict, args) -> None:
                     if not session.qr_payload:
                         _refuse(5, "no_qr", "the engine produced no QR payload",
                              "retry, or pair with a phone-number code instead")
-                    _emit({"ok": True, "connection": cfg["id"], "method": "qr",
-                           "qr_value": session.qr_payload,
-                           "instructions": "render qr_value as a QR code and scan "
-                                           "it in WhatsApp → Linked Devices → Link "
-                                           "a Device, then re-run `whatsapp pair` "
-                                           "with --hold to capture the history burst"})
-                    return
-                try:
-                    code = session._client.PairPhone(number, True)
-                except Exception as exc:
-                    _refuse(5, "pair_code_failed",
-                         f"the pairing code could not be requested: "
-                         f"{type(exc).__name__}: {exc}",
-                         "retry, or use --qr")
-                session.pair_code = code
-                _log(f"\n  Pairing code for +{number}:  {code}\n"
-                     "  On that phone: WhatsApp → Settings → Linked Devices → Link a "
-                     "Device → 'Link with phone number instead' → enter this code.\n")
-            if not session.wait_connected(600):
+                    _log_qr(session.qr_payload)
+                else:
+                    try:
+                        code = session._client.PairPhone(number, True)
+                    except Exception as exc:
+                        _refuse(5, "pair_code_failed",
+                             f"the pairing code could not be requested: "
+                             f"{type(exc).__name__}: {exc}",
+                             "retry, or use --qr")
+                    session.pair_code = code
+                    _log(f"\n  Pairing code for +{number}:  {code}\n"
+                         "  On that phone: WhatsApp → Settings → Linked Devices → Link a "
+                         "Device → 'Link with phone number instead' → enter this code.\n")
+            if not session.wait_linked(echo_qr=bool(args.qr)):
                 _refuse(7, "never_linked",
                      "the device was not linked before the request expired",
                      f"re-run `{NAME} pair --connection {cfg['id']}` to get a new code")
