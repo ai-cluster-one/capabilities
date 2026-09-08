@@ -3111,8 +3111,7 @@ def _flatten_tags(issue):
 #
 # Every write entry must carry the issue-side `$type`; YouTrack rejects the
 # entry outright with "$type is required" and infers nothing from the value
-# shape. The map below is keyed on that $type — measured against DEV, see
-# .claude/plans/2026-07-27-youtrack-mcp-parity.md.
+# shape. The map below is keyed on that $type, measured against a live instance.
 #
 # Two traps live here. A `date` field is DateIssueCustomField and its value is
 # snapped by the server to 12:00 UTC of the same UTC day, so we send noon
@@ -3701,7 +3700,7 @@ def issues_comments_add(c, a):
 
 # ── issues: links ────────────────────────────────────────────────────────
 #
-# Measured 2026-07-28, see .claude/plans/2026-07-27-youtrack-mcp-parity.md.
+# Measured 2026-07-28 against a live instance.
 #
 # GET /issues/{id}/links returns every possible slot — 7 where the instance has
 # 4 link types — each with a direction-encoded id (`137-3s` OUTWARD, `137-3t`
@@ -3827,7 +3826,7 @@ def issues_links_remove(c, a):
 
 # ── issues: tags ─────────────────────────────────────────────────────────
 #
-# Measured 2026-07-28, see .claude/plans/2026-07-27-youtrack-mcp-parity.md.
+# Measured 2026-07-28 against a live instance.
 #
 # The write path takes an id and REJECTS a name — and an unknown name returns
 # the byte-identical 400 — so the name a caller knows has to be resolved here
@@ -3912,7 +3911,7 @@ def issues_tags_remove(c, a):
 
 # ── issues: work items ───────────────────────────────────────────────────
 #
-# Measured 2026-07-28, see .claude/plans/2026-07-27-youtrack-mcp-parity.md.
+# Measured 2026-07-28 against a live instance.
 #
 # Three traps, all measured:
 #   1. A unit-less duration is read as HOURS — "90" logs 90h, not 90m.

@@ -6,14 +6,6 @@ credentials.env
 .env.signoz.*
 *.local
 
-# Private working notes — grounded scratch (backlog, plans, session recaps).
-# Deliberately reference the cross-project conversations that produced them;
-# kept local so the public repo never ships those specifics.
-.assets/
-.claude/askproject/
-# Agent settings are per-machine and name local tooling, not the project.
-.claude/settings.local.json
-
 # OS / editor cruft
 .DS_Store
 *.swp

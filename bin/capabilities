@@ -4568,8 +4568,8 @@ def cmd_doctor() -> None:
         # The registry copy is the canonical binary — a real file the manager
         # wrote, never a symlink into a working tree. A dev-time `ln -s` back to
         # a project checkout makes the machine run an uncommitted binary and
-        # reintroduces a direct project reference; the closed-loop lifecycle
-        # (.claude/rules/CONFORMANCE.md) exists to prevent exactly that.
+        # reintroduces a direct project reference; the closed-loop source
+        # release lifecycle exists to prevent exactly that.
         if script.is_symlink():
             findings.append(
                 f"{name}: registry script is a symlink to {script.resolve()}, "
@@ -7099,7 +7099,6 @@ def _selfcheck_doclinks() -> list[str]:
     link_re = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
     docs = [_ASSET_ROOT / n for n in
             ("DOCTRINE.md", "SHEBANG.md", "TEMPLATE.md", "ROUTINES.md", "README.md")]
-    docs += sorted((_ASSET_ROOT / ".claude" / "rules").glob("*.md"))
     docs += sorted((_ASSET_ROOT / "guides").glob("*.md"))
     for doc in docs:
         if not doc.is_file():
