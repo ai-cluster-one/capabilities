@@ -1,7 +1,7 @@
 # Handoff: migrate simplbooks to the v2 capabilities model
 
 Paste the prompt below into a fresh Claude Code session opened in
-`/Users/kz/dev/simplbooks`. It is written for an agent with no memory of how we
+`the consuming project`. It is written for an agent with no memory of how we
 got here. Start with the **Stripe pilot** (Phase A); once it verifies, run the
 rest (Phase B).
 
@@ -19,16 +19,16 @@ CRITICAL — why this is not a rename:
 - Reference .md files live in .capabilities/<name>/reference/ — a dedicated subfolder, the single home for references, kept apart from the JSON config files. The context build and `<name> refs` glob reference/*.md and read FRONT-MATTER ONLY. A loose .md beside the JSON files, or at the envelope top level, is NOT read.
 - identifiers.json holds VALUES ONLY (ids, codes, labels) in the envelope shape `{ "<label>": { "value": <any>, "note": "<text>" } }` — NO prose, NO method, NO narrative (DOCTRINE rule 4). Any "how it works / how to book it" prose is NOT an identifier; it is a reference.
 
-AUTHORITATIVE SHAPES: read /Users/kz/dev/capabilities/TEMPLATE.md (the slots + "Settings vs identifiers vs reference") and /Users/kz/dev/capabilities/SHEBANG.md (the "Connections", "project envelope", and "ids verbs" sections). Use each capability's own verbs to author the envelope where possible: `<name> ids set|get|list|rm`, `<name> refs`, `<name> connections` (read-only, to verify resolution).
+AUTHORITATIVE SHAPES: read the capabilities source checkout/TEMPLATE.md (the slots + "Settings vs identifiers vs reference") and the capabilities source checkout/SHEBANG.md (the "Connections", "project envelope", and "ids verbs" sections). Use each capability's own verbs to author the envelope where possible: `<name> ids set|get|list|rm`, `<name> refs`, `<name> connections` (read-only, to verify resolution).
 
 STEP 0 — refresh the installed manager (it now injects per-capability references from the reference/ subfolder, audits that subfolder, and carries the `capabilities ids` verb):
-  cp /Users/kz/dev/capabilities/bin/capabilities ~/.capabilities/.manager/capabilities
+  cp the capabilities source checkout/bin/capabilities ~/.capabilities/.manager/capabilities
   capabilities help    # confirm an `ids <name>` verb is listed
 
 =================== PHASE A — STRIPE PILOT ===================
 
 A1. Install + replace the old symlink (machine-global, from the local source of truth):
-  capabilities install stripe --from /Users/kz/dev/capabilities
+  capabilities install stripe --from the capabilities source checkout
   rm -f ~/bin/stripe        # old symlink into ~/dev/capabilities; the install made ~/.local/bin/stripe
   which -a stripe           # confirm it resolves to ~/.local/bin/stripe
 (The recorded source becomes the local repo path, so `capabilities update stripe` later re-pulls from there.)
@@ -48,8 +48,8 @@ A3. Migrate .capabilities/stripe/ — read the old files first, then split by KI
 
 A4. References vs GUIDES — the boundary, applied per piece of prose:
   Ask: "Would ANY company using the stripe capability need this, or is it only simplbooks' mapping?"
-  - Only simplbooks (COA 248, cashbook 7, client 407, the MWQSHUMO invoice flow, Estonian VAT type 11) → stays as a project REFERENCE in .capabilities/stripe/reference/.
-  - Capability-global (e.g. a generic "how to reconcile a Stripe clearing account into a ledger") → it is a GUIDE, not a reference. Do NOT leave it in simplbooks. List the candidate(s) and STOP for the user — guides are migrated UPSTREAM by hand to /Users/kz/dev/capabilities/capabilities/stripe/guides/<topic>.md, surfaced by `stripe guide <topic>` (DOCTRINE rule 14). Report them; do not author them in this repo.
+  - Only simplbooks (a specific chart-of-accounts code, cashbook, client and invoice flow, and a national VAT type) → stays as a project REFERENCE in .capabilities/stripe/reference/.
+  - Capability-global (e.g. a generic "how to reconcile a Stripe clearing account into a ledger") → it is a GUIDE, not a reference. Do NOT leave it in simplbooks. List the candidate(s) and STOP for the user — guides are migrated UPSTREAM by hand to the capabilities source checkout/capabilities/stripe/guides/<topic>.md, surfaced by `stripe guide <topic>` (DOCTRINE rule 14). Report them; do not author them in this repo.
 
 A5. Connections: Stripe is a single account, so it likely needs NO connections.json (the implicit `default` connection + the Stripe key in simplbooks .env/.env.local is enough). Confirm with `stripe connections` and `stripe doctor`.
 
@@ -67,7 +67,7 @@ PAUSE here and let the user confirm the pilot before Phase B.
 
 B1. Install + detach the remaining proper capabilities (machine-global):
   For each of: asana askproject callva directo mail mailbox notion simplbooks telegram whatsapp windmill
-    capabilities install <name> --from /Users/kz/dev/capabilities
+    capabilities install <name> --from the capabilities source checkout
     rm -f ~/bin/<name>
   Then `capabilities list` to confirm all are installed.
   askproject is a core-only capability (no credentials, no connections — it drives the local `claude` CLI): install + detach it like the rest, but it has NO envelope to migrate (skip the B3 split for it). Enabling it in this project is optional — it is a machine-level meta-tool used to query OTHER projects.
@@ -81,7 +81,7 @@ B3. Migrate each remaining .capabilities/<name>/ envelope using the SAME split d
   - prose/model → reference .md under .capabilities/<name>/reference/ with name:+description: front-matter
   - capability-global guidance → flag for upstream migration, do not leave as a reference
   - old per-account / per-bank "profiles" → v2 CONNECTIONS in .capabilities/<name>/connections.json per SHEBANG's Connections shape: non-secret values inline, secrets by env-key indirection (NEVER inline a secret), a `default` pointer, `allow_write` only where a write leaves the system.
-    * Investigate .capabilities/swedbank/ specifically — it is most likely an old bank-connection profile that becomes a connection on the simplbooks capability, not a capability of its own.
+    * Investigate .capabilities/<bank>/ specifically — it is most likely an old bank-connection profile that becomes a connection on the simplbooks capability, not a capability of its own.
     * whatsapp specifically: the legacy .capabilities/whatsapp/whatsapp.json (its bespoke "profiles" map) is now read as the standard .capabilities/whatsapp/connections.json. Convert each profile to a connection entry — base_url, session, secret_env, dashboard_user_env, dashboard_pass_env, number, engine, tier (CORE for the free WAHA edition, PLUS for paid), messages_dir all carry over verbatim; the old `mode: "read"|"send"` becomes `allow_write` (a "send" profile ⇒ `allow_write: true`). The `default` key becomes the envelope's `default` pointer. Selection is `--connection <id>` (the old `--profile` flag is gone). Verify with `whatsapp connections`, then delete whatsapp.json.
     * simplbooks specifically: it now carries a per-connection WRITE GATE, off by default. The mutating verbs — clients/invoices/expenses/payments/incomings/kanne create·update·delete (+ invoices unbind, payments/incomings bind, expenses send-payment, bank-transactions save) — exit 4 unless the selected connection has `allow_write: true`. Reads are never gated. If this project creates invoices, records payments, or stages bank payments (it does), give simplbooks a .capabilities/simplbooks/connections.json with a connection that sets `allow_write: true` (email literal + secret_env for the password); otherwise every write is refused. The minted login session (ACCOUNT + COOKIE) stays per-connection state in the state home — login/refresh/doctor behave as before.
 

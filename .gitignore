@@ -11,6 +11,8 @@ credentials.env
 # kept local so the public repo never ships those specifics.
 .assets/
 .claude/askproject/
+# Agent settings are per-machine and name local tooling, not the project.
+.claude/settings.local.json
 
 # OS / editor cruft
 .DS_Store

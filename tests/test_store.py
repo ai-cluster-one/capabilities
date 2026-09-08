@@ -32,7 +32,7 @@ _PG_DSN = os.environ.get("STORE_TEST_PG")
 _BACKENDS = ["sqlite"] + (["postgres"] if _PG_DSN else [])
 
 
-MARVIN_ID = "3f1c9b4e-0000-4d92-9a11-0c5e8f2d6a44"
+ATLAS_ID = "3f1c9b4e-0000-4d92-9a11-0c5e8f2d6a44"
 OTHER_ID = "3f1c9b4e-1111-4d92-9a11-111111111111"
 
 
@@ -48,20 +48,20 @@ def store(request, tmp_path):
     s.migrate()
     # A record scoped to a project needs the project to exist; rows refer to it
     # by id, and there is no id until someone claims the slug.
-    s.project_register(MARVIN_ID, "marvin")
+    s.project_register(ATLAS_ID, "atlas")
     yield s
     s.close()
 
 
 @pytest.fixture()
 def scopes():
-    return Scopes(project="marvin")
+    return Scopes(project="atlas")
 
 
 # --- scope model -------------------------------------------------------------
 
 def test_chain_is_highest_first(store, scopes):
-    assert store._chain(scopes) == [("project", MARVIN_ID), ("global", None)]
+    assert store._chain(scopes) == [("project", ATLAS_ID), ("global", None)]
 
 
 def test_chain_skips_a_project_nobody_registered(store):
@@ -71,7 +71,7 @@ def test_chain_skips_a_project_nobody_registered(store):
 
 def test_the_global_scope_takes_no_project(store):
     with pytest.raises(StoreError) as exc:
-        store.config_set("telegram", "setting", "a", 1, ("global", "marvin"))
+        store.config_set("telegram", "setting", "a", 1, ("global", "atlas"))
     assert exc.value.slug == "bad_scope"
 
 
@@ -88,8 +88,8 @@ def test_write_target_refuses_a_scope_it_has_no_name_for():
 
 
 def test_write_target_names_the_two_scopes_there_are():
-    assert Scopes(project="marvin").write_target("project") == ("project", "marvin")
-    assert Scopes(project="marvin").write_target("global") == ("global", None)
+    assert Scopes(project="atlas").write_target("project") == ("project", "atlas")
+    assert Scopes(project="atlas").write_target("global") == ("global", None)
 
 
 # --- MERGE: rule 17, an absent higher entry inherits the lower ---------------
@@ -97,7 +97,7 @@ def test_write_target_names_the_two_scopes_there_are():
 def test_merge_inherits_per_key(store, scopes):
     store.config_set("telegram", "setting", "tick", 1, ("global", ""))
     store.config_set("telegram", "setting", "voice", "on", ("global", ""))
-    store.config_set("telegram", "setting", "tick", 5, ("project", "marvin"))
+    store.config_set("telegram", "setting", "tick", 5, ("project", "atlas"))
 
     assert store.config_get("telegram", "setting", "tick", scopes) == 5
     assert store.config_get("telegram", "setting", "voice", scopes) == "on"
@@ -105,16 +105,16 @@ def test_merge_inherits_per_key(store, scopes):
 
 def test_a_project_beats_global(store, scopes):
     store.config_set("telegram", "setting", "model", "sol", ("global", ""))
-    store.config_set("telegram", "setting", "model", "terra", ("project", "marvin"))
+    store.config_set("telegram", "setting", "model", "terra", ("project", "atlas"))
 
     assert store.config_get("telegram", "setting", "model", scopes) == "terra"
-    assert store.config_origin("telegram", "setting", "model", scopes) == ("project", MARVIN_ID)
+    assert store.config_origin("telegram", "setting", "model", scopes) == ("project", ATLAS_ID)
 
 
 def test_policy_gate_merges_like_the_file_gate_did(store, scopes):
     store.config_set("capabilities", "policy", "telegram", {"enabled": True}, ("global", ""))
     store.config_set("capabilities", "policy", "slack", {"enabled": True}, ("global", ""))
-    store.config_set("capabilities", "policy", "slack", {"enabled": False}, ("project", "marvin"))
+    store.config_set("capabilities", "policy", "slack", {"enabled": False}, ("project", "atlas"))
 
     resolved = store.config_resolve("capabilities", "policy", scopes)
     assert resolved["telegram"]["value"] == {"enabled": True}
@@ -134,10 +134,10 @@ def isolated_collection():
 
 def test_first_takes_one_scope_whole(store, scopes, isolated_collection):
     store.config_set("telegram", isolated_collection, "kz", {"api_id": 1}, ("global", ""))
-    store.config_set("telegram", isolated_collection, "marvin", {"api_id": 3}, ("project", "marvin"))
+    store.config_set("telegram", isolated_collection, "atlas", {"api_id": 3}, ("project", "atlas"))
 
     resolved = store.config_resolve("telegram", isolated_collection, scopes)
-    assert set(resolved) == {"marvin"}  # the global-only "kz" does not leak through
+    assert set(resolved) == {"atlas"}  # the global-only "kz" does not leak through
 
 
 def test_first_falls_through_an_empty_scope(store, scopes, isolated_collection):
@@ -151,7 +151,7 @@ def test_the_two_semantics_disagree_on_the_same_data(store, scopes, isolated_col
     """The same rows resolve differently by collection — which is the point."""
     for collection in (isolated_collection, "setting"):
         store.config_set("x", collection, "only_global", "g", ("global", ""))
-        store.config_set("x", collection, "overridden", "p", ("project", "marvin"))
+        store.config_set("x", collection, "overridden", "p", ("project", "atlas"))
 
     assert set(store.config_resolve("x", "setting", scopes)) == {"only_global", "overridden"}
     assert set(store.config_resolve("x", isolated_collection, scopes)) == {"overridden"}
@@ -159,51 +159,51 @@ def test_the_two_semantics_disagree_on_the_same_data(store, scopes, isolated_col
 
 # --- connection + grant: identity is a fact, permission is a decision --------
 
-MARVIN_BOX = {"address": "marvin@callva.io", "imap_host": "mail.amanati.ai",
-              "imap_port": 993, "secret_env": "MAILBOX_MARVIN_APP_PASSWORD"}
+ATLAS_BOX = {"address": "assistant@example.com", "imap_host": "mail.example.com",
+              "imap_port": 993, "secret_env": "MAILBOX_ATLAS_APP_PASSWORD"}
 
 
 def test_a_project_grants_write_without_restating_the_identity(store, scopes):
     """The whole point: one grant row, and not one field of the box repeated."""
-    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
-    store.config_set("mailbox", "grant", "marvin", {"allow_write": False}, ("global", ""))
-    store.config_set("mailbox", "grant", "marvin", {"allow_write": True}, ("project", "marvin"))
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"allow_write": False}, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"allow_write": True}, ("project", "atlas"))
 
     effective = store.connections_effective("mailbox", scopes)
-    assert effective["marvin"]["allow_write"] is True
-    assert effective["marvin"]["value"] == MARVIN_BOX          # identity untouched
-    assert effective["marvin"]["scope"] == ("global", None)      # and still global
-    assert effective["marvin"]["grant_scope"] == ("project", MARVIN_ID)
+    assert effective["atlas"]["allow_write"] is True
+    assert effective["atlas"]["value"] == ATLAS_BOX          # identity untouched
+    assert effective["atlas"]["scope"] == ("global", None)      # and still global
+    assert effective["atlas"]["grant_scope"] == ("project", ATLAS_ID)
 
 
 def test_a_project_can_disable_a_globally_declared_connection(store, scopes):
-    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
     store.config_set("mailbox", "connection", "osyris", {"address": "osyris@gmail.com"}, ("global", ""))
-    store.config_set("mailbox", "grant", "osyris", {"enabled": False}, ("project", "marvin"))
+    store.config_set("mailbox", "grant", "osyris", {"enabled": False}, ("project", "atlas"))
 
-    assert set(store.connections_effective("mailbox", scopes)) == {"marvin"}
+    assert set(store.connections_effective("mailbox", scopes)) == {"atlas"}
     both = store.connections_effective("mailbox", scopes, include_disabled=True)
     assert both["osyris"]["enabled"] is False
 
 
 def test_a_project_only_connection_lives_beside_the_global_ones(store, scopes):
-    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
     store.config_set("mailbox", "connection", "client", {"address": "a@client.tld"},
-                     ("project", "marvin"))
+                     ("project", "atlas"))
 
     effective = store.connections_effective("mailbox", scopes)
-    assert set(effective) == {"marvin", "client"}
-    assert effective["client"]["scope"] == ("project", MARVIN_ID)
+    assert set(effective) == {"atlas", "client"}
+    assert effective["client"]["scope"] == ("project", ATLAS_ID)
 
 
 def test_a_project_may_replace_a_global_identity_whole(store, scopes):
     """Entry-level merge, never field-level: the project's row is taken whole,
     so no connection is ever assembled out of two scopes."""
-    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
-    store.config_set("mailbox", "connection", "marvin", {"address": "other@x.tld"},
-                     ("project", "marvin"))
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "connection", "atlas", {"address": "other@x.tld"},
+                     ("project", "atlas"))
 
-    value = store.connections_effective("mailbox", scopes)["marvin"]["value"]
+    value = store.connections_effective("mailbox", scopes)["atlas"]["value"]
     assert value == {"address": "other@x.tld"}
     assert "imap_host" not in value  # nothing inherited from the global entry
 
@@ -215,8 +215,8 @@ def test_writability_falls_back_to_the_capability_default(store, scopes):
 
 
 def test_a_grant_naming_an_unknown_field_is_refused(store, scopes):
-    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
-    store.config_set("mailbox", "grant", "marvin", {"allow_read": True}, ("global", ""))
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"allow_read": True}, ("global", ""))
     with pytest.raises(StoreError) as exc:
         store.connections_effective("mailbox", scopes)
     assert exc.value.slug == "bad_grant"
@@ -225,87 +225,87 @@ def test_a_grant_naming_an_unknown_field_is_refused(store, scopes):
 def test_a_grant_aimed_at_nothing_is_reported_rather_than_dropped(store, scopes):
     """A mistyped id would otherwise mean permission silently not granted, which
     looks exactly like permission correctly withheld."""
-    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
-    store.config_set("mailbox", "grant", "marvni", {"allow_write": True}, ("project", "marvin"))
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "marvni", {"allow_write": True}, ("project", "atlas"))
 
-    assert set(store.connections_effective("mailbox", scopes)) == {"marvin"}
+    assert set(store.connections_effective("mailbox", scopes)) == {"atlas"}
     orphans = store.grant_orphans("mailbox", scopes)
     assert [o["key"] for o in orphans] == ["marvni"]
-    assert orphans[0]["scope"] == ("project", MARVIN_ID)
+    assert orphans[0]["scope"] == ("project", ATLAS_ID)
 
 
 def test_a_grant_that_lands_is_not_reported_as_an_orphan(store, scopes):
-    store.config_set("mailbox", "connection", "marvin", MARVIN_BOX, ("global", ""))
-    store.config_set("mailbox", "grant", "marvin", {"allow_write": True}, ("project", "marvin"))
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"allow_write": True}, ("project", "atlas"))
     assert store.grant_orphans("mailbox", scopes) == []
 
 
 # --- the project registry ----------------------------------------------------
 
-MARVIN_ID = "018f2c1a-7b3e-4d92-9a11-0c5e8f2d6a44"
+ATLAS_ID = "018f2c1a-7b3e-4d92-9a11-0c5e8f2d6a44"
 OTHER_ID = "018f2c1a-0000-4d92-9a11-000000000000"
 
 
 def test_a_project_is_addressed_by_slug_not_by_directory(store):
-    store.project_register(MARVIN_ID, "marvin", name="Marvin")
-    assert store.project_get("marvin")["name"] == "Marvin"
-    assert store.project_get("marvin")["id"] == MARVIN_ID
+    store.project_register(ATLAS_ID, "atlas", name="Marvin")
+    assert store.project_get("atlas")["name"] == "Marvin"
+    assert store.project_get("atlas")["id"] == ATLAS_ID
     assert store.project_get("nope") is None
 
 
 def test_the_same_project_sits_at_a_different_path_on_each_machine(store):
-    store.project_register(MARVIN_ID, "marvin")
-    store.project_bind_path("marvin", "kz-mbp", "/Users/kz/dev/marvin")
-    store.project_bind_path("marvin", "prod-1", "/opt/marvin")
+    store.project_register(ATLAS_ID, "atlas")
+    store.project_bind_path("atlas", "laptop-1", "/home/dev/atlas")
+    store.project_bind_path("atlas", "prod-1", "/opt/atlas")
 
-    assert store.project_path("marvin", "kz-mbp") == "/Users/kz/dev/marvin"
-    assert store.project_path("marvin", "prod-1") == "/opt/marvin"
-    assert store.project_path("marvin", "unknown-box") is None
+    assert store.project_path("atlas", "laptop-1") == "/home/dev/atlas"
+    assert store.project_path("atlas", "prod-1") == "/opt/atlas"
+    assert store.project_path("atlas", "unknown-box") is None
 
 
 def test_binding_a_path_to_an_unregistered_project_is_refused(store):
     with pytest.raises(StoreError) as exc:
-        store.project_bind_path("ghost", "kz-mbp", "/tmp/ghost")
+        store.project_bind_path("ghost", "laptop-1", "/tmp/ghost")
     assert exc.value.slug == "unknown_project"
 
 
 def test_a_second_machine_joins_the_project_the_id_names(store):
     """The id travels in the repository, so a laptop and a server agree that
     they are the same project without anyone telling them."""
-    store.project_register(MARVIN_ID, "marvin", name="Marvin")
-    store.project_register(MARVIN_ID, "marvin", name="Marvin AI")
-    assert [p["slug"] for p in store.project_list()] == ["marvin"]
-    assert store.project_get("marvin")["name"] == "Marvin AI"
+    store.project_register(ATLAS_ID, "atlas", name="Marvin")
+    store.project_register(ATLAS_ID, "atlas", name="Marvin AI")
+    assert [p["slug"] for p in store.project_list()] == ["atlas"]
+    assert store.project_get("atlas")["name"] == "Marvin AI"
 
 
 def test_another_project_cannot_take_a_label_that_is_held(store):
     """The collision that matters: an unrelated repository also calling itself
-    marvin is told the label is taken, rather than silently sharing the rows."""
-    store.project_register(MARVIN_ID, "marvin")
+    the caller is told the label is taken, rather than silently sharing the rows."""
+    store.project_register(ATLAS_ID, "atlas")
     with pytest.raises(StoreError) as exc:
-        store.project_register(OTHER_ID, "marvin")
+        store.project_register(OTHER_ID, "atlas")
     assert exc.value.slug == "slug_taken"
-    assert store.project_get("marvin")["id"] == MARVIN_ID
+    assert store.project_get("atlas")["id"] == ATLAS_ID
 
 
 def test_relabelling_a_project_is_a_migration_not_an_edit(store):
-    store.project_register(MARVIN_ID, "marvin")
+    store.project_register(ATLAS_ID, "atlas")
     with pytest.raises(StoreError) as exc:
-        store.project_register(MARVIN_ID, "marvin-two")
+        store.project_register(ATLAS_ID, "atlas-two")
     assert exc.value.slug == "slug_immutable"
 
 
 def test_a_project_without_an_id_is_refused(store):
     with pytest.raises(StoreError) as exc:
-        store.project_register("", "marvin")
+        store.project_register("", "atlas")
     assert exc.value.slug == "bad_project_id"
 
 
 # --- EXACT: rule 16, state does not cascade ----------------------------------
 
 def test_state_does_not_fall_back_to_another_scope(store):
-    store.state_set("telegram", "cursor", 42, ("project", "marvin"))
-    assert store.state_get("telegram", "cursor", ("project", "marvin")) == 42
+    store.state_set("telegram", "cursor", 42, ("project", "atlas"))
+    assert store.state_get("telegram", "cursor", ("project", "atlas")) == 42
     assert store.state_get("telegram", "cursor", ("global", "")) is None
 
 
@@ -320,26 +320,26 @@ def test_state_is_not_reachable_as_config(store, scopes):
 
 
 def test_expired_state_reads_as_absent_and_sweeps(store):
-    store.state_set("telegram", "lease", "held", ("project", "marvin"), ttl_seconds=-5)
-    assert store.state_get("telegram", "lease", ("project", "marvin")) is None
+    store.state_set("telegram", "lease", "held", ("project", "atlas"), ttl_seconds=-5)
+    assert store.state_get("telegram", "lease", ("project", "atlas")) is None
     assert store.state_sweep() == 1
     assert store.state_sweep() == 0
 
 
 def test_live_state_survives_a_sweep(store):
-    store.state_set("telegram", "lease", "held", ("project", "marvin"), ttl_seconds=600)
+    store.state_set("telegram", "lease", "held", ("project", "atlas"), ttl_seconds=600)
     assert store.state_sweep() == 0
-    assert store.state_get("telegram", "lease", ("project", "marvin")) == "held"
+    assert store.state_get("telegram", "lease", ("project", "atlas")) == "held"
 
 
 # --- revisions: what git used to answer --------------------------------------
 
 def test_every_write_records_who_and_what_it_was(store):
     store.config_set("telegram", "setting", "model", "sol", ("global", ""), actor="kz")
-    store.config_set("telegram", "setting", "model", "terra", ("global", ""), actor="marvin")
+    store.config_set("telegram", "setting", "model", "terra", ("global", ""), actor="atlas")
 
     log = store.revisions("telegram", "setting", "model")
-    assert [r["actor"] for r in log] == ["marvin", "kz"]
+    assert [r["actor"] for r in log] == ["atlas", "kz"]
     assert log[0]["old_value"] == "sol" and log[0]["new_value"] == "terra"
     assert log[1]["old_value"] is None
 
@@ -393,12 +393,12 @@ def test_unknown_collection_is_refused(store, scopes):
 
 def test_an_email_address_is_a_valid_connection_id(store, scopes):
     """Real mailboxes are addressed by address; the key has to carry one."""
-    store.config_set("mailbox", "connection", "konstantin@amanati.ai",
-                     {"address": "konstantin@amanati.ai"}, ("global", ""))
-    store.config_set("mailbox", "grant", "konstantin@amanati.ai",
-                     {"allow_write": True}, ("project", "marvin"))
+    store.config_set("mailbox", "connection", "owner@example.com",
+                     {"address": "owner@example.com"}, ("global", ""))
+    store.config_set("mailbox", "grant", "owner@example.com",
+                     {"allow_write": True}, ("project", "atlas"))
     effective = store.connections_effective("mailbox", scopes)
-    assert effective["konstantin@amanati.ai"]["allow_write"] is True
+    assert effective["owner@example.com"]["allow_write"] is True
 
 
 def test_a_key_with_whitespace_is_still_refused(store):
@@ -527,8 +527,8 @@ def test_a_project_inherits_the_globally_active_version(store, scopes):
 def test_a_projects_own_version_wins_over_the_global_one(store, scopes):
     shared = store.context_put("telegram", "voice-agent", "shared", ("global", ""))
     store.context_activate("telegram", "voice-agent", shared, ("global", ""))
-    own = store.context_put("telegram", "voice-agent", "ours", ("project", "marvin"))
-    store.context_activate("telegram", "voice-agent", own, ("project", "marvin"))
+    own = store.context_put("telegram", "voice-agent", "ours", ("project", "atlas"))
+    store.context_activate("telegram", "voice-agent", own, ("project", "atlas"))
 
     assert store.context_read("telegram", "voice-agent", scopes)["body"] == "ours"
     assert store.context_read("telegram", "voice-agent", Scopes())["body"] == "shared"
@@ -538,7 +538,7 @@ def test_one_projects_drafts_stay_out_of_anothers_history(store, scopes):
     """Without a scope on the row, every project's versions of the same key
     would pool under one name and each would read the others' history."""
     store.project_register(OTHER_ID, "client")
-    store.context_put("telegram", "voice-agent", "marvin's", ("project", "marvin"))
+    store.context_put("telegram", "voice-agent", "the agent's", ("project", "atlas"))
     store.context_put("telegram", "voice-agent", "client's", ("project", "client"))
 
     assert len(store.context_versions("telegram", "voice-agent", scopes)) == 1
@@ -550,7 +550,7 @@ def test_a_version_from_another_scope_cannot_be_activated(store):
     else's text would be a copy nobody made deliberately."""
     theirs = store.context_put("telegram", "voice-agent", "theirs", ("global", ""))
     with pytest.raises(StoreError) as exc:
-        store.context_activate("telegram", "voice-agent", theirs, ("project", "marvin"))
+        store.context_activate("telegram", "voice-agent", theirs, ("project", "atlas"))
     assert exc.value.slug == "unknown_version"
 
 
@@ -561,12 +561,12 @@ def test_an_unactivated_item_reads_as_absent(store, scopes):
 
 def test_a_body_survives_exactly(store, scopes):
     body = "#!/usr/bin/env python3\nprint('héllo')\n\n\ttabbed\n"
-    digest = store.context_put("automations", "upstream-watch", body, ("project", "marvin"),
+    digest = store.context_put("automations", "upstream-watch", body, ("project", "atlas"),
                                media_type="text/x-python", activate=True)
     got = store.context_read("automations", "upstream-watch", scopes)
     assert got["body"] == body and got["hash"] == digest
     assert got["media_type"] == "text/x-python"
-    assert got["scope"] == ("project", MARVIN_ID)
+    assert got["scope"] == ("project", ATLAS_ID)
 
 
 def test_history_omits_the_bodies_it_lists(store, scopes):
@@ -577,7 +577,7 @@ def test_history_omits_the_bodies_it_lists(store, scopes):
 
 def test_a_reference_is_context_like_any_other(store, scopes):
     body = "---\nname: Project Telegram Session\ndescription: how to wire it\n---\n\nbody\n"
-    store.context_put("telegram", "reference.project-session", body, ("project", "marvin"),
+    store.context_put("telegram", "reference.project-session", body, ("project", "atlas"),
                       media_type="text/markdown", activate=True)
     assert store.context_read("telegram", "reference.project-session", scopes)["body"] == body
     assert store.context_keys("telegram", scopes) == ["reference.project-session"]

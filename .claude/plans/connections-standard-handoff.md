@@ -2,7 +2,7 @@
 
 Self-contained brief for a fresh agent (or this session after compaction). It states the
 **consolidated connection standard going forward**, then the concrete work that brings the
-laggards into line. Repo: `/Users/kz/dev/capabilities`, branch **`main`** (protocol v2 is the
+laggards into line. Repo: `the capabilities source checkout`, branch **`main`** (protocol v2 is the
 primary line now).
 
 ## 0. Current state / what's already done
@@ -13,7 +13,7 @@ primary line now).
 - **Deviation pre-clean done** (ahead of Task C): three perceived deviations were investigated and found to be cruft / over-recording, not rule-departures —
   - **windmill** — settings-tier removed from the credential cascade (`_resolve_key_default` collapsed into the standard `_resolve_env_key`); `deviations.md` deleted. `folder`/`operator` stay in `_config_value` (legitimate non-secret config). `doctor` green live.
   - **railwayc** — cascade normalized (user `credentials.env` tier restored; `_resolve_env_key` byte-identical to stripe's); only the "2-tier" section dropped from `deviations.md` — its genuine entries (subprocess transport, transparent forwarding, write-verb classification, refuse-ambient-auth, doctor-via-status/exit-7) remain. `SCOPE=project` kept for scaffolding; `expect_project` guards mis-scope.
-  - **mailbox** — `$MAILBOX_CONFIG` override + legacy `settings.json`-profiles detection removed; `_registry_envelope` simplified to the standard envelope check; dead `_project_settings` removed. Registry resolution is now the standard two-home walk. The two live consumer configs migrated to `connections.json` (agentic-dev: 1 conn, default `jess`; simplbooks: 5 conns, **no default** — explicit `--connection` required), legacy `settings.json`/`mailbox.json` deleted.
+  - **mailbox** — `$MAILBOX_CONFIG` override + legacy `settings.json`-profiles detection removed; `_registry_envelope` simplified to the standard envelope check; dead `_project_settings` removed. Registry resolution is now the standard two-home walk. The two live consumer configs migrated to `connections.json` (one consumer with a single connection and a default; another with five and no default, **no default** — explicit `--connection` required), legacy `settings.json`/`mailbox.json` deleted.
   - **Implication for Task C:** the override-convention (`# contract: override`) now has **no known consumer** — confirm at step-zero diff and prefer dropping the mechanism (cleaner canonical loader, stricter drift-check) over building it speculatively.
   - **callva** — the same settings-tier cruft as windmill, narrower (only `api_url`, the API base endpoint; the secret stayed clean) and dead on disk; now removed: `_resolve_key_default` folded into the standard `_resolve_env_key`, dead `_project_settings` removed, docstring renumbered to 4 tiers, `deviations.md` deleted. audit green. **callva held the last settings-tier; that cruft class is fully eliminated.**
 - Sibling handoffs in `.claude/plans/` (untracked working notes):
@@ -67,9 +67,9 @@ The enforcement of "one loader inherited by all" is Task C (`sync-contract`): th
 - `connections.json` example to support in help:
   ```json
   {
-    "default": "juko",
+    "default": "primary",
     "connections": {
-      "juko":  { "login_email": "<email>", "secret_env": "SIMPLBOOKS_JUKO_PASSWORD", "allow_write": true },
+      "primary": { "login_email": "<email>", "secret_env": "SIMPLBOOKS_PRIMARY_PASSWORD", "allow_write": true },
       "other": { "login_email": "<email>", "secret_env": "SIMPLBOOKS_OTHER_PASSWORD", "allow_write": false }
     }
   }
@@ -82,10 +82,10 @@ The enforcement of "one loader inherited by all" is Task C (`sync-contract`): th
 
 ## Task W — whatsapp: normalize to the standard connections.json
 
-**Why:** whatsapp is connections in spirit (a `default` pointer + named entries with `base_url` + `secret_env`) but wears a parallel coat. Reference the real file `/Users/kz/dev/simplbooks/.capabilities/whatsapp/whatsapp.json`:
+**Why:** whatsapp is connections in spirit (a `default` pointer + named entries with `base_url` + `secret_env`) but wears a parallel coat. Reference the real file `<consumer-project>/.capabilities/whatsapp/whatsapp.json`:
 ```json
-{ "default": "kz-personal", "messages_dir": "messages",
-  "kz-personal": { "base_url": "https://waha.callva.one", "session": "default",
+{ "default": "personal", "messages_dir": "messages",
+  "personal": { "base_url": "https://<waha-host>", "session": "default",
                    "number": "...", "mode": "read", "secret_env": "WAHA_WHATSAPP_API_KEY" } }
 ```
 **The five incidental deltas to remove** (current code in `capabilities/whatsapp/bin/whatsapp`: `CONFIG_REL = .capabilities/whatsapp/settings.json`, `LEGACY_CONFIG_REL = …/whatsapp.json`, `$WHATSAPP_CONFIG`, bespoke profile discovery, no registry helpers):
@@ -99,8 +99,8 @@ The enforcement of "one loader inherited by all" is Task C (`sync-contract`): th
 
 **Target shape** (`.capabilities/whatsapp/connections.json`):
 ```json
-{ "default": "kz-personal",
-  "connections": { "kz-personal": { "base_url": "...", "session": "default",
+{ "default": "personal",
+  "connections": { "personal": { "base_url": "...", "session": "default",
                                      "number": "...", "secret_env": "WAHA_WHATSAPP_API_KEY",
                                      "allow_write": false } } }
 ```
