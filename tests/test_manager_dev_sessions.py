@@ -151,11 +151,11 @@ def _env(tmp_path: Path) -> dict[str, str]:
 
 
 def _run(
-    env: dict[str, str], *args: str, check: bool = True
+    env: dict[str, str], *args: str, check: bool = True, cwd: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         [str(MANAGER), *args],
-        cwd=REPO,
+        cwd=cwd or REPO,
         env=env,
         text=True,
         capture_output=True,
@@ -1138,3 +1138,142 @@ def test_pending_release_does_not_reinstall_explicitly_removed_payload(tmp_path)
     }]
     assert not registry.exists()
     assert not link.exists()
+
+
+def _custom_source(env: dict[str, str], source_id: str, name: str) -> Path:
+    """A source produced by `capabilities source init`, which vendors no manager."""
+    created = json.loads(_run(env, "source", "init", source_id).stdout)
+    workspace = Path(created["path"])
+    assert not (workspace / "bin" / "capabilities").exists()
+    _run(env, "new", name, "--source", source_id, cwd=workspace)
+    _git(workspace, "add", "-A")
+    _run(env, "source", "index", source_id, "--staged", cwd=workspace)
+    _commit_all(workspace, "Fixture custom source")
+    return workspace
+
+
+def test_dev_session_manager_resolves_for_a_source_without_a_vendored_manager(tmp_path):
+    """Only the official source vendors bin/capabilities; a session against any
+    other source must still shell through a manager that exists."""
+    env = _env(tmp_path)
+    _custom_source(env, "fixture-custom", "fixture-cap")
+    started = json.loads(
+        _run(
+            env, "dev", "start", "fixture-cap", "--source", "fixture-custom",
+            "--no-project", "--session", "custom-source-manager",
+        ).stdout
+    )
+    try:
+        manager = Path(started["isolated"]["bin"]) / "capabilities"
+        assert manager.is_symlink()
+        assert manager.resolve().is_file(), (
+            f"session manager link dangles: {manager} -> {os.readlink(manager)}"
+        )
+        installed = json.loads(
+            _run(env, "dev", "install", "custom-source-manager", "fixture-cap").stdout
+        )
+        assert installed["ok"] is True
+        payload = Path(started["isolated"]["registry"]) / "fixture-cap" / "fixture-cap"
+        assert payload.is_file()
+        doctor = json.loads(_run(env, "dev", "doctor", "custom-source-manager").stdout)
+        assert doctor["ok"] is True, doctor["findings"]
+        assert [item["name"] for item in doctor["installed"]] == ["fixture-cap"]
+    finally:
+        _run(env, "dev", "stop", "custom-source-manager", check=False)
+
+
+def test_dev_session_manager_stays_the_candidate_for_a_vendored_manager(tmp_path):
+    """A source that vendors the manager puts it under development, so the
+    session keeps exercising the worktree candidate."""
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer, session="vendored-manager")
+    try:
+        manager = Path(started["isolated"]["bin"]) / "capabilities"
+        candidate = Path(started["source_worktree"]) / "bin" / "capabilities"
+        assert manager.resolve() == candidate.resolve()
+        state = json.loads(
+            (
+                Path(env["XDG_STATE_HOME"]) / "capabilities" / "dev"
+                / "vendored-manager" / "session.json"
+            ).read_text()
+        )
+        assert state["manager"] == str(candidate)
+        doctor = json.loads(_run(env, "dev", "doctor", "vendored-manager").stdout)
+        assert doctor["ok"] is True, doctor["findings"]
+    finally:
+        _run(env, "dev", "stop", "vendored-manager", check=False)
+
+
+def test_dev_check_stale_catalogue_remediation_runs_for_a_custom_source(tmp_path):
+    """`dev check` tells the author to run its remediation exactly, so the
+    command must run from a source that vendors no bin/capabilities."""
+    env = _env(tmp_path)
+    _custom_source(env, "fx", "fixture-cap")
+    started = json.loads(
+        _run(
+            env, "dev", "start", "fixture-cap", "--source", "fx",
+            "--no-project", "--session", "stale-catalogue",
+        ).stdout
+    )
+    worktree = Path(started["source_worktree"])
+    try:
+        assert not (worktree / "bin" / "capabilities").exists()
+        _run(env, "new", "second-cap", "--source", "fx", cwd=worktree)
+        _git(worktree, "add", "-A")
+        stale = json.loads(
+            _run(env, "dev", "check", "stale-catalogue", check=False).stdout
+        )["failures"]["catalog"]
+        assert len(stale) == 1, stale
+        command = stale[0].split("run exactly: ", 1)[1]
+        remedy = subprocess.run(
+            ["bash", "-c", command],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=300,
+            check=False,
+        )
+        assert remedy.returncode == 0, (
+            f"{command}\nstdout:\n{remedy.stdout}\nstderr:\n{remedy.stderr}"
+        )
+        _git(worktree, "add", "-A")
+        recheck = json.loads(
+            _run(env, "dev", "check", "stale-catalogue", check=False).stdout
+        )
+        assert "catalog" not in recheck["failures"], recheck["failures"]
+    finally:
+        _run(env, "dev", "stop", "stale-catalogue", check=False)
+
+
+def test_dev_doctor_verifies_a_session_recorded_without_a_manager_key(tmp_path):
+    """A session written before the manager choice was recorded still verifies
+    against the worktree manager its link was created from."""
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer, session="legacy-manager-key")
+    state_file = (
+        Path(env["XDG_STATE_HOME"]) / "capabilities" / "dev"
+        / "legacy-manager-key" / "session.json"
+    )
+    link = Path(started["isolated"]["bin"]) / "capabilities"
+    candidate = Path(started["source_worktree"]) / "bin" / "capabilities"
+    try:
+        state = json.loads(state_file.read_text())
+        del state["manager"]
+        state_file.write_text(json.dumps(state) + "\n")
+        doctor = json.loads(_run(env, "dev", "doctor", "legacy-manager-key").stdout)
+        assert doctor["ok"] is True, doctor["findings"]
+
+        link.unlink()
+        link.symlink_to(tmp_path / "not-a-manager")
+        broken = _run(env, "dev", "doctor", "legacy-manager-key", check=False)
+        assert broken.returncode == 7
+        assert f"dev manager link does not point to {candidate}" in \
+            json.loads(broken.stdout)["findings"]
+        link.unlink()
+        link.symlink_to(candidate)
+    finally:
+        _run(env, "dev", "stop", "legacy-manager-key", check=False)

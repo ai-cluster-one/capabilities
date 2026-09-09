@@ -2287,6 +2287,19 @@ def _dev_existing_overlaps(repo: Path, capability: str, project: dict | None,
     return blockers
 
 
+def _dev_manager_target(source_worktree: Path) -> Path:
+    """Pick the manager a session shells through.
+
+    A source that vendors the manager puts it under development in the session,
+    so the session must exercise the worktree candidate. Any other source has no
+    manager under test, so the session pins the manager that created it.
+    """
+    vendored = source_worktree / MANAGER_EXECUTABLE_REL
+    if vendored.is_file():
+        return vendored
+    return Path(__file__).resolve()
+
+
 def cmd_dev_start(name: str, source_ref: str | None, project_ref: str | None,
                   no_project: bool, requested_session: str | None,
                   allow_parallel: bool) -> None:
@@ -2357,12 +2370,14 @@ def cmd_dev_start(name: str, source_ref: str | None, project_ref: str | None,
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
         manager_link = paths["bin"] / "capabilities"
-        manager_link.symlink_to(source_worktree / "bin" / "capabilities")
+        manager_target = _dev_manager_target(source_worktree)
+        manager_link.symlink_to(manager_target)
         session = {
             "schema": DEV_SESSION_SCHEMA,
             "id": session_id,
             "capability": name,
             "created_at": int(time.time()),
+            "manager": str(manager_target),
             "source": {
                 "id": source_id, "repo": str(source_repo),
                 "git_common_dir": _git_checkout_identity(source_repo)["git_common_dir"],
@@ -2385,6 +2400,7 @@ def cmd_dev_start(name: str, source_ref: str | None, project_ref: str | None,
         "source_worktree": str(source_worktree),
         "source_branch": source_branch,
         "attached_project": attached["path"] if attached else None,
+        "manager": str(manager_target),
         "parallel_overrides": overlaps,
         "isolated": {key: str(paths[key]) for key in
                      ("registry", "bin", "config", "state", "data", "cache",
@@ -2585,7 +2601,7 @@ def cmd_dev_check(session_id: str) -> None:
             source_id = session["source"].get("id") or OFFICIAL_SOURCE_ID
             command = (
                 f"cd {shlex.quote(str(source_root))} && "
-                f"./bin/capabilities source index "
+                f"{shlex.quote(str(manager))} source index "
                 f"{shlex.quote(str(source_id))} --staged")
             if "catalog" in stale_generated:
                 failures.setdefault("catalog", []).append(
@@ -3336,9 +3352,13 @@ def cmd_dev_doctor(session_id: str) -> None:
     if source_error:
         findings.append(source_error)
     manager = Path(session["paths"]["bin"]) / "capabilities"
-    expected_manager = Path(source["worktree"]) / "bin" / "capabilities"
+    recorded_manager = session.get("manager")
+    expected_manager = Path(recorded_manager) if isinstance(recorded_manager, str) \
+        else Path(source["worktree"]) / MANAGER_EXECUTABLE_REL
     if not manager.is_symlink() or manager.resolve() != expected_manager.resolve():
         findings.append(f"dev manager link does not point to {expected_manager}")
+    elif not manager.is_file():
+        findings.append(f"dev manager link resolves to nothing: {expected_manager}")
     installed = []
     registry = Path(session["paths"]["registry"])
     bindir = Path(session["paths"]["bin"])
