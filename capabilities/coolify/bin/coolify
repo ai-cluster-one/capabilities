@@ -125,7 +125,7 @@ COMMANDS
       Write verb - requires allow_write.
 
   deploy <uuid> [--force] [--tag T]
-      Trigger a deployment of an application/service by uuid (GET /deploy).
+      Trigger a deployment of an application/service by uuid (POST /deploy).
       --force rebuilds without cache; --tag deploys by image tag instead.
   start <uuid>   --type application|service|database
   stop <uuid>    --type application|service|database
@@ -3131,7 +3131,9 @@ def cmd_deploy(c, uuid: str, force: bool, tag: str | None):
 
 def cmd_lifecycle(c, action: str, uuid: str, rtype: str):
     base = LIFECYCLE_PATHS[rtype]
-    return _request(c, "GET", f"/{base}/{uuid}/{action}")
+    # POST, like /deploy: Coolify answers the GET route on the same path with
+    # "this endpoint has changed to a POST request" (405).
+    return _request(c, "POST", f"/{base}/{uuid}/{action}")
 
 
 def _normalize_env_list(response):
