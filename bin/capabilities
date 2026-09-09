@@ -16,7 +16,8 @@ scripts into the machine registry, snapshots their self-descriptions, gates
 them through project/global policy, composes the session context injection, and verifies the
 whole arrangement. It is the SOLE WRITER of the shared surfaces it manages —
 the machine registry (~/.capabilities/<name>/), the project/global policy
-collection, the project capabilities/.gitignore, the generated skill, and the
+collection, the project capabilities/.gitignore, the global skill
+(~/.capabilities/.manager/skill/, symlinked into each host), and the
 host hook wiring. Capability scripts never write any of these.
 
 ENVIRONMENT
@@ -79,6 +80,11 @@ MACHINE VERBS
         release is verified and staged before one atomic symlink switch. No-op
         when already current. The manager is not a capability, so it has no
         registry entry or snapshots.
+  skill
+        Place the carried global skill and relink every agent host present on
+        this machine. The bootstrap and every install/uninstall/update already
+        do this; run it after installing a new agent host, or to repair the
+        drift `doctor` reports.
   list
         Installed capabilities with summaries and explicit project/global gate,
         effective state, the scope that supplied it, and — in a project — the
@@ -251,8 +257,9 @@ I/O CONTRACT
   Success: JSON on stdout, except the documented Markdown renderers
   (`context --fragment`, `ids`). Failure: {"error": {"code", "message",
   "hint"?}} on stderr. Exit codes: 0 success, 2 auth, 3 not found,
-  5 network, 6 input/validation, 7 drift or conformance failures
-  (doctor/audit).
+  4 policy (a capability disabled by the gate, or a connection that does not
+  allow writes — ask the user, never lift either yourself), 5 network,
+  6 input/validation, 7 drift or conformance failures (doctor/audit).
 """
 
 from __future__ import annotations
@@ -408,9 +415,10 @@ _MANAGER_GUIDE_TOPICS = (
     "authoring", "conforming", "contract", "dev", "grooming", "publishing",
     "repositories", "sanitizing",
 )
+SKILL_ASSET = "skill/SKILL.md"
 _MANAGER_RUNTIME_ASSETS = tuple(
     f"guides/{topic}.md" for topic in _MANAGER_GUIDE_TOPICS
-)
+) + (SKILL_ASSET,)
 _MANAGER_RELEASE_ASSETS = _AUTHORING_ASSETS + _MANAGER_RUNTIME_ASSETS
 MANAGER_RELEASE_SCHEMA = "capabilities.manager-release.v1"
 MANAGER_RELEASE_MANIFEST_REL = ".capability-source/manager-release.json"
@@ -1505,7 +1513,7 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
             proc = subprocess.run(["sh", "-c", step["cmd"]], capture_output=True,
                                   text=True, env=_snapshot_env())
             ran.append({"cmd": step["cmd"], "exit": proc.returncode})
-    _regen_skills()
+    _sync_skill()
     result = {
         "installed": name, "registry": str(reg), "symlink": str(link),
         "summary": manifest.get("summary"), "scope": manifest["credentials"]["scope"],
@@ -1540,7 +1548,7 @@ def cmd_uninstall(name: str, purge_credentials: bool) -> None:
             link.unlink()
             removed_link = True
         shutil.rmtree(reg)
-    _regen_skills()
+    _sync_skill()
     result = {"uninstalled": name, "symlink_removed": removed_link}
     cred_file = _CONFIG_HOME / name / "credentials.env"
     if cred_file.exists():
@@ -1581,7 +1589,7 @@ def cmd_update(name: str | None) -> None:
         })
         _activate_payload(n, stage)
         results.append({"name": n, "changed": before != after})
-    _regen_skills()
+    _sync_skill()
     _emit({"updated": results})
 
 
@@ -3976,7 +3984,6 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False) -> None:
     if name not in _installed():
         result["note"] = f"{name} is not installed — run `capabilities install {name}`"
     _refresh_after_gate(root, result, enabled)
-    _regen_skills()
     _emit(result)
 
 
@@ -4003,7 +4010,6 @@ def _inherit_gate(name: str, scope: str) -> None:
     result = {"inherited": name, "scope": scope, "removed": removed,
               "gate": gate_source}
     _refresh_after_gate(root, result)
-    _regen_skills()
     _emit(result)
 
 # ---------------------------------------------------------------- context
@@ -4356,7 +4362,7 @@ def cmd_init(claude: bool, codex: bool) -> None:
         retired = _retire_capabilities_host_wiring(root)
         if retired:
             result["retired_capabilities_wiring"] = retired
-        _regen_skills(force_claude=claude, force_codex=codex)
+        _sync_skill(force_claude=claude, force_codex=codex)
         _emit(result)
         return
     if claude:
@@ -4372,113 +4378,68 @@ def cmd_init(claude: bool, codex: bool) -> None:
         if migration["findings"]:
             result["codex_migration_findings"] = migration["findings"]
         result["codex"] = _wire_codex(root)
-    _regen_skills(force_claude=claude, force_codex=codex)
+    _sync_skill(force_claude=claude, force_codex=codex)
     _emit(result)
 
 # ---------------------------------------------------------------- skill
 
-SKILL_BODY = """\
-Capabilities are self-contained CLIs installed on PATH, managed by the
-`capabilities` manager. Each one is self-describing through the same contract
-verbs:
-
-- `<name> help` — the full usage contract (always start here)
-- `<name> doctor` — proves credentials, reachability, identity, per connection
-- `<name> connections` — where every value resolves from (tier, source,
-  secrets masked) — local only, no network
-- `<name> guide [<topic>]` — its guide menu with previews / one live guide
-- `<name> ids list|get|set|rm` — the project's identifiers envelope
-- `<name> refs` — the project's reference files for it
-
-Manager surface: `capabilities list` (what is installed and gated where),
-`capabilities install <name>`, `capabilities enable|disable <name>
---project|--global`, `capabilities inherit <name> --project|--global`,
-`capabilities init` (wire a project), `capabilities ids
-<name>` (render a capability's project identifiers), `capabilities doctor` /
-`capabilities audit <name>` (verify), `capabilities context --fragment`
-(render the manager-owned project block), `capabilities help` (full contract).
-`capabilities guide` lists the manager's own authoring, development, review,
-and publishing guides with previews; `capabilities guide <topic>` reads one.
-Custom managed source code lives only under
-`~/.capabilities/sources/<source-id>/`: create it with `capabilities source init
-<id>`, create packages with `capabilities new <name> --source <id>`, and run
-`capabilities source index <id> --staged` before committing, then `source verify
-<id> --ref HEAD` before release.
-Remote catalogues attach through `capabilities source add`; `capabilities
-search` lists their generated indexes without executing package code. Never
-edit the read-only source cache, installed registry, or a project's capability
-envelope as source code.
-
-Policy scope is never inferred. When the user asks to enable or disable a
-capability, first ask whether the change is local to this project or global to
-every project; then pass `--project` or `--global`. A project entry overrides
-the global entry; an absent project entry inherits global policy; absence at
-both scopes is disabled by default.
-
-Project visibility is host-owner-generated. Without ContextKit, in a Codex project run
-`capabilities init --codex` once, then `capabilities enable <name> --project`; after
-manual capabilities/ envelope edits refresh with `capabilities context
---codex` or `.codex/hooks/build-context.sh`. No project-root instruction
-markdown file is required or assumed. Do not create or edit generated
-capabilities context by hand: the manager owns the Codex `.codex` wiring and
-generated `.codex/generated/` context; `.codex/hooks/build-context.sh` is
-overwritten on each `capabilities init --codex`. In Claude Code use
-`capabilities init --claude` (or bare `capabilities init`, which defaults to
-Claude wiring) and the manager-owned `.claude/rules/CAPABILITIES.md`.
-
-When `.contextkit/config.toml` is present, ContextKit owns Claude/Codex hooks
-and the combined generated context. It obtains the manager-owned capability
-block through `capabilities context --fragment` and inserts it verbatim.
-`capabilities init` and the host-writing context modes do not write host wiring
-there; refresh with `contextkit build`. ContextKit also owns where the project
-envelope sits: the manager asks it for that location and exposes the result via
-`capabilities path --json`. Capability CLIs consume the manager-owned answer
-rather than invoking ContextKit. Without ContextKit the root `capabilities/`
-directory is the envelope; a broken configured binding is a structured error.
-
-THE GATES (both exit 4 — ask the user, never lift one yourself): a capability
-not enabled by effective project/global policy refuses operational verbs;
-a connection that does not allow writes (its entry's allow_write, else the
-capability's declared default — false where writes leave the system) refuses
-write verbs. Do not work around either — ask, then stop; granting a write is
-`allow_write: true` on that connection in connections.json.
-
-Every connection-bearing capability requires an explicit named connection,
-even for one connection. Project records resolve before global records through
-the project's selected files/DB adapter; identities compose by whole entry and
-permissions live in separate grants. Values named by the selected identity
-still resolve through project .env(.local), user credentials.env, then process
-env. `<name> connections` lists the effective connections and masked resolution
-locally; `<name> doctor` checks health.
-Global enable covers ordinary CLI verbs. A bundled service's init/start/run
-requires an explicit project enable; inherited global enable is insufficient.
-Secrets never go on argv.
-"""
+# The one place an agent learns the system exists before any project is open.
+# It is a carried asset, not a composed one: it names the manager and stops
+# there, because what is installed, what is gated, and what each capability
+# does are answered by the manager and by each project's own context.
+CANONICAL_SKILL_DIR = CAP_HOME / ".manager" / "skill"
+CANONICAL_SKILL = CANONICAL_SKILL_DIR / "SKILL.md"
 
 
-def _skill_text() -> str:
-    names = sorted(_installed())
-    listed = ", ".join(names) if names else "none installed yet"
-    description = (
-        f"Operate installed capability CLIs ({listed}) and the capabilities "
-        f"manager — contract verbs, project/global policy gate, exit-4 "
-        f"rule, credential cascade, connections.")
-    return (f"---\nname: capabilities\ndescription: {description}\n---\n\n"
-            f"# Capabilities\n\n{SKILL_BODY}")
+def _skill_hosts(force_claude: bool = False, force_codex: bool = False) -> list[Path]:
+    """Where each agent host present on this machine reads global skills."""
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    hosts = []
+    if force_claude or (Path.home() / ".claude").is_dir():
+        hosts.append(Path.home() / ".claude" / "skills" / "capabilities")
+    if force_codex or codex_home.is_dir():
+        hosts.append(Path.home() / ".agents" / "skills" / "capabilities")
+    return hosts
 
 
-def _regen_skills(force_claude: bool = False, force_codex: bool = False) -> list[str]:
-    """Generate the skill for each host present on this machine."""
-    written = []
-    text = _skill_text()
-    for base, forced in ((Path.home() / ".claude", force_claude),
-                         (Path.home() / ".agents", force_codex)):
-        if base.is_dir() or forced:
-            skill = base / "skills" / "capabilities" / "SKILL.md"
-            skill.parent.mkdir(parents=True, exist_ok=True)
-            skill.write_text(text)
-            written.append(str(skill))
-    return written
+def _link_skill(host: Path) -> None:
+    """Point one host at the canonical skill without clobbering foreign content."""
+    if host.is_symlink():
+        if host.resolve() == CANONICAL_SKILL_DIR.resolve():
+            return
+        host.unlink()
+    elif host.is_dir():
+        if {entry.name for entry in host.iterdir()} - {"SKILL.md"}:
+            host.joinpath("SKILL.md").write_text(CANONICAL_SKILL.read_text())
+            return
+        shutil.rmtree(host)
+    elif host.exists():
+        host.unlink()
+    host.parent.mkdir(parents=True, exist_ok=True)
+    staged = host.with_name(f".{host.name}.link-{secrets.token_hex(8)}")
+    staged.unlink(missing_ok=True)
+    staged.symlink_to(CANONICAL_SKILL_DIR)
+    os.replace(staged, host)
+
+
+def _sync_skill(force_claude: bool = False, force_codex: bool = False) -> list[str]:
+    """Place the carried skill once and point every present host at it."""
+    CANONICAL_SKILL_DIR.mkdir(parents=True, exist_ok=True)
+    carried = (_ASSET_ROOT / SKILL_ASSET).read_text()
+    if not CANONICAL_SKILL.is_file() or CANONICAL_SKILL.read_text() != carried:
+        CANONICAL_SKILL.write_text(carried)
+    linked = []
+    for host in _skill_hosts(force_claude, force_codex):
+        _link_skill(host)
+        linked.append(str(host))
+    return linked
+
+
+def cmd_skill() -> None:
+    """Place the canonical skill and relink the hosts on this machine."""
+    linked = _sync_skill()
+    _emit({"skill": str(CANONICAL_SKILL), "hosts": linked})
+
 
 # ---------------------------------------------------------------- doctor
 
@@ -4560,6 +4521,26 @@ def _check_record_connections(findings: list[str], adapter, names) -> None:
                         f"project: {name} grant {cid!r} {field} is not boolean")
 
 
+def _check_skill(findings: list[str]) -> None:
+    """Reconcile the global awareness surface: one artifact, hosts pointing at it."""
+    try:
+        carried = (_ASSET_ROOT / SKILL_ASSET).read_text()
+    except OSError as exc:
+        findings.append(f"skill: carried skill unreadable ({exc}) — reinstall the manager")
+        return
+    if not CANONICAL_SKILL.is_file():
+        findings.append(f"skill: {CANONICAL_SKILL} missing — run `capabilities skill`")
+    elif CANONICAL_SKILL.read_text() != carried:
+        findings.append(f"skill: {CANONICAL_SKILL} differs from the carried skill — "
+                        f"run `capabilities skill`")
+    for host in _skill_hosts():
+        if not host.exists():
+            findings.append(f"skill: {host} missing — run `capabilities skill`")
+        elif host.resolve() != CANONICAL_SKILL_DIR.resolve():
+            findings.append(f"skill: {host} does not resolve to "
+                            f"{CANONICAL_SKILL_DIR} — run `capabilities skill`")
+
+
 def cmd_doctor() -> None:
     findings: list[str] = []
     bin_dir = _bin_dir()
@@ -4594,6 +4575,7 @@ def cmd_doctor() -> None:
         user_reg = _CONFIG_HOME / name / "connections.json"
         if user_reg.exists():
             _check_registry(findings, name, user_reg)
+    _check_skill(findings)
     _check_policy(findings, "global", GLOBAL_GATE_FILE)
     root = _project_root()
     if root and (root / LEGACY_PROJECT_CAPABILITIES_REL).is_dir():
@@ -6634,7 +6616,7 @@ def _source_release(
         else:
             installed_removals.append(result)
     if state["installed_actions"]:
-        _regen_skills()
+        _sync_skill()
     manager_update = None
     if manager_changed and source_id == OFFICIAL_SOURCE_ID:
         content, assets, manifest = _manager_release_from_root(
@@ -7428,6 +7410,8 @@ def main() -> None:
         _inherit_gate(pos[0], scope)
     elif cmd == "init":
         cmd_init(flag("--claude"), flag("--codex"))
+    elif cmd == "skill":
+        cmd_skill()
     elif cmd == "context":
         modes = [name for name in ("--claude", "--codex", "--fragment") if flag(name)]
         if len(modes) > 1:

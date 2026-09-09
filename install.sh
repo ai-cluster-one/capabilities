@@ -46,6 +46,7 @@ printf '  fetch    %s/bin/capabilities\n' "$REPO"
 if [ -n "$SHA256" ]; then printf '  verify   sha256 %s\n' "$SHA256"; else printf '  verify   (no checksum pinned for ref %s)\n' "$TAG"; fi
 printf '  place    %s\n' "$MANAGER"
 printf '  symlink  %s/capabilities\n' "$BIN_DIR"
+printf '  skill    global agent awareness for every host on this machine\n'
 if (exec < /dev/tty) 2>/dev/null; then
     printf 'Proceed? [Y/n] '
     read -r answer < /dev/tty || answer=""
@@ -59,7 +60,7 @@ curl -fsSL "$REPO/bin/capabilities" -o "$tmp" || err "fetch failed: $REPO/bin/ca
 for asset in SHEBANG.md DOCTRINE.md TEMPLATE.md SOURCES.md ROUTINES.md \
   contract/preamble.py contract/store.py guides/authoring.md guides/conforming.md \
   guides/contract.md guides/dev.md guides/grooming.md guides/publishing.md \
-  guides/repositories.md guides/sanitizing.md; do
+  guides/repositories.md guides/sanitizing.md skill/SKILL.md; do
     mkdir -p "$assets_tmp/$(dirname "$asset")"
     curl -fsSL "$REPO/$asset" -o "$assets_tmp/$asset" || err "fetch failed: $REPO/$asset"
 done
@@ -115,7 +116,8 @@ with lock_path.open("a+") as lock:
                 "guides/authoring.md",
                 "guides/conforming.md", "guides/contract.md", "guides/dev.md",
                 "guides/grooming.md", "guides/publishing.md",
-                "guides/repositories.md", "guides/sanitizing.md"):
+                "guides/repositories.md", "guides/sanitizing.md",
+                "skill/SKILL.md"):
         target = manager.parent / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         staged_target = target.with_name(target.name + ".bootstrap-tmp")
@@ -131,6 +133,10 @@ PY
 if [ -f "./capabilities.repo.json" ] && [ -x "./bin/capabilities" ]; then
     ./bin/capabilities source register-checkout official >/dev/null
 fi
+
+# Global awareness is what makes an agent able to reach any of this. The
+# bootstrap owns it: nothing else runs on a machine that has only the manager.
+"$BIN_DIR/capabilities" skill >/dev/null || printf 'NOTE: could not generate the agent skill — run `capabilities skill`.\n' >&2
 
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;

@@ -60,6 +60,7 @@ def _source_repo(tmp_path: Path) -> Path:
                  "ROUTINES.md"):
         shutil.copy2(REPO / name, source / name)
     shutil.copytree(REPO / "contract", source / "contract")
+    shutil.copytree(REPO / "skill", source / "skill")
     shutil.copytree(
         REPO / "capabilities" / "deployment",
         source / "capabilities" / "deployment",
@@ -97,6 +98,7 @@ def _release_source_repo(tmp_path: Path) -> tuple[Path, Path]:
                  "ROUTINES.md"):
         shutil.copy2(REPO / name, source / name)
     shutil.copytree(REPO / "contract", source / "contract")
+    shutil.copytree(REPO / "skill", source / "skill")
     shutil.copytree(REPO / "guides", source / "guides")
     shutil.copytree(
         REPO / "capabilities" / "askproject",
@@ -898,6 +900,9 @@ def test_dev_finish_removes_deleted_installed_capability_and_resumes(tmp_path):
     assert indexed.returncode == 0, indexed.stderr
     candidate = _commit_all(worktree, "Remove installed capability payload")
 
+    # A Codex host makes the manager place the skill; a file where its skill
+    # root belongs forces exactly one interruption after the payload removal.
+    (Path(env["HOME"]) / ".codex").mkdir(parents=True, exist_ok=True)
     agents_dir = Path(env["HOME"]) / ".agents"
     agents_dir.mkdir(parents=True)
     blocked_skills = agents_dir / "skills"
