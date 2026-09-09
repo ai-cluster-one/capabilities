@@ -2552,9 +2552,9 @@ def _dev_changed_paths(session: dict) -> tuple[str, str, list[str]]:
     return base, head, sorted(filter(None, paths))
 
 
-def cmd_dev_check(session_id: str) -> None:
+def _dev_check_report(session: dict) -> dict:
     """Run each direct validator once for the scope changed since session base."""
-    session = _dev_session(session_id)
+    session_id = str(session["id"])
     base, head, changed = _dev_changed_paths(session)
     source_root = Path(session["source"]["worktree"])
     manager_changed, packages = _source_validation_scope(source_root, changed)
@@ -2641,8 +2641,13 @@ def cmd_dev_check(session_id: str) -> None:
         "failures": failures,
         "ok": not failures,
     }
+    return result
+
+
+def cmd_dev_check(session_id: str) -> None:
+    result = _dev_check_report(_dev_session(session_id))
     _emit(result)
-    if failures:
+    if not result["ok"]:
         sys.exit(7)
 
 
@@ -3433,6 +3438,134 @@ def cmd_dev_doctor(session_id: str) -> None:
         sys.exit(7)
 
 
+def _dev_commit_identity(worktree: Path) -> list[str]:
+    """Supply a committer identity only where git cannot determine one itself."""
+    probe = _dev_git(worktree, "var", "GIT_COMMITTER_IDENT")
+    if probe.returncode == 0 and probe.stdout.strip():
+        return []
+    return ["-c", "user.name=capabilities dev",
+            "-c", "user.email=dev@capabilities.invalid"]
+
+
+def _dev_bring_session_forward(session: dict) -> dict | None:
+    """Re-home a session whose recorded base another release already overtook.
+
+    The recorded base is where the session started, not an invariant: any
+    release moves the tracked branch under every other open session. Bringing
+    the branch forward is the session's own work, so it happens here, in the
+    open, and the caller reports it. The author's commit is replayed, never
+    rewritten silently, and a conflicting replay is refused with the paths a
+    human needs.
+    """
+    session_id = str(session["id"])
+    source = session["source"]
+    worktree = Path(source["worktree"])
+    repo = Path(source["repo"])
+    ref = str(source.get("ref") or "main")
+    base = str(source.get("base_commit") or "")
+    if not base:
+        return None
+    resolved = _dev_git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if resolved.returncode != 0:
+        return None
+    onto = resolved.stdout.strip()
+    head = _dev_git_value(worktree, "rev-parse", "HEAD")
+    if onto == base or head == base:
+        return None
+    if _release_state_path(repo, ref).exists():
+        # An interrupted release owns this candidate; resuming it is the answer.
+        return None
+    if _dev_git(worktree, "merge-base", "--is-ancestor", head, onto).returncode == 0:
+        # The prepared commit already reached the tracked branch.
+        return None
+    if _dev_git(worktree, "merge-base", "--is-ancestor", base, onto).returncode != 0:
+        return None
+    forward = {
+        "previous_base": base, "previous_head": head, "onto": onto,
+        "reason": f"{ref} advanced past the session base while the session was open",
+    }
+    if _dev_git(worktree, "merge-base", "--is-ancestor", onto, head).returncode == 0:
+        forward["rebased"] = False
+    else:
+        rebase = _dev_git(
+            worktree, *_dev_commit_identity(worktree), "rebase",
+            "--onto", onto, base, timeout=300)
+        if rebase.returncode != 0:
+            conflicts = sorted({
+                line for line in _dev_git(
+                    worktree, "diff", "--name-only", "--diff-filter=U"
+                ).stdout.splitlines() if line.strip()})
+            _dev_git(worktree, "rebase", "--abort", timeout=300)
+            _die(
+                6,
+                "dev_rebase_conflict",
+                f"dev session {session_id} conflicts with {ref} at {onto} and must "
+                "be brought forward by hand",
+                "conflicting paths: "
+                + (", ".join(conflicts) or "unreported by git")
+                + f"; rebase {source.get('branch')} in {worktree} onto {onto}, "
+                "resolve, commit, then finish again"
+                + (f"; git said: {rebase.stderr.strip().splitlines()[-1]}"
+                   if rebase.stderr.strip() else ""),
+            )
+        forward["rebased"] = True
+    source["base_commit"] = onto
+    _write_json(_dev_state_dir(session_id) / "session.json", session)
+    forward["generated"] = _dev_regenerate_candidate_index(session)
+    forward["candidate"] = _dev_git_value(worktree, "rev-parse", "HEAD")
+    report = _dev_check_report(session)
+    forward["validation"] = {
+        "ok": report["ok"], "manager_changed": report["manager_changed"],
+        "audited_packages": report["audited_packages"],
+        "failures": report["failures"],
+    }
+    if not report["ok"]:
+        _die(
+            7,
+            "dev_forward_validation_failed",
+            f"dev session {session_id} was brought forward onto {onto} but no "
+            "longer validates against that base",
+            json.dumps(report["failures"], sort_keys=True),
+        )
+    return forward
+
+
+def _dev_regenerate_candidate_index(session: dict) -> list[str]:
+    """Rebuild the generated catalogue and manager manifest for the new base."""
+    worktree = Path(session["source"]["worktree"])
+    source_id = str(session["source"].get("id") or OFFICIAL_SOURCE_ID)
+    manager = Path(session["paths"]["bin"]) / "capabilities"
+    indexed = subprocess.run(
+        [str(manager), "source", "index", source_id, "--staged"],
+        cwd=worktree, env=_dev_env(session), capture_output=True, text=True,
+        timeout=600, check=False)
+    if indexed.returncode != 0:
+        _die(
+            7,
+            "dev_forward_index_failed",
+            f"could not rebuild the generated index for session {session['id']} "
+            "on its new base",
+            indexed.stdout.strip() or indexed.stderr.strip() or None,
+        )
+    staged = sorted({
+        line for line in _dev_git(
+            worktree, "diff", "--name-only", "--cached").stdout.splitlines()
+        if line.strip()})
+    if not staged:
+        return []
+    amended = _dev_git(
+        worktree, *_dev_commit_identity(worktree), "commit", "--amend",
+        "--no-edit", timeout=120)
+    if amended.returncode != 0:
+        _die(
+            6,
+            "dev_forward_amend_failed",
+            "could not fold the regenerated index into the prepared commit",
+            amended.stderr.strip() or amended.stdout.strip() or None,
+        )
+    return staged
+
+
 def cmd_dev_finish(session_id: str) -> None:
     _assert_session_without_takeover(session_id)
     session = _dev_session(session_id)
@@ -3449,6 +3582,7 @@ def cmd_dev_finish(session_id: str) -> None:
             "prepare one clean commit before finishing the session",
         )
     repo = Path(source["repo"])
+    forward = _dev_bring_session_forward(session)
     candidate = _dev_git_value(source_worktree, "rev-parse", "HEAD")
     if candidate == source.get("base_commit"):
         _die(6, "dev_no_change", f"dev session {session_id} has no prepared commit")
@@ -3470,6 +3604,7 @@ def cmd_dev_finish(session_id: str) -> None:
         )
     _emit({
         "session": session_id,
+        "rebase": forward,
         "release": release,
         "cleanup": cleanup,
         "ok": True,

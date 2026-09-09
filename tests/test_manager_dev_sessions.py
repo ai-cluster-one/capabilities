@@ -830,6 +830,94 @@ def test_dev_finish_refuses_dirty_main_before_publication(tmp_path):
     assert worktree.is_dir()
 
 
+def _overtaken_pair(
+    tmp_path, env: dict[str, str], source: Path, first: str, second: str
+) -> tuple[Path, Path, str]:
+    """Open two sessions on one source, then read the second's recorded base."""
+    opened = json.loads(_run(
+        env, "dev", "start", "askproject", "--source", str(source),
+        "--no-project", "--session", first).stdout)
+    overtaken = json.loads(_run(
+        env, "dev", "start", "askproject", "--source", str(source),
+        "--no-project", "--session", second, "--allow-parallel").stdout)
+    recorded = json.loads(
+        (Path(env["XDG_STATE_HOME"]) / "capabilities" / "dev" / second
+         / "session.json").read_text())["source"]["base_commit"]
+    return (Path(opened["source_worktree"]), Path(overtaken["source_worktree"]),
+            recorded)
+
+
+def test_dev_finish_brings_a_session_forward_when_another_release_overtook_it(
+    tmp_path,
+):
+    source, remote = _release_source_repo(tmp_path)
+    env = _env(tmp_path)
+    first_worktree, second_worktree, recorded_base = _overtaken_pair(
+        tmp_path, env, source, "overtaken-first", "overtaken-second")
+
+    (first_worktree / "FIRST.md").write_text("first release\n")
+    first_candidate = _commit_all(first_worktree, "Publish the first change")
+    assert json.loads(
+        _run(env, "dev", "finish", "overtaken-first").stdout)["ok"] is True
+
+    (second_worktree / "SECOND.md").write_text("second release\n")
+    stranded = _commit_all(second_worktree, "Prepare the overtaken change")
+
+    finished = json.loads(_run(env, "dev", "finish", "overtaken-second").stdout)
+
+    assert finished["ok"] is True
+    rebase = finished["rebase"]
+    assert rebase["previous_base"] == recorded_base
+    assert rebase["onto"] == first_candidate
+    assert rebase["previous_head"] == stranded
+    assert rebase["candidate"] != stranded
+    assert rebase["candidate"] == finished["release"]["commit"]
+    published = _git(remote, "rev-parse", "refs/heads/main").stdout.strip()
+    assert published == finished["release"]["commit"]
+    assert _git(source, "show", f"{published}:FIRST.md").stdout == "first release\n"
+    assert _git(source, "show", f"{published}:SECOND.md").stdout == "second release\n"
+    assert _git(source, "rev-parse", "HEAD").stdout.strip() == published
+    assert not second_worktree.exists()
+    assert json.loads(_run(env, "dev", "list").stdout)["sessions"] == []
+
+
+def test_dev_finish_refuses_a_conflicting_forward_and_preserves_the_session(
+    tmp_path,
+):
+    source, remote = _release_source_repo(tmp_path)
+    env = _env(tmp_path)
+    first_worktree, second_worktree, recorded_base = _overtaken_pair(
+        tmp_path, env, source, "conflict-first", "conflict-second")
+
+    (first_worktree / "README.md").write_text("first edit of the shared file\n")
+    first_candidate = _commit_all(first_worktree, "Publish a conflicting change")
+    assert json.loads(
+        _run(env, "dev", "finish", "conflict-first").stdout)["ok"] is True
+
+    (second_worktree / "README.md").write_text("second edit of the shared file\n")
+    stranded = _commit_all(second_worktree, "Prepare the conflicting change")
+
+    refused = _run(env, "dev", "finish", "conflict-second", check=False)
+
+    assert refused.returncode == 6
+    error = _error(refused)
+    assert error["code"] == "dev_rebase_conflict"
+    assert "README.md" in error["hint"]
+    assert "by hand" in error["message"]
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() \
+        == first_candidate
+    assert second_worktree.is_dir()
+    assert _git(second_worktree, "rev-parse", "HEAD").stdout.strip() == stranded
+    assert _git(second_worktree, "status", "--porcelain").stdout == ""
+    assert not (Path(_git(second_worktree, "rev-parse", "--git-dir").stdout.strip())
+                / "rebase-merge").exists()
+    assert _git(second_worktree, "show", "HEAD:README.md").stdout \
+        == "second edit of the shared file\n"
+    doctor = json.loads(
+        _run(env, "dev", "doctor", "conflict-second", check=False).stdout)
+    assert doctor["source"]["base_commit"] == recorded_base
+
+
 def test_dev_finish_reconciles_changed_installed_capability(tmp_path):
     source, _remote = _release_source_repo(tmp_path)
     consumer = _consumer_repo(tmp_path)
