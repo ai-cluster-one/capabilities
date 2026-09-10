@@ -64,11 +64,11 @@ CONNECTIONS
   applies, else the sole entry; several entries without a pointer is refused.
 
 JUDGES
-  A `semantic` assertion is settled by a judge model, declared in a "judges"
-  block of the same connections file so one file holds every credential this
-  harness resolves:
+  A `semantic` assertion is settled by a judge model. A judge is this harness's
+  own configuration rather than a CallVA tenant, so the roster is the "judges"
+  setting, written like any other setting record:
 
-    "judges": {
+    capabilities set callvatest setting judges '{
       "default": "haiku",
       "connections": {
         "haiku":   {"provider": "anthropic",
@@ -77,10 +77,15 @@ JUDGES
         "gpt-oss": {"provider": "cerebras", "model": "gpt-oss-120b",
                     "secret_env": "CEREBRAS_API_KEY"}
       }
-    }
+    }'
+
+  It resolves project-then-global like every setting, so a machine-wide roster
+  is declared once and a project overrides it by declaring its own.
+  `callvatest connections` reports every judge it resolved, its model, and
+  where its key came from, without calling anything.
 
   Providers are "anthropic" and "cerebras"; the model is named per judge, so a
-  backend is switched in the registry or per invocation with --judge <id>,
+  backend is switched in the roster or per invocation with --judge <id>,
   never in a scenario. Keys resolve by the same cascade as the API key and are
   never passed on argv. The judge is asked at temperature 0 for a JSON verdict,
   and it is resolved only when a scenario actually declares a `semantic` claim.
@@ -293,9 +298,11 @@ _SHARED_ROOM_HINT = ("a test room is named uniquely, so nobody reaches this one 
 JUDGE_TIMEOUT_S = 60.0       # one judgement, off the call's critical path
 JUDGE_MAX_TOKENS = 1000      # a verdict is two fields; the room is for models that reason first
 
+JUDGES_SETTING = "judges"    # the setting record the judge roster is declared as
+
 # The two judge transports. A judge runs after the call has ended, so accuracy
 # decides the choice and latency does not; the model is named per judge in the
-# connections registry rather than pinned here.
+# declared roster rather than pinned here.
 JUDGE_PROVIDERS = {
     "anthropic": {"url": "https://api.anthropic.com/v1/messages",
                   "key_env": "ANTHROPIC_API_KEY"},
@@ -3117,7 +3124,41 @@ def _connections_report() -> dict:
         report["connections"][cid] = {
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
             "keys": keys}
+    report["judges"] = _judges_resolution()
     return report
+
+
+def _judges_resolution() -> dict:
+    """Every declared judge, its model, and where its key resolved — the same
+    local-only report a tenant gets, in the shape the roster is declared in. A
+    judge that will not answer is then visible before a suite spends a call on
+    finding out, and a roster that resolved is visible when someone doubts it
+    did.
+
+    The roster is reported by the scope that supplied it rather than by a path,
+    because a scope is what a project keeping its records in the store has
+    too."""
+    out: dict = {"default": None, "scope": None, "connections": {}}
+    try:
+        judges, pointer, scope = _judges_roster()
+    except JudgeError as e:
+        out["error"] = str(e)
+        return out
+    out["scope"] = scope
+    out["default"] = pointer or (next(iter(judges)) if len(judges) == 1 else None)
+    for jid, entry in judges.items():
+        entry = entry if isinstance(entry, dict) else {}
+        provider = entry.get("provider")
+        key_env = entry.get("secret_env") or \
+            (JUDGE_PROVIDERS.get(provider) or {}).get("key_env")
+        if key_env:
+            value, tier, key_source = _resolve_env_key(key_env)
+            keys = [_key_report(key_env, True, True, value, tier, key_source)]
+        else:
+            keys = [_key_report("secret_env", False, True, None, None, None)]
+        out["connections"][jid] = {"provider": provider,
+                                   "model": entry.get("model"), "keys": keys}
+    return out
 
 
 def _cmd_connections() -> None:
@@ -4029,26 +4070,59 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + " …[truncated]"
 
 
-def _select_judge(wanted: str | None) -> dict:
-    """Materialize a judge from the `judges` block of the connections envelope:
-    flag → default pointer → sole entry. Its key resolves through the ordinary
-    cascade, so a judge is configured exactly the way a CallVA tenant is and no
-    secret ever reaches argv."""
-    reg, reg_path = _connections_registry()
-    block = (reg or {}).get("judges")
-    judges = (block or {}).get("connections") if isinstance(block, dict) else None
-    if not isinstance(judges, dict) or not judges:
+def _judges_declared() -> tuple[Any, str | None, str]:
+    """The declared judge roster, the scope that supplied it, and the home a
+    project declares one in.
+
+    A judge is this harness's own configuration, not one of the CallVA tenants
+    it tests, so it is kept as a setting and read through the records adapter
+    like every other record — which is what lets a project hold it in files or
+    in the store without this asking which. The resolution says which scope
+    answered, so nothing here re-derives the precedence it already applied."""
+    adapter = _records()
+    try:
+        row = adapter.resolve(NAME, "setting").get(JUDGES_SETTING)
+        home = str(adapter.collection_source(NAME, "setting"))
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    if row is None:
+        return None, None, home
+    return row["value"], row.get("scope"), home
+
+
+def _judges_roster() -> tuple[dict, str | None, str | None]:
+    """(roster, default pointer, the scope that declared it), or a refusal that
+    says which of the two ways the declaration is missing: absent entirely, or
+    present and naming nobody. Sending a reader to a file is only honest when
+    that file is really what is missing the block, so the path appears in the
+    first refusal and nowhere else."""
+    declared, scope, home = _judges_declared()
+    if declared is None:
         raise JudgeError(
-            f"no judges are declared in {reg_path} — a semantic assertion needs "
-            '{"judges": {"default": "<id>", "connections": {"<id>": '
+            f"no judges are declared in {home} — a semantic assertion needs "
+            f"`capabilities set {NAME} setting judges "
+            '\'{"default": "<id>", "connections": {"<id>": '
             '{"provider": "anthropic|cerebras", "model": "<model>", '
-            '"secret_env": "<ENV VAR>"}}}}')
+            '"secret_env": "<ENV VAR>"}}}\'`')
+    roster = declared.get("connections") if isinstance(declared, dict) else None
+    if not isinstance(roster, dict) or not roster:
+        raise JudgeError(f"the judges setting declared at {scope} scope names "
+                         'no judge under "connections"')
+    return roster, declared.get("default"), scope
+
+
+def _select_judge(wanted: str | None) -> dict:
+    """Materialize a judge from the declared roster: flag → default pointer →
+    sole entry. Its key resolves through the ordinary cascade, so a judge is
+    configured exactly the way a CallVA tenant is and no secret ever reaches
+    argv."""
+    judges, pointer, _scope = _judges_roster()
     if wanted:
         if wanted not in judges:
             raise JudgeError(f"no judge named {wanted!r}; known: {', '.join(judges)}")
         jid = wanted
-    elif block.get("default"):
-        jid = block["default"]
+    elif pointer:
+        jid = pointer
         if jid not in judges:
             raise JudgeError(f"judges default points to unknown judge {jid!r}; "
                              f"known: {', '.join(judges)}")
@@ -4694,13 +4768,13 @@ def cmd_fixtures(args) -> None:
         _die(3, "no_fixtures", f"no fixture files under {root}")
 
     if args.all_judges:
-        reg, _ = _connections_registry()
-        wanted = list((((reg or {}).get("judges") or {}).get("connections") or {}))
-        if not wanted:
-            _die(6, "no_judges",
-                 "no judges are declared in the connections envelope")
+        try:
+            judges, _pointer, _scope = _judges_roster()
+        except JudgeError as e:
+            _die(6, "no_judges", str(e))
+        wanted = list(judges)
     else:
-        wanted = [args.judge]        # None resolves to the registry's default
+        wanted = [args.judge]        # None resolves to the roster's default
 
     out: dict = {"root": str(root), "judges": {}}
     disagreed = 0
@@ -4792,22 +4866,21 @@ def cmd_doctor(args) -> None:
                 "type": (match or {}).get("field_type"),
             }
 
-    # Judges are optional, so their absence is reported rather than failed. Each
-    # declared one is proven by asking it to settle a trivial claim: a key that
+    # Judges are optional, so their absence is reported rather than failed —
+    # which is why the resolution the report already made is carried whole: it
+    # says where the roster came from, or why there is none. Each declared judge
+    # is then proven by asking it to settle a trivial claim, because a key that
     # resolves says nothing about a model that answers.
-    reg_judges = ((reg or {}).get("judges") or {}).get("connections") or {}
-    if reg_judges:
-        out["judges"] = {}
-        for jid in reg_judges:
-            try:
-                cfg = _select_judge(jid)
-                verdict, reason = judge_claim(
-                    cfg, "The agent said the time ten o'clock.",
-                    "Kõige varasem vaba aeg on kell kümme.", ["10:00"])
-                out["judges"][jid] = {"ok": verdict, "provider": cfg["provider"],
-                                      "model": cfg["model"], "reason": reason}
-            except JudgeError as e:
-                out["judges"][jid] = {"ok": False, "error": str(e)}
+    out["judges"] = report.get("judges") or {}
+    for jid, entry in (out["judges"].get("connections") or {}).items():
+        try:
+            cfg = _select_judge(jid)
+            verdict, reason = judge_claim(
+                cfg, "The agent said the time ten o'clock.",
+                "Kõige varasem vaba aeg on kell kümme.", ["10:00"])
+            entry.update({"ok": verdict, "reason": reason})
+        except JudgeError as e:
+            entry.update({"ok": False, "error": str(e)})
     _emit(out)
 
 

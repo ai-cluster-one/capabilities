@@ -68,9 +68,9 @@ recorded for one model's weakness hides a bug in the claim.
 
 ## Choosing a backend on material that matters
 
-The model is named per judge in the connections registry, so a backend is
-switched there or with `--judge` for one run, never inside a scenario. A
-scenario states its claim; which model settles it is configuration.
+The model is named per judge in the declared roster, so a backend is switched
+there or with `--judge` for one run, never inside a scenario. A scenario states
+its claim; which model settles it is configuration.
 
 `--all-judges` runs the whole fixture set past every declared judge. That
 comparison is worth more than any published benchmark, because it is measured on
