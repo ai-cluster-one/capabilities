@@ -140,3 +140,22 @@ coolify applications <application-uuid>
 Use `deploy --force` only when a cache-free rebuild is intentional. The final
 application read should show the requested `ports_exposes`, domains,
 `base_directory`, Dockerfile location, and health-check settings.
+
+## A database's host port cannot be set through the API
+
+`database create` accepts `--set public_port=<n>`, and Coolify honours it at
+creation. Changing it afterwards does not work: `PATCH /databases/<uuid>`
+refuses `ports_mappings` outright.
+
+```
+{"message":"Validation failed.","errors":{"ports_mappings":["This field is not allowed."]}}
+```
+
+The binding can only be changed in the Coolify UI. Reach the database over the
+container's own address instead of binding a host port, which is also what
+`internal_db_url` in the create response is for.
+
+Two related shapes are worth knowing before you spend a request on them.
+`is_public` is silently forced to false when no `public_port` is given, so a
+database asked to be public without a port comes back private. And `dragonfly`
+alone returns no `internal_db_url` at all.
