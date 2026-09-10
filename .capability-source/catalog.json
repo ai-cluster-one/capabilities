@@ -32,7 +32,7 @@
     },
     "callvatest": {
       "path": "capabilities/callvatest",
-      "payload_sha256": "b8b3e50307ec2e3ecc91233e3f32fe414585924c071eb0f00a1d434238661a10",
+      "payload_sha256": "4f32f90b2d1e7e7395e7650037b15bfecf24ae660985c276a35dfc0ba081c025",
       "summary": "CallVA agent test harness — drives a deployed voice agent through a real LiveKit room over text, then asserts the transcript, the tools it called, the arguments it generated, the results it answered from, and the fields stored after the call."
     },
     "clickup": {

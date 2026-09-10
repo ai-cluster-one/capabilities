@@ -75,20 +75,37 @@ JUDGES
                     "model": "claude-haiku-4-5-20251001",
                     "secret_env": "ANTHROPIC_API_KEY"},
         "gpt-oss": {"provider": "cerebras", "model": "gpt-oss-120b",
-                    "secret_env": "CEREBRAS_API_KEY"}
+                    "secret_env": "CEREBRAS_API_KEY",
+                    "reasoning_effort": "low"},
+        "terra":   {"provider": "azure", "model": "gpt-5.6-terra",
+                    "endpoint": "my-resource.openai.azure.com",
+                    "api_version": "2025-04-01-preview",
+                    "secret_env": "AZURE_OPENAI_API_KEY"}
       }
     }'
 
   It resolves project-then-global like every setting, so a machine-wide roster
   is declared once and a project overrides it by declaring its own.
-  `callvatest connections` reports every judge it resolved, its model, and
-  where its key came from, without calling anything.
+  `callvatest connections` reports every judge it resolved, its model, the
+  address it composed, and where its key came from, without calling anything.
 
-  Providers are "anthropic" and "cerebras"; the model is named per judge, so a
-  backend is switched in the roster or per invocation with --judge <id>,
-  never in a scenario. Keys resolve by the same cascade as the API key and are
-  never passed on argv. The judge is asked at temperature 0 for a JSON verdict,
-  and it is resolved only when a scenario actually declares a `semantic` claim.
+  Providers are "anthropic", "cerebras" and "azure"; the model is named per
+  judge, so a backend is switched in the roster or per invocation with
+  --judge <id>, never in a scenario. Keys resolve by the same cascade as the API
+  key and are never passed on argv. A judge is resolved only when a scenario
+  actually declares a `semantic` claim.
+
+  An azure model is a deployment inside one resource, so an azure judge names
+  its own "endpoint" and the model is the deployment name; "api_version" is
+  optional and defaults to a version this harness pins. "reasoning_effort" is
+  optional on the providers that read it, and refused on the ones that do not.
+
+  A steady verdict is asked for by constraint rather than by sampling: the judge
+  is given the tool results as ground truth and must answer with a two-field
+  JSON object, and a reply it cannot be parsed from fails the assertion instead
+  of passing it. Temperature 0 is sent where the provider takes it, and the
+  newest Azure families refuse every value but their own. `fixtures` is how a
+  judge is shown to be steady on the claims this project actually asserts.
 
   A judge runs after the call has ended, so its accuracy decides the choice and
   its latency does not.
@@ -299,15 +316,26 @@ JUDGE_TIMEOUT_S = 60.0       # one judgement, off the call's critical path
 JUDGE_MAX_TOKENS = 1000      # a verdict is two fields; the room is for models that reason first
 
 JUDGES_SETTING = "judges"    # the setting record the judge roster is declared as
+AZURE_API_VERSION = "2025-04-01-preview"   # the default an azure judge overrides
 
-# The two judge transports. A judge runs after the call has ended, so accuracy
+# The judge transports. A judge runs after the call has ended, so accuracy
 # decides the choice and latency does not; the model is named per judge in the
 # declared roster rather than pinned here.
+#
+# "url" is the one address every model of that provider answers at. Azure has
+# none, because an Azure model is a deployment inside somebody's own resource
+# and the address is therefore the judge's own to state. "temperature" is sent
+# only where the whole provider takes it: the newest Azure model families refuse
+# every value but their own default, and asking for a verdict is not worth a
+# field that fails outright on the models it would be asked of. "reasoning"
+# says the transport carries a declared `reasoning_effort`.
 JUDGE_PROVIDERS = {
     "anthropic": {"url": "https://api.anthropic.com/v1/messages",
-                  "key_env": "ANTHROPIC_API_KEY"},
+                  "key_env": "ANTHROPIC_API_KEY", "temperature": 0},
     "cerebras": {"url": "https://api.cerebras.ai/v1/chat/completions",
-                 "key_env": "CEREBRAS_API_KEY"},
+                 "key_env": "CEREBRAS_API_KEY", "temperature": 0,
+                 "reasoning": True},
+    "azure": {"url": None, "key_env": "AZURE_OPENAI_API_KEY", "reasoning": True},
 }
 
 # --- Capability declaration — one home for every contract fact ---------------
@@ -3156,8 +3184,16 @@ def _judges_resolution() -> dict:
             keys = [_key_report(key_env, True, True, value, tier, key_source)]
         else:
             keys = [_key_report("secret_env", False, True, None, None, None)]
-        out["connections"][jid] = {"provider": provider,
-                                   "model": entry.get("model"), "keys": keys}
+        model = entry.get("model")
+        reported = {"provider": provider, "model": model, "keys": keys}
+        if provider in JUDGE_PROVIDERS and model:
+            # The composed address, so a judge assembled from an endpoint and an
+            # api-version is readable before a call is spent proving it wrong.
+            try:
+                reported["url"] = _judge_url(jid, provider, model, entry)
+            except JudgeError as e:
+                reported["error"] = str(e)
+        out["connections"][jid] = reported
     return out
 
 
@@ -4102,13 +4138,34 @@ def _judges_roster() -> tuple[dict, str | None, str | None]:
             f"no judges are declared in {home} — a semantic assertion needs "
             f"`capabilities set {NAME} setting judges "
             '\'{"default": "<id>", "connections": {"<id>": '
-            '{"provider": "anthropic|cerebras", "model": "<model>", '
+            '{"provider": "' + "|".join(JUDGE_PROVIDERS) + '", "model": "<model>", '
             '"secret_env": "<ENV VAR>"}}}\'`')
     roster = declared.get("connections") if isinstance(declared, dict) else None
     if not isinstance(roster, dict) or not roster:
         raise JudgeError(f"the judges setting declared at {scope} scope names "
                          'no judge under "connections"')
     return roster, declared.get("default"), scope
+
+
+def _judge_url(jid: str, provider: str, model: str, entry: dict) -> str:
+    """The address this judge is asked at. Every provider with one shared address
+    answers there; an Azure model lives inside somebody's own resource, so the
+    judge states its `endpoint` and the deployment is the model name. The
+    api-version is the field that goes stale, so a judge may pin its own."""
+    shared = JUDGE_PROVIDERS[provider]["url"]
+    if shared:
+        return shared
+    endpoint = str(entry.get("endpoint") or "").strip().rstrip("/")
+    if not endpoint:
+        raise JudgeError(f"judge {jid!r} is on {provider} and declares no 'endpoint' "
+                         "— an azure model is a deployment inside one resource, so "
+                         'the judge names it, e.g. "endpoint": '
+                         '"my-resource.openai.azure.com"')
+    if "://" not in endpoint:
+        endpoint = f"https://{endpoint}"
+    version = entry.get("api_version") or AZURE_API_VERSION
+    return (f"{endpoint}/openai/deployments/{model}/chat/completions"
+            f"?api-version={version}")
 
 
 def _select_judge(wanted: str | None) -> dict:
@@ -4145,22 +4202,41 @@ def _select_judge(wanted: str | None) -> dict:
         raise JudgeError(f"env var {key_env} (for judge {jid!r}) is unset — set it "
                          f"in the project's .env / .env.local, {CREDENTIALS_ENV}, "
                          f"or the environment")
+    effort = entry.get("reasoning_effort")
+    if effort and not JUDGE_PROVIDERS[provider].get("reasoning"):
+        raise JudgeError(f"judge {jid!r} declares 'reasoning_effort' and {provider} "
+                         "takes none — a field that is quietly dropped is worse "
+                         "than one that is refused")
     return {"id": jid, "provider": provider, "model": model, "key_env": key_env,
-            "api_key": api_key, "url": JUDGE_PROVIDERS[provider]["url"]}
+            "api_key": api_key, "reasoning_effort": effort,
+            "url": _judge_url(jid, provider, model, entry)}
 
 
 def _judge_call(cfg: dict, user: str) -> str:
     """One judgement over whichever transport the judge declares."""
-    if cfg["provider"] == "anthropic":
+    provider = cfg["provider"]
+    if provider == "anthropic":
         headers = {"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"}
-        body = {"model": cfg["model"], "max_tokens": JUDGE_MAX_TOKENS, "temperature": 0,
+        body = {"model": cfg["model"], "max_tokens": JUDGE_MAX_TOKENS,
                 "system": _JUDGE_SYSTEM,
                 "messages": [{"role": "user", "content": user}]}
-    else:
-        headers = {"Authorization": f"Bearer {cfg['api_key']}"}
-        body = {"model": cfg["model"], "max_tokens": JUDGE_MAX_TOKENS, "temperature": 0,
+    elif provider == "azure":
+        # The deployment is already named in the URL, and this model family
+        # counts the budget as completion tokens.
+        headers = {"api-key": cfg["api_key"]}
+        body = {"max_completion_tokens": JUDGE_MAX_TOKENS,
                 "messages": [{"role": "system", "content": _JUDGE_SYSTEM},
                              {"role": "user", "content": user}]}
+    else:
+        headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+        body = {"model": cfg["model"], "max_tokens": JUDGE_MAX_TOKENS,
+                "messages": [{"role": "system", "content": _JUDGE_SYSTEM},
+                             {"role": "user", "content": user}]}
+    temperature = JUDGE_PROVIDERS[provider].get("temperature")
+    if temperature is not None:
+        body["temperature"] = temperature
+    if cfg.get("reasoning_effort"):
+        body["reasoning_effort"] = cfg["reasoning_effort"]
     # A shared judge endpoint throttles, and a fixture set of a dozen claims
     # walks straight into it. Backing off is the difference between a real
     # disagreement and a queue.
