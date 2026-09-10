@@ -4,6 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
+#     "qrcode>=7.4",
 #     "neonize @ https://github.com/ai-cluster-one/neonize/releases/download/v0.4.7-histsync.3/neonize-0.4.7-py3-none-any.whl",
 # ]
 # ///
@@ -116,8 +117,11 @@ Commands
                                        Prints an XXXX-XXXX code to enter on the
                                        phone (Settings → Linked Devices → Link a
                                        Device → "Link with phone number"); --qr
-                                       announces a QR reference to render and
-                                       scan instead, refreshing it as it expires.
+                                       paints a scannable QR code on the progress
+                                       stream instead, repainting it whenever the
+                                       reference expires. The symbol is wide — it
+                                       says so when the terminal is too narrow to
+                                       hold it.
                                        Either way the invocation holds the socket
                                        the code was minted on until the phone
                                        completes the link — a link cannot complete
@@ -250,6 +254,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -4257,6 +4262,10 @@ SEND_SETTLE = 3.0             # after a send, long enough for the account's own 
 LINK_TIMEOUT = 600            # the phone's own pace, from code shown to link done
 QR_SCAN_WINDOW = 180          # one QR reference, from minted to expired
 QR_REF_GRACE = 60             # a refreshed reference, given its own window again
+_QR_QUIET_ZONE = 4            # the margin the symbol needs; the terminal around it is not one
+_QR_BLACK = "\033[48;5;16m"   # a dark module, painted rather than drawn
+_QR_WHITE = "\033[48;5;231m"  # a light module, and the quiet zone
+_QR_RESET = "\033[0m"
 
 
 class Session:
@@ -5199,18 +5208,63 @@ def _wm_health(cfg: dict) -> None:
     _emit(out)
 
 
+def _paint_qr(payload: str) -> None:
+    """Paint one QR module per terminal row, two cells wide, onto stderr.
+
+    Each cell is coloured background rather than a block glyph. A glyph is laid
+    out inside the font's em box, so a terminal with room above and below the
+    line leaves the module short of the cell and stripes the symbol into
+    unscannable bands; a background fills the whole cell at any line height.
+    Two cells per module square up the aspect, since a cell is about twice as
+    tall as it is wide."""
+    import qrcode
+
+    code = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L,
+                         border=_QR_QUIET_ZONE)
+    code.add_data(payload)
+    code.make(fit=True)
+    matrix = code.get_matrix()
+
+    columns, rows = len(matrix[0]) * 2, len(matrix)
+    try:
+        # The symbol goes to stderr, so stderr's size is the one that decides;
+        # stdout is commonly redirected to catch the result.
+        window = os.get_terminal_size(sys.stderr.fileno())
+    except OSError:
+        window = shutil.get_terminal_size()
+    if window.columns < columns or window.lines < rows:
+        # Too short scrolls the upper finder patterns away as silently as too
+        # narrow wraps the rows, and neither survives a scan.
+        _log(f"  This code needs {columns} columns and {rows} rows; the terminal "
+             f"reports {window.columns} by {window.lines}. Widen the window or "
+             f"reduce the font size, or it will not scan.")
+
+    lines = []
+    for row in matrix:
+        cells, painted = [], None
+        for module in row:
+            colour = _QR_BLACK if module else _QR_WHITE
+            if colour != painted:
+                cells.append(colour)
+                painted = colour
+            cells.append("  ")
+        lines.append("".join(cells) + _QR_RESET)
+    sys.stderr.write("\n".join(lines) + "\n")
+
+
 def _log_qr(payload: str, *, refreshed: bool = False) -> None:
-    """Announce one QR reference on the progress stream, greppably.
+    """Announce one QR reference on the progress stream, greppably, and paint it.
 
     The result on stdout cannot carry it: the code has to be rendered and
     scanned while this invocation still holds the socket, so it is reported as
     progress and read as the run proceeds."""
     _log(f"\n  QR: {payload}\n"
-         + ("  The previous reference expired \u2014 render and scan this one.\n"
+         + ("  The previous reference expired \u2014 scan this one.\n"
             if refreshed else
-            "  Render that value as a QR code and scan it on the phone:\n"
+            "  Scan this code on the phone:\n"
             "  WhatsApp \u2192 Settings \u2192 Linked Devices \u2192 Link a Device.\n"
             "  This invocation stays connected until the link completes.\n"))
+    _paint_qr(payload)
 
 
 def _wm_pair(cfg: dict, args) -> None:
@@ -7252,7 +7306,7 @@ def main():
     pp.add_argument("--number", help="account phone number incl. country code "
                     "(default: the connection's `number`); digits, `+`/spaces stripped")
     pp.add_argument("--qr", action="store_true",
-                    help="return the QR payload instead of requesting a pairing code")
+                    help="paint a scannable QR code instead of requesting a pairing code")
     pp.add_argument("--days", type=int,
                     help="history window for the one-time pairing burst "
                          "(default: the connection's initial_sync_days)")
