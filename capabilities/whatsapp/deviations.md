@@ -11,10 +11,12 @@ expose — the on-demand history request and the generic peer message — and
 without them a read can only ever return what one pairing burst happened to
 hand over. The URL pins one immutable artifact, the same guarantee a pinned index version
 gives. The compiled library travels inside the wheel rather than being fetched
-at run time, so no other build can be substituted for it. What the wheel tag
-does not carry is the platform it was built for, which defers a host mismatch
-from install to first use — where it surfaces as a refusal naming the engine,
-and where a read served from an existing store is unaffected, because the engine
+at run time, so no other build can be substituted for it. One `any`-tagged wheel
+carries the compiled library for every host the capability supports — macOS on
+arm64, Linux on amd64 and arm64 — so one pinned URL serves a workstation and a
+deployed container alike and the tag claims no more than it delivers. A host
+outside that set is refused at first use rather than at install, naming the
+engine; a read served from an existing store is unaffected, because the engine
 is imported only by what reaches the account. When the change lands upstream
 this becomes an ordinary pinned dependency.
 
