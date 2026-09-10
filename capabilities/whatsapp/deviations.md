@@ -28,14 +28,6 @@ the bridge's own wire objects, and no engine but that bridge can produce them.
 The envelope replacing it is the one the export already publishes, so the two
 read surfaces now agree, and the export's `schema_version` carries the change.
 
-## `send` is declared and refused
-
-`send` is named in the surface and in `WRITE_VERBS`, and it exits 6 rather than
-sending. The write gate is real and answers first, so a read-only connection
-still refuses at exit 4; what is missing is the confirmation step a message that
-reaches a person deserves. Declaring it keeps the gate and the refusal in one
-place instead of leaving the verb absent and its policy undefined.
-
 ## The process ends itself
 
 Every path exits through one funnel that flushes and terminates rather than

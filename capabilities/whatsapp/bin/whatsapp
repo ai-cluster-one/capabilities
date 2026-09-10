@@ -179,8 +179,11 @@ Commands
                                        a markdown conversation log (date headers,
                                        sender names, voice transcriptions inlined).
                                        stdout by default; --out writes a file.
-  whatsapp send <chat_id> <text>       [planned, not implemented] Send a message —
-                                       write-enabled connections only.
+  whatsapp send <chat_id> <text>       Send one text message. Write-enabled
+                                       connections only: `send` exits 4 unless
+                                       the connection carries allow_write.
+                                       Reports the id the account minted, which
+                                       is what a later read carries.
 
 Chat and contact IDs
   DMs    — <number>@s.whatsapp.net  e.g. 15551234567@s.whatsapp.net
@@ -3585,6 +3588,15 @@ def _normalize_chat_id(raw: str) -> str:
     return f"{user}@{server}"
 
 
+def _require_text(args) -> str:
+    """A message with nothing in it is a mistake, not an empty message."""
+    text = getattr(args, "text", None)
+    if text is None or not str(text).strip():
+        _refuse(6, "empty_message", "a message needs text",
+             "pass the text as the second argument, quoted")
+    return str(text)
+
+
 def _is_group(chat_id: str) -> bool:
     return str(chat_id or "").endswith("@g.us")
 
@@ -4237,6 +4249,7 @@ DRAIN_TIMEOUT = 30            # wait for the offline queue's own completion even
 CHUNK_SETTLE = 4.0            # quiet time after the last chunk before moving on
 DRAIN_CEILING = 60            # an ordinary verb's connection, at its longest
 ANSWER_TIMEOUT = 45           # one on-demand history request, answered by the phone
+SEND_SETTLE = 3.0             # after a send, long enough for the account's own copy to arrive back
 LINK_TIMEOUT = 600            # the phone's own pace, from code shown to link done
 QR_SCAN_WINDOW = 180          # one QR reference, from minted to expired
 QR_REF_GRACE = 60             # a refreshed reference, given its own window again
@@ -6313,6 +6326,56 @@ def _slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:60]
 
 
+def _waha_send(cfg, args):
+    """Hand the text to the bridge and report what it minted."""
+    text = _require_text(args)
+    chat_id = _normalize_chat_id(args.chat_id)
+    data = api_request("POST", "/api/sendText", cfg, json_body={
+        "session": cfg["session"], "chatId": chat_id, "text": text})
+    minted = data.get("id") if isinstance(data, dict) else None
+    if isinstance(minted, dict):
+        minted = minted.get("_serialized") or minted.get("id")
+    return {"ok": True, "connection": cfg["id"], "chat": chat_id,
+            "message_id": minted, "length": len(text)}
+
+
+def _wm_send(cfg, args):
+    """Send one text message and report the id the account minted for it.
+
+    The message goes out on a live session, so this opens one under the same
+    lock every other connected verb takes. What comes back is the account's own
+    id for the message, which is what a later read will carry: an answer that
+    said only "sent" could not be joined to anything.
+
+    The copy that lands in the store is not written here. A linked device sees
+    its own outbound message the way it sees any other -- it arrives back on the
+    wire -- so it is captured by the same path as everything else rather than by
+    a second writer that would have to agree with it.
+    """
+    text = _require_text(args)
+    chat_id = _normalize_chat_id(args.chat_id)
+    engine = _engine()
+    user, _, server = chat_id.partition("@")
+    with _session(cfg) as session:
+        try:
+            response = session._client.send_message(
+                engine["build_jid"](user, server), text)
+        except Exception as exc:
+            _refuse(5, "send_failed",
+                 f"the message was not sent: {type(exc).__name__}: {exc}",
+                 "the account must be reachable and the recipient must exist; "
+                 "nothing was delivered")
+        minted = getattr(response, "ID", None) or None
+        stamp = _ts_seconds(getattr(response, "Timestamp", 0)) or 0
+        session.drain(timeout=SEND_SETTLE, settle=SEND_SETTLE,
+                      ceiling=SEND_SETTLE)
+    return {"ok": True, "connection": cfg["id"], "chat": chat_id,
+            "message_id": minted, "timestamp": stamp,
+            "date": (datetime.datetime.fromtimestamp(stamp).isoformat()
+                     if stamp else None),
+            "length": len(text)}
+
+
 def _waha_export(cfg, args):
     config = cfg
     session = config["session"]
@@ -7134,17 +7197,10 @@ def cmd_export(args):
 
 
 def cmd_send(args):
-    # ── PLACEHOLDER — NOT IMPLEMENTED ────────────────────────────────────────
-    # The engine's send surface is complete — text, replies, edits, revocations,
-    # reactions, every media kind, albums, polls — and reaching it is a small
-    # amount of code. What is missing is the ceremony around a message that
-    # reaches a real person: the standard write gate in main() already refuses a
-    # read-only connection, and outbound to a human wants a confirmation step of
-    # its own before it ships.
-    get_config(args)
-    _refuse(6, "not_implemented",
-         "`whatsapp send` is not implemented yet",
-         "reads run from any connection; sending awaits its confirmation step")
+    cfg = get_config(args)
+    _refuse_foreign_flags(cfg, args)
+    return (_waha_send(cfg, args) if cfg["engine"] == ENGINE_WAHA
+            else _wm_send(cfg, args))
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -7273,7 +7329,7 @@ def main():
     pr.add_argument("--out", help="write to a file instead of stdout")
 
     psend = _sub(
-        "send", help="[planned, not implemented] Send a message (write-enabled connections only)")
+        "send", help="Send a text message (write-enabled connections only)")
     psend.add_argument("chat_id", nargs="?", help="recipient chat id")
     psend.add_argument("text", nargs="?", help="message text")
 
