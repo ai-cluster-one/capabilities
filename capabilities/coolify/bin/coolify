@@ -124,6 +124,32 @@ COMMANDS
       base64-encoded before sending. Returns the service uuid.
       Write verb - requires allow_write.
 
+  database create --engine <engine> --project <uuid> --server <uuid>
+                  (--environment <name> | --environment-uuid <uuid>)
+      Create a standalone database. --engine picks the endpoint
+      (POST /databases/<engine>) and is one of:
+        postgresql  mysql  mariadb  mongodb  redis  keydb  dragonfly  clickhouse
+      Coolify accepts an environment by name or by uuid; supply at least one.
+      Named optional flags: --name, --description, --image, --instant-deploy,
+      --destination <uuid>.
+      Every other body field is a pass-through, applied after the named flags:
+        --set KEY=VALUE       sends VALUE as a JSON string
+        --set-json KEY=JSON   sends a parsed JSON value (boolean, number, array)
+      Both repeat. The capability sends these names and values as given and
+      validates neither against the engine — Coolify answers an unknown or
+      malformed field with 422 naming it. The engine credentials and tuning live
+      here and differ per engine (postgres_user/postgres_password/postgres_db,
+      mysql_root_password, mariadb_database, mongo_initdb_root_username,
+      redis_password, keydb_password, dragonfly_password, clickhouse_admin_user
+      and their neighbours), next to the fields every engine shares (is_public,
+      public_port, tags, the limits_* set). Coolify wants each *_conf field
+      base64-encoded, and silently drops is_public when public_port is absent.
+      A value passed this way sits in the process argument list, so treat a
+      credential set that way as exposed locally.
+      Returns the database uuid, with internal_db_url on every engine except
+      dragonfly, and external_db_url only on a public database.
+      Write verb - requires allow_write.
+
   deploy <uuid> [--force] [--tag T]
       Trigger a deployment of an application/service by uuid (POST /deploy).
       --force rebuilds without cache; --tag deploys by image tag instead.
@@ -193,7 +219,7 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {
     "deploy", "start", "stop", "restart", "env",
-    "projects", "app", "service",
+    "projects", "app", "service", "database",
 }   # verbs that mutate the instance
 WRITE_DEFAULT = True    # writes stay inside an instance the consumer owns
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
@@ -3458,6 +3484,71 @@ def cmd_service_create(c, args):
     return _request(c, "POST", "/services", json_body=payload)
 
 
+# One create endpoint per engine, at /databases/<engine>. Coolify keeps the
+# envelope (project, server, environment, name, image, limits, tags) identical
+# across all eight and varies only the engine's own credential and conf fields,
+# which this capability passes through rather than models.
+DATABASE_ENGINES = (
+    "postgresql", "mysql", "mariadb", "mongodb",
+    "redis", "keydb", "dragonfly", "clickhouse",
+)
+
+
+def _database_overrides(args) -> dict:
+    """Body fields the caller supplies verbatim, sent without validation.
+
+    The engine-specific surface is wide, differs per engine and moves upstream,
+    so the capability carries no copy of it: `--set` types a value as a string,
+    `--set-json` types it by parsing, and Coolify judges the field.
+    """
+    payload: dict = {}
+    for raw in getattr(args, "set_string", None) or []:
+        key, sep, value = raw.partition("=")
+        if not sep or not key:
+            _die(6, "input", f"--set expects KEY=VALUE, got {raw!r}")
+        payload[key] = value
+    for raw in getattr(args, "set_json", None) or []:
+        key, sep, value = raw.partition("=")
+        if not sep or not key:
+            _die(6, "input", f"--set-json expects KEY=JSON, got {raw!r}")
+        try:
+            payload[key] = json.loads(value)
+        except ValueError:
+            _die(6, "input",
+                 f"--set-json value for {key!r} is not JSON: {value!r}",
+                 "quote a JSON literal, for example --set-json is_public=true")
+    return payload
+
+
+def cmd_database_create(c, args):
+    """Create a standalone database of one engine."""
+    if not (args.environment or args.environment_uuid):
+        _die(6, "input",
+             "database create requires --environment or --environment-uuid")
+
+    payload = {
+        "project_uuid": args.project,
+        "server_uuid": args.server,
+    }
+    if args.environment:
+        payload["environment_name"] = args.environment
+    if args.environment_uuid:
+        payload["environment_uuid"] = args.environment_uuid
+    if args.name:
+        payload["name"] = args.name
+    if args.description:
+        payload["description"] = args.description
+    if args.image:
+        payload["image"] = args.image
+    if args.destination:
+        payload["destination_uuid"] = args.destination
+    if args.instant_deploy:
+        payload["instant_deploy"] = True
+    payload.update(_database_overrides(args))
+
+    return _request(c, "POST", f"/databases/{args.engine}", json_body=payload)
+
+
 def _add_app_patch_arguments(parser: argparse.ArgumentParser) -> None:
     """Arguments shared by application creation and PATCH updates."""
     parser.add_argument("--name", help="application name")
@@ -3612,6 +3703,40 @@ def main() -> None:
     sp_create.add_argument("--instant-deploy", dest="instant_deploy", action="store_true")
     sp_create.add_argument("--destination", help="destination UUID")
 
+    # database create
+    sp = sub.add_parser("database", help="create a database")
+    database_sub = sp.add_subparsers(dest="database_cmd", required=True)
+    sp_create = database_sub.add_parser("create", help="create database")
+    sp_create.add_argument(
+        "--engine", required=True, choices=list(DATABASE_ENGINES),
+        help="database engine; selects the POST /databases/<engine> endpoint",
+    )
+    sp_create.add_argument("--project", required=True, help="project UUID")
+    sp_create.add_argument("--server", required=True, help="server UUID")
+    sp_create.add_argument(
+        "--environment", default=None,
+        help="environment name (supply this or --environment-uuid)",
+    )
+    sp_create.add_argument(
+        "--environment-uuid", dest="environment_uuid", default=None,
+        help="environment UUID (supply this or --environment)",
+    )
+    sp_create.add_argument("--name", help="database name")
+    sp_create.add_argument("--description", help="database description")
+    sp_create.add_argument(
+        "--image", help="database docker image, tag included (e.g. postgres:16)",
+    )
+    sp_create.add_argument("--instant-deploy", dest="instant_deploy", action="store_true")
+    sp_create.add_argument("--destination", help="destination UUID")
+    sp_create.add_argument(
+        "--set", dest="set_string", action="append", metavar="KEY=VALUE",
+        help="body field sent as a JSON string, unvalidated; repeatable",
+    )
+    sp_create.add_argument(
+        "--set-json", dest="set_json", action="append", metavar="KEY=JSON",
+        help="body field sent as parsed JSON, unvalidated; repeatable",
+    )
+
     sp = sub.add_parser("env", help="manage application/service environment variables")
     env_sub = sp.add_subparsers(dest="env_cmd", required=True)
 
@@ -3651,7 +3776,8 @@ def main() -> None:
     # command family (notably `env list`) must remain usable on read-only
     # connections.
     is_write = (
-        args.cmd in {"deploy", "start", "stop", "restart", "app", "service"}
+        args.cmd in {"deploy", "start", "stop", "restart", "app", "service",
+                     "database"}
         or (
             args.cmd == "projects"
             and hasattr(args, "subcmd")
@@ -3696,6 +3822,12 @@ def main() -> None:
                 _emit(cmd_service_create(c, args))
             else:
                 _die(6, "unknown_command", f"no handler for service {args.service_cmd!r}")
+        elif args.cmd == "database":
+            if args.database_cmd == "create":
+                _emit(cmd_database_create(c, args))
+            else:
+                _die(6, "unknown_command",
+                     f"no handler for database {args.database_cmd!r}")
         elif args.cmd == "env":
             if args.env_cmd == "list":
                 _emit(cmd_env_list_typed(c, args.uuid, args.rtype))
