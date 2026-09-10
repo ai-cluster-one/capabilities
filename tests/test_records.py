@@ -97,6 +97,51 @@ class FileAdapter(unittest.TestCase):
         self.assertIn("legacy", self.r.connections("clickup", include_disabled=True))
         self.assertTrue(self.r.connections("clickup")["callva"]["allow_write"])
 
+    def _declare_globally(self, body: dict) -> None:
+        (self.globals / "coolify").mkdir(parents=True, exist_ok=True)
+        (self.globals / "coolify" / "connections.json").write_text(json.dumps(body))
+
+    def _declare_in_project(self, body: dict) -> None:
+        (self.env / "coolify").mkdir(parents=True, exist_ok=True)
+        (self.env / "coolify" / "connections.json").write_text(json.dumps(body))
+
+    def test_a_grant_only_project_entry_does_not_blank_the_inherited_identity(self):
+        """One file holds both records here, so a project that writes nothing but
+        a decision writes an entry with no identity fields. It decides about the
+        global connection; it never replaces it with a blank one."""
+        self._declare_globally({"connections": {"default": {
+            "base_url": "https://coolify.example", "secret_env": "COOLIFY_TOKEN"}}})
+        self._declare_in_project({"connections": {"default": {"enabled": True}}})
+
+        identity = self.r.resolve("coolify", "connection")["default"]
+        self.assertEqual(identity["value"], {"base_url": "https://coolify.example",
+                                             "secret_env": "COOLIFY_TOKEN"})
+        self.assertEqual(identity["scope"], "global")
+        usable = self.r.connections("coolify")["default"]
+        self.assertEqual(usable["value"]["base_url"], "https://coolify.example")
+
+    def test_a_fieldless_entry_with_nothing_to_inherit_is_still_a_connection(self):
+        """The shape `audit` writes: an entry may carry a decision and no address
+        at all, and where no scope below declares one it is the whole identity."""
+        self._declare_in_project({"default": "a", "connections": {
+            "a": {}, "b": {"allow_write": False}}})
+        usable = self.r.connections("coolify")
+        self.assertEqual(sorted(usable), ["a", "b"])
+        self.assertFalse(usable["b"]["allow_write"])
+
+    def test_a_global_connection_is_withheld_from_a_project_that_did_not_grant_it(self):
+        self._declare_globally({"connections": {"personal": {
+            "base_url": "https://coolify.example", "secret_env": "COOLIFY_TOKEN"}}})
+        self.assertEqual(self.r.connections("coolify"), {})
+        withheld = self.r.connections("coolify", include_disabled=True)["personal"]
+        self.assertFalse(withheld["enabled"])
+        self.assertEqual(withheld["scope"], ("global", None))
+
+    def test_a_global_grant_does_not_bless_a_global_connection(self):
+        self._declare_globally({"connections": {"personal": {
+            "base_url": "https://coolify.example", "enabled": True}}})
+        self.assertEqual(self.r.connections("coolify"), {})
+
     def test_writes_land_where_the_reader_looks(self):
         self.r.set("clickup", "identifier", "new-id", "42", note="minted here")
         self.assertEqual(self.r.get("clickup", "identifier", "new-id"), "42")

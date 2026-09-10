@@ -411,7 +411,10 @@ def test_connection_bearing_capability_requires_registry(tmp_path: Path) -> None
     assert missing.returncode == 6
     assert _stderr_error(missing)["code"] == "connections_required"
 
-    registry = config / "youtrack" / "connections.json"
+    # Declared where the project can see it: a connection inherited from the
+    # config home is withheld until this project grants it, and this test is
+    # about a registry existing at all.
+    registry = project / "capabilities" / "youtrack" / "connections.json"
     registry.parent.mkdir(parents=True)
     registry.write_text(json.dumps({
         "default": "work",

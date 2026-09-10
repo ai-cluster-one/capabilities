@@ -1522,14 +1522,15 @@ class Store:
         entry = self.config_resolve(capability, collection, scopes).get(key)
         return entry["value"] if entry else None
 
-    def config_resolve(self, capability: str, collection: str,
-                       scopes: Scopes) -> dict[str, dict[str, Any]]:
-        """The whole collection as the capability should see it, each entry
-        carrying the scope it came from so `connections` can report resolution
-        without a second query."""
+    def config_layers(self, capability: str, collection: str,
+                      scopes: Scopes) -> list[dict[str, dict[str, Any]]]:
+        """Each scope's own rows, highest scope first, uncollapsed.
+
+        `config_resolve` answers what this project sees; this answers what each
+        scope said. A record whose *fields* are decided one at a time needs the
+        second question, and asking it here keeps one query behind both."""
         _store_check("capability", capability, CAPABILITY_RE)
-        semantics = self._semantics(collection)
-        if semantics == EXACT:
+        if self._semantics(collection) == EXACT:
             raise StoreError("bad_collection",
                              f"collection {collection!r} is state, not config",
                              "read it with state_get")
@@ -1545,12 +1546,17 @@ class Store:
             by_scope.setdefault(
                 (row["scope"], row["project_id"] or ""), {}
             )[row["key"]] = row
+        return [by_scope[(kind, pid or "")] for kind, pid in chain
+                if by_scope.get((kind, pid or ""))]
 
+    def config_resolve(self, capability: str, collection: str,
+                       scopes: Scopes) -> dict[str, dict[str, Any]]:
+        """The whole collection as the capability should see it, each entry
+        carrying the scope it came from so `connections` can report resolution
+        without a second query."""
+        semantics = self._semantics(collection)
         out: dict[str, dict[str, Any]] = {}
-        for kind, pid in chain:
-            entries = by_scope.get((kind, pid or ""))
-            if not entries:
-                continue
+        for entries in self.config_layers(capability, collection, scopes):
             if semantics == FIRST:
                 return entries
             for key, row in entries.items():
@@ -1682,22 +1688,30 @@ class Store:
         """Every connection this project may use, already carrying the decision
         made about it — the one read a capability needs before it acts."""
         identities = self.config_resolve(capability, "connection", scopes)
-        grants = self.config_resolve(capability, "grant", scopes)
+        layers = self.config_layers(capability, "grant", scopes)
         out: dict[str, dict[str, Any]] = {}
         for cid, entry in identities.items():
-            grant = grants.get(cid)
-            decided = grant["value"] if grant else {}
-            if not isinstance(decided, dict):
-                raise StoreError("bad_grant",
-                                 f"grant {cid!r} must be a table, got {type(decided).__name__}")
-            unknown = set(decided) - set(GRANT_FIELDS)
-            if unknown:
-                raise StoreError("bad_grant",
-                                 f"grant {cid!r} has unknown field(s): {', '.join(sorted(unknown))}",
-                                 f"known: {', '.join(GRANT_FIELDS)}")
-            enabled = bool(decided.get("enabled", True))
+            rows = [layer[cid] for layer in layers if cid in layer]
+            # Named through the class: this method also runs with a
+            # FileRecords `self`, which carries no store internals.
+            decided, decided_at = Store._grant_decisions(cid, rows)
+            # Where the identity resolves decides whether it is this project's
+            # to use at all. A project that declares an identity locally has
+            # already said yes by declaring it; an identity inherited from the
+            # global scope is withheld until a grant *resolving at project
+            # scope* says `enabled: true`. A global `enabled: true` can never be
+            # the blessing — one global line would otherwise hand every project
+            # on the machine the same connection back.
+            declared = decided.get("enabled")
+            identity_is_project = entry["scope"] == "project"
+            blessed_here = decided_at.get("enabled") == "project"
+            if declared is None:
+                enabled = identity_is_project
+            else:
+                enabled = bool(declared) and (identity_is_project or blessed_here)
             if not enabled and not include_disabled:
                 continue
+            grant = rows[0] if rows else None
             out[cid] = {
                 "id": cid,
                 "value": entry["value"],
@@ -1707,6 +1721,37 @@ class Store:
                 "grant_scope": (grant["scope"], grant["project_id"]) if grant else None,
             }
         return out
+
+    @staticmethod
+    def _grant_decisions(cid: str, rows: Sequence[dict[str, Any]]) -> tuple[dict, dict]:
+        """One grant assembled field by field, highest scope first.
+
+        This is the line COLLECTIONS already draws between the two records. An
+        identity is a fact about the world, so it is atomic: taken whole from
+        one scope, never assembled out of two. A grant is a decision, and a
+        decision a lower scope made about one field stands until some higher
+        scope decides that same field — so a machine-wide `allow_write: false`
+        survives a project that only says `enabled: true`, and write permission
+        is never acquired by saying something else.
+
+        Returns the decided fields and, per field, the scope that decided it."""
+        decided: dict[str, Any] = {}
+        decided_at: dict[str, str] = {}
+        for row in rows:
+            value = row["value"]
+            if not isinstance(value, dict):
+                raise StoreError("bad_grant",
+                                 f"grant {cid!r} must be a table, got {type(value).__name__}")
+            unknown = set(value) - set(GRANT_FIELDS)
+            if unknown:
+                raise StoreError("bad_grant",
+                                 f"grant {cid!r} has unknown field(s): {', '.join(sorted(unknown))}",
+                                 f"known: {', '.join(GRANT_FIELDS)}")
+            for field, decision in value.items():
+                if field not in decided:
+                    decided[field] = decision
+                    decided_at[field] = row["scope"]
+        return decided, decided_at
 
     def grant_orphans(self, capability: str, scopes: Scopes) -> list[dict[str, Any]]:
         """Grants naming a connection that does not resolve. A grant is the only
@@ -2343,26 +2388,47 @@ class FileRecords(Records):
         entry = raw.get(key)
         return entry.get("note") if isinstance(entry, dict) else None
 
-    def resolve(self, capability: str, collection: str) -> dict[str, dict[str, Any]]:
+    def config_layers(self, capability: str, collection: str,
+                      _scopes: Any = None) -> list[dict[str, dict[str, Any]]]:
+        """Each scope's own rows, highest scope first, uncollapsed — the same
+        question `Store.config_layers` answers, asked of the two directories."""
         _store_check("capability", capability, CAPABILITY_RE)
-        semantics = Store._semantics(collection)
-        out: dict[str, dict[str, Any]] = {}
+        Store._semantics(collection)
+        layers: list[dict[str, dict[str, Any]]] = []
         for scope, pid, root in self._chain():
             entries = self._entries(root, capability, collection)
             if not entries:
                 continue
-            rows = {
+            layers.append({
                 key: {"id": f"{scope}:{capability}/{collection}/{key}", "scope": scope,
                       "project_id": pid, "capability": capability,
                       "collection": collection, "key": key, "value": value,
                       "note": self._note(root, capability, collection, key),
                       "updated_at": None, "updated_by": None}
                 for key, value in entries.items()
-            }
+            })
+        return layers
+
+    def resolve(self, capability: str, collection: str) -> dict[str, dict[str, Any]]:
+        semantics = Store._semantics(collection)
+        out: dict[str, dict[str, Any]] = {}
+        for rows in self.config_layers(capability, collection):
             if semantics == FIRST:
                 return rows
             for key, row in rows.items():
-                out.setdefault(key, row)
+                prior = out.get(key)
+                if prior is None:
+                    out[key] = row
+                elif (collection == "connection" and not prior["value"]
+                        and row["value"]):
+                    # One file holds both records here, so an entry carrying
+                    # only grant fields yields an identity with no fields. That
+                    # is a decision about an inherited connection, never a
+                    # replacement for it: it must not blank the identity the
+                    # lower scope declared. Where nothing is inherited the
+                    # fieldless identity stands, which is the only reading a
+                    # glued file leaves for it.
+                    out[key] = row
         return out
 
     def resolve_scope(self, capability: str, collection: str,
@@ -2655,6 +2721,45 @@ def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 
 
+def _grant_hint(cid: str) -> str:
+    """One wording for the one way a project grants an inherited connection.
+
+    Same shape as `_write_gate`'s: the gate is the human's to lift, never the
+    agent's, and the hint carries the exact command rather than a description
+    of one. Where no project resolves there is no scope to grant in, so the
+    hint names the command that makes one and then the grant, in the order they
+    have to happen."""
+    grant = f"`capabilities set {NAME} grant {cid} '{{\"enabled\": true}}'`"
+    if _project_root() is None:
+        return ("Do not lift the gate yourself — ask the user; run "
+                f"`capabilities init` in the project that should use {NAME}, "
+                f"then {grant} there.")
+    return ("Do not lift the gate yourself — ask the user; granting is "
+            f"{grant} run inside this project.")
+
+
+def _grant_gate(reg: dict, cid: str) -> None:
+    """Refuse a connection this project may not use, for read as for write.
+
+    A connection declared outside the project is not the project's to use until
+    the project itself says so, and one the project switched off is off;
+    nothing in the cascade lifts either. Outside a project there is no scope in
+    which anything could have said so, which is a different situation and says
+    so rather than asserting a project that is not there."""
+    entry = (reg.get("withheld") or {}).get(cid)
+    if entry is None:
+        return
+    if entry.get("scope") == "project":
+        message = f"connection {cid!r} is disabled in this project"
+    elif _project_root() is None:
+        message = (f"connection {cid!r} is declared globally and there is no "
+                   f"project here to grant it in")
+    else:
+        message = (f"connection {cid!r} is declared outside this project and "
+                   f"this project has not granted it")
+    _die(4, "connection_not_granted", message, _grant_hint(cid))
+
+
 def _connections_composed() -> dict:
     """The connections envelope shape, composed out of resolved records.
 
@@ -2664,10 +2769,17 @@ def _connections_composed() -> dict:
     is the source, never the shape.
 
     The permission a project was granted is folded back onto the entry as
-    `allow_write`, which is where the rest of the contract looks for it."""
+    `allow_write`, which is where the rest of the contract looks for it.
+
+    A connection this project may not use is kept apart under `withheld`, not
+    dropped: `connections` holds exactly what may be acted on — which is what
+    every capability's own report iterates — while selection still has the name
+    it needs to explain a refusal instead of pretending the connection was
+    never declared."""
     adapter = _records()
     try:
-        effective = adapter.connections(NAME, write_default=WRITE_DEFAULT)
+        effective = adapter.connections(NAME, write_default=WRITE_DEFAULT,
+                                        include_disabled=True)
         default = adapter.get(NAME, "setting", "connection.default")
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
@@ -2676,10 +2788,24 @@ def _connections_composed() -> dict:
              f"{NAME} requires an explicit connections registry and "
              f"{adapter.source} holds none",
              'expected {"default": "<id>", "connections": {"<id>": { ... }}}')
+    usable = {cid: e for cid, e in effective.items() if e["enabled"]}
+    withheld = {cid: e for cid, e in effective.items() if not e["enabled"]}
+    if not usable:
+        named = ", ".join(sorted(withheld))
+        if _project_root() is None:
+            refusal = (f"there is no project here to use a {NAME} connection in, "
+                       f"so every connection declared globally stays "
+                       f"withheld: {named}")
+        else:
+            refusal = (f"no {NAME} connection is usable in this project; every "
+                       f"one it can see is withheld: {named}")
+        _die(4, "connection_not_granted", refusal, _grant_hint("<id>"))
     return {
         "default": default,
         "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
-                        for cid, entry in effective.items()},
+                        for cid, entry in usable.items()},
+        "withheld": {cid: {"scope": entry["scope"][0]}
+                     for cid, entry in withheld.items()},
     }
 
 
@@ -2696,7 +2822,11 @@ def _connections_registry() -> tuple[dict | None, Path | str | None]:
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
     """flag → default pointer → sole entry → die 6. A connection's own
     `address` field selects it too (used where a
-    connection carries a human-recognizable address; absent fields never match)."""
+    connection carries a human-recognizable address; absent fields never match).
+
+    A connection the project was never granted is refused here rather than
+    reported missing, so the one enforcement point every capability already
+    routes through is also the one that answers "why not"."""
     if reg is None:
         _die(6, "connections_required",
              f"{NAME} requires an explicit connections registry")
@@ -2707,11 +2837,13 @@ def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict 
         for cid, entry in conns.items():
             if (entry or {}).get("address", "").lower() == wanted.lower():
                 return cid, entry
+        _grant_gate(reg, wanted)
         _die(6, "unknown_connection", f"no connection matches {wanted!r}",
              f"known: {', '.join(conns)}")
     default = reg.get("default")
     if default:
         if default not in conns:
+            _grant_gate(reg, default)
             _die(6, "bad_default", f"default points to unknown connection {default!r}",
                  f"known: {', '.join(conns)}")
         return default, conns[default]

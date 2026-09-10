@@ -167,7 +167,8 @@ def test_a_project_grants_write_without_restating_the_identity(store, scopes):
     """The whole point: one grant row, and not one field of the box repeated."""
     store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
     store.config_set("mailbox", "grant", "atlas", {"allow_write": False}, ("global", ""))
-    store.config_set("mailbox", "grant", "atlas", {"allow_write": True}, ("project", "atlas"))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True, "allow_write": True},
+                     ("project", "atlas"))
 
     effective = store.connections_effective("mailbox", scopes)
     assert effective["atlas"]["allow_write"] is True
@@ -179,6 +180,7 @@ def test_a_project_grants_write_without_restating_the_identity(store, scopes):
 def test_a_project_can_disable_a_globally_declared_connection(store, scopes):
     store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
     store.config_set("mailbox", "connection", "osyris", {"address": "osyris@gmail.com"}, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True}, ("project", "atlas"))
     store.config_set("mailbox", "grant", "osyris", {"enabled": False}, ("project", "atlas"))
 
     assert set(store.connections_effective("mailbox", scopes)) == {"atlas"}
@@ -188,6 +190,7 @@ def test_a_project_can_disable_a_globally_declared_connection(store, scopes):
 
 def test_a_project_only_connection_lives_beside_the_global_ones(store, scopes):
     store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True}, ("project", "atlas"))
     store.config_set("mailbox", "connection", "client", {"address": "a@client.tld"},
                      ("project", "atlas"))
 
@@ -210,6 +213,7 @@ def test_a_project_may_replace_a_global_identity_whole(store, scopes):
 
 def test_writability_falls_back_to_the_capability_default(store, scopes):
     store.config_set("callva", "connection", "smart-id", {"k": 1}, ("global", ""))
+    store.config_set("callva", "grant", "smart-id", {"enabled": True}, ("project", "atlas"))
     assert store.connections_effective("callva", scopes)["smart-id"]["allow_write"] is False
     assert store.connections_effective("callva", scopes, write_default=True)["smart-id"]["allow_write"] is True
 
@@ -226,6 +230,7 @@ def test_a_grant_aimed_at_nothing_is_reported_rather_than_dropped(store, scopes)
     """A mistyped id would otherwise mean permission silently not granted, which
     looks exactly like permission correctly withheld."""
     store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True}, ("project", "atlas"))
     store.config_set("mailbox", "grant", "marvni", {"allow_write": True}, ("project", "atlas"))
 
     assert set(store.connections_effective("mailbox", scopes)) == {"atlas"}
@@ -238,6 +243,106 @@ def test_a_grant_that_lands_is_not_reported_as_an_orphan(store, scopes):
     store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
     store.config_set("mailbox", "grant", "atlas", {"allow_write": True}, ("project", "atlas"))
     assert store.grant_orphans("mailbox", scopes) == []
+
+
+# --- who may use a connection: the project's own grant, and nothing else ------
+#
+# An identity that resolves at project scope is a project that already said
+# yes -- declaring it locally is the act of permission. An identity inherited
+# from the global scope is withheld until this project's own grant says so, so
+# one line in the machine's config cannot hand the same connection to every
+# project on it.
+
+def test_a_global_identity_is_withheld_until_this_project_grants_it(store, scopes):
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    assert store.connections_effective("mailbox", scopes) == {}
+
+
+def test_a_project_grant_is_what_opens_a_global_identity(store, scopes):
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True}, ("project", "atlas"))
+
+    effective = store.connections_effective("mailbox", scopes)
+    assert effective["atlas"]["enabled"] is True
+    assert effective["atlas"]["scope"] == ("global", None)
+    assert effective["atlas"]["grant_scope"] == ("project", ATLAS_ID)
+
+
+def test_a_global_grant_is_never_the_blessing(store, scopes):
+    """It would restore the hole everywhere at once, which is the whole reason
+    the decision has to resolve where the project can see it."""
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True}, ("global", ""))
+    assert store.connections_effective("mailbox", scopes) == {}
+
+
+def test_a_project_grant_that_decides_only_writability_is_not_a_blessing(store, scopes):
+    """`allow_write` answers what may be done with a connection, never whether
+    this project may reach it at all."""
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"allow_write": True}, ("project", "atlas"))
+    assert store.connections_effective("mailbox", scopes) == {}
+
+
+def test_a_project_scope_identity_is_enabled_by_declaring_it(store, scopes):
+    store.config_set("mailbox", "connection", "client", {"address": "a@client.tld"},
+                     ("project", "atlas"))
+    effective = store.connections_effective("mailbox", scopes)
+    assert effective["client"]["enabled"] is True
+    assert effective["client"]["grant_scope"] is None
+
+
+def test_granting_reach_does_not_grant_write_the_owner_withheld(store, scopes):
+    """A grant is a decision, and its fields are decided one at a time: the
+    machine's `allow_write: false` survives a project that only says `enabled`.
+    Write permission is never picked up on the way to asking for something else."""
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"allow_write": False}, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True}, ("project", "atlas"))
+
+    effective = store.connections_effective("mailbox", scopes, write_default=True)
+    assert effective["atlas"]["enabled"] is True
+    assert effective["atlas"]["allow_write"] is False
+
+
+def test_a_project_deciding_writability_for_itself_still_wins(store, scopes):
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"allow_write": False}, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True, "allow_write": True},
+                     ("project", "atlas"))
+    assert store.connections_effective("mailbox", scopes)["atlas"]["allow_write"] is True
+
+
+def test_a_field_no_scope_decided_falls_back_to_the_capability_default(store, scopes):
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True}, ("project", "atlas"))
+    assert store.connections_effective(
+        "mailbox", scopes, write_default=True)["atlas"]["allow_write"] is True
+    assert store.connections_effective(
+        "mailbox", scopes)["atlas"]["allow_write"] is False
+
+
+def test_a_global_enabled_true_is_still_no_blessing_beside_a_project_grant(store, scopes):
+    """Field-wise resolution must not smuggle the blessing back: `enabled` is
+    decided by the highest scope that declares it, and only a project deciding
+    it opens an inherited identity."""
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"enabled": True}, ("global", ""))
+    store.config_set("mailbox", "grant", "atlas", {"allow_write": True}, ("project", "atlas"))
+    assert store.connections_effective("mailbox", scopes) == {}
+
+
+def test_include_disabled_still_returns_what_is_withheld(store, scopes):
+    """The manager's doctor reconciles what is declared, not what may be used,
+    so nothing may be hidden from it."""
+    store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
+    store.config_set("mailbox", "connection", "client", {"address": "a@client.tld"},
+                     ("project", "atlas"))
+    everything = store.connections_effective("mailbox", scopes, include_disabled=True)
+    assert set(everything) == {"atlas", "client"}
+    assert everything["atlas"]["enabled"] is False
+    assert everything["atlas"]["value"] == ATLAS_BOX
+    assert everything["client"]["enabled"] is True
 
 
 # --- the project registry ----------------------------------------------------
@@ -396,7 +501,7 @@ def test_an_email_address_is_a_valid_connection_id(store, scopes):
     store.config_set("mailbox", "connection", "owner@example.com",
                      {"address": "owner@example.com"}, ("global", ""))
     store.config_set("mailbox", "grant", "owner@example.com",
-                     {"allow_write": True}, ("project", "atlas"))
+                     {"enabled": True, "allow_write": True}, ("project", "atlas"))
     effective = store.connections_effective("mailbox", scopes)
     assert effective["owner@example.com"]["allow_write"] is True
 

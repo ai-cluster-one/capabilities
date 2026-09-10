@@ -906,6 +906,45 @@ def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 
 
+def _grant_hint(cid: str) -> str:
+    """One wording for the one way a project grants an inherited connection.
+
+    Same shape as `_write_gate`'s: the gate is the human's to lift, never the
+    agent's, and the hint carries the exact command rather than a description
+    of one. Where no project resolves there is no scope to grant in, so the
+    hint names the command that makes one and then the grant, in the order they
+    have to happen."""
+    grant = f"`capabilities set {NAME} grant {cid} '{{\"enabled\": true}}'`"
+    if _project_root() is None:
+        return ("Do not lift the gate yourself — ask the user; run "
+                f"`capabilities init` in the project that should use {NAME}, "
+                f"then {grant} there.")
+    return ("Do not lift the gate yourself — ask the user; granting is "
+            f"{grant} run inside this project.")
+
+
+def _grant_gate(reg: dict, cid: str) -> None:
+    """Refuse a connection this project may not use, for read as for write.
+
+    A connection declared outside the project is not the project's to use until
+    the project itself says so, and one the project switched off is off;
+    nothing in the cascade lifts either. Outside a project there is no scope in
+    which anything could have said so, which is a different situation and says
+    so rather than asserting a project that is not there."""
+    entry = (reg.get("withheld") or {}).get(cid)
+    if entry is None:
+        return
+    if entry.get("scope") == "project":
+        message = f"connection {cid!r} is disabled in this project"
+    elif _project_root() is None:
+        message = (f"connection {cid!r} is declared globally and there is no "
+                   f"project here to grant it in")
+    else:
+        message = (f"connection {cid!r} is declared outside this project and "
+                   f"this project has not granted it")
+    _die(4, "connection_not_granted", message, _grant_hint(cid))
+
+
 def _connections_composed() -> dict:
     """The connections envelope shape, composed out of resolved records.
 
@@ -915,10 +954,17 @@ def _connections_composed() -> dict:
     is the source, never the shape.
 
     The permission a project was granted is folded back onto the entry as
-    `allow_write`, which is where the rest of the contract looks for it."""
+    `allow_write`, which is where the rest of the contract looks for it.
+
+    A connection this project may not use is kept apart under `withheld`, not
+    dropped: `connections` holds exactly what may be acted on — which is what
+    every capability's own report iterates — while selection still has the name
+    it needs to explain a refusal instead of pretending the connection was
+    never declared."""
     adapter = _records()
     try:
-        effective = adapter.connections(NAME, write_default=WRITE_DEFAULT)
+        effective = adapter.connections(NAME, write_default=WRITE_DEFAULT,
+                                        include_disabled=True)
         default = adapter.get(NAME, "setting", "connection.default")
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
@@ -927,10 +973,24 @@ def _connections_composed() -> dict:
              f"{NAME} requires an explicit connections registry and "
              f"{adapter.source} holds none",
              'expected {"default": "<id>", "connections": {"<id>": { ... }}}')
+    usable = {cid: e for cid, e in effective.items() if e["enabled"]}
+    withheld = {cid: e for cid, e in effective.items() if not e["enabled"]}
+    if not usable:
+        named = ", ".join(sorted(withheld))
+        if _project_root() is None:
+            refusal = (f"there is no project here to use a {NAME} connection in, "
+                       f"so every connection declared globally stays "
+                       f"withheld: {named}")
+        else:
+            refusal = (f"no {NAME} connection is usable in this project; every "
+                       f"one it can see is withheld: {named}")
+        _die(4, "connection_not_granted", refusal, _grant_hint("<id>"))
     return {
         "default": default,
         "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
-                        for cid, entry in effective.items()},
+                        for cid, entry in usable.items()},
+        "withheld": {cid: {"scope": entry["scope"][0]}
+                     for cid, entry in withheld.items()},
     }
 
 
@@ -947,7 +1007,11 @@ def _connections_registry() -> tuple[dict | None, Path | str | None]:
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
     """flag → default pointer → sole entry → die 6. A connection's own
     `address` field selects it too (used where a
-    connection carries a human-recognizable address; absent fields never match)."""
+    connection carries a human-recognizable address; absent fields never match).
+
+    A connection the project was never granted is refused here rather than
+    reported missing, so the one enforcement point every capability already
+    routes through is also the one that answers "why not"."""
     if reg is None:
         _die(6, "connections_required",
              f"{NAME} requires an explicit connections registry")
@@ -958,11 +1022,13 @@ def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict 
         for cid, entry in conns.items():
             if (entry or {}).get("address", "").lower() == wanted.lower():
                 return cid, entry
+        _grant_gate(reg, wanted)
         _die(6, "unknown_connection", f"no connection matches {wanted!r}",
              f"known: {', '.join(conns)}")
     default = reg.get("default")
     if default:
         if default not in conns:
+            _grant_gate(reg, default)
             _die(6, "bad_default", f"default points to unknown connection {default!r}",
                  f"known: {', '.join(conns)}")
         return default, conns[default]
