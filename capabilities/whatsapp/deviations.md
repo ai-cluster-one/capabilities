@@ -28,6 +28,24 @@ the bridge's own wire objects, and no engine but that bridge can produce them.
 The envelope replacing it is the one the export already publishes, so the two
 read surfaces now agree, and the export's `schema_version` carries the change.
 
+## The engine is pinned to a build that does not announce itself
+
+Upstream neonize appends a `<bot biz_bot="1"/>` node to every message addressed
+to a person, which the recipient's WhatsApp renders as an "AI" badge and which
+marks the sending account's traffic as automated. The pinned build turns that
+node off by default and takes `NEONIZE_BOT_TAG=on` to restore it.
+
+The choice is not about hiding what the sender is. It is about where that is
+said: a sentence in the message is answerable and belongs to the conversation,
+while the protocol flag is a standing claim about the account, made on every
+message, on accounts that also carry a person's own correspondence. Saying who
+is writing is left to what gets written.
+
+The flag could not be set from here. A Go runtime inside a shared library reads
+the environment its process started with, so a value exported after the
+interpreter is running never reaches it — which is why this lives in the build
+rather than in a line of Python before the import.
+
 ## The process ends itself
 
 Every path exits through one funnel that flushes and terminates rather than

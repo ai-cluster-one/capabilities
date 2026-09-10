@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "puremagic>=1.28",
-#     "neonize @ https://github.com/ai-cluster-one/neonize/releases/download/v0.4.7-histsync.2/neonize-0.4.7-py3-none-any.whl",
+#     "neonize @ https://github.com/ai-cluster-one/neonize/releases/download/v0.4.7-histsync.3/neonize-0.4.7-py3-none-any.whl",
 # ]
 # ///
 """How a history chunk becomes rows, checked against the protocol's own message

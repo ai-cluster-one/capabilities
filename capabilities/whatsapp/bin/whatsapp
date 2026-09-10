@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
-#     "neonize @ https://github.com/ai-cluster-one/neonize/releases/download/v0.4.7-histsync.2/neonize-0.4.7-py3-none-any.whl",
+#     "neonize @ https://github.com/ai-cluster-one/neonize/releases/download/v0.4.7-histsync.3/neonize-0.4.7-py3-none-any.whl",
 # ]
 # ///
 """
@@ -184,10 +184,10 @@ Commands
                                        the connection carries allow_write.
                                        Reports the id the account minted, which
                                        is what a later read carries. What goes
-                                       out is an ordinary message: nothing marks
-                                       it as bot traffic, so saying who is
-                                       writing is the sender's job and belongs
-                                       in the text.
+                                       out is an ordinary message, carrying no
+                                       machine marking of any kind, so saying
+                                       who is writing is the sender's job and
+                                       belongs in the text.
 
 Chat and contact IDs
   DMs    — <number>@s.whatsapp.net  e.g. 15551234567@s.whatsapp.net
@@ -3420,22 +3420,6 @@ def parse_date(date_str):
 # which is why draining is a property of connecting rather than a verb of its own.
 
 
-def _quiet_bot_tag() -> None:
-    """Stop the engine from labelling every direct message as bot traffic.
-
-    The library attaches a `<bot biz_bot="1"/>` node to any message addressed to
-    a person rather than a group, and WhatsApp renders that as an "AI" badge on
-    the message. Being open about what this is belongs in what the assistant
-    writes, in words the reader can answer; the protocol flag says the same
-    thing worse, and it also marks the account's traffic as automated on an
-    account that carries real correspondence.
-
-    The Go runtime reads its environment when the shared library loads, so this
-    has to be set before the import below and not merely before a send.
-    `setdefault` leaves an operator who exported the variable in charge of it."""
-    os.environ.setdefault("NEONIZE_BOT_TAG", "off")
-
-
 def _install_magic_shim() -> None:
     """neonize imports `magic` (libmagic) at module scope and reaches for it only
     to sniff the mime type of outbound media. Binding a system library for that
@@ -3475,7 +3459,6 @@ def _engine():
     global _ENGINE
     if _ENGINE is not None:
         return _ENGINE
-    _quiet_bot_tag()
     _install_magic_shim()
     try:
         import logging
