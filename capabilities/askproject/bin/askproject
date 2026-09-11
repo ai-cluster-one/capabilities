@@ -39,7 +39,11 @@ COMMANDS
 
 <target> is a path to the other project: absolute, ~-expanded, or relative to
 your cwd. YOU decide which project to talk to and pass its path. It must be a
-directory (a git repo is strongly recommended — see snapshots below).
+directory (a git repo is strongly recommended — see snapshots below), and it
+must not be your OWN project root: that call is refused before any peer starts,
+because you already stand there with the context loaded and a peer would only
+re-read what you can read yourself. A subdirectory of your project, and a git
+worktree of your repository at another path, are other projects and are fine.
 
 ────────────────────────────────────────────────────────────────────────────
 MODES  (the fence; how each engine implements it differs)
@@ -2682,6 +2686,63 @@ def die(msg: str, *, as_json: bool, code: int = 1):
     sys.exit(code)
 
 
+def _real(path: Path) -> Path | None:
+    """The fully resolved real path, or None when the filesystem cannot say.
+
+    Identity is decided here and nowhere else, so `~/dev/p`, `../p`, a trailing
+    slash, an uncollapsed `..` and a symlinked path all reduce to one answer.
+    Only used to compare; the caller keeps its own unresolved path.
+    """
+    try:
+        return Path(os.path.realpath(str(path)))
+    except OSError:
+        return None
+
+
+def _root_is_where_caller_stands(root: Path) -> bool:
+    """Whether `root` is the project the caller actually stands in.
+
+    Root detection reads `.git` as a directory marker, so it walks straight
+    through a linked git worktree — whose `.git` is a file — and settles on an
+    enclosing checkout that is a different project. Identity cannot be decided
+    from that answer, so say no and let the call through: a peer that should
+    have been refused is the old behaviour, refusing a legitimate one is not.
+    """
+    try:
+        here = Path.cwd().resolve()
+    except OSError:
+        return False
+    for d in (here, *here.parents):
+        if d == root:
+            return True
+        if (d / ".git").is_file():
+            return False
+    return False
+
+
+def _refuse_self_target(target: Path, root: Path | None, *, as_json: bool) -> None:
+    """Refuse a target that is the caller's own project root.
+
+    The peer would load the context the caller already holds and re-read files
+    the caller can read itself, at the price of a fresh prompt cache — always
+    waste, and silent, because the answer comes back correct. Only the root
+    itself is refused: a subdirectory of this project, and a git worktree of
+    this repository living at another path, are different targets.
+    """
+    if root is None:
+        return
+    real_root = _real(root)
+    real_target = _real(target)
+    if real_root is None or real_target is None or real_target != real_root:
+        return
+    if not _root_is_where_caller_stands(root):
+        return
+    die(f"target is this project itself ({root}) — askproject reaches a peer in "
+        "ANOTHER project; you already stand here with this context loaded, so "
+        "read the files directly (Read/Glob/Grep) instead of paying for a peer",
+        as_json=as_json)
+
+
 class PeerTimeout(Exception):
     """A timed-out peer plus the native session id observed before it stopped."""
 
@@ -3351,6 +3412,7 @@ def run(args):
 
     requested_mode = "act" if args.act else "read"
     root = _project_root()
+    _refuse_self_target(target, root, as_json=as_json)
     caller = root.name if root else Path.cwd().name
 
     state = load_state()
