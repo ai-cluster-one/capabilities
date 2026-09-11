@@ -31,6 +31,13 @@ ENVIRONMENT
   CAPABILITIES_PROJECT_ENVELOPE
                        the project envelope location, supplied by the project's
                        context owner in advance of the lookup below.
+  CAPABILITIES_PROJECT_ENVELOPE_ROOT
+                       the project root the value above answers for. A capability
+                       sets both when it hands its resolved answer down to the
+                       processes it spawns, so a descendant standing in another
+                       project passes that handoff over and resolves its own.
+                       Alone it carries no answer; an envelope supplied without
+                       it is honored wherever it is inherited.
 
 PROJECT PATH VERB
   path --json
@@ -345,6 +352,7 @@ CONTEXTKIT_CONFIG_REL = Path(".contextkit") / "config.toml"
 CONTEXTKIT_BIN = "contextkit"
 CONTEXTKIT_ENVELOPE_QUERY = ("path", "capabilities")
 ENVELOPE_ENV = "CAPABILITIES_PROJECT_ENVELOPE"
+ENVELOPE_ROOT_ENV = "CAPABILITIES_PROJECT_ENVELOPE_ROOT"
 CODEX_HOOK_COMMAND = "capabilities context --codex"
 DEFAULT_CONTEXT_PROMPT = (
     "Identifiers are durable, non-secret project lookups discovered while using "
@@ -576,14 +584,35 @@ def _validated_envelope(root: Path, raw: str, provider: str) -> Path:
     return resolved
 
 
-def _contextkit_envelope(root: Path) -> Path:
-    """Where ContextKit keeps this project's envelope, or a structured error.
+def _handed_off_envelope(root: Path) -> str:
+    """The handoff meant for THIS project root, or "" when there is none.
 
-    $CAPABILITIES_PROJECT_ENVELOPE is the same answer handed over in advance, so
-    a context owner composing through `capabilities context --fragment` never
-    has to be called back mid-flight.
+    $CAPABILITIES_PROJECT_ENVELOPE is inherited by every descendant process, and
+    a descendant does not always stand in the project its parent stood in.
+    $CAPABILITIES_PROJECT_ENVELOPE_ROOT names the root the handed value answers
+    for, so a handoff that crossed a project boundary is passed over instead of
+    being applied to the wrong project. A handoff supplied without that companion
+    belongs to whoever launched the process and is honored as given, which is how
+    a context owner composing through `capabilities context --fragment` hands its
+    answer over in advance and is never called back mid-flight.
     """
     override = os.environ.get(ENVELOPE_ENV, "").strip()
+    if not override:
+        return ""
+    scope = os.environ.get(ENVELOPE_ROOT_ENV, "").strip()
+    if not scope:
+        return override
+    try:
+        if Path(scope).expanduser().resolve() != root.resolve():
+            return ""
+    except OSError:
+        return ""
+    return override
+
+
+def _contextkit_envelope(root: Path) -> Path:
+    """Where ContextKit keeps this project's envelope, or a structured error."""
+    override = _handed_off_envelope(root)
     if override:
         return _validated_envelope(root, override, "environment handoff")
     try:
@@ -626,9 +655,9 @@ def _envelope_home(root: Path) -> Path:
     if cached is not None:
         return cached
     home = root / PROJECT_CAPABILITIES_REL
-    if os.environ.get(ENVELOPE_ENV, "").strip():
-        home = _validated_envelope(
-            root, os.environ[ENVELOPE_ENV], "environment handoff")
+    handoff = _handed_off_envelope(root)
+    if handoff:
+        home = _validated_envelope(root, handoff, "environment handoff")
     elif _contextkit_managed(root):
         home = _contextkit_envelope(root)
     _ENVELOPE_HOME[root] = home
@@ -655,7 +684,7 @@ def cmd_path(json_output: bool) -> None:
         _die(6, "input", "path requires --json")
     root = _require_project().resolve()
     envelope = _envelope_home(root).resolve()
-    if os.environ.get(ENVELOPE_ENV, "").strip():
+    if _handed_off_envelope(root):
         provider = "handoff"
     elif _contextkit_managed(root):
         provider = "contextkit"

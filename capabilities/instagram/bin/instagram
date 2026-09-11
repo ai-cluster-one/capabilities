@@ -158,9 +158,36 @@ def _validated_project_envelope(root: Path, raw, provider: str) -> Path:
     return resolved
 
 
+def _handed_off_envelope(root: Path) -> str:
+    """The handoff meant for THIS project root, or "" when there is none.
+
+    `CAPABILITIES_PROJECT_ENVELOPE` is inherited by every descendant process, and
+    a descendant does not always stand in the project its parent stood in: a peer
+    spawned in another project, or a worker whose cwd sits under a different root,
+    must resolve its own envelope. `CAPABILITIES_PROJECT_ENVELOPE_ROOT` names the
+    root the handed value answers for, so a handoff that crossed a project
+    boundary is passed over instead of being applied to the wrong project. A
+    handoff supplied without that companion belongs to whoever launched the
+    process and is honored as given, which is how a context owner hands its answer
+    over in advance.
+    """
+    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
+    if not override:
+        return ""
+    scope = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE_ROOT", "").strip()
+    if not scope:
+        return override
+    try:
+        if Path(scope).expanduser().resolve() != root.resolve():
+            return ""
+    except OSError:
+        return ""
+    return override
+
+
 def _manager_project_envelope(root: Path) -> Path:
     """Consume the capabilities manager's one authoritative project answer."""
-    override = os.environ.get("CAPABILITIES_PROJECT_ENVELOPE", "").strip()
+    override = _handed_off_envelope(root)
     if override:
         return _validated_project_envelope(root, override, "environment handoff")
 
@@ -219,12 +246,20 @@ def _envelope_home(root: Path) -> Path:
     The capabilities manager owns project-envelope discovery, including any
     delegation to ContextKit. Capability CLIs consume that answer and never
     duplicate context-owner detection.
+
+    The answer is then handed to this process's descendants, scoped to the root
+    it answers for. Asking for it costs two interpreter starts — the manager and
+    the context owner it delegates to — so a worker, a peer, or a nested
+    capability call that would otherwise repeat the whole chain under whatever
+    load the machine is under by then reads it instead.
     """
     cached = _ENVELOPE_HOME.get(root)
     if cached is not None:
         return cached
     home = _manager_project_envelope(root)
     _ENVELOPE_HOME[root] = home
+    os.environ["CAPABILITIES_PROJECT_ENVELOPE"] = str(home)
+    os.environ["CAPABILITIES_PROJECT_ENVELOPE_ROOT"] = str(root)
     return home
 
 

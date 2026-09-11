@@ -5,7 +5,7 @@
     "SHEBANG.md": "57cbc5ba144f1d1098a0b0d817fd986402839f520b8e7ca0e2bd2951e63e94e4",
     "SOURCES.md": "8e8b7f1f500b8ebe3d1abb2874616071e8142c69b897110be5cbc0f0194b0085",
     "TEMPLATE.md": "f0eb0069570509b7669be7a9c660703e86924ade416ccf87983eaa447169233d",
-    "contract/preamble.py": "8e85d3ee177a8052d089bcb4e4831caca6959c7f966eaf85434084fd6ab09ced",
+    "contract/preamble.py": "b0470fcad52ea9e012011d2ee5b1363876ae4036892c2a27fca484cce7753b53",
     "contract/store.py": "9a8fef37e53e3e29cf91a44879d5234e78d97fe8bf6a56642e35c4268a7eeb24",
     "guides/authoring.md": "3b12c12aa60cecb6dc96994d95b37fa8901be7f920fee7f8be3dc2a3b6e947b9",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
@@ -19,7 +19,7 @@
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "750c19241b2e31eaba4349358323d285b57de900a3287416694dc470d6c2a937"
+    "sha256": "f49f92c025b3bbd223a821c65f58806b777cb65d16866f60131f0f6af03c5fc9"
   },
   "schema": "capabilities.manager-release.v1"
 }
