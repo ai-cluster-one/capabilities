@@ -47,7 +47,9 @@ worktree of your repository at another path, are other projects and are fine.
 
 ────────────────────────────────────────────────────────────────────────────
 MODES  (the fence; how each engine implements it differs)
-  read  (default)   Pure research. claude: ONLY Read/Glob/Grep + plan mode.
+  read  (default)   Pure research. claude: the turn's built-in tool set IS
+                    Read/Glob/Grep (--tools), so it has no shell and nothing
+                    that writes, plus plan mode.
                     codex: an OS read-only sandbox (sandbox_mode=read-only) —
                     it may run read-only shell but cannot write. Use for
                     "what does X do", reviews.
@@ -68,10 +70,13 @@ EFFORT: on claude the peer thinks at `high` reasoning effort by default;
 codex takes its reasoning settings from your ~/.codex/config.toml, so on codex
 the reported effort is null.
 
-FENCING REALITY: read mode is a hard fence (claude has no harmful tools; codex
-runs in an OS read-only sandbox). act mode intentionally drops the peer's
-prompts so it can complete build work end-to-end. The prompt and the git
-snapshot (below) are your safety net.
+FENCING REALITY: in read mode the invocation itself is the fence — claude is
+given only the reading tools, so no permission setting on your machine can hand
+the peer a shell or a writer (an MCP server configured on that machine is
+outside the built-in set and still reaches the peer), and codex runs in an OS
+read-only sandbox. act mode intentionally drops the peer's prompts so it can
+complete build work end-to-end. The prompt and the git snapshot (below) are your
+safety net.
 
 ────────────────────────────────────────────────────────────────────────────
 SESSION CONTINUITY  (state is LOCAL to the project you call from)
@@ -3219,7 +3224,15 @@ def run_claude(target, prompt, mode, model, effort, caller, append,
     if resume_id:
         cmd += ["--resume", resume_id]
     if mode == "read":
-        cmd += ["--allowedTools", "Read,Glob,Grep", "--permission-mode", "plan"]
+        # --tools is what makes read mode a fence: it decides which built-in
+        # tools exist for the turn, so Bash/Edit/Write are absent from the
+        # schema and no settings file on the calling machine can hand them back.
+        # --allowedTools only says the listed tools need no prompt; it removes
+        # nothing, so under a permissive user settings file the peer kept a
+        # working shell. It stays so the three reading tools remain
+        # pre-approved, and plan mode stays as the model-facing signal.
+        cmd += ["--tools", "Read,Glob,Grep",
+                "--allowedTools", "Read,Glob,Grep", "--permission-mode", "plan"]
     else:
         cmd += ["--permission-mode", "bypassPermissions", "--add-dir", str(target)]
     cmd += ["--append-system-prompt", build_preamble(mode, caller, append, schema_text)]

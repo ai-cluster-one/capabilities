@@ -3282,8 +3282,17 @@ def _agent_command(profile: dict[str, Any], root: Path, schema: Path | None,
         if profile["effort"]:
             command += ["--effort", profile["effort"]]
         if profile["mode"] == "read":
+            # --tools decides which built-in tools exist for the turn, so a read
+            # profile has no Bash, Edit or Write in its schema and no settings
+            # file on the machine running the job can hand them back.
+            # --allowedTools only marks the listed tools as needing no prompt; it
+            # removes nothing, so on its own a read profile kept a working shell
+            # wherever user settings were permissive. It stays so the three
+            # reading tools remain pre-approved, and plan mode stays as the
+            # model-facing signal.
             command += ["--permission-mode", "plan",
-                        "--allowedTools", "Read", "Glob", "Grep"]
+                        "--tools", "Read,Glob,Grep",
+                        "--allowedTools", "Read,Glob,Grep"]
         else:
             command += ["--permission-mode", "bypassPermissions"]
         if schema is not None:

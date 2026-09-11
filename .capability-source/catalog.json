@@ -7,12 +7,12 @@
     },
     "askproject": {
       "path": "capabilities/askproject",
-      "payload_sha256": "a279ef1576af758871eb251a2d756180a9b430db11018138da3685de18774294",
+      "payload_sha256": "7071493ab14914d6772a6f1aafbb81a942d6f1633cb17a4192253f17b9e635b3",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project, fenced by mode (read/act), and return its answer with cost, token, and files-changed traceability."
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "335f4b8ec5fe7d8aa2edbd2088a24d952abf59b4258000c3afa7e0ced2848a2c",
+      "payload_sha256": "85841d4d4f72611d9d2165c8f5cfe838321a93dcf761adc8b4c58b4cc706a1a2",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {

@@ -299,6 +299,10 @@ retries = 1
         read = cli.__dict__["_agent_command"](base, self.root, None, answer)
         self.assertIn("plan", read)
         self.assertNotIn("bypassPermissions", read)
+        # The fence has to remove the tools, not merely pre-approve three of
+        # them: an allow rule leaves Bash and Write in the turn for whatever the
+        # machine's own settings decide about them.
+        self.assertEqual(read[read.index("--tools") + 1], "Read,Glob,Grep")
         write = cli.__dict__["_agent_command"]({**base, "mode": "write"},
                                                self.root, None, answer)
         self.assertIn("bypassPermissions", write)
