@@ -3221,11 +3221,46 @@ def _tool_stage(name, tool_input=None) -> tuple[str, str]:
     return "work", "Using a project tool"
 
 
-def _stream_process(cmd: list[str], *, cwd: str, timeout: int,
+def _peer_env(target) -> dict:
+    """The caller's environment, made to belong to the target project.
+
+    A peer is started in another project's directory, and cwd is the weakest
+    thing that says so: a capability CLI reads $CLAUDE_PROJECT_DIR first and
+    falls back to cwd only in its absence, and it honours a handed-off envelope
+    whenever the handoff names the root it stands in. Inherited unchanged, both
+    make the peer answer as the CALLER's project while standing in the target —
+    its capability calls resolve the caller's envelope and the caller's
+    credentials. So the target is named and the handoff is dropped rather than
+    re-pointed: the envelope answer belongs to whoever resolved it, and a
+    descendant in another project resolves its own.
+
+    A per-turn authority granted to the caller by whatever ingress launched it
+    is the caller's alone. The Telegram service's worker keys are that authority
+    here — the launch nonce, the authorized chat, the progress outbox — and a
+    peer holding them writes into the caller's own chat through the worker shim
+    the same service left on the inherited PATH. TELEGRAM_REAL_TELEGRAM is kept
+    because it names the real executable rather than any authority; without it
+    that shim finds itself on PATH again and re-execs forever.
+
+    Everything else is inherited deliberately: PATH, HOME, the language runtime
+    and the engine's own credentials are what let the peer run at all, and no
+    list written here could name them.
+    """
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(target)
+    env.pop("CAPABILITIES_PROJECT_ENVELOPE", None)
+    env.pop("CAPABILITIES_PROJECT_ENVELOPE_ROOT", None)
+    for key in [k for k in env
+                if k.startswith("TELEGRAM_") and k != "TELEGRAM_REAL_TELEGRAM"]:
+        env.pop(key, None)
+    return env
+
+
+def _stream_process(cmd: list[str], *, cwd: str, env: dict, timeout: int,
                     on_stdout) -> subprocess.CompletedProcess:
     """Capture both pipes without deadlock while delivering stdout lines live."""
     proc = subprocess.Popen(
-        cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, bufsize=1,
     )
     events: queue.Queue = queue.Queue()
@@ -3395,6 +3430,7 @@ def run_claude(target, prompt, mode, model, effort, caller, append,
     cmd += ["--append-system-prompt", build_preamble(mode, caller, append, schema_text)]
 
     result_event: dict = {}
+    peer_env = _peer_env(target)
     try:
         if reporter.enabled:
             def on_stdout(line: str) -> None:
@@ -3405,10 +3441,11 @@ def run_claude(target, prompt, mode, model, effort, caller, append,
                 if evt.get("type") == "result":
                     result_event.update(evt)
 
-            proc = _stream_process(cmd, cwd=str(target), timeout=timeout,
-                                   on_stdout=on_stdout)
+            proc = _stream_process(cmd, cwd=str(target), env=peer_env,
+                                   timeout=timeout, on_stdout=on_stdout)
         else:
-            proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
+            proc = subprocess.run(cmd, cwd=str(target), env=peer_env,
+                                  capture_output=True,
                                   text=True, timeout=timeout,
                                   stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as exc:
@@ -3515,13 +3552,15 @@ def run_codex(target, prompt, mode, model, effort, caller, append,
             Path(schema_file).write_text(schema_text)
             cmd += ["--output-schema", schema_file]
 
+        peer_env = _peer_env(target)
         try:
             if reporter.enabled:
                 progress = CodexProgress(reporter)
-                proc = _stream_process(cmd, cwd=str(target), timeout=timeout,
-                                       on_stdout=progress.feed)
+                proc = _stream_process(cmd, cwd=str(target), env=peer_env,
+                                       timeout=timeout, on_stdout=progress.feed)
             else:
-                proc = subprocess.run(cmd, cwd=str(target), capture_output=True,
+                proc = subprocess.run(cmd, cwd=str(target), env=peer_env,
+                                      capture_output=True,
                                       text=True, timeout=timeout,
                                       stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as exc:
