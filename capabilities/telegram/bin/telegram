@@ -91,10 +91,26 @@ Commands:
                                                List a forum group's topics; each
                                                `id` is the root message id the
                                                send verbs take as --topic.
-  telegram read <chat> [--limit N] [--since ISO] [--json]
-                                               Read messages from a chat.
-  telegram search <chat> <query> [--limit N] [--json]
-                                               Search messages inside a chat.
+  telegram read <chat> [--limit N] [--since ISO] [--topic TOPIC_ID] [--json]
+                                               Read messages from a chat. A read
+                                               of a forum spans every one of its
+                                               topics unless --topic names one
+                                               by its root message id, the id
+                                               `telegram topics` prints and the
+                                               send verbs take; a named topic
+                                               carries both the messages posted
+                                               straight into it and the replies
+                                               threaded inside it, and --limit
+                                               counts what comes back. Each JSON
+                                               record carries the `topic_id` it
+                                               came from: a root message id, 1
+                                               for a forum's General topic, and
+                                               null in a chat whose messages
+                                               live in no topic at all.
+  telegram search <chat> <query> [--limit N] [--topic TOPIC_ID] [--json]
+                                               Search messages inside a chat;
+                                               the same forum-topic scoping and
+                                               `topic_id` as `read`.
   telegram send <chat> <text> [--reply-to MSG_ID | --topic TOPIC_ID] [--external]
                                                Send a message. In a forum, a
                                                message lands in the topic named
@@ -112,11 +128,13 @@ Commands:
                                                path (download only if absent);
                                                prints the absolute path.
   telegram export <chat> --out PATH [--media-dir PATH] [--limit N] [--since ISO]
-            [--no-photos] [--no-stickers] [--videos] [--documents]
+            [--topic TOPIC_ID] [--no-photos] [--no-stickers] [--videos] [--documents]
                                                Dump full history to JSON; download
                                                voice/audio (+photos/stickers by
                                                default) to media-dir; leave
-                                               transcription placeholders.
+                                               transcription placeholders. The
+                                               same forum-topic scoping and
+                                               `topic_id` as `read`.
   telegram transcribe <json_path> [--force] [--model nova-3]
                                                Fill transcription placeholders in an
                                                exported JSON via Deepgram (audio
@@ -3560,6 +3578,16 @@ async def cmd_chats(cfg: dict, limit: int) -> list[dict]:
     return out
 
 
+async def _require_forum(client, entity) -> None:
+    """Refuse a topic question about a chat whose messages live in no topic."""
+    if getattr(entity, "forum", False):
+        return
+    await client.disconnect()
+    _die(3, "not_a_forum",
+         f"{entity_label(entity)} has no forum topics",
+         "topics exist only in a group with Telegram's topics feature on")
+
+
 def topic_to_dict(topic) -> dict:
     """A forum topic; `id` is the root message id the send verbs take."""
     return {
@@ -3587,11 +3615,7 @@ async def cmd_topics(cfg: dict, chat: str, limit: int,
     client = make_client(cfg)
     await _require_auth(client)
     entity = await resolve_chat(client, chat)
-    if not getattr(entity, "forum", False):
-        await client.disconnect()
-        _die(3, "not_a_forum",
-             f"{entity_label(entity)} has no forum topics",
-             "topics exist only in a group with Telegram's topics feature on")
+    await _require_forum(client, entity)
     collected: list[dict] = []
     offset_date, offset_id, offset_topic = None, 0, 0
     while len(collected) < limit:
@@ -3617,7 +3641,81 @@ async def cmd_topics(cfg: dict, chat: str, limit: int,
     return collected[:limit]
 
 
-def msg_to_dict(m) -> dict:
+def _service_forum() -> Path:
+    return _service_bundle_dir() / "service" / "forum.py"
+
+
+_FORUM_MODULE = None
+
+
+def _forum_module():
+    """The bundle's forum-topic resolution, shared with the assistant service."""
+    global _FORUM_MODULE
+    if _FORUM_MODULE is not None:
+        return _FORUM_MODULE
+    path = _service_forum()
+    _require_service_bundle_files(path)
+    spec = importlib.util.spec_from_file_location("telegram_service_forum", path)
+    if spec is None or spec.loader is None:
+        _die(3, "service_bundle_missing",
+             f"cannot load the bundled forum-topic resolution: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _FORUM_MODULE = module
+    return module
+
+
+def _topic_resolver(entity):
+    """How this chat answers which of its topics a message is in.
+
+    A forum's General topic marks nothing on the wire, so a message of a forum
+    that is not marked as a topic message is General's, and Telegram lists
+    General as topic 1 — the id `telegram topics` prints — so that is the answer
+    given here.  A chat whose messages live in no topic has no answer at all,
+    and the difference between 1 and nothing is what tells a caller a forum's
+    General apart from a group that never had topics.
+    """
+    forum = _forum_module()
+    if not getattr(entity, "forum", False):
+        return lambda message: forum.message_topic_id(message)
+    return lambda message: forum.message_topic_id(
+        message, lambda _message: forum.GENERAL_TOPIC_ID)
+
+
+async def _iter_topic_scope(client, entity, topic_id: int | None, topic_of, *,
+                            limit: int | None = None, search: str | None = None):
+    """Messages newest-first, narrowed to one forum topic when one is named.
+
+    Telegram addresses a topic thread by its root message id, and asking the
+    server for that thread is what keeps a scoped read off the rest of the
+    forum.  Two scopes cannot take that route: General owns no root message to
+    thread from, and a query is dropped the moment a reply target is set, so
+    each of those walks the chat instead.  Either way the same resolution
+    decides what is emitted — a narrowed answer is never trusted on its own,
+    because the thread carries both the posts made straight into the topic and
+    the replies made inside it — which is why `limit` counts the messages
+    handed back rather than the ones examined.
+    """
+    if topic_id is None:
+        async for message in client.iter_messages(entity, limit=limit,
+                                                  search=search):
+            yield message
+        return
+    narrowed = {}
+    if search is None and topic_id != _forum_module().GENERAL_TOPIC_ID:
+        narrowed["reply_to"] = topic_id
+    emitted = 0
+    async for message in client.iter_messages(entity, limit=None, search=search,
+                                              **narrowed):
+        if topic_of(message) != topic_id:
+            continue
+        yield message
+        emitted += 1
+        if limit is not None and emitted >= limit:
+            return
+
+
+def msg_to_dict(m, topic_of) -> dict:
     return {
         "id": m.id,
         "date": m.date.astimezone(timezone.utc).isoformat() if m.date else None,
@@ -3625,6 +3723,7 @@ def msg_to_dict(m) -> dict:
         "sender": entity_label(m.sender) if m.sender else None,
         "text": m.message or "",
         "reply_to": m.reply_to_msg_id,
+        "topic_id": topic_of(m),
     }
 
 
@@ -3638,37 +3737,57 @@ def _render_transcript(header: str, messages: list) -> str:
     return "\n".join(lines)
 
 
-async def cmd_read(cfg, chat: str, limit: int, since: str | None, as_json: bool):
+async def cmd_read(cfg, chat: str, limit: int, since: str | None, as_json: bool,
+                   topic: int | None = None):
+    _require_message_id(topic, "--topic")
     client = make_client(cfg)
     await _require_auth(client)
     entity = await resolve_chat(client, chat)
+    if topic is not None:
+        await _require_forum(client, entity)
+    topic_of = _topic_resolver(entity)
     since_dt = _parse_since(since)
     messages = []
-    async for m in client.iter_messages(entity, limit=limit):
+    async for m in _iter_topic_scope(client, entity, topic, topic_of,
+                                     limit=limit):
         if since_dt and m.date and m.date < since_dt:
             break
         messages.append(m)
     messages.reverse()
     await client.disconnect()
     if as_json:
-        return [msg_to_dict(m) for m in messages]
+        return [msg_to_dict(m, topic_of) for m in messages]
     return _render_transcript(
         f"# {entity_label(entity)}  ({len(messages)} messages)", messages)
 
 
-async def cmd_search(cfg, chat: str, query: str, limit: int, as_json: bool):
+async def cmd_search(cfg, chat: str, query: str, limit: int, as_json: bool,
+                     topic: int | None = None):
+    _require_message_id(topic, "--topic")
     client = make_client(cfg)
     await _require_auth(client)
     entity = await resolve_chat(client, chat)
+    if topic is not None:
+        await _require_forum(client, entity)
+    topic_of = _topic_resolver(entity)
     messages = []
-    async for m in client.iter_messages(entity, search=query, limit=limit):
+    async for m in _iter_topic_scope(client, entity, topic, topic_of,
+                                     limit=limit, search=query):
         messages.append(m)
     messages.reverse()
     await client.disconnect()
     if as_json:
-        return [msg_to_dict(m) for m in messages]
+        return [msg_to_dict(m, topic_of) for m in messages]
     return _render_transcript(
         f"# {entity_label(entity)}  search: {query!r}  ({len(messages)} hits)", messages)
+
+
+def _require_message_id(value: int | None, flag: str) -> None:
+    """Every flag naming a message or a topic root names a positive id."""
+    if value is not None and value <= 0:
+        _die(6, "invalid_message_id",
+             f"{flag} must be a positive Telegram message id, got {value}",
+             "read the chat to find the message or topic root id")
 
 
 def _reply_target(reply_to: int | None, topic: int | None) -> int | None:
@@ -3681,10 +3800,7 @@ def _reply_target(reply_to: int | None, topic: int | None) -> int | None:
     fixes the topic, so a second answer could only contradict it.
     """
     for value, flag in ((reply_to, "--reply-to"), (topic, "--topic")):
-        if value is not None and value <= 0:
-            _die(6, "invalid_message_id",
-                 f"{flag} must be a positive Telegram message id, got {value}",
-                 "read the chat to find the message or topic root id")
+        _require_message_id(value, flag)
     if reply_to is not None and topic is not None:
         _die(6, "reply_target_conflict",
              "--reply-to and --topic cannot be combined",
@@ -3882,13 +3998,14 @@ def _classify_media(m):
     return "text", None
 
 
-def _unsupported_export_entry(message, exc: Exception) -> dict:
+def _unsupported_export_entry(message, exc: Exception, topic_of) -> dict:
     return {
         "id": getattr(message, "id", None),
         "date": _safe_iso(getattr(message, "date", None)),
         "edited_at": _safe_iso(getattr(message, "edit_date", None)),
         "sender": None,
         "reply_to_msg_id": getattr(message, "reply_to_msg_id", None),
+        "topic_id": topic_of(message),
         "forward": None,
         "type": "unsupported",
         "text": _json_text(getattr(message, "message", None)),
@@ -3899,7 +4016,7 @@ def _unsupported_export_entry(message, exc: Exception) -> dict:
     }
 
 
-def _export_message_entry(message) -> dict:
+def _export_message_entry(message, topic_of) -> dict:
     kind, media_meta = _classify_media(message)
     sender = None
     if message.sender is not None:
@@ -3935,6 +4052,7 @@ def _export_message_entry(message) -> dict:
         "edited_at": _safe_iso(getattr(message, "edit_date", None)),
         "sender": sender,
         "reply_to_msg_id": getattr(message, "reply_to_msg_id", None),
+        "topic_id": topic_of(message),
         "forward": forward,
         "type": kind,
         "text": _json_text(getattr(message, "message", None)),
@@ -3952,11 +4070,16 @@ def _find_existing_media(media_dir: Path, msg_id: int) -> Path | None:
 async def cmd_export(cfg, chat: str, out_path: str, media_dir: str | None,
                      limit: int | None, since: str | None,
                      download_photos: bool, download_stickers: bool,
-                     download_videos: bool, download_documents: bool) -> dict:
+                     download_videos: bool, download_documents: bool,
+                     topic: int | None = None) -> dict:
+    _require_message_id(topic, "--topic")
     client = make_client(cfg)
     await _require_auth(client)
 
     entity = await resolve_chat(client, chat)
+    if topic is not None:
+        await _require_forum(client, entity)
+    topic_of = _topic_resolver(entity)
     out = Path(out_path).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3998,10 +4121,6 @@ async def cmd_export(cfg, chat: str, out_path: str, media_dir: str | None,
     }
 
     messages_out: list[dict] = []
-    iter_kwargs: dict = {}
-    if limit:
-        iter_kwargs["limit"] = limit
-
     count = 0
     dl_counts: dict[str, int] = {}
     progress_every = 100
@@ -4012,14 +4131,15 @@ async def cmd_export(cfg, chat: str, out_path: str, media_dir: str | None,
     if prior_transcriptions:
         _log(f"Preserving:   {len(prior_transcriptions)} existing transcription(s)")
 
-    async for m in client.iter_messages(entity, **iter_kwargs):
+    async for m in _iter_topic_scope(client, entity, topic, topic_of,
+                                     limit=limit or None):
         if since_dt and m.date and m.date < since_dt:
             break
 
         try:
-            entry = _export_message_entry(m)
+            entry = _export_message_entry(m, topic_of)
         except Exception as exc:
-            entry = _unsupported_export_entry(m, exc)
+            entry = _unsupported_export_entry(m, exc, topic_of)
         kind = entry["type"]
 
         if kind in download_types:
@@ -4045,7 +4165,7 @@ async def cmd_export(cfg, chat: str, out_path: str, media_dir: str | None,
         try:
             json.dumps(entry, ensure_ascii=False, sort_keys=True)
         except (TypeError, ValueError) as exc:
-            entry = _unsupported_export_entry(m, exc)
+            entry = _unsupported_export_entry(m, exc, topic_of)
         messages_out.append(entry)
         count += 1
         if count % progress_every == 0:
@@ -5597,12 +5717,16 @@ def main() -> None:
     pr.add_argument("chat")
     pr.add_argument("--limit", type=int, default=50)
     pr.add_argument("--since", help="ISO datetime; stop at this date")
+    pr.add_argument("--topic", type=int,
+                    help="forum topic root message id to read inside")
     pr.add_argument("--json", action="store_true")
 
     ps = sub.add_parser("search", help="search inside a chat")
     ps.add_argument("chat")
     ps.add_argument("query")
     ps.add_argument("--limit", type=int, default=50)
+    ps.add_argument("--topic", type=int,
+                    help="forum topic root message id to search inside")
     ps.add_argument("--json", action="store_true")
 
     pn = sub.add_parser("send", help="send a message")
@@ -5645,6 +5769,8 @@ def main() -> None:
     pe.add_argument("--media-dir", help="directory for downloaded media (default: alongside --out)")
     pe.add_argument("--limit", type=int, help="max messages (default: all)")
     pe.add_argument("--since", help="ISO datetime; stop at this date")
+    pe.add_argument("--topic", type=int,
+                    help="forum topic root message id to export")
     pe.add_argument("--photos", action=argparse.BooleanOptionalAction, default=True,
                     help="download photos (default: on; --no-photos to skip)")
     pe.add_argument("--stickers", action=argparse.BooleanOptionalAction, default=True,
@@ -5887,9 +6013,11 @@ def main() -> None:
         elif args.cmd == "topics":
             _emit(asyncio.run(cmd_topics(cfg, args.chat, args.limit, args.query)))
         elif args.cmd == "read":
-            _emit(asyncio.run(cmd_read(cfg, args.chat, args.limit, args.since, args.json)))
+            _emit(asyncio.run(cmd_read(cfg, args.chat, args.limit, args.since,
+                                       args.json, args.topic)))
         elif args.cmd == "search":
-            _emit(asyncio.run(cmd_search(cfg, args.chat, args.query, args.limit, args.json)))
+            _emit(asyncio.run(cmd_search(cfg, args.chat, args.query, args.limit,
+                                         args.json, args.topic)))
         elif args.cmd == "send":
             _emit(asyncio.run(cmd_send(
                 cfg, args.chat, args.text, args.reply_to, args.topic,
@@ -5907,6 +6035,7 @@ def main() -> None:
             _emit(asyncio.run(cmd_export(
                 cfg, args.chat, args.out, args.media_dir, args.limit, args.since,
                 args.photos, args.stickers, args.videos, args.documents,
+                args.topic,
             )))
     except (ApiIdInvalidError, AuthKeyUnregisteredError) as e:
         _die(2, "auth_failed", f"Telegram rejected the session/credentials: {e.__class__.__name__}",

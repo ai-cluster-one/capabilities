@@ -144,6 +144,48 @@ def _topic(topic_id, title, top_message, **flags):
         unread_count=flags.pop("unread_count", 0), **flags)
 
 
+class _HistoryClient(_Client):
+    """Answers iter_messages with one history and records how it was asked."""
+
+    def __init__(self, history):
+        super().__init__()
+        self.history = list(history)
+        self.asked = []
+
+    async def iter_messages(self, _entity, **kwargs):
+        self.asked.append(kwargs)
+        for message in self.history:
+            yield message
+
+    async def get_me(self):
+        return types.SimpleNamespace(
+            id=4242424242, first_name="Agent", last_name="", username="agent")
+
+
+def _reply_header(*, forum_topic=False, top_id=None, msg_id=None):
+    """The MessageReplyHeader Telegram attaches, where threading actually lives.
+
+    `forum_topic` and `reply_to_top_id` sit on the header and on nothing else;
+    a Telethon Message carries neither, which is why a caller reading
+    `reply_to` alone cannot tell a threaded reply inside a topic from a reply
+    in a plain group.
+    """
+    return types.SimpleNamespace(
+        forum_topic=forum_topic, reply_to_top_id=top_id, reply_to_msg_id=msg_id)
+
+
+def _forum_message(message_id, *, text="", reply_to=None, forum_topic=False):
+    return types.SimpleNamespace(
+        id=message_id, date=None, edit_date=None, sender=None, sender_id=77,
+        message=text, forum_topic=forum_topic, reply_to=reply_to,
+        reply_to_msg_id=getattr(reply_to, "reply_to_msg_id", None),
+        forward=None, action=None, voice=False, audio=False, video_note=False,
+        video=False, sticker=False, photo=False, document=False,
+        web_preview=False, poll=None, contact=False, geo=False, media=None,
+        download_media=None,
+    )
+
+
 class _DialogClient(_Client):
     """Answers iter_dialogs with one fixed listing, in the order given."""
 
@@ -383,6 +425,157 @@ class OutboundActionsTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code, 3)
         self.assertEqual(self.client.requests, [])
         self.assertTrue(self.client.disconnected)
+
+    def _use_history(self, history, *, forum=True, title="Example Forum"):
+        self.client = _HistoryClient(history)
+        self.cli.make_client = lambda _cfg: self.client
+
+        async def resolve(_client, _chat):
+            return types.SimpleNamespace(forum=forum, title=title)
+
+        self.cli.resolve_chat = resolve
+
+    # A forum whose messages carry each shape the question has an answer for:
+    # posted straight into a topic, threaded inside it, in General, and in
+    # another topic entirely.
+    DIRECT = _forum_message(
+        7300, text="posted straight into the topic", forum_topic=True,
+        reply_to=_reply_header(forum_topic=True, msg_id=7151))
+    THREADED = _forum_message(
+        7301, text="replying inside the topic", forum_topic=True,
+        reply_to=_reply_header(forum_topic=True, top_id=7151, msg_id=7300))
+    GENERAL = _forum_message(12, text="in General")
+    OTHER = _forum_message(
+        9100, text="another topic entirely", forum_topic=True,
+        reply_to=_reply_header(forum_topic=True, msg_id=9000))
+
+    def test_read_reports_which_topic_each_message_is_in(self):
+        """`reply_to` answers three different things for one question, which is
+        why `topic_id` answers it instead."""
+        self._use_history([self.OTHER, self.GENERAL, self.THREADED, self.DIRECT])
+
+        result = asyncio.run(self.cli.cmd_read(
+            {"id": "test"}, "-1001", 50, None, True))
+
+        self.assertEqual([(row["id"], row["reply_to"], row["topic_id"])
+                          for row in result],
+                         [(7300, 7151, 7151), (7301, 7300, 7151),
+                          (12, None, 1), (9100, 9000, 9000)])
+
+    def test_read_of_a_chat_without_topics_reports_no_topic_at_all(self):
+        """Null against General's 1 is what separates a forum's General from a
+        group that never had topics."""
+        self._use_history([_forum_message(5, text="plain group talk")],
+                          forum=False, title="Example Group")
+
+        result = asyncio.run(self.cli.cmd_read(
+            {"id": "test"}, "-1002", 50, None, True))
+
+        self.assertEqual([row["topic_id"] for row in result], [None])
+
+    def test_read_scoped_to_a_topic_asks_for_that_thread_and_keeps_both_shapes(self):
+        self._use_history([self.OTHER, self.GENERAL, self.THREADED, self.DIRECT])
+
+        result = asyncio.run(self.cli.cmd_read(
+            {"id": "test"}, "-1001", 50, None, True, 7151))
+
+        self.assertEqual(self.client.asked,
+                         [{"limit": None, "search": None, "reply_to": 7151}])
+        self.assertEqual([row["id"] for row in result], [7300, 7301])
+
+    def test_read_scoped_to_general_walks_the_chat_because_general_has_no_root(self):
+        self._use_history([self.OTHER, self.GENERAL, self.THREADED, self.DIRECT])
+
+        result = asyncio.run(self.cli.cmd_read(
+            {"id": "test"}, "-1001", 50, None, True, 1))
+
+        self.assertEqual(self.client.asked, [{"limit": None, "search": None}])
+        self.assertEqual([row["id"] for row in result], [12])
+
+    def test_a_scoped_limit_counts_the_messages_handed_back(self):
+        # The topic holds two of these four messages, so a limit of one proves the
+        # count is of what came back rather than of what was looked at: an unwanted
+        # message never consumes the budget.
+        self._use_history([self.OTHER, self.GENERAL, self.THREADED, self.DIRECT])
+
+        result = asyncio.run(self.cli.cmd_read(
+            {"id": "test"}, "-1001", 1, None, True, 7151))
+
+        self.assertEqual([row["id"] for row in result], [7301])
+
+    def test_an_unscoped_read_asks_the_chat_exactly_as_before(self):
+        self._use_history([self.GENERAL])
+
+        asyncio.run(self.cli.cmd_read({"id": "test"}, "-1001", 50, None, True))
+
+        self.assertEqual(self.client.asked, [{"limit": 50, "search": None}])
+
+    def test_a_scoped_search_keeps_the_query_and_resolves_the_topic_itself(self):
+        """Telegram drops a query the moment a reply target is set, so a scoped
+        search asks its own question and settles the topic on what comes back."""
+        self._use_history([self.OTHER, self.GENERAL, self.THREADED, self.DIRECT])
+
+        result = asyncio.run(self.cli.cmd_search(
+            {"id": "test"}, "-1001", "topic", 50, True, 7151))
+
+        self.assertEqual(self.client.asked,
+                         [{"limit": None, "search": "topic"}])
+        self.assertEqual([row["id"] for row in result], [7300, 7301])
+
+    def test_an_unscoped_search_asks_the_chat_exactly_as_before(self):
+        self._use_history([self.GENERAL])
+
+        asyncio.run(self.cli.cmd_search(
+            {"id": "test"}, "-1001", "talk", 50, True))
+
+        self.assertEqual(self.client.asked, [{"limit": 50, "search": "talk"}])
+
+    def test_reading_a_topic_of_a_chat_that_has_no_forum_is_refused(self):
+        self._use_history([], forum=False, title="Example Group")
+
+        with self.assertRaises(SystemExit) as stopped:
+            asyncio.run(self.cli.cmd_read(
+                {"id": "test"}, "-1002", 50, None, True, 7151))
+
+        self.assertEqual(stopped.exception.code, 3)
+        self.assertEqual(self.client.asked, [])
+        self.assertTrue(self.client.disconnected)
+
+    def test_a_topic_is_refused_before_connecting_unless_it_is_a_message_id(self):
+        for topic in (0, -4):
+            self._use_history([self.GENERAL])
+            with self.assertRaises(SystemExit) as stopped:
+                asyncio.run(self.cli.cmd_read(
+                    {"id": "test"}, "-1001", 50, None, True, topic))
+            self.assertEqual(stopped.exception.code, 6)
+            self.assertEqual(self.client.asked, [])
+
+    def test_export_records_the_topic_of_every_message_and_scopes_to_one(self):
+        self._use_history([self.OTHER, self.GENERAL, self.THREADED, self.DIRECT])
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "export.json"
+            unscoped = asyncio.run(self.cli.cmd_export(
+                {"id": "test"}, "-1001", str(output), None, None, None,
+                False, False, False, False))
+            payload = json.loads(output.read_text())
+
+        self.assertEqual(unscoped["message_count"], 4)
+        self.assertEqual({row["id"]: row["topic_id"] for row in payload["messages"]},
+                         {7300: 7151, 7301: 7151, 12: 1, 9100: 9000})
+        self.assertEqual(self.client.asked, [{"limit": None, "search": None}])
+
+        self._use_history([self.OTHER, self.GENERAL, self.THREADED, self.DIRECT])
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "topic.json"
+            scoped = asyncio.run(self.cli.cmd_export(
+                {"id": "test"}, "-1001", str(output), None, None, None,
+                False, False, False, False, 7151))
+            payload = json.loads(output.read_text())
+
+        self.assertEqual(scoped["message_count"], 2)
+        self.assertEqual([row["id"] for row in payload["messages"]], [7300, 7301])
+        self.assertEqual(self.client.asked,
+                         [{"limit": None, "search": None, "reply_to": 7151}])
 
     def _use_dialogs(self, dialogs):
         self.client = _DialogClient(dialogs)

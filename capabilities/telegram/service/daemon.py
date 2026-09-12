@@ -118,6 +118,7 @@ from call_recording_helpers import (
 )
 import jobs
 import voice_agent
+from forum import GENERAL_TOPIC_ID, message_topic_id
 from settings_schema import validate_settings
 sys.path.pop(0)
 
@@ -3537,7 +3538,6 @@ def _reply_to_message_id(message):
         return None
 
 
-GENERAL_TOPIC_ID = 1
 # Two agents share one room, and each side runs a daemon that answers on its
 # own. A request tagged EXTERNAL says its answer is consumed by a live session
 # rather than by the peer's daemon, so the daemon stamps NO_REPLY on everything
@@ -3549,41 +3549,13 @@ NO_REPLY_MARKER = "#noreply"
 
 
 def _message_topic_id(message):
-    """Canonical forum-topic root id, or None for ordinary chat messages."""
-    reply = getattr(message, "reply_to", None)
-    # Telegram marks every message inside a forum topic with forum_topic. The
-    # general topic leaves the flag unset and carries reply_to_top_id with the
-    # root of a plain reply chain, so the flag alone separates a topic from an
-    # ordinary threaded conversation.
-    is_topic = bool(
-        getattr(message, "forum_topic", False)
-        or getattr(reply, "forum_topic", False)
-    )
-    if not is_topic:
-        return _general_topic_id(message)
-    for value in (
-        getattr(message, "reply_to_top_id", None),
-        getattr(reply, "reply_to_top_id", None),
-        getattr(message, "topic_id", None),
-    ):
-        try:
-            if value is not None and int(value) > 0:
-                return int(value)
-        except (TypeError, ValueError):
-            pass
-    # A topic's root service message and a direct post into a topic expose only
-    # reply_to_msg_id / the message id rather than reply_to_top_id.
-    for value in (
-        getattr(message, "reply_to_msg_id", None),
-        getattr(reply, "reply_to_msg_id", None),
-        getattr(message, "id", None),
-    ):
-        try:
-            if value is not None and int(value) > 0:
-                return int(value)
-        except (TypeError, ValueError):
-            pass
-    return None
+    """Canonical forum-topic root id as this daemon reads it.
+
+    The wire shapes are resolved by the bundle's forum module; General is the
+    part this daemon answers for itself, out of the routing policy the chat
+    declared.
+    """
+    return message_topic_id(message, _general_topic_id)
 
 
 def _general_topic_id(message):

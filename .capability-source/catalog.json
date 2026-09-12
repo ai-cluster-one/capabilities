@@ -137,7 +137,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "f86447649d2cfa7342e4544bdf26c579c640713f15f24fc6e80b2a9843c3c9db",
+      "payload_sha256": "d392c0a4ed09626596f27813e9d2971b76db29e3877278fb52d86d78d2433b09",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
