@@ -574,14 +574,29 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(running.wait(), timeout=6)
             self.assertEqual(register.get(row["id"])["session_id"], "thread-1")
             register.request_stop(row["id"])
-            await wait_until(
-                lambda: register.get(row["id"])["outcome"] == daemon.jobs.CANCELLED,
-                timeout=8)
+            # Landing the stop and handing its result over are two separate
+            # ticks of the runner, and `resume` refuses a job whose result is
+            # still owed.  Waiting only on the outcome resumes into that window
+            # whenever the poll lands between the two, so wait for the whole
+            # stop: cancelled *and* its result delivered.
+            def stopped_and_delivered():
+                current = register.get(row["id"])
+                return (current["outcome"] == daemon.jobs.CANCELLED
+                        and current["delivery_state"] == "delivered")
+
+            await wait_until(stopped_and_delivered, timeout=8)
             paused = register.get(row["id"])
             self.assertEqual(paused["session_id"], "thread-1")
             self.assertEqual(len(runs), 1, "a paused job is not retried")
             register.resume(row["id"])
-            await wait_until(lambda: len(runs) == 2, timeout=8)
+            # `runs` grows when the second attempt starts; the outcome is
+            # written when it lands. Waiting on the list alone reads the row
+            # mid-attempt, so wait for the attempt to be over.
+            def continued_and_finished():
+                return (len(runs) == 2
+                        and register.get(row["id"])["outcome"] is not None)
+
+            await wait_until(continued_and_finished, timeout=8)
             self.assertEqual(runs[1]["resume"], "thread-1")
             self.assertEqual(register.get(row["id"])["outcome"],
                              daemon.jobs.SUCCEEDED)

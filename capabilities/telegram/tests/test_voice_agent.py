@@ -694,10 +694,18 @@ class VoiceAgentMediaTests(unittest.IsolatedAsyncioTestCase):
                 await session.stop()
                 tracks = session.tracks
 
-        durations = {track["kind"]: track["duration_seconds"] for track in tracks}
-        self.assertAlmostEqual(durations["caller"], durations["agent"], delta=0.001)
+        # `duration_seconds` is the reported figure, rounded to a millisecond.
+        # Both tracks are sealed to one window but carry it on their own sample
+        # grid, so they differ by a fraction of a millisecond and the two
+        # roundings can land a whole one apart. Measure the sealed length
+        # itself: there the grids can disagree by at most one caller sample and
+        # the window is an exact ceiling.
+        durations = {track["kind"]: track["bytes"] / (track["sample_rate"] * 2)
+                     for track in tracks}
+        self.assertAlmostEqual(durations["caller"], durations["agent"],
+                               delta=1 / va.CALLER_RATE)
         for duration in durations.values():
-            self.assertLessEqual(duration, session.window_seconds + 0.001)
+            self.assertLessEqual(duration, session.window_seconds)
 
 
 class TrackAlignmentTests(unittest.TestCase):
