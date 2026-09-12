@@ -706,6 +706,12 @@ class VoiceAgentMediaTests(unittest.IsolatedAsyncioTestCase):
                                delta=1 / va.CALLER_RATE)
         for duration in durations.values():
             self.assertLessEqual(duration, session.window_seconds)
+        # The reported figure is that same sealed length rounded, so hold it
+        # against the row it is derived from rather than against the clock.
+        for track in tracks:
+            self.assertEqual(
+                track["duration_seconds"],
+                round(track["bytes"] / (track["sample_rate"] * 2), 3))
 
 
 class TrackAlignmentTests(unittest.TestCase):
