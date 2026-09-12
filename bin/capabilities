@@ -4096,6 +4096,15 @@ def cmd_relabel(slug: str) -> None:
     store = None
     try:
         store = store_module.open_store()
+        # The store is opened, never prepared, by whoever opens it first, and on
+        # a machine where no service has ever prepared it the registry has no
+        # tables to ask about — so asking raises the driver's own error rather
+        # than answering. The migration is the manager's to write (DOCTRINE rule
+        # 15) and is the same idempotent one every first writer of `projects`
+        # runs, so it is run here: then "this project holds no label" is read
+        # from a registry that exists, rather than guessed from an exception a
+        # locked or unreadable store raises in the same words.
+        store.migrate()
         registry["previous"] = store.project_relabel(identity["id"], slug)
         registry["registered"] = True
     except store_module.StoreError as exc:

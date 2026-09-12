@@ -100,6 +100,44 @@ def test_manager_does_not_take_another_writers_collection(tmp_path):
     assert json.loads(refused.stderr)["error"]["code"] == "record_writer"
 
 
+def test_relabel_moves_the_label_on_both_sides(tmp_path):
+    root, env, store_path = _project(tmp_path)
+    identity = json.loads((root / "capabilities" / "project.json").read_text())
+    with S.SQLiteStore.open(str(store_path)) as store:
+        store.state_set("deployment", "cursor", 42, ("project", identity["slug"]))
+    payload = json.loads(_run([str(MANAGER), "relabel", "fixture-renamed"], root, env).stdout)
+    assert payload["store_registry"] == "relabelled"
+    assert payload["previous_slug"] == identity["slug"]
+    assert json.loads(
+        (root / "capabilities" / "project.json").read_text())["slug"] == "fixture-renamed"
+    with S.SQLiteStore.open(str(store_path)) as store:
+        assert store.project_get("fixture-renamed")["id"] == identity["id"]
+        assert store.state_get("deployment", "cursor",
+                               ("project", "fixture-renamed")) == 42
+
+
+def test_relabel_completes_on_a_store_nothing_has_prepared(tmp_path):
+    """The registry is created by whoever opens the store first, so where no
+    service ever has there are no tables to ask about. The rename is still a
+    rename with one side to write, not the driver's complaint about a missing
+    table."""
+    root, env, _store_path = _project(tmp_path)
+    identity = json.loads((root / "capabilities" / "project.json").read_text())
+    unprepared = tmp_path / "unprepared.db"
+    env = dict(env, CAPABILITIES_STORE_URL=str(unprepared))
+    assert not unprepared.exists()
+    renamed = _run([str(MANAGER), "relabel", "fixture-renamed"], root, env)
+    assert "Traceback" not in renamed.stderr
+    payload = json.loads(renamed.stdout)
+    assert payload["ok"] is True
+    assert payload["store_registry"] == "no row to move"
+    assert payload["previous_slug"] == identity["slug"]
+    assert json.loads(
+        (root / "capabilities" / "project.json").read_text())["slug"] == "fixture-renamed"
+    with S.SQLiteStore.open(str(unprepared)) as store:
+        assert store.project_list() == []
+
+
 def test_manager_ids_renders_identifiers_from_the_store(tmp_path):
     root, env, store_path = _project(tmp_path)
     identity = json.loads((root / "capabilities" / "project.json").read_text())
