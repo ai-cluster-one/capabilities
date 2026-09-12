@@ -2775,9 +2775,13 @@ def _legacy_state_path(root: Path) -> Path:
     return _project_capabilities_dir(root) / NAME / "state"
 
 
+# Files the running service produces for itself rather than durable state a
+# project owns. daemon.log belongs here because start opens the XDG copy in
+# append mode: the daemon's own output makes it differ from the legacy original,
+# so a migration that carried it would refuse every later start.
 LEGACY_REGENERATED = {
     "automations.db", "automations.db-shm", "automations.db-wal",
-    "daemon.lock", "daemon.pid", "daemon.fingerprint", "scripts",
+    "daemon.lock", "daemon.pid", "daemon.fingerprint", "daemon.log", "scripts",
 }
 
 
@@ -2817,8 +2821,6 @@ def _migrate_legacy_state(root: Path, runtime, config: dict[str, Any]) -> dict[s
     try:
         for source in sorted(legacy.iterdir()):
             if source.name in LEGACY_REGENERATED:
-                continue
-            if source.name == "daemon.log" and source.is_file() and source.stat().st_size == 0:
                 continue
             copied += _copy_legacy_state(source, target / source.name)
     except (OSError, RuntimeError) as exc:

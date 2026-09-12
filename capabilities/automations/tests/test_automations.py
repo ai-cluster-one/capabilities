@@ -250,6 +250,30 @@ retries = 1
         self.assertEqual((legacy / "cursor.json").read_text(), '{"source": 1}\n')
         self.assertEqual((target / "cursor.json").read_text(), '{"target": 2}\n')
 
+    def test_service_starts_again_after_the_daemon_wrote_to_its_own_log(self) -> None:
+        # The daemon's log is the one file the service itself makes diverge:
+        # start opens the XDG copy in append mode, so the first line the daemon
+        # writes there leaves it unequal to the legacy original. A migration
+        # that compared them would refuse every start from then on.
+        legacy = self.root / "capabilities" / "automations" / "state"
+        legacy.mkdir(parents=True)
+        (legacy / "daemon.log").write_text("output from the in-repo daemon\n")
+
+        started = json.loads(self.cli("service", "start").stdout)
+        self.assertTrue(started["started"])
+        target = Path(started["state_dir"])
+
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text().replace("max_parallel = 2", "max_parallel = 3", 1))
+        self.assertTrue(json.loads(self.cli("service", "reload").stdout)["reloaded"])
+        self.cli("service", "stop", "--timeout", "5", "--force")
+        self.assertNotEqual((target / "daemon.log").read_bytes(),
+                            (legacy / "daemon.log").read_bytes())
+
+        restarted = json.loads(self.cli("service", "start").stdout)
+        self.assertTrue(restarted["started"])
+        self.assertEqual((legacy / "daemon.log").read_text(), "output from the in-repo daemon\n")
+
     def test_declared_agent_adds_and_overrides_field_by_field(self) -> None:
         agents = RUNTIME.load_agents({
             "agents": {
