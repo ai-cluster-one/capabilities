@@ -144,6 +144,33 @@ def _topic(topic_id, title, top_message, **flags):
         unread_count=flags.pop("unread_count", 0), **flags)
 
 
+class _DialogClient(_Client):
+    """Answers iter_dialogs with one fixed listing, in the order given."""
+
+    def __init__(self, dialogs):
+        super().__init__()
+        self.dialogs = list(dialogs)
+        self.limits = []
+
+    async def iter_dialogs(self, limit=None):
+        self.limits.append(limit)
+        for dialog in self.dialogs:
+            yield dialog
+
+
+def _entity(class_name, **flags):
+    """A dialog entity of the class Telegram would file it under."""
+    entity = type(class_name, (), {})()
+    for key, value in flags.items():
+        setattr(entity, key, value)
+    return entity
+
+
+def _dialog(dialog_id, name, entity, unread=0):
+    return types.SimpleNamespace(
+        id=dialog_id, name=name, entity=entity, unread_count=unread)
+
+
 class _ExportClient(_Client):
     def __init__(self, messages):
         super().__init__()
@@ -356,6 +383,65 @@ class OutboundActionsTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code, 3)
         self.assertEqual(self.client.requests, [])
         self.assertTrue(self.client.disconnected)
+
+    def _use_dialogs(self, dialogs):
+        self.client = _DialogClient(dialogs)
+        self.cli.make_client = lambda _cfg: self.client
+
+    def test_chats_separate_a_group_from_a_feed_and_a_bot_from_a_person(self):
+        """`kind` files a supergroup, a gigagroup and a broadcast under one
+        word, and a bot under the word for a person."""
+        self._use_dialogs([
+            _dialog(-1001, "Working supergroup",
+                    _entity("Channel", megagroup=True, broadcast=False)),
+            _dialog(-1002, "Announcements",
+                    _entity("Channel", megagroup=False, broadcast=True)),
+            _dialog(-1003, "Broadcast group",
+                    _entity("Channel", megagroup=False, gigagroup=True, broadcast=True)),
+            _dialog(-1004, "Legacy group", _entity("Chat")),
+            _dialog(4001, "A person", _entity("User", bot=False)),
+            _dialog(4002, "A bot", _entity("User", bot=True)),
+            _dialog(-1005, "Banned from this one", _entity("ChatForbidden")),
+        ])
+
+        result = asyncio.run(self.cli.cmd_chats({"id": "test"}, 50))
+
+        self.assertEqual([entry["category"] for entry in result],
+                         ["group", "channel", "group", "group",
+                          "user", "bot", "unknown"])
+        self.assertEqual([entry["kind"] for entry in result[:2]],
+                         ["Channel", "Channel"])
+        self.assertEqual(self.client.limits, [50])
+        self.assertTrue(self.client.disconnected)
+
+    def test_chats_flag_a_forum_beside_its_category_rather_than_instead_of_it(self):
+        """A forum is a group whose messages live in topics, so a caller
+        filtering for groups still matches it and knows to ask `topics`."""
+        self._use_dialogs([
+            _dialog(-1001, "Forum", _entity("Channel", megagroup=True, forum=True)),
+            _dialog(-1002, "Plain supergroup", _entity("Channel", megagroup=True)),
+            _dialog(4001, "A person", _entity("User")),
+        ])
+
+        result = asyncio.run(self.cli.cmd_chats({"id": "test"}, 50))
+
+        self.assertEqual([(entry["category"], entry["forum"]) for entry in result],
+                         [("group", True), ("group", False), ("user", False)])
+
+    def test_chats_keep_every_field_a_caller_already_reads(self):
+        self._use_dialogs([
+            _dialog(-1001, "Working supergroup",
+                    _entity("Channel", megagroup=True), unread=3),
+            _dialog(-1002, None, _entity("Chat"), unread=0),
+        ])
+
+        result = asyncio.run(self.cli.cmd_chats({"id": "test"}, 50))
+
+        self.assertEqual(
+            [{key: entry[key] for key in ("id", "kind", "name", "unread")}
+             for entry in result],
+            [{"id": -1001, "kind": "Channel", "name": "Working supergroup", "unread": 3},
+             {"id": -1002, "kind": "Chat", "name": "(untitled)", "unread": 0}])
 
     def test_worker_scope_covers_the_topics_verb(self):
         shim = import_worker_shim()

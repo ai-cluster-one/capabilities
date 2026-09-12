@@ -77,7 +77,16 @@ Commands:
   telegram login [--qr]                        Interactive first-time auth (phone + code,
                                                or scan a QR from an authorized app).
   telegram whoami                              Identity of the signed-in account.
-  telegram chats [--limit N]                   List recent dialogs.
+  telegram chats [--limit N]                   List recent dialogs. Beside `id`, `name`,
+                                               `unread` and `kind` (the raw Telegram
+                                               class), each entry settles what the chat
+                                               is: `category` is `user`, `bot`, `group`
+                                               (a legacy group, a supergroup or a
+                                               gigagroup), `channel` (a broadcast only
+                                               its admins post in), or `unknown` when the
+                                               class settles nothing; and `forum` is true
+                                               when the chat's messages live in topics,
+                                               which `telegram topics` lists.
   telegram topics <chat> [--limit N] [--query TEXT]
                                                List a forum group's topics; each
                                                `id` is the root message id the
@@ -3467,6 +3476,33 @@ async def cmd_whoami(cfg: dict) -> dict:
             "username": me.username}
 
 
+def dialog_category(ent) -> str:
+    """What the chat is to the account, which `kind` alone cannot say: Telegram
+    files a supergroup and a broadcast channel under one class, and a bot under
+    the class of a person.
+
+    The values are mutually exclusive, so the question a caller has — may I talk
+    here, and to what — is answered by one equality test rather than by knowing
+    which entity flag outranks which. The raw class stays in `kind`, which is
+    where a caller goes for the finer taxonomy this deliberately flattens.
+
+    Participation decides it. `megagroup` and `gigagroup` are read before
+    `broadcast` because a broadcast group is still a group the account is in,
+    whatever else Telegram sets on it. A class this cannot settle says so
+    instead of inventing a value that looks like one of these.
+    """
+    cls = type(ent).__name__
+    if cls == "User":
+        return "bot" if getattr(ent, "bot", False) else "user"
+    if cls == "Chat":
+        return "group"
+    if getattr(ent, "megagroup", False) or getattr(ent, "gigagroup", False):
+        return "group"
+    if getattr(ent, "broadcast", False):
+        return "channel"
+    return "unknown"
+
+
 async def cmd_chats(cfg: dict, limit: int) -> list[dict]:
     client = make_client(cfg)
     await _require_auth(client)
@@ -3478,6 +3514,11 @@ async def cmd_chats(cfg: dict, limit: int) -> list[dict]:
             "kind": type(ent).__name__,
             "name": dialog.name or "(untitled)",
             "unread": dialog.unread_count or 0,
+            "category": dialog_category(ent),
+            # A forum is not one room; it is orthogonal to the category, so it
+            # stays its own field rather than a fifth value nobody filtering
+            # for groups would match.
+            "forum": bool(getattr(ent, "forum", False)),
         })
     await client.disconnect()
     return out
