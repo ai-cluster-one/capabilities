@@ -176,12 +176,48 @@ $XDG_STATE_HOME/telegram/8200881535/calls/recordings/<timestamp>-<chat>-call-<id
 ```
 
 The auth session and service runtime files are separate. `TELEGRAM_SERVICE_STATE_DIR`
-may relocate runtime files, but never the account-global `control/` directory.
+may relocate runtime files, but never the `control/` directory, whose scope is
+stated below.
 `owner.json` names the actual bundle, launch nonce, project, connection, auth
 session, state and health paths. The exact positive `service_state_version` in
 the canonical payload, development payload and `state-schema.json` must agree;
 live takeover never migrates or downgrades state. Marker-less pre-feature state
 is version 1 and receives only an atomic version-1 marker from compatible code.
+
+### The scope of `control/`
+
+`control/` is what keeps two daemons off one account, and its reach is one machine.
+
+Its location is derived from the account id under `$XDG_STATE_HOME` and has no override: `TELEGRAM_SERVICE_STATE_DIR` relocates the runtime files beside it and never this directory, and a daemon launched with a `TELEGRAM_ACCOUNT_CONTROL_DIR` that does not resolve to the same path exits before it connects.
+
+Everything the capability uses to decide who holds the account is in this directory, and each piece can observe only the machine it runs on:
+
+- `daemon.lock` is taken with a non-blocking exclusive `flock`, a kernel lock over one host's open file. A second daemon on the same machine fails to take it and exits naming the lock.
+- Whether a recorded owner is still alive is decided by signalling the pid in `owner.json` with `os.kill(pid, 0)`, which answers only for this host's process table.
+- `service stop` and `service reload` act by sending a signal to that pid or its process group.
+- `ownership-v1.json` is the one-time cutover marker, and the cutover that writes it enumerates this host's processes with `ps -axo`, filtered to the current uid, while holding `transition.lock`.
+- `takeover.json` is the lease `capabilities dev live start` writes so a development payload can borrow the account from the canonical daemon it shares a machine with.
+
+"Account-global" therefore means global across every project and every connection on one machine.
+
+Two hosts running a daemon on one account each derive their own `control/` directory from the same account id, each take their own `daemon.lock`, and each write their own `owner.json` naming a pid in their own process table. Neither directory is read by the other, and the capability contains nothing that compares them or arbitrates between the daemons that hold them.
+
+### What is bound to the host, and what is not
+
+| State | Where it lives | Bound to the host |
+|---|---|---|
+| `control/` and its contents | derived from the account id; not overrideable | Yes, by construction — every primitive above is machine-local. |
+| `daemon.pid`, `daemon.log`, `health.json`, `progress/`, `worker-sessions/`, `lanes.json`, `authority/`, `project-layout.json`, `state-schema.json` | the service state dir | Yes — each describes one running daemon: its process, its logs, its in-flight work and the version of the tree it sits in. |
+| `register.json` | the service state dir | Not by construction; it is the file that decides what a daemon answers, below. |
+| the auth session | `$XDG_STATE_HOME/telegram/<account>/session.session`, or the `session` path the connection declares | No — its location is derived from the connection, not from the machine. What re-authenticating elsewhere does to it is recorded in this bundle's `deviations.md`. |
+| `settings.json`, `context.md`, `delegation.md`, `job-worker.md`, `voice-agent.md` | the project envelope, handed to the daemon at launch | No — they are project files, versioned with the project. |
+| registered jobs | the shared capabilities store, scoped by project and environment | No — see *Registered Jobs*. The store is a local SQLite file under `$XDG_STATE_HOME/capabilities/` unless `CAPABILITIES_STORE_URL` points it at a PostgreSQL instance. |
+
+`register.json` is what decides whether a message is answered. It holds, per channel, the jobs already reserved and the last processed message id. A message is skipped only because that file already knows it: `reserve_job` is the single idempotency boundary for live delivery and startup catch-up alike, and it asks `_message_is_known`, which reads this register and nothing else.
+
+Startup and each periodic sync reconcile recent history — the last `tail_size` messages of each channel the register already holds — against that register's own watermarks. A channel the local register does not hold is not reconciled at all; a channel it holds is reconciled against the watermark this host recorded for it.
+
+So what a daemon treats as already answered is decided entirely by the register under its own state directory. A message one host has answered is invisible to the other's decision: where the other's register holds that channel with an earlier watermark, the message is not known to it and is reconciled as unanswered.
 
 For a managed development session, use `capabilities dev live start <session>
 telegram`. The manager stops only a matching canonical owner, launches the
