@@ -2592,6 +2592,31 @@ def _dev_changed_paths(session: dict) -> tuple[str, str, list[str]]:
     return base, head, sorted(filter(None, paths))
 
 
+def _validator_diagnosis(proc: subprocess.CompletedProcess, fallback: str) -> str:
+    """The account a failed direct validator gave of itself, without its launcher's.
+
+    The manager runs from a uv launcher, so whenever that launcher's cache is
+    cold its own resolution reaches stderr ahead of anything the manager writes,
+    and reading the stream whole reports the launcher instead of the validator.
+    The I/O contract says which stream holds the account: exit 7 is a drift or
+    conformance report on stdout, and every other failure is one line of JSON
+    error envelope, last of what the manager wrote to stderr. Anything else -
+    a validator that crashed, or one that said nothing at all - is passed
+    through whole rather than trimmed to a line that may not be its point.
+    """
+    if proc.returncode == 7 and proc.stdout.strip():
+        return proc.stdout.strip()
+    written = [line.strip() for line in proc.stderr.splitlines() if line.strip()]
+    if written:
+        try:
+            envelope = json.loads(written[-1])
+        except ValueError:
+            envelope = None
+        if isinstance(envelope, dict) and "error" in envelope:
+            return written[-1]
+    return proc.stderr.strip() or proc.stdout.strip() or fallback
+
+
 def _dev_check_report(session: dict) -> dict:
     """Run each direct validator once for the scope changed since session base."""
     session_id = str(session["id"])
@@ -2610,7 +2635,7 @@ def _dev_check_report(session: dict) -> dict:
             capture_output=True, text=True, timeout=600, check=False)
         if proc.returncode != 0:
             failures.setdefault("manager", []).append(
-                proc.stderr.strip() or proc.stdout.strip() or f"selfcheck exited {proc.returncode}")
+                _validator_diagnosis(proc, f"selfcheck exited {proc.returncode}"))
     for name in existing:
         proc = subprocess.run(
             [str(manager), "audit", name, "--from", str(source_root)],
@@ -2619,7 +2644,7 @@ def _dev_check_report(session: dict) -> dict:
         audited.append(name)
         if proc.returncode != 0:
             failures.setdefault(name, []).append(
-                proc.stderr.strip() or proc.stdout.strip() or f"audit exited {proc.returncode}")
+                _validator_diagnosis(proc, f"audit exited {proc.returncode}"))
     status = _dev_git_value(source_root, "status", "--porcelain")
     staged_paths = _dev_git_value(source_root, "diff", "--name-only", "--cached").splitlines()
     staged_manager, staged_packages = _source_change_scope(staged_paths)

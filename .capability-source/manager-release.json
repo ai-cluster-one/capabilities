@@ -19,7 +19,7 @@
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "c3a0325c89a4f770ba052c5d247ff0b415927a8a281c22077f373645113e304e"
+    "sha256": "fdf92d517fbd0c0fb2be5d26e3f7de9a4e852b8b97b3161dcaaf991ca4ee8e85"
   },
   "schema": "capabilities.manager-release.v1"
 }

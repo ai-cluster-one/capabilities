@@ -475,6 +475,54 @@ def test_dev_check_runs_one_direct_audit_without_installing(tmp_path):
     assert session.get("installed_payloads") in (None, {})
 
 
+def test_dev_check_reports_the_audit_report_not_the_launcher_that_carried_it(tmp_path):
+    """A session's uv cache starts empty, so every validator here runs cold."""
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer, session="audit-diagnosis")
+    worktree = Path(started["source_worktree"])
+    script = worktree / "capabilities" / "deployment" / "bin" / "deployment"
+    script.write_text(
+        script.read_text().replace(
+            "def _emit(",
+            "def _emit_drift_probe():\n    pass\n\n\ndef _emit(",
+            1,
+        )
+    )
+
+    checked = json.loads(
+        _run(env, "dev", "check", "audit-diagnosis", check=False).stdout
+    )
+    assert checked["ok"] is False
+    entries = checked["failures"]["deployment"]
+    assert len(entries) == 1
+    # The launcher's own resolution lands on the same stderr the manager writes
+    # to. Parsing proves the entry is the audit's report and nothing else.
+    report = json.loads(entries[0])
+    assert report["name"] == "deployment"
+    assert report["ok"] is False
+    assert report["failures"]
+
+
+def test_dev_check_reports_the_managers_envelope_when_selfcheck_cannot_run(tmp_path):
+    """A validator that fails without a report still names its own cause."""
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer, session="selfcheck-diagnosis")
+    worktree = Path(started["source_worktree"])
+    (worktree / "contract" / "preamble.py").unlink()
+
+    checked = json.loads(
+        _run(env, "dev", "check", "selfcheck-diagnosis", check=False).stdout
+    )
+    assert checked["ok"] is False
+    entries = checked["failures"]["manager"]
+    assert len(entries) == 1
+    assert json.loads(entries[0])["error"]["code"] == "no_preamble"
+
+
 def test_dev_run_executes_only_the_session_payload_against_attached_project(tmp_path):
     source = _source_repo(tmp_path)
     consumer = _consumer_repo(tmp_path)
