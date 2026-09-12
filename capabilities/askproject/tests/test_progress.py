@@ -151,6 +151,34 @@ Path(outfile).write_text("RESUMED ACT SESSION")
 '''
 
 
+CODEX_RESUME_READ_FAKE = r'''#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[:3] != ["exec", "resume", "codex-timeout-thread"]:
+    print(f"unexpected resume args: {args[:3]}", file=sys.stderr)
+    raise SystemExit(20)
+if "--dangerously-bypass-approvals-and-sandbox" in args:
+    print("read resume kept act authority", file=sys.stderr)
+    raise SystemExit(21)
+if 'sandbox_mode="read-only"' not in args:
+    print("read resume was not sandboxed", file=sys.stderr)
+    raise SystemExit(22)
+
+outfile = args[args.index("-o") + 1]
+print(json.dumps({
+    "type": "thread.started", "thread_id": "codex-timeout-thread"
+}), flush=True)
+print(json.dumps({
+    "type": "turn.completed",
+    "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}
+}), flush=True)
+Path(outfile).write_text("RESUMED READ SESSION")
+'''
+
+
 CLAUDE_FAKE = r'''#!/usr/bin/env python3
 import json
 import os
@@ -377,20 +405,49 @@ def test_default_timeout_is_one_hour():
     assert "default 3600" in CLI.__doc__
 
 
-def test_timed_out_act_session_can_resume_without_repeating_act(tmp_path):
+def test_act_session_resumes_only_when_the_follow_up_names_its_mode(tmp_path):
     timed_out = _invoke(
         tmp_path, "codex", CODEX_TIMEOUT_FAKE, "--act", "--timeout", "1")
 
     assert timed_out.returncode == 1
     assert "resume it with -c" in json.loads(timed_out.stdout)["error"]
 
-    resumed = _invoke(tmp_path, "codex", CODEX_RESUME_ACT_FAKE, "-c")
+    bare = _invoke(tmp_path, "codex", CODEX_RESUME_ACT_FAKE, "-c", "--quiet")
+
+    assert bare.returncode == 1
+    error = json.loads(bare.stdout)["error"]
+    assert "the last session used act" in error
+    assert "--act" in error and "--read" in error
+
+    resumed = _invoke(tmp_path, "codex", CODEX_RESUME_ACT_FAKE, "-c", "--act")
 
     assert resumed.returncode == 0, resumed.stderr
     result = json.loads(resumed.stdout)
     assert result["mode"] == "act"
     assert result["resumed"] is True
     assert result["answer"] == "RESUMED ACT SESSION"
+
+
+def test_read_resumes_an_act_thread_fenced_to_reading(tmp_path):
+    timed_out = _invoke(
+        tmp_path, "codex", CODEX_TIMEOUT_FAKE, "--act", "--timeout", "1")
+    assert timed_out.returncode == 1
+
+    resumed = _invoke(
+        tmp_path, "codex", CODEX_RESUME_READ_FAKE, "-c", "--read", "--quiet")
+
+    assert resumed.returncode == 0, resumed.stderr
+    result = json.loads(resumed.stdout)
+    assert result["mode"] == "read"
+    assert result["resumed"] is True
+    assert result["answer"] == "RESUMED READ SESSION"
+
+
+def test_act_and_read_together_are_refused(tmp_path):
+    proc = _invoke(tmp_path, "codex", CODEX_FAKE, "--quiet", "--act", "--read")
+
+    assert proc.returncode == 1
+    assert "contradictory" in json.loads(proc.stdout)["error"]
 
 
 def test_timeout_without_session_id_does_not_fall_back_to_older_session(tmp_path):

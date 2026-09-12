@@ -59,8 +59,8 @@ COMPILED PROJECT CONTEXT
 
 ────────────────────────────────────────────────────────────────────────────
 MODES  (the fence; how each engine implements it differs)
-  read  (default)   Pure research. claude: the turn's built-in tool set IS
-                    Read/Glob/Grep (--tools), so it has no shell and nothing
+  read  (default;   Pure research. claude: the turn's built-in tool set IS
+        --read)     Read/Glob/Grep (--tools), so it has no shell and nothing
                     that writes, plus plan mode.
                     codex: an OS read-only sandbox (sandbox_mode=read-only) —
                     it may run read-only shell but cannot write. Use for
@@ -98,8 +98,11 @@ SESSION CONTINUITY  (state is LOCAL to the project you call from)
     - Otherwise: ~/.local/state/askproject/<project-key>/
 
   This state is local to YOUR project, not the targets. `-c/--continue` resumes
-  the last session for that target with its original engine and read/act mode;
-  add --fork to branch instead of continue.
+  the last session for that target with its original engine. A read thread also
+  keeps its mode, but a thread whose last session ran in act mode refuses a bare
+  -c and asks you to name --act or --read for that follow-up, so nothing hands
+  the peer write tools with no flag typed; add --fork to branch instead of
+  continue.
 
   Scope a session to ONE unit of work — resume with -c only while on that
   same item; start a fresh call for a new one; use --fork to branch off an
@@ -140,8 +143,14 @@ FLAGS
                         $ASKPROJECT_ENGINE). A -c resume adopts the session's
                         own engine — a codex thread can't be resumed by claude.
   --act                 Modification mode (bypass prompts).
+  --read                Read-only mode. It is already the default for a fresh
+                        call; on a -c resume of an act thread it is how you
+                        deliberately fence the follow-up back to reading.
+                        Contradicts --act.
   -c, --continue        Resume the last session for this target, retaining its
-                        engine and read/act mode.
+                        engine. A read thread continues in read mode. An act
+                        thread refuses until you say which mode this follow-up
+                        runs in: --act to keep writing, --read to fence it.
   --fork                Reserved; neither headless CLI has a non-interactive
                         fork, so this exits with a controlled error.
   --model <m>           Override the model, forcing it regardless of mode
@@ -3535,6 +3544,8 @@ def run(args):
     if not target.is_dir():
         die(f"target is not a directory: {target}", as_json=as_json)
 
+    if args.act and args.read:
+        die("--act and --read are contradictory; pass one", as_json=as_json)
     requested_mode = "act" if args.act else "read"
     root = _project_root()
     _refuse_self_target(target, root, as_json=as_json)
@@ -3570,7 +3581,15 @@ def run(args):
         if args.act and stored_mode != "act":
             die(f"cannot resume {target} in act mode: the last session used "
                 f"{stored_mode}; start a fresh call without -c", as_json=as_json)
-        mode = stored_mode
+        # An act thread is never continued by inheritance: a bare -c would hand
+        # the peer write tools with no flag typed, while a silent downgrade to
+        # read would stop a scripted act workflow writing without saying so.
+        if stored_mode == "act" and not (args.act or args.read):
+            die(f"cannot resume {target} without naming a mode: the last "
+                "session used act, so the peer could write; pass --act to "
+                "continue writing or --read to continue fenced to reading",
+                as_json=as_json)
+        mode = "read" if args.read else stored_mode
         if args.fork:
             die("--fork is not supported in headless mode", as_json=as_json)
         resumed = True
@@ -3768,6 +3787,7 @@ def main():
     p.add_argument("prompt")
     p.add_argument("--engine", choices=ENGINES)
     p.add_argument("--act", action="store_true")
+    p.add_argument("--read", action="store_true")
     p.add_argument("-c", "--continue", dest="cont", action="store_true")
     p.add_argument("--fork", action="store_true")
     p.add_argument("--model")
