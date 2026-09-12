@@ -3,8 +3,8 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "telethon==1.43.2",
-#     "py-tgcalls==3.0.0.dev6",
-#     "ntgcalls==3.0.0b20",
+#     "py-tgcalls==3.0.0rc3",
+#     "ntgcalls==3.0.0rc3",
 #     "google-genai>=1.36.0",
 # ]
 # ///
@@ -19,10 +19,20 @@
 # b19 carried the first fix for ntgcalls#61 - a conference SIGSEGV when an
 # incoming audio channel is removed - and the fix for ntgcalls#62, the
 # lock-order inversion that wedged the whole interpreter beside a live call.
-# b20 carries the second fix for #61, on the data races in the incoming channel
-# maps, which is the one aimed at what actually triggers the fault here: a
-# participant whose channel is torn down and rebuilt over and over. b19 still
-# faulted on 2026-08-31, on a call with 26 such cycles in eighteen minutes.
+# b20 carried the second fix for #61, on the data races in the incoming channel
+# maps. Neither closed it: b19 faulted on 2026-08-31, and b20 faulted four
+# times between 2026-09-10 and 2026-09-12 over 612 channel teardowns, three at
+# the familiar null +0x58 and once on a pointer that failed authentication -
+# the same code path reading an object that had been freed and reused.
+#
+# rc3 is here because the maintainer asked for it against those four, not
+# because it claims to fix them: between the commit b20 was built from
+# (ee078f4) and rc3 there is no commit naming #61. What it does carry is
+# WebRTC m150 to m152, a fix for a deadlock when spawning shell processes -
+# which this capability does, for every recording's ffmpeg - and an
+# Android-only Oboe use-after-free that cannot be this one. So rc3 is a fresh
+# base to measure from, and any verdict on #61 has to come from live
+# conference traffic on it rather than from its changelog.
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
 
