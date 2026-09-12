@@ -179,13 +179,13 @@ def test_a_project_grants_write_without_restating_the_identity(store, scopes):
 
 def test_a_project_can_disable_a_globally_declared_connection(store, scopes):
     store.config_set("mailbox", "connection", "atlas", ATLAS_BOX, ("global", ""))
-    store.config_set("mailbox", "connection", "osyris", {"address": "osyris@gmail.com"}, ("global", ""))
+    store.config_set("mailbox", "connection", "personal", {"address": "personal@example.com"}, ("global", ""))
     store.config_set("mailbox", "grant", "atlas", {"enabled": True}, ("project", "atlas"))
-    store.config_set("mailbox", "grant", "osyris", {"enabled": False}, ("project", "atlas"))
+    store.config_set("mailbox", "grant", "personal", {"enabled": False}, ("project", "atlas"))
 
     assert set(store.connections_effective("mailbox", scopes)) == {"atlas"}
     both = store.connections_effective("mailbox", scopes, include_disabled=True)
-    assert both["osyris"]["enabled"] is False
+    assert both["personal"]["enabled"] is False
 
 
 def test_a_project_only_connection_lives_beside_the_global_ones(store, scopes):
