@@ -269,9 +269,38 @@ retries = 1
         self.cli("service", "stop", "--timeout", "5", "--force")
         self.assertNotEqual((target / "daemon.log").read_bytes(),
                             (legacy / "daemon.log").read_bytes())
+        self.assertTrue((target / "daemon.log").read_text().startswith(
+            "output from the in-repo daemon\n"))
 
         restarted = json.loads(self.cli("service", "start").stdout)
         self.assertTrue(restarted["started"])
+        self.assertEqual((legacy / "daemon.log").read_text(), "output from the in-repo daemon\n")
+
+    def test_run_supervised_project_still_reads_its_migrated_daemon_log(self) -> None:
+        # `service start` is the only thing that ever creates the XDG daemon.log,
+        # so a project supervised by `service run` has nothing there but what the
+        # migration carried over. Declining to carry the file would turn this
+        # project's `service logs` into logs_not_found.
+        legacy = self.root / "capabilities" / "automations" / "state"
+        legacy.mkdir(parents=True)
+        (legacy / "daemon.log").write_text("output from the in-repo daemon\n")
+        target = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
+
+        supervised = subprocess.Popen(
+            [str(CLI), "service", "run"], cwd=self.root, env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline and not (target / "daemon.pid").is_file():
+                time.sleep(0.1)
+            self.assertTrue((target / "daemon.pid").is_file(), "supervised daemon did not start")
+        finally:
+            supervised.terminate()
+            supervised.wait(timeout=15)
+
+        logs = json.loads(self.cli("service", "logs").stdout)
+        self.assertEqual(logs["log_file"], str(target / "daemon.log"))
+        self.assertEqual(logs["lines"], ["output from the in-repo daemon"])
         self.assertEqual((legacy / "daemon.log").read_text(), "output from the in-repo daemon\n")
 
     def test_declared_agent_adds_and_overrides_field_by_field(self) -> None:

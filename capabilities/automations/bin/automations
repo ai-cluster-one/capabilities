@@ -2775,14 +2775,17 @@ def _legacy_state_path(root: Path) -> Path:
     return _project_capabilities_dir(root) / NAME / "state"
 
 
-# Files the running service produces for itself rather than durable state a
-# project owns. daemon.log belongs here because start opens the XDG copy in
-# append mode: the daemon's own output makes it differ from the legacy original,
-# so a migration that carried it would refuse every later start.
 LEGACY_REGENERATED = {
     "automations.db", "automations.db-shm", "automations.db-wal",
-    "daemon.lock", "daemon.pid", "daemon.fingerprint", "daemon.log", "scripts",
+    "daemon.lock", "daemon.pid", "daemon.fingerprint", "scripts",
 }
+
+# Files the service appends to rather than rebuilds. Their legacy content is
+# real history and is carried across, but `service start` reopens the XDG copy
+# in append mode, so the daemon's own output makes the two differ from the first
+# line it writes. Seed such a file once and then leave it alone: a later
+# divergence is the service running, not a conflict between two states.
+LEGACY_APPENDED = {"daemon.log"}
 
 
 def _copy_legacy_state(source: Path, destination: Path) -> int:
@@ -2822,7 +2825,13 @@ def _migrate_legacy_state(root: Path, runtime, config: dict[str, Any]) -> dict[s
         for source in sorted(legacy.iterdir()):
             if source.name in LEGACY_REGENERATED:
                 continue
-            copied += _copy_legacy_state(source, target / source.name)
+            destination = target / source.name
+            if source.name in LEGACY_APPENDED and source.is_file():
+                # Nothing to hand over from an empty log, and once the
+                # destination exists it is the live file the service writes to.
+                if source.stat().st_size == 0 or destination.exists():
+                    continue
+            copied += _copy_legacy_state(source, destination)
     except (OSError, RuntimeError) as exc:
         raise runtime.ConfigError(f"cannot migrate legacy automation state: {exc}") from exc
 
