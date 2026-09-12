@@ -25,8 +25,10 @@ Scripts execute as Deno TypeScript in Windmill's sandboxed workers (nsjail
 isolation):
 
 - Deno with `npm:` specifiers (e.g. `import * as wmill from "npm:windmill-client@1"`).
-- Outbound `fetch()` is allowed; there is no host filesystem, no cross-project
-  access, no local imports.
+- Outbound `fetch()` is allowed; there is no host filesystem and no reach
+  outside the workspace — but another script *in the same workspace* is
+  importable by path, and that import is an ordinary TypeScript one (see
+  "Crossing an automation boundary").
 - One job runs one step to completion with no mid-execution yielding — pick a
   deploy timeout that fits the job's real worst case rather than polling and
   waiting inside a job.
@@ -110,6 +112,116 @@ Keep effects and computation apart:
 `main()` orchestrates: wrappers fetch, pure functions compute, wrappers persist.
 Everything hard to test lives in wrappers; everything interesting lives in pure
 functions.
+
+## Crossing an automation boundary
+
+Arguments reach an automation two different ways, and the two do not behave the
+same.
+
+- **By name.** Over HTTP and over sub-job dispatch the payload is a JSON object
+  matched to `main`'s parameters by name — `callva automations run --args`, the
+  voice runtime's `http_request` body, and the internal job API below all take
+  that form. Key order in the object is insignificant, and a parameter the
+  payload omits takes its default.
+- **By position.** A direct TypeScript import of another automation is an
+  ordinary JavaScript call: arguments bind by position and nothing compares the
+  two sides. Reordering, inserting, or removing a parameter in the callee shifts
+  every later value into the wrong parameter — no error at the call site, no
+  error at deploy, and a run that succeeds while writing wrong data.
+
+The import itself is by path, carrying the `.ts` extension the Deno runtime
+requires: `./sibling.ts` or `../other/folder/script.ts` relative to the
+importing script, or absolute as `/f/<namespace>/<script>.ts`. The worker
+rewrites those paths onto the workspace's raw-script endpoint and fetches them
+uncached on every run, so an import always resolves to the callee's *latest
+deployed* version rather than to the copy that existed when the caller was
+deployed. Only scripts in the same workspace are reachable.
+
+Windmill runs Deno with type checking off, so nothing catches a mismatched call
+at deploy or at run. Three shapes are therefore forbidden across this boundary,
+each because it ties the caller to the callee's parameter order:
+
+- **Importing another automation's `main`.** `main` is the platform's entry
+  point; its parameter list is an argument form for Windmill, not a contract for
+  a caller to hold.
+- **`Parameters<typeof main>`.** It re-derives from the callee, so it agrees
+  with whatever the callee becomes and can never disagree with it — swap two
+  same-typed parameters and the tuple stays valid while every value moves.
+- **Spreading a positional tuple** into the call (`fn(...args)`), which hides
+  the order and the arity from every reader, the author included.
+
+Parameter discipline below makes all three worse: every `main()` parameter
+carries a default, so every argument is optional and dropping one is not even an
+arity error.
+
+### The shape to use
+
+Export the request as a named interface and a function taking one object of that
+shape, and keep `main` a thin Windmill adapter over it that holds no logic:
+
+```typescript
+// f/<namespace>/enrich_call.ts
+export interface EnrichCallRequest {
+  call_id: string;
+  target_date?: string;
+  dry_run?: boolean;
+}
+
+export async function enrichCall(req: EnrichCallRequest) {
+  const { call_id, target_date = "", dry_run = false } = req;
+  // the real body
+}
+
+// Windmill's entry point — argument form only.
+export async function main(
+  call_id: string = "", target_date: string = "", dry_run: boolean = false,
+) {
+  return await enrichCall({ call_id, target_date, dry_run });
+}
+```
+
+A caller imports the function and its interface, never `main`:
+
+```typescript
+import { enrichCall, type EnrichCallRequest } from "/f/<namespace>/enrich_call.ts";
+
+const req: EnrichCallRequest = { call_id: id, dry_run: true };
+const result = await enrichCall(req);
+```
+
+Every argument is named on both sides now. Adding a field is additive, and a
+field the caller does not send arrives as `undefined` at the line that uses it
+instead of arriving as some other field's value — a loud failure where the
+positional shape gave a silent one.
+
+The rule stops at the automation boundary. A pure helper inside one script —
+`formatRecord(record, tz)`, `localToUtcIso(stamp, tz)` — keeps ordinary
+positional arguments; both sides move together in one file and one deploy, so
+they cannot disagree. The context-object bullet under Structure is a readability
+call about long signatures and stays scoped to those helpers, while this rule
+governs two separately deployed scripts however short the signature.
+
+### Reshaping a callee a caller already depends on
+
+Windmill deploys one script at a time, and a deployed caller picks up the
+callee's newest version on its next run, so a new shape is live for every caller
+the instant the callee is deployed. There is no atomic two-script deploy and no
+window to schedule around; the only safe order is one in which the callee never
+stops accepting a shape some caller still sends.
+
+1. **Widen the callee.** Add the new field to the request interface as optional
+   and accept both the old and the new shape. Deploy it — nothing a caller
+   currently sends has changed meaning, so every caller keeps working.
+2. **Move the callers.** Deploy them onto the new shape one at a time, letting
+   each run once and reading `callva automations runs <id>` before the next.
+3. **Narrow the callee.** Delete the old field and the compatibility branch, and
+   deploy that last, once no caller sends the old shape.
+
+Deploying a callee also queues a lock recomputation for every script importing
+it, so give the workspace the same few seconds any deploy wants before running a
+caller. Never reshape in place: a callee deployed with a renamed or reordered
+parameter is already live for callers nobody has touched, and rolling it back is
+another deploy (see the deploy-and-test loop) that lands after the wrong runs.
 
 ## Parameter discipline
 
