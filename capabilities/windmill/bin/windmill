@@ -1945,12 +1945,7 @@ class Store:
             raise StoreError("bad_project_id", "a project id is required",
                              "generate one once and keep it in the project's own config")
         with self.transaction():
-            holder = self._execute("SELECT id FROM projects WHERE slug = ?", (slug,)).fetchone()
-            if holder and holder[0] != project_id:
-                raise StoreError(
-                    "slug_taken", f"the label {slug!r} belongs to project {holder[0]}",
-                    "pick another label; this is a different project, and sharing "
-                    "the label would share its rows")
+            self._refuse_held_slug(slug, project_id)
             existing = self._execute(
                 "SELECT slug FROM projects WHERE id = ?", (project_id,)).fetchone()
             if existing and existing[0] != slug:
@@ -1958,7 +1953,8 @@ class Store:
                     "slug_immutable",
                     f"project {project_id} is already labelled {existing[0]!r}",
                     "rows are scoped by the id, but the label is how it is found, "
-                    "so renaming one is a migration rather than an edit")
+                    "so renaming one is `capabilities relabel <slug>` in the "
+                    "project, which moves the label on both sides at once")
             if existing:
                 self._execute("UPDATE projects SET name = ? WHERE id = ?", (name, project_id))
             else:
@@ -1966,6 +1962,46 @@ class Store:
                     "INSERT INTO projects (id, slug, name, created_at) VALUES (?, ?, ?, ?)",
                     (project_id, slug, name, _now()))
         getattr(self, "_project_ids", {}).pop(slug, None)
+
+    def _refuse_held_slug(self, slug: str, project_id: str) -> None:
+        """The one reason a label is unavailable, stated once for whoever wants
+        it: another project holds it, and a label is how rows are found."""
+        holder = self._execute("SELECT id FROM projects WHERE slug = ?", (slug,)).fetchone()
+        if holder and holder[0] != project_id:
+            raise StoreError(
+                "slug_taken", f"the label {slug!r} belongs to project {holder[0]}",
+                "pick another label; this is a different project, and sharing "
+                "the label would share its rows")
+
+    def project_relabel(self, project_id: str, slug: str) -> str:
+        """Move a known project's label, keeping its id and therefore its rows.
+
+        This is the migration `project_register` refuses to perform silently.
+        Registration declares who a project is and so must not quietly answer
+        to a second name; relabelling says the project is the same one under a
+        new label, which is a different request and is made deliberately.
+
+        Nothing is re-scoped, because nothing was ever scoped by the label: the
+        id is the column every row carries. Returns the label given up, so a
+        caller can say what changed rather than assume."""
+        _store_check("slug", slug, CAPABILITY_RE)
+        with self.transaction():
+            current = self._execute(
+                "SELECT slug FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if not current:
+                raise StoreError(
+                    "unknown_project", f"no project registered with id {project_id!r}",
+                    "a relabel moves a label a project already holds; there is "
+                    "nothing here to move, and inventing the project instead "
+                    "would claim the label for rows that do not exist")
+            self._refuse_held_slug(slug, project_id)
+            if current[0] != slug:
+                self._execute("UPDATE projects SET slug = ? WHERE id = ?",
+                              (slug, project_id))
+        cache = getattr(self, "_project_ids", {})
+        cache.pop(current[0], None)
+        cache.pop(slug, None)
+        return current[0]
 
     def project_get(self, slug: str) -> dict[str, Any] | None:
         row = self._execute(

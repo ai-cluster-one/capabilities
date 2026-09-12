@@ -6,7 +6,7 @@
     "SOURCES.md": "8e8b7f1f500b8ebe3d1abb2874616071e8142c69b897110be5cbc0f0194b0085",
     "TEMPLATE.md": "f0eb0069570509b7669be7a9c660703e86924ade416ccf87983eaa447169233d",
     "contract/preamble.py": "b0470fcad52ea9e012011d2ee5b1363876ae4036892c2a27fca484cce7753b53",
-    "contract/store.py": "9a8fef37e53e3e29cf91a44879d5234e78d97fe8bf6a56642e35c4268a7eeb24",
+    "contract/store.py": "70f97d1ca38cfbdd68862e9807728b5e89f83be5daacda4f8b2eb6834aaf66aa",
     "guides/authoring.md": "3b12c12aa60cecb6dc96994d95b37fa8901be7f920fee7f8be3dc2a3b6e947b9",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
     "guides/contract.md": "72408b3b5d035b15f9d98b5a5dc3d558870f391ed254b8c5f017656be75a13f4",
@@ -19,7 +19,7 @@
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "da4772da303090c832101c0de5e6ca36b5c1730c7a4042bfe8a370256ed763eb"
+    "sha256": "1375f0dfe88ceaa98a06686b88d31bf6e7ccc5665a4cc9c8a4a297907a6393d1"
   },
   "schema": "capabilities.manager-release.v1"
 }

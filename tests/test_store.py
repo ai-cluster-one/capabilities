@@ -406,6 +406,68 @@ def test_a_project_without_an_id_is_refused(store):
     assert exc.value.slug == "bad_project_id"
 
 
+def test_the_migration_moves_the_label_and_leaves_the_rows_where_they_are(store):
+    """The point of the whole arrangement: the label is a way in, the id is what
+    holds the rows, so the rows are found under the new label without one of
+    them being touched."""
+    store.state_set("telegram", "cursor", 42, ("project", "atlas"))
+    store.config_set("mailbox", "identifier", "inbox", "INBOX", ("project", "atlas"))
+
+    assert store.project_relabel(ATLAS_ID, "atlas-two") == "atlas"
+
+    assert store.project_get("atlas") is None
+    assert store.project_get("atlas-two")["id"] == ATLAS_ID
+    assert store.state_get("telegram", "cursor", ("project", "atlas-two")) == 42
+    assert store.config_get("mailbox", "identifier", "inbox",
+                            Scopes(project="atlas-two")) == "INBOX"
+
+
+def test_a_relabel_keeps_the_name_and_the_creation_date(store):
+    """A rename is a rename. Anything it changes beyond the label is something
+    nobody asked it to change."""
+    store.project_register(ATLAS_ID, "atlas", name="A Consuming Project")
+    before = store.project_get("atlas")
+    store.project_relabel(ATLAS_ID, "atlas-two")
+    after = store.project_get("atlas-two")
+    assert (after["name"], after["created_at"]) == (before["name"], before["created_at"])
+
+
+def test_a_relabel_cannot_take_a_label_another_project_holds(store):
+    """Refused for the reason registration refuses it: the label is how rows are
+    found, so taking it would take that project's rows."""
+    store.project_register(OTHER_ID, "client")
+    with pytest.raises(StoreError) as exc:
+        store.project_relabel(ATLAS_ID, "client")
+    assert exc.value.slug == "slug_taken"
+    assert store.project_get("client")["id"] == OTHER_ID
+    assert store.project_get("atlas")["id"] == ATLAS_ID
+
+
+def test_relabelling_an_unregistered_project_does_not_register_it(store):
+    """A relabel moves a label that is held; there is nothing to move here, and
+    minting the project instead would claim the label for rows that do not
+    exist."""
+    with pytest.raises(StoreError) as exc:
+        store.project_relabel("018f2c1a-9999-4d92-9a11-999999999999", "ghost")
+    assert exc.value.slug == "unknown_project"
+    assert store.project_get("ghost") is None
+    assert [p["slug"] for p in store.project_list()] == ["atlas"]
+
+
+def test_a_relabel_validates_the_new_label_as_registration_does(store):
+    with pytest.raises(StoreError) as exc:
+        store.project_relabel(ATLAS_ID, "Atlas Two")
+    assert exc.value.slug == "bad_name"
+    assert store.project_get("atlas")["id"] == ATLAS_ID
+
+
+def test_relabelling_to_the_label_already_held_changes_nothing(store):
+    """The retry after a half-finished rename has to be able to succeed, so the
+    second run of the same request is not an error."""
+    assert store.project_relabel(ATLAS_ID, "atlas") == "atlas"
+    assert store.project_get("atlas")["id"] == ATLAS_ID
+
+
 # --- EXACT: rule 16, state does not cascade ----------------------------------
 
 def test_state_does_not_fall_back_to_another_scope(store):

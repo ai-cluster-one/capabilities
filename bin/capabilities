@@ -197,6 +197,15 @@ PROJECT VERBS (run inside a consuming project)
         envelope and skill setup but skips host wiring: ContextKit owns it.
         A legacy project `.capabilities/` envelope is preflighted and migrated
         into visible `capabilities/`; content conflicts refuse before writes.
+  relabel <slug>
+        Give this project a new label, keeping the id its records are scoped
+        by. The label lives in the project identity and in the store registry,
+        so the rename writes both; registration alone refuses a changed label
+        because a project must not quietly answer to a second name. Records
+        are not moved and are not re-scoped — they never referred to the label.
+        Refused when another project already holds the label. A project that
+        has never opened the store simply has one side to write. Renaming the
+        directory is unrelated and needs no command. Idempotent.
   context --claude|--codex|--fragment
         Compose the session injection from the gate + snapshots + project
         envelopes. --fragment prints the manager-owned Markdown block without
@@ -4061,6 +4070,52 @@ def _project_identity(root: Path) -> dict | None:
     return identity if isinstance(identity, dict) and identity.get("id") else None
 
 
+def cmd_relabel(slug: str) -> None:
+    """Give this project a new label, keeping the id its rows are scoped by.
+
+    The label is carried in two places — the project's own identity file and
+    the store's registry — so a rename is one act with two writes, and doing
+    only one of them is the state this verb exists to leave nobody in: the
+    registry refuses a label it did not issue, and the project can no longer
+    say who it is. The manager performs it because it is the writer of project
+    identity and of migration (DOCTRINE rule 15).
+
+    Nothing else moves. Rows were never scoped by the label, and the directory
+    on disk was never the label either, so renaming the directory remains a
+    thing that needs no command at all.
+    """
+    root = _require_project()
+    identity = _project_identity(root)
+    if identity is None:
+        _die(6, "no_project_identity",
+             f"{_envelope_home(root) / PROJECT_IDENTITY_REL} carries no project id",
+             "run `capabilities init` in the project to mint its identity")
+    store_module = _store_module()
+    was = identity.get("slug")
+    registry: dict = {"registered": False, "previous": was}
+    store = None
+    try:
+        store = store_module.open_store()
+        registry["previous"] = store.project_relabel(identity["id"], slug)
+        registry["registered"] = True
+    except store_module.StoreError as exc:
+        # A project that has never opened the store holds no row to move; that
+        # is not a failed rename, it is a rename with one side to write. Any
+        # other refusal is the store declining, and it is passed on as given.
+        if exc.slug != "unknown_project":
+            _die(6, exc.slug, exc.message, exc.hint)
+    finally:
+        if store is not None:
+            store.close()
+    identity["slug"] = slug
+    _write_json(_envelope_home(root) / PROJECT_IDENTITY_REL, identity)
+    _emit({"ok": True, "project": str(root), "id": identity["id"],
+           "slug": slug, "previous_slug": registry["previous"],
+           "identity": str(_envelope_home(root) / PROJECT_IDENTITY_REL),
+           "store_registry": "relabelled" if registry["registered"] else "no row to move",
+           "unchanged": registry["previous"] == slug})
+
+
 def cmd_path_store() -> None:
     """Where records go, and what decided. A store URL may carry a password, so
     the credential is stripped rather than printed: this is a report, and a
@@ -7640,6 +7695,10 @@ def main() -> None:
         _inherit_gate(pos[0], scope)
     elif cmd == "init":
         cmd_init(flag("--claude"), flag("--codex"))
+    elif cmd == "relabel":
+        if len(pos) != 1:
+            _die(6, "input", "relabel needs exactly one new slug")
+        cmd_relabel(pos[0])
     elif cmd == "skill":
         cmd_skill()
     elif cmd == "context":
