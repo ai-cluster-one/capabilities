@@ -2779,14 +2779,52 @@ def _state_marker_path(root: Path) -> Path:
     return _project_capabilities_dir(root) / NAME / "state-root.json"
 
 
-def _record_state_root(root: Path, state: Path) -> None:
+def _record_state_root(root: Path, state: Path) -> str | None:
+    """Record the root, or say why it could not be recorded. Never raise.
+
+    An envelope that refuses the file - a read-only mount, foreign ownership -
+    is an inability to write down a fact about a daemon that is starting
+    regardless, and that cannot be a reason for the daemon not to exist. The
+    failure is returned for the caller to surface rather than thrown, because
+    unrecorded and unreported is the invisibility this record exists to remove.
+    """
     path = _state_marker_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"state_dir": str(state)}, indent=2) + "\n")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"state_dir": str(state)}, indent=2) + "\n")
+    except OSError as exc:
+        return (f"state root not recorded in {path}: {exc.strerror or exc}"
+                " - an invocation that does not carry AUTOMATIONS_STATE_DIR will answer"
+                " about the default root rather than about this daemon")
+    return None
 
 
-def _forget_state_root(root: Path) -> None:
-    _state_marker_path(root).unlink(missing_ok=True)
+def _forget_state_root(root: Path) -> str | None:
+    path = _state_marker_path(root)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        return (f"state root record not removed from {path}: {exc.strerror or exc}"
+                " - it stays behind, and is ignored while no live daemon answers for it")
+    return None
+
+
+def _state_record_unwritable(root: Path) -> str | None:
+    """Why there is no record to read, when the answer is that there could not be one.
+
+    An absent record has two unlike causes - no daemon ever wrote one, or the
+    envelope refuses the file - and they look identical from the absence. Only
+    the second is a fault, and it is the one that makes a `running: false`
+    wrong. Probed rather than attempted, because the caller is `status`, which
+    answers about the machine and never changes it.
+    """
+    path = _state_marker_path(root)
+    existing = next((candidate for candidate in (path, *path.parents) if candidate.exists()), None)
+    if existing is None or os.access(existing, os.W_OK):
+        return None
+    return (f"no state root record: {path} cannot be written"
+            " - a daemon started here is not findable by an invocation that does"
+            " not carry AUTOMATIONS_STATE_DIR")
 
 
 def _recorded_state_root(root: Path) -> Path | None:
@@ -3033,6 +3071,8 @@ def cmd_service_init(force: bool) -> dict[str, Any]:
 
 def service_status(root: Path) -> dict[str, Any]:
     state, state_source, considered = _state_resolution(root)
+    record_error = None if _recorded_state_root(root) is not None \
+        else _state_record_unwritable(root)
     pid_file = state / "daemon.pid"
     pid = _read_pid(pid_file)
     running = _pid_alive(pid)
@@ -3073,6 +3113,10 @@ def service_status(root: Path) -> dict[str, Any]:
         # checked against a directory instead.
         "state_dir_source": state_source,
         "state_dirs_considered": considered,
+        # And a reader who finds no record behind a `false` is owed the reason
+        # there is none, because an envelope that refuses the file makes that
+        # `false` wrong in a way no directory listing explains.
+        **({"state_record_error": record_error} if record_error else {}),
         "store": os.environ.get("CAPABILITIES_STORE_URL") or "default",
         "pid_file": str(pid_file),
         "log_file": str(state / "daemon.log"),
@@ -3263,9 +3307,13 @@ def cmd_service_start() -> dict[str, Any]:
     if proc.poll() is not None:
         tail = log_path.read_text(errors="replace").splitlines()[-8:]
         _die(5, "service_start_failed", f"automations daemon exited with {proc.returncode}", "\n".join(tail))
-    _record_state_root(root, state)
+    record_error = _record_state_root(root, state)
     out = service_status(root)
     out["started"] = True
+    # The daemon is up either way; the payload is where this command says so
+    # when the fact about it could not be written down.
+    if record_error is not None:
+        out["state_record_error"] = record_error
     if migration is not None:
         out["state_migration"] = migration
     return out
@@ -3331,11 +3379,18 @@ def cmd_service_stop(timeout: float, force: bool) -> dict[str, Any]:
     pid = _read_pid(pid_file)
     # The record answers for a daemon that is running. Once this returns there is
     # none, so it goes with the pid file rather than outliving it as a claim
-    # about a directory the next `start` may not even choose.
-    if not _pid_alive(pid):
+    # about a directory the next `start` may not even choose. A record that will
+    # not go is reported in the payload and never raised: the daemon is stopped
+    # either way, and that is what the caller asked for.
+    def released(payload: dict[str, Any]) -> dict[str, Any]:
         pid_file.unlink(missing_ok=True)
-        _forget_state_root(root)
-        return {"stopped": False, "running": False, "pid": None}
+        reason = _forget_state_root(root)
+        if reason is not None:
+            payload["state_record_error"] = reason
+        return payload
+
+    if not _pid_alive(pid):
+        return released({"stopped": False, "running": False, "pid": None})
 
     def send(sig: signal.Signals) -> None:
         try:
@@ -3350,15 +3405,11 @@ def cmd_service_stop(timeout: float, force: bool) -> dict[str, Any]:
     deadline = time.time() + max(timeout, 0.0)
     while time.time() < deadline:
         if not _pid_alive(pid):
-            pid_file.unlink(missing_ok=True)
-            _forget_state_root(root)
-            return {"stopped": True, "running": False, "pid": pid}
+            return released({"stopped": True, "running": False, "pid": pid})
         time.sleep(0.1)
     if force:
         send(signal.SIGKILL)
-        pid_file.unlink(missing_ok=True)
-        _forget_state_root(root)
-        return {"stopped": True, "killed": True, "running": False, "pid": pid}
+        return released({"stopped": True, "killed": True, "running": False, "pid": pid})
     _die(5, "service_stop_timeout", f"automations daemon did not stop within {timeout:g}s", "retry with `automations service stop --force`")
 
 
@@ -3374,7 +3425,13 @@ def cmd_service_logs(tail: int) -> dict[str, Any]:
 def cmd_service_run() -> NoReturn:
     root = _root_required()
     _prepare_service(root)
-    _record_state_root(root, _state_path(root))
+    # This process becomes the daemon, so it has no payload to carry the news:
+    # stderr is the surface a supervisor captures, and it is written before the
+    # exec because after it there is nothing left of this program to write it.
+    record_error = _record_state_root(root, _state_path(root))
+    if record_error is not None:
+        sys.stderr.write(json.dumps({"warning": record_error}, ensure_ascii=False) + "\n")
+        sys.stderr.flush()
     runtime = _runtime_path()
     os.execvpe(sys.executable, [sys.executable, str(runtime)], _service_env(root))
 

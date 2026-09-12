@@ -12,7 +12,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "c50b4af7d576a15e125563baf5a60df331308e2d59ad50c55c990c36d6957698",
+      "payload_sha256": "26c80d8081c70bd72ceb764489dfb15a70e1d555ba65f3f545d73869f9d59eb0",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {

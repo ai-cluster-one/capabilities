@@ -349,6 +349,47 @@ retries = 1
         self.assertEqual(spent["state_dir_source"], "default")
         self.assertIn(str(pinned), spent["state_dirs_considered"])
 
+    def test_a_daemon_starts_when_its_state_root_cannot_be_recorded(self) -> None:
+        # An envelope that refuses the record - a read-only mount, foreign
+        # ownership - is an inability to write down a fact about a daemon that
+        # is starting regardless, and `service run` is a container's foreground
+        # process. So the daemon must still exist; what must not happen is that
+        # it goes unrecorded in silence, which is the invisibility the record
+        # exists to remove. Each surface says so in the form it has: `run`
+        # execs and has stderr, `start` returns a payload, and `status` is
+        # where a reader checks a `running` they doubt.
+        envelope = self.root / "capabilities" / "automations"
+        marker = envelope / "state-root.json"
+        pinned = Path(self.tmp.name) / "container-state"
+        envelope.chmod(0o555)
+        try:
+            supervised = subprocess.Popen(
+                [str(CLI), "service", "run"], cwd=self.root,
+                env={**self.env, "AUTOMATIONS_STATE_DIR": str(pinned)},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.time() + 15
+                while time.time() < deadline and not (pinned / "daemon.pid").is_file():
+                    time.sleep(0.1)
+                self.assertTrue((pinned / "daemon.pid").is_file(),
+                                "daemon did not start when its state root could not be recorded")
+            finally:
+                supervised.terminate()
+                _out, err = supervised.communicate(timeout=15)
+            self.assertIn("state root not recorded", err)
+            self.assertFalse(marker.exists())
+
+            started = json.loads(self.cli("service", "start").stdout)
+            self.assertTrue(started["running"])
+            self.assertIn("state root not recorded", started["state_record_error"])
+
+            status = json.loads(self.cli("service", "status").stdout)
+            self.assertTrue(status["running"])
+            self.assertIn("cannot be written", status["state_record_error"])
+        finally:
+            envelope.chmod(0o755)
+            self.cli("service", "stop", "--force", check=False)
+
     def test_declared_agent_adds_and_overrides_field_by_field(self) -> None:
         agents = RUNTIME.load_agents({
             "agents": {
