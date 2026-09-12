@@ -110,6 +110,33 @@ def enforce_job_scope(argv):
                  f"this turn is scoped to chat {allowed_chat}", exit_code=4)
 
 
+def pin_jobs_to_service_project(argv):
+    """A worker `jobs` call answers about the daemon's register, not the route's.
+
+    The queue belongs to the daemon: its slots, its leases, its delivery loop,
+    and every read the runner does is partitioned by the daemon's project. Which
+    project the work then happens in is a property of the route, resolved again
+    at claim time from the channel. So a routed turn, whose capability CLIs
+    deliberately resolve the project it was routed to, would otherwise register
+    into a partition nobody drains and read back an empty one.
+
+    The daemon states its own project in the worker environment; here it is put
+    in front of the CLI in the names the CLI resolves a project and an envelope
+    from, for `jobs` alone, so every other capability call keeps reaching the
+    routed project. On a turn that was not routed those names already name this
+    project and setting them changes nothing.
+    """
+    if argv[1:2] != ["jobs"]:
+        return
+    root = os.environ.get("TELEGRAM_SERVICE_PROJECT_ROOT", "").strip()
+    envelope = os.environ.get("TELEGRAM_SERVICE_PROJECT_ENVELOPE", "").strip()
+    if not root or not envelope:
+        return
+    os.environ["CLAUDE_PROJECT_DIR"] = root
+    os.environ["CAPABILITIES_PROJECT_ENVELOPE"] = envelope
+    os.environ["CAPABILITIES_PROJECT_ENVELOPE_ROOT"] = root
+
+
 def _is_jobs_help(passthrough):
     """Whether a `jobs` call is asking for the surface rather than acting on it.
 
@@ -342,6 +369,7 @@ def main():
     if not cross_connection and write_progress(sys.argv):
         return 0
     enforce_job_scope(sys.argv)
+    pin_jobs_to_service_project(sys.argv)
     enforce_current_chat_scope(sys.argv)
     real = os.environ.get("TELEGRAM_REAL_TELEGRAM")
     if not real:

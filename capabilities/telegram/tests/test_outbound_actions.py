@@ -662,6 +662,39 @@ class OutboundActionsTests(unittest.TestCase):
             cli._job_channel_key("-1001", "General")
         self.assertEqual(stopped.exception.code, 6)
 
+    def test_a_routed_turn_still_registers_into_the_daemons_own_queue(self):
+        """The queue is the daemon's - its slots, its leases, its delivery loop -
+        and every read its runner does is partitioned by the daemon's project.
+        A routed turn resolves the project it was routed to, so without this pin
+        `jobs register` wrote a row into a partition nobody drains and `jobs
+        active` read back the empty one beside it, while the handoff still told
+        the requester the work had been accepted."""
+        shim = import_worker_shim()
+        routed = {
+            "TELEGRAM_SERVICE_PROJECT_ROOT": "/home/daemonproj",
+            "TELEGRAM_SERVICE_PROJECT_ENVELOPE": "/home/daemonproj/capabilities",
+            "CLAUDE_PROJECT_DIR": "/home/routedproj",
+            "CAPABILITIES_PROJECT_ENVELOPE": "",
+        }
+        with mock.patch.dict(os.environ, routed, clear=False):
+            os.environ.pop("CAPABILITIES_PROJECT_ENVELOPE")
+            shim.pin_jobs_to_service_project(["telegram", "jobs", "register", "work"])
+            self.assertEqual(os.environ["CLAUDE_PROJECT_DIR"], "/home/daemonproj")
+            self.assertEqual(os.environ["CAPABILITIES_PROJECT_ENVELOPE"],
+                             "/home/daemonproj/capabilities")
+            # The handed envelope names the root it answers for, so a descendant
+            # standing elsewhere passes it over rather than applying it there.
+            self.assertEqual(os.environ["CAPABILITIES_PROJECT_ENVELOPE_ROOT"],
+                             "/home/daemonproj")
+
+        with mock.patch.dict(os.environ, routed, clear=False):
+            os.environ.pop("CAPABILITIES_PROJECT_ENVELOPE")
+            # Routing exists so the work happens in the project it names, and
+            # every call that is not about the queue keeps reaching it.
+            shim.pin_jobs_to_service_project(["telegram", "read", "-1001"])
+            self.assertEqual(os.environ["CLAUDE_PROJECT_DIR"], "/home/routedproj")
+            self.assertNotIn("CAPABILITIES_PROJECT_ENVELOPE", os.environ)
+
     def test_worker_jobs_without_an_authorized_chat_are_refused(self):
         shim = import_worker_shim()
         with mock.patch.dict(os.environ, {"TELEGRAM_AUTHORIZED_CHAT_ID": ""},

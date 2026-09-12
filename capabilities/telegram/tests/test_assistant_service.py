@@ -4627,12 +4627,21 @@ class ChatProjectRoutingTests(unittest.IsolatedAsyncioTestCase):
                 home = daemon.worker_env({"project_dir": daemon.PROJECT_ROOT})
 
             self.assertEqual(routed["CLAUDE_PROJECT_DIR"], str(target))
-            for name in pinned:
-                self.assertNotIn(name, routed)
+            self.assertNotIn("CAPABILITIES_PROJECT_ENVELOPE", routed)
+            self.assertNotIn("TELEGRAM_SERVICE_PROJECT_LAYOUT", routed)
+            # Which project this service is stays true however far a turn was
+            # routed, and it is stated from what the daemon resolved rather than
+            # from whatever its launcher handed over. The job register is the
+            # daemon's own, and a worker asked about the queue has to be able to
+            # name the project that owns it.
+            self.assertEqual(routed["TELEGRAM_SERVICE_PROJECT_ROOT"],
+                             str(daemon.PROJECT_ROOT))
+            self.assertEqual(routed["TELEGRAM_SERVICE_PROJECT_ENVELOPE"],
+                             str(daemon.PROJECT_CAPABILITIES_DIR))
             # The home route is the row that results when nothing matched, and
             # it must stay exactly as the launcher handed it over.
-            self.assertEqual(home["CAPABILITIES_PROJECT_ENVELOPE"],
-                             pinned["CAPABILITIES_PROJECT_ENVELOPE"])
+            for name, value in pinned.items():
+                self.assertEqual(home[name], value)
             self.assertNotIn("CLAUDE_PROJECT_DIR", home)
 
     async def test_a_worker_never_inherits_the_nonce_or_an_agent_channel(self):

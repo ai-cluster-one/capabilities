@@ -4039,6 +4039,12 @@ def worker_env(state=None):
         for name in WORKER_ENV_DROP_WHEN_ROUTED:
             env.pop(name, None)
         env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        # Which project this service is does not change with the route. The job
+        # register is the daemon's own, so a worker asked about the queue has to
+        # be able to name the project that owns it, and it is told from what the
+        # daemon resolved rather than from what its launcher happened to supply.
+        env["TELEGRAM_SERVICE_PROJECT_ROOT"] = str(PROJECT_ROOT)
+        env["TELEGRAM_SERVICE_PROJECT_ENVELOPE"] = str(PROJECT_CAPABILITIES_DIR)
     real_telegram = env.get("TELEGRAM_REAL_TELEGRAM") or shutil.which("telegram")
     if real_telegram:
         env["TELEGRAM_REAL_TELEGRAM"] = real_telegram
