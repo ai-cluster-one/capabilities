@@ -11,9 +11,9 @@ context, then return its answer plus traceability to the caller.
 
 This tool is designed to be invoked BY an agent (you), from inside your own
 project. It spawns a headless peer agent in a target project's directory, so
-that peer loads the target's project context (Claude reads CLAUDE.md, Codex
-reads AGENTS.md) / settings / rights and answers as that project — then hands
-back the answer with cost, token, and files-changed data.
+that peer reads whatever project context is compiled on disk there at that
+moment (Claude reads CLAUDE.md, Codex reads AGENTS.md) / settings / rights —
+then hands back the answer with cost, token, and files-changed data.
 
 Two engines drive the peer, selected with `--engine`:
   claude (default)  headless `claude -p` — the newest Sonnet in read mode, the
@@ -44,6 +44,18 @@ must not be your OWN project root: that call is refused before any peer starts,
 because you already stand there with the context loaded and a peer would only
 re-read what you can read yourself. A subdirectory of your project, and a git
 worktree of your repository at another path, are other projects and are fine.
+
+────────────────────────────────────────────────────────────────────────────
+COMPILED PROJECT CONTEXT
+  Some targets do not author the file the peer reads — a tool compiles it from
+  that project's own sources. The peer then reads the snapshot sitting on disk
+  when it starts, which can lag those sources. askproject never builds it, and
+  a build wired to the engine's session start refreshes the snapshot for the
+  NEXT call rather than this one, so a single-shot peer answers one revision
+  behind. `compiled_context` in the result names that artifact and how old it
+  is — a fact, not a verdict: a build legitimately leaves an unchanged file
+  alone, so older does not mean behind. Run the target's own build yourself
+  before asking when the difference matters.
 
 ────────────────────────────────────────────────────────────────────────────
 MODES  (the fence; how each engine implements it differs)
@@ -108,8 +120,12 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
     "tokens": {input, output, cache_read, cache_creation},
     "git": {"repo": bool, "head_before","head_after","dirty_before",
             "files_changed":[{"path","status"}]},
+    "compiled_context": {"path","modified_at","age_seconds"} | null,
     "permission_denials": [ ... attempts the peer made and was blocked on ... ]
   }
+  `compiled_context` describes the engine's compiled project-context file in
+  the target as it stood when the peer started — see above. It is null, with
+  no warning, for the ordinary target that compiles no such file.
   In read mode files_changed must be empty; if it isn't, ok=false and it is
   flagged loudly (a read query should never mutate).
 
@@ -2962,6 +2978,53 @@ def diff_snapshots(before: dict, after: dict) -> tuple[list[dict], bool]:
     return changed, dirty_before
 
 
+# A ContextKit-bound project compiles its context into one file per engine and
+# declares each destination in its own `.contextkit/config.toml`; these are the
+# destinations it writes when the binding declares none.
+CONTEXT_OUTPUT_DEFAULTS = {
+    "claude": ".claude/rules/CONTEXT.md",
+    "codex": ".codex/generated/context.md",
+}
+
+
+def _compiled_context(target: Path, engine: str) -> dict | None:
+    """Describe the compiled project-context file the peer is about to read.
+
+    A fact for the caller to weigh, never a verdict: a build legitimately
+    leaves a file whose content did not change alone, so an artifact older than
+    its sources may still be current. Every failure to find or read one — no
+    binding, no declaration, no file, an unparseable config — returns None, so
+    the ordinary target that compiles nothing is silent and unaffected.
+    """
+    import datetime
+
+    binding = target / ".contextkit" / "config.toml"
+    if not binding.is_file():
+        return None
+    try:
+        import tomllib
+
+        declared = tomllib.loads(binding.read_text(encoding="utf-8"))
+        output = ((declared.get("targets") or {}).get(engine) or {}).get("output")
+    except (OSError, ValueError, TypeError, AttributeError):
+        output = None
+    if not isinstance(output, str) or not output.strip():
+        output = CONTEXT_OUTPUT_DEFAULTS.get(engine)
+    if not output:
+        return None
+    try:
+        path = (target / output.strip()).resolve()
+        mtime = path.stat().st_mtime
+    except (OSError, ValueError, RuntimeError):
+        return None
+    modified = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+    return {
+        "path": str(path),
+        "modified_at": modified.isoformat(),
+        "age_seconds": round(max(0.0, time.time() - mtime), 3),
+    }
+
+
 def resolve_schema(spec: str) -> str:
     p = Path(spec).expanduser()
     if p.exists():
@@ -3519,6 +3582,10 @@ def run(args):
     reporter = ProgressReporter(engine, enabled=not args.quiet)
     reporter.emit("starting", f"Launching {engine} peer")
     before = snapshot(target)
+    # Read before the peer starts: an engine that builds its context at session
+    # start rewrites this file during the run, and the peer answered from the
+    # revision that was there when it began.
+    compiled_context = _compiled_context(target, engine)
     try:
         res = ENGINE_RUNNERS[engine](target, args.prompt, mode, model, effort,
                                      caller, args.append, schema_text, resume_id,
@@ -3599,6 +3666,7 @@ def run(args):
             "dirty_before": dirty_before,
             "files_changed": files_changed,
         },
+        "compiled_context": compiled_context,
         "permission_denials": res.get("permission_denials", []),
     }
     print(json.dumps(result, indent=2))

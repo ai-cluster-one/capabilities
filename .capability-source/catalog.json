@@ -7,7 +7,7 @@
     },
     "askproject": {
       "path": "capabilities/askproject",
-      "payload_sha256": "a1505bfd5a1f128188fdac8393e9c120825ce73edf3c4669f0f9a85f76a03bc1",
+      "payload_sha256": "db9d15c45733218dc8218754e2e30defc4ea3ae048c887ff4f22c8ea56649a65",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project, fenced by mode (read/act), and return its answer with cost, token, and files-changed traceability."
     },
     "automations": {
