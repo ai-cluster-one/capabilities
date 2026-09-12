@@ -2993,8 +2993,15 @@ def _compiled_context(target: Path, engine: str) -> dict | None:
     A fact for the caller to weigh, never a verdict: a build legitimately
     leaves a file whose content did not change alone, so an artifact older than
     its sources may still be current. Every failure to find or read one — no
-    binding, no declaration, no file, an unparseable config — returns None, so
-    the ordinary target that compiles nothing is silent and unaffected.
+    binding, no declaration, no file, an unparseable config, a declaration that
+    does not name a regular file of the target — returns None, so the ordinary
+    target that compiles nothing is silent and unaffected.
+
+    The declaration is the target's own file and the result is printed into the
+    caller's, so what it may name is bounded here: the artifact must resolve to
+    a regular file strictly inside the target. Containment is judged after
+    every symlink is followed, because a link out of the target discloses the
+    outside path exactly as naming it would.
     """
     import datetime
 
@@ -3013,7 +3020,14 @@ def _compiled_context(target: Path, engine: str) -> dict | None:
     if not output:
         return None
     try:
-        path = (target / output.strip()).resolve()
+        inside = _real(target)
+        path = _real(target / output.strip())
+        if inside is None or path is None:
+            return None
+        if path == inside or not path.is_relative_to(inside):
+            return None
+        if not path.is_file():
+            return None
         mtime = path.stat().st_mtime
     except (OSError, ValueError, RuntimeError):
         return None
