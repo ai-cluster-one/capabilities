@@ -116,6 +116,8 @@ MACHINE VERBS
         Inspect sources, resolve the one editable path, refresh remote caches,
         compare declarations, payload hashes and the generated catalogue, or
         unregister a source. Authoring audit stays explicit.
+        `check` writes nothing, so it reads any registered source — an editable
+        workspace or a fetched cache — from any directory. Exit 0 clean, 7 drift.
         Removing never deletes an editable workspace.
   source index ID [--staged]
         Deterministically rebuild the generated catalogue. --staged derives it
@@ -5553,8 +5555,13 @@ def _source_root(source_id: str) -> Path:
     return _source_cache(source_id)
 
 
-def _source_author_root(source_id: str) -> Path:
-    """Return the editable root selected by an already-applied identity fuse."""
+def _source_local_root(source_id: str) -> Path:
+    """Resolve the local tree that answers for a source, without requiring one.
+
+    A cwd checkout claiming this source wins, then the running manager's own
+    official checkout, then the registered root — an editable workspace, or the
+    manager-owned read-only cache clone of a remote source.
+    """
     cwd_root = _marked_checkout(Path.cwd())
     if cwd_root is not None and _source_id_for_repo(cwd_root) == source_id:
         return cwd_root
@@ -5562,6 +5569,11 @@ def _source_author_root(source_id: str) -> Path:
             (_REPO_ROOT / "capabilities.repo.json").is_file():
         return _REPO_ROOT
     return _source_root(source_id)
+
+
+def _source_author_root(source_id: str) -> Path:
+    """Return the editable root selected by an already-applied identity fuse."""
+    return _source_local_root(source_id)
 
 
 def _git(args: list[str], cwd: Path | None = None) -> str:
@@ -6281,8 +6293,9 @@ def cmd_source_index(source_id: str, staged: bool = False) -> None:
 
 
 def cmd_source_check(source_id: str) -> None:
-    _guard_source_checkout(source_id, "source check")
-    root = _source_author_root(source_id)
+    # Reading a source for drift writes nothing, so it does not borrow the
+    # write-side checkout fuse: a cached remote source answers from any cwd.
+    root = _source_local_root(source_id)
     if not root.is_dir():
         _die(3, "source_unavailable", f"source {source_id!r} is not available locally",
              f"run `capabilities source refresh {source_id}`")
