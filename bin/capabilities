@@ -160,10 +160,14 @@ DEVELOPMENT VERBS
         Inspect provenance, worktrees, isolation paths, installed payloads, and
         cleanup readiness. Source dirtiness is visible development state, not
         by itself a failure.
-  dev stop <session>
+  dev stop <session> [--discard-work]
         Remove only a clean session whose commits are absent, merged, or
         patch-equivalent to commits on its recorded base ref. Dirty or
-        unpublished worktrees are preserved and refused.
+        unpublished worktrees are preserved and refused. --discard-work
+        removes an abandoned session by destroying exactly that work, its
+        uncommitted changes and its unpublished commits, and names what it
+        destroyed in the result. It never reaches a live takeover lease, a
+        worktree git cannot report on, or an unmanaged path.
   dev finish <session>
         Require a clean prepared commit, release it through the existing
         source transaction, then remove only manager-owned session paths. The
@@ -3381,16 +3385,7 @@ def _dev_git_status(worktree: Path) -> tuple[str | None, str | None]:
     return status.stdout, None
 
 
-def _dev_worktree_cleanup_problem(info: dict) -> str | None:
-    if info.get("live"):
-        return None
-    worktree = Path(info["worktree"])
-    status, error = _dev_git_status(worktree)
-    if error:
-        return error
-    if status:
-        return f"dirty worktree: {worktree}"
-    head = _dev_git_value(worktree, "rev-parse", "HEAD")
+def _dev_unpublished_commit_problem(info: dict, head: str | None) -> str | None:
     if head == info.get("base_commit"):
         return None
     merged = _dev_git(Path(info["repo"]), "merge-base", "--is-ancestor",
@@ -3406,12 +3401,44 @@ def _dev_worktree_cleanup_problem(info: dict) -> str | None:
     return f"unpublished commits on {info.get('branch')}: {head}"
 
 
+def _dev_worktree_cleanup_obstacles(
+        info: dict, discard_work: bool) -> tuple[list[str], list[str]]:
+    """Split one worktree's cleanup obstacles into refusals and discardable work.
+
+    An uncommitted tree and commits the recorded base ref never received are the
+    session's own abandoned source work, and move to the discarded list only when
+    the caller opted in. A worktree git cannot report on is never discardable:
+    the read failed, so nothing establishes what the directory even holds.
+    """
+    if info.get("live"):
+        return [], []
+    worktree = Path(info["worktree"])
+    status, error = _dev_git_status(worktree)
+    if error:
+        return [error], []
+    discarded: list[str] = []
+    if status:
+        dirty = f"dirty worktree: {worktree}"
+        if not discard_work:
+            return [dirty], []
+        discarded.append(dirty)
+    head = _dev_git_value(worktree, "rev-parse", "HEAD")
+    unpublished = _dev_unpublished_commit_problem(info, head)
+    if not unpublished:
+        return [], discarded
+    if not discard_work:
+        return [unpublished], discarded
+    discarded.append(unpublished)
+    return [], discarded
+
+
+def _dev_cleanup_obstacles(
+        session: dict, discard_work: bool) -> tuple[list[str], list[str]]:
+    return _dev_worktree_cleanup_obstacles(session["source"], discard_work)
+
+
 def _dev_cleanup_problems(session: dict) -> list[str]:
-    problems = []
-    source_problem = _dev_worktree_cleanup_problem(session["source"])
-    if source_problem:
-        problems.append(source_problem)
-    return problems
+    return _dev_cleanup_obstacles(session, False)[0]
 
 
 def cmd_dev_doctor(session_id: str) -> None:
@@ -3789,13 +3816,14 @@ def cmd_dev_list() -> None:
            "state_root": str(DEV_STATE_ROOT), "data_root": str(DEV_DATA_ROOT)})
 
 
-def _dev_remove_worktree(info: dict) -> None:
+def _dev_remove_worktree(info: dict, discard_work: bool = False) -> None:
     if info.get("live"):
         return
     repo = Path(info["repo"])
     worktree = Path(info["worktree"])
     branch = info.get("branch")
-    proc = _dev_git(repo, "worktree", "remove", str(worktree), timeout=120)
+    force = ["--force"] if discard_work else []
+    proc = _dev_git(repo, "worktree", "remove", *force, str(worktree), timeout=120)
     if proc.returncode != 0:
         _die(6, "worktree_remove_failed", f"cannot remove worktree {worktree}",
              proc.stderr.strip() or proc.stdout.strip() or None)
@@ -3814,7 +3842,8 @@ def _dev_assert_owned_path(path: Path, root: Path) -> None:
         _die(6, "unsafe_dev_path", f"refusing cleanup outside dev root: {resolved}")
 
 
-def _dev_stop(session_id: str, emit_result: bool) -> dict:
+def _dev_stop(session_id: str, emit_result: bool,
+              discard_work: bool = False) -> dict:
     MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
     mutation = MANAGER_MUTATION_LOCK.open("a+")
     fcntl.flock(mutation, fcntl.LOCK_EX)
@@ -3832,27 +3861,29 @@ def _dev_stop(session_id: str, emit_result: bool) -> dict:
     _dev_assert_owned_path(state_dir, DEV_STATE_ROOT)
     _dev_assert_owned_path(data_dir, DEV_DATA_ROOT)
     _dev_assert_owned_path(Path(session["source"]["worktree"]), data_dir)
-    problems = _dev_cleanup_problems(session)
+    problems, discarded = _dev_cleanup_obstacles(session, discard_work)
     if problems:
         if emit_result:
             _die(6, "dev_cleanup_refused", f"dev session {session_id} is not removable",
                  "; ".join(problems))
         mutation.close()
         return {"session": session_id, "removed": False, "problems": problems}
-    _dev_remove_worktree(session["source"])
+    _dev_remove_worktree(session["source"], bool(discarded))
     if data_dir.exists():
         shutil.rmtree(data_dir)
     if state_dir.exists():
         shutil.rmtree(state_dir)
     result = {"session": session_id, "removed": True}
+    if discarded:
+        result["discarded"] = discarded
     mutation.close()
     if emit_result:
         _emit(result)
     return result
 
 
-def cmd_dev_stop(session_id: str) -> None:
-    _dev_stop(session_id, True)
+def cmd_dev_stop(session_id: str, discard_work: bool = False) -> None:
+    _dev_stop(session_id, True, discard_work)
 
 
 def _dev_duration(value: str) -> int:
@@ -7621,9 +7652,16 @@ def main() -> None:
         elif sub == "list":
             cmd_dev_list()
         elif sub == "stop":
-            if not dev_args:
+            unknown = [value for value in dev_args
+                       if value.startswith("--") and value != "--discard-work"]
+            if unknown:
+                _die(6, "input", f"unknown dev stop option: {unknown[0]}")
+            stop_args = [value for value in dev_args if not value.startswith("--")]
+            if not stop_args:
                 _die(6, "input", "dev stop needs a session id")
-            cmd_dev_stop(dev_args[0])
+            if len(stop_args) > 1:
+                _die(6, "input", "dev stop takes exactly one session id")
+            cmd_dev_stop(stop_args[0], "--discard-work" in dev_args)
         elif sub == "finish":
             if not dev_args:
                 _die(6, "input", "dev finish needs a session id")

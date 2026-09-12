@@ -628,6 +628,157 @@ def test_dev_stop_preserves_dirty_and_unmerged_work_then_allows_merged_cleanup(
     assert (source / "development.txt").read_text() == "uncommitted\n"
 
 
+def _branch_exists(source: Path, session: str) -> bool:
+    return _git(
+        source, "show-ref", "--verify", f"refs/heads/dev/{session}", check=False
+    ).returncode == 0
+
+
+def test_dev_stop_discards_an_abandoned_dirty_worktree_only_when_asked(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer)
+    source_worktree = Path(started["source_worktree"])
+    (source_worktree / "development.txt").write_text("uncommitted\n")
+
+    refused = _run(env, "dev", "stop", "deployment-test", check=False)
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "dev_cleanup_refused"
+    assert source_worktree.is_dir()
+
+    stopped = json.loads(
+        _run(env, "dev", "stop", "deployment-test", "--discard-work").stdout
+    )
+    assert stopped["removed"] is True
+    assert stopped["discarded"] == [f"dirty worktree: {source_worktree}"]
+    assert not source_worktree.exists()
+    assert not _branch_exists(source, "deployment-test")
+    assert not (source / "development.txt").exists()
+
+
+def test_dev_stop_discards_unpublished_commits_only_when_asked(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer)
+    source_worktree = Path(started["source_worktree"])
+    (source_worktree / "development.txt").write_text("committed\n")
+    prepared = _commit_all(source_worktree, "Abandoned capability change")
+
+    refused = _run(env, "dev", "stop", "deployment-test", check=False)
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "dev_cleanup_refused"
+    assert "unpublished commits" in refused.stderr
+
+    stopped = json.loads(
+        _run(env, "dev", "stop", "deployment-test", "--discard-work").stdout
+    )
+    assert stopped["removed"] is True
+    assert stopped["discarded"] == [
+        f"unpublished commits on dev/deployment-test: {prepared}"
+    ]
+    assert not source_worktree.exists()
+    assert not _branch_exists(source, "deployment-test")
+
+
+def test_dev_stop_discards_a_dirty_worktree_and_its_commits_together(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer)
+    source_worktree = Path(started["source_worktree"])
+    (source_worktree / "committed.txt").write_text("committed\n")
+    prepared = _commit_all(source_worktree, "Abandoned capability change")
+    (source_worktree / "uncommitted.txt").write_text("uncommitted\n")
+
+    stopped = json.loads(
+        _run(env, "dev", "stop", "deployment-test", "--discard-work").stdout
+    )
+    assert stopped["removed"] is True
+    assert stopped["discarded"] == [
+        f"dirty worktree: {source_worktree}",
+        f"unpublished commits on dev/deployment-test: {prepared}",
+    ]
+    assert not source_worktree.exists()
+    assert not _branch_exists(source, "deployment-test")
+
+
+def test_dev_stop_discard_work_is_silent_about_a_session_that_had_none(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer)
+
+    stopped = json.loads(
+        _run(env, "dev", "stop", "deployment-test", "--discard-work").stdout
+    )
+    assert stopped == {"session": "deployment-test", "removed": True}
+    assert not Path(started["source_worktree"]).exists()
+
+
+def test_dev_stop_discard_work_never_reaches_an_active_live_takeover(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer)
+    source_worktree = Path(started["source_worktree"])
+    (source_worktree / "development.txt").write_text("uncommitted\n")
+    lease = (
+        Path(env["XDG_STATE_HOME"]) / "telegram" / "borrowed" / "control"
+        / "takeover.json"
+    )
+    lease.parent.mkdir(parents=True)
+    lease.write_text(
+        json.dumps(
+            {
+                "capability": "telegram",
+                "session_id": "deployment-test",
+                "state": "borrowed",
+            }
+        )
+        + "\n"
+    )
+
+    refused = _run(env, "dev", "stop", "deployment-test", "--discard-work", check=False)
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "takeover_active"
+    assert source_worktree.is_dir()
+
+    lease.unlink()
+    _run(env, "dev", "stop", "deployment-test", "--discard-work")
+
+
+def test_dev_stop_refuses_an_unreadable_worktree_even_when_discarding(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer)
+    source_worktree = Path(started["source_worktree"])
+    shutil.rmtree(source_worktree)
+
+    refused = _run(env, "dev", "stop", "deployment-test", "--discard-work", check=False)
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "dev_cleanup_refused"
+    assert "worktree is missing" in refused.stderr
+
+
+def test_dev_stop_names_an_option_it_does_not_understand(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    started = _start(env, source, consumer)
+    (Path(started["source_worktree"]) / "development.txt").write_text("uncommitted\n")
+
+    refused = _run(env, "dev", "stop", "deployment-test", "--force", check=False)
+    assert refused.returncode == 6
+    assert _error(refused)["code"] == "input"
+    assert "--force" in refused.stderr
+    assert Path(started["source_worktree"]).is_dir()
+
+    _run(env, "dev", "stop", "deployment-test", "--discard-work")
+
+
 def test_dev_start_rejects_obsolete_consumer_worktree_flag(tmp_path):
     source = _source_repo(tmp_path)
     consumer = _consumer_repo(tmp_path)
