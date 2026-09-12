@@ -35,6 +35,17 @@ GEMINITALK_SCRIPT = REPO / "capabilities" / "geminitalk" / "bin" / "geminitalk"
 GEMINITALK_BASE = REPO / "capabilities" / "geminitalk" / "prompts" / "base.md"
 
 
+def _error_envelope(result: subprocess.CompletedProcess) -> dict:
+    """The error envelope a uv-launched capability script wrote, off the last line of stderr.
+
+    The launcher resolves the script's dependencies on stderr whenever its cache
+    is cold, so download, build and install progress precedes the envelope. The
+    envelope itself is one line of JSON, so the last non-empty line is it."""
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    assert lines, result.stdout
+    return json.loads(lines[-1])
+
+
 def test_telegram_service_start_proves_runner_child_by_nonce_and_provenance(
     tmp_path: Path,
 ) -> None:
@@ -587,7 +598,7 @@ def test_capability_auth_context_denies_unlisted_capability() -> None:
         timeout=30,
     )
     assert proc.returncode == 4
-    payload = json.loads(proc.stderr)
+    payload = _error_envelope(proc)
     assert payload["error"]["code"] == "capability_not_authorized"
     assert "mailbox" in payload["error"]["message"]
 
@@ -653,7 +664,7 @@ def test_telegram_service_authority_pins_connection_and_session() -> None:
             cwd=str(REPO), env=env, capture_output=True, text=True, timeout=30,
         )
         assert wrong_connection.returncode == 4
-        payload = json.loads(wrong_connection.stderr)
+        payload = _error_envelope(wrong_connection)
         assert payload["error"]["code"] == "connection_scope_denied"
 
         wrong_session = subprocess.run(
@@ -661,7 +672,7 @@ def test_telegram_service_authority_pins_connection_and_session() -> None:
             cwd=str(REPO), env=env, capture_output=True, text=True, timeout=30,
         )
         assert wrong_session.returncode == 4
-        payload = json.loads(wrong_session.stderr)
+        payload = _error_envelope(wrong_session)
         assert payload["error"]["code"] == "session_scope_denied"
 
 
