@@ -547,6 +547,118 @@ script = "capabilities/automations/scripts/job.py"
         self.assertTrue(report["ok"])
         self.assertNotIn("config_stale", report)
 
+    def _supervised_daemon(self, environment: str) -> subprocess.Popen:
+        state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
+        daemon = subprocess.Popen(
+            [str(CLI), "service", "run"], cwd=self.root,
+            env={**self.env, "AUTOMATIONS_ENVIRONMENT": environment},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 15
+        while time.time() < deadline and not (state / "daemon.pid").is_file():
+            time.sleep(0.1)
+        self.assertTrue((state / "daemon.pid").is_file(), "supervised daemon did not start")
+        return daemon
+
+    def test_doctor_reports_the_environment_its_daemon_loaded(self) -> None:
+        # A supervisor starts the daemon with its own selector and the shell that
+        # asks afterwards carries none, so an answer computed from the asking
+        # process describes nobody. Both belong in the payload, told apart.
+        daemon = self._supervised_daemon("test")
+        try:
+            report = json.loads(self.cli("doctor").stdout)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["environment"], "test")
+            self.assertEqual(report["daemon_environment"], "test")
+            self.assertEqual(report["service"]["daemon_environment"], "test")
+            self.assertNotIn("environment_idle", report)
+
+            # Asked from an environment of its own, the invocation's answer moves
+            # and the daemon's does not, which is what makes them two answers.
+            elsewhere = json.loads(subprocess.run(
+                [str(CLI), "doctor"], cwd=self.root,
+                env={**self.env, "AUTOMATIONS_ENVIRONMENT": "staging"},
+                capture_output=True, text=True, timeout=30).stdout)
+            self.assertEqual(elsewhere["environment"], "staging")
+            self.assertEqual(elsewhere["daemon_environment"], "test")
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=15)
+
+    def test_doctor_fails_when_the_daemon_schedules_none_of_the_declarations(self) -> None:
+        # The failure this closes: a daemon started under a selector no
+        # automation is declared for is alive, answering, and scheduling
+        # nothing, and a count of the declarations reports it as healthy. What a
+        # supervisor acts on is `ok`, so this is where it has to show.
+        daemon = self._supervised_daemon("production")
+        try:
+            probe = self.cli("service", "doctor", check=False)
+            self.assertEqual(probe.returncode, 6)
+            report = json.loads(probe.stdout)
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["daemon_environment"], "production")
+            self.assertEqual(report["environment"], "test")
+            self.assertTrue(report["service"]["running"])
+            self.assertEqual(report["environment_idle"]["daemon_environment"], "production")
+            self.assertEqual(report["environment_idle"]["declared"], ["test"])
+            self.assertIn("scheduling nothing", report["environment_idle"]["message"])
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=15)
+
+        # Stopped, the daemon is not scheduling the wrong thing; there is
+        # nothing to be wrong about, and the answer goes quiet again.
+        stopped = json.loads(self.cli("doctor").stdout)
+        self.assertTrue(stopped["ok"])
+        self.assertIsNone(stopped["daemon_environment"])
+        self.assertNotIn("environment_idle", stopped)
+
+    def test_an_automation_declared_for_every_environment_keeps_doctor_quiet(self) -> None:
+        # An automation naming no environment runs under all of them, so a
+        # daemon holding one is scheduling whatever its selector is, and a
+        # finding about the selector would be about nothing.
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "everywhere"
+script = "capabilities/automations/scripts/job.py"
+schedule = "0 3 * * *"
+""")
+        daemon = self._supervised_daemon("production")
+        try:
+            report = json.loads(self.cli("doctor").stdout)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["daemon_environment"], "production")
+            self.assertNotIn("environment_idle", report)
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=15)
+
+    def test_a_daemon_that_published_no_environment_is_not_called_healthy(self) -> None:
+        # A daemon started by an older payload published the bare fingerprint
+        # and keeps running across an upgrade. Its declaration still reads, so
+        # `config_stale` stays quiet; what cannot be shown is which automations
+        # it is scheduling, and that is said rather than assumed to be fine.
+        daemon = self._supervised_daemon("test")
+        try:
+            state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
+            legacy = state / RUNTIME.DAEMON_FINGERPRINT_FILE
+            fingerprint = RUNTIME.read_config_fingerprint(state)
+            legacy.write_text(fingerprint + "\n")
+            self.assertEqual(RUNTIME.read_config_fingerprint(state), fingerprint)
+            self.assertIsNone(RUNTIME.read_daemon_environment(state))
+
+            probe = self.cli("service", "doctor", check=False)
+            self.assertEqual(probe.returncode, 6)
+            report = json.loads(probe.stdout)
+            self.assertFalse(report["ok"])
+            self.assertNotIn("config_stale", report)
+            self.assertIsNone(report["daemon_environment"])
+            self.assertIn("did not record which environment",
+                          report["environment_idle"]["message"])
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=15)
+
     def test_manual_run_history_and_logs(self) -> None:
         doctor = json.loads(self.cli("doctor").stdout)
         self.assertTrue(doctor["ok"])

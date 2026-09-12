@@ -375,12 +375,55 @@ def config_fingerprint(config: dict[str, Any]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
+def daemon_record(config: dict[str, Any]) -> str:
+    """Everything the running daemon publishes about what it loaded.
+
+    The fingerprint answers *which declaration*; the environment answers *which
+    of it is in force*, and the second is taken from the daemon's own process
+    environment, which nothing outside that process can see. A supervisor that
+    exports one environment and a terminal opened later that carries none are
+    the ordinary case, so the loaded value is written down rather than
+    re-derived by whoever asks. It rides in the file the daemon already writes
+    beside its pid and behind the same lock, because a second file answering
+    for the same process is a second thing to disagree with.
+    """
+    return json.dumps({
+        "config": config_fingerprint(config),
+        "environment": config["engine"]["environment"],
+    }, sort_keys=True) + "\n"
+
+
+def read_daemon_record(state_dir: Path) -> dict[str, Any]:
+    """What the running daemon published, as far as it published anything.
+
+    A daemon started by an older payload wrote the bare fingerprint and no
+    environment, and it keeps running across an upgrade, so that form is read
+    as what it is rather than as a damaged record."""
+    try:
+        text = (state_dir / DAEMON_FINGERPRINT_FILE).read_text().strip()
+    except OSError:
+        return {}
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return {"config": text}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
 def read_config_fingerprint(state_dir: Path) -> str | None:
     """What the running daemon recorded, or None if it recorded nothing."""
-    try:
-        return (state_dir / DAEMON_FINGERPRINT_FILE).read_text().strip() or None
-    except OSError:
-        return None
+    value = read_daemon_record(state_dir).get("config")
+    return value if isinstance(value, str) and value else None
+
+
+def read_daemon_environment(state_dir: Path) -> str | None:
+    """The environment the running daemon loaded, or None if it published none."""
+    value = read_daemon_record(state_dir).get("environment")
+    return value if isinstance(value, str) and value else None
 
 
 def _store_mode(root: Path) -> tuple[str, str]:
@@ -1256,7 +1299,7 @@ class Daemon:
         self.config = config
         self.by_id = automation_map(config)
         self.reload_error = None
-        fingerprint_path.write_text(config_fingerprint(config) + "\n")
+        fingerprint_path.write_text(daemon_record(config))
         sys.stderr.write(
             f"automations daemon: reloaded, {len(self.by_id)} automations declared\n"
         )
@@ -1275,8 +1318,9 @@ class Daemon:
             raise RuntimeError(f"another automations daemon holds {lock_path}") from exc
         pid_path.write_text(f"{os.getpid()}\n")
         # Written behind the lock and beside the pid, because it answers for the
-        # same process: which configuration the daemon still running loaded.
-        fingerprint_path.write_text(config_fingerprint(self.config) + "\n")
+        # same process: which configuration the daemon still running loaded, and
+        # which environment it loaded it under.
+        fingerprint_path.write_text(daemon_record(self.config))
         self.recover()
 
         def stop(_signum: int, _frame: Any) -> None:

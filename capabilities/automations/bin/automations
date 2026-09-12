@@ -25,7 +25,12 @@ Commands:
       Validate config, scripts, state storage, and daemon status. Fails with
       `config_stale` when the running daemon loaded a configuration that has
       changed since, because a daemon reads its declaration once and a
-      supervisor cannot see that it went out of date. Reports a store whose
+      supervisor cannot see that it went out of date. Fails with
+      `environment_idle` when the daemon loaded an environment none of the
+      declared automations is declared for, so a daemon that is alive and
+      scheduling nothing stops reading as healthy. `daemon_environment` is the
+      environment that daemon published; `environment` is this invocation's, and
+      the two are ordinarily different. Reports a store whose
       `runs` table predates the nullable automation reference, which stops a
       file-declared automation recording any run. `--repair` rebuilds that
       table in place, keeping every row.
@@ -3141,6 +3146,12 @@ def service_status(root: Path) -> dict[str, Any]:
         "environment": os.environ.get("AUTOMATIONS_ENVIRONMENT")
         or _project_env().get("AUTOMATIONS_ENVIRONMENT")
         or "development",
+        # The environment above is this invocation's, and a supervisor's is not
+        # visible from a terminal opened later, so the two are ordinarily
+        # different and a payload carrying only one lets a reader take it for
+        # both. This is the daemon's own answer, published by the daemon; `null`
+        # says there is no daemon, or that it is one too old to have published it.
+        "daemon_environment": runtime.read_daemon_environment(state) if running else None,
         "config": str(_config_path(root)),
         "state_dir": str(state),
         # A `running: false` is a statement about one directory, and a reader who
@@ -3203,10 +3214,57 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
                 ),
                 "hint": "restart the service so the daemon reloads its configuration",
             }
+    # A daemon that is alive is not thereby working: it selects what to schedule
+    # by the environment it was started under, which is its own and not this
+    # invocation's, so a supervisor's selector can leave every declared
+    # automation unselected. That daemon ticks, answers, and schedules nothing,
+    # and counting the declarations rather than the selected ones reports it as
+    # healthy. Selection here is by environment alone and not by `applies`,
+    # because an automation switched off is off on purpose and a health answer
+    # that failed over it would be wrong about a project that meant it.
+    #
+    # Only a project whose every automation names an environment can be left
+    # idle this way: one that names none runs under all of them, so a daemon
+    # with even one of those is scheduling regardless and is owed no finding.
+    daemon_environment = status["daemon_environment"]
+    environment_idle = None
+    environment_scoped = config["automations"] and all(
+        item["environments"] for item in config["automations"])
+    if status["running"] and environment_scoped:
+        declared = sorted({name for item in config["automations"]
+                           for name in item["environments"]})
+        selected = [item["id"] for item in config["automations"]
+                    if daemon_environment in item["environments"]]
+        if daemon_environment is None:
+            environment_idle = {
+                "daemon_environment": None,
+                "declared": declared,
+                "message": (
+                    "the running daemon did not record which environment it loaded, so the "
+                    "automations it is scheduling cannot be shown to be the ones declared here"
+                ),
+                "hint": "restart the service so the daemon publishes the environment it loads",
+            }
+        elif not selected:
+            environment_idle = {
+                "daemon_environment": daemon_environment,
+                "declared": declared,
+                "message": (
+                    f"the running daemon loaded environment {daemon_environment!r}, and none "
+                    f"of the {len(config['automations'])} automations declared here is "
+                    "declared for it, so it is scheduling nothing"
+                ),
+                "hint": "start the service under a declared environment, or declare these "
+                        "automations for the one it runs under",
+            }
     result = {
-        "ok": not missing_scripts and schema_defect is None and config_stale is None,
+        "ok": not missing_scripts and schema_defect is None and config_stale is None
+        and environment_idle is None,
         "project": str(root),
         "environment": config["engine"]["environment"],
+        # This invocation's environment is the one above; this is the running
+        # daemon's, and only it decides what is actually being scheduled.
+        "daemon_environment": daemon_environment,
         "namespace": config["engine"]["namespace"],
         "automations": len(config["automations"]),
         "missing_scripts": missing_scripts,
@@ -3214,6 +3272,8 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     }
     if config_stale is not None:
         result["config_stale"] = config_stale
+    if environment_idle is not None:
+        result["environment_idle"] = environment_idle
     if repaired is not None:
         result["repaired"] = repaired
     if schema_defect is not None:
