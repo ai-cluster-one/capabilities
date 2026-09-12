@@ -2251,6 +2251,11 @@ class StoreRecords(Records):
         """What answered. A row has no path, so the store says so as itself."""
         return self.source
 
+    def scope_source(self, capability: str, collection: str, scope: str) -> str:
+        """What answered, for one scope. A row has no path at any scope, so
+        every scope answers as the store itself does."""
+        return self.source
+
     def document_path(self, capability: str, key: str) -> Path | None:
         """Nothing to open: a version in the store is not a file anywhere. The
         working copy an edit needs is the caller's to make, and `put` is what
@@ -2431,16 +2436,21 @@ class FileRecords(Records):
                     out[key] = row
         return out
 
+    def _scope_root(self, scope: str) -> tuple[Path, str | None]:
+        """The directory one named scope keeps its records in, and the project
+        it answers for. Named once so asking a scope for its rows and asking it
+        for its file can never land in different trees."""
+        if scope == "project":
+            return self.envelope, self.project_id
+        if scope == "global":
+            return self.global_dir, None
+        raise StoreError("bad_scope",
+                         f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+
     def resolve_scope(self, capability: str, collection: str,
                       scope: str) -> dict[str, dict[str, Any]]:
         _store_check("capability", capability, CAPABILITY_RE)
-        if scope == "project":
-            root, pid = self.envelope, self.project_id
-        elif scope == "global":
-            root, pid = self.global_dir, None
-        else:
-            raise StoreError("bad_scope",
-                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        root, pid = self._scope_root(scope)
         return {
             key: {"id": f"{scope}:{capability}/{collection}/{key}",
                   "scope": scope, "project_id": pid,
@@ -2463,6 +2473,15 @@ class FileRecords(Records):
             if self._entries(root, capability, collection):
                 return str(self._file(root, capability, collection))
         return str(self._file(self.envelope, capability, collection))
+
+    def scope_source(self, capability: str, collection: str, scope: str) -> str:
+        """The file one named scope keeps this collection in. What a record
+        resolved *to* is a question about that record, so the caller that knows
+        which scope answered asks here rather than for the collection's own
+        file: one file per scope, and the chain is not walked again."""
+        _store_check("capability", capability, CAPABILITY_RE)
+        root, _pid = self._scope_root(scope)
+        return str(self._file(root, capability, collection))
 
     def connections(self, capability: str, write_default: bool = False,
                     include_disabled: bool = False) -> dict[str, dict[str, Any]]:
@@ -2775,7 +2794,15 @@ def _connections_composed() -> dict:
     dropped: `connections` holds exactly what may be acted on — which is what
     every capability's own report iterates — while selection still has the name
     it needs to explain a refusal instead of pretending the connection was
-    never declared."""
+    never declared.
+
+    `sources` names, per connection, the file its identity was read out of. An
+    identity is taken whole from one scope, so each connection has exactly one
+    origin, and a project that merely granted an inherited connection is not
+    where that connection's values are written. It is kept beside the entries
+    rather than folded into them because it describes a record rather than
+    configuring one: nothing resolves through it, and its one reader is each
+    capability's own report, naming the origin of its `connection`-tier keys."""
     adapter = _records()
     try:
         effective = adapter.connections(NAME, write_default=WRITE_DEFAULT,
@@ -2804,6 +2831,8 @@ def _connections_composed() -> dict:
         "default": default,
         "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
                         for cid, entry in usable.items()},
+        "sources": {cid: adapter.scope_source(NAME, "connection", entry["scope"][0])
+                    for cid, entry in usable.items()},
         "withheld": {cid: {"scope": entry["scope"][0]}
                      for cid, entry in withheld.items()},
     }
@@ -2815,7 +2844,12 @@ def _connections_registry() -> tuple[dict | None, Path | str | None]:
     Composed from the two records a connection is kept as -- who it is, and
     what this project may do with it -- and handed on in the shape the rest of
     the contract already reads, so selection, the write gate and the report
-    never learn which source answered."""
+    never learn which source answered.
+
+    The path returned beside it answers for the collection -- where this project
+    reads connections from. Where one connection's own values came from is a
+    question about that connection, and `reg["sources"][cid]` is what answers
+    it."""
     return _connections_composed(), _records().collection_source(NAME, "connection")
 
 

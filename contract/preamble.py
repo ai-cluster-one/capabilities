@@ -995,7 +995,15 @@ def _connections_composed() -> dict:
     dropped: `connections` holds exactly what may be acted on — which is what
     every capability's own report iterates — while selection still has the name
     it needs to explain a refusal instead of pretending the connection was
-    never declared."""
+    never declared.
+
+    `sources` names, per connection, the file its identity was read out of. An
+    identity is taken whole from one scope, so each connection has exactly one
+    origin, and a project that merely granted an inherited connection is not
+    where that connection's values are written. It is kept beside the entries
+    rather than folded into them because it describes a record rather than
+    configuring one: nothing resolves through it, and its one reader is each
+    capability's own report, naming the origin of its `connection`-tier keys."""
     adapter = _records()
     try:
         effective = adapter.connections(NAME, write_default=WRITE_DEFAULT,
@@ -1024,6 +1032,8 @@ def _connections_composed() -> dict:
         "default": default,
         "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
                         for cid, entry in usable.items()},
+        "sources": {cid: adapter.scope_source(NAME, "connection", entry["scope"][0])
+                    for cid, entry in usable.items()},
         "withheld": {cid: {"scope": entry["scope"][0]}
                      for cid, entry in withheld.items()},
     }
@@ -1035,7 +1045,12 @@ def _connections_registry() -> tuple[dict | None, Path | str | None]:
     Composed from the two records a connection is kept as -- who it is, and
     what this project may do with it -- and handed on in the shape the rest of
     the contract already reads, so selection, the write gate and the report
-    never learn which source answered."""
+    never learn which source answered.
+
+    The path returned beside it answers for the collection -- where this project
+    reads connections from. Where one connection's own values came from is a
+    question about that connection, and `reg["sources"][cid]` is what answers
+    it."""
     return _connections_composed(), _records().collection_source(NAME, "connection")
 
 
