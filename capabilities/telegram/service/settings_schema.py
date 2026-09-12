@@ -363,10 +363,18 @@ def _participant(value, path, project_root, service_dir, *, member=False):
     }
     if member:
         allowed.update({"kind", "address_aliases"})
+    else:
+        # A user entry is the only declaration of the channel a person is alone
+        # in, so it is where that channel's worker window belongs. A group
+        # member has no channel of their own here: their turn runs in the
+        # group's, whose window the group policy already owns.
+        allowed.add("worker_timeout")
     _unknown(value, allowed, path)
     for key in ("name", "username", "role"):
         if key in value:
             _string(value[key], f"{path}.{key}", nonempty=True)
+    if "worker_timeout" in value:
+        _number(value["worker_timeout"], f"{path}.worker_timeout", 1, 3600)
     if "may_address" in value:
         _boolean(value["may_address"], f"{path}.may_address")
     if "kind" in value:

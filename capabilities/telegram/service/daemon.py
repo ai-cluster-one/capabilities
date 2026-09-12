@@ -2341,6 +2341,21 @@ def _group_policy(chat_id):
     return None, None
 
 
+def _direct_user_policy(chat_id):
+    """The `allowed_users` entry a direct chat belongs to.
+
+    A private chat is identified by the user's own ID, which is how
+    `allowed_users` is keyed, so the channel alone names its participant. A
+    group chat's ID is negative and names nobody, and a chat this project does
+    not know answers with an empty policy rather than with someone else's."""
+    try:
+        if int(chat_id) <= 0:
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    return _as_mapping(ALLOWED.get(str(chat_id)))
+
+
 class RouteUnavailable(RuntimeError):
     """A configured route names a directory that cannot serve this request."""
 
@@ -3123,15 +3138,20 @@ def voice_task_authority(caller_id, caller_name, text, task_id="voice-task"):
 
 
 def channel_settings(reg, key):
-    """Project defaults and channel policy overlaid by this channel's /set overrides."""
+    """Project defaults and channel policy overlaid by this channel's /set overrides.
+
+    The worker window is declared by whichever policy owns the channel — a
+    group's by its `allowed_groups` entry, a direct chat's by the participant's
+    `allowed_users` entry — and a `/set` override in the channel still wins over
+    both."""
     row = reg.get(key, {})
     s = row.get("settings", {})
-    _, group_policy = _group_policy(_channel_identity(key)[0])
-    configured_timeout = (
-        group_policy.get("worker_timeout", DEFAULTS.get("worker_timeout", 90))
-        if isinstance(group_policy, dict)
-        else DEFAULTS.get("worker_timeout", 90)
-    )
+    chat_id, _ = _channel_identity(key)
+    _, group_policy = _group_policy(chat_id)
+    channel_policy = (group_policy if isinstance(group_policy, dict)
+                      else _direct_user_policy(chat_id))
+    configured_timeout = channel_policy.get(
+        "worker_timeout", DEFAULTS.get("worker_timeout", 90))
     worker = _active_worker(row)
     cfg = _worker_settings(row, worker)
     out = {

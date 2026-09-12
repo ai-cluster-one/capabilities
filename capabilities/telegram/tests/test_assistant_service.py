@@ -3070,6 +3070,59 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(daemon.channel_settings(reg, "-200")["worker_timeout"], 600)
             self.assertNotIn("worker_timeout", reg["-200"]["settings"])
 
+    async def test_direct_worker_timeout_from_user_entry(self):
+        """A direct chat's window is declarable where that person is declared,
+        and sits exactly where a group's does: over the project default, under
+        the channel's own /set override. A room is judged by its own policy
+        alone, so the same user entry leaves every group untouched."""
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = settings(worker_timeout=120)
+            service_settings["allowed_users"] = {"777": {"worker_timeout": 600}}
+            service_settings["allowed_groups"] = {"-200": {}}
+            daemon = import_daemon(Path(td), service_settings)
+            reg = daemon.load_register()
+
+            self.assertEqual(daemon.channel_settings(reg, "777")["worker_timeout"], 600)
+            self.assertIn("worker-timeout = 600s", daemon._status(reg, "777"))
+            self.assertEqual(daemon.channel_settings(reg, "-200")["worker_timeout"], 120)
+            self.assertEqual(daemon.channel_settings(reg, "999")["worker_timeout"], 120)
+
+            result = daemon.set_channel_setting(reg, "777", "worker-timeout", "300")
+            self.assertEqual(result, "worker-timeout = 300s")
+            self.assertEqual(daemon.channel_settings(reg, "777")["worker_timeout"], 300)
+
+            result = daemon.set_channel_setting(reg, "777", "worker-timeout", "default")
+            self.assertEqual(result, "worker-timeout = default (600s effective)")
+            self.assertEqual(daemon.channel_settings(reg, "777")["worker_timeout"], 600)
+            self.assertNotIn("worker_timeout", reg["777"]["settings"])
+
+    async def test_user_entry_worker_timeout_bounds_and_scope(self):
+        """The declarable window is bounded like the group's, and it is offered
+        only where a channel is being described — a group member entry describes
+        a person inside someone else's room and still rejects it."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td)
+
+            def validated(allowed_users, allowed_groups=None):
+                return daemon.validate_settings(
+                    {"connection": "test", "assistant_name": "Assistant",
+                     "direct_messages": {"mode": "anyone",
+                                         "default_role": "direct_user"},
+                     "allowed_users": allowed_users,
+                     "allowed_groups": allowed_groups or {}},
+                    root, root)
+
+            validated({"777": {"worker_timeout": 600}})
+            with self.assertRaisesRegex(Exception, "must be between 1 and 3600"):
+                validated({"777": {"worker_timeout": 0}})
+            with self.assertRaisesRegex(Exception, "must be between 1 and 3600"):
+                validated({"777": {"worker_timeout": 3601}})
+            with self.assertRaisesRegex(Exception, "must be a number"):
+                validated({"777": {"worker_timeout": "600"}})
+            with self.assertRaisesRegex(Exception, "unsupported property"):
+                validated({}, {"-200": {"members": {"777": {"worker_timeout": 600}}}})
+
     async def test_set_worker_timeout_validation_and_help(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
