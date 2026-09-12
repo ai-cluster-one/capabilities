@@ -5555,15 +5555,42 @@ def _source_root(source_id: str) -> Path:
     return _source_cache(source_id)
 
 
-def _source_local_root(source_id: str) -> Path:
-    """Resolve the local tree that answers for a source, without requiring one.
+def _source_designates(source_id: str, repo: Path) -> bool:
+    """Answer whether a source's registration designates this exact checkout.
 
-    A cwd checkout claiming this source wins, then the running manager's own
-    official checkout, then the registered root — an editable workspace, or the
-    manager-owned read-only cache clone of a remote source.
+    A registration designates a checkout only where it names one: the official
+    integration checkout binding, or a registered workspace — either as itself
+    or as a worktree linked to it. A fetched source names no checkout, so its
+    registration designates nothing on disk but its own cache clone.
+    """
+    if source_id == OFFICIAL_SOURCE_ID:
+        binding = _sources_config().get("official_checkout")
+        if not isinstance(binding, dict):
+            return False
+        designated = Path(str(binding.get("git_common_dir") or "")).expanduser()
+    else:
+        if _source_entry(source_id).get("kind") != "workspace":
+            return False
+        workspace = _source_root(source_id)
+        if not workspace.is_dir():
+            return False
+        designated = Path(_git_checkout_identity(workspace)["git_common_dir"])
+    if not designated.is_absolute():
+        return False
+    return _git_checkout_identity(repo)["git_common_dir"] == str(designated.resolve())
+
+
+def _source_local_root(source_id: str) -> Path:
+    """Resolve the tree a source's registration designates, for reading only.
+
+    A cwd checkout answers only where the registration designates it, then the
+    running manager's own official checkout, then the registered root — an
+    editable workspace, or the manager-owned cache clone of a fetched source.
+    A cwd merely claiming the same origin never stands in for that clone, so a
+    read reports on the tree the registration names and not on the caller's.
     """
     cwd_root = _marked_checkout(Path.cwd())
-    if cwd_root is not None and _source_id_for_repo(cwd_root) == source_id:
+    if cwd_root is not None and _source_designates(source_id, cwd_root):
         return cwd_root
     if source_id == OFFICIAL_SOURCE_ID and \
             (_REPO_ROOT / "capabilities.repo.json").is_file():
@@ -5573,7 +5600,13 @@ def _source_local_root(source_id: str) -> Path:
 
 def _source_author_root(source_id: str) -> Path:
     """Return the editable root selected by an already-applied identity fuse."""
-    return _source_local_root(source_id)
+    cwd_root = _marked_checkout(Path.cwd())
+    if cwd_root is not None and _source_id_for_repo(cwd_root) == source_id:
+        return cwd_root
+    if source_id == OFFICIAL_SOURCE_ID and \
+            (_REPO_ROOT / "capabilities.repo.json").is_file():
+        return _REPO_ROOT
+    return _source_root(source_id)
 
 
 def _git(args: list[str], cwd: Path | None = None) -> str:
