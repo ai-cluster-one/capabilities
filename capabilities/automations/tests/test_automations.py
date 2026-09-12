@@ -633,11 +633,14 @@ schedule = "0 3 * * *"
             daemon.terminate()
             daemon.wait(timeout=15)
 
-    def test_a_daemon_that_published_no_environment_is_not_called_healthy(self) -> None:
+    def test_a_daemon_that_published_no_environment_is_reported_without_failing(self) -> None:
         # A daemon started by an older payload published the bare fingerprint
-        # and keeps running across an upgrade. Its declaration still reads, so
-        # `config_stale` stays quiet; what cannot be shown is which automations
-        # it is scheduling, and that is said rather than assumed to be fine.
+        # and keeps running across an upgrade, scheduling correctly all the
+        # while. Its declaration still reads, so `config_stale` stays quiet, and
+        # an absent environment is the absence of the fact that would decide
+        # rather than evidence of a mismatch: reading it as one fails every
+        # working deployment on its first health check after the upgrade. So it
+        # is said in the payload, and `ok` is left to what can be shown.
         daemon = self._supervised_daemon("test")
         try:
             state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
@@ -648,16 +651,27 @@ schedule = "0 3 * * *"
             self.assertIsNone(RUNTIME.read_daemon_environment(state))
 
             probe = self.cli("service", "doctor", check=False)
-            self.assertEqual(probe.returncode, 6)
+            self.assertEqual(probe.returncode, 0)
             report = json.loads(probe.stdout)
-            self.assertFalse(report["ok"])
+            self.assertTrue(report["ok"])
             self.assertNotIn("config_stale", report)
+            self.assertNotIn("environment_idle", report)
             self.assertIsNone(report["daemon_environment"])
+            self.assertIsNone(report["service"]["daemon_environment"])
+            self.assertIsNone(report["environment_unknown"]["daemon_environment"])
+            self.assertEqual(report["environment_unknown"]["declared"], ["test"])
             self.assertIn("did not record which environment",
-                          report["environment_idle"]["message"])
+                          report["environment_unknown"]["message"])
+            self.assertIn("cannot say", report["environment_unknown"]["message"])
         finally:
             daemon.terminate()
             daemon.wait(timeout=15)
+
+        # Once that daemon is gone there is nothing left to be unable to speak
+        # for, so the notice goes with it rather than lingering.
+        stopped = json.loads(self.cli("doctor").stdout)
+        self.assertTrue(stopped["ok"])
+        self.assertNotIn("environment_unknown", stopped)
 
     def test_manual_run_history_and_logs(self) -> None:
         doctor = json.loads(self.cli("doctor").stdout)

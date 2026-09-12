@@ -30,7 +30,11 @@ Commands:
       declared automations is declared for, so a daemon that is alive and
       scheduling nothing stops reading as healthy. `daemon_environment` is the
       environment that daemon published; `environment` is this invocation's, and
-      the two are ordinarily different. Reports a store whose
+      the two are ordinarily different. Reports `environment_unknown`, without
+      failing, when a running daemon published no environment at all - one
+      started before this payload - because a missing record says what this
+      answer cannot speak to rather than that anything is wrong.
+      Reports a store whose
       `runs` table predates the nullable automation reference, which stops a
       file-declared automation recording any run. `--repair` rebuilds that
       table in place, keeping every row.
@@ -3226,8 +3230,18 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     # Only a project whose every automation names an environment can be left
     # idle this way: one that names none runs under all of them, so a daemon
     # with even one of those is scheduling regardless and is owed no finding.
+    #
+    # A daemon that published no environment is a different answer and not a
+    # quieter version of this one. The finding is a positive fact - this daemon
+    # holds an environment, and nothing declared here names it - while an
+    # absent record is the absence of the fact that would decide, and inferring
+    # idleness from it would fail every correctly running daemon started before
+    # this payload, on the first health check after an upgrade. So it is said in
+    # the payload instead of in the exit code: `environment_unknown` names what
+    # this answer cannot speak to, and leaves `ok` to the things it can.
     daemon_environment = status["daemon_environment"]
     environment_idle = None
+    environment_unknown = None
     environment_scoped = config["automations"] and all(
         item["environments"] for item in config["automations"])
     if status["running"] and environment_scoped:
@@ -3236,12 +3250,15 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
         selected = [item["id"] for item in config["automations"]
                     if daemon_environment in item["environments"]]
         if daemon_environment is None:
-            environment_idle = {
+            environment_unknown = {
                 "daemon_environment": None,
                 "declared": declared,
                 "message": (
-                    "the running daemon did not record which environment it loaded, so the "
-                    "automations it is scheduling cannot be shown to be the ones declared here"
+                    "the running daemon did not record which environment it loaded, so this "
+                    "answer cannot say which of the automations declared here it is "
+                    "scheduling, or whether it is scheduling any; a daemon started before "
+                    "this payload publishes no environment and keeps running across the "
+                    "upgrade, and that is not itself a fault"
                 ),
                 "hint": "restart the service so the daemon publishes the environment it loads",
             }
@@ -3274,6 +3291,8 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
         result["config_stale"] = config_stale
     if environment_idle is not None:
         result["environment_idle"] = environment_idle
+    if environment_unknown is not None:
+        result["environment_unknown"] = environment_unknown
     if repaired is not None:
         result["repaired"] = repaired
     if schema_defect is not None:
