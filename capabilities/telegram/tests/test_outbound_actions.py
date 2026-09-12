@@ -145,7 +145,12 @@ def _topic(topic_id, title, top_message, **flags):
 
 
 class _HistoryClient(_Client):
-    """Answers iter_messages with one history and records how it was asked."""
+    """Answers iter_messages with one history and records how it was asked.
+
+    A limit is spent the way Telegram spends one - nothing at all comes back
+    for a limit of zero - so an unscoped answer can be held against a scoped
+    one at the same limit.
+    """
 
     def __init__(self, history):
         super().__init__()
@@ -154,7 +159,10 @@ class _HistoryClient(_Client):
 
     async def iter_messages(self, _entity, **kwargs):
         self.asked.append(kwargs)
-        for message in self.history:
+        limit = kwargs.get("limit")
+        for spent, message in enumerate(self.history):
+            if limit is not None and spent >= limit:
+                return
             yield message
 
     async def get_me(self):
@@ -502,6 +510,39 @@ class OutboundActionsTests(unittest.TestCase):
             {"id": "test"}, "-1001", 1, None, True, 7151))
 
         self.assertEqual([row["id"] for row in result], [7301])
+
+    def test_a_limit_of_nothing_hands_back_nothing_scoped_as_unscoped(self):
+        """A budget of nothing is spent before the first message, so a limit
+        means the same on a read and on a search whether or not a topic
+        narrows the walk - including the one limit that asks for no message at
+        all."""
+        history = [self.OTHER, self.GENERAL, self.THREADED, self.DIRECT]
+        for topic in (None, 7151, 1):
+            self._use_history(history)
+            read = asyncio.run(self.cli.cmd_read(
+                {"id": "test"}, "-1001", 0, None, True, topic))
+            self._use_history(history)
+            found = asyncio.run(self.cli.cmd_search(
+                {"id": "test"}, "-1001", "topic", 0, True, topic))
+
+            self.assertEqual((topic, read, found), (topic, [], []))
+
+    def test_an_export_limit_of_nothing_stays_the_whole_history(self):
+        """A number is no limit at all on this verb, which is why a scoped
+        export of zero hands back the topic rather than nothing: the meaning of
+        the number is the verb's and scoping does not move it."""
+        history = [self.OTHER, self.GENERAL, self.THREADED, self.DIRECT]
+        counts = []
+        for topic in (None, 7151):
+            self._use_history(history)
+            with tempfile.TemporaryDirectory() as td:
+                counts.append(asyncio.run(self.cli.cmd_export(
+                    {"id": "test"}, "-1001", str(Path(td) / "export.json"),
+                    None, 0, None, False, False, False, False,
+                    topic))["message_count"])
+                self.assertEqual(self.client.asked[0]["limit"], None)
+
+        self.assertEqual(counts, [4, 2])
 
     def test_an_unscoped_read_asks_the_chat_exactly_as_before(self):
         self._use_history([self.GENERAL])

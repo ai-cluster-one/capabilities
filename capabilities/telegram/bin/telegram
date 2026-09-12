@@ -3694,12 +3694,16 @@ async def _iter_topic_scope(client, entity, topic_id: int | None, topic_of, *,
     decides what is emitted — a narrowed answer is never trusted on its own,
     because the thread carries both the posts made straight into the topic and
     the replies made inside it — which is why `limit` counts the messages
-    handed back rather than the ones examined.
+    handed back rather than the ones examined.  Counting what is handed back
+    means the budget is spent before anything is, so a budget of nothing hands
+    back nothing, as the server does with a limit it is given itself.
     """
     if topic_id is None:
         async for message in client.iter_messages(entity, limit=limit,
                                                   search=search):
             yield message
+        return
+    if limit is not None and limit <= 0:
         return
     narrowed = {}
     if search is None and topic_id != _forum_module().GENERAL_TOPIC_ID:
