@@ -303,6 +303,52 @@ retries = 1
         self.assertEqual(logs["lines"], ["output from the in-repo daemon"])
         self.assertEqual((legacy / "daemon.log").read_text(), "output from the in-repo daemon\n")
 
+    def test_status_answers_for_the_state_root_a_supervised_daemon_pinned(self) -> None:
+        # A supervisor's environment is invisible to a shell opened afterwards,
+        # so an invocation that re-derives the root answers about a directory the
+        # daemon never wrote to, and a live daemon reads as `running: false`. The
+        # daemon records where its state went; the answer follows that record for
+        # as long as a daemon is behind it, an explicit override still outranks
+        # it, and a record no daemon answers for is reported and not followed.
+        pinned = Path(self.tmp.name) / "pinned-state"
+        default = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
+        self.assertNotEqual(pinned, default)
+
+        supervised = subprocess.Popen(
+            [str(CLI), "service", "run"], cwd=self.root,
+            env={**self.env, "AUTOMATIONS_STATE_DIR": str(pinned)},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline and not (pinned / "daemon.pid").is_file():
+                time.sleep(0.1)
+            self.assertTrue((pinned / "daemon.pid").is_file(), "supervised daemon did not start")
+
+            status = json.loads(self.cli("service", "status").stdout)
+            self.assertTrue(status["running"])
+            self.assertEqual(status["pid"], int((pinned / "daemon.pid").read_text().strip()))
+            self.assertEqual(status["state_dir"], str(pinned))
+            self.assertEqual(status["state_dir_source"], "daemon_record")
+            self.assertIn(str(default), status["state_dirs_considered"])
+
+            elsewhere = Path(self.tmp.name) / "elsewhere"
+            named = json.loads(subprocess.run(
+                [str(CLI), "service", "status"], cwd=self.root,
+                env={**self.env, "AUTOMATIONS_STATE_DIR": str(elsewhere)},
+                capture_output=True, text=True, timeout=30).stdout)
+            self.assertEqual(named["state_dir"], str(elsewhere))
+            self.assertEqual(named["state_dir_source"], "override")
+            self.assertFalse(named["running"])
+        finally:
+            supervised.terminate()
+            supervised.wait(timeout=15)
+
+        spent = json.loads(self.cli("service", "status").stdout)
+        self.assertFalse(spent["running"])
+        self.assertEqual(spent["state_dir"], str(default))
+        self.assertEqual(spent["state_dir_source"], "default")
+        self.assertIn(str(pinned), spent["state_dirs_considered"])
+
     def test_declared_agent_adds_and_overrides_field_by_field(self) -> None:
         agents = RUNTIME.load_agents({
             "agents": {

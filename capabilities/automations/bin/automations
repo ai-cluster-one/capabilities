@@ -72,6 +72,10 @@ Environment:
   AUTOMATIONS_BIN          Absolute path of this CLI, exported into every job so
                            a script can call `automations agent` without
                            resolving anything itself.
+  AUTOMATIONS_ENVIRONMENT, AUTOMATIONS_NAMESPACE, AUTOMATIONS_CONFIG and
+  AUTOMATIONS_STATE_DIR are read from the process environment first and then from
+  the project's .env and .env.local (.local wins), so a project declares one for
+  every invocation made in it, `service status` included, without a shell export.
 
 Scheduling:
   Each automation may use a numeric five-field cron `schedule`, an
@@ -2764,11 +2768,63 @@ def _state_project_key(root: Path) -> str:
     return f"path-{digest}"
 
 
-def _state_path(root: Path) -> Path:
+def _state_marker_path(root: Path) -> Path:
+    """Where a starting daemon records the state root it is actually using.
+
+    A supervisor's environment is not visible from a terminal opened afterwards,
+    so an invocation that re-derives the root can only guess at a daemon started
+    with an override. The record is written by the process that starts the
+    daemon, from the same value it hands the daemon, so the two cannot disagree.
+    """
+    return _project_capabilities_dir(root) / NAME / "state-root.json"
+
+
+def _record_state_root(root: Path, state: Path) -> None:
+    path = _state_marker_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"state_dir": str(state)}, indent=2) + "\n")
+
+
+def _forget_state_root(root: Path) -> None:
+    _state_marker_path(root).unlink(missing_ok=True)
+
+
+def _recorded_state_root(root: Path) -> Path | None:
+    try:
+        record = json.loads(_state_marker_path(root).read_text())
+    except (OSError, ValueError):
+        return None
+    raw = record.get("state_dir") if isinstance(record, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    path = Path(raw.strip()).expanduser()
+    return path if path.is_absolute() else root / path
+
+
+def _state_resolution(root: Path) -> tuple[Path, str, list[str]]:
+    """The state root this invocation acts on, and every root it looked at.
+
+    An explicit override is an instruction and wins: a record left by a daemon
+    does not get to overrule what the caller said. Otherwise a record with a live
+    daemon behind it beats the derived default, because it is the fact and the
+    default is only a derivation of one. A record no live daemon answers for is
+    spent - it must not send a `start` somewhere else, nor make an answer be
+    about a directory nobody is using - so it is reported and not followed.
+    """
+    default = _STATE_HOME / "capabilities" / "projects" / _state_project_key(root) / NAME
     override = _state_override(root)
+    recorded = _recorded_state_root(root)
+    considered = [str(path) for path in
+                  dict.fromkeys(path for path in (override, recorded, default) if path is not None)]
     if override is not None:
-        return override
-    return _STATE_HOME / "capabilities" / "projects" / _state_project_key(root) / NAME
+        return override, "override", considered
+    if recorded is not None and recorded != default and _pid_alive(_read_pid(recorded / "daemon.pid")):
+        return recorded, "daemon_record", considered
+    return default, "default", considered
+
+
+def _state_path(root: Path) -> Path:
+    return _state_resolution(root)[0]
 
 
 def _legacy_state_path(root: Path) -> Path:
@@ -2976,7 +3032,7 @@ def cmd_service_init(force: bool) -> dict[str, Any]:
 
 
 def service_status(root: Path) -> dict[str, Any]:
-    state = _state_path(root)
+    state, state_source, considered = _state_resolution(root)
     pid_file = state / "daemon.pid"
     pid = _read_pid(pid_file)
     running = _pid_alive(pid)
@@ -3011,6 +3067,12 @@ def service_status(root: Path) -> dict[str, Any]:
         or "development",
         "config": str(_config_path(root)),
         "state_dir": str(state),
+        # A `running: false` is a statement about one directory, and a reader who
+        # cannot see which one has to believe it. These name the place the answer
+        # came from and every place this invocation weighed, so the answer can be
+        # checked against a directory instead.
+        "state_dir_source": state_source,
+        "state_dirs_considered": considered,
         "store": os.environ.get("CAPABILITIES_STORE_URL") or "default",
         "pid_file": str(pid_file),
         "log_file": str(state / "daemon.log"),
@@ -3201,6 +3263,7 @@ def cmd_service_start() -> dict[str, Any]:
     if proc.poll() is not None:
         tail = log_path.read_text(errors="replace").splitlines()[-8:]
         _die(5, "service_start_failed", f"automations daemon exited with {proc.returncode}", "\n".join(tail))
+    _record_state_root(root, state)
     out = service_status(root)
     out["started"] = True
     if migration is not None:
@@ -3266,8 +3329,12 @@ def cmd_service_stop(timeout: float, force: bool) -> dict[str, Any]:
     state = _state_path(root)
     pid_file = state / "daemon.pid"
     pid = _read_pid(pid_file)
+    # The record answers for a daemon that is running. Once this returns there is
+    # none, so it goes with the pid file rather than outliving it as a claim
+    # about a directory the next `start` may not even choose.
     if not _pid_alive(pid):
         pid_file.unlink(missing_ok=True)
+        _forget_state_root(root)
         return {"stopped": False, "running": False, "pid": None}
 
     def send(sig: signal.Signals) -> None:
@@ -3284,11 +3351,13 @@ def cmd_service_stop(timeout: float, force: bool) -> dict[str, Any]:
     while time.time() < deadline:
         if not _pid_alive(pid):
             pid_file.unlink(missing_ok=True)
+            _forget_state_root(root)
             return {"stopped": True, "running": False, "pid": pid}
         time.sleep(0.1)
     if force:
         send(signal.SIGKILL)
         pid_file.unlink(missing_ok=True)
+        _forget_state_root(root)
         return {"stopped": True, "killed": True, "running": False, "pid": pid}
     _die(5, "service_stop_timeout", f"automations daemon did not stop within {timeout:g}s", "retry with `automations service stop --force`")
 
@@ -3305,6 +3374,7 @@ def cmd_service_logs(tail: int) -> dict[str, Any]:
 def cmd_service_run() -> NoReturn:
     root = _root_required()
     _prepare_service(root)
+    _record_state_root(root, _state_path(root))
     runtime = _runtime_path()
     os.execvpe(sys.executable, [sys.executable, str(runtime)], _service_env(root))
 
