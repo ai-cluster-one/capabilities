@@ -4779,6 +4779,63 @@ def _job_channel_key(chat: str | None, topic_id: str | None) -> str | None:
              "pass --topic-id <the topic's root message id>")
 
 
+def _job_scope(args) -> tuple[str | None, str | None, str | None]:
+    """The chat, topic and actor one `jobs` call runs under.
+
+    Two kinds of caller reach this register and they are not the same caller. A
+    maintainer at a terminal owns the project and reads all of it, so an
+    unscoped call stays unscoped. A process the daemon started acts for exactly
+    one requester, and the daemon says who by handing that requester down; a
+    child that arrives without one was launched wrong, which is a missing answer
+    rather than permission to answer for everybody.
+
+    Which of the two is asking is told by the daemon rather than guessed from
+    what happens to be in the environment: it stamps every child it launches,
+    outside any conditional, so the stamp is present exactly when the scope
+    should have been. A stamped child with no requester is refused by name.
+    """
+    chat, topic = args.chat, args.topic_id
+    actor = args.actor
+    authorized_actor = os.environ.get("TELEGRAM_AUTHORIZED_REQUESTER_ID", "").strip()
+    authorized_chat = os.environ.get("TELEGRAM_AUTHORIZED_CHAT_ID", "").strip()
+    authorized_topic = os.environ.get("TELEGRAM_AUTHORIZED_TOPIC_ID", "").strip()
+    if not authorized_actor and os.environ.get("TELEGRAM_DAEMON_CHILD", "").strip():
+        _die(4, "job_scope_missing",
+             "a worker the Telegram daemon started reached the job register "
+             "without the requester it acts for",
+             "the daemon hands its worker TELEGRAM_AUTHORIZED_REQUESTER_ID; a "
+             "child launched without it has no scope and is refused rather than "
+             "answered for every requester")
+    if authorized_actor:
+        if actor and str(actor) != authorized_actor:
+            _die(4, "job_actor_denied", "worker job actor differs from its daemon scope")
+        actor = authorized_actor
+        if chat and str(chat) != authorized_chat:
+            _die(4, "job_scope_denied", "worker job chat differs from its daemon scope")
+        chat = authorized_chat
+        if topic and str(topic) != authorized_topic:
+            _die(4, "job_scope_denied", "worker job topic differs from its daemon scope")
+        topic = authorized_topic or None
+        if args.jobs_cmd == "register":
+            args.requested_by = authorized_actor
+            authorized_origin = os.environ.get(
+                "TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID", "").strip()
+            if args.origin_message_id and str(args.origin_message_id) != authorized_origin:
+                _die(4, "job_scope_denied", "worker job origin differs from its daemon scope")
+            args.origin_message_id = authorized_origin or None
+            authorized_engine = os.environ.get(
+                "TELEGRAM_AUTHORIZED_JOB_ENGINE", "").strip()
+            authorized_model = os.environ.get(
+                "TELEGRAM_AUTHORIZED_JOB_MODEL", "").strip()
+            if args.engine and authorized_engine and args.engine != authorized_engine:
+                _die(4, "job_scope_denied", "worker job engine differs from its channel scope")
+            if args.model and authorized_model and args.model != authorized_model:
+                _die(4, "job_scope_denied", "worker job model differs from its channel scope")
+            args.engine = authorized_engine or args.engine
+            args.model = authorized_model or args.model
+    return chat, topic, actor
+
+
 def _job_row(view: dict) -> dict:
     """One row as this CLI reports it.
 
@@ -5948,38 +6005,7 @@ def main() -> None:
             return
         # The register is a table, not a session: this reaches the store and
         # never opens Telegram, so it runs before any connection is loaded.
-        chat, topic = args.chat, args.topic_id
-        actor = args.actor
-        authorized_actor = os.environ.get("TELEGRAM_AUTHORIZED_REQUESTER_ID", "").strip()
-        authorized_chat = os.environ.get("TELEGRAM_AUTHORIZED_CHAT_ID", "").strip()
-        authorized_topic = os.environ.get("TELEGRAM_AUTHORIZED_TOPIC_ID", "").strip()
-        if authorized_actor:
-            if actor and str(actor) != authorized_actor:
-                _die(4, "job_actor_denied", "worker job actor differs from its daemon scope")
-            actor = authorized_actor
-            if chat and str(chat) != authorized_chat:
-                _die(4, "job_scope_denied", "worker job chat differs from its daemon scope")
-            chat = authorized_chat
-            if topic and str(topic) != authorized_topic:
-                _die(4, "job_scope_denied", "worker job topic differs from its daemon scope")
-            topic = authorized_topic or None
-            if args.jobs_cmd == "register":
-                args.requested_by = authorized_actor
-                authorized_origin = os.environ.get(
-                    "TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID", "").strip()
-                if args.origin_message_id and str(args.origin_message_id) != authorized_origin:
-                    _die(4, "job_scope_denied", "worker job origin differs from its daemon scope")
-                args.origin_message_id = authorized_origin or None
-                authorized_engine = os.environ.get(
-                    "TELEGRAM_AUTHORIZED_JOB_ENGINE", "").strip()
-                authorized_model = os.environ.get(
-                    "TELEGRAM_AUTHORIZED_JOB_MODEL", "").strip()
-                if args.engine and authorized_engine and args.engine != authorized_engine:
-                    _die(4, "job_scope_denied", "worker job engine differs from its channel scope")
-                if args.model and authorized_model and args.model != authorized_model:
-                    _die(4, "job_scope_denied", "worker job model differs from its channel scope")
-                args.engine = authorized_engine or args.engine
-                args.model = authorized_model or args.model
+        chat, topic, actor = _job_scope(args)
         if args.jobs_cmd == "list":
             _emit(cmd_jobs_list(chat, topic, args.state, args.outcome,
                                 args.limit, False, actor))

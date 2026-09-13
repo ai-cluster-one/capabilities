@@ -1015,6 +1015,39 @@ class OutboundActionsTests(unittest.TestCase):
             self.assertEqual(os.environ["CLAUDE_PROJECT_DIR"], "/home/routedproj")
             self.assertNotIn("CAPABILITIES_PROJECT_ENVELOPE", os.environ)
 
+    def _unscoped_jobs_call(self):
+        return types.SimpleNamespace(chat=None, topic_id=None, actor=None,
+                                     jobs_cmd="list")
+
+    @staticmethod
+    def _forget_daemon_scope():
+        for name in ("TELEGRAM_DAEMON_CHILD", "TELEGRAM_AUTHORIZED_REQUESTER_ID",
+                     "TELEGRAM_AUTHORIZED_CHAT_ID", "TELEGRAM_AUTHORIZED_TOPIC_ID"):
+            os.environ.pop(name, None)
+
+    def test_a_daemon_child_that_names_no_requester_is_refused_the_register(self):
+        """The register is keyed by requester, so a child arriving without one
+        used to fall through as an unscoped caller and be answered for every
+        requester in the project. A launcher that said nothing about who it acts
+        for is a missing answer, and the refusal names it rather than widening."""
+        cli = import_cli()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            self._forget_daemon_scope()
+            os.environ["TELEGRAM_DAEMON_CHILD"] = "1"
+            with self.assertRaises(SystemExit) as stopped:
+                cli._job_scope(self._unscoped_jobs_call())
+        self.assertEqual(stopped.exception.code, 4)
+
+    def test_an_unstamped_caller_still_reads_the_whole_register(self):
+        """A maintainer at a terminal owns this project and every job in it.
+        Nothing the daemon did not launch carries the stamp, so that call stays
+        the call it always was."""
+        cli = import_cli()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            self._forget_daemon_scope()
+            self.assertEqual(cli._job_scope(self._unscoped_jobs_call()),
+                             (None, None, None))
+
     def test_worker_jobs_without_an_authorized_chat_are_refused(self):
         shim = import_worker_shim()
         with mock.patch.dict(os.environ, {"TELEGRAM_AUTHORIZED_CHAT_ID": ""},

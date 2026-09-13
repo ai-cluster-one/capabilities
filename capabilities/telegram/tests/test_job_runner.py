@@ -9,10 +9,13 @@ test_job_register.py.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,7 +30,11 @@ from test_assistant_service import (  # noqa: E402
     successful_result,
     wait_until,
 )
+from test_outbound_actions import import_cli  # noqa: E402
 sys.path.pop(0)
+
+DAEMON_SOURCE = (Path(__file__).resolve().parents[1]
+                 / "service" / "daemon.py")
 
 
 def job_settings(**overrides):
@@ -116,6 +123,81 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any("register unavailable" in line
                                 for line in daemon._test_logs))
             await self.stop_session(client, task)
+
+    # -- the scope a child of the daemon asks the register with ----------------
+
+    def test_every_child_the_daemon_launches_says_it_is_one(self):
+        """The CLI can only refuse an unscoped child if it can tell one from a
+        maintainer at a terminal, and only the daemon knows which it launched.
+        The stamp therefore sits outside every conditional: a launcher with
+        nothing to hand down is exactly the case it exists for."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.assertEqual(daemon.worker_env({})["TELEGRAM_DAEMON_CHILD"], "1")
+            self.assertEqual(
+                daemon.worker_env(
+                    daemon.voice_capability_state("111", None))["TELEGRAM_DAEMON_CHILD"],
+                "1")
+
+    def test_a_voice_capability_read_is_launched_with_its_callers_scope(self):
+        """The handler that answers `run_capability` on a live call reaches this
+        state rather than assembling its own, so the caller it acts for cannot
+        be left out of the child it starts."""
+        launched = []
+        for node in ast.walk(ast.parse(DAEMON_SOURCE.read_text())):
+            if not isinstance(node, ast.FunctionDef) and not isinstance(
+                    node, ast.AsyncFunctionDef):
+                continue
+            if node.name != "run_voice_capability":
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and getattr(
+                        inner.func, "id", None) == "worker_env":
+                    launched.append(inner)
+        self.assertEqual(len(launched), 1)
+        call = launched[0]
+        self.assertEqual(len(call.args), 1)
+        self.assertIsInstance(call.args[0], ast.Call)
+        self.assertEqual(call.args[0].func.id, "voice_capability_state")
+
+    def test_a_voice_capability_read_sees_only_its_own_callers_jobs(self):
+        """Two callers, one register. The child runs the real CLI with no shim
+        in front of it, so the scope it was launched with is the only thing
+        between one caller's question and another caller's work."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            store, register = self.as_cli(daemon)
+            try:
+                for caller in ("111", "222"):
+                    queued(register, channel_key=caller, requested_by=caller,
+                           description=f"work for {caller}", engine="stub")
+            finally:
+                store.close()
+
+            cli = import_cli()
+            seen = {}
+            for caller in ("111", "222"):
+                env = daemon.worker_env(
+                    daemon.voice_capability_state(caller, None))
+                self.assertEqual(env["TELEGRAM_AUTHORIZED_CHAT_ID"], caller)
+                self.assertEqual(env["TELEGRAM_AUTHORIZED_REQUESTER_ID"], caller)
+                asked = types.SimpleNamespace(
+                    chat=None, topic_id=None, actor=None, jobs_cmd="list")
+                child = {key: value for key, value in env.items()
+                         if key.startswith("TELEGRAM_AUTHORIZED_")
+                         or key == "TELEGRAM_DAEMON_CHILD"}
+                child.update({"CLAUDE_PROJECT_DIR": str(daemon.PROJECT_ROOT),
+                              "CAPABILITIES_STORE_URL": str(daemon.STORE_URL),
+                              "TELEGRAM_ENVIRONMENT": daemon.ENVIRONMENT})
+                with mock.patch.dict(os.environ, child, clear=False):
+                    os.environ.pop("TELEGRAM_AUTHORIZED_TOPIC_ID", None)
+                    chat, topic, actor = cli._job_scope(asked)
+                    answer = cli.cmd_jobs_list(
+                        chat, topic, None, None, 50, False, actor)
+                seen[caller] = sorted(row["description"] for row in answer["jobs"])
+                self.assertEqual(answer["channel_key"], caller)
+            self.assertEqual(seen, {"111": ["work for 111"],
+                                    "222": ["work for 222"]})
 
     # -- registering from a dialogue turn -------------------------------------
 

@@ -4051,6 +4051,13 @@ def worker_env(state=None):
     if real_telegram:
         env["TELEGRAM_REAL_TELEGRAM"] = real_telegram
     env["PATH"] = f"{WORKER_BIN}{os.pathsep}{env.get('PATH', '')}"
+    # Stamped on every child, whether or not this launcher had a scope to hand
+    # down. The job register answers unscoped to a maintainer at a terminal and
+    # that is the intended answer; it must never be the answer to a process the
+    # daemon started, and only the daemon can tell the two apart. Set outside
+    # every conditional below so a launcher that forgets the scope is refused
+    # rather than promoted.
+    env["TELEGRAM_DAEMON_CHILD"] = "1"
     if st.get("progress_outbox"):
         env["TELEGRAM_PROGRESS_OUTBOX"] = st["progress_outbox"]
     if st.get("worker_session"):
@@ -4082,6 +4089,22 @@ def worker_env(state=None):
     if req.get("reply_to"):
         env["TELEGRAM_PROGRESS_REPLY_TO"] = str(req["reply_to"])
     return env
+
+
+def voice_capability_state(caller_id, authority_context):
+    """The state one capability read runs under, for a caller on the line.
+
+    A call reaches the register the same caller's messages reach, keyed the way
+    `voice_task_job` keys them, so this is the voice worker's own state minus
+    everything a single read has no use for. Naming the caller is what keeps the
+    read to that caller's own rows: a child that named nobody would be answered
+    about everybody.
+    """
+    key = str(caller_id)
+    return {"authority_context": authority_context,
+            "chat_type": "private",
+            "chat_id": key,
+            "current_request": {"sender_id": key}}
 
 
 def write_authority_context(authority, stem):
@@ -7417,8 +7440,7 @@ async def run_session(client):
             if authority is not None:
                 authority_context = write_authority_context(
                     authority, f"{key}-cap-{capability}")
-            env = worker_env({"authority_context": authority_context,
-                              "chat_type": "private"})
+            env = worker_env(voice_capability_state(key, authority_context))
 
             try:
                 # Three calls running, three of them spent guessing a flag: an
