@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib.util
 import itertools
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -6476,6 +6478,133 @@ class UncleanExitTests(unittest.IsolatedAsyncioTestCase):
             daemon.report_unclean_exit()
 
             self.assertEqual(daemon._test_logs, [])
+
+
+class ChannelStopTests(unittest.IsolatedAsyncioTestCase):
+    """`/stop` stops the channel's running work, whatever started it.
+
+    The guide promises a channel command, not a dialogue command, so these hold
+    the rule that decides what belongs to a channel rather than the spelling any
+    one kind of run happens to use today."""
+
+    def stop_settings(self):
+        # `/stop` is a supervisor command; a direct user could not reach it.
+        base = settings()
+        base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
+        return base
+
+    def live_stand_in(self):
+        """A real process group, in its own session exactly as a worker's is —
+        /stop has to actually kill something for this to mean anything."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        self.addCleanup(self.reap, proc)
+        return proc
+
+    def reap(self, proc):
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+    async def registered_runs(self, daemon, client, run_keys):
+        """Leave one live worker process registered under each of `run_keys`.
+
+        A worker is handed the daemon's own proc register, which is the single
+        place a run is registered, so this stands runs up through the surface
+        the daemon itself uses rather than beside it."""
+        running = {}
+
+        def worker(_chat, _tail, state=None, procs=None):
+            for run_key in run_keys:
+                running[run_key] = self.live_stand_in()
+                procs[run_key] = running[run_key]
+            return successful_result("dispatched")
+
+        daemon.WORKERS["stub"] = worker
+        first = Message(120, text="Assistant, start something")
+        client.messages.append(first)
+        task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        await client.handler(Event(first))
+        await wait_until(
+            lambda: daemon.load_register()["123"]["last_processed_message_id"] == 120)
+        self.assertEqual(sorted(running), sorted(run_keys))
+        return task, running
+
+    async def stop_command(self, client):
+        stop = Message(121, text="/stop")
+        client.messages.append(stop)
+        await client.handler(Event(stop))
+        return client.sent[-1]["text"]
+
+    async def finish(self, client, task):
+        client.disconnected.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    async def test_stop_reaches_the_channels_runs_whatever_identifies_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.stop_settings())
+            # A voice task's own run id, and one of a kind nobody has written
+            # yet. Both are minted the one way a channel's runs are minted, so
+            # what is asserted is the rule rather than either spelling.
+            run_keys = [daemon.worker_proc_key("123", "voice-1757000000-1"),
+                        daemon.worker_proc_key("123", "a-kind-of-run-not-yet-invented")]
+            client = FakeClient()
+            task, running = await self.registered_runs(daemon, client, run_keys)
+
+            self.assertEqual(await self.stop_command(client), "Stopped.")
+            for run_key, proc in running.items():
+                await wait_until(lambda p=proc: p.poll() is not None)
+                self.assertNotEqual(proc.returncode, 0, run_key)
+            await self.finish(client, task)
+
+    async def test_stop_leaves_another_channels_run_and_a_delegated_job_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.stop_settings())
+            # A forum topic inside this same chat is its own channel, and a
+            # delegated job belongs to no channel at all — it is cancelled
+            # through the job register. Neither answers to `/stop` in chat 123.
+            run_keys = [daemon.worker_proc_key(daemon.jobs.channel_key(123, 7), 99),
+                        "job:3d1f9c2e"]
+            client = FakeClient()
+            task, running = await self.registered_runs(daemon, client, run_keys)
+
+            self.assertEqual(await self.stop_command(client),
+                             "Nothing is running right now.")
+            for run_key, proc in running.items():
+                self.assertIsNone(proc.poll(), run_key)
+            await self.finish(client, task)
+
+    def test_every_run_key_a_channel_owns_is_minted_by_one_function(self):
+        """The half of the rule that lives with the producers.
+
+        `/stop` reaches a run because the run's key was minted by
+        `worker_proc_key`. A new kind of run that spells its own key is
+        therefore unreachable however carefully the matcher is written, which is
+        exactly how the voice task went missing, so the spelling is pinned from
+        this side too."""
+        tree = ast.parse(DAEMON_PATH.read_text())
+        hand_spelled = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not isinstance(node.value, ast.JoinedStr):
+                continue
+            if not any(isinstance(target, ast.Name) and target.id == "proc_key"
+                       for target in node.targets):
+                continue
+            head = node.value.values[0] if node.value.values else None
+            hand_spelled.append(
+                (node.lineno, head.value if isinstance(head, ast.Constant) else None))
+
+        self.assertEqual(
+            [prefix for _, prefix in hand_spelled], ["job:"],
+            "a worker run key is built by hand at daemon.py line(s) "
+            f"{[line for line, _ in hand_spelled]}; a run a channel owns is "
+            "minted by worker_proc_key so /stop reaches it, and only the "
+            "delegated job, which belongs to no channel, spells its own")
 
 
 if __name__ == "__main__":

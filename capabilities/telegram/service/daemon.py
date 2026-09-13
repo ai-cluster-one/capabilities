@@ -4357,6 +4357,33 @@ def _stream_worker_proc(proc, on_line):
     return "".join(collected["out"]), "".join(collected["err"])
 
 
+# Every worker run a channel owns — a dialogue turn, a voice task, whatever is
+# written next — is registered under the channel key, this separator, and
+# whatever identifies the run. The pair below is the only place that spelling
+# lives: one function writes it, one reads it back, so a new kind of run is
+# reachable by /stop the moment it is minted here rather than when somebody
+# remembers to teach /stop a fourth spelling. That is the whole defect this
+# replaced — a voice task spelled its own key and /stop, which knew only the
+# dialogue spelling, reported nothing running while the worker was alive.
+#
+# The separator is load-bearing because a forum topic's channel key already
+# carries `#topic:<id>`: `<chat>` and `<chat>#topic:7` are different channels,
+# and a run under either must not answer to the other.
+WORKER_RUN_SEPARATOR = ":"
+
+
+def worker_proc_key(channel_key, run_id):
+    """The key one worker process running for `channel_key` is registered under."""
+    return f"{channel_key}{WORKER_RUN_SEPARATOR}{run_id}"
+
+
+def worker_run_in_channel(run_key, channel_key):
+    """Whether a registered worker run is work that `channel_key` may stop."""
+    run_key, channel_key = str(run_key), str(channel_key)
+    return (run_key == channel_key
+            or run_key.startswith(f"{channel_key}{WORKER_RUN_SEPARATOR}"))
+
+
 def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None,
                     on_start=None, cwd=None):
     """Run a worker subprocess in its own process group (start_new_session) and register it in
@@ -5075,7 +5102,7 @@ async def run_session(client):
             log(f"{key}: killed lingering worker pgid {proc.pid} during job cleanup")
 
     def proc_key_for(chat_key, job):
-        return f"{chat_key}:{job.get('message_id')}"
+        return worker_proc_key(chat_key, job.get("message_id"))
 
     def message_chunks(text, reserve=0):
         """Split outbound text without exceeding Telegram's message length limit.
@@ -5773,10 +5800,14 @@ async def run_session(client):
         timers[key] = asyncio.create_task(debounce(key, ent_id))
 
     def stop_running(key):
-        """/stop: abort this chat's in-flight worker and clear queued jobs."""
+        """/stop: abort this channel's in-flight workers and clear queued jobs.
+
+        Which runs are this channel's is asked of `worker_run_in_channel` rather
+        than decided here, so every kind of run minted for the channel is reached
+        and no kind has to be enumerated."""
         stopped = False
         for run_key, proc in list(procs.items()):
-            if run_key != key and not run_key.startswith(f"{key}:"):
+            if not worker_run_in_channel(run_key, key):
                 continue
             if not proc:
                 continue
@@ -6052,6 +6083,10 @@ async def run_session(client):
             "text": row["description"],
         }
 
+        # Spelled here rather than by `worker_proc_key`, and deliberately: a
+        # delegated job is owned by the register and cancelled through it, not by
+        # the channel it was asked from, so it names no channel and /stop does
+        # not reach it.
         proc_key = f"job:{job_id}"
         cancel_event = threading.Event()
         job_procs[job_id], job_cancels[job_id] = proc_key, cancel_event
@@ -7256,7 +7291,7 @@ async def run_session(client):
                         caller_id, VOICE_PROGRESS_INTERVAL) + text
                 job = voice_task_job(caller_id, caller_name, worker_text, task_id)
                 authority = _authority_policy_for(job, None, True)
-                proc_key = f"{key}#voice-{task_id}"
+                proc_key = worker_proc_key(key, task_id)
                 authority_context = None
                 worker_session = None
                 cancel_event = threading.Event()
