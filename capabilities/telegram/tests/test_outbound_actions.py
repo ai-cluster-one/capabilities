@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sqlite3
@@ -13,6 +15,7 @@ import tempfile
 import time
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -1249,6 +1252,111 @@ class OutboundActionsTests(unittest.TestCase):
         )
         self.assertEqual(by_id[2]["type"], "unsupported")
         self.assertEqual(by_id[3]["text"], "later message")
+
+
+class ServiceDoctorExitTests(unittest.TestCase):
+    """`service doctor` is what a container entrypoint and a deploy step gate
+    on, so its verdict has to reach the exit code. The payload is the contract a
+    consuming project already reads; only the exit code answers for `ok`."""
+
+    PAYLOAD_KEYS = {"ok", "service", "connection", "note"}
+
+    def _run_doctor(self, cli, tmp, health):
+        """Drive the real dispatch for one runtime-health shape and return
+        (exit_code, payload). The verdict is computed by the real
+        `cmd_service_doctor` over the real `_service_runtime_health`; only the
+        initialization, connection and status plumbing around it is stood in
+        for. `health=None` means no daemon at all."""
+        health_path = Path(tmp) / "health.json"
+        running = health is not None
+        if health:
+            health_path.write_text(json.dumps(health))
+        runtime = cli._service_runtime_health(health_path, running)
+
+        def fake_status(connection_flag, session_flag):
+            return {"initialized": True, "running": running,
+                    "healthy": runtime["healthy"], "health": runtime,
+                    "connection": "probe", "expectation_mismatches": []}
+
+        cfg = {"id": "probe", "allow_write": True,
+               "session": str(Path(tmp) / "probe")}
+        captured = io.StringIO()
+        with mock.patch.object(cli, "_gate", lambda: None), \
+                mock.patch.object(cli, "_contract", lambda argv: None), \
+                mock.patch.object(cli, "_service_project_root", lambda: Path(tmp)), \
+                mock.patch.object(cli, "_require_service_initialized", lambda root: None), \
+                mock.patch.object(cli, "_validate_service_settings", lambda root: None), \
+                mock.patch.object(cli, "_service_wanted_connection",
+                                  lambda root, flag: "probe"), \
+                mock.patch.object(cli, "_load_config", lambda *a, **k: cfg), \
+                mock.patch.object(cli, "_write_gate", lambda *a: None), \
+                mock.patch.object(cli, "cmd_service_status", fake_status), \
+                mock.patch.object(sys, "argv", ["telegram", "service", "doctor"]), \
+                contextlib.redirect_stdout(captured):
+            try:
+                cli.main()
+                code = 0
+            except SystemExit as stopped:
+                code = stopped.code
+        return code, json.loads(captured.getvalue())
+
+    @staticmethod
+    def _stamp(age_seconds):
+        moment = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        return moment.isoformat().replace("+00:00", "Z")
+
+    def test_a_live_daemon_with_no_health_record_fails(self):
+        """`health.json` absent under a live pid is state `unknown` — the
+        daemon is up and nothing says its sync is current."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload = self._run_doctor(cli, tmp, health={})
+        self.assertEqual(payload["service"]["health"]["state"], "unknown")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(code, 5)
+
+    def test_a_live_daemon_whose_sync_went_stale_fails(self):
+        """A health record older than its own staleness window is state
+        `stale` — the sync stopped without the process dying."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload = self._run_doctor(cli, tmp, health={
+                "state": "healthy", "last_sync_at": self._stamp(900),
+                "stale_after_seconds": 60})
+        self.assertEqual(payload["service"]["health"]["state"], "stale")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(code, 5)
+
+    def test_a_fresh_daemon_passes(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload = self._run_doctor(cli, tmp, health={
+                "state": "healthy", "last_sync_at": self._stamp(1),
+                "stale_after_seconds": 600})
+        self.assertEqual(payload["service"]["health"]["state"], "healthy")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(code, 0)
+
+    def test_a_stopped_service_passes(self):
+        """No daemon is not a failing daemon; the verdict is unchanged."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload = self._run_doctor(cli, tmp, health=None)
+        self.assertEqual(payload["service"]["health"]["state"], "stopped")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(code, 0)
+
+    def test_the_failing_verdict_still_emits_the_whole_payload(self):
+        """A consuming project reads this payload; the exit code is added to it
+        rather than taken out of it."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            failing = self._run_doctor(cli, tmp, health={})[1]
+            passing = self._run_doctor(cli, tmp, health=None)[1]
+        for payload in (failing, passing):
+            self.assertEqual(set(payload), self.PAYLOAD_KEYS)
+            self.assertEqual(payload["connection"], "probe")
+            self.assertIn("update sync", payload["note"])
 
 
 if __name__ == "__main__":

@@ -155,6 +155,9 @@ Commands:
                                                Status follows the account-global
                                                owner record and reports actual code,
                                                project and state provenance.
+                                               `doctor` exits 5 when its own
+                                               verdict is `ok: false`, so a
+                                               script can gate on it.
 
 Chat references:
   <chat> can be @username, a phone (+1555…), a numeric id, or a chat title
@@ -188,7 +191,9 @@ Exit codes:
   4  policy refusal — disabled by effective project/global policy records,
      or `send` on a read-only connection — ask the user, never lift the gate
      yourself
-  5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx
+  5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx, and
+     `service doctor` reporting `ok: false` — a running daemon whose update
+     sync is not fresh
   6  input / validation — a malformed argument, a bad date
 
 Quirks worth knowing:
@@ -5741,6 +5746,9 @@ def cmd_service_logs(connection_flag: str | None, session_flag: str | None,
 
 
 def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) -> dict:
+    """The service's verdict, for the caller to gate on. Like `telegram doctor`,
+    it exits 0 only while the verdict is ok; the dispatcher below turns an
+    `ok: false` into exit 5."""
     root = _service_project_root()
     _require_service_initialized(root)
     _validate_service_settings(root)
@@ -6044,7 +6052,14 @@ def main() -> None:
         elif args.service_cmd == "logs":
             _emit(cmd_service_logs(connection_flag, session_flag, args.tail))
         elif args.service_cmd == "doctor":
-            _emit(cmd_service_doctor(connection_flag, session_flag))
+            report = cmd_service_doctor(connection_flag, session_flag)
+            _emit(report)                # the payload first — a caller reads it
+            if not report["ok"]:
+                # An entrypoint or a deploy step gates on this, so the verdict
+                # has to reach the exit code. What reaches `ok: false` is a
+                # running daemon whose update sync is not fresh: a
+                # server/network outcome, category 5.
+                sys.exit(5)
         elif args.service_cmd == "run":
             cmd_service_run(connection_flag, session_flag)
         elif args.service_cmd == "migrate-ownership":
