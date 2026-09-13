@@ -918,6 +918,101 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(register.get(row["id"])["attempt"], 2)
             await self.stop_session(second_client, second)
 
+    # -- a run's progress file ends with the run ------------------------------
+
+    @staticmethod
+    def left_behind(daemon):
+        if not daemon.PROGRESS_DIR.exists():
+            return []
+        return sorted(path.name for path in daemon.PROGRESS_DIR.iterdir())
+
+    async def run_one_job(self, td, worker, *, wait_for):
+        """Hand the runner one row and let it take it.
+
+        The job class is the other thing that mints a progress file, and its
+        file is named for the row rather than for a message — so it accumulates
+        one per durable job where a dialogue turn accumulates one per message."""
+        daemon = self.daemon_with_store(td)
+        self.addCleanup(daemon.close_job_register)
+        register = daemon.job_register()
+        row = queued(register, channel_key="123", requested_by="777",
+                     description="the job", engine="stub")
+        daemon.WORKERS["stub"] = worker
+        client = FakeClient([])
+        task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        await wait_until(lambda: wait_for(daemon, register, row), timeout=10)
+        return daemon, register, row, client, task
+
+    async def test_a_completed_job_keeps_its_progress_file_only_while_it_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            seen = []
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                outbox = Path(state["progress_outbox"])
+                outbox.write_text(json.dumps({"text": "half way"}) + "\n")
+                # Read from inside the run, the one moment the file is meant
+                # to be there.
+                seen.append((outbox, outbox.exists()))
+                return successful_result("done")
+
+            daemon, _register, _row, client, task = await self.run_one_job(
+                td, worker,
+                wait_for=lambda d, reg, r: (
+                    reg.get(r["id"])["outcome"] == d.jobs.SUCCEEDED))
+            await self.stop_session(client, task)
+
+            self.assertEqual([alive for _path, alive in seen], [True],
+                             "the file is transport while the worker runs")
+            self.assertFalse(seen[0][0].exists())
+            self.assertEqual(self.left_behind(daemon), [])
+
+    async def test_a_failed_job_leaves_no_progress_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            seen = []
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                outbox = Path(state["progress_outbox"])
+                outbox.write_text(json.dumps({"text": "about to fall"}) + "\n")
+                seen.append(outbox)
+                raise RuntimeError("the job fell over")
+
+            daemon, _register, _row, client, task = await self.run_one_job(
+                td, worker,
+                wait_for=lambda d, reg, r: (
+                    reg.get(r["id"])["outcome"] == d.jobs.FAILED))
+            await self.stop_session(client, task)
+
+            self.assertTrue(seen, "the worker reached the point of writing")
+            self.assertEqual(self.left_behind(daemon), [])
+
+    async def test_a_job_interrupted_by_session_close_leaves_no_progress_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            seen = []
+            loop = asyncio.get_running_loop()
+            running = asyncio.Event()
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                outbox = Path(state["progress_outbox"])
+                outbox.write_text(json.dumps({"text": "mid flight"}) + "\n")
+                seen.append(outbox)
+                loop.call_soon_threadsafe(running.set)
+                state["cancel_event"].wait(timeout=8)
+                raise RuntimeError("worker process group killed")
+
+            daemon, _register, row, client, task = await self.run_one_job(
+                td, worker, wait_for=lambda _d, _reg, _r: running.is_set())
+            # The close interrupts the run rather than answering it: the row
+            # goes back to waiting, and the file goes with the run.
+            await self.stop_session(client, task)
+
+            self.assertTrue(seen)
+            # The session's own register went with the session; this is the
+            # reopened one, exactly as a restart reads the row.
+            register = daemon.job_register()
+            self.assertEqual(register.get(row["id"])["state"], daemon.jobs.WAITING)
+            self.assertEqual(self.left_behind(daemon), [])
+
 
 if __name__ == "__main__":
     unittest.main()

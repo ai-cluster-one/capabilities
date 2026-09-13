@@ -7635,5 +7635,226 @@ class VoiceReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(session_task, timeout=10)
 
 
+class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
+    """A run's progress file lives exactly as long as the run does.
+
+    It is live transport while the worker is running, so it has to be on disk
+    for the whole turn and gone once the turn has ended, by any ending. The
+    names are unique per run, so nothing a later run does can collect what an
+    earlier one left: a file that outlives its run outlives the deployment, and
+    it holds that worker's intermediate reasoning while it does."""
+
+    async def stop_session(self, client, task):
+        client.disconnected.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    def stop_settings(self):
+        # `/stop` is a supervisor command; a direct user could not reach it.
+        base = settings(worker_timeout=30)
+        base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
+        return base
+
+    @staticmethod
+    def left_behind(daemon):
+        if not daemon.PROGRESS_DIR.exists():
+            return []
+        return sorted(path.name for path in daemon.PROGRESS_DIR.iterdir())
+
+    def blocking_worker(self, daemon, seen):
+        """A worker holding a real child open until something kills it.
+
+        The turn has to still be running when `/stop` or the session close
+        arrives, and it has to have written its progress file first, or these
+        endings would land on a run that had already finished cleaning up."""
+        def worker(_chat, _tail, state=None, procs=None):
+            outbox = Path(state["progress_outbox"])
+            outbox.write_text(json.dumps({"text": "working on it"}) + "\n")
+            seen.append(outbox)
+            rc, _out, err = daemon.run_worker_proc(
+                state["proc_key"],
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                procs,
+                cancel_event=state["cancel_event"],
+            )
+            if rc:
+                raise RuntimeError(err or f"worker exit {rc}")
+            return successful_result()
+        return worker
+
+    async def test_a_completed_turn_keeps_its_progress_file_only_while_it_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            seen = []
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                outbox = Path(state["progress_outbox"])
+                outbox.write_text(json.dumps({"text": "half way"}) + "\n")
+                # Read from inside the run, the one moment the file is meant
+                # to be there.
+                seen.append((outbox, outbox.exists()))
+                return successful_result("finished")
+
+            daemon.WORKERS["stub"] = worker
+            message = Message(200, text="Assistant, do the thing")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 200)
+            await self.stop_session(client, task)
+
+            self.assertEqual([alive for _path, alive in seen], [True],
+                             "the file is transport while the worker runs")
+            self.assertFalse(seen[0][0].exists())
+            self.assertEqual(self.left_behind(daemon), [])
+
+    async def test_a_failed_turn_leaves_no_progress_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            seen = []
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                outbox = Path(state["progress_outbox"])
+                outbox.write_text(json.dumps({"text": "about to fall over"}) + "\n")
+                seen.append(outbox)
+                raise RuntimeError("the worker fell over")
+
+            daemon.WORKERS["stub"] = worker
+            message = Message(201, text="Assistant, do the thing")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 201)
+            await self.stop_session(client, task)
+
+            self.assertTrue(seen, "the worker reached the point of writing")
+            self.assertEqual(self.left_behind(daemon), [])
+
+    async def test_a_turn_stopped_by_stop_leaves_no_progress_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.stop_settings())
+            seen = []
+            daemon.WORKERS["stub"] = self.blocking_worker(daemon, seen)
+            message = Message(202, text="Assistant, do something slow")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(lambda: seen and seen[0].exists(), timeout=15)
+
+            stop = Message(203, text="/stop")
+            client.messages.append(stop)
+            await client.handler(Event(stop))
+            await wait_until(lambda: not daemon.load_register()["123"]["jobs"],
+                             timeout=15)
+            await self.stop_session(client, task)
+
+            self.assertEqual(self.left_behind(daemon), [])
+
+    async def test_a_turn_cancelled_by_session_close_leaves_no_progress_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.stop_settings())
+            seen = []
+            daemon.WORKERS["stub"] = self.blocking_worker(daemon, seen)
+            message = Message(204, text="Assistant, do something slow")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(lambda: seen and seen[0].exists(), timeout=15)
+
+            # The close cancels the turn mid-run, which is the ending that
+            # requeues the job rather than answering it.
+            await self.stop_session(client, task)
+            await wait_until(lambda: not self.left_behind(daemon), timeout=15)
+
+            self.assertEqual(self.left_behind(daemon), [])
+            self.assertEqual(
+                daemon.load_register()["123"]["jobs"]["204"]["status"], "queued")
+
+    async def test_a_daemons_turns_do_not_accumulate_progress_files(self):
+        """The measured symptom: one file per message, for the life of a run."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                Path(state["progress_outbox"]).write_text(
+                    json.dumps({"text": "working"}) + "\n")
+                return successful_result("done")
+
+            daemon.WORKERS["stub"] = worker
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            for message_id in range(210, 215):
+                message = Message(message_id, text="Assistant, again")
+                client.messages.append(message)
+                await client.handler(Event(message))
+                await wait_until(
+                    lambda mid=message_id: daemon.load_register()["123"][
+                        "last_processed_message_id"] == mid)
+            await self.stop_session(client, task)
+
+            self.assertEqual(self.left_behind(daemon), [])
+
+    def test_a_progress_file_is_minted_and_dropped_in_one_place_each(self):
+        """The half of the rule no single run can demonstrate.
+
+        Three kinds of run mint an outbox, and each used to spell the mint and
+        the pre-emptive unlink itself — which is how two of them came to spell
+        a mint and no cleanup at all. `PROGRESS_DIR` being unreachable outside
+        `prepare_progress_outbox` is what makes a new minting path come through
+        the pair, and a function that mints one owes the discard."""
+        tree = ast.parse(DAEMON_PATH.read_text())
+        mint = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "prepare_progress_outbox")
+        outside = sorted({
+            node.lineno for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id == "PROGRESS_DIR"
+            and not isinstance(node.ctx, ast.Store)
+            and not mint.lineno <= node.lineno <= mint.end_lineno})
+        self.assertEqual(
+            outside, [],
+            "PROGRESS_DIR is read at daemon.py line(s) "
+            f"{outside}; a progress file is minted through "
+            "prepare_progress_outbox so that every mint owes a discard")
+
+        def own_calls(node, found=None):
+            """The names this body calls itself.
+
+            A nested definition is its own body and answers for itself, so the
+            walk stops at one: the daemon nests these runs several deep, and
+            counting a child's calls as the parent's would let an inner mint be
+            paid for by an outer discard."""
+            found = set() if found is None else found
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.Lambda)):
+                    continue
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                    found.add(child.func.id)
+                own_calls(child, found)
+            return found
+
+        minting = [node for node in ast.walk(tree)
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node is not mint
+                   and "prepare_progress_outbox" in own_calls(node)]
+        self.assertEqual(sorted(node.name for node in minting),
+                         ["attempt", "run_job_row", "run_one_job"],
+                         "the voice task, the durable job and the dialogue turn")
+        undropped = sorted(node.name for node in minting
+                           if "discard_progress_outbox" not in own_calls(node))
+        self.assertEqual(
+            undropped, [],
+            f"{undropped} mint a progress file and never drop it; the file "
+            "carries the worker's intermediate reasoning and outlives the "
+            "deployment once its run has gone")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4019,6 +4019,35 @@ def cleanup_worker_session(worker_session):
             Path(worker_session + suffix).unlink()
 
 
+def prepare_progress_outbox(stem):
+    """Mint the file one run's intermediate lines travel through.
+
+    Every stem is unique to its run, so nothing here can collect an earlier
+    run's file and the pre-emptive unlink only ever clears this run's own
+    leftovers. What ends the file is `discard_progress_outbox` in the `finally`
+    that ends the run, and the pairing is the whole reason these two exist:
+    `PROGRESS_DIR` is read nowhere else, so a path that mints an outbox has to
+    come through here and is visible when it does not also discard one.
+    """
+    PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+    progress_outbox = PROGRESS_DIR / f"{stem}.jsonl"
+    discard_progress_outbox(progress_outbox)
+    return progress_outbox
+
+
+def discard_progress_outbox(progress_outbox):
+    """Drop a run's progress file.
+
+    The file is live transport for as long as the worker is running, so this
+    belongs after the pump that reads it has been stopped and never while the
+    turn is in flight. `None` is the run that failed before it minted one.
+    """
+    if progress_outbox is None:
+        return
+    with contextlib.suppress(OSError):
+        Path(progress_outbox).unlink()
+
+
 WORKER_ENV_DROP = ("TELEGRAM_SERVICE_LAUNCH_NONCE", "SSH_AUTH_SOCK")
 WORKER_ENV_DROP_PREFIXES = ("CLAUDE_CODE_", "CLAUDECODE", "VSCODE_")
 WORKER_ENV_DROP_WHEN_ROUTED = (
@@ -5725,6 +5754,7 @@ async def run_session(client):
         future = None
         progress_task = None
         progress_stop = None
+        progress_outbox = None
         progress_delivered = []
         handoff = {"event": asyncio.Event(), "job": None}
         handoff_wait = None
@@ -5754,10 +5784,8 @@ async def run_session(client):
                 (item for item in tail if item.get("id") == job.get("message_id")), {})
             if current_tail_entry.get("in_reply_to"):
                 current_request["in_reply_to"] = current_tail_entry["in_reply_to"]
-            PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-            progress_outbox = PROGRESS_DIR / f"{_safe_file_part(key)}-{job.get('message_id')}.jsonl"
-            with contextlib.suppress(OSError):
-                progress_outbox.unlink()
+            progress_outbox = prepare_progress_outbox(
+                f"{_safe_file_part(key)}-{job.get('message_id')}")
             worker_session = prepare_worker_session(key, job.get("message_id"))
             authority = _authority_policy_for(job, group_policy, is_direct)
             route_value, route_label = _route_for(job, group_policy, is_direct)
@@ -5955,6 +5983,7 @@ async def run_session(client):
             if progress_task is not None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await asyncio.wait_for(progress_task, timeout=5)
+            discard_progress_outbox(progress_outbox)
             cleanup_worker_session(worker_session)
             if authority_context:
                 with contextlib.suppress(OSError):
@@ -6359,7 +6388,7 @@ async def run_session(client):
         cancel_event = threading.Event()
         job_procs[job_id], job_cancels[job_id] = proc_key, cancel_event
         future = None
-        progress_task = progress_stop = None
+        progress_task = progress_stop = progress_outbox = None
         worker_session = authority_context = None
         participants = [{"name": sender["name"], "role": sender["role"]}]
         try:
@@ -6383,10 +6412,8 @@ async def run_session(client):
                 "delivery": ("the final answer is posted into this channel when "
                              "the job finishes, as a reply to the request"),
             }
-            PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-            progress_outbox = PROGRESS_DIR / f"job-{_safe_file_part(job_id)}.jsonl"
-            with contextlib.suppress(OSError):
-                progress_outbox.unlink()
+            progress_outbox = prepare_progress_outbox(
+                f"job-{_safe_file_part(job_id)}")
             worker_session = prepare_worker_session(key, f"job-{job_id}")
             authority = _authority_policy_for(job, group_policy, is_direct)
             route_value, route_label = _route_for(job, group_policy, is_direct)
@@ -6594,6 +6621,7 @@ async def run_session(client):
             if progress_task is not None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await asyncio.wait_for(progress_task, timeout=5)
+            discard_progress_outbox(progress_outbox)
             cleanup_worker_session(worker_session)
             if authority_context:
                 with contextlib.suppress(OSError):
@@ -7591,10 +7619,8 @@ async def run_session(client):
                     if stage:
                         on_progress(stage, "stream")
 
-                PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-                progress_outbox = PROGRESS_DIR / f"{_safe_file_part(key)}-{task_id}.jsonl"
-                with contextlib.suppress(OSError):
-                    progress_outbox.unlink()
+                progress_outbox = prepare_progress_outbox(
+                    f"{_safe_file_part(key)}-{task_id}")
                 try:
                     worker_session = prepare_worker_session(key, task_id)
                     if authority is not None:
@@ -7659,8 +7685,7 @@ async def run_session(client):
                         progress_task.cancel()
                         with contextlib.suppress(BaseException):
                             await progress_task
-                    with contextlib.suppress(OSError):
-                        progress_outbox.unlink()
+                    discard_progress_outbox(progress_outbox)
                     cleanup_worker_session(worker_session)
                     if authority_context:
                         with contextlib.suppress(OSError):
