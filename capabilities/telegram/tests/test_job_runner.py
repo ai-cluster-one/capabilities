@@ -22,6 +22,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_assistant_service import (  # noqa: E402
+    CODEX_MODEL_REFUSAL_STDOUT,
+    REFUSED_MODEL,
     Event,
     FakeClient,
     Message,
@@ -742,6 +744,56 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                              "a paused queue waits; it is not retried into the wall")
             self.assertTrue(any("usage limit" in (item.get("text") or "")
                                 for item in client.sent))
+            await self.stop_session(client, task)
+
+    # -- a refused model ------------------------------------------------------
+
+    async def test_a_refused_model_is_recorded_as_one_and_named_in_the_chat(self):
+        """Work the binary would not start is not work that failed. Resuming it
+        unchanged buys the same refusal, so the row says which setting is
+        holding it rather than sitting among the jobs worth trying again — and
+        the person reading it is told the binary and the model, not the trace
+        the provider happened to return."""
+        with tempfile.TemporaryDirectory() as td:
+            # The supervisor is the one who can act on this, so the text a
+            # supervisor gets is the text under test.
+            supervised = job_settings()
+            supervised["direct_messages"]["default_role"] = "supervisor"
+            daemon = import_daemon(Path(td), supervised, store=True)
+            self.assertEqual(daemon.STORE_URL, str(Path(td) / "store.sqlite3"))
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            row = queued(register, channel_key="123", requested_by="777",
+                                    description="reconcile the ledger",
+                                    engine="stub")
+
+            def refusing_worker(chat, tail, state=None, procs=None):
+                raise daemon.worker_failure(
+                    "codex", REFUSED_MODEL,
+                    daemon.codex_failure_reason(CODEX_MODEL_REFUSAL_STDOUT, "", 1))
+
+            daemon.WORKERS["stub"] = refusing_worker
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(
+                lambda: register.get(row["id"])["outcome"] is not None, timeout=6)
+
+            stopped = register.get(row["id"])
+            self.assertEqual(stopped["outcome"], daemon.jobs.MODEL_REFUSED)
+            self.assertIn(REFUSED_MODEL, stopped["error"])
+            self.assertNotIn(daemon.jobs.MODEL_REFUSED, daemon.jobs.SELF_RESUMING,
+                             "nothing resumes itself into the same refusal")
+
+            # The row is written where the work ended; the notice is delivered
+            # after it, so it is waited for rather than read beside the outcome.
+            def notices():
+                return [item.get("text") or "" for item in client.sent]
+
+            await wait_until(lambda: any(REFUSED_MODEL in text and "codex" in text
+                                         for text in notices()), timeout=6)
+            self.assertFalse(any("invalid_request_error" in text
+                                 for text in notices()), notices())
             await self.stop_session(client, task)
 
     # -- restart --------------------------------------------------------------

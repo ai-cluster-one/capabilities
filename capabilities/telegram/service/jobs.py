@@ -257,7 +257,10 @@ STORE_MIGRATION_STEPS = {
 # `outcome` is that label — why the job is stopped. It earns its values by
 # them behaving differently: `quota` is resumed by the runner when the pause
 # lifts, `interrupted` by the configured recovery policy, and the rest only by
-# somebody asking. It says nothing while the job is waiting or running.
+# somebody asking. `model_refused` is the one that answers a resume the same
+# way it answered the run, because the binary refused the model rather than the
+# work — asking again without changing the setting spends another attempt on a
+# refusal already given. It says nothing while the job is waiting or running.
 # A job is written before it is handed over. `draft` is that gap made explicit:
 # the row exists, so a description can be corrected and material added to it,
 # and no runner will take it, because the runner claims `waiting` and nothing
@@ -273,7 +276,8 @@ FAILED = "failed"
 CANCELLED = "cancelled"
 INTERRUPTED = "interrupted"
 QUOTA = "quota"
-OUTCOMES = (SUCCEEDED, FAILED, CANCELLED, INTERRUPTED, QUOTA)
+MODEL_REFUSED = "model_refused"
+OUTCOMES = (SUCCEEDED, FAILED, CANCELLED, INTERRUPTED, QUOTA, MODEL_REFUSED)
 
 # Resumed without being asked: one when the subscription comes back, one when
 # the daemon that was running it restarted. Every other outcome waits for a

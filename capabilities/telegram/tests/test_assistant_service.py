@@ -530,6 +530,34 @@ CLAUDE_ERROR_DOCUMENT = {
     "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 }
 
+# The same shape carrying a failure that is not about the model, so the rule
+# that the document outranks whatever stderr carried is still read against an
+# ordinary failure now that a refused model is answered in its own words.
+CLAUDE_ORDINARY_ERROR_DOCUMENT = {
+    **CLAUDE_ERROR_DOCUMENT,
+    "result": "Credit balance is too low to run this request.",
+    "api_error_status": 400,
+}
+
+# The model the binary will not run, named the same way on both engines: it is
+# the value a person configured and the one they have to change.
+REFUSED_MODEL = "bogus-model-x"
+
+# What codex prints when it will not run the model it was given — the provider's
+# own 400 forwarded verbatim as the turn's verdict, in a register that has
+# nothing in common with the sentence claude writes for the same refusal.
+CODEX_MODEL_REFUSAL = (
+    "unexpected status 400 Bad Request: "
+    + json.dumps({"error": {
+        "message": f"The '{REFUSED_MODEL}' model requires a newer version of "
+                   "Codex. Please update to the latest version.",
+        "type": "invalid_request_error", "param": None, "code": None}}))
+CODEX_MODEL_REFUSAL_STDOUT = "\n".join([
+    json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+    json.dumps({"type": "error", "message": CODEX_MODEL_REFUSAL}),
+    json.dumps({"type": "turn.failed", "error": {"message": CODEX_MODEL_REFUSAL}}),
+])
+
 
 class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_register_replace_failure_keeps_previous_complete_json(self):
@@ -680,7 +708,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         had none."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            document = json.dumps(CLAUDE_ERROR_DOCUMENT)
+            document = json.dumps(CLAUDE_ORDINARY_ERROR_DOCUMENT)
             noise = ("node:internal/process/promises:288\n"
                      "Warning: some noise on stderr\n")
             for stderr in (noise, ""):
@@ -692,7 +720,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     str(caught.exception),
                     "claude worker failed: "
-                    + CLAUDE_ERROR_DOCUMENT["result"])
+                    + CLAUDE_ORDINARY_ERROR_DOCUMENT["result"])
             reason = daemon.claude_failure_reason(document, noise, 1)
             self.assertNotIn("promises:288", reason)
             self.assertNotIn("{", reason)
@@ -707,6 +735,73 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 daemon.claude_failure_reason(
                     json.dumps(CLAUDE_ERROR_DOCUMENT), "", 1),
                 CLAUDE_ERROR_DOCUMENT["result"])
+
+    async def test_a_refused_codex_model_is_named_rather_than_relayed(self):
+        """A binary that will not run the configured model answers with the
+        provider's invalid-request trace, which names no action a person can
+        take and reads like any other worker failure. The refusal is recognised
+        and reported as what it is: this binary, that model."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            state = {"settings": {"model": REFUSED_MODEL}}
+            with mock.patch.object(
+                    daemon, "run_worker_proc",
+                    return_value=(1, CODEX_MODEL_REFUSAL_STDOUT,
+                                  "Reading additional input from stdin...\n")):
+                with self.assertRaises(daemon.WorkerModelRefused) as caught:
+                    daemon.worker_codex("123", [], state, {})
+            notice = str(caught.exception)
+            self.assertIn(REFUSED_MODEL, notice)
+            self.assertIn("codex", notice)
+            self.assertNotIn("invalid_request_error", notice)
+            self.assertNotIn("{", notice)
+            reason = daemon.codex_failure_reason(CODEX_MODEL_REFUSAL_STDOUT, "", 1)
+            self.assertTrue(daemon.is_model_refused(reason))
+
+    async def test_a_refused_claude_model_is_named_rather_than_relayed(self):
+        """The same refusal from the other engine. claude writes a sentence
+        where codex forwards a trace, so nothing that recognised one of them
+        would recognise the other, and both have to be."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            document = json.dumps(CLAUDE_ERROR_DOCUMENT)
+            state = {"settings": {"model": REFUSED_MODEL}}
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(1, document, "")):
+                with self.assertRaises(daemon.WorkerModelRefused) as caught:
+                    daemon.worker_claude("123", [], state, {})
+            notice = str(caught.exception)
+            self.assertIn(REFUSED_MODEL, notice)
+            self.assertIn("claude", notice)
+            self.assertNotIn("{", notice)
+            self.assertTrue(
+                daemon.is_model_refused(CLAUDE_ERROR_DOCUMENT["result"]))
+
+    async def test_a_refused_model_is_not_read_as_a_spent_subscription(self):
+        """The two readings ask different questions and only one of them is a
+        pause the queue can wait out. A run that says both is the pause, because
+        waiting is what makes it right again; nothing waits out a setting."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            both = (f"The model {REFUSED_MODEL} is not available: "
+                    "you've hit your usage limit.")
+            self.assertTrue(daemon.MODEL_REFUSED_RE.search(both))
+            self.assertTrue(daemon.is_quota_exhausted(both))
+            self.assertFalse(daemon.is_model_refused(both))
+
+            quota_reason = daemon.codex_failure_reason(
+                json.dumps({"type": "turn.failed", "error": {
+                    "message": "You've hit your usage limit."}}), "", 1)
+            self.assertFalse(daemon.is_model_refused(quota_reason))
+
+            # An ordinary failure stays an ordinary failure, word for word.
+            for reason in ("auth token expired", "exit 7", "segmentation fault"):
+                self.assertFalse(daemon.is_model_refused(reason))
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(7, "", "")):
+                with self.assertRaises(RuntimeError) as caught:
+                    daemon.worker_claude("123", [], {}, {})
+            self.assertNotIsInstance(caught.exception, daemon.WorkerModelRefused)
 
     async def test_a_failing_claude_with_no_document_falls_back(self):
         """The common shape: four of the five ways the installed CLI exits
@@ -7043,6 +7138,36 @@ class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
             # from a clean slate, and only then was the failure the caller's.
             self.assertEqual(len(runs), 2)
             self.assertNotEqual(runs[0], runs[1])
+            await self.finish(client, session_task)
+
+    async def test_a_voice_task_whose_model_was_refused_is_not_run_again(self):
+        """The same conditions as the retry above — a resumed session, no thread
+        ever opened — and the opposite answer. The binary refused the model
+        before it did anything, so it reads as a session that was lost; running
+        it again in a fresh session hands over the same model, and the caller
+        waits out the identical failure twice to be told it once."""
+        with tempfile.TemporaryDirectory() as td:
+            holder, runs = {}, []
+            daemon, client, session_task, run_task = await self.answered_call(
+                td, holder, runs, worker_timeout=30, carrying="thread-1")
+
+            def refusing_worker(chat, tail, state=None, procs=None):
+                runs.append(state["proc_key"])
+                raise daemon.worker_failure(
+                    "codex", REFUSED_MODEL,
+                    daemon.codex_failure_reason(CODEX_MODEL_REFUSAL_STDOUT, "", 1))
+
+            daemon.WORKERS["codex"] = refusing_worker
+            with self.assertRaises(daemon.WorkerModelRefused) as caught:
+                await asyncio.wait_for(run_task("look something up"), timeout=30)
+
+            self.assertEqual(len(runs), 1, runs)
+            spoken = str(caught.exception)
+            self.assertIn(REFUSED_MODEL, spoken)
+            self.assertIn("codex", spoken)
+            self.assertNotIn("invalid_request_error", spoken)
+            # The carried session is let go, as it is on any other ending.
+            self.assertIsNone(daemon.load_lane(777).session_id)
             await self.finish(client, session_task)
 
 

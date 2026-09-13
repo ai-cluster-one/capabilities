@@ -4567,8 +4567,7 @@ def worker_claude(chat, tail, state=None, procs=None):
         on_start=(state or {}).get("on_worker_start"),
         cwd=(state or {}).get("project_dir"))
     if rc != 0:
-        raise RuntimeError(
-            f"claude worker failed: {claude_failure_reason(out, err, rc)[:500]}")
+        raise worker_failure("claude", model, claude_failure_reason(out, err, rc))
     obj = _first_json_document(out, ("result", "is_error", "subtype"))
     reply = (obj.get("result") or "").strip()
     if obj.get("is_error") or not reply:
@@ -4705,6 +4704,63 @@ def is_quota_exhausted(reason):
     return bool(QUOTA_EXHAUSTED_RE.search(str(reason or "")))
 
 
+# What an engine says when it will not run the model it was handed, rather than
+# when the work is wrong or the subscription is spent. The two answer in
+# completely different registers — codex forwards the provider's invalid-request
+# trace verbatim, claude writes a sentence — so both shapes are named here
+# rather than derived from one of them.
+MODEL_REFUSED_RE = re.compile(
+    r"\bmodel_not_found\b"
+    r"|\b(?:unknown|unsupported|unrecognized|unrecognised|invalid)[ _-]model\b"
+    r"|\bmodel\b[^\n]{0,100}?"
+    r"(?:does not exist|do not exist|may not exist|not have access"
+    r"|requires a newer version|is not supported|is not available)",
+    re.IGNORECASE,
+)
+
+
+def is_model_refused(reason):
+    """True when the binary refused the model rather than the work.
+
+    Read behind the quota sentence, never beside it. A subscription spent on one
+    model says both things at once, and only one of them is a pause that can be
+    waited out; taking the other reading would retire a job the queue would
+    otherwise have resumed by itself.
+    """
+    text = str(reason or "")
+    return bool(MODEL_REFUSED_RE.search(text)) and not is_quota_exhausted(text)
+
+
+class WorkerModelRefused(RuntimeError):
+    """The worker binary will not run the model it was configured with.
+
+    This ending is named because nothing about it is worth another attempt: the
+    same binary refuses the same model the same way every time, and no amount of
+    starting over changes a setting. It is also the one failure that happens
+    before any work does, so there is nothing half-done to protect.
+    """
+
+
+def model_refusal_notice(binary, model):
+    """What a person is told when the binary will not run the model.
+
+    The binary and the model are the whole of the fact — one of them has to
+    change — and both are taken from what the run was configured with rather
+    than from the refusal's own prose, which names them in whatever shape the
+    provider chose and often in none a person can act on.
+    """
+    named = f'the model "{model}"' if model else "its default model"
+    return (f"{binary} will not run {named}. Nothing ran, and a retry is "
+            f"refused the same way until the configured model changes.")
+
+
+def worker_failure(binary, model, reason):
+    """The exception a non-zero worker exit raises, named by what ended it."""
+    if is_model_refused(reason):
+        return WorkerModelRefused(model_refusal_notice(binary, model))
+    return RuntimeError(f"{binary} worker failed: {str(reason)[:500]}")
+
+
 def _codex_turn_completed(stdout):
     """True only when Codex's JSONL protocol confirms a successful turn end."""
     for line in stdout.splitlines():
@@ -4828,8 +4884,8 @@ def worker_codex(chat, tail, state=None, procs=None):
             on_line=(state or {}).get("on_worker_line"),
             on_start=(state or {}).get("on_worker_start"))
         if rc != 0:
-            raise RuntimeError(
-                f"codex worker failed: {codex_failure_reason(stdout_txt, err, rc)[:500]}")
+            raise worker_failure(
+                "codex", model, codex_failure_reason(stdout_txt, err, rc))
         reply = Path(out).read_text().strip()
         if not reply:
             if _codex_turn_completed(stdout_txt):
@@ -6425,12 +6481,21 @@ async def run_session(client):
                     register.resume(job_id)
                 log(f"{key}: job {job_id} interrupted by session close: {reason}")
             else:
-                failure_text = (f"Job failed: «{row['description']}»\n{reason}"
+                # A refused model is recorded as one. It stopped the work before
+                # any of it happened and will stop a resume the same way, so the
+                # row has to say which setting is holding it rather than leave it
+                # among the jobs that merely failed, indistinguishable from work
+                # that is worth trying again.
+                refused = isinstance(exc, WorkerModelRefused)
+                detail = str(exc) if refused else reason
+                failure_text = (f"Job failed: «{row['description']}»\n{detail}"
                                 if any(p.get("role") == "supervisor"
                                        for p in participants)
                                 else f"«{row['description']}» could not be completed. "
                                      "Please tell an administrator.")
-                register.stop(job_id, jobs.FAILED, error=reason,
+                register.stop(job_id,
+                              jobs.MODEL_REFUSED if refused else jobs.FAILED,
+                              error=reason,
                               attempt_token=attempt_token, owner_id=JOB_OWNER_ID,
                               result_text=failure_text)
                 log(f"{key}: job {job_id} failed: {reason}")
@@ -7548,6 +7613,17 @@ async def run_session(client):
                         # session is the one thing they asked not to happen.
                         if lane is not None:
                             lane.clear("stopped")
+                            save_lane(caller_id, lane)
+                        raise
+                    except WorkerModelRefused:
+                        # Read beside the two above and for the same reason. A
+                        # binary that refused the model died before it opened a
+                        # thread, which is exactly the shape of a session that
+                        # was lost — and a fresh session is handed the same model
+                        # and refuses it again, so the caller would wait out the
+                        # same failure twice to be told it once.
+                        if lane is not None:
+                            lane.clear("model_refused")
                             save_lane(caller_id, lane)
                         raise
                     except Exception:

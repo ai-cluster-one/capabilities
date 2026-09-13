@@ -5901,7 +5901,7 @@ def main() -> None:
                        help="what the job is doing")
     jlist.add_argument("--outcome",
                        choices=["succeeded", "failed", "cancelled",
-                                "interrupted", "quota"],
+                                "interrupted", "quota", "model_refused"],
                        help="why a stopped job stopped")
     jlist.add_argument("--limit", type=int, default=50)
     jactive = job_scope(jb.add_parser(
