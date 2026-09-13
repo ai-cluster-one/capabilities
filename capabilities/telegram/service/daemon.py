@@ -4540,13 +4540,14 @@ def _progress_already_delivered(delivered, reply):
 
 
 class ProgressThrottle:
-    """How long a turn must have been working before a progress line is relayed.
+    """How long the chat waits between one progress line and the next.
 
-    One timestamp decides it. It starts at the turn's start and is restamped
-    every time a line is actually sent, so `progress_after` is the minimum gap
-    between the chat hearing anything at all — including the gap before the
-    first line. A turn shorter than the window therefore relays nothing, which
-    is what the setting's name asks for: progress after N seconds of work.
+    The first line of a turn is never held. Its whole point is that it arrives
+    immediately — the way a person says "one moment" before going to look — and
+    the worker is asked for it before its first read. `progress_after` governs
+    the gap after that: the timestamp is stamped on each send, so a burst inside
+    one window relays at most one line beyond the first, and a turn that keeps
+    working stays quiet between lines.
 
     A window of 0 admits every line the moment it arrives, and that falls out
     of the arithmetic rather than out of a branch.
@@ -4558,15 +4559,17 @@ class ProgressThrottle:
         except (TypeError, ValueError):
             self.after = 0.0
         self.since = time.monotonic() if now is None else float(now)
+        self.relayed = False
 
     def elapsed(self, now=None):
         return (time.monotonic() if now is None else float(now)) - self.since
 
     def allows(self, now=None):
-        return self.elapsed(now) >= self.after
+        return not self.relayed or self.elapsed(now) >= self.after
 
     def sent(self, now=None):
         self.since = time.monotonic() if now is None else float(now)
+        self.relayed = True
 
 
 async def _cancel_recording_task(task):
@@ -5514,8 +5517,9 @@ async def run_session(client):
                             progress_after, mark=None, delivered=None,
                             handoff=None):
         offset = 0
-        # The pump is created as the turn is dispatched, so its own start is
-        # the turn's start and the single reference the throttle measures from.
+        # The pump is created as the turn is dispatched, so one throttle spans
+        # the whole turn: the first line it sees is the turn's first line and
+        # goes straight through, and every line after that owes the window.
         # The window is required rather than defaulted: a call site that
         # forgot it would silently relay everything, which is the defect.
         throttle = ProgressThrottle(progress_after)

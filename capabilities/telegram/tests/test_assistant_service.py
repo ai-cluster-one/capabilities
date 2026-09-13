@@ -956,9 +956,9 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_final_reply_is_suppressed_when_progress_already_delivered_it(self):
         with tempfile.TemporaryDirectory() as td:
-            # This turn answers instantly, so the shipped throttle would hold
-            # its progress line and there would be nothing to suppress against.
-            # The unthrottled window is what puts the line in the chat.
+            # Suppressing a duplicate is what this test is about, so the window
+            # is turned off rather than relied on: the line reaches the chat
+            # whatever the throttle is doing.
             daemon = import_daemon(Path(td), settings(progress_after=0))
 
             def echoing_worker(_chat, _tail, state=None, _procs=None):
@@ -982,31 +982,78 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                                 for line in daemon._test_logs))
             await self.stop_session(client, task)
 
-    async def test_the_progress_throttle_measures_from_the_turn_and_from_each_send(self):
-        """One timestamp decides every progress line, including the first.
+    async def test_the_progress_throttle_admits_the_first_line_and_paces_the_rest(self):
+        """The first line owes nothing; the window is the gap after it.
 
-        It starts at the turn's start, so a turn shorter than the window says
-        nothing at all, and it is restamped on each send, so the window is also
-        the minimum gap between two lines reaching the chat. A window of 0 is
-        no throttle, and that falls out of `elapsed >= 0` rather than a branch.
+        Nothing has reached the chat yet when a turn's opening line arrives, so
+        it goes through at the turn's own start. The timestamp is restamped on
+        each send, so the window is the minimum gap between two lines reaching
+        the chat, every time. A window of 0 is no throttle, and that still
+        falls out of `elapsed >= 0` rather than a branch.
         """
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
 
             throttle = daemon.ProgressThrottle(15, now=100.0)
-            # The first line is gated exactly like every later one.
-            self.assertFalse(throttle.allows(now=100.0))
-            self.assertFalse(throttle.allows(now=114.9))
-            self.assertTrue(throttle.allows(now=115.0))
-            throttle.sent(now=115.0)
-            # Sending restamps, so the next line owes the window again.
-            self.assertFalse(throttle.allows(now=129.9))
-            self.assertTrue(throttle.allows(now=130.0))
+            # The first line is admitted at the instant the turn started.
+            self.assertTrue(throttle.allows(now=100.0))
+            self.assertTrue(throttle.allows(now=100.1))
+            throttle.sent(now=100.1)
+            # Sending restamps, so the second line owes the whole window.
+            self.assertFalse(throttle.allows(now=100.1))
+            self.assertFalse(throttle.allows(now=115.0))
+            self.assertTrue(throttle.allows(now=115.1))
+            throttle.sent(now=115.1)
+            # And so does the third: the gap rule is not spent on one line.
+            self.assertFalse(throttle.allows(now=130.0))
+            self.assertTrue(throttle.allows(now=130.1))
 
             unthrottled = daemon.ProgressThrottle(0, now=100.0)
             self.assertTrue(unthrottled.allows(now=100.0))
             unthrottled.sent(now=100.0)
             self.assertTrue(unthrottled.allows(now=100.0))
+
+    async def test_the_first_progress_line_of_a_turn_reaches_the_chat_at_once(self):
+        """A turn far shorter than its window still says it has started.
+
+        The worker is asked for that line before its first read, and the point
+        of it is that it arrives immediately — the way a person says "one
+        moment" before going to look. Nothing about the window may withhold it.
+        """
+        window = 30
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(progress_after=window, worker_timeout=20))
+
+            def announcing_worker(_chat, _tail, state=None, _procs=None):
+                Path(state["progress_outbox"]).write_text(json.dumps({
+                    "text": "Looking into it now."
+                }) + "\n")
+                time.sleep(1.5)
+                return successful_result("Here is the answer.")
+
+            daemon.WORKERS["stub"] = announcing_worker
+            message = Message(96, text="Assistant, do the slow thing")
+            client = TimedClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            # Taken before the turn exists, so it is never later than the
+            # instant the throttle starts from.
+            before_the_turn = time.monotonic()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 96,
+                timeout=20)
+
+            self.assertEqual([item["text"] for item in client.sent],
+                             ["Looking into it now.", "Here is the answer."])
+            # The turn is over long before the window would have elapsed, so a
+            # window that gated this line would have relayed it never.
+            said_after = client.sent_at[0] - before_the_turn
+            self.assertLess(said_after, window, said_after)
+            self.assertFalse(any("progress held" in line
+                                 for line in daemon._test_logs))
+            await self.stop_session(client, task)
 
     async def test_progress_lines_inside_one_window_reach_the_chat_at_most_once(self):
         """A worker that narrates steadily does not narrate into the chat."""
@@ -1030,9 +1077,6 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             client = TimedClient([message])
             task = asyncio.create_task(daemon.run_session(client))
             await client.started.wait()
-            # Taken before the turn exists, so it is never later than the
-            # instant the throttle starts from.
-            before_the_turn = time.monotonic()
             await client.handler(Event(message))
             await wait_until(
                 lambda: daemon.load_register()["123"]["last_processed_message_id"] == 93,
@@ -1049,8 +1093,9 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             gaps = [later - earlier for (earlier, _), (later, _)
                     in zip(relayed, relayed[1:])]
             self.assertTrue(all(gap >= window for gap in gaps), gaps)
-            # The first line is gated too: nothing is said in the opening window.
-            self.assertGreaterEqual(relayed[0][0] - before_the_turn, window)
+            # The burst's opening line is the one that is never held, so it is
+            # the one the chat hears — a later line never takes its place.
+            self.assertEqual(relayed[0][1], "step 0")
             # A held line is dropped where it was read, never queued behind the
             # window, so the chat never receives the whole narration late.
             self.assertIn("all done", [item["text"] for item in client.sent])
@@ -1091,11 +1136,46 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                                  for line in daemon._test_logs))
             await self.stop_session(client, task)
 
+    def handoff_worker(self, daemon, *, before=(), after=()):
+        """A dialogue worker that registers a durable job and is taken over by it.
+
+        `before` and `after` are chat lines written to the outbox ahead of and
+        behind the `job_submitted` event, so a test decides whether the handoff
+        is read before or after the turn has spent its unheld first line.
+        """
+        def worker(_chat, _tail, state=None, _procs=None):
+            if state["current_request"]["kind"] == "registered job":
+                return successful_result("count complete")
+            store, register = daemon.jobs.open_register(
+                daemon._records_module(), daemon.PROJECT_CAPABILITIES_DIR,
+                daemon.ENVIRONMENT, url=daemon.STORE_URL)
+            try:
+                row = register.register(
+                    channel_key=state["channel_key"],
+                    requested_by=state["current_request"]["sender_id"],
+                    origin_message_id=state["current_request"]["message_id"],
+                    description="Count every topic",
+                    engine="stub",
+                )
+                row = register.submit(row["id"])
+            finally:
+                store.close()
+            items = [{"text": text} for text in before]
+            items.append({"event": "job_submitted", "job_id": row["id"],
+                          "description": row["description"]})
+            items.extend({"text": text} for text in after)
+            Path(state["progress_outbox"]).write_text(
+                "".join(json.dumps(item) + "\n" for item in items))
+            while not state["cancel_event"].wait(0.005):
+                pass
+            raise RuntimeError("dialogue worker was handed off")
+        return worker
+
     async def test_a_job_handoff_is_read_while_the_throttle_holds_chat_text(self):
         """The handoff is control flow rather than chat text, so the window
-        never delays it. A turn that registers a durable job inside the window
-        must still hand off, and the acknowledgement the daemon writes when no
-        progress was delivered is what proves the text half stayed held."""
+        never delays it. This turn spends its unheld first line before it
+        registers the job, so the line behind the handoff is squarely inside
+        the window and the chat never receives it."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(
                 Path(td), settings(worker_timeout=2, progress_after=3600),
@@ -1104,34 +1184,9 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             message = Message(95, text="Do a long count")
             client = FakeClient([message])
 
-            def worker(_chat, _tail, state=None, _procs=None):
-                if state["current_request"]["kind"] == "registered job":
-                    return successful_result("count complete")
-                store, register = daemon.jobs.open_register(
-                    daemon._records_module(), daemon.PROJECT_CAPABILITIES_DIR,
-                    daemon.ENVIRONMENT, url=daemon.STORE_URL)
-                try:
-                    row = register.register(
-                        channel_key=state["channel_key"],
-                        requested_by=state["current_request"]["sender_id"],
-                        origin_message_id=state["current_request"]["message_id"],
-                        description="Count every topic",
-                        engine="stub",
-                    )
-                    row = register.submit(row["id"])
-                finally:
-                    store.close()
-                Path(state["progress_outbox"]).write_text(
-                    json.dumps({
-                        "event": "job_submitted",
-                        "job_id": row["id"],
-                        "description": row["description"],
-                    }) + "\n" + json.dumps({"text": "Counting every topic."}) + "\n")
-                while not state["cancel_event"].wait(0.005):
-                    pass
-                raise RuntimeError("dialogue worker was handed off")
-
-            daemon.WORKERS["stub"] = worker
+            daemon.WORKERS["stub"] = self.handoff_worker(
+                daemon, before=("Looking into it now.",),
+                after=("Counting every topic.",))
             task = asyncio.create_task(daemon.run_session(client))
             await client.started.wait()
             await client.handler(Event(message))
@@ -1144,8 +1199,39 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             texts = [item["text"] for item in client.sent]
             self.assertTrue(any("handed off to durable job" in line
                                 for line in daemon._test_logs))
+            # The opening line owed the window nothing and went straight out.
+            self.assertIn("Looking into it now.", texts)
             # The window held the narration, and nothing replayed it later.
             self.assertNotIn("Counting every topic.", texts)
+            # The chat had already been told, so the handoff adds no notice.
+            self.assertNotIn("▶ Count every topic", texts)
+            self.assertIn("count complete", texts)
+            await self.stop_session(client, task)
+
+    async def test_a_handoff_that_said_nothing_is_acknowledged_in_the_chat(self):
+        """A turn that hands off without writing a single progress line leaves
+        the chat with nothing, so the daemon names the job it handed to."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(worker_timeout=2, progress_after=3600),
+                store=True)
+            daemon.DIALOGUE_HANDOFF_GRACE_SECONDS = 0.02
+            message = Message(97, text="Do a long count")
+            client = FakeClient([message])
+
+            daemon.WORKERS["stub"] = self.handoff_worker(daemon)
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 97)
+            await wait_until(
+                lambda: any(item["text"] == "count complete"
+                            for item in client.sent), timeout=8)
+
+            texts = [item["text"] for item in client.sent]
+            self.assertTrue(any("handed off to durable job" in line
+                                for line in daemon._test_logs))
             self.assertIn("▶ Count every topic", texts)
             self.assertIn("count complete", texts)
             await self.stop_session(client, task)
@@ -1430,10 +1516,9 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_forum_topic_progress_uses_the_prompted_wrapper_and_reply(self):
         with tempfile.TemporaryDirectory() as td:
-            # The worker's `telegram send` is the progress channel, so the
-            # shipped throttle would hold this instant turn's line. The wrapper
-            # and the reply target are what this test is about, and an
-            # unthrottled window is what puts them in the chat to be read.
+            # The worker's `telegram send` is the progress channel. The wrapper
+            # and the reply target are what this test is about, so the window
+            # is turned off rather than relied on to let the line through.
             service_settings = settings(progress_after=0)
             service_settings["allowed_groups"] = {
                 "-200": {"aliases": ["Assistant"]},
