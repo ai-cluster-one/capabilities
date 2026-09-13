@@ -4738,27 +4738,63 @@ class WorkerModelRefused(RuntimeError):
     same binary refuses the same model the same way every time, and no amount of
     starting over changes a setting. It is also the one failure that happens
     before any work does, so there is nothing half-done to protect.
+
+    It carries two texts and keeps them apart, because they are read by
+    different people. `str(...)` is the notice — the product's own words, and
+    the whole of what a caller on a call is told, since that path speaks
+    whatever it is handed to whoever is on the line. The engine's own sentence
+    stays on `reason`, for the surfaces that answer to an operator: naming the
+    ending is what was missing, and it is not worth having if the price is the
+    only text that says what actually refused.
     """
+
+    def __init__(self, notice, reason=""):
+        super().__init__(notice)
+        self.notice = notice
+        self.reason = str(reason or "")
 
 
 def model_refusal_notice(binary, model):
     """What a person is told when the binary will not run the model.
 
-    The binary and the model are the whole of the fact — one of them has to
-    change — and both are taken from what the run was configured with rather
-    than from the refusal's own prose, which names them in whatever shape the
-    provider chose and often in none a person can act on.
+    The binary and the model are the whole of the fact, and the fact is that
+    these two will not run together — both taken from what the run was
+    configured with rather than from the refusal's own prose, which names them
+    in whatever shape the provider chose and often in none a person can act on.
+
+    Which of the two is the one to move is not something the daemon knows. The
+    same refusal is returned for a model that does not exist and for a binary
+    too old for one that does, so the notice states the pairing and stops
+    rather than sending a person to the setting that may not be holding it.
     """
     named = f'the model "{model}"' if model else "its default model"
     return (f"{binary} will not run {named}. Nothing ran, and a retry is "
-            f"refused the same way until the configured model changes.")
+            "refused the same way.")
 
 
 def worker_failure(binary, model, reason):
     """The exception a non-zero worker exit raises, named by what ended it."""
     if is_model_refused(reason):
-        return WorkerModelRefused(model_refusal_notice(binary, model))
+        return WorkerModelRefused(model_refusal_notice(binary, model), reason)
     return RuntimeError(f"{binary} worker failed: {str(reason)[:500]}")
+
+
+def worker_diagnosis(exc, fallback):
+    """What an operator is told about a worker that ended badly.
+
+    A named ending keeps the engine's own words *under* the name rather than in
+    place of it. The name is the classification, which an operator has no other
+    way to get; the engine's sentence is the only text that says what actually
+    refused, and it is the one an operator acts on. Anything the daemon has not
+    named reads exactly as it read before there was a name for anything.
+    """
+    if isinstance(exc, WorkerModelRefused) and exc.reason:
+        # Flattened and bounded exactly as `_short_error` flattens and bounds
+        # every other reason that reaches these same surfaces, so one line of
+        # log stays one line of log and a row stays a row.
+        said = exc.reason.replace("\n", " ")[:500]
+        return f"{exc.notice} It said: {said}"
+    return fallback
 
 
 def _codex_turn_completed(stdout):
@@ -5879,12 +5915,17 @@ async def run_session(client):
             release_worker_proc(proc_key)
 
     async def fail_job(key, ent_id, job, is_direct, participants, error):
-        log(f"{key}: worker error job msg={job.get('message_id')}: {error}")
+        # One text for all three of this path's operator surfaces — the log, the
+        # supervisor's notice, and the row — because at base they carried the
+        # same string and there is no reason for them to disagree now that one
+        # ending has a name of its own.
+        detail = worker_diagnosis(error, str(error))
+        log(f"{key}: worker error job msg={job.get('message_id')}: {detail}")
         is_supervisor = (
             job.get("sender_role") == "supervisor"
             or any(p.get("role") == "supervisor" for p in participants)
         )
-        notice = (f"Worker error:\n{error}" if is_supervisor
+        notice = (f"Worker error:\n{detail}" if is_supervisor
                   else "Something went wrong while processing this. Please tell an administrator.")
         try:
             _, group_policy = _group_policy(job.get("chat_id") or _channel_identity(key)[0])
@@ -5897,7 +5938,7 @@ async def run_session(client):
                 mark=NO_REPLY_MARKER if job.get("external_request") else None)
         except Exception as se:
             log(f"{key}: failed to send error notice: {se}")
-        mark_job_finished(key, job, "error", error=error)
+        mark_job_finished(key, job, "error", error=detail)
 
     async def run_queue(key, ent_id):
         """Per-chat queue runner. Each addressed message is its own persisted job and
@@ -6487,7 +6528,7 @@ async def run_session(client):
                 # among the jobs that merely failed, indistinguishable from work
                 # that is worth trying again.
                 refused = isinstance(exc, WorkerModelRefused)
-                detail = str(exc) if refused else reason
+                detail = worker_diagnosis(exc, reason)
                 failure_text = (f"Job failed: «{row['description']}»\n{detail}"
                                 if any(p.get("role") == "supervisor"
                                        for p in participants)
@@ -6495,10 +6536,10 @@ async def run_session(client):
                                      "Please tell an administrator.")
                 register.stop(job_id,
                               jobs.MODEL_REFUSED if refused else jobs.FAILED,
-                              error=reason,
+                              error=detail,
                               attempt_token=attempt_token, owner_id=JOB_OWNER_ID,
                               result_text=failure_text)
-                log(f"{key}: job {job_id} failed: {reason}")
+                log(f"{key}: job {job_id} failed: {detail}")
         finally:
             if progress_stop is not None:
                 progress_stop.set()

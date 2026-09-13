@@ -748,53 +748,87 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     # -- a refused model ------------------------------------------------------
 
+    async def run_refused_job(self, td, *, role):
+        """One durable job whose engine refuses the configured model.
+
+        Returns the stopped row and the texts the chat was sent, so the two
+        readerships — the one who can change the setting and the one who cannot
+        — are driven through the same runner rather than two lookalikes.
+        """
+        supervised = job_settings()
+        supervised["direct_messages"]["default_role"] = role
+        daemon = import_daemon(Path(td), supervised, store=True)
+        self.assertEqual(daemon.STORE_URL, str(Path(td) / "store.sqlite3"))
+        self.addCleanup(daemon.close_job_register)
+        register = daemon.job_register()
+        row = queued(register, channel_key="123", requested_by="777",
+                                description="reconcile the ledger",
+                                engine="stub")
+
+        def refusing_worker(chat, tail, state=None, procs=None):
+            raise daemon.worker_failure(
+                "codex", REFUSED_MODEL,
+                daemon.codex_failure_reason(CODEX_MODEL_REFUSAL_STDOUT, "", 1))
+
+        daemon.WORKERS["stub"] = refusing_worker
+        client = FakeClient([])
+        task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        await wait_until(
+            lambda: register.get(row["id"])["outcome"] is not None, timeout=6)
+        stopped = register.get(row["id"])
+
+        # The row is written where the work ended; the notice is delivered
+        # after it, so it is waited for rather than read beside the outcome.
+        def notices():
+            return [item.get("text") or "" for item in client.sent]
+
+        await wait_until(lambda: bool(notices()), timeout=6)
+        await self.stop_session(client, task)
+        return daemon, stopped, notices()
+
     async def test_a_refused_model_is_recorded_as_one_and_named_in_the_chat(self):
         """Work the binary would not start is not work that failed. Resuming it
         unchanged buys the same refusal, so the row says which setting is
         holding it rather than sitting among the jobs worth trying again — and
-        the person reading it is told the binary and the model, not the trace
-        the provider happened to return."""
+        the supervisor reading it is told the binary and the model, *and* what
+        the engine itself said, which is the only text naming what refused."""
         with tempfile.TemporaryDirectory() as td:
-            # The supervisor is the one who can act on this, so the text a
-            # supervisor gets is the text under test.
-            supervised = job_settings()
-            supervised["direct_messages"]["default_role"] = "supervisor"
-            daemon = import_daemon(Path(td), supervised, store=True)
-            self.assertEqual(daemon.STORE_URL, str(Path(td) / "store.sqlite3"))
-            self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
-            row = queued(register, channel_key="123", requested_by="777",
-                                    description="reconcile the ledger",
-                                    engine="stub")
+            daemon, stopped, notices = await self.run_refused_job(
+                td, role="supervisor")
 
-            def refusing_worker(chat, tail, state=None, procs=None):
-                raise daemon.worker_failure(
-                    "codex", REFUSED_MODEL,
-                    daemon.codex_failure_reason(CODEX_MODEL_REFUSAL_STDOUT, "", 1))
-
-            daemon.WORKERS["stub"] = refusing_worker
-            client = FakeClient([])
-            task = asyncio.create_task(daemon.run_session(client))
-            await client.started.wait()
-            await wait_until(
-                lambda: register.get(row["id"])["outcome"] is not None, timeout=6)
-
-            stopped = register.get(row["id"])
             self.assertEqual(stopped["outcome"], daemon.jobs.MODEL_REFUSED)
-            self.assertIn(REFUSED_MODEL, stopped["error"])
             self.assertNotIn(daemon.jobs.MODEL_REFUSED, daemon.jobs.SELF_RESUMING,
                              "nothing resumes itself into the same refusal")
 
-            # The row is written where the work ended; the notice is delivered
-            # after it, so it is waited for rather than read beside the outcome.
-            def notices():
-                return [item.get("text") or "" for item in client.sent]
+            # The classification and the diagnosis, on the row and in the chat
+            # alike: the name of the ending, and under it the engine's own
+            # sentence, which is what an operator acts on and what every
+            # surface here carried before the ending had a name.
+            engine_said = daemon.codex_failure_reason(
+                CODEX_MODEL_REFUSAL_STDOUT, "", 1)
+            for surface, text in (("row", stopped["error"]),
+                                  ("chat", "\n".join(notices))):
+                self.assertIn(REFUSED_MODEL, text, surface)
+                self.assertIn("codex", text, surface)
+                self.assertIn(engine_said, text, surface)
+                self.assertIn("invalid_request_error", text, surface)
 
-            await wait_until(lambda: any(REFUSED_MODEL in text and "codex" in text
-                                         for text in notices()), timeout=6)
-            self.assertFalse(any("invalid_request_error" in text
-                                 for text in notices()), notices())
-            await self.stop_session(client, task)
+    async def test_a_refused_model_tells_a_non_supervisor_no_more_than_before(self):
+        """The diagnosis is for whoever can act on it. Everyone else is told
+        the same sentence every other failure tells them — no binary, no model,
+        and none of the provider's trace."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon, stopped, notices = await self.run_refused_job(
+                td, role="direct_user")
+
+            self.assertEqual(stopped["outcome"], daemon.jobs.MODEL_REFUSED)
+            self.assertTrue(any("could not be completed" in text
+                                for text in notices), notices)
+            for text in notices:
+                self.assertNotIn(REFUSED_MODEL, text)
+                self.assertNotIn("codex", text)
+                self.assertNotIn("invalid_request_error", text)
 
     # -- restart --------------------------------------------------------------
 

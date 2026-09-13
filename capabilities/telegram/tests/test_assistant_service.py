@@ -803,6 +803,77 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                     daemon.worker_claude("123", [], {}, {})
             self.assertNotIsInstance(caught.exception, daemon.WorkerModelRefused)
 
+    async def test_a_refusal_keeps_the_engines_own_words_for_an_operator(self):
+        """Naming the ending is what was missing; it is not worth the engine's
+        own sentence, which is the only text that says what actually refused.
+        The two are kept apart rather than merged, because the notice is spoken
+        to whoever is on a call and the diagnosis is read by whoever can act."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            engine_said = daemon.codex_failure_reason(
+                CODEX_MODEL_REFUSAL_STDOUT, "", 1)
+            exc = daemon.worker_failure("codex", REFUSED_MODEL, engine_said)
+
+            self.assertEqual(exc.reason, engine_said)
+            self.assertEqual(str(exc), exc.notice)
+            self.assertNotIn("invalid_request_error", str(exc))
+
+            diagnosis = daemon.worker_diagnosis(exc, "unused fallback")
+            self.assertIn(exc.notice, diagnosis)
+            self.assertIn(engine_said, diagnosis)
+
+            # The notice states the pairing and stops. Which of the two has to
+            # move is not knowable from a refusal — the same one is returned
+            # for a model that does not exist and for a binary too old for one
+            # that does — so it must not be asserted.
+            self.assertNotIn("until the configured model changes", exc.notice)
+
+            # Nothing the daemon has not named reads any differently.
+            ordinary = daemon.worker_failure("codex", REFUSED_MODEL, "exit 7")
+            self.assertEqual(daemon.worker_diagnosis(ordinary, "the fallback"),
+                             "the fallback")
+
+    async def test_a_refused_model_in_a_dialogue_turn_reaches_a_supervisor(self):
+        """The other text path. A dialogue turn's worker error goes to the chat
+        it came from, and a supervisor there is the person who can change the
+        setting — so the classification and the engine's own words both land,
+        exactly as the engine's words did before the ending had a name."""
+        for role, told in (("supervisor", True), ("direct_user", False)):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as td:
+                base = settings()
+                base["direct_messages"] = {"mode": "anyone", "default_role": role}
+                daemon = import_daemon(Path(td), base)
+                engine_said = daemon.codex_failure_reason(
+                    CODEX_MODEL_REFUSAL_STDOUT, "", 1)
+
+                def refusing_worker(_chat, _tail, state=None, _procs=None):
+                    raise daemon.worker_failure(
+                        "codex", REFUSED_MODEL,
+                        daemon.codex_failure_reason(
+                            CODEX_MODEL_REFUSAL_STDOUT, "", 1))
+
+                daemon.WORKERS["stub"] = refusing_worker
+                message = Message(93, text="Assistant, answer this")
+                client = FakeClient([message])
+                task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+                await client.handler(Event(message))
+                await wait_until(lambda: bool(client.sent))
+
+                sent = "\n".join(item["text"] for item in client.sent)
+                self.assertEqual(told, REFUSED_MODEL in sent, sent)
+                self.assertEqual(told, engine_said in sent, sent)
+                if not told:
+                    self.assertIn("Please tell an administrator", sent)
+
+                # The log answers to an operator whoever was in the chat, and
+                # it carried the engine's words on this path from the start.
+                logged = "\n".join(line for line in daemon._test_logs
+                                   if "worker error job" in line)
+                self.assertIn(REFUSED_MODEL, logged)
+                self.assertIn(engine_said, logged)
+                await self.stop_session(client, task)
+
     async def test_a_failing_claude_with_no_document_falls_back(self):
         """The common shape: four of the five ways the installed CLI exits
         non-zero leave stdout empty and put one plain line on stderr, and one
