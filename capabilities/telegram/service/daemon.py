@@ -4510,6 +4510,36 @@ def _progress_already_delivered(delivered, reply):
     return False
 
 
+class ProgressThrottle:
+    """How long a turn must have been working before a progress line is relayed.
+
+    One timestamp decides it. It starts at the turn's start and is restamped
+    every time a line is actually sent, so `progress_after` is the minimum gap
+    between the chat hearing anything at all — including the gap before the
+    first line. A turn shorter than the window therefore relays nothing, which
+    is what the setting's name asks for: progress after N seconds of work.
+
+    A window of 0 admits every line the moment it arrives, and that falls out
+    of the arithmetic rather than out of a branch.
+    """
+
+    def __init__(self, after, now=None):
+        try:
+            self.after = max(0.0, float(after))
+        except (TypeError, ValueError):
+            self.after = 0.0
+        self.since = time.monotonic() if now is None else float(now)
+
+    def elapsed(self, now=None):
+        return (time.monotonic() if now is None else float(now)) - self.since
+
+    def allows(self, now=None):
+        return self.elapsed(now) >= self.after
+
+    def sent(self, now=None):
+        self.since = time.monotonic() if now is None else float(now)
+
+
 async def _cancel_recording_task(task):
     """Stop a preempted recorder before its conference chain can settle."""
     if task is None or task is asyncio.current_task():
@@ -5406,7 +5436,7 @@ async def run_session(client):
         return True
 
     async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset,
-                             mark=None, delivered=None, handoff=None):
+                             throttle, mark=None, delivered=None, handoff=None):
         path = Path(outbox)
         if not path.exists():
             return offset
@@ -5433,28 +5463,44 @@ async def run_session(client):
             text = str(item.get("text") or "").strip()
             if not text or text in ("-", ".", "..."):
                 continue
+            # The window is the last thing a line passes, and it governs chat
+            # text alone: a `job_submitted` line left this loop above, handed
+            # off whatever the window says, because it is control flow. A line
+            # held here is dropped where it was read — the offset has already
+            # moved past it — so nothing arrives late in a burst.
+            if not throttle.allows():
+                log(f"{key}: progress held job msg={reply_to or 'direct'} "
+                    f"{throttle.elapsed():.1f}s/{throttle.after:g}s «{text[:80]}»")
+                continue
             _, _ = await send_channel_message(
                 ent_id, text, is_direct,
                 reply_to=None if is_direct else reply_to, mark=mark)
+            throttle.sent()
             if delivered is not None:
                 delivered.append(_normalize_delivered(text))
             log(f"{key}: progress job msg={reply_to or 'direct'} «{text[:80]}»")
         return offset
 
     async def pump_progress(key, outbox, ent_id, is_direct, reply_to, stop_event,
-                            mark=None, delivered=None, handoff=None):
+                            progress_after, mark=None, delivered=None,
+                            handoff=None):
         offset = 0
+        # The pump is created as the turn is dispatched, so its own start is
+        # the turn's start and the single reference the throttle measures from.
+        # The window is required rather than defaulted: a call site that
+        # forgot it would silently relay everything, which is the defect.
+        throttle = ProgressThrottle(progress_after)
         while not stop_event.is_set():
             offset = await drain_progress(
-                key, outbox, ent_id, is_direct, reply_to, offset, mark=mark,
-                delivered=delivered, handoff=handoff)
+                key, outbox, ent_id, is_direct, reply_to, offset, throttle,
+                mark=mark, delivered=delivered, handoff=handoff)
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=1)
             except asyncio.TimeoutError:
                 pass
         await drain_progress(
-            key, outbox, ent_id, is_direct, reply_to, offset, mark=mark,
-            delivered=delivered, handoff=handoff)
+            key, outbox, ent_id, is_direct, reply_to, offset, throttle,
+            mark=mark, delivered=delivered, handoff=handoff)
 
     def reserve_job(key, message, group_policy, is_direct, reason, chat_id=None):
         """Persist ownership of a message before any transcription or other await.
@@ -5762,7 +5808,8 @@ async def run_session(client):
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
                               delivery_reply_id, progress_stop, mark=answer_mark,
-                              delivered=progress_delivered, handoff=handoff))
+                              delivered=progress_delivered, handoff=handoff,
+                              progress_after=s["progress_after"]))
             future = worker_turn(loop, s["worker"], key, tail, state, procs)
             handoff_wait = asyncio.create_task(handoff["event"].wait())
             async with client.action(ent_id, "typing"):
@@ -6426,7 +6473,8 @@ async def run_session(client):
             progress_stop = asyncio.Event()
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
-                              delivery_reply_id, progress_stop))
+                              delivery_reply_id, progress_stop,
+                              progress_after=s["progress_after"]))
             current_before_start = register.get(job_id)
             if (current_before_start is not None
                     and current_before_start.get("stop_requested")):
