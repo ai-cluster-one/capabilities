@@ -35,8 +35,8 @@ from test_assistant_service import (  # noqa: E402
 from test_outbound_actions import import_cli  # noqa: E402
 sys.path.pop(0)
 
-DAEMON_SOURCE = (Path(__file__).resolve().parents[1]
-                 / "service" / "daemon.py")
+TELEGRAM_DIR = Path(__file__).resolve().parents[1]
+DAEMON_SOURCE = TELEGRAM_DIR / "service" / "daemon.py"
 
 
 def job_settings(**overrides):
@@ -477,6 +477,95 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(register.list()[0]["result_text"],
                              "The ledger is reconciled.")
+            await self.stop_session(client, task)
+
+    async def test_a_worker_that_answered_for_itself_is_not_answered_again(self):
+        """One request, one delivery.
+
+        A worker whose result belongs in a file sends it into the chat itself
+        and then has nothing left to return. The job is finished, not failed,
+        and the daemon says nothing after it — the two of them speaking is the
+        person being told the same thing twice."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            row = queued(register, channel_key="123", requested_by="777",
+                                    description="send the table",
+                                    engine="claude")
+            # The real engine worker, handed the document claude writes for a
+            # turn that ran to its end and chose to say nothing.
+            document = json.dumps({
+                "type": "result", "subtype": "success", "is_error": False,
+                "result": "", "session_id": "sess-job",
+                "usage": {"input_tokens": 8, "output_tokens": 0},
+            })
+            client = FakeClient([])
+            with mock.patch.object(daemon, "run_worker_proc",
+                                   return_value=(0, document, "")):
+                task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+                await wait_until(
+                    lambda: register.get(row["id"])["state"] == daemon.jobs.STOPPED,
+                    timeout=8)
+                after = register.get(row["id"])
+                self.assertEqual(after["outcome"], daemon.jobs.SUCCEEDED,
+                                 after["error"])
+
+            after = register.get(row["id"])
+            self.assertTrue(after["result_silent"])
+            # Nothing is left pending, so the delivery drain has nothing to
+            # find however long it runs.
+            self.assertEqual(after["delivery_state"], "delivered")
+            await asyncio.sleep(daemon.JOB_POLL_INTERVAL * 4)
+            self.assertEqual([item["text"] for item in client.sent], [])
+            await self.stop_session(client, task)
+
+    async def test_the_job_worker_is_told_which_of_the_two_deliveries_is_its(self):
+        """The instruction and the daemon's own delivery note agree.
+
+        The worker used to be told both that what it returns is the only thing
+        that has to be said and that a result whose formatting matters goes in
+        a file it sends itself. Obeying both is how one request was answered
+        twice, so neither sentence may stand unconditionally."""
+        template = (TELEGRAM_DIR / "service" / "templates"
+                    / "job-worker.md").read_text()
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), job_settings(), store=True,
+                                   job_worker=template)
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            queued(register, channel_key="123", requested_by="777",
+                              description="compare the two ledgers",
+                              engine="stub")
+            seen = {}
+
+            def worker(_chat, tail, state=None, _procs=None):
+                seen["prompt"] = daemon.build_prompt(tail, state)
+                return successful_result("done")
+
+            daemon.WORKERS["stub"] = worker
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(lambda: "prompt" in seen, timeout=6)
+            prompt = seen["prompt"]
+
+            # The sentence the file-sending rule contradicted is gone from the
+            # prompt as a whole, not merely from the template.
+            self.assertNotIn("the only thing that has to be said", prompt)
+            # The daemon's own note no longer promises a post that a returned
+            # nothing will not produce.
+            delivery = next(line for line in prompt.splitlines()
+                            if line.startswith("Delivery: "))
+            self.assertIn("return nothing", delivery)
+            self.assertNotIn("the final answer is posted", delivery)
+            # And the rule is stated where a worker obeying the file rule is
+            # already reading, rather than only at the top of the file.
+            file_rule = next(line for line in template.splitlines()
+                             if "put it in a file and send the file" in line)
+            self.assertIn("return nothing", file_rule)
+            self.assertIn(file_rule, prompt)
             await self.stop_session(client, task)
 
     async def test_result_delivery_retries_without_reexecuting_the_job(self):

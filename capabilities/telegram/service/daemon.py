@@ -4606,6 +4606,24 @@ def claude_failure_reason(stdout, stderr, rc):
     return (stderr or "").strip() or (stdout or "").strip() or f"exit {rc}"
 
 
+def _claude_turn_completed(document):
+    """True only when claude's own result document confirms a successful turn end.
+
+    The codex counterpart reads `turn.completed` off the event stream. Claude
+    states the same thing in one object: `subtype` carries the verdict and
+    `is_error` the flag, and "success" with `is_error` false is the only pair it
+    writes for a turn that ran to its end. `error_max_turns`,
+    `error_during_execution` and a run that never got far enough to write a
+    verdict all leave the completion unstated, and an unstated completion is a
+    failure here exactly as it is on codex. The answer comes from what the
+    engine reports, never from the emptiness of the text.
+    """
+    if not isinstance(document, dict):
+        return False
+    return (not document.get("is_error")
+            and str(document.get("subtype") or "") == "success")
+
+
 def worker_claude(chat, tail, state=None, procs=None):
     """Headless `claude -p`. --output-format json carries the reply (.result) plus
     usage / cost / model / session metadata in one object. --dangerously-skip-permissions gives
@@ -4632,7 +4650,7 @@ def worker_claude(chat, tail, state=None, procs=None):
         raise worker_failure("claude", model, claude_failure_reason(out, err, rc))
     obj = _first_json_document(out, ("result", "is_error", "subtype"))
     reply = (obj.get("result") or "").strip()
-    if obj.get("is_error") or not reply:
+    if obj.get("is_error") or (not reply and not _claude_turn_completed(obj)):
         log("claude worker produced no answer; "
             + _usage_summary(obj.get("usage")))
         raise RuntimeError(f"claude worker error: {str(obj.get('subtype') or obj.get('result'))[:160]}")
@@ -4646,6 +4664,12 @@ def worker_claude(chat, tail, state=None, procs=None):
             "cost_usd": obj.get("total_cost_usd"),
             "duration_ms": obj.get("duration_ms"),
             "session_id": obj.get("session_id")}
+    if not reply:
+        # A completed turn that says nothing has already said it: the worker
+        # sent its own result and returned nothing rather than have the daemon
+        # deliver it a second time. Codex has meant this since it learned to
+        # report a completed turn; claude means it here, from the same source.
+        return {"reply": "", "silent": True, "meta": meta}
     return {"reply": reply, "meta": meta}
 
 
@@ -6413,8 +6437,9 @@ async def run_session(client):
                 "kind": "registered job",
                 "text": request_text,
                 "reply_to": delivery_reply_id,
-                "delivery": ("the final answer is posted into this channel when "
-                             "the job finishes, as a reply to the request"),
+                "delivery": ("what you return at the end is posted into this "
+                             "channel when the job finishes, as a reply to the "
+                             "request; return nothing and nothing is posted"),
             }
             progress_outbox = prepare_progress_outbox(
                 f"job-{_safe_file_part(job_id)}")

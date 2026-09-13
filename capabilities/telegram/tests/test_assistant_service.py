@@ -630,6 +630,60 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["meta"]["session_id"], "thread-1")
             self.assertEqual(result["meta"]["tokens"]["output"], 0)
 
+    async def test_claude_completed_empty_result_is_a_silent_success(self):
+        """Saying nothing has to mean one thing on both engines.
+
+        A worker that sent its result into the chat itself returns nothing, and
+        that is a finished turn rather than a broken one. Codex reports the
+        completion through `turn.completed`; claude reports it in the one
+        document it reports everything else in, and the daemon used to throw
+        that report away and call the turn an error."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            stdout = json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "",
+                "session_id": "sess-1",
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+                "total_cost_usd": 0.02,
+            })
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
+                result = daemon.worker_claude("123", [], {}, {})
+
+            self.assertTrue(result["silent"])
+            self.assertEqual(result["reply"], "")
+            self.assertEqual(result["meta"]["session_id"], "sess-1")
+            self.assertEqual(result["meta"]["tokens"]["output"], 0)
+            self.assertFalse(result["meta"]["is_error"])
+
+    async def test_an_unconfirmed_claude_turn_fails_whatever_its_text(self):
+        """The distinction comes from what the engine reports, never from the
+        emptiness of the answer. A turn claude does not state as completed, and
+        a turn it states as an error, fail exactly as they failed before."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            for label, document in (
+                    ("no verdict at all",
+                     {"result": "", "is_error": False, "subtype": None}),
+                    ("a verdict that is not a completion",
+                     {"result": "", "is_error": False,
+                      "subtype": "error_max_turns"}),
+                    ("a completed turn the engine calls an error",
+                     {"result": "", "is_error": True, "subtype": "success"}),
+                    ("an error that carried text",
+                     {"result": "it broke", "is_error": True,
+                      "subtype": "success"})):
+                with self.subTest(label):
+                    with mock.patch.object(
+                            daemon, "run_worker_proc",
+                            return_value=(0, json.dumps(document), "")):
+                        with self.assertRaisesRegex(RuntimeError,
+                                                    "claude worker error"):
+                            daemon.worker_claude("123", [], {}, {})
+
     async def test_codex_is_told_to_run_the_hooks_no_daemon_can_have_trusted(self):
         """Hook trust is granted interactively, so a daemon never holds any, and
         a project's session hook is skipped in silence without the bypass."""
