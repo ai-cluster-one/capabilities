@@ -427,6 +427,53 @@ retries = 1
                 with self.assertRaises(RUNTIME.ConfigError):
                     RUNTIME.load_agents({"agents": case})
 
+    def test_automation_block_refuses_a_key_it_does_not_read(self) -> None:
+        # The dropped key was the whole defect: `args` where the runtime reads
+        # `arguments` left the automation running on schedule, exiting zero, and
+        # passing nothing — a green record every tick and no work done.
+        with self.assertRaises(RUNTIME.ConfigError) as caught:
+            RUNTIME.normalise_config(self.root, {"version": 1, "automations": [{
+                "id": "job", "script": "capabilities/automations/scripts/job.py",
+                "args": ["--apply"], "retires": 2,
+            }]})
+        self.assertEqual(str(caught.exception),
+                         "automations[0] has unknown key(s): args, retires")
+
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "misspelled"
+environments = ["test"]
+script = "capabilities/automations/scripts/job.py"
+args = ["--apply"]
+""")
+        refused = self.cli("service", "doctor", check=False)
+        self.assertEqual(refused.returncode, 6)
+        self.assertEqual(json.loads(refused.stderr)["error"]["code"], "invalid_config")
+        self.assertIn("automations[5] has unknown key(s): args", refused.stderr)
+
+    def test_every_key_the_block_loop_reads_is_accepted(self) -> None:
+        # The refusal above is only correct while this set is exactly what the
+        # loop below it reads, so the set is pinned from the other side: a key
+        # dropped from it would start refusing a config that was always valid.
+        declared = {
+            "id": "full", "script": "capabilities/automations/scripts/job.py",
+            "enabled": False, "every_seconds": 30, "timeout_seconds": 12,
+            "max_parallel": 2, "max_pending": 3, "overlap": "queue",
+            "retries": 1, "arguments": ["--apply"], "environments": ["test"],
+        }
+        normalised = RUNTIME.normalise_config(
+            self.root, {"version": 1, "automations": [declared]})["automations"][0]
+        for key, value in declared.items():
+            self.assertEqual(normalised[key], value, key)
+        # `schedule` is the twelfth and cannot share a block with `every_seconds`.
+        scheduled = {**declared, "schedule": "0 3 * * *"}
+        scheduled.pop("every_seconds")
+        self.assertEqual(RUNTIME.normalise_config(
+            self.root, {"version": 1, "automations": [scheduled]})["automations"][0]["schedule"],
+            "0 3 * * *")
+        self.assertEqual(set(RUNTIME.AUTOMATION_KEYS), set(declared) | {"schedule"})
+
     def test_agent_command_fences_read_and_opens_write(self) -> None:
         import importlib.util as _ilu
         spec = _ilu.spec_from_loader("automations_cli_test", loader=None)

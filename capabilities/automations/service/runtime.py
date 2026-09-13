@@ -31,6 +31,14 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 AGENT_KEYS = frozenset(
     {"engine", "model", "effort", "mode", "timeout_seconds", "service_tier"}
 )
+# Exactly the keys the block loop below reads. A key outside it was silently
+# dropped, so a misspelled `arguments` left an automation running on schedule,
+# exiting zero, and doing none of what it was declared to do.
+AUTOMATION_KEYS = frozenset(
+    {"id", "script", "enabled", "schedule", "every_seconds", "timeout_seconds",
+     "max_parallel", "max_pending", "overlap", "retries", "arguments",
+     "environments"}
+)
 
 # Shipped profiles name Claude's rolling aliases, which keep pointing at the
 # newest model of each tier, so the capability carries no model id that ages.
@@ -586,6 +594,9 @@ def normalise_config(root: Path, raw: dict[str, Any],
         label = f"automations[{index}]"
         if not isinstance(item, dict):
             raise ConfigError(f"{label} must be a table")
+        unknown = sorted(set(item) - AUTOMATION_KEYS)
+        if unknown:
+            raise ConfigError(f"{label} has unknown key(s): {', '.join(unknown)}")
         automation_id = item.get("id")
         if not isinstance(automation_id, str) or not ID_RE.fullmatch(automation_id):
             raise ConfigError(f"{label}.id must match {ID_RE.pattern}")
