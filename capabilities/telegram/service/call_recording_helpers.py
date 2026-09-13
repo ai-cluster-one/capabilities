@@ -298,6 +298,102 @@ def recording_caption(metadata: dict) -> str:
     return f"Запись звонка · {duration}"
 
 
+# The line a recording's failure is announced with. Someone who asked for a
+# recording, or who was already told one was coming, hears that it is not.
+RECORDING_FAILURE_NOTICE = "Запись звонка не сохранилась — {reason}"
+
+
+def recording_failure_reason(metadata: dict) -> str:
+    """Why a recording never reached the chat, in the record's own words.
+
+    A conversion that failed is the reason whatever the delivery says about
+    itself, because a delivery with no file to send failed for want of that
+    file. Where the conversion was fine, the delivery's own error is the
+    reason."""
+    audio = metadata.get("audio")
+    conversion = audio.get("conversion") if isinstance(audio, dict) else None
+    delivery = metadata.get("delivery")
+    for candidate in (
+        conversion.get("error") if isinstance(conversion, dict) else None,
+        delivery.get("error") if isinstance(delivery, dict) else None,
+    ):
+        if candidate:
+            return str(candidate)
+    return "unknown_error"
+
+
+def recording_failure_code(reason: str) -> str:
+    """The failure's name without the detail that names this machine.
+
+    Every error on a recording record is written `<code>: <detail>`, where the
+    detail is ffmpeg's stderr or a Telethon exception's message — both of which
+    carry absolute paths out of the connection's state directory and neither of
+    which reads any better for it. The code is what goes to the chat; the whole
+    error stays on the record."""
+    return str(reason).split(":", 1)[0].strip() or "unknown_error"
+
+
+async def report_recording_failure(client, chat_id, metadata_path: Path,
+                                   metadata: dict,
+                                   emit_event_fn=None) -> bool:
+    """Tell the chat that a recording it was promised is not coming, and why.
+
+    Every way a recording can die on its way to delivery ends here, so there is
+    one sentence rather than one per path — a conversion that would not run, a
+    recovery's conversion that would not run, a send that used up its attempts,
+    and the same three again on the group-call side.
+
+    Saying it is the whole point. A failed recording is persisted in a terminal
+    state that `reconcile_orphaned_recordings` does not admit, so nothing in the
+    daemon ever looks at that record again; rewriting its status only moves the
+    silence. The person who was on the call is the one surface that reads.
+
+    Said once. A record already carrying `notified_at` is left alone, so a
+    recovery that walks the same record a second time does not repeat itself.
+
+    Returns whether the chat was told.
+    """
+    delivery = metadata.setdefault("delivery", {})
+    if delivery.get("notified_at"):
+        return True
+    if not delivery.get("enabled"):
+        # Nobody asked for this recording, so there is nobody to tell.
+        return False
+    try:
+        destination = int(chat_id)
+    except (TypeError, ValueError):
+        return False
+    reason = recording_failure_reason(metadata)
+    try:
+        notice = await client.send_message(
+            destination,
+            RECORDING_FAILURE_NOTICE.format(
+                reason=recording_failure_code(reason)),
+        )
+    except Exception as exc:
+        # The chat is the only reader there is, and it could not be reached.
+        # Said on the record and in the log rather than swallowed, because
+        # nothing downstream will ask again.
+        delivery["notice_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        write_metadata(metadata_path, metadata)
+        if emit_event_fn:
+            emit_event_fn("recording_failure_unreported", chat_id=chat_id,
+                          reason=reason, error=delivery["notice_error"])
+        return False
+    delivery.update({
+        "status": "failed",
+        "error": reason,
+        "notified_at": iso_utc(),
+        "failure_message_id": getattr(notice, "id", None),
+    })
+    write_metadata(metadata_path, metadata)
+    if emit_event_fn:
+        emit_event_fn("recording_failure_reported", chat_id=chat_id,
+                      reason=reason,
+                      message_id=delivery["failure_message_id"])
+    return True
+
+
 def pack_voice_waveform(values: list[int]) -> bytes:
     """Pack Telegram's 5-bit waveform samples into their wire representation."""
     packed = bytearray((len(values) * 5 + 7) // 8)
@@ -456,5 +552,10 @@ async def send_recording_to_chat(
                 attempts=attempt,
             )
         return
+    # Three attempts were all there were. The caption went out before the first
+    # of them, so the chat has been told a recording is coming and would
+    # otherwise go on waiting for one that no longer has anywhere to come from.
+    await report_recording_failure(client, chat_id, metadata_path, metadata,
+                                   emit_event_fn=emit_event_fn)
 
 

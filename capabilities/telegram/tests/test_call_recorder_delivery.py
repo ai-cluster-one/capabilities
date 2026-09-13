@@ -412,5 +412,196 @@ class RecoveredDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.file_calls, [])
 
 
+class ChatWriteForbiddenError(Exception):
+    pass
+
+
+class RefusingClient(FakeClient):
+    """A chat that takes text and refuses files, which is what a send running
+    out of attempts looks like from in here."""
+
+    def __init__(self, message_error=None):
+        super().__init__()
+        self.message_error = message_error
+
+    async def send_message(self, chat_id, text):
+        if self.message_error is not None:
+            raise self.message_error
+        return await super().send_message(chat_id, text)
+
+    async def send_file(self, chat_id, **kwargs):
+        self.file_calls.append((chat_id, kwargs))
+        raise ChatWriteForbiddenError("the account may not write here")
+
+
+class RecordingFailureNoticeTests(unittest.IsolatedAsyncioTestCase):
+    """A recording that dies on its way to the chat is persisted in a terminal
+    state no sweep admits, so the chat is the only surface left that reads.
+    Whether it is told is what these hold."""
+
+    @contextmanager
+    def instant_retries(self, helpers):
+        original = helpers.asyncio.sleep
+
+        async def no_wait(_delay):
+            return None
+
+        helpers.asyncio.sleep = no_wait
+        try:
+            yield
+        finally:
+            helpers.asyncio.sleep = original
+
+    @contextmanager
+    def stub_waveform(self, helpers):
+        original = helpers.build_voice_waveform
+
+        async def fake_waveform(_path):
+            return b"waveform"
+
+        helpers.build_voice_waveform = fake_waveform
+        try:
+            yield
+        finally:
+            helpers.build_voice_waveform = original
+
+    async def test_a_send_that_used_up_its_attempts_says_so_in_the_chat(self):
+        """The caption goes out before the first attempt, so this chat has been
+        told a recording is coming and would otherwise wait for it forever."""
+        helpers = import_call_recording_helpers()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output = root / "recording.ogg"
+            output.write_bytes(b"ogg")
+            metadata_path = root / "recording.json"
+            metadata = {
+                "status": "complete",
+                "duration_seconds": 61,
+                "audio": {"settled": True,
+                          "conversion": {"status": "complete", "error": None}},
+                "delivery": {"enabled": True},
+            }
+            client = RefusingClient()
+            with self.instant_retries(helpers), self.stub_waveform(helpers):
+                await helpers.send_recording_to_chat(
+                    client, 4242, output, metadata_path, metadata)
+
+            self.assertEqual(len(client.file_calls), 3)
+            self.assertEqual(metadata["delivery"]["attempts"], 3)
+            self.assertEqual(metadata["delivery"]["status"], "failed")
+            self.assertEqual(
+                client.message_calls[-1],
+                (4242, "Запись звонка не сохранилась — ChatWriteForbiddenError"))
+            persisted = json.loads(metadata_path.read_text())
+            self.assertTrue(persisted["delivery"]["notified_at"])
+            self.assertEqual(persisted["delivery"]["failure_message_id"], 7000)
+
+    async def test_the_chat_hears_the_name_and_the_record_keeps_the_detail(self):
+        """Every error on a recording is `<code>: <detail>`, and the detail is
+        ffmpeg's stderr or a Telethon message — both of which name paths inside
+        the connection's state directory and neither of which reads better for
+        it."""
+        helpers = import_call_recording_helpers()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            metadata_path = root / "recording.json"
+            error = (f"ffmpeg_exit_1: {root / 'capture.mp3'}: "
+                     "Invalid data found when processing input")
+            metadata = {
+                "status": "conversion_failed",
+                "audio": {"settled": False,
+                          "conversion": {"status": "failed", "error": error}},
+                "delivery": {"enabled": True, "status": "pending",
+                             "attempts": 0, "error": None},
+            }
+            client = FakeClient()
+
+            told = await helpers.report_recording_failure(
+                client, 4242, metadata_path, metadata)
+
+            self.assertTrue(told)
+            self.assertEqual(
+                client.message_calls,
+                [(4242, "Запись звонка не сохранилась — ffmpeg_exit_1")])
+            self.assertNotIn("capture.mp3", client.message_calls[0][1])
+            persisted = json.loads(metadata_path.read_text())
+            self.assertEqual(persisted["delivery"]["status"], "failed")
+            self.assertEqual(persisted["delivery"]["error"], error)
+
+    async def test_a_failure_is_announced_once_however_often_it_is_walked(self):
+        """A recovery walks a record a previous run already settled; the person
+        on the other end does not hear about the same failure twice."""
+        helpers = import_call_recording_helpers()
+        with tempfile.TemporaryDirectory() as td:
+            metadata_path = Path(td) / "recording.json"
+            metadata = {
+                "status": "conversion_failed",
+                "audio": {"conversion": {"status": "failed",
+                                         "error": "ogg_output_is_empty"}},
+                "delivery": {"enabled": True, "status": "pending"},
+            }
+            client = FakeClient()
+
+            first = await helpers.report_recording_failure(
+                client, 4242, metadata_path, metadata)
+            second = await helpers.report_recording_failure(
+                client, 4242, metadata_path, metadata)
+
+            self.assertTrue(first)
+            self.assertTrue(second)
+            self.assertEqual(len(client.message_calls), 1)
+
+    async def test_a_recording_nobody_asked_for_is_not_announced(self):
+        """Delivery off is a recording kept on disk for its own sake. Nobody is
+        waiting on it to be disappointed."""
+        helpers = import_call_recording_helpers()
+        with tempfile.TemporaryDirectory() as td:
+            metadata_path = Path(td) / "recording.json"
+            metadata = {
+                "status": "conversion_failed",
+                "audio": {"conversion": {"status": "failed",
+                                         "error": "mp3_capture_is_empty"}},
+                "delivery": {"enabled": False, "status": "disabled"},
+            }
+            client = FakeClient()
+
+            told = await helpers.report_recording_failure(
+                client, 4242, metadata_path, metadata)
+
+            self.assertFalse(told)
+            self.assertEqual(client.message_calls, [])
+            self.assertFalse(metadata_path.exists())
+
+    async def test_a_chat_that_cannot_be_told_is_recorded_not_swallowed(self):
+        """The chat is the last reader there is. When it refuses, that is the
+        end of the line, and the record and the log say so rather than the
+        failure going quiet a second time."""
+        helpers = import_call_recording_helpers()
+        with tempfile.TemporaryDirectory() as td:
+            metadata_path = Path(td) / "recording.json"
+            metadata = {
+                "status": "conversion_failed",
+                "audio": {"conversion": {
+                    "status": "failed",
+                    "error": "ffmpeg_unavailable: no such file"}},
+                "delivery": {"enabled": True, "status": "pending"},
+            }
+            client = RefusingClient(
+                message_error=ChatWriteForbiddenError("chat is gone"))
+            events = []
+
+            told = await helpers.report_recording_failure(
+                client, 4242, metadata_path, metadata,
+                emit_event_fn=lambda event, **fields: events.append(
+                    (event, fields)))
+
+            self.assertFalse(told)
+            persisted = json.loads(metadata_path.read_text())
+            self.assertEqual(persisted["delivery"]["notice_error"],
+                             "ChatWriteForbiddenError: chat is gone")
+            self.assertEqual([event for event, _ in events],
+                             ["recording_failure_unreported"])
+
+
 if __name__ == "__main__":
     unittest.main()

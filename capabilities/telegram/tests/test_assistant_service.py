@@ -6365,6 +6365,174 @@ class UnfinishedDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(daemon.reconcile_orphaned_recordings(), [])
 
 
+class RecordingFailureIsNotSilentTests(unittest.IsolatedAsyncioTestCase):
+    """A recording that fails on its way to delivery is persisted in a terminal
+    status, and `reconcile_orphaned_recordings` admits none of them — it holds
+    `sending` and `pending_recovery` and nothing else, and it is the only reader
+    that folder has. So a failed recording is out of the daemon's reach for
+    good the moment it is written, and the person who was on the call is the
+    one surface that can still be told."""
+
+    HELPERS_PATH = TELEGRAM_DIR / "service" / "call_recording_helpers.py"
+
+    class Client:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, chat_id, text):
+            self.messages.append((chat_id, text))
+            return SimpleNamespace(id=31)
+
+    def write(self, daemon, name, *, conversion, delivery, mode="p2p",
+              key="caller_id", destination="4242", capture_bytes=0,
+              settled=False, status=None):
+        folder = daemon.CONNECTION_STATE_DIR / "calls" / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{name}.json"
+        output = folder / f"{name}.ogg"
+        capture = folder / f"{name}.mp3"
+        if capture_bytes:
+            capture.write_bytes(b"x" * capture_bytes)
+        if settled:
+            output.write_bytes(b"ogg")
+        record = {
+            "status": status or ("complete" if settled else "conversion_failed"),
+            "stop_reason": "call_closed",
+            "mode": mode,
+            key: destination,
+            "duration_seconds": 61.0,
+            "audio": {
+                "path": str(output), "bytes": 0, "settled": settled,
+                "source": {"path": str(capture), "bytes": capture_bytes,
+                           "retained": bool(capture_bytes)},
+                "conversion": conversion,
+            },
+            "delivery": dict({"enabled": True, "attempts": 0,
+                              "message_id": None, "sent_at": None,
+                              "error": None}, **delivery),
+        }
+        path.write_text(json.dumps(record) + "\n")
+        return path, record
+
+    def dead_ends(self, daemon):
+        """One record per way a recording dies, written as that path writes it.
+
+        The four are the p2p and conference finalizer, the recovery's own
+        conversion, a send that uses up its three attempts, and the group-call
+        finalizer, which is a closure of its own with its own defaults."""
+        failed = ("ffmpeg_exit_1: " + str(daemon.CONNECTION_STATE_DIR)
+                  + "/calls/recordings/x.mp3: Invalid data found")
+        return {
+            "a p2p conversion that would not run": self.write(
+                daemon, "p2p",
+                conversion={"status": "failed", "error": failed},
+                delivery={"status": "pending"}),
+            "a recovery's conversion that would not run": self.write(
+                daemon, "recovered", mode="conference", capture_bytes=4096,
+                conversion={"status": "failed", "error": failed},
+                delivery={"status": "failed", "error": failed}),
+            "a send that used up its attempts": self.write(
+                daemon, "unsent", settled=True,
+                conversion={"status": "complete", "error": None},
+                delivery={"status": "failed", "attempts": 3,
+                          "error": "ChatWriteForbiddenError: no write access",
+                          "notice_message_id": 12}),
+            "a group call's conversion that would not run": self.write(
+                daemon, "group", mode="group", key="chat_id",
+                destination="-1001", capture_bytes=4096,
+                conversion={"status": "failed", "error": failed},
+                delivery={"status": "pending"}),
+        }
+
+    async def test_no_failed_recording_is_both_silent_and_out_of_reach(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            dead_ends = self.dead_ends(daemon)
+
+            self.assertEqual(
+                daemon.reconcile_orphaned_recordings(), [],
+                "the sweep now admits a terminal failed recording, so the "
+                "half of this property it stands for has moved")
+
+            for name, (path, record) in dead_ends.items():
+                with self.subTest(name):
+                    client = self.Client()
+                    told = await daemon.report_recording_failure(
+                        client, record.get("caller_id") or record.get("chat_id"),
+                        path, record)
+
+                    self.assertTrue(told, name)
+                    self.assertEqual(len(client.messages), 1, name)
+                    chat, text = client.messages[0]
+                    self.assertEqual(
+                        chat, int(record.get("caller_id")
+                                  or record.get("chat_id")))
+                    self.assertTrue(
+                        text.startswith("Запись звонка не сохранилась"), text)
+                    persisted = json.loads(path.read_text())
+                    self.assertEqual(persisted["delivery"]["status"], "failed")
+                    self.assertTrue(persisted["delivery"]["notified_at"])
+
+    async def test_a_recovery_that_cannot_convert_tells_the_caller(self):
+        """The one of the four whose whole path is reachable from here."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path, _ = self.write(
+                daemon, "crashed", status="recording", capture_bytes=4096,
+                conversion={"status": "pending", "error": None},
+                delivery={"status": "pending"})
+            held = daemon.reconcile_orphaned_recordings()
+            self.assertEqual(held, [path])
+
+            async def trailing_silence_start(_capture, **_kwargs):
+                return None
+
+            async def finalize_mp3_capture(_capture, _output, **_kwargs):
+                return {"status": "failed",
+                        "error": "ffmpeg_exit_1: Invalid data found",
+                        "output_bytes": 0, "source_bytes": 4096,
+                        "source_retained": True, "duration_seconds": None}
+
+            daemon.trailing_silence_start = trailing_silence_start
+            daemon.finalize_mp3_capture = finalize_mp3_capture
+            client = self.Client()
+
+            await daemon.recover_interrupted_recordings(client, held,
+                                                        rejoin=None)
+
+            record = json.loads(path.read_text())
+            self.assertEqual(record["status"], "conversion_failed")
+            self.assertEqual(record["delivery"]["status"], "failed")
+            self.assertTrue(record["delivery"]["notified_at"])
+            self.assertEqual(
+                client.messages,
+                [(4242, "Запись звонка не сохранилась — ffmpeg_exit_1")])
+
+    def test_every_path_that_gives_up_on_a_recording_reports_it(self):
+        """The two finalizers are closures inside `run_session` and cannot be
+        driven from here, so the wiring is pinned from the source instead. Four
+        hand-rolled notices would disagree eventually and the disagreement
+        would belong to nobody, which is why there is one function and why each
+        path is held to calling it."""
+        wired = set()
+        for path in (DAEMON_PATH, self.HELPERS_PATH):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if any(isinstance(child, ast.Call)
+                       and isinstance(child.func, ast.Name)
+                       and child.func.id == "report_recording_failure"
+                       for child in ast.walk(node)):
+                    wired.add(node.name)
+
+        self.assertEqual(
+            {"finalize_call_recording", "_recover_one_recording",
+             "send_recording_to_chat", "finish_group_recording"} - wired,
+            set(),
+            "a path that ends a recording without delivering it no longer "
+            "tells the chat, and nothing else ever reads that record again")
+
+
 class StitchedRecordingTests(unittest.IsolatedAsyncioTestCase):
     """A call split by a crash is one conversation, and is delivered as one."""
 

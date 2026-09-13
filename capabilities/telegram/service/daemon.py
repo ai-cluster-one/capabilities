@@ -112,6 +112,7 @@ from call_recording_helpers import (
     display_duration,
     finalize_mp3_capture,
     iso_utc,
+    report_recording_failure,
     send_recording_to_chat,
     trailing_silence_start,
     write_metadata,
@@ -1597,6 +1598,10 @@ async def _recover_one_recording(client, path, record, rejoin, call_active):
         write_metadata(path, record)
         log(f"call: recovered audio for {path.stem} would not convert — "
             f"{finalized['error']}")
+        await report_recording_failure(
+            client, destination, path, record,
+            emit_event_fn=lambda event, **fields: log(
+                f"call-delivery: {event} {fields}"))
         return
     if duration < RECOVERY_MIN_AUDIO_SECONDS:
         delivery.update({"status": "skipped", "error": "audio_not_received"})
@@ -8336,6 +8341,13 @@ async def run_session(client):
                     log(f"call: recording delivered to {caller_id}")
                 elif finalized["status"] != "complete":
                     log(f"call: recording conversion failed — {finalized['error']}")
+                    await report_recording_failure(
+                        client,
+                        caller_id,
+                        metadata_path,
+                        metadata,
+                        emit_event_fn=lambda event, **fields: log(f"call-delivery: {event} {fields}"),
+                    )
                 else:
                     log(f"call: recording complete, delivery disabled")
 
@@ -8774,6 +8786,14 @@ async def run_session(client):
                     client,
                     chat_id,
                     output,
+                    current["metadata_path"],
+                    metadata,
+                    emit_event_fn=lambda event, **fields: log(f"group-call-delivery: {event} {fields}"),
+                )
+            elif finalized["status"] != "complete":
+                await report_recording_failure(
+                    client,
+                    chat_id,
                     current["metadata_path"],
                     metadata,
                     emit_event_fn=lambda event, **fields: log(f"group-call-delivery: {event} {fields}"),
