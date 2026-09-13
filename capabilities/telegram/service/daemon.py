@@ -4519,6 +4519,31 @@ async def _cancel_recording_task(task):
         await task
 
 
+def claude_failure_reason(stdout, stderr, rc):
+    """Why a claude run failed, taken from where claude actually says so.
+
+    A failed headless run answers with the same document a good one answers
+    with: `subtype` stays "success" while `is_error` turns true, so `result` is
+    the only field carrying a sentence a person can read. That document was
+    read on the successful path alone, so a failure reported whichever host
+    noise stderr happened to carry — and delivered the raw document to the chat
+    when stderr carried nothing.
+
+    Most non-zero exits carry no document at all. A rejected session id, an
+    empty prompt, an unknown flag each leave stdout empty and put a single line
+    on stderr, so stderr and then the exit code stay the answer for them.
+    """
+    try:
+        document = _first_json_document(stdout, ("result", "is_error", "subtype"))
+    except RuntimeError:
+        document = None
+    if isinstance(document, dict):
+        reason = str(document.get("result") or "").strip()
+        if reason:
+            return reason
+    return (stderr or "").strip() or (stdout or "").strip() or f"exit {rc}"
+
+
 def worker_claude(chat, tail, state=None, procs=None):
     """Headless `claude -p`. --output-format json carries the reply (.result) plus
     usage / cost / model / session metadata in one object. --dangerously-skip-permissions gives
@@ -4542,8 +4567,8 @@ def worker_claude(chat, tail, state=None, procs=None):
         on_start=(state or {}).get("on_worker_start"),
         cwd=(state or {}).get("project_dir"))
     if rc != 0:
-        detail = (err.strip() or out.strip() or f"exit {rc}")[:500]
-        raise RuntimeError(f"claude worker failed: {detail}")
+        raise RuntimeError(
+            f"claude worker failed: {claude_failure_reason(out, err, rc)[:500]}")
     obj = _first_json_document(out, ("result", "is_error", "subtype"))
     reply = (obj.get("result") or "").strip()
     if obj.get("is_error") or not reply:

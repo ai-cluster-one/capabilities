@@ -672,36 +672,41 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 "exit 7")
             self.assertFalse(daemon.is_quota_exhausted("auth token expired"))
 
-    async def test_a_failing_claude_reports_stderr_and_never_its_own_document(self):
-        """The behaviour as it stands, asserted before it is changed.
-
-        claude answers a failed run with the same document it answers a good
-        one with, and the reason a person can read is in `.result`. That
-        document is parsed only on the rc == 0 path, so a non-zero exit reports
-        whichever host noise stderr happened to carry, and hands the chat the
-        raw blob when stderr was empty.
-        """
+    async def test_the_reported_claude_failure_is_the_one_claude_gave(self):
+        """claude answers a failed run with the same document it answers a good
+        one with, and the reason a person can read is in `.result`. Reading the
+        document only on the successful path named the host's noise as the
+        cause whenever stderr had any, and handed the chat the raw blob when it
+        had none."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             document = json.dumps(CLAUDE_ERROR_DOCUMENT)
             noise = ("node:internal/process/promises:288\n"
                      "Warning: some noise on stderr\n")
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(1, document, noise)):
-                with self.assertRaises(RuntimeError) as caught:
-                    daemon.worker_claude("123", [], {}, {})
-            self.assertEqual(
-                str(caught.exception),
-                "claude worker failed: node:internal/process/promises:288\n"
-                "Warning: some noise on stderr")
-            self.assertNotIn("selected model", str(caught.exception))
+            for stderr in (noise, ""):
+                with mock.patch.object(
+                        daemon, "run_worker_proc",
+                        return_value=(1, document, stderr)):
+                    with self.assertRaises(RuntimeError) as caught:
+                        daemon.worker_claude("123", [], {}, {})
+                self.assertEqual(
+                    str(caught.exception),
+                    "claude worker failed: "
+                    + CLAUDE_ERROR_DOCUMENT["result"])
+            reason = daemon.claude_failure_reason(document, noise, 1)
+            self.assertNotIn("promises:288", reason)
+            self.assertNotIn("{", reason)
 
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(1, document, "")):
-                with self.assertRaises(RuntimeError) as caught:
-                    daemon.worker_claude("123", [], {}, {})
+    async def test_a_claude_failure_names_the_reason_over_its_own_subtype(self):
+        """`subtype` reads "success" on the document of a failed run, so the
+        readable reason is `result` and nothing else."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.assertEqual(CLAUDE_ERROR_DOCUMENT["subtype"], "success")
             self.assertEqual(
-                str(caught.exception), f"claude worker failed: {document[:500]}")
+                daemon.claude_failure_reason(
+                    json.dumps(CLAUDE_ERROR_DOCUMENT), "", 1),
+                CLAUDE_ERROR_DOCUMENT["result"])
 
     async def test_a_failing_claude_with_no_document_falls_back(self):
         """The common shape: four of the five ways the installed CLI exits
@@ -723,6 +728,16 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(RuntimeError) as caught:
                     daemon.worker_claude("123", [], {}, {})
             self.assertEqual(str(caught.exception), "claude worker failed: exit 7")
+
+            # Unparseable stdout with nothing on stderr still reaches the chat
+            # as it always did, rather than being swallowed by the lookup.
+            with mock.patch.object(
+                    daemon, "run_worker_proc",
+                    return_value=(1, "segmentation fault\n", "")):
+                with self.assertRaises(RuntimeError) as caught:
+                    daemon.worker_claude("123", [], {}, {})
+            self.assertEqual(
+                str(caught.exception), "claude worker failed: segmentation fault")
 
     async def test_codex_empty_final_without_completion_remains_an_error(self):
         with tempfile.TemporaryDirectory() as td:
