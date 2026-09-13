@@ -84,11 +84,11 @@ the reported effort is null.
 
 FENCING REALITY: in read mode the invocation itself is the fence — claude is
 given only the reading tools, so no permission setting on your machine can hand
-the peer a shell or a writer (an MCP server configured on that machine is
-outside the built-in set and still reaches the peer), and codex runs in an OS
-read-only sandbox. act mode intentionally drops the peer's prompts so it can
-complete build work end-to-end. The prompt and the git snapshot (below) are your
-safety net.
+the peer a shell or a writer, and the turn carries an empty MCP configuration
+that no file on that machine is merged into, so a configured MCP server puts no
+tool in front of the peer either; codex runs in an OS read-only sandbox. act
+mode intentionally drops the peer's prompts so it can complete build work
+end-to-end. The prompt and the git snapshot (below) are your safety net.
 
 ────────────────────────────────────────────────────────────────────────────
 SESSION CONTINUITY  (state is LOCAL to the project you call from)
@@ -3442,8 +3442,17 @@ def run_claude(target, prompt, mode, model, effort, caller, append,
         # nothing, so under a permissive user settings file the peer kept a
         # working shell. It stays so the three reading tools remain
         # pre-approved, and plan mode stays as the model-facing signal.
+        #
+        # --tools decides the BUILT-IN set only, so an MCP server configured on
+        # the calling machine sits outside it and hands the peer its tools
+        # beside the three. An empty --mcp-config is the whole MCP
+        # configuration for the turn, and --strict-mcp-config is what stops the
+        # machine's own files being merged back into it, so the read peer has
+        # no MCP surface to reach. The pair is unconditional: the fence is what
+        # this tool knows read mode to be, not something a caller declares.
         cmd += ["--tools", "Read,Glob,Grep",
-                "--allowedTools", "Read,Glob,Grep", "--permission-mode", "plan"]
+                "--allowedTools", "Read,Glob,Grep", "--permission-mode", "plan",
+                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
     else:
         cmd += ["--permission-mode", "bypassPermissions", "--add-dir", str(target)]
     cmd += ["--append-system-prompt", build_preamble(mode, caller, append, schema_text)]
