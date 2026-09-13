@@ -6787,5 +6787,206 @@ class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
             await self.finish(client, session_task)
 
 
+class ReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
+    """A worker declares where its reply begins, and the rest stays home.
+
+    The daemon used to deliver a worker's opening reasoning along with its
+    answer, because nothing told it where one ended and the other began.
+    Nothing guesses that now either: the worker writes `=== REPLY ===` above
+    its message, and a reply that carries no such line is delivered exactly as
+    it was written — which is what the daemon already did."""
+
+    async def stop_session(self, client, task):
+        client.disconnected.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    async def delivered(self, td, reply):
+        """One real dialogue turn whose worker returns `reply`.
+
+        Returns what reached the chat and what the daemon logged, both taken
+        from the daemon's own delivery rather than from the cut in isolation."""
+        daemon = import_daemon(Path(td), settings())
+
+        def worker(_chat, _tail, state=None, _procs=None):
+            return successful_result(reply)
+
+        daemon.WORKERS["stub"] = worker
+        message = Message(140, text="Assistant, answer this")
+        client = FakeClient([message])
+        task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        await client.handler(Event(message))
+        await wait_until(
+            lambda: daemon.load_register()["123"]["last_processed_message_id"] == 140)
+        logs = list(daemon._test_logs)
+        await self.stop_session(client, task)
+        return client.sent, logs
+
+    def marker_logs(self, logs):
+        return [line for line in logs
+                if "carried no" in line or "put nothing under" in line]
+
+    async def test_the_working_out_above_the_marker_never_reaches_the_chat(self):
+        with tempfile.TemporaryDirectory() as td:
+            sent, logs = await self.delivered(
+                td,
+                "The user is thanking the group. Nothing to check, nothing to "
+                "build.\n\n=== REPLY ===\nGlad it helped — shout if anything "
+                "else comes up.")
+
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0]["text"],
+                             "Glad it helped — shout if anything else comes up.")
+            # Present and honoured is the ordinary case, and it says nothing.
+            self.assertEqual(self.marker_logs(logs), [])
+
+    async def test_a_reply_the_daemon_reasons_in_its_own_language_is_still_cut(self):
+        """The case no guess about the text can see.
+
+        Reasoning and answer in one language is invisible to a phrase list and
+        to a script comparison alike, and it is the case this exists for."""
+        with tempfile.TemporaryDirectory() as td:
+            sent, _logs = await self.delivered(
+                td, "Это просто благодарность, делать ничего не нужно.\n\n"
+                    "=== REPLY ===\nРад помочь.")
+
+            self.assertEqual(sent[0]["text"], "Рад помочь.")
+
+    async def test_a_reply_without_the_marker_is_delivered_exactly_as_written(self):
+        """The floor: a worker that forgets is no worse off than before."""
+        with tempfile.TemporaryDirectory() as td:
+            reply = ("The message is just a thank-you. Nothing to check.\n\n"
+                     "Glad it helped.")
+            sent, logs = await self.delivered(td, reply)
+
+            self.assertEqual(sent[0]["text"], reply)
+            # How often it is forgotten is the only honest measure of whether
+            # the convention holds, so it is on the record rather than guessed.
+            self.assertEqual(
+                self.marker_logs(logs),
+                ["123: reply carried no === REPLY === marker"])
+
+    async def test_a_marker_with_nothing_under_it_delivers_the_whole_reply(self):
+        """A worker that mislabelled its own answer, not one that forgot.
+
+        Delivering the empty half would turn a real answer into silence, which
+        is worse than the opening this exists to remove — and it is a different
+        fault from the omission above, so it says so in its own words."""
+        with tempfile.TemporaryDirectory() as td:
+            reply = "The answer is ready.\n\n=== REPLY ===\n   "
+            sent, logs = await self.delivered(td, reply)
+
+            self.assertEqual(sent[0]["text"], reply)
+            self.assertEqual(
+                self.marker_logs(logs),
+                ["123: reply put nothing under its === REPLY === marker; "
+                 "delivered whole"])
+
+    def cut(self, td, text):
+        return import_daemon(Path(td), settings()).cut_at_reply_marker(text)
+
+    async def test_the_last_marker_wins(self):
+        """A worker explaining the convention would otherwise cut its own answer."""
+        with tempfile.TemporaryDirectory() as td:
+            text, outcome = self.cut(
+                td, "You write your message under a line reading === REPLY ===, "
+                    "like this.\n\n=== REPLY ===\nUnderstood.")
+
+            self.assertEqual(text, "Understood.")
+            self.assertEqual(outcome, "marked")
+
+    async def test_text_the_cut_does_not_understand_comes_back_untouched(self):
+        """Byte for byte, and the same object: nothing is rewritten on its way
+        past. Every case the marker does not cover has to end where it started,
+        or a convention nobody adopted would have made the product worse."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            untouched = [
+                "Plain answer with no marker at all.",
+                "=== reply ===\nwrong case, not the marker",
+                "a === REPLY === marker sharing its line with prose",
+                "===  REPLY  ===\nextra spacing is not the marker",
+                "Answer ready.\n\n=== REPLY ===\n \t \n",
+                "\n\n   \tleading and trailing whitespace kept   \n\n",
+            ]
+            for text in untouched:
+                cut, outcome = daemon.cut_at_reply_marker(text)
+                self.assertIs(cut, text, text)
+                self.assertIn(outcome, ("unmarked", "mislabelled"), text)
+
+    def test_every_sink_reads_the_worker_table_through_one_dispatch(self):
+        """The half of the rule that lives with the dispatchers.
+
+        A worker's text reaches a dialogue reply, a durable job's stored result
+        and a voice task's spoken answer, and each used to dispatch its own
+        worker. The cut is honoured because `worker_turn` is the only thing that
+        reads `WORKERS`, so a sink that reached into the table itself would go
+        around the cut however carefully it was written."""
+        tree = ast.parse(DAEMON_PATH.read_text())
+        dispatch = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "worker_turn")
+        outside = [node.lineno for node in ast.walk(tree)
+                   if isinstance(node, ast.Subscript)
+                   and isinstance(node.value, ast.Name)
+                   and node.value.id == "WORKERS"
+                   and not dispatch.lineno <= node.lineno <= dispatch.end_lineno]
+
+        self.assertEqual(
+            outside, [],
+            "a worker is taken from WORKERS at daemon.py line(s) "
+            f"{outside}; every sink dispatches through worker_turn so the "
+            "reply marker is honoured once rather than once per consumer")
+
+
+class VoiceReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
+    """The sink where an unmarked opening is least visible and worst heard.
+
+    A voice task's answer is spoken to the caller, so the working-out above the
+    marker has to be gone before the runner is handed anything."""
+
+    def voice_settings(self):
+        base = settings()
+        base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
+        base["defaults"]["voice_agent"] = {"worker": "stub"}
+        base["allowed_users"] = {"777": {"name": "Caller", "role": "supervisor",
+                                         "voice_agent": {"mode": "enabled"}}}
+        return base
+
+    async def test_a_voice_task_speaks_only_what_is_under_the_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.voice_settings(),
+                                   voice_context="Answer briefly.",
+                                   project_env={"GOOGLE_API_KEY": "test-key"})
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                return successful_result(
+                    "The caller wants the ledger total. I should look it up.\n\n"
+                    "=== REPLY ===\nThe ledger comes to forty-two.")
+
+            daemon.WORKERS["stub"] = worker
+            captured = {}
+
+            def capture_runner(run_task, *_args, **_kwargs):
+                captured["run"] = run_task
+                return SimpleNamespace()
+
+            daemon.voice_agent.VoiceTaskRunner = capture_runner
+            daemon.voice_agent.VoiceCallSession = StubVoiceCallSession
+            client = FakeClient()
+            session_task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            calls = daemon.PyTgCalls.instances[-1]
+            await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=777))
+            await wait_until(lambda: "run" in captured, timeout=10)
+
+            spoken = await asyncio.wait_for(captured["run"]("the ledger total"),
+                                            timeout=30)
+
+            self.assertEqual(spoken, "The ledger comes to forty-two.")
+            client.disconnected.set()
+            await asyncio.wait_for(session_task, timeout=10)
+
+
 if __name__ == "__main__":
     unittest.main()

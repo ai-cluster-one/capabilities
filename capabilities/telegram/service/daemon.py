@@ -4820,6 +4820,78 @@ def worker_codex(chat, tail, state=None, procs=None):
 WORKERS = {"stub": worker_stub, "claude": worker_claude, "codex": worker_codex}
 
 
+# The line a worker writes to declare where its message to the chat begins.
+# Everything above it is the worker's own working-out and never leaves the
+# machine.
+#
+# A declaration, not a guess: nothing about where an opening ended is inferred
+# from the text, so a worker that reasons in the language it answers in is read
+# exactly like one that does not. A worker that never writes the line is left
+# with the reply it wrote, which is what the daemon does today.
+REPLY_MARKER_LINE = "=== REPLY ==="
+REPLY_MARKER = re.compile(r"^[ \t]*=== REPLY ===[ \t]*$", re.M)
+
+
+def cut_at_reply_marker(reply):
+    """Return `(text, outcome)` for the part of a worker's result it meant to send.
+
+    `marked` — a marker named where the reply began, and `text` is what followed
+    it, stripped. The last marker wins: a worker quoting the convention while
+    explaining it would otherwise truncate its own answer at the quote.
+
+    `unmarked` — no marker, and `text` is `reply` itself, byte for byte.
+
+    `mislabelled` — a marker with nothing under it, and `text` is again `reply`
+    itself, byte for byte. Delivering the empty half would turn a real answer
+    into silence, which is worse than the opening this exists to remove.
+
+    Text is only ever dropped on the `marked` path, so no case this does not
+    understand comes out worse than it went in."""
+    matches = list(REPLY_MARKER.finditer(reply))
+    if not matches:
+        return reply, "unmarked"
+    after = reply[matches[-1].end():].strip()
+    if not after:
+        return reply, "mislabelled"
+    return after, "marked"
+
+
+def worker_turn(loop, worker, key, tail, state, procs):
+    """Dispatch one worker turn and hand back the future carrying its result.
+
+    Every sink a worker's text reaches goes through here — a dialogue reply, a
+    durable job's stored result, a voice task's spoken answer — so the marker is
+    honoured once for all of them rather than once per consumer. Cutting inside
+    the dispatch rather than in a consumer is also what puts the cut ahead of
+    every decision a consumer makes about the text, including whether it
+    duplicates a progress line and whether it is empty.
+
+    The cut can never empty a reply, so a consumer that reads emptiness as
+    silence reads exactly what it read before."""
+    run_worker = WORKERS[worker]
+
+    def turn():
+        result = run_worker(key, tail, state, procs)
+        if isinstance(result, dict):
+            reply = result.get("reply")
+            # A worker that said nothing has no message to mark, and counting it
+            # as a forgotten marker would make the measure below lie.
+            if isinstance(reply, str) and reply.strip():
+                text, outcome = cut_at_reply_marker(reply)
+                result["reply"] = text
+                if outcome == "unmarked":
+                    # How often the convention is forgotten is the only honest
+                    # measure of whether it holds, and it should not have to be
+                    # guessed at.
+                    log(f"{key}: reply carried no {REPLY_MARKER_LINE} marker")
+                elif outcome == "mislabelled":
+                    log(f"{key}: reply put nothing under its {REPLY_MARKER_LINE} "
+                        f"marker; delivered whole")
+        return result
+
+    return loop.run_in_executor(None, turn)
+
+
 class WorkerLane:
     """The worker session a caller keeps, and the decisions about it.
 
@@ -5569,7 +5641,7 @@ async def run_session(client):
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
                               delivery_reply_id, progress_stop, mark=answer_mark,
                               delivered=progress_delivered, handoff=handoff))
-            future = loop.run_in_executor(None, WORKERS[s["worker"]], key, tail, state, procs)
+            future = worker_turn(loop, s["worker"], key, tail, state, procs)
             handoff_wait = asyncio.create_task(handoff["event"].wait())
             async with client.action(ent_id, "typing"):
                 done, _ = await asyncio.wait(
@@ -6237,8 +6309,7 @@ async def run_session(client):
                     error="stopped by request",
                     result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
                 return
-            future = loop.run_in_executor(
-                None, WORKERS[s["worker"]], key, tail, state, procs)
+            future = worker_turn(loop, s["worker"], key, tail, state, procs)
             job_futures[job_id] = future
             result = await future
             reply, meta = result["reply"], result["meta"]
@@ -7380,8 +7451,7 @@ async def run_session(client):
                         progress_task = asyncio.create_task(
                             tail_voice_progress(progress_outbox, on_progress))
                     loop = asyncio.get_running_loop()
-                    future = loop.run_in_executor(
-                        None, WORKERS[s["worker"]], key, [], state, procs)
+                    future = worker_turn(loop, s["worker"], key, [], state, procs)
                     done, _ = await asyncio.wait({future},
                                                  timeout=float(s["worker_timeout"]))
                     if not done:

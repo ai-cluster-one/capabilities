@@ -449,6 +449,34 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(seen, ["gpt-pinned"])
             await self.stop_session(client, task)
 
+    async def test_a_stored_result_is_cut_at_the_workers_reply_marker(self):
+        """The sink that keeps the text instead of sending it straight out.
+
+        A job's result is written down and read again later, so working-out
+        left in it outlives the turn that produced it."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            queued(register, channel_key="123", requested_by="777",
+                              description="reconcile the ledger", engine="stub")
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                return successful_result(
+                    "They want the ledger reconciled. Reading it now.\n\n"
+                    "=== REPLY ===\nThe ledger is reconciled.")
+
+            daemon.WORKERS["stub"] = worker
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(lambda: any(row["outcome"] == daemon.jobs.SUCCEEDED
+                                         for row in register.list()), timeout=6)
+
+            self.assertEqual(register.list()[0]["result_text"],
+                             "The ledger is reconciled.")
+            await self.stop_session(client, task)
+
     async def test_result_delivery_retries_without_reexecuting_the_job(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
