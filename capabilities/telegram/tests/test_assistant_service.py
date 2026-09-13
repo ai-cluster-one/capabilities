@@ -122,8 +122,38 @@ def write_fake_pytgcalls(root: Path) -> None:
 from . import filters
 
 class PyTgCalls:
+    \"\"\"Enough of the call client for the daemon to register its handlers and
+    answer a call. The handlers are kept so a test can ring the daemon the way
+    the media stack does, and the call verbs record what they were asked to
+    join rather than reaching for a device.\"\"\"
+
+    instances = []
+
     def __init__(self, *args, **kwargs):
+        self.handlers = {}
+        self.joined = []
+        PyTgCalls.instances.append(self)
+
+    def on_update(self, *args, **kwargs):
+        def register(fn):
+            self.handlers[fn.__name__] = fn
+            return fn
+        return register
+
+    async def start(self):
         pass
+
+    async def _handle_connection_changed(self, chat_id, net_state):
+        pass
+
+    async def record(self, chat_id, *args, **kwargs):
+        self.joined.append(("record", chat_id))
+
+    async def play(self, chat_id, *args, **kwargs):
+        self.joined.append(("play", chat_id))
+
+    async def leave_call(self, chat_id, *args, **kwargs):
+        self.joined.append(("leave", chat_id))
 
 __version__ = "2.3.3-test"
 """.lstrip()
@@ -345,6 +375,7 @@ class FakeClient:
         self.get_messages_calls = 0
         self.catch_up_calls = 0
         self.handler = None
+        self.handlers = {}
         self.started = asyncio.Event()
         self.disconnected = asyncio.Event()
 
@@ -359,7 +390,12 @@ class FakeClient:
 
     def on(self, _event):
         def decorate(fn):
-            self.handler = fn
+            self.handlers[fn.__name__] = fn
+            # `handler` is the message handler, which registers first. A daemon
+            # with call features on registers a raw-update handler after it, and
+            # handing a message to that one would answer nothing.
+            if self.handler is None:
+                self.handler = fn
             return fn
         return decorate
 
@@ -6605,6 +6641,150 @@ class ChannelStopTests(unittest.IsolatedAsyncioTestCase):
             f"{[line for line, _ in hand_spelled]}; a run a channel owns is "
             "minted by worker_proc_key so /stop reaches it, and only the "
             "delegated job, which belongs to no channel, spells its own")
+
+
+class StubVoiceCallSession:
+    """The Live session a call runs on, reduced to the handful of things the
+    daemon asks of it while answering. Nothing here has an opinion; the point is
+    to get a real call up so the real task machinery can be driven."""
+
+    def __init__(self, *args, **kwargs):
+        self.progress = []
+
+    def note_progress(self, note, source="stream"):
+        self.progress.append((note, source))
+
+    def start_pump(self):
+        pass
+
+    def set_system_instruction(self, text):
+        pass
+
+    async def start_agent(self):
+        pass
+
+    async def stop(self):
+        pass
+
+
+class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
+    """What becomes of a voice task once `/stop` has killed its worker.
+
+    Killing the process is half of stopping the work. A worker that dies by a
+    signal reports what a worker that broke reports, so the run that is retried
+    after a crash is the same run the caller just walked away from — and the one
+    person who must never see the task run again is the one who stopped it."""
+
+    def voice_settings(self, worker_timeout):
+        base = settings(worker_timeout=worker_timeout)
+        # `/stop` is a supervisor command, and the caller is the one who stops
+        # the task they asked for.
+        base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
+        base["defaults"]["voice_agent"] = {"worker": "codex",
+                                           "session": {"mode": "carry"}}
+        base["allowed_users"] = {"777": {"name": "Caller", "role": "supervisor",
+                                         "voice_agent": {"mode": "enabled"}}}
+        return base
+
+    def blocking_worker(self, holder, runs):
+        """A worker that behaves as codex does around a kill.
+
+        It runs a real child in its own process group through the daemon's own
+        `run_worker_proc`, and turns a non-zero return into the RuntimeError
+        codex raises. Whatever ends it — `/stop`, the timeout — ends it exactly
+        the way the shipped worker ends, which is the whole thing under test."""
+        def worker(chat, tail, state=None, procs=None):
+            daemon = holder["daemon"]
+            runs.append(state["proc_key"])
+            holder["procs"] = procs
+            rc, _out, _err = daemon.run_worker_proc(
+                state["proc_key"],
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                procs, cancel_event=state.get("cancel_event"))
+            if rc != 0:
+                raise RuntimeError(f"codex worker failed: exit {rc}")
+            return {"reply": "done", "meta": {"session_id": "thread-2"}}
+        return worker
+
+    async def answered_call(self, td, holder, runs, *, worker_timeout, carrying):
+        """Ring the daemon as a caller and hand back its own task runner.
+
+        The call is answered through the daemon's own handler, so the task this
+        returns is the real closure over the real register, the real process
+        table and the real carried session — not a copy of the logic."""
+        daemon = import_daemon(Path(td), self.voice_settings(worker_timeout),
+                               voice_context="Answer briefly.",
+                               project_env={"GOOGLE_API_KEY": "test-key"})
+        holder["daemon"] = daemon
+        daemon.WORKERS["codex"] = self.blocking_worker(holder, runs)
+        lane = daemon.WorkerLane()
+        lane.pin(carrying)
+        daemon.save_lane(777, lane)
+
+        captured = {}
+
+        def capture_runner(run_task, *args, **kwargs):
+            captured["run"] = run_task
+            return SimpleNamespace()
+
+        daemon.voice_agent.VoiceTaskRunner = capture_runner
+        daemon.voice_agent.VoiceCallSession = StubVoiceCallSession
+        client = FakeClient()
+        session_task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        calls = daemon.PyTgCalls.instances[-1]
+        await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=777))
+        await wait_until(lambda: "run" in captured, timeout=10)
+        return daemon, client, session_task, captured["run"]
+
+    async def finish(self, client, session_task):
+        client.disconnected.set()
+        await asyncio.wait_for(session_task, timeout=10)
+
+    async def test_a_stopped_voice_task_is_not_run_again_in_a_new_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            holder, runs = {}, []
+            daemon, client, session_task, run_task = await self.answered_call(
+                td, holder, runs, worker_timeout=30, carrying="thread-1")
+            task = asyncio.create_task(run_task("look something up"))
+            await wait_until(lambda: runs and runs[0] in holder.get("procs", {}),
+                             timeout=10)
+
+            stop = Message(121, text="/stop")
+            client.messages.append(stop)
+            await client.handler(Event(stop, chat_id=777))
+            self.assertEqual(client.sent[-1]["text"], "Stopped.")
+
+            with self.assertRaises(Exception) as caught:
+                await asyncio.wait_for(task, timeout=15)
+            # The outcome, not the branch that produced it: the caller was told
+            # the work was stopped, and no second run for them ever starts.
+            self.assertEqual(len(runs), 1, runs)
+            self.assertIsInstance(caught.exception, daemon.WorkerStopped)
+            self.assertIsNone(daemon.load_lane(777).session_id)
+            await self.finish(client, session_task)
+
+    async def test_a_voice_task_whose_worker_timed_out_still_runs_again(self):
+        """The other kind of kill, and it must be untouched.
+
+        Nobody walked away here — the worker overran its window on a resumed
+        session that never opened a thread, which is the one failure that may be
+        run again because nothing of it happened. Losing this retry would be a
+        worse defect than the one that made `/stop` reach a voice task at all."""
+        with tempfile.TemporaryDirectory() as td:
+            holder, runs = {}, []
+            daemon, client, session_task, run_task = await self.answered_call(
+                td, holder, runs, worker_timeout=1, carrying="thread-1")
+
+            with self.assertRaises(Exception) as caught:
+                await asyncio.wait_for(run_task("look something up"), timeout=30)
+
+            self.assertIn("timed out", str(caught.exception))
+            # Two runs, the second one its own: the lost session was run again
+            # from a clean slate, and only then was the failure the caller's.
+            self.assertEqual(len(runs), 2)
+            self.assertNotEqual(runs[0], runs[1])
+            await self.finish(client, session_task)
 
 
 if __name__ == "__main__":

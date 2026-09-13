@@ -5019,6 +5019,16 @@ class WorkerTimedOut(Exception):
     """The worker future exceeded its configured deadline without being cancelled."""
 
 
+class WorkerStopped(Exception):
+    """The caller stopped this worker run themselves, with `/stop`.
+
+    A killed worker comes back as an ordinary failure — the process died, and its
+    return code says nothing about who ended it — so every kind of ending reads
+    the same to whoever has to decide what happens next. This is that ending
+    named, so a run the caller walked away from is never mistaken for one that
+    broke and is worth another try."""
+
+
 # A dialogue turn gets a brief chance to return its natural acknowledgement
 # after it registers durable work.  Past this point it is a duplicate executor,
 # not a dialogue worker, so the daemon ends it without reporting an error.
@@ -5074,7 +5084,12 @@ async def run_session(client):
     # max_parallel_dialogue. Long work is not here — it is a row in the job
     # register, drained by the job runner against its own budget.
     busy, timers, runners = set(), {}, {}
-    procs, stopping = {}, set()   # live worker per chat + chats whose worker /stop just killed
+    # Every live worker process by the run key it was registered under, and the
+    # run keys `/stop` killed. The second is kept per *run* rather than per chat
+    # because it exists to answer one question, asked by the run itself on its
+    # way out: was I stopped, or did I break? A chat can have several runs going
+    # at once, so a flag on the chat cannot tell one run's ending from another's.
+    procs, stopping = {}, set()
     closing = False
 
     def kill_worker_proc(key, reason):
@@ -5097,6 +5112,10 @@ async def run_session(client):
             kill_worker_proc(key, reason)
 
     def release_worker_proc(key):
+        # The one place a run ends, so the one place its stop record is dropped.
+        # Every run comes through here however it finished, which is what keeps
+        # the record from outliving the run it describes.
+        stopping.discard(key)
         proc = procs.pop(key, None)
         if proc is not None and _kill_process_group(proc):
             log(f"{key}: killed lingering worker pgid {proc.pid} during job cleanup")
@@ -5676,7 +5695,9 @@ async def run_session(client):
             await terminate_worker(proc_key, future, cancel_event, "job failed before completion")
             current = _job_map(reg, key).get(_job_id(job.get("message_id")))
             if current is not job or job.get("status") == "stopped":
-                stopping.discard(key)
+                # A dialogue turn reads its own ending off the register row
+                # `/stop` marked; the run's stop record is dropped with the run
+                # itself, in `release_worker_proc` below.
                 log(f"{key}: run stopped by /stop")
                 return
             if closing:
@@ -5811,11 +5832,12 @@ async def run_session(client):
                 continue
             if not proc:
                 continue
-            stopping.add(key)
             if kill_worker_proc(run_key, "/stop"):
+                # Written against the run that was killed, because the kill is
+                # the only moment anything knows this ending was asked for. The
+                # run reads it back before it decides what to do about dying.
+                stopping.add(run_key)
                 stopped = True
-            else:
-                stopping.discard(key)
         t = timers.pop(key, None)
         if t:
             t.cancel()
@@ -7369,6 +7391,15 @@ async def run_session(client):
                         raise RuntimeError(
                             f"{s['worker']} worker timed out after {s['worker_timeout']}s")
                     return await future
+                except Exception:
+                    # Asked here, before the run is released and the record with
+                    # it. A worker killed by `/stop` raises exactly what a worker
+                    # that died of anything else raises, so the ending is named
+                    # from what the kill recorded rather than guessed from a
+                    # return code that cannot tell them apart.
+                    if proc_key in stopping:
+                        raise WorkerStopped(f"{task_id} stopped by /stop")
+                    raise
                 finally:
                     if progress_task is not None:
                         progress_task.cancel()
@@ -7408,6 +7439,15 @@ async def run_session(client):
                         # the other would re-run work the caller walked away from.
                         if lane is not None:
                             lane.clear("cancelled")
+                            save_lane(caller_id, lane)
+                        raise
+                    except WorkerStopped:
+                        # Read beside the cancellation above and for the same
+                        # reason. The caller ended this run with `/stop` and was
+                        # told it was stopped; running the task again in a fresh
+                        # session is the one thing they asked not to happen.
+                        if lane is not None:
+                            lane.clear("stopped")
                             save_lane(caller_id, lane)
                         raise
                     except Exception:
