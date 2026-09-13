@@ -507,6 +507,30 @@ def successful_result(reply="done"):
     }
 
 
+# What the installed claude CLI actually prints when it fails with something to
+# say: the shape of the success document, `subtype` still "success", `is_error`
+# true, and the sentence a person can read in `result`. Measured against
+# `claude --model <nonexistent>`, which exits 1 with this on stdout and nothing
+# at all on stderr.
+CLAUDE_ERROR_DOCUMENT = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": True,
+    "result": "There's an issue with the selected model (bogus-model-x). "
+              "It may not exist or you may not have access to it.",
+    "api_error_status": 404,
+    "stop_reason": None,
+    "terminal_reason": "error",
+    "session_id": "11111111-2222-3333-4444-555555555555",
+    "duration_ms": 1234,
+    "total_cost_usd": 0.0,
+    "usage": {"input_tokens": 3, "output_tokens": 0},
+    "modelUsage": {},
+    "permission_denials": [],
+    "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+}
+
+
 class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_register_replace_failure_keeps_previous_complete_json(self):
         with tempfile.TemporaryDirectory() as td:
@@ -647,6 +671,58 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                     "", "Reading additional input from stdin...\n", 7),
                 "exit 7")
             self.assertFalse(daemon.is_quota_exhausted("auth token expired"))
+
+    async def test_a_failing_claude_reports_stderr_and_never_its_own_document(self):
+        """The behaviour as it stands, asserted before it is changed.
+
+        claude answers a failed run with the same document it answers a good
+        one with, and the reason a person can read is in `.result`. That
+        document is parsed only on the rc == 0 path, so a non-zero exit reports
+        whichever host noise stderr happened to carry, and hands the chat the
+        raw blob when stderr was empty.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            document = json.dumps(CLAUDE_ERROR_DOCUMENT)
+            noise = ("node:internal/process/promises:288\n"
+                     "Warning: some noise on stderr\n")
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(1, document, noise)):
+                with self.assertRaises(RuntimeError) as caught:
+                    daemon.worker_claude("123", [], {}, {})
+            self.assertEqual(
+                str(caught.exception),
+                "claude worker failed: node:internal/process/promises:288\n"
+                "Warning: some noise on stderr")
+            self.assertNotIn("selected model", str(caught.exception))
+
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(1, document, "")):
+                with self.assertRaises(RuntimeError) as caught:
+                    daemon.worker_claude("123", [], {}, {})
+            self.assertEqual(
+                str(caught.exception), f"claude worker failed: {document[:500]}")
+
+    async def test_a_failing_claude_with_no_document_falls_back(self):
+        """The common shape: four of the five ways the installed CLI exits
+        non-zero leave stdout empty and put one plain line on stderr, and one
+        leaves nothing anywhere. stderr, then the exit code, is the answer."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            with mock.patch.object(
+                    daemon, "run_worker_proc",
+                    return_value=(1, "", "Error: Invalid session ID: not-a-session\n")):
+                with self.assertRaises(RuntimeError) as caught:
+                    daemon.worker_claude("123", [], {}, {})
+            self.assertEqual(
+                str(caught.exception),
+                "claude worker failed: Error: Invalid session ID: not-a-session")
+
+            with mock.patch.object(
+                    daemon, "run_worker_proc", return_value=(7, "", "")):
+                with self.assertRaises(RuntimeError) as caught:
+                    daemon.worker_claude("123", [], {}, {})
+            self.assertEqual(str(caught.exception), "claude worker failed: exit 7")
 
     async def test_codex_empty_final_without_completion_remains_an_error(self):
         with tempfile.TemporaryDirectory() as td:
