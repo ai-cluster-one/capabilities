@@ -16,7 +16,7 @@ A script computes; when it needs an agent to judge, compare, or write prose, it 
 
 Declare profiles under `[agents]`. `sonnet`, `opus` and `haiku` ship with the capability and need no configuration; `[agents.workers.<name>]` adds a profile or retunes a shipped one field by field. A profile names `engine` (`claude` or `codex`), `model`, `effort`, `mode`, `timeout_seconds`, and `service_tier` for codex. Set `agents.default` to the profile a script gets when it names none.
 
-`mode = "read"` fences the turn to reading the project. `mode = "write"` lets the turn change files, which a scheduled job does with nobody watching, so it is declared per profile and is never the shipped default. Give a judgement-only automation a read profile and the question stops being whether the prompt was careful enough.
+`mode = "read"` fences the turn to reading the project. `mode = "write"` lets the turn change files, and `mode = "act"` drops the sandbox altogether, for a worker whose job is to reach the network and operate tools outside the project. Neither of those two is a shipped default: a scheduled job runs with nobody watching, so the authority it holds is declared per profile and read at a glance. Give a judgement-only automation a read profile and the question stops being whether the prompt was careful enough.
 
 Every job receives `AUTOMATIONS_BIN`, the absolute path of the CLI that scheduled it, so the call needs no lookup:
 
