@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib.util
 import json
@@ -457,7 +458,9 @@ args = ["--apply"]
         # loop below it reads, so the set is pinned from the other side: a key
         # dropped from it would start refusing a config that was always valid.
         declared = {
-            "id": "full", "script": "capabilities/automations/scripts/job.py",
+            "id": "full", "name": "Full block",
+            "description": "Every key a block may carry, in one place.",
+            "script": "capabilities/automations/scripts/job.py",
             "enabled": False, "every_seconds": 30, "timeout_seconds": 12,
             "max_parallel": 2, "max_pending": 3, "overlap": "queue",
             "retries": 1, "arguments": ["--apply"], "environments": ["test"],
@@ -466,13 +469,67 @@ args = ["--apply"]
             self.root, {"version": 1, "automations": [declared]})["automations"][0]
         for key, value in declared.items():
             self.assertEqual(normalised[key], value, key)
-        # `schedule` is the twelfth and cannot share a block with `every_seconds`.
+        # `schedule` is the last and cannot share a block with `every_seconds`.
         scheduled = {**declared, "schedule": "0 3 * * *"}
         scheduled.pop("every_seconds")
         self.assertEqual(RUNTIME.normalise_config(
             self.root, {"version": 1, "automations": [scheduled]})["automations"][0]["schedule"],
             "0 3 * * *")
         self.assertEqual(set(RUNTIME.AUTOMATION_KEYS), set(declared) | {"schedule"})
+
+    def test_the_importer_reads_exactly_the_keys_the_runtime_accepts(self) -> None:
+        # Two surfaces read an `[[automations]]` block, and drift between them is
+        # silent in both directions: a key the importer carries and the runtime
+        # refuses cannot be authored at all, and a key the runtime accepts and
+        # the importer drops is lost the moment a project moves into the store.
+        importer = CAPABILITY.parents[1] / "tools" / "import_envelope.py"
+        if not importer.is_file():
+            self.skipTest("the importer ships with the repository, not the bundle")
+        block = next(
+            node for node in ast.walk(ast.parse(importer.read_text()))
+            if isinstance(node, ast.FunctionDef) and node.name == "plan_automations")
+        read: set[str] = set()
+        for node in ast.walk(block):
+            if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                    and node.value.id == "item" and isinstance(node.slice, ast.Constant)):
+                read.add(node.slice.value)
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get" and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "item" and node.args
+                    and isinstance(node.args[0], ast.Constant)):
+                read.add(node.args[0].value)
+        self.assertEqual(read, set(RUNTIME.AUTOMATION_KEYS))
+
+    def test_a_labelled_automation_reaches_the_listing(self) -> None:
+        # `name` and `description` have one consumer, a person reading the
+        # listing, so a value that loads and is then dropped between the config
+        # and this output has not arrived anywhere.
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "labelled"
+name = "Nightly digest"
+description = "Summarises yesterday's runs before the morning review."
+environments = ["test"]
+script = "capabilities/automations/scripts/job.py"
+""")
+        listed = {item["id"]: item
+                  for item in json.loads(self.cli("list").stdout)["automations"]}
+        self.assertEqual(listed["labelled"]["name"], "Nightly digest")
+        self.assertEqual(listed["labelled"]["description"],
+                         "Summarises yesterday's runs before the morning review.")
+        # Both are optional, and a block declaring neither reads as it always did.
+        self.assertIsNone(listed["job"]["name"])
+        self.assertIsNone(listed["job"]["description"])
+
+    def test_a_label_must_be_text(self) -> None:
+        for key in ("name", "description"):
+            with self.subTest(key=key), self.assertRaises(RUNTIME.ConfigError) as caught:
+                RUNTIME.normalise_config(self.root, {"version": 1, "automations": [{
+                    "id": "job", "script": "capabilities/automations/scripts/job.py",
+                    key: 12,
+                }]})
+            self.assertEqual(str(caught.exception), f"automations[0].{key} must be a string")
 
     def test_agent_command_fences_read_and_opens_write(self) -> None:
         import importlib.util as _ilu
@@ -973,6 +1030,45 @@ def _store_with_automation(tmp_path):
     })
     st._conn.commit()
     return st, project_id, automation_id
+
+
+def test_the_store_rebuild_carries_the_labels_a_person_wrote(tmp_path, monkeypatch):
+    """The same config has to read the same way from either source. A label the
+    file keeps and the store rebuild drops is the same defect wearing a mode."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import store as store_mod
+    import runtime as rt
+
+    project_id = "11111111-2222-3333-4444-555555555555"
+    root = tmp_path / "project"
+    (root / "capabilities").mkdir(parents=True)
+    (root / "capabilities" / "project.json").write_text(json.dumps(
+        {"schema": "capabilities.project.v1", "id": project_id,
+         "slug": "labelled", "store": "db"}))
+    monkeypatch.setenv("CAPABILITIES_STORE_URL", str(tmp_path / "shared.db"))
+
+    st = store_mod.SQLiteStore.open(str(tmp_path / "shared.db"))
+    st.migrate()
+    st.project_register(project_id, "labelled")
+    st.migrate(rt.STORE_NAMESPACE, rt.STORE_VERSION, rt.STORE_MIGRATIONS)
+    st.context_put("automations", "script.nightly", "print('done')\n",
+                   ("project", "labelled"), author="test", activate=True)
+    rt.store_upsert(st, "project", st._project_id("labelled"), {
+        "slug": "nightly", "name": "Nightly digest",
+        "description": "Why it exists, for whoever reads the listing.",
+        "enabled": 1, "script_key": "script.nightly", "schedule": "0 3 * * *",
+        "every_seconds": None, "timeout_seconds": 300.0, "max_parallel": 1,
+        "max_pending": 1, "overlap": "skip", "retries": 0,
+        "arguments": [], "environments": [],
+    })
+    st._conn.commit()
+    st.close()
+
+    item = rt.load_effective_config(
+        root, root / "absent.toml", tmp_path / "state")["automations"][0]
+    assert item["name"] == "Nightly digest"
+    assert item["description"] == "Why it exists, for whoever reads the listing."
 
 
 def _claim(st, project_id, automation_id, dedupe):

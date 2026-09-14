@@ -3336,6 +3336,10 @@ def cmd_list() -> dict[str, Any]:
         items.append(
             {
                 "id": item["id"],
+                # Authored for whoever reads the listing rather than for the
+                # engine, so this is the surface they exist to reach.
+                "name": item["name"],
+                "description": item["description"],
                 "enabled": item["enabled"],
                 "applies": runtime.applies(item, environment),
                 "environments": item["environments"],

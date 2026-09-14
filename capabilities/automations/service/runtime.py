@@ -34,10 +34,14 @@ AGENT_KEYS = frozenset(
 # Exactly the keys the block loop below reads. A key outside it was silently
 # dropped, so a misspelled `arguments` left an automation running on schedule,
 # exiting zero, and doing none of what it was declared to do.
+# `name` and `description` are read for a person rather than for the engine:
+# they change no scheduling, and they carry what an automation is called and
+# why it exists into the listing, so reading one no longer means opening every
+# script. Nothing executing consumes them, which is a fact about their reader.
 AUTOMATION_KEYS = frozenset(
-    {"id", "script", "enabled", "schedule", "every_seconds", "timeout_seconds",
-     "max_parallel", "max_pending", "overlap", "retries", "arguments",
-     "environments"}
+    {"id", "name", "description", "script", "enabled", "schedule",
+     "every_seconds", "timeout_seconds", "max_parallel", "max_pending",
+     "overlap", "retries", "arguments", "environments"}
 )
 
 # Shipped profiles name Claude's rolling aliases, which keep pointing at the
@@ -523,7 +527,8 @@ def load_config_from_store(root: Path, state_dir: Path) -> dict[str, Any]:
             # The record names a versioned document, not an operator-supplied
             # filesystem path. Keep the materialized name relative to its XDG
             # cache and fence it to that cache below.
-            "id": row[0], "enabled": bool(row[3]),
+            "id": row[0], "name": row[1], "description": row[2],
+            "enabled": bool(row[3]),
             "script": str(scripts[row[4]].relative_to(state_dir.resolve())),
             "schedule": row[5], "every_seconds": row[6], "timeout_seconds": row[7],
             "max_parallel": row[8], "max_pending": row[9], "overlap": row[10],
@@ -638,8 +643,16 @@ def normalise_config(root: Path, raw: dict[str, Any],
             isinstance(v, str) and v for v in environments
         ):
             raise ConfigError(f"{label}.environments must be an array of strings")
+        name = item.get("name")
+        if name is not None and not isinstance(name, str):
+            raise ConfigError(f"{label}.name must be a string")
+        description = item.get("description")
+        if description is not None and not isinstance(description, str):
+            raise ConfigError(f"{label}.description must be a string")
         automations.append({
             "id": automation_id,
+            "name": name or None,
+            "description": description or None,
             "script": script_raw,
             "script_path": resolved_script,
             "enabled": bool(item.get("enabled", True)),
