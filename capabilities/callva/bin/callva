@@ -84,11 +84,37 @@ Commands (`-f key=value` is repeatable for list filters):
   agents list [--is-active B]
   agents default
   agents get <id>
-  agents update <id> [--name N] [--voice V] [--prompt T | --prompt-file F]
+  agents update <id> [--name N] [--prompt T | --prompt-file F]
                      [--greeting-type prompt|exact|instruction]
                      [--greeting-exact T] [--greeting-instruction T]
                      [--agent-speaks-first B] [--config JSON | --data JSON]
+  agents clone <id> [--name N]
   agents delete <id>
+
+  An agent owns the conversation; a preset owns the speech stack it runs on.
+  Voice, model, temperature, transcriber and languages live on the preset, not
+  on the agent, and `agents update` refuses them. An agent holds at most one
+  configuration per preset and keeps the ones it is not running, so switching
+  stacks loses nothing — and comparing two configurations of one stack means
+  two agents, which is what `agents clone` is for.
+
+  presets catalog
+  presets describe <preset> [--group G]
+  presets list <agent-id>
+  presets get <agent-id> <preset>
+  presets set <agent-id> <preset> (--config JSON | --config-file F)
+  presets patch <agent-id> <preset> (--config JSON | --config-file F)
+  presets activate <agent-id> <preset>
+
+  `catalog` names the presets this platform offers; `describe` is the one that
+  says what a preset takes — every field, its type, its bounds, and whether a
+  list is closed or merely suggested. Read it before writing a configuration:
+  it is the same declaration the platform validates against, so a write it
+  refuses is a write the API refuses.
+
+  `set` replaces the configuration; `patch` merges into it. Prefer `set` when
+  removing a key, because a merge has no way to express one. `activate` is what
+  makes a preset the stack the agent's next call runs on.
 
   assets list [--type prompt|schema|payload] [--per-page N]
   assets get <id>
@@ -246,7 +272,8 @@ MAX_RETRIES = 3
 
 NAME = "callva"
 SUMMARY = ("CallVA voice-AI platform CLI over the External API — "
-           "read/create/update/delete agents, assets (prompts), calls, "
+           "read/create/update/delete agents and the speech-stack presets "
+           "they run on, assets (prompts), calls, "
            "transcripts, recordings, call analytics, custom fields, webhook "
            "schedules, automations (Windmill scripts), webhook logs, "
            "variables, settings, projects, phone numbers, and providers.")
@@ -258,7 +285,8 @@ CRED_KEYS = [
      "note": "API base URL; default https://api.callva.one/api/v1"},
 ]
 WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platform
-    "agents update", "agents delete",
+    "agents update", "agents delete", "agents clone",
+    "presets set", "presets patch", "presets activate",
     "assets create", "assets update", "assets delete",
     "calls create", "calls update", "calls delete", "calls batch",
     "transcripts store", "transcripts delete",
@@ -3183,6 +3211,32 @@ def _api_message(data) -> str | None:
     return None
 
 
+def _api_details(data) -> str | None:
+    """What a validation failure actually refused, field by field.
+
+    A CallVA 422 carries a summary in `message` and the specifics in `errors`,
+    keyed by field. `_api_message` returns the summary, which on its own says
+    only that something was wrong - useless to a caller that has to decide what
+    to send instead. This is the part that names the field and the bound.
+    """
+    if not isinstance(data, dict):
+        return None
+    errs = data.get("errors")
+    if not isinstance(errs, dict) or not errs:
+        return None
+    lines = []
+    for field, messages in errs.items():
+        if isinstance(messages, list):
+            lines.extend(f"{field}: {m}" for m in messages)
+        else:
+            lines.append(f"{field}: {messages}")
+    if not lines:
+        return None
+    shown, rest = lines[:10], len(lines) - 10
+    joined = "; ".join(shown)
+    return joined + (f"; (+{rest} more)" if rest > 0 else "")
+
+
 def _map_4xx(status: int, data, path: str, allow_404: bool):
     if allow_404 and status == 404:
         return None
@@ -3194,7 +3248,7 @@ def _map_4xx(status: int, data, path: str, allow_404: bool):
         _die(3, "not_found", msg,
              "verify the id exists and the key can see it", status=status)
     if status in (400, 422):
-        _die(6, "invalid_request", msg, None, status=status)
+        _die(6, "invalid_request", msg, _api_details(data), status=status)
     _die(5, "api_error", msg, None, status=status)
 
 
@@ -3395,14 +3449,26 @@ def agents_get(args):
 
 
 def agents_update(args):
+    # Voice is a property of the speech stack, not of the agent, and where it
+    # sits inside that stack differs per preset. Translating it here would mean
+    # guessing which preset the agent is on and writing a field the caller did
+    # not name - so the flag says where the value moved and writes nothing. The
+    # API refuses it too; this refuses it before the request, with the command
+    # that replaces it.
+    if getattr(args, "voice", None) is not None:
+        _die(6, "moved_to_preset",
+             "voice belongs to the preset the agent runs, not to the agent",
+             hint=(f"callva presets list {args.id} names the active preset; "
+                   f"write the voice with `callva presets patch {args.id} <preset> "
+                   "--config '{\"voice\": \"...\"}'`, and "
+                   "`callva presets describe <preset>` says which voices it takes"))
+
     data = {}
     if args.payload:
         data = args.payload
     else:
         if args.name is not None:
             data["name"] = args.name
-        if args.voice is not None:
-            data["voice"] = args.voice
         if args.prompt is not None:
             data["prompt"] = args.prompt
         if args.prompt_file is not None:
@@ -3423,9 +3489,154 @@ def agents_update(args):
     return r.get("data", r)
 
 
+def agents_clone(args):
+    """Copy an agent, with every preset row it holds.
+
+    An agent holds at most one configuration per preset, so two configurations
+    of one stack is two agents. This is what makes that answer cheap.
+    """
+    data = {}
+    if args.name is not None:
+        data["name"] = args.name
+    r = api("POST", f"/external/agents/{args.id}/clone", data)
+    return r.get("data", r)
+
+
 def agents_delete(args):
     api("DELETE", f"/external/agents/{args.id}")
     return {"deleted": args.id}
+
+
+# ---------------------------------------------------------------------------
+# Presets — the speech stack an agent runs on
+# ---------------------------------------------------------------------------
+#
+# A preset's configuration is its own record, one per preset per agent, and the
+# platform declares what each one takes. `describe` serves that declaration
+# whole, which is the only way a caller with no dashboard can configure a stack
+# it has never seen: the fields, their bounds, and which lists are closed are
+# all in it, and the platform validates a write against the same declaration.
+
+
+def _descriptors():
+    r = api("GET", "/external/presets")
+    return r.get("data", r)
+
+
+def _slim_field(field):
+    """One control, as much of it as a caller needs to write a value.
+
+    `enum` closes a value and `suggestions` only offers one, so both are kept
+    and the difference between them is not flattened away. `requires` stays
+    because a field whose condition is unmet is one the worker does not read.
+    """
+    kept = _pick(field, [
+        "label", "type", "nullable", "default", "unit", "help",
+        "requires", "max_items", "max_selections", "advanced",
+    ])
+    for key in ("enum", "suggestions"):
+        if key in field:
+            kept[key] = _slim_options(field[key])
+    if "range" in field:
+        kept["range"] = field["range"]
+    if "discriminator" in field:
+        kept["discriminator"] = field.get("discriminator")
+        kept["default_variant"] = field.get("default_variant")
+        kept["variants"] = {
+            name: {"label": body.get("label"),
+                   "fields": {k: _slim_field(v) for k, v in (body.get("fields") or {}).items()}}
+            for name, body in (field.get("variants") or {}).items()
+        }
+    if "fields" in field:
+        kept["fields"] = {k: _slim_field(v) for k, v in field["fields"].items()}
+    if "language_set" in field:
+        kept["language_set"] = field["language_set"]
+    if "language_set_by" in field:
+        kept["language_set_by"] = field["language_set_by"]
+    return kept
+
+
+def presets_catalog(_args):
+    descriptors = _descriptors()
+    if FULL:
+        return descriptors
+    return [_pick(d, ["id", "label", "description", "strict", "schema_version"])
+            for d in descriptors]
+
+
+def presets_describe(args):
+    for descriptor in _descriptors():
+        if descriptor.get("id") != args.preset:
+            continue
+        if FULL:
+            return descriptor
+        fields = descriptor.get("fields") or {}
+        if args.group:
+            fields = {k: v for k, v in fields.items() if v.get("group") == args.group}
+            if not fields:
+                _die(3, "group_not_found",
+                     f"preset '{args.preset}' declares no group '{args.group}'",
+                     hint="groups are listed by `callva presets describe " + args.preset + "`")
+        slim = _pick(descriptor, ["id", "label", "description", "strict", "schema_version", "groups"])
+        slim["fields"] = {k: _slim_field(v) for k, v in fields.items()}
+        return slim
+    known = ", ".join(sorted(d.get("id", "") for d in _descriptors()))
+    _die(3, "preset_not_found", f"no preset '{args.preset}'",
+         hint=f"this platform offers: {known}")
+
+
+def presets_list(args):
+    result = api("GET", f"/external/agents/{args.agent_id}/presets")
+    slim = lambda r: _apply_slim(r, lambda row: _pick(row, [
+        "preset", "is_active", "updated_at"]))
+    return _result(result, slim=slim)
+
+
+def presets_get(args):
+    r = api("GET", f"/external/agents/{args.agent_id}/presets/{args.preset}")
+    return r.get("data", r)
+
+
+def _preset_config(args):
+    if args.config_file is not None:
+        raw = sys.stdin.read() if args.config_file == "-" else open(args.config_file).read()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            _die(6, "invalid_json", f"config file is not valid JSON: {exc}")
+    return args.config_json
+
+
+def presets_set(args):
+    """Replace the configuration.
+
+    A key that was stored and is not sent is gone, which is the only way a leaf
+    is removed at all - JSON carries no delete token.
+    """
+    r = api("PUT", f"/external/agents/{args.agent_id}/presets/{args.preset}",
+            {"config": _preset_config(args)})
+    return r.get("data", r)
+
+
+def presets_patch(args):
+    """Merge into the configuration.
+
+    A merge cannot express a removal: a key left out keeps whatever it held.
+    Use `presets set` to drop one.
+    """
+    r = api("PATCH", f"/external/agents/{args.agent_id}/presets/{args.preset}",
+            {"config": _preset_config(args)})
+    return r.get("data", r)
+
+
+def presets_activate(args):
+    """Make this the stack the agent's next call runs on.
+
+    There is no separate confirming act, so an activation made mid-day changes
+    live behaviour immediately.
+    """
+    r = api("POST", f"/external/agents/{args.agent_id}/presets/{args.preset}/activate")
+    return r.get("data", r)
 
 
 # ===================================================================
@@ -4199,7 +4410,9 @@ def build_parser():
     ag_upd = ag_sub.add_parser("update", help="Update agent")
     ag_upd.add_argument("id", help="Agent UUID")
     ag_upd.add_argument("--name", help="Agent name")
-    ag_upd.add_argument("--voice", help="Voice identifier")
+    # Declared so the refusal can name where it moved: argparse's own
+    # "unrecognized arguments" would send the caller looking for a typo.
+    ag_upd.add_argument("--voice", help="Moved to the preset; see `callva presets`")
     ag_upd.add_argument("--prompt", help="Prompt text (inline)")
     ag_upd.add_argument("--prompt-file", help="Read prompt from file")
     ag_upd.add_argument("--greeting-type", choices=["prompt", "exact", "instruction"])
@@ -4208,8 +4421,39 @@ def build_parser():
     ag_upd.add_argument("--agent-speaks-first", type=parse_bool, default=None)
     ag_upd.add_argument("--config", dest="config_json", type=parse_json_arg, help="Config JSON (partial merge)")
     ag_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Full update payload as JSON")
+    ag_cl = ag_sub.add_parser("clone", help="Copy an agent with every preset row it holds")
+    ag_cl.add_argument("id", help="Agent UUID")
+    ag_cl.add_argument("--name", help="Name for the copy; derived from the source when omitted")
     ag_del = ag_sub.add_parser("delete", help="Delete agent")
     ag_del.add_argument("id", help="Agent UUID")
+
+    # --- presets ---
+    pr = subs.add_parser("presets", help="The speech stack an agent runs on")
+    pr_sub = pr.add_subparsers(dest="action", required=True)
+    pr_sub.add_parser("catalog", help="List the presets this platform offers")
+    pr_desc = pr_sub.add_parser("describe", help="What one preset takes, field by field")
+    pr_desc.add_argument("preset", help="Preset id, from `presets catalog`")
+    pr_desc.add_argument("--group", help="Only the fields in one group")
+    pr_ls = pr_sub.add_parser("list", help="The presets an agent has configured")
+    pr_ls.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
+    pr_get = pr_sub.add_parser("get", help="One agent's configuration of one preset")
+    pr_get.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
+    pr_get.add_argument("preset", help="Preset id")
+    pr_set = pr_sub.add_parser("set", help="Replace the configuration")
+    pr_set.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
+    pr_set.add_argument("preset", help="Preset id")
+    pr_set.add_argument("--config", dest="config_json", type=parse_json_arg,
+                        help="The whole configuration as JSON")
+    pr_set.add_argument("--config-file", help="Read the configuration from a file (- for stdin)")
+    pr_pat = pr_sub.add_parser("patch", help="Merge into the configuration")
+    pr_pat.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
+    pr_pat.add_argument("preset", help="Preset id")
+    pr_pat.add_argument("--config", dest="config_json", type=parse_json_arg,
+                        help="The keys to change, as JSON")
+    pr_pat.add_argument("--config-file", help="Read the keys from a file (- for stdin)")
+    pr_act = pr_sub.add_parser("activate", help="Run the agent's next call on this preset")
+    pr_act.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
+    pr_act.add_argument("preset", help="Preset id")
 
     # --- assets ---
     ast = subs.add_parser("assets", help="Manage assets (prompts, schemas, payloads)")
@@ -4507,7 +4751,12 @@ def build_parser():
 DISPATCH = {
     "agents": {
         "list": agents_list, "default": agents_default, "get": agents_get,
-        "update": agents_update, "delete": agents_delete,
+        "update": agents_update, "clone": agents_clone, "delete": agents_delete,
+    },
+    "presets": {
+        "catalog": presets_catalog, "describe": presets_describe,
+        "list": presets_list, "get": presets_get, "set": presets_set,
+        "patch": presets_patch, "activate": presets_activate,
     },
     "assets": {
         "list": assets_list, "get": assets_get, "create": assets_create,
