@@ -561,6 +561,39 @@ script = "capabilities/automations/scripts/job.py"
             self.root, None, answer)
         self.assertIn("workspace-write", codex_write)
 
+    def test_agent_command_hands_only_act_the_machine(self) -> None:
+        # `act` is the one mode that drops the codex sandbox rather than
+        # choosing a narrower one, so the flag it produces is the whole
+        # difference between a fenced worker and one holding the machine.
+        # Nothing else in the capability names that flag, so a build that moved
+        # it - off `act`, or onto `write` - changed who gets the machine without
+        # anything failing.
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_loader("automations_cli_act_test", loader=None)
+        cli = _ilu.module_from_spec(spec)
+        cli.__dict__["__file__"] = str(CLI)
+        exec(compile(CLI.read_text(), str(CLI), "exec"), cli.__dict__)
+        agent_command = cli.__dict__["_agent_command"]
+        answer = Path(self.tmp.name) / "answer.txt"
+        base = {"engine": "codex", "model": "gpt-5.6-sol", "effort": None,
+                "mode": "act", "timeout_seconds": 60.0, "service_tier": None}
+        act = agent_command(base, self.root, None, answer)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", act)
+        # Dropping the sandbox means emitting no `-s` at all. A mode that still
+        # selected one would still be sandboxed, whatever else it carried.
+        self.assertNotIn("-s", act)
+        for mode in ("read", "write"):
+            with self.subTest(mode=mode):
+                fenced = agent_command({**base, "mode": mode}, self.root, None, answer)
+                self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", fenced)
+                self.assertIn("-s", fenced)
+        # Claude has no sandbox to drop, so `act` reaches it as the permissive
+        # mode and never carries codex's flag into the other engine's argv.
+        claude_act = agent_command({**base, "engine": "claude", "model": "sonnet"},
+                                   self.root, None, answer)
+        self.assertIn("bypassPermissions", claude_act)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", claude_act)
+
     def test_agents_verb_lists_profiles(self) -> None:
         listed = json.loads(self.cli("agents").stdout)
         self.assertEqual(listed["default"], "sonnet")
