@@ -418,7 +418,7 @@ retries = 1
             {"workers": {"x": {"engine": "claude", "model": "m", "modle": "typo"}}},
             {"workers": {"x": {"engine": "claude", "model": "m", "effort": "turbo"}}},
             {"workers": {"x": {"engine": "claude", "model": "m", "service_tier": "priority"}}},
-            {"workers": {"x": {"engine": "claude", "model": "m", "mode": "act"}}},
+            {"workers": {"x": {"engine": "claude", "model": "m", "mode": "admin"}}},
             {"workers": {"x": {"engine": "claude"}}},
             {"default": "absent"},
             {"unknown": True},
