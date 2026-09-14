@@ -72,7 +72,7 @@
     },
     "ical": {
       "path": "capabilities/ical",
-      "payload_sha256": "f0de9b84b52c712cad59c430dcfe0d7867e1c13ea3a5a80c425f77211e833d4f",
+      "payload_sha256": "2e070971b08b4b1ec6052c7e72ca2c067a04ab8b96e8e5912e411259fc6feadd",
       "summary": "macOS Calendar CLI with indexed EventKit reads and Calendar.app automation writes across configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); no credential is stored on disk."
     },
     "instagram": {
