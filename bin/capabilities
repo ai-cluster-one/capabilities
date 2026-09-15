@@ -436,7 +436,7 @@ _AUTHORING_ASSETS = (
 )
 _MANAGER_GUIDE_TOPICS = (
     "authoring", "conforming", "contract", "dev", "grooming", "publishing",
-    "repositories", "sanitizing",
+    "reporting", "repositories", "sanitizing",
 )
 SKILL_ASSET = "skill/SKILL.md"
 _MANAGER_RUNTIME_ASSETS = tuple(

@@ -30,6 +30,7 @@ def test_manager_guide_menu_uses_the_capability_guide_shape() -> None:
         "dev",
         "grooming",
         "publishing",
+        "reporting",
         "repositories",
         "sanitizing",
     ]

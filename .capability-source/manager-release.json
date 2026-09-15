@@ -13,13 +13,14 @@
     "guides/dev.md": "f280bf39242b065fa30060a332ccdf9e32999e3f9b61c86f934062cb425a18c6",
     "guides/grooming.md": "a3ed64a86c4c0efbd2232cb42521f556452ffb1d1211f9599203360916b317bc",
     "guides/publishing.md": "afe771c3d708ce65092a2e63ccf8360966ce0149c268275bac70e3ee8c46ebf8",
+    "guides/reporting.md": "5492d5058213e19738a70ab2be013c62a154238c1bf8c24bfb947bf34d1d0836",
     "guides/repositories.md": "0ec2af6dfc92d20aa283fecab82b7888fb22b2480541cbb597e9a52f680ec2f4",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "e2921a71124f2a256d562ab6f9ef9a6dbdb239cf3fdcf4422f4d7a2e5659c844"
+    "sha256": "6e9a9c4b1aa19f05129858862c20447450e08a66af1bf8a1b47a391310ff0d7a"
   },
   "schema": "capabilities.manager-release.v1"
 }
