@@ -46,8 +46,9 @@ CONNECTIONS
   default base URL applies. "allow_write": false makes the connection
   read-only: every mutating verb (the create/update/delete/batch/store/
   reorder/deploy/run actions on agents, assets, calls, transcripts, fields,
-  field-groups, schedules, automations, and variables, plus the outbound
-  `call`) exits 4, and no flag lifts the gate.
+  field-groups, schedules, automations, and variables, the add/update/remove/
+  toggle trigger actions on automations, plus the outbound `call`) exits 4, and
+  no flag lifts the gate.
 
   Selection: --connection <id> (accepted anywhere on the command line).
   Unflagged, the registry's "default" pointer applies, else the sole entry;
@@ -192,6 +193,36 @@ Commands (`-f key=value` is repeatable for list filters):
   automations run-detail <id> <job_id>
   automations runtime-info
 
+  automations triggers <id>
+  automations add-trigger <id> --method get|post --mode async|sync
+                          --auth none|signature [--secret S] [--route-path P]
+  automations update-trigger <id> <trigger_path> [--method M] [--mode M]
+                             [--auth A] [--secret S] [--route-path P]
+  automations remove-trigger <id> <trigger_path>
+  automations toggle-trigger <id> <trigger_path> --enabled B
+                          (HTTP triggers put an automation behind a URL. Each
+                           trigger's `webhook_url` is the value an agent's
+                           custom_config_url / custom_webhook_url takes.
+                           <trigger_path> is the trigger's `path` — its Windmill
+                           identifier, not its URL. Read it from `automations
+                           triggers` and pass it whole: it may carry slashes
+                           (`f/proj_ab12cd34/trigger_e5f6a7b8c9d0`) and they are
+                           sent literally, not escaped.
+                           --route-path is the other field, the URL tail after
+                           /api/r/. The platform accepts only a single
+                           [a-z0-9_-] segment there, so a trigger whose
+                           route_path already carries slashes — Windmill permits
+                           those, the platform does not mint them — can be
+                           listed, toggled and otherwise changed here, but
+                           neither created nor re-pathed. Omit --route-path on
+                           add and the platform derives one from the automation
+                           id. Whether the workspace name sits in the URL is the
+                           trigger's own `workspaced_route`, set in Windmill and
+                           read back, never sent.
+                           --secret is required by --auth signature, min 8
+                           chars; it is stored as a workspace variable and is
+                           never read back.)
+
   webhook-logs list [--per-page N] [--page N] [--sort F] [-f k=v ...]
   webhook-logs get <id>
   webhook-logs filters
@@ -298,6 +329,8 @@ WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platfor
     "schedules create", "schedules update", "schedules delete",
     "automations create", "automations update", "automations delete",
     "automations deploy", "automations run",
+    "automations add-trigger", "automations update-trigger",
+    "automations remove-trigger", "automations toggle-trigger",
     "variables create", "variables update", "variables delete",
 }
 WRITE_DEFAULT = True    # writes stay inside a tenant the consumer owns
@@ -4148,6 +4181,92 @@ def automations_all_runs(args):
     return _result(result, slim=slim)
 
 
+# --- HTTP triggers ---------------------------------------------------------
+# A trigger is addressed by its Windmill path (`f/proj_x/trigger_y`), which is
+# always slashed; the API route matches it as `.*`, so the separators stay
+# literal and only the other characters are escaped.
+
+
+def _trigger_path(raw):
+    return urllib.parse.quote(raw, safe="/")
+
+
+def automations_triggers(args):
+    result = api("GET", f"/external/automations/{args.id}/triggers")
+    slim = lambda r: _apply_slim(r, lambda t: _pick(t, [
+        "path", "route_path", "webhook_url", "mode", "http_method", "request_type",
+        "authentication_method", "workspaced_route", "script_path"]))
+    return _result(result, slim=slim)
+
+
+_ROUTE_PATH_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_-"
+
+
+def _trigger_fields(args, creating):
+    route_path = args.route_path
+    # The platform refuses any other shape, but reports the refusal as a retried
+    # 500 rather than as validation, so the CLI has to make it legible here.
+    if route_path is not None and not (
+            0 < len(route_path) <= 100 and all(c in _ROUTE_PATH_CHARS for c in route_path)):
+        _die(6, "invalid_route_path",
+             f"route path {route_path!r} is not a single [a-z0-9_-] segment of 1 to 100 characters",
+             "the platform mints only that shape; a slashed route path can exist on a trigger "
+             "made directly in Windmill, but cannot be created or set here")
+    if args.auth == "signature" and not args.secret:
+        _die(6, "missing_secret", "--auth signature needs --secret",
+             "the secret signs the caller's request; it is stored as a workspace variable")
+    if args.secret is not None:
+        if args.auth != "signature":
+            _die(6, "secret_without_signature",
+                 "--secret is only read with --auth signature",
+                 "the platform drops it otherwise; pass --auth signature to set or rotate it")
+        if len(args.secret) < 8:
+            _die(6, "secret_too_short", "--secret must be at least 8 characters")
+    data = {}
+    if creating or args.method is not None:
+        data["http_method"] = args.method
+    if creating or args.mode is not None:
+        data["request_type"] = args.mode
+    if creating or args.auth is not None:
+        data["auth_method"] = args.auth
+    if args.secret is not None:
+        data["secret"] = args.secret
+    if route_path is not None:
+        data["route_path"] = route_path
+    return data
+
+
+def automations_add_trigger(args):
+    r = api("POST", f"/external/automations/{args.id}/triggers",
+            _trigger_fields(args, creating=True))
+    return r.get("data", r)
+
+
+def automations_update_trigger(args):
+    data = _trigger_fields(args, creating=False)
+    if not data:
+        _die(6, "nothing_to_update",
+             "no fields to update; use --method, --mode, --auth, --secret, or --route-path")
+    r = api("PUT",
+            f"/external/automations/{args.id}/triggers/{_trigger_path(args.trigger_path)}",
+            data)
+    return r.get("data", r)
+
+
+def automations_remove_trigger(args):
+    api("DELETE",
+        f"/external/automations/{args.id}/triggers/{_trigger_path(args.trigger_path)}")
+    return {"deleted": args.trigger_path}
+
+
+def automations_toggle_trigger(args):
+    r = api("POST",
+            f"/external/automations/{args.id}/triggers/"
+            f"{_trigger_path(args.trigger_path)}/toggle",
+            {"enabled": args.enabled})
+    return r.get("data", r)
+
+
 # ===================================================================
 # WEBHOOK LOGS
 # ===================================================================
@@ -4677,6 +4796,41 @@ def build_parser():
     aut_rd.add_argument("job_id", help="Job UUID")
     aut_sub.add_parser("runtime-info", help="Get runtime environment info")
 
+    _TRIGGER_PATH_HELP = ("The trigger's `path` as listed by `automations triggers` — its Windmill "
+                          "identifier, not its URL; pass it whole, slashes included")
+    _ROUTE_PATH_HELP = ("URL tail after /api/r/; the platform mints only a single [a-z0-9_-] "
+                        "segment, omitted on add it derives one from the automation id")
+    aut_trg = aut_sub.add_parser("triggers",
+                                 help="List the HTTP triggers that call one automation, each with its webhook_url")
+    aut_trg.add_argument("id", help="Automation UUID")
+    aut_tadd = aut_sub.add_parser("add-trigger", help="Put an automation behind a webhook URL")
+    aut_tadd.add_argument("id", help="Automation UUID")
+    aut_tadd.add_argument("--method", required=True, choices=["get", "post"],
+                          help="HTTP method the webhook accepts")
+    aut_tadd.add_argument("--mode", required=True, choices=["async", "sync"],
+                          help="async returns a job id at once; sync holds the request for the result")
+    aut_tadd.add_argument("--auth", required=True, choices=["none", "signature"],
+                          help="Caller authentication; signature requires --secret")
+    aut_tadd.add_argument("--secret", help="HMAC secret for --auth signature (min 8 chars)")
+    aut_tadd.add_argument("--route-path", dest="route_path", help=_ROUTE_PATH_HELP)
+    aut_tupd = aut_sub.add_parser("update-trigger", help="Change an existing trigger")
+    aut_tupd.add_argument("id", help="Automation UUID")
+    aut_tupd.add_argument("trigger_path", help=_TRIGGER_PATH_HELP)
+    aut_tupd.add_argument("--method", choices=["get", "post"], help="HTTP method the webhook accepts")
+    aut_tupd.add_argument("--mode", choices=["async", "sync"], help="async job id at once, sync waits for the result")
+    aut_tupd.add_argument("--auth", choices=["none", "signature"],
+                          help="Caller authentication; signature requires --secret")
+    aut_tupd.add_argument("--secret", help="HMAC secret for --auth signature (min 8 chars)")
+    aut_tupd.add_argument("--route-path", dest="route_path", help=_ROUTE_PATH_HELP)
+    aut_trm = aut_sub.add_parser("remove-trigger", help="Delete a trigger and its stored secret")
+    aut_trm.add_argument("id", help="Automation UUID")
+    aut_trm.add_argument("trigger_path", help=_TRIGGER_PATH_HELP)
+    aut_ttg = aut_sub.add_parser("toggle-trigger", help="Enable or disable a trigger without deleting it")
+    aut_ttg.add_argument("id", help="Automation UUID")
+    aut_ttg.add_argument("trigger_path", help=_TRIGGER_PATH_HELP)
+    aut_ttg.add_argument("--enabled", type=parse_bool, required=True,
+                         help="true to serve the webhook, false to refuse it")
+
     # --- webhook-logs ---
     wl = subs.add_parser("webhook-logs", help="Inspect inbound webhook activity")
     wl_sub = wl.add_subparsers(dest="action", required=True)
@@ -4797,6 +4951,10 @@ DISPATCH = {
         "code": automations_code, "deploy": automations_deploy, "run": automations_run,
         "runs": automations_runs, "all-runs": automations_all_runs,
         "run-detail": automations_run_detail, "runtime-info": automations_runtime_info,
+        "triggers": automations_triggers, "add-trigger": automations_add_trigger,
+        "update-trigger": automations_update_trigger,
+        "remove-trigger": automations_remove_trigger,
+        "toggle-trigger": automations_toggle_trigger,
     },
     "webhook-logs": {
         "list": webhook_logs_list, "get": webhook_logs_get, "filters": webhook_logs_filters,
