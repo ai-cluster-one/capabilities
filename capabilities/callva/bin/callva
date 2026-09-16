@@ -88,9 +88,14 @@ Commands (`-f key=value` is repeatable for list filters):
   agents update <id> [--name N] [--prompt T | --prompt-file F]
                      [--greeting-type prompt|exact|instruction]
                      [--greeting-exact T] [--greeting-instruction T]
-                     [--agent-speaks-first B] [--config JSON | --data JSON]
+                     [--agent-speaks-first B] [--config JSON] [--data JSON]
   agents clone <id> [--name N]
   agents delete <id>
+
+  --data is the base object of an update and every flag above writes over it
+  under that flag's own key: pass --data and --prompt together and the prompt
+  is the one from --prompt, and --config beats a `config` key inside --data.
+  Keys --data carries that no flag names are sent as given.
 
   An agent owns the conversation; a preset owns the speech stack it runs on.
   Voice, model, temperature, transcriber and languages live on the preset, not
@@ -180,7 +185,10 @@ Commands (`-f key=value` is repeatable for list filters):
   automations get <id>
   automations create --name N [--description D]
   automations update <id> [--name N] [--description D] [--is-active B]
-                          [--settings JSON | --data JSON]
+                          [--settings JSON] [--data JSON]
+                          (--data is the base; each flag above writes over it
+                           under its own key, and --settings beats a `settings`
+                           key inside --data)
   automations delete <id>
   automations code <id>
   automations deploy <id> (--file F | --code C)
@@ -3457,6 +3465,20 @@ def _data(value):
     return value
 
 
+def _merge_update(payload, fields):
+    """One update body from --data and the typed flags, by one rule everywhere.
+
+    --data is the base object. Every flag the caller actually passed is written
+    over it under that flag's own key and wins there, including --config over a
+    `config` key already in --data. Keys --data carries that no flag names are
+    kept. Taking a record whole and correcting one field is the common case, so
+    the flags read as a correction rather than as a mode that turns --data off.
+    """
+    data = dict(payload) if payload else {}
+    data.update(fields)
+    return data
+
+
 # ===================================================================
 # AGENTS
 # ===================================================================
@@ -3496,26 +3518,24 @@ def agents_update(args):
                    "--config '{\"voice\": \"...\"}'`, and "
                    "`callva presets describe <preset>` says which voices it takes"))
 
-    data = {}
-    if args.payload:
-        data = args.payload
-    else:
-        if args.name is not None:
-            data["name"] = args.name
-        if args.prompt is not None:
-            data["prompt"] = args.prompt
-        if args.prompt_file is not None:
-            data["prompt"] = open(args.prompt_file).read()
-        if args.greeting_type is not None:
-            data["greeting_type"] = args.greeting_type
-        if args.greeting_exact is not None:
-            data["greeting_exact"] = args.greeting_exact
-        if args.greeting_instruction is not None:
-            data["greeting_instruction"] = args.greeting_instruction
-        if args.agent_speaks_first is not None:
-            data["agent_speaks_first"] = args.agent_speaks_first
-        if args.config_json:
-            data["config"] = args.config_json
+    fields = {}
+    if args.name is not None:
+        fields["name"] = args.name
+    if args.prompt is not None:
+        fields["prompt"] = args.prompt
+    if args.prompt_file is not None:
+        fields["prompt"] = open(args.prompt_file).read()
+    if args.greeting_type is not None:
+        fields["greeting_type"] = args.greeting_type
+    if args.greeting_exact is not None:
+        fields["greeting_exact"] = args.greeting_exact
+    if args.greeting_instruction is not None:
+        fields["greeting_instruction"] = args.greeting_instruction
+    if args.agent_speaks_first is not None:
+        fields["agent_speaks_first"] = args.agent_speaks_first
+    if args.config_json is not None:
+        fields["config"] = args.config_json
+    data = _merge_update(args.payload, fields)
     if not data:
         _die(6, "nothing_to_update", "no fields to update; use flags or --data '{...}'")
     r = api("PATCH", f"/external/agents/{args.id}", data)
@@ -4093,18 +4113,16 @@ def automations_create(args):
 
 
 def automations_update(args):
-    data = {}
-    if args.payload:
-        data = args.payload
-    else:
-        if args.name is not None:
-            data["name"] = args.name
-        if args.description is not None:
-            data["description"] = args.description
-        if args.is_active is not None:
-            data["is_active"] = args.is_active
-        if getattr(args, "settings_json", None) is not None:
-            data["settings"] = args.settings_json
+    fields = {}
+    if args.name is not None:
+        fields["name"] = args.name
+    if args.description is not None:
+        fields["description"] = args.description
+    if args.is_active is not None:
+        fields["is_active"] = args.is_active
+    if getattr(args, "settings_json", None) is not None:
+        fields["settings"] = args.settings_json
+    data = _merge_update(args.payload, fields)
     if not data:
         _die(6, "nothing_to_update",
              "no fields to update; use --name, --description, --is-active, --settings, or --data")
@@ -4538,8 +4556,8 @@ def build_parser():
     ag_upd.add_argument("--greeting-exact", help="Exact greeting text")
     ag_upd.add_argument("--greeting-instruction", help="Greeting instruction")
     ag_upd.add_argument("--agent-speaks-first", type=parse_bool, default=None)
-    ag_upd.add_argument("--config", dest="config_json", type=parse_json_arg, help="Config JSON (partial merge)")
-    ag_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Full update payload as JSON")
+    ag_upd.add_argument("--config", dest="config_json", type=parse_json_arg, help="Config JSON (partial merge); beats a `config` key in --data")
+    ag_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Base update payload as JSON; the flags above write over it")
     ag_cl = ag_sub.add_parser("clone", help="Copy an agent with every preset row it holds")
     ag_cl.add_argument("id", help="Agent UUID")
     ag_cl.add_argument("--name", help="Name for the copy; derived from the source when omitted")
@@ -4760,8 +4778,8 @@ def build_parser():
     aut_upd.add_argument("--name", help="New name")
     aut_upd.add_argument("--description", help="New description")
     aut_upd.add_argument("--is-active", type=parse_bool, default=None, help="Active status")
-    aut_upd.add_argument("--settings", dest="settings_json", type=parse_json_arg, help="Settings as JSON")
-    aut_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Full update payload as JSON")
+    aut_upd.add_argument("--settings", dest="settings_json", type=parse_json_arg, help="Settings as JSON; beats a `settings` key in --data")
+    aut_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Base update payload as JSON; the flags above write over it")
     aut_del = aut_sub.add_parser("delete", help="Delete automation")
     aut_del.add_argument("id", help="Automation UUID")
     aut_code = aut_sub.add_parser("code", help="Get deployed script code")
