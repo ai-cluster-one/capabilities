@@ -122,6 +122,27 @@ Commands (`-f key=value` is repeatable for list filters):
   removing a key, because a merge has no way to express one. `activate` is what
   makes a preset the stack the agent's next call runs on.
 
+  tools list <agent-id>
+  tools get <agent-id> <key>
+  tools set <agent-id> <key> (--config JSON | --config-file F)
+            [--type end_call|http_request] [--is-enabled B] [--position N]
+  tools patch <agent-id> <key> [--config JSON | --config-file F]
+            [--type end_call|http_request] [--is-enabled B] [--position N]
+  tools delete <agent-id> <key>
+
+  A tool is a record of its own, addressed by the name it carries, so an edit
+  reaches only the tool it names and no stale copy of the others can remove one.
+  The name is case-sensitive and is written exactly as typed. `agents update`
+  refuses a `tools` key inside --config for the same reason.
+
+  `set` states the whole record: the body is stored as sent and every field left
+  out takes its default — no type, enabled, position 0 — which is the only way a
+  leaf inside the body, or the type itself, is removed. `patch` writes only the
+  fields the command names and deep-merges the body, replacing lists whole, so
+  toggling `--is-enabled` leaves the type, the position and the body as they
+  were. Either creates the tool when the agent has none. `delete` leaves the
+  agent with no tool by that name, whether or not it had one.
+
   assets list [--type prompt|schema|payload] [--per-page N]
   assets get <id>
   assets create --name N --type T (--content C | --content-file F) [--inactive]
@@ -311,8 +332,8 @@ MAX_RETRIES = 3
 
 NAME = "callva"
 SUMMARY = ("CallVA voice-AI platform CLI over the External API — "
-           "read/create/update/delete agents and the speech-stack presets "
-           "they run on, assets (prompts), calls, "
+           "read/create/update/delete agents, the speech-stack presets "
+           "they run on and the tools they call, assets (prompts), calls, "
            "transcripts, recordings, call analytics, custom fields, webhook "
            "schedules, automations (Windmill scripts), webhook logs, "
            "variables, settings, projects, phone numbers, and providers.")
@@ -326,6 +347,7 @@ CRED_KEYS = [
 WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platform
     "agents update", "agents delete", "agents clone",
     "presets set", "presets patch", "presets activate",
+    "tools set", "tools patch", "tools delete",
     "assets create", "assets update", "assets delete",
     "calls create", "calls update", "calls delete", "calls batch",
     "transcripts store", "transcripts delete",
@@ -3538,6 +3560,17 @@ def agents_update(args):
     data = _merge_update(args.payload, fields)
     if not data:
         _die(6, "nothing_to_update", "no fields to update; use flags or --data '{...}'")
+    # Tools left the config blob because a map has no address: removing one
+    # meant sending all of them, so a stale copy silently deleted the tools it
+    # had never heard of. The API refuses the key; this refuses it on the
+    # merged body, which is the one place both --config and --data arrive at.
+    config = data.get("config")
+    if isinstance(config, dict) and "tools" in config:
+        _die(6, "moved_to_tools",
+             "tools are records of their own, not a key in the agent's config",
+             hint=(f"callva tools list {args.id} names them; write one with "
+                   f"`callva tools set {args.id} <key> --config '{{...}}'` and "
+                   f"remove one with `callva tools delete {args.id} <key>`"))
     r = api("PATCH", f"/external/agents/{args.id}", data)
     return r.get("data", r)
 
@@ -3650,7 +3683,7 @@ def presets_get(args):
     return r.get("data", r)
 
 
-def _preset_config(args):
+def _config_arg(args):
     if args.config_file is not None:
         raw = sys.stdin.read() if args.config_file == "-" else open(args.config_file).read()
         try:
@@ -3667,7 +3700,7 @@ def presets_set(args):
     is removed at all - JSON carries no delete token.
     """
     r = api("PUT", f"/external/agents/{args.agent_id}/presets/{args.preset}",
-            {"config": _preset_config(args)})
+            {"config": _config_arg(args)})
     return r.get("data", r)
 
 
@@ -3678,7 +3711,7 @@ def presets_patch(args):
     Use `presets set` to drop one.
     """
     r = api("PATCH", f"/external/agents/{args.agent_id}/presets/{args.preset}",
-            {"config": _preset_config(args)})
+            {"config": _config_arg(args)})
     return r.get("data", r)
 
 
@@ -3690,6 +3723,98 @@ def presets_activate(args):
     """
     r = api("POST", f"/external/agents/{args.agent_id}/presets/{args.preset}/activate")
     return r.get("data", r)
+
+
+# ---------------------------------------------------------------------------
+# Tools — what an agent can call, one record per tool
+# ---------------------------------------------------------------------------
+#
+# Each tool is addressed by its own name, so an edit reaches only the tool it
+# names and a stale view of the rest can no longer remove one. The name is the
+# key the worker reads, and camelCase names are live, so it is sent exactly as
+# the caller typed it and is never normalised here.
+
+
+def _tool_path(args):
+    """The tool's address, with the name escaped rather than trusted.
+
+    A name the platform cannot hold is the platform's refusal to give, and it
+    can only give it about the name it was actually handed: an unescaped `?` or
+    `#` ends the path, so the server would answer about a shorter name than the
+    caller typed. Nothing in a legal name is escaped by this.
+    """
+    key = urllib.parse.quote(args.key, safe="")
+    return f"/external/agents/{args.agent_id}/tools/{key}"
+
+
+def _tool_fields(args):
+    """Only the fields the command actually named.
+
+    A field sent unasked is a field overwritten: carrying `type` along with an
+    `--is-enabled` toggle would strip the type off a tool the worker then cannot
+    build, and a tool the cascade worker finds by module name has none to begin
+    with.
+    """
+    fields = {}
+    if args.type is not None:
+        fields["type"] = args.type
+    if args.is_enabled is not None:
+        fields["is_enabled"] = args.is_enabled
+    if args.position is not None:
+        fields["position"] = args.position
+    if args.config_json is not None or args.config_file is not None:
+        fields["config"] = _config_arg(args)
+    return fields
+
+
+def tools_list(args):
+    result = api("GET", f"/external/agents/{args.agent_id}/tools")
+    slim = lambda r: _apply_slim(r, lambda row: _pick(row, [
+        "key", "type", "is_enabled", "position", "updated_at"]))
+    return _result(result, slim=slim)
+
+
+def tools_get(args):
+    r = api("GET", _tool_path(args))
+    return r.get("data", r)
+
+
+def tools_set(args):
+    """Replace the record.
+
+    Every field left out takes its default - no type, enabled, position 0 - and
+    the body is stored as sent, which is the only way a leaf inside it, or the
+    type itself, is removed.
+    """
+    fields = _tool_fields(args)
+    if "config" not in fields:
+        _die(6, "missing_config",
+             "`tools set` states the whole record, so it needs the body: "
+             "--config '{...}' or --config-file F",
+             hint="`callva tools patch` changes named fields and leaves the rest")
+    r = api("PUT", _tool_path(args), fields)
+    return r.get("data", r)
+
+
+def tools_patch(args):
+    """Write only the fields this command names.
+
+    The body is merged into what is stored, with lists replaced whole, so a
+    merge cannot express a removal. Use `tools set` to drop one.
+    """
+    fields = _tool_fields(args)
+    if not fields:
+        _die(6, "nothing_to_update",
+             "no fields to change; name at least one of "
+             "--config, --config-file, --type, --is-enabled, --position")
+    r = api("PATCH", _tool_path(args), fields)
+    return r.get("data", r)
+
+
+def tools_delete(args):
+    """Leave the agent with no tool by that name, whether or not it had one."""
+    api("DELETE", _tool_path(args))
+    return {"deleted": args.key, "agent_id": args.agent_id}
 
 
 # ===================================================================
@@ -4592,6 +4717,31 @@ def build_parser():
     pr_act.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
     pr_act.add_argument("preset", help="Preset id")
 
+    # --- tools ---
+    tl = subs.add_parser("tools", help="What an agent can call, one record per tool")
+    tl_sub = tl.add_subparsers(dest="action", required=True)
+    tl_ls = tl_sub.add_parser("list", help="Every tool this agent holds")
+    tl_ls.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
+    tl_get = tl_sub.add_parser("get", help="One tool, whole")
+    tl_get.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
+    tl_get.add_argument("key", help="Tool name, exactly as stored (case-sensitive)")
+    for name, parser_help in (("set", "Replace the record; fields left out take their defaults"),
+                              ("patch", "Write only the fields named here")):
+        tl_w = tl_sub.add_parser(name, help=parser_help)
+        tl_w.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
+        tl_w.add_argument("key", help="Tool name, exactly as the worker reads it (case-sensitive)")
+        tl_w.add_argument("--config", dest="config_json", type=parse_json_arg,
+                          help="The tool body as a JSON object")
+        tl_w.add_argument("--config-file", help="Read the body from a file (- for stdin)")
+        tl_w.add_argument("--type", choices=["end_call", "http_request"],
+                          help="Tool type; a tool found by module name carries none")
+        tl_w.add_argument("--is-enabled", type=parse_bool, default=None,
+                          help="Whether the agent is offered this tool")
+        tl_w.add_argument("--position", type=int, help="Order the tools are offered in (>= 0)")
+    tl_del = tl_sub.add_parser("delete", help="Remove one tool, leaving the rest")
+    tl_del.add_argument("agent_id", metavar="agent-id", help="Agent UUID")
+    tl_del.add_argument("key", help="Tool name, exactly as stored (case-sensitive)")
+
     # --- assets ---
     ast = subs.add_parser("assets", help="Manage assets (prompts, schemas, payloads)")
     ast_sub = ast.add_subparsers(dest="action", required=True)
@@ -4929,6 +5079,10 @@ DISPATCH = {
         "catalog": presets_catalog, "describe": presets_describe,
         "list": presets_list, "get": presets_get, "set": presets_set,
         "patch": presets_patch, "activate": presets_activate,
+    },
+    "tools": {
+        "list": tools_list, "get": tools_get, "set": tools_set,
+        "patch": tools_patch, "delete": tools_delete,
     },
     "assets": {
         "list": assets_list, "get": assets_get, "create": assets_create,
