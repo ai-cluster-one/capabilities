@@ -2,10 +2,10 @@
   "assets": {
     "DOCTRINE.md": "8230128b730cbb30cb833191c15ce636f3f38979d30e2f5e7ed29c2bb4cba5fc",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "57cbc5ba144f1d1098a0b0d817fd986402839f520b8e7ca0e2bd2951e63e94e4",
+    "SHEBANG.md": "f49a3026b63734eddedb9daf646b56c10a7174bcfa36a85017e5e57e442edc40",
     "SOURCES.md": "8e8b7f1f500b8ebe3d1abb2874616071e8142c69b897110be5cbc0f0194b0085",
     "TEMPLATE.md": "f0eb0069570509b7669be7a9c660703e86924ade416ccf87983eaa447169233d",
-    "contract/preamble.py": "90ba0dfc717e0ac67482bcd9b92ee2a5dfc7b92005d9af67c49cf2ba3db63d92",
+    "contract/preamble.py": "2e11a9dca96067eaa0260de987ea8b20537f599995f875426cdd53b86eef815a",
     "contract/store.py": "eebb1f849aa8be51e30aaf9566fbc3f8c02e96c0b788342ad58fcfb8f89598c5",
     "guides/authoring.md": "3b12c12aa60cecb6dc96994d95b37fa8901be7f920fee7f8be3dc2a3b6e947b9",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
@@ -20,7 +20,7 @@
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "6e9a9c4b1aa19f05129858862c20447450e08a66af1bf8a1b47a391310ff0d7a"
+    "sha256": "909ddf8f11a39ff6b57fc005c67f3128149912686976f309a9d26f6ed13d905c"
   },
   "schema": "capabilities.manager-release.v1"
 }

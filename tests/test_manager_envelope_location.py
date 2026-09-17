@@ -45,6 +45,23 @@ def _fake_contextkit(tmp_path: Path, envelope: Path | None, exit_code: int = 0) 
     return log
 
 
+def _binding_reading_contextkit(tmp_path: Path) -> Path:
+    """A stand-in `contextkit` that answers out of the project's own binding."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "contextkit-calls.log"
+    script = bin_dir / "contextkit"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{log}"\n'
+        "here=$(pwd)\n"
+        "body=$(sed -n 's/^root = \"\\(.*\\)\"$/\\1/p' .contextkit/config.toml)\n"
+        'if [ -n "$body" ]; then printf "%s/%s/capabilities\\n" "$here" "$body"\n'
+        'else printf "%s/capabilities\\n" "$here"; fi\n')
+    script.chmod(0o755)
+    return log
+
+
 def _env(tmp_path: Path, project: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update({
@@ -52,6 +69,7 @@ def _env(tmp_path: Path, project: Path) -> dict[str, str]:
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "CLAUDE_PROJECT_DIR": str(project),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
         "PATH": f"{tmp_path / 'fakebin'}{os.pathsep}{env.get('PATH', '')}",
     })
     env.pop("CAPABILITIES_PROJECT_ENVELOPE", None)
@@ -87,7 +105,8 @@ def test_contextkit_body_root_relocates_the_whole_envelope(tmp_path: Path) -> No
     gate = json.loads((envelope / "settings.json").read_text())
     assert gate["capabilities"]["asana"]["enabled"] is True
     assert enabled["gate"] == str(envelope.resolve() / "settings.json")
-    assert log.read_text().splitlines() == ["path capabilities"] * 2
+    # One lookup covers both invocations: the second reads the first's record.
+    assert log.read_text().splitlines() == ["path capabilities"]
 
     listed = _json(_run(tmp_path, project, "list"))
     assert listed["project_envelope"] == str(envelope.resolve())
@@ -244,3 +263,125 @@ def test_path_requires_json_output(tmp_path: Path) -> None:
 
     assert result.returncode == 6
     assert json.loads(result.stderr)["error"]["code"] == "input"
+
+
+def _records(tmp_path: Path) -> list[Path]:
+    root = tmp_path / "cache" / "capabilities" / "envelope"
+    return sorted(root.glob("*.json")) if root.is_dir() else []
+
+
+def _record(tmp_path: Path) -> dict:
+    entries = _records(tmp_path)
+    assert len(entries) == 1, entries
+    return json.loads(entries[0].read_text())
+
+
+def test_a_second_process_reads_the_recorded_answer(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root="agent")
+    envelope = project / "agent" / "capabilities"
+    log = _fake_contextkit(tmp_path, envelope)
+
+    first = _json(_run(tmp_path, project, "path", "--json"))
+    second = _json(_run(tmp_path, project, "path", "--json"))
+
+    assert first == second
+    assert second["project_envelope"] == str(envelope.resolve())
+    assert log.read_text().splitlines() == ["path capabilities"]
+    assert _record(tmp_path)["root"] == str(project.resolve())
+
+
+def test_a_capability_reads_the_record_without_starting_the_manager(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root="agent")
+    envelope = project / "agent" / "capabilities"
+    envelope.mkdir(parents=True)
+    (envelope / "settings.json").write_text(json.dumps({
+        "capabilities": {"youtrack": {"enabled": False}},
+    }))
+    _fake_contextkit(tmp_path, envelope)
+    _json(_run(tmp_path, project, "path", "--json"))
+
+    # A manager that refuses to answer proves the record carried the resolution.
+    refuser = tmp_path / "fakebin" / "refusing-manager"
+    refuser.write_text("#!/bin/sh\nexit 9\n")
+    refuser.chmod(0o755)
+    env = _env(tmp_path, project)
+    env["CAPABILITIES_MANAGER_BIN"] = str(refuser)
+
+    result = subprocess.run(
+        [str(YOUTRACK), "refs"], cwd=project,
+        env=env, text=True, capture_output=True, timeout=60,
+    )
+
+    # `disabled` (not a manager failure) proves the relocated gate was read.
+    assert result.returncode == 4, result.stderr
+    assert _stderr_error(result)["code"] == "disabled"
+
+
+def test_a_changed_context_binding_is_resolved_again(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root="agent")
+    log = _binding_reading_contextkit(tmp_path)
+    first = _json(_run(tmp_path, project, "path", "--json"))
+    assert first["project_envelope"] == str((project / "agent" / "capabilities").resolve())
+
+    (project / ".contextkit" / "config.toml").write_text(
+        'version = 1\ntype = "agent-project"\n\n[body]\nroot = "workbench"\n')
+
+    answer = _json(_run(tmp_path, project, "path", "--json"))
+
+    assert answer["project_envelope"] == str((project / "workbench" / "capabilities").resolve())
+    assert log.read_text().splitlines() == ["path capabilities"] * 2
+
+
+def test_a_replaced_context_owner_is_resolved_again(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root="agent")
+    log = _fake_contextkit(tmp_path, project / "agent" / "capabilities")
+    _json(_run(tmp_path, project, "path", "--json"))
+
+    _fake_contextkit(tmp_path, project / "elsewhere-entirely" / "capabilities")
+
+    answer = _json(_run(tmp_path, project, "path", "--json"))
+
+    assert answer["project_envelope"] == str(
+        (project / "elsewhere-entirely" / "capabilities").resolve())
+    assert log.read_text().splitlines() == ["path capabilities"] * 2
+
+
+def test_a_damaged_record_costs_a_lookup_rather_than_the_answer(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root="agent")
+    envelope = project / "agent" / "capabilities"
+    log = _fake_contextkit(tmp_path, envelope)
+    _json(_run(tmp_path, project, "path", "--json"))
+    _records(tmp_path)[0].write_text("{ this is not json")
+
+    answer = _json(_run(tmp_path, project, "path", "--json"))
+
+    assert answer["project_envelope"] == str(envelope.resolve())
+    assert log.read_text().splitlines() == ["path capabilities"] * 2
+
+
+def test_each_project_root_keeps_its_own_record(tmp_path: Path) -> None:
+    first = _project(tmp_path, contextkit=True, body_root="agent")
+    second = tmp_path / "second"
+    (second / ".git").mkdir(parents=True)
+    _fake_contextkit(tmp_path, first / "agent" / "capabilities")
+
+    first_answer = _json(_run(tmp_path, first, "path", "--json"))
+    second_answer = _json(_run(tmp_path, second, "path", "--json",
+                               env={**_env(tmp_path, second)}))
+
+    assert first_answer["project_envelope"] == str((first / "agent" / "capabilities").resolve())
+    assert second_answer["project_envelope"] == str((second / "capabilities").resolve())
+    assert len(_records(tmp_path)) == 2
+
+
+def test_a_handed_off_answer_is_never_recorded(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root="agent")
+    log = _fake_contextkit(tmp_path, project / "capabilities")
+    env = _env(tmp_path, project)
+    env["CAPABILITIES_PROJECT_ENVELOPE"] = str(project / "agent" / "capabilities")
+
+    answer = _json(_run(tmp_path, project, "path", "--json", env=env))
+
+    assert answer["provider"] == "handoff"
+    assert not log.exists()
+    assert _records(tmp_path) == []

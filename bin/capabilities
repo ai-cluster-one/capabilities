@@ -302,6 +302,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NoReturn
@@ -317,6 +318,12 @@ SOURCE_WORKSPACE_ROOT = CAP_HOME / "sources"
 LEGACY_SOURCE_WORKSPACE_ROOT = Path.home() / "capabilities-sources"
 SOURCES_FILE = _CONFIG_HOME / "capabilities" / "sources.json"
 SOURCE_CACHE_ROOT = _CACHE_HOME / "capabilities" / "sources"
+ENVELOPE_CACHE_ROOT = _CACHE_HOME / "capabilities" / "envelope"
+ENVELOPE_CACHE_VERSION = 1
+# The record is keyed on what the answer rests on, so an outer bound only has to
+# catch what a stat cannot see — a context owner that starts answering
+# differently without its own program or the project's binding changing.
+ENVELOPE_CACHE_TTL = 3600
 OFFICIAL_SOURCE_ID = "official"
 OFFICIAL_GIT_URL = "https://github.com/ai-cluster-one/capabilities.git"
 RESERVED_CAPABILITY_NAMES = {"sources"}
@@ -625,6 +632,92 @@ def _handed_off_envelope(root: Path) -> str:
     return override
 
 
+def _envelope_cache_file(key: str) -> Path:
+    """Where this manager records its answer for one absolute project root.
+
+    The file name only buckets roots apart; the entry's own `root` field is what
+    proves identity, so two roots landing in one bucket cost a miss rather than
+    a wrong answer.
+    """
+    return ENVELOPE_CACHE_ROOT / f"{format(zlib.crc32(key.encode()), '08x')}.json"
+
+
+def _envelope_witness(path) -> dict:
+    """One input the envelope answer rests on, as that input stands right now."""
+    try:
+        seen = os.stat(path)
+    except OSError:
+        return {"path": str(path), "present": False}
+    return {"path": str(path), "present": True,
+            "size": seen.st_size, "mtime_ns": seen.st_mtime_ns}
+
+
+def _cached_envelope(root: Path) -> Path | None:
+    """The recorded answer for this root while every input it rests on holds.
+
+    Every reader re-observes the inputs the record names and compares each of
+    them whole. Anything at all in doubt — an unreadable file, an unexpected
+    shape, an input that moved, an expiry already behind the clock or a write
+    ahead of it — returns None and costs a full resolution, so the failure mode
+    is slow and never wrong.
+    """
+    key = str(root.resolve())
+    try:
+        entry = json.loads(_envelope_cache_file(key).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("version") != ENVELOPE_CACHE_VERSION or entry.get("root") != key:
+        return None
+    written, expires = entry.get("written_at"), entry.get("expires_at")
+    if not isinstance(written, (int, float)) or not isinstance(expires, (int, float)):
+        return None
+    now = time.time()
+    if now < written or now >= expires:
+        return None
+    witness = entry.get("witness")
+    if not isinstance(witness, list):
+        return None
+    for observed in witness:
+        if (not isinstance(observed, dict)
+                or _envelope_witness(observed.get("path")) != observed):
+            return None
+    envelope = Path(str(entry.get("envelope") or ""))
+    if not envelope.is_absolute():
+        return None
+    try:
+        envelope.resolve().relative_to(key)
+    except (OSError, ValueError):
+        return None
+    return envelope
+
+
+def _record_envelope(key: str, envelope: Path, witness: list[dict]) -> None:
+    """Record one resolved answer with the inputs it rests on.
+
+    The entry is written under a process-unique name beside its home and moved
+    into place, so concurrent capability calls read a whole record or none.
+    Writing is best effort throughout: a record that cannot be written costs
+    speed and nothing else.
+    """
+    now = time.time()
+    entry = {"version": ENVELOPE_CACHE_VERSION, "root": key,
+             "envelope": str(envelope), "witness": witness,
+             "written_at": now, "expires_at": now + ENVELOPE_CACHE_TTL}
+    path = _envelope_cache_file(key)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(entry, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _contextkit_envelope(root: Path) -> Path:
     """Where ContextKit keeps this project's envelope, or a structured error."""
     override = _handed_off_envelope(root)
@@ -665,16 +758,31 @@ def _envelope_home(root: Path) -> Path:
     ContextKit owns the location of the projects it manages, so it is asked
     rather than assumed. Broken configured bindings fail closed. Every other
     project keeps the envelope at <root>/capabilities.
+
+    An answer this manager resolved itself is recorded against the inputs it
+    rests on — the project's context binding and the program that answered — so
+    the next process on this machine reads it instead of starting an interpreter
+    to ask the same question. A handed-off answer is the caller's assertion about
+    one invocation, so it outranks the record and is never written into it.
     """
     cached = _ENVELOPE_HOME.get(root)
     if cached is not None:
         return cached
-    home = root / PROJECT_CAPABILITIES_REL
     handoff = _handed_off_envelope(root)
     if handoff:
         home = _validated_envelope(root, handoff, "environment handoff")
-    elif _contextkit_managed(root):
-        home = _contextkit_envelope(root)
+    else:
+        home = _cached_envelope(root)
+        if home is None:
+            witness = [_envelope_witness(root / CONTEXTKIT_CONFIG_REL)]
+            if _contextkit_managed(root):
+                program = shutil.which(CONTEXTKIT_BIN)
+                if program:
+                    witness.append(_envelope_witness(program))
+                home = _contextkit_envelope(root)
+            else:
+                home = root / PROJECT_CAPABILITIES_REL
+            _record_envelope(str(root.resolve()), home, witness)
     _ENVELOPE_HOME[root] = home
     return home
 

@@ -356,6 +356,76 @@ def _handed_off_envelope(root: Path) -> str:
     return override
 
 
+ENVELOPE_CACHE_VERSION = 1
+
+
+def _envelope_cache_file(key: str) -> Path:
+    """Where the manager records its answer for one absolute project root.
+
+    The file name only buckets roots apart; the entry's own `root` field is what
+    proves identity, so two roots landing in one bucket cost a miss rather than
+    a wrong answer.
+    """
+    import zlib
+
+    base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    return (base / "capabilities" / "envelope"
+            / f"{format(zlib.crc32(key.encode()), '08x')}.json")
+
+
+def _envelope_witness(path) -> dict:
+    """One input the envelope answer rests on, as that input stands right now."""
+    try:
+        seen = os.stat(path)
+    except OSError:
+        return {"path": str(path), "present": False}
+    return {"path": str(path), "present": True,
+            "size": seen.st_size, "mtime_ns": seen.st_mtime_ns}
+
+
+def _cached_envelope(root: Path):
+    """The recorded answer for this root while every input it rests on holds.
+
+    The manager writes the record and names the inputs its answer consulted; a
+    reader re-observes each of them and compares it whole. Anything at all in
+    doubt — an unreadable file, an unexpected shape, an input that moved, an
+    expiry already behind the clock or a write ahead of it — returns None and
+    costs a full resolution, so the failure mode is slow and never wrong.
+    """
+    import time
+
+    key = str(root.resolve())
+    try:
+        entry = json.loads(_envelope_cache_file(key).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("version") != ENVELOPE_CACHE_VERSION or entry.get("root") != key:
+        return None
+    written, expires = entry.get("written_at"), entry.get("expires_at")
+    if not isinstance(written, (int, float)) or not isinstance(expires, (int, float)):
+        return None
+    now = time.time()
+    if now < written or now >= expires:
+        return None
+    witness = entry.get("witness")
+    if not isinstance(witness, list):
+        return None
+    for observed in witness:
+        if (not isinstance(observed, dict)
+                or _envelope_witness(observed.get("path")) != observed):
+            return None
+    envelope = Path(str(entry.get("envelope") or ""))
+    if not envelope.is_absolute():
+        return None
+    try:
+        envelope.resolve().relative_to(key)
+    except (OSError, ValueError):
+        return None
+    return envelope
+
+
 def _manager_project_envelope(root: Path) -> Path:
     """Consume the capabilities manager's one authoritative project answer."""
     override = _handed_off_envelope(root)
@@ -423,11 +493,18 @@ def _envelope_home(root: Path) -> Path:
     the context owner it delegates to — so a worker, a peer, or a nested
     capability call that would otherwise repeat the whole chain under whatever
     load the machine is under by then reads it instead.
+
+    A fresh top-level call has no such handoff, and reads the manager's recorded
+    answer for this root instead, which stands only while every input that answer
+    rests on is unchanged. A live handoff outranks the record, and any doubt about
+    the record asks the manager again.
     """
     cached = _ENVELOPE_HOME.get(root)
     if cached is not None:
         return cached
-    home = _manager_project_envelope(root)
+    home = None if _handed_off_envelope(root) else _cached_envelope(root)
+    if home is None:
+        home = _manager_project_envelope(root)
     _ENVELOPE_HOME[root] = home
     os.environ["CAPABILITIES_PROJECT_ENVELOPE"] = str(home)
     os.environ["CAPABILITIES_PROJECT_ENVELOPE_ROOT"] = str(root)

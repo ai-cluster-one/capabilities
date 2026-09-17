@@ -213,12 +213,27 @@ follows that answer: the project identity, the manager-owned `.gitignore`, per-c
 identifiers, references, connections, and state. `$CAPABILITIES_PROJECT_ENVELOPE`
 supplies the same answer in advance, so a context owner composing through
 `capabilities context --fragment` is never called back mid-compose. Resolution is
-filesystem-cheap and side-effect free: at most one lookup per invocation, cached
-per project root, and never during project-root discovery. Every other case —
-no `.contextkit/config.toml`, no `contextkit` on `PATH`, a failing command, or
-output that is not an absolute path inside the project — keeps the envelope at
-`<root>/capabilities`, so a project without a context owner depends on nothing
-but itself.
+filesystem-cheap and leaves the project untouched: at most one lookup per
+invocation, cached per project root, and never during project-root discovery.
+Every other case — no `.contextkit/config.toml`, no `contextkit` on `PATH`, a
+failing command, or output that is not an absolute path inside the project —
+keeps the envelope at `<root>/capabilities`, so a project without a context owner
+depends on nothing but itself.
+
+**A resolved answer is recorded, and stands only while its inputs do.** The
+manager writes one entry per absolute project root at
+`$XDG_CACHE_HOME/capabilities/envelope/`, holding the resolved envelope, the size
+and modification time of every input that answer consulted — the project's
+`.contextkit/config.toml` and the context owner's own program — and a coarse
+expiry bounding what a stat cannot see. A capability CLI and the manager both
+read it, re-observing each named input and comparing it whole, so an ordinary
+call resolves the envelope in one small read rather than two interpreter starts.
+Anything in doubt — an unreadable file, an unexpected shape, a moved input, a
+passed expiry — resolves again from the context owner, so the failure mode is
+slow and never wrong. `$CAPABILITIES_PROJECT_ENVELOPE` outranks the record and is
+never written into it. The manager is the record's only writer and replaces
+entries atomically, because capability CLIs run concurrently; the record is
+reconstructible from nothing, so deleting it costs one resolution.
 
 - **Identifiers** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). In files mode `identifiers.json` is a thin standard envelope — label → `{ value, note }`; in database mode the same entries are identifier records. Any reader renders the same menu without understanding the capability, and capability-specific structure lives inside values:
 
