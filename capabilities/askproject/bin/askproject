@@ -111,13 +111,21 @@ SESSION CONTINUITY  (state is LOCAL to the project you call from)
   Use `askproject targets` to see which sessions exist and when they were
   last used.
 
+  On claude the session id is chosen before the peer starts and handed to it,
+  rather than read back out of what it printed. It is therefore known for the
+  whole run, including a run that times out or dies mid-turn with work already
+  done in the target: `-c` still reaches that session. Both the id and the peer
+  name are announced on stderr as the run begins, because stdout carries the
+  result only once the process exits. codex reports its own thread id when it
+  is done, and takes no name.
+
 ────────────────────────────────────────────────────────────────────────────
 OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   {
     "ok": bool, "error": str|null,
     "target": "<abs path>", "engine": "claude|codex", "mode": "read|act",
     "model": "<model id>|null", "effort": "<level>|null",
-    "session_id": "<uuid>", "resumed": bool,
+    "session_id": "<uuid>", "peer_name": "<name>|null", "resumed": bool,
     "answer": <string OR parsed object when --schema is used>,
     "cost_usd": float, "duration_ms": int, "num_turns": int,
     "tokens": {input, output, cache_read, cache_creation},
@@ -168,6 +176,11 @@ FLAGS
                         on error).
   --quiet               Suppress the concise progress stream on stderr.
   --append <text>       Extra instruction appended to the peer's system prompt.
+  --name <name>         Display name for the claude peer's session, so several
+                        live peers are told apart in a listing. Default: the
+                        target's basename plus the session's own prefix, which
+                        is what keeps two peers in one target from sharing a
+                        name. A claude-engine control; codex refuses it.
 
 EXAMPLES
   askproject ../shop "Which file defines the pricing taxonomy?"
@@ -196,6 +209,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import NoReturn
 
@@ -3132,6 +3146,20 @@ def _default_model(mode: str) -> str:
     return _env_default("ASKPROJECT_MODEL", fallback) or fallback
 
 
+def _default_peer_name(target: Path, session_id: str) -> str:
+    """The peer's display name when the caller names none.
+
+    The target's basename is what distinguishes several live peers in a listing:
+    it says which project each one is working in. The session's own prefix is
+    what makes it unique - two peers launched into one target would otherwise
+    register the same name, and a name that resolves to two running sessions is
+    worse than no name at all.
+    """
+    stem = "".join(c if (c.isalnum() or c in "._-") else "-"
+                   for c in target.name).strip("-") or "peer"
+    return f"{stem[:32]}-{session_id[:8]}"
+
+
 def _default_effort() -> str:
     """Reasoning effort when --effort is not passed. An unknown value falls back."""
     v = _env_default("ASKPROJECT_EFFORT", DEFAULT_EFFORT).lower()
@@ -3425,7 +3453,8 @@ def _claude_progress(evt: dict, reporter: ProgressReporter) -> None:
 
 def run_claude(target, prompt, mode, model, effort, caller, append,
                schema_text, resume_id, timeout, as_json,
-               reporter: ProgressReporter) -> dict:
+               reporter: ProgressReporter, peer_name=None,
+               session_id=None) -> dict:
     """Headless Claude. Progress uses stream-json; --quiet retains json mode."""
     output_format = "stream-json" if reporter.enabled else "json"
     cmd = ["claude", "-p", prompt, "--output-format", output_format,
@@ -3433,7 +3462,13 @@ def run_claude(target, prompt, mode, model, effort, caller, append,
     if reporter.enabled:
         cmd += ["--verbose"]
     if resume_id:
+        # A resumed conversation already carries its id; naming a second one
+        # would address a different session than the one being continued.
         cmd += ["--resume", resume_id]
+    elif session_id:
+        cmd += ["--session-id", session_id]
+    if peer_name:
+        cmd += ["--name", peer_name]
     if mode == "read":
         # --tools is what makes read mode a fence: it decides which built-in
         # tools exist for the turn, so Bash/Edit/Write are absent from the
@@ -3478,8 +3513,13 @@ def run_claude(target, prompt, mode, model, effort, caller, append,
                                   stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as exc:
         reporter.emit("failed", f"Peer timed out after {timeout}s")
-        session_id = _parse_claude_session_id(_timeout_output(exc)) or resume_id
-        raise PeerTimeout(timeout, session_id) from exc
+        # The id was settled before launch, so a peer that times out mid-turn
+        # is still addressable. Reading it out of partial output stays as the
+        # fallback for a caller that supplied none.
+        known = resume_id or session_id
+        raise PeerTimeout(
+            timeout,
+            known or _parse_claude_session_id(_timeout_output(exc))) from exc
     if proc.returncode != 0:
         reporter.emit("failed", f"Claude peer exited with status {proc.returncode}")
         snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
@@ -3508,7 +3548,7 @@ def run_claude(target, prompt, mode, model, effort, caller, append,
     usage = env.get("usage", {}) or {}
     return {
         "answer": answer,
-        "session_id": env.get("session_id"),
+        "session_id": env.get("session_id") or session_id or resume_id,
         "model": model,
         "effort": effort,
         "cost_usd": env.get("total_cost_usd"),
@@ -3550,7 +3590,8 @@ def _parse_codex_events(stdout: str) -> tuple[dict, str | None, bool]:
 
 def run_codex(target, prompt, mode, model, effort, caller, append,
               schema_text, resume_id, timeout, as_json,
-              reporter: ProgressReporter) -> dict:
+              reporter: ProgressReporter, peer_name=None,
+              session_id=None) -> dict:
     """Headless `codex exec`. codex has no system-prompt flag, so the peer
     preamble is folded into the prompt; the final message is read from -o and
     usage/thread id from the --json JSONL. Schema uses codex's native
@@ -3715,7 +3756,27 @@ def run(args):
 
     schema_text = resolve_schema(args.schema) if args.schema else None
 
+    if args.name and engine != "claude":
+        die(f"--name is a claude-engine control; {engine} names no peer",
+            as_json=as_json)
+
+    # The peer's identity is settled here rather than read back out of its
+    # output. An id that exists only once the peer has spoken is missing exactly
+    # when it is worth most: a peer that times out or dies mid-turn has already
+    # worked in the target, and with no id there is nothing left to resume or
+    # inspect. codex reports its own thread id and takes neither.
+    if engine == "claude":
+        session_id_upfront = resume_id or str(uuid.uuid4())
+        peer_name = args.name or _default_peer_name(target, session_id_upfront)
+    else:
+        session_id_upfront = None
+        peer_name = None
+
     reporter = ProgressReporter(engine, enabled=not args.quiet)
+    # Before the launch line: stdout carries the result only at exit, so this is
+    # the only moment a caller watching a live run learns what it is watching.
+    if peer_name:
+        reporter.emit("peer", f"{peer_name} session {session_id_upfront}")
     reporter.emit("starting", f"Launching {engine} peer")
     before = snapshot(target)
     # Read before the peer starts: an engine that builds its context at session
@@ -3725,7 +3786,8 @@ def run(args):
     try:
         res = ENGINE_RUNNERS[engine](target, args.prompt, mode, model, effort,
                                      caller, args.append, schema_text, resume_id,
-                                     args.timeout, as_json, reporter)
+                                     args.timeout, as_json, reporter, peer_name,
+                                     session_id_upfront)
     except PeerTimeout as exc:
         entry["last_attempt"] = {
             "status": "timed_out",
@@ -3789,6 +3851,7 @@ def run(args):
         "model": res.get("model"),
         "effort": res.get("effort"),
         "session_id": session_id,
+        "peer_name": peer_name,
         "resumed": resumed,
         "answer": answer,
         "cost_usd": res.get("cost_usd"),
@@ -3900,6 +3963,7 @@ def main():
     p.add_argument("--text", action="store_true")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--append")
+    p.add_argument("--name")
     args = p.parse_args(argv)
     run(args)
 
