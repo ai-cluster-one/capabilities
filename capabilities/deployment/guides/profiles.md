@@ -47,17 +47,20 @@ running container's filesystem is a build artifact and a rebuild replaces it.
 `agent-box-checkout` leaves `compiler.container.project_root` an empty mount
 point and declares an `agent_body` volume over it. On a first boot the entrypoint
 clones `AGENT_REPO_URL` at `AGENT_REPO_BRANCH` into that volume. On every boot
-after, a populated volume is left exactly as it is: what was committed there
-outranks anything the image believes.
+after, a populated volume is never cloned over: what was committed there
+outranks anything the image believes. Bringing it level with the branch it
+tracks is a separate job, and the profile does it - see **Keeping the body
+current** below.
 
 **What a redeploy costs.** This is the whole decision. Under `agent-box` a
 rebuild is how a change reaches the box, and anything the agent wrote inside the
 container is gone with the old image. Under `agent-box-checkout` the body
-survives the rebuild, and a change reaches the box through Git instead. Pick the
-checkout profile when the thing inside the box writes to its own project and
-that writing has to last - an assistant whose repository is its memory. Pick
-`agent-box` when the project is input the box only reads, which is the ordinary
-case and the simpler one.
+survives the rebuild, and a change reaches the box through Git instead - carried
+by the profile's own sync program rather than by a rebuild or by anything the
+project declares. Pick the checkout profile when the thing inside the box writes
+to its own project and that writing has to last - an assistant whose repository
+is its memory. Pick `agent-box` when the project is input the box only reads,
+which is the ordinary case and the simpler one.
 
 **What still comes from the image.** `deployment/capabilities.lock` is compiled
 from the effective project gate on the workstation and copied into the image, so
@@ -71,15 +74,17 @@ until the volume is mounted, so its entrypoint runs `capabilities init`, and
 where ContextKit is bound `contextkit init`, `install-hooks` and `build`, on
 every boot. That costs boot time and needs the network at start; in exchange the
 bindings always describe the checkout actually running. It also writes into the
-checkout, which is now a working tree someone may be committing: a project on
-this profile has to ignore its generated host bindings, or every boot shows up
-as a change.
+checkout, which is now a working tree the profile itself commits and pushes: a
+project on this profile has to ignore its generated host bindings, or every boot
+shows up as a commit the box sends to the branch everyone else reads.
 
 **Where the boot inputs sit.** A volume mounted at the project root hides
 anything the image left underneath it, so the checkout profile copies the lock,
-the entrypoint, and the Supervisor configuration to `/opt/agent` and reads them
-from there. They are copied into one directory, so their file names must differ.
-The generated `.dockerignore` narrows the build context to exactly those files.
+the entrypoint, the sync program, and the Supervisor configuration to
+`/opt/agent` and reads them from there. They are copied into one directory, so
+their file names must differ, and `deployment doctor` refuses a declaration that
+collides with one of them. The generated `.dockerignore` narrows the build
+context to exactly those files.
 
 **What the box needs told.** `AGENT_REPO_URL` is required, and Compose passes
 only declared keys, so an undeclared one never reaches the entrypoint and a
@@ -92,9 +97,46 @@ context is the project, even though the running container clones its own copy.
 What the checkout profile removes is the project from the *image*, not from the
 build.
 
-**Two writers, one branch.** A box that commits its own body and a person who
-commits the same repository are two writers, and nothing in this capability
-arbitrates between them. That belongs to whatever runs inside the box.
+**Keeping the body current.** A box whose body never moves is a box stuck on the
+commit it first cloned, and anything it wrote there never leaves it. That is a
+property of this runtime shape rather than of any one project, so the profile
+owns it: managed checkout artifacts render a sync program beside the entrypoint
+and supervise it, and the project declares nothing to get it.
+
+It runs in both directions in one pass. What was pushed to the tracked branch is
+taken in by rebase, and what the box wrote and nobody committed deliberately is
+snapshotted and sent on. Both halves are one program because a puller and a
+pusher sharing a working tree have to agree on when it is safe to touch it.
+
+It runs twice over: once in the entrypoint before anything else reads the body,
+and then on an interval under Supervisor. The boot pass is what makes the box
+repairable - a box that took in a broken declaration has to be able to take in
+the fix, so the program depends on git and the base system alone and reaches for
+no capability CLI, no project configuration, and no scheduler. A boot pass that
+cannot reach the remote warns and lets the box come up on the body it has.
+
+A change is only snapshotted once the tree has been continuously dirty for the
+quiet window, measured from the first pass that saw it dirty, so a burst of
+writing becomes one commit rather than five and a continuous writer cannot defer
+the snapshot forever. The snapshot is taken before the network is touched, so an
+unreachable remote costs the push and never the commit. A tree left
+mid-operation - an interrupted rebase, an unresolved merge - stops the pass
+loudly instead of reading as settling, and a rebase that conflicts is aborted,
+leaving the box holding its own work until a person unpicks it. Every one of
+those is a failed pass rather than a failed process: the program says so and
+waits for the next tick, so a fault nobody has fixed yet costs one line an
+interval rather than a restart.
+
+`AGENT_BODY_SYNC` turns it off, `AGENT_BODY_SYNC_INTERVAL` sets how often a pass
+runs, and `AGENT_BODY_SYNC_QUIET` sets the window. The generated `.env.example`
+carries all three with the values the box will run with. A box told not to sync
+exits zero and stays exited rather than restart-looping, and a program that
+cannot run at all is backed off and reported rather than respawned under a
+status that reads healthy.
+
+Where the entrypoint artifact is declared `external`, the project has taken its
+boot path and process management whole, and the profile renders no sync program
+into it.
 
 ## What changes between a container and a host
 

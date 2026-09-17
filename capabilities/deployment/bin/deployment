@@ -52,11 +52,13 @@ USAGE
       `agent-box` builds one supervised container carrying the project.
       `agent-box-checkout` builds the same container without the project: the
       image holds tools and the boot path, and the checkout arrives from Git on
-      a volume the entrypoint clones into, so what the agent commits there
-      survives a redeploy. `host-agents` supervises the same declared services
-      as processes on the machine itself: `sync` writes one launchd agent per
-      service under `compiler.host.agents_dir`, and `deployment next` hands over
-      the launchctl steps. `generic` stays declaration-only. Run
+      a volume the entrypoint clones into. The profile then keeps that body
+      level with the branch it tracks, in both directions, so what was pushed
+      reaches the box and what the agent commits there both survives a redeploy
+      and reaches the remote. `host-agents` supervises the same declared
+      services as processes on the machine itself: `sync` writes one launchd
+      agent per service under `compiler.host.agents_dir`, and `deployment next`
+      hands over the launchctl steps. `generic` stays declaration-only. Run
       `deployment guide profiles` for the trade-offs.
 
   deployment freeze [--force]
@@ -205,15 +207,43 @@ HOST_PROFILES = ("host-agents",)
 # A checkout profile builds the same container and fills it differently. The
 # image carries tools and the boot path and no project at all; the checkout
 # arrives at run time on a volume, which the entrypoint clones into while it is
-# still empty and never touches again. Everything else follows from that: what
-# needs a checkout to exist cannot run at build time, so it runs at boot, and
-# the boot inputs are copied somewhere the volume cannot mask them.
+# still empty. Everything else follows from that: what needs a checkout to exist
+# cannot run at build time, so it runs at boot, the boot inputs are copied
+# somewhere the volume cannot mask them, and keeping the body level with the
+# branch it tracks becomes the profile's own work rather than the project's.
 CHECKOUT_PROFILES = ("agent-box-checkout",)
 BOOT_DIR = "/opt/agent"
 BODY_VOLUME = "agent_body"
 LOCK_REL = "deployment/capabilities.lock"
 REPO_URL_ENV = "AGENT_REPO_URL"
 REPO_BRANCH_ENV = "AGENT_REPO_BRANCH"
+# The one program the compiler owns on this substrate. Every other Supervisor
+# program comes from an installed capability's deploy descriptor; this one comes
+# from the profile, because keeping the body current is a property of the runtime
+# shape rather than of any project running on it. It is on unless an operator
+# says otherwise: a checkout that neither takes in what was pushed nor sends what
+# it wrote is a half-configured box, not a choice.
+SYNC_PROGRAM = "body-sync.sh"
+SYNC_SERVICE = "body-sync"
+SYNC_ENABLED_ENV = "AGENT_BODY_SYNC"
+SYNC_INTERVAL_ENV = "AGENT_BODY_SYNC_INTERVAL"
+SYNC_QUIET_ENV = "AGENT_BODY_SYNC_QUIET"
+SYNC_TRAILER = "Body-Sync: agent-box-checkout"
+# What Supervisor counts as a successful start, and the only bound there is on a
+# program that dies the moment it is spawned. Below this window an exit is a
+# start failure Supervisor backs off from and reports; above it an exit is a
+# restart it repeats at once and forever, while `status` still reads RUNNING. A
+# window of zero therefore buys an unbounded respawn that announces itself as
+# healthy, which is worse than either honest answer.
+SYNC_START_SECONDS = 3
+SYNC_DEFAULTS = {
+    SYNC_ENABLED_ENV: "1",
+    # Long enough that a burst of writing is one snapshot rather than five, short
+    # enough that what the box wrote and what was pushed to it are never more
+    # than a working pause apart.
+    SYNC_INTERVAL_ENV: "300",
+    SYNC_QUIET_ENV: "600",
+}
 HOST_SUPERVISORS = ("launchd",)
 # A supervisor restarts a process that died. It cannot see one that is alive
 # and doing nothing — the shape a deadlock leaves behind, where the process
@@ -3317,6 +3347,12 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
             "# volume the entrypoint clones this, and on a populated one it is unused.",
             f"{REPO_URL_ENV}=",
             f"{REPO_BRANCH_ENV}=main",
+            "",
+            "# Keeping the body current. The box takes in what was pushed to that",
+            "# branch and sends on what it wrote, every interval seconds, once a",
+            "# change has sat for quiet seconds. Set the first to 0 to turn all of",
+            "# that off; a box that does neither cannot be reached and cannot be read.",
+            *[f"{key}={SYNC_DEFAULTS[key]}" for key in sorted(SYNC_DEFAULTS)],
         ]
     lines += [
         "",
@@ -3350,7 +3386,7 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
     # the same name, and the later one wins.
     stated = [runtime.get("image_env")]
     if checkout:
-        stated += [REPO_URL_ENV, REPO_BRANCH_ENV]
+        stated += [REPO_URL_ENV, REPO_BRANCH_ENV, *SYNC_DEFAULTS]
     for key in stated:
         if isinstance(key, str) and key:
             required.discard(key)
@@ -3368,11 +3404,298 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
     return "\n".join(lines) + "\n"
 
 
+_BODY_SYNC_PROGRAM = r'''#!/usr/bin/env bash
+# Body sync: one writer moving this box's checkout in both directions.
+#
+# It takes in what was pushed to the branch the box tracks, and it sends on what
+# the box wrote and nobody committed deliberately. Both halves are one program
+# because a puller and a pusher working the same tree have to agree on when it is
+# safe to touch, and one writer removes the question.
+#
+# It depends on git and on nothing else. A box whose project configuration is
+# what broke still has to be able to pull the fix, so this program never reaches
+# for a capability CLI, for the project's scheduler, or for anything the body
+# declares about itself.
+#
+# The clock a writer cannot touch. A change counts as settled once the tree has
+# been continuously dirty, as this program saw it, for the whole quiet window.
+# That is measured from the first pass that found the tree dirty, and the stamp
+# is kept in the git directory, outside the working tree, so that neither a
+# rebase nor a clean nor the writing itself can reset it. Two nearer
+# clocks are both broken: the newest mtime among the changed paths is reset by
+# the very writing it exists to bound, so a continuous writer defers the snapshot
+# - and the rebase waiting behind it - forever; and the age of the last commit
+# has the inverse failure, letting the first keystroke after any quiet stretch
+# commit immediately.
+#
+# Nothing here is hostage to a step that can fail. The snapshot is taken before
+# the network is touched, so an unreachable remote costs the push and never the
+# commit, and the next pass starts from a body that already holds the work. What
+# does stop a pass is a tree left mid-operation: an interrupted rebase reads as a
+# tree someone is still writing, and a pass that quietly called that "settling"
+# would leave the box out of contact with nothing saying so.
+#
+# The message is deterministic. An agent that wants its work described commits it
+# when it does it; this program exists for what was not committed that way, and a
+# snapshot deserves a snapshot's message.
+set -uo pipefail
+
+APP=__APP__
+TRAILER='__TRAILER__'
+IDENTITY=__IDENTITY__
+
+enabled="${__ENABLED__:-__ENABLED_DEFAULT__}"
+interval="${__INTERVAL__:-__INTERVAL_DEFAULT__}"
+quiet="${__QUIET__:-__QUIET_DEFAULT__}"
+
+# A tree left mid-operation. Git names each of these inside the git directory,
+# and any one of them means a previous pass, or a person, stopped halfway.
+INTERRUPTIONS='rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG'
+
+# How much of the change the subject and the body carry before they stop being
+# scannable. Past these the diff is the record, and it is one command away.
+AREA_BUDGET=5
+FILE_BUDGET=40
+
+log() { printf '[body-sync] %s\n' "$*"; }
+warn() { printf '[body-sync] %s\n' "$*" >&2; }
+
+g() { git -C "$APP" "$@"; }
+
+# A count read back from git, which is a whole number or nothing readable.
+digits() {
+  case "${1:-}" in
+    '' | *[!0-9]*) printf '%s' "$2" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# A setting read from the environment. An unusable value falls back to the
+# default and says so: a box quietly running a window nobody chose is the same
+# defect as one running none.
+seconds() {
+  case "${2:-}" in
+    '') printf '%s' "$3"; return ;;
+    *[!0-9]*)
+      warn "$1=$2 is not a whole number of seconds; using $3"
+      printf '%s' "$3"
+      return
+      ;;
+  esac
+  printf '%s' "$2"
+}
+
+on() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    0 | false | no | off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Stage everything and commit it under a message a person can scan: the
+# top-level areas that moved, then the files themselves. `add -A` is deliberate.
+# An allowlist of the paths the box is expected to write drops a new routine, a
+# new note or a new record the first time it invents one, silently, which is the
+# failure that actually costs something. What bounds it is the body's own
+# .gitignore.
+snapshot() {
+  local branch="$1" files count areas areas_shown areas_total subject body noun
+  g config --get user.email >/dev/null 2>&1 || g config user.email "$IDENTITY@local"
+  g config --get user.name >/dev/null 2>&1 || g config user.name "$IDENTITY"
+  if ! g add -A; then
+    warn "FATAL: git could not stage the tree at $APP; nothing is snapshotted"
+    return 1
+  fi
+  if g diff --cached --quiet; then
+    warn "$branch - the tree reads as changed but nothing of it can be staged; git status on the box says what it is"
+    return 2
+  fi
+  files="$(g diff --cached --name-only)"
+  count="$(printf '%s\n' "$files" | wc -l | tr -d ' ')"
+  areas="$(printf '%s\n' "$files" \
+    | awk -F/ 'NF > 1 { print $1; next } { print "(root)" }' | sort -u)"
+  areas_total="$(printf '%s\n' "$areas" | wc -l | tr -d ' ')"
+  areas_shown="$(printf '%s\n' "$areas" | head -"$AREA_BUDGET" \
+    | awk '{ s = s (NR > 1 ? ", " : "") $0 } END { printf "%s", s }')"
+  if [ "$areas_total" -gt "$AREA_BUDGET" ]; then
+    areas_shown="$areas_shown and $((areas_total - AREA_BUDGET)) more"
+  fi
+  noun='files'
+  [ "$count" -eq 1 ] && noun='file'
+  subject="body snapshot: $areas_shown ($count $noun)"
+  body="$(printf '%s\n' "$files" | head -"$FILE_BUDGET" | sed 's/^/- /')"
+  if [ "$count" -gt "$FILE_BUDGET" ]; then
+    body="$body
+- ... and $((count - FILE_BUDGET)) more"
+  fi
+  if ! g commit --quiet -m "$subject" -m "$body" -m "$TRAILER"; then
+    warn "FATAL: the snapshot could not be committed at $APP"
+    return 1
+  fi
+  log "$branch - committed - $subject"
+  return 0
+}
+
+pass() {
+  local gitdir stamp branch dirty halted now since age changed taken
+  local behind ahead arrived clashing outcome
+
+  if ! gitdir="$(g rev-parse --absolute-git-dir 2>/dev/null)" || [ -z "$gitdir" ]; then
+    warn "FATAL: $APP is not a git checkout this program can read; nothing is taken in and nothing is sent"
+    return 1
+  fi
+
+  halted=''
+  for name in $INTERRUPTIONS; do
+    [ -e "$gitdir/$name" ] && halted="$halted $name"
+  done
+  [ -n "$(g ls-files --unmerged)" ] && halted="$halted unmerged-paths"
+  if [ -n "$halted" ]; then
+    warn "FATAL: $APP is mid-operation ($(printf '%s' "${halted# }")) and nothing can be snapshotted over it; the box takes nothing in and sends nothing until a person finishes it: git -C $APP rebase --abort"
+    return 1
+  fi
+
+  branch="$(g rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  if [ -z "$branch" ] || [ "$branch" = 'HEAD' ]; then
+    warn "FATAL: HEAD is detached at $APP; a snapshot has no branch to land on"
+    return 1
+  fi
+
+  stamp="$gitdir/agent-body-sync"
+  now="$(date +%s)"
+  dirty="$(g status --porcelain)"
+  if [ -n "$dirty" ]; then
+    since="$(cat "$stamp" 2>/dev/null)"
+    case "$since" in
+      '' | *[!0-9]*)
+        since="$now"
+        if ! printf '%s\n' "$now" > "$stamp" 2>/dev/null; then
+          warn "FATAL: the dirty-since clock cannot be written to $stamp; without it nothing bounds how long a tree being written holds the snapshot and the rebase"
+          return 1
+        fi
+        ;;
+    esac
+    age=$((now - since))
+    changed="$(printf '%s\n' "$dirty" | wc -l | tr -d ' ')"
+    if [ "$age" -lt "$quiet" ]; then
+      log "$branch - $changed changed path(s) - settling (${age}s of ${quiet}s); nothing is taken in while the tree is being written"
+      return 0
+    fi
+    snapshot "$branch"
+    outcome=$?
+    if [ "$outcome" -ne 0 ]; then
+      return "$outcome"
+    fi
+    dirty="$(g status --porcelain)"
+    if [ -n "$dirty" ]; then
+      printf '%s\n' "$now" > "$stamp" 2>/dev/null
+      log "$branch - the tree was written again; the rest waits for the next pass"
+      return 0
+    fi
+  fi
+  rm -f "$stamp" 2>/dev/null
+
+  if ! g fetch --quiet origin "$branch"; then
+    warn "$branch - the remote could not be reached; nothing was taken in and nothing was sent this pass"
+    return 1
+  fi
+  behind="$(digits "$(g rev-list --count "HEAD..origin/$branch" 2>/dev/null)" 0)"
+  taken=0
+  if [ "$behind" -gt 0 ]; then
+    arrived="$(g diff --name-only "HEAD...origin/$branch" | wc -l | tr -d ' ')"
+    if ! g rebase --quiet "origin/$branch"; then
+      clashing="$(g diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/ *$//')"
+      g rebase --abort > /dev/null 2>&1
+      warn "FATAL: rebasing onto origin/$branch conflicts in ${clashing:-unknown paths}; the box keeps its own work and takes nothing in until a person unpicks it"
+      return 1
+    fi
+    taken="$arrived"
+    log "$branch - $taken file(s) taken in from origin/$branch"
+  fi
+  ahead="$(digits "$(g rev-list --count "origin/$branch..HEAD" 2>/dev/null)" 0)"
+  if [ "$ahead" -gt 0 ]; then
+    if ! g push --quiet origin "HEAD:refs/heads/$branch"; then
+      warn "$branch - the push was rejected; the work stays on the box and the next pass retries"
+      return 1
+    fi
+    log "$branch - $ahead commit(s) sent to origin/$branch"
+  fi
+  if [ "$behind" -eq 0 ] && [ "$ahead" -eq 0 ]; then
+    log "$branch - up to date with origin/$branch"
+  fi
+  return 0
+}
+
+# A quiet window of zero is a box that snapshots as soon as it sees a change,
+# which is a choice; an interval of zero is a busy loop, which is not.
+interval="$(seconds __INTERVAL__ "$interval" __INTERVAL_DEFAULT__)"
+quiet="$(seconds __QUIET__ "$quiet" __QUIET_DEFAULT__)"
+if [ "$interval" -lt 1 ]; then
+  warn "__INTERVAL__=$interval would spin; using __INTERVAL_DEFAULT__"
+  interval=__INTERVAL_DEFAULT__
+fi
+
+mode="${1:---once}"
+
+if ! on "$enabled"; then
+  log "disabled by __ENABLED__=$enabled; this box neither takes in what was pushed nor sends what it wrote"
+  # A supervisor tells a program that could not start from one that started and
+  # then stopped by how long the process lived, and nothing else. A supervised
+  # pass that means to do nothing therefore has to outlive that window before it
+  # exits, or a box deliberately turned off is indistinguishable from one whose
+  # program cannot run at all. The boot pass answers to no supervisor and exits
+  # at once.
+  [ "$mode" = '--loop' ] && sleep __SETTLE__
+  exit 0
+fi
+
+case "$mode" in
+  --once)
+    pass
+    exit $?
+    ;;
+  --loop)
+    log "watching $APP every ${interval}s; a change counts as settled after ${quiet}s"
+    while :; do
+      pass
+      sleep "$interval"
+    done
+    ;;
+  *)
+    warn "usage: ${0##*/} [--once|--loop]"
+    exit 2
+    ;;
+esac
+'''
+
+
+def _body_sync_template(project_name: str, project_root: str) -> str:
+    """The profile's own program, rendered for one box.
+
+    Everything it needs is baked in: where the body is, who the box commits as,
+    and the names and defaults of the three settings an operator can change. It
+    reads nothing else, because the box it has to be able to repair is the one
+    whose project configuration is what broke.
+    """
+    return (_BODY_SYNC_PROGRAM
+            .replace("__APP__", shlex.quote(project_root.rstrip("/") or "/app"))
+            .replace("__IDENTITY__", shlex.quote(_slug(project_name)))
+            .replace("__TRAILER__", SYNC_TRAILER)
+            .replace("__ENABLED_DEFAULT__", SYNC_DEFAULTS[SYNC_ENABLED_ENV])
+            .replace("__INTERVAL_DEFAULT__", SYNC_DEFAULTS[SYNC_INTERVAL_ENV])
+            .replace("__QUIET_DEFAULT__", SYNC_DEFAULTS[SYNC_QUIET_ENV])
+            .replace("__SETTLE__", str(SYNC_START_SECONDS + 1))
+            .replace("__ENABLED__", SYNC_ENABLED_ENV)
+            .replace("__INTERVAL__", SYNC_INTERVAL_ENV)
+            .replace("__QUIET__", SYNC_QUIET_ENV))
+
+
 _CHECKOUT_BLOCK = """
 # --- Project checkout --------------------------------------------------------
 # The image carries tools and this boot path and no project at all. The volume
-# mounted here is the live body, and a populated one is left exactly as it is:
-# what was committed there outranks anything the image believes.
+# mounted here is the live body, and a populated one is never cloned over: what
+# was committed there outranks anything the image believes. Bringing it level
+# with the branch it tracks is the next block's job, not this one's.
 #
 # A fresh named volume is seeded from the image, which leaves the empty mount
 # directories behind, so emptiness is judged by files rather than by entries.
@@ -3403,6 +3726,15 @@ fi
 
 cd "$APP"
 
+# --- Taking in what was pushed -----------------------------------------------
+# Before anything else reads the body, the body is brought level with the branch
+# it tracks. This is the boot pass of the program the profile supervises, and it
+# runs here, first, for one reason: a box that took in a broken declaration has
+# to be able to take in the fix, and a sync that needed the project's scheduler
+# or the project's configuration to be healthy could not repair the box whose
+# configuration is what broke. It depends on git and on nothing else.
+__SYNC__
+
 # --- Project initialization --------------------------------------------------
 # Host bindings, capability wiring, and compiled context are build artifacts of
 # a checkout. There is no checkout at build time, so they are made here against
@@ -3423,7 +3755,8 @@ _ENTRYPOINT_DOCTORS = {
 
 def _entrypoint_template(project_name: str, supervisor_config: str | None = None,
                          checkout: bool = False, project_root: str = "/app",
-                         has_contextkit: bool = False) -> str:
+                         has_contextkit: bool = False,
+                         body_sync: str | None = None) -> str:
     identity = _slug(project_name)
     default_command = (
         f"exec /usr/bin/supervisord -c {shlex.quote(supervisor_config)}"
@@ -3440,10 +3773,16 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
                     "contextkit install-hooks --target codex --target claude",
                     "contextkit build --target all"]
             doctors.append(_ENTRYPOINT_DOCTORS["contextkit"])
+        # A boot that could not reach the remote still boots: the box comes up on
+        # the body it has and the supervised pass retries.
+        sync = (f"{shlex.quote(body_sync)} --once || echo \"[entrypoint] WARN: the body"
+                " could not be brought level with its branch; the box is running what"
+                " the volume already held\" >&2") if body_sync else ""
         checkout_block = (_CHECKOUT_BLOCK
                           .replace("__APP__", shlex.quote(project_root.rstrip("/") or "/app"))
                           .replace("__URL__", REPO_URL_ENV)
                           .replace("__BRANCH__", REPO_BRANCH_ENV)
+                          .replace("__SYNC__", sync)
                           .replace("__INIT__", "\n".join(init))
                           .replace("__DOCTORS__", "\n".join(doctors)))
     return f"""#!/usr/bin/env bash
@@ -3497,6 +3836,7 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
     username = Path(agent_home).name
     entrypoint_path = project_root.rstrip("/") + "/" + entrypoint_rel
     lock_path = project_root.rstrip("/") + "/deployment/capabilities.lock"
+    chmod_paths = entrypoint_path
     if checkout:
         # Both are read from the boot directory instead: the volume mounts over
         # the project root and would hide anything the image left under it.
@@ -3538,6 +3878,13 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
         contextkit_build = ""
         capabilities_init_and_doctor = ""
         copies = " ".join(boot_copy or [])
+        # Every generated file the boot path runs is made executable, not just
+        # the entrypoint: a COPY carries the mode of whatever the build context
+        # held, and a program the image cannot run is a box that cannot sync.
+        chmod_paths = " ".join(
+            [entrypoint_path]
+            + [BOOT_DIR + "/" + Path(rel).name for rel in (boot_copy or [])
+               if Path(rel).name == SYNC_PROGRAM])
         body_copy = "\n".join([
             "# The image carries tools and the boot path, never the project. The checkout",
             "# arrives at run time on the volume mounted at " + project_root + ", so that",
@@ -3611,7 +3958,7 @@ RUN uv python install 3.13
 {contextkit_install}
 {body_copy}
 
-RUN chmod +x {entrypoint_path}
+RUN chmod +x {chmod_paths}
 
 USER root
 RUN ln -sf {agent_home}/.local/bin/claude /usr/local/bin/claude \\
@@ -3643,7 +3990,8 @@ ENTRYPOINT [{json.dumps(entrypoint_path)}]
 """
 
 
-def _supervisor_template(embedded: dict[str, dict], project_root: str) -> str:
+def _supervisor_template(embedded: dict[str, dict], project_root: str,
+                         body_sync: str | None = None) -> str:
     sections = ["""[unix_http_server]
 file=/tmp/agent-box-supervisor.sock
 chmod=0700
@@ -3659,6 +4007,32 @@ supervisor.rpcinterface_factory=supervisor.rpcinterface:make_main_rpcinterface
 
 [supervisorctl]
 serverurl=unix:///tmp/agent-box-supervisor.sock"""]
+    if body_sync:
+        # The one program here that no descriptor declares. It starts ahead of
+        # the capability services so they read a body already level with its
+        # branch, and `autorestart=unexpected` is what lets the off switch be an
+        # environment variable: a box told not to sync exits zero and stays
+        # exited, while a program that died restarts. The start window is what
+        # keeps that second half bounded — a program that cannot run at all is
+        # backed off and reported rather than respawned forever under a status
+        # that reads RUNNING — and the program outlives it before exiting on the
+        # off switch, so the two answers stay distinguishable.
+        sections.append(f"""[program:{SYNC_SERVICE}]
+command={shlex.quote(body_sync)} --loop
+directory={project_root}
+autostart=true
+autorestart=unexpected
+exitcodes=0
+startsecs={SYNC_START_SECONDS}
+startretries=100
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
+priority=5""")
     for priority, (name, service) in enumerate(sorted(embedded.items()), 10):
         deploy = service["deploy"]
         restart = str(deploy.get("restart") or "unless-stopped")
@@ -3811,8 +4185,8 @@ def _runtime_template(profile: str, project_name: str) -> dict:
             "Container that holds the agent CLIs and capability CLIs; the project "
             f"checkout lives on the {BODY_VOLUME} volume.")
         agent["required_env"] = [REPO_URL_ENV]
-        agent["optional_env"] = ["AGENT_IMAGE", REPO_BRANCH_ENV]
-        agent["environment_defaults"] = {REPO_BRANCH_ENV: "main"}
+        agent["optional_env"] = ["AGENT_IMAGE", REPO_BRANCH_ENV, *sorted(SYNC_DEFAULTS)]
+        agent["environment_defaults"] = {REPO_BRANCH_ENV: "main", **SYNC_DEFAULTS}
         agent["state"] = [*agent["state"], BODY_VOLUME]
         volumes[BODY_VOLUME] = {
             "description": "The project checkout the agent reads, writes, and commits from.",
@@ -3893,7 +4267,10 @@ def _compile_runtime(root: Path, runtime: dict,
     if host:
         active = {**embedded, **active}
         embedded = {}
-    if embedded and "supervisor" not in compiler["artifacts"]:
+    # A checkout profile needs a Supervisor configuration for its own program
+    # even when no capability service is embedded in the box.
+    if ((embedded or str(runtime.get("profile") or "") in CHECKOUT_PROFILES)
+            and "supervisor" not in compiler["artifacts"]):
         managed = all(
             _artifact_declaration(compiler["artifacts"][key])[1] == "managed"
             for key in ("dockerfile", "entrypoint")
@@ -3936,8 +4313,18 @@ def _compile_runtime(root: Path, runtime: dict,
         agent_entry["optional_env"] = [
             key for key in _merged_strings(agent_entry.get("optional_env"), [REPO_BRANCH_ENV])
             if key not in agent_entry["required_env"]]
+        agent_entry["optional_env"] = [
+            key for key in _merged_strings(agent_entry["optional_env"],
+                                           sorted(SYNC_DEFAULTS))
+            if key not in agent_entry["required_env"]]
         defaults = dict(agent_entry.get("environment_defaults") or {})
         defaults.setdefault(REPO_BRANCH_ENV, "main")
+        # Compose passes only declared keys, so the defaults are declared here
+        # rather than left to the program: an operator reading the runtime, the
+        # Compose file or the env example sees the same three settings and the
+        # same values the box will run with.
+        for key, value in SYNC_DEFAULTS.items():
+            defaults.setdefault(key, value)
         agent_entry["environment_defaults"] = defaults
         services["agent"] = agent_entry
     if embedded:
@@ -4144,16 +4531,31 @@ def _artifact_texts(root: Path, runtime: dict,
     build_context = Path(os.path.relpath(root, paths["compose"].parent)).as_posix()
     dockerfile_rel = paths["dockerfile"].relative_to(root).as_posix()
     entrypoint_rel = paths["entrypoint"].relative_to(root).as_posix()
+    # The profile's own program sits beside the entrypoint, because it is the
+    # entrypoint's boot path that runs it and the same ownership answers for
+    # both. A project that has taken the entrypoint over owns its process
+    # management whole, and the profile renders nothing into it.
+    body_sync_path = None
+    body_sync_rel = None
+    body_sync_config = None
+    if checkout and _artifact_ownership(runtime, "entrypoint") == "managed":
+        body_sync_path = paths["entrypoint"].parent / SYNC_PROGRAM
+        body_sync_rel = body_sync_path.relative_to(root).as_posix()
+        body_sync_config = BOOT_DIR + "/" + SYNC_PROGRAM
     supervisor_path = paths.get("supervisor")
     supervisor_config = None
     supervisor_rel = None
-    if embedded and supervisor_path is not None:
+    # A checkout box runs Supervisor for the profile's program alone, with no
+    # capability service embedded in it at all.
+    if (embedded or body_sync_config) and supervisor_path is not None:
         supervisor_rel = supervisor_path.relative_to(root).as_posix()
         supervisor_config = ((BOOT_DIR + "/" + supervisor_path.name) if checkout
                              else project_root.rstrip("/") + "/" + supervisor_rel)
     # A checkout image copies these and nothing else, so they are both what the
     # Dockerfile names and the only paths the build context has to carry.
-    boot_copy = ([LOCK_REL, entrypoint_rel] + ([supervisor_rel] if supervisor_config else [])
+    boot_copy = ([LOCK_REL, entrypoint_rel]
+                 + ([supervisor_rel] if supervisor_config else [])
+                 + ([body_sync_rel] if body_sync_rel else [])
                  if checkout else None)
     raw = {paths["compose"]: _compose_template(
         project_name, runtime, active, build_context, dockerfile_rel, has_contextkit)}
@@ -4167,11 +4569,17 @@ def _artifact_texts(root: Path, runtime: dict,
             checkout=checkout, boot_copy=boot_copy),
         "entrypoint": _entrypoint_template(
             project_name, supervisor_config, checkout=checkout,
-            project_root=project_root, has_contextkit=has_contextkit),
+            project_root=project_root, has_contextkit=has_contextkit,
+            body_sync=body_sync_config),
     }
     if supervisor_path is not None:
         candidates["supervisor"] = _supervisor_template(
-            embedded, compiler["container"]["project_root"])
+            embedded, compiler["container"]["project_root"],
+            body_sync=body_sync_config)
+    # The profile owns this one outright rather than offering it as a declarable
+    # artifact: which program keeps the body current is not a project's choice.
+    if body_sync_path is not None:
+        raw[body_sync_path] = _body_sync_template(project_name, project_root)
     for key, text in candidates.items():
         if _artifact_ownership(runtime, key) == "managed":
             raw[paths[key]] = text
@@ -4957,7 +5365,7 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                                 "and a fresh volume has nothing to clone")})
         # The boot inputs are copied into one directory, so two of them cannot
         # share a file name.
-        boot_names = [Path(LOCK_REL).name]
+        boot_names = [Path(LOCK_REL).name, SYNC_PROGRAM]
         raw_artifacts = (compiler_raw.get("artifacts")
                          if isinstance(compiler_raw, dict) else None)
         if isinstance(raw_artifacts, dict):

@@ -110,8 +110,20 @@ For an embedded descriptor, the same required/optional environment, defaults,
 and state mounts are reconciled into `services.agent`; its name is recorded in
 `services.agent.embedded_services`. Managed agent-box artifacts install
 Supervisor, render each descriptor command as one program, and start it from the
-entrypoint. If the Dockerfile, entrypoint, or supervisor artifact is declared
-`external`, its process-management implementation remains project-owned.
+entrypoint.
+
+A profile may additionally own a supervised program that no capability
+descriptor declares, where keeping the runtime shape itself working is the
+profile's property rather than any project's. The compiler renders that program
+beside the entrypoint, starts it ahead of the descriptor programs under the same
+start window they carry, and renders a managed Supervisor configuration for it
+even when no capability service is embedded. It is not a declarable
+`compiler.artifacts` key: a project neither asks for it nor substitutes its own.
+Its controls are environment keys, declared on `services.agent` with their
+defaults so Compose passes them, and it depends only on the base image, never on
+an installed capability. If the Dockerfile, entrypoint, or supervisor artifact is
+declared `external`, its process-management implementation remains project-owned
+and the profile renders no program of its own into it.
 
 Each runtime service may declare `environment_defaults`, a mapping from env key
 to string fallback. These project defaults take precedence over descriptor
