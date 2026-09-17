@@ -404,5 +404,80 @@ class AttachmentDeleteUnbindTests(unittest.TestCase):
         simplbooks._purchase_remove_all_bindings.assert_not_called()
 
 
+D = simplbooks.Decimal
+
+
+class ExchangeRatePrecisionTests(unittest.TestCase):
+    """A rate rendered at 4 dp cannot always express the EUR total SB stored."""
+
+    def test_no_four_decimal_rate_reaches_the_stored_total(self) -> None:
+        # The case that moved a booked invoice: 199.00 USD carried at 173,52 EUR.
+        self.assertEqual(simplbooks._eur_from(D("199.00"), D("1.1468")), D("173.53"))
+        self.assertEqual(simplbooks._eur_from(D("199.00"), D("1.1469")), D("173.51"))
+        self.assertEqual(simplbooks._eur_from(D("199.00"), D("1.146842")), D("173.52"))
+
+    def _preserve(self, payable, eur_total, rendered):
+        with (
+            mock.patch.object(simplbooks, "_purchase_eur_total", return_value=eur_total),
+            mock.patch.object(simplbooks, "_purchase_read_payable", return_value=payable),
+        ):
+            return simplbooks._purchase_rate_preserving_stored_total(
+                mock.Mock(), "account", 42, rendered
+            )
+
+    def test_a_rate_that_cannot_hold_the_total_is_re_derived(self) -> None:
+        rate, total = self._preserve("199,00", D("173.52"), "1,1469")
+        self.assertEqual(rate, "1,146842")
+        self.assertEqual(total, D("173.52"))
+        self.assertEqual(simplbooks._eur_from(D("199.00"), D("1.146842")), total)
+
+    def test_a_rate_that_already_holds_the_total_is_left_alone(self) -> None:
+        # Churning a rate that works would rewrite history for no reason.
+        self.assertEqual(self._preserve("7,78", D("6.74"), "1,1549")[0], "1,1549")
+
+    def test_a_euro_purchase_is_untouched(self) -> None:
+        self.assertEqual(self._preserve("161,80", D("161.80"), "1,0000")[0], "1,0000")
+
+    def test_an_unreachable_total_leaves_the_rate_as_rendered(self) -> None:
+        self.assertEqual(self._preserve("199,00", None, "1,1469")[0], "1,1469")
+
+    def test_a_total_no_rate_can_express_refuses_rather_than_guessing(self) -> None:
+        with mock.patch.object(simplbooks, "_eur_from", return_value=D("0.00")):
+            rate, total = self._preserve("199,00", D("173.52"), "1,1469")
+        self.assertIsNone(rate)
+        self.assertEqual(total, D("173.52"))
+
+
+class EurTotalDriftTests(unittest.TestCase):
+    def _check(self, after, before=D("173.52"), unbound=()):
+        with (
+            mock.patch.object(simplbooks, "_purchase_eur_total", return_value=after),
+            mock.patch.object(simplbooks, "_purchase_read_payable", return_value="199,00"),
+        ):
+            simplbooks._verify_eur_total_unmoved(
+                mock.Mock(), "account", 501, before, list(unbound)
+            )
+
+    def test_an_unmoved_total_passes(self) -> None:
+        self._check(D("173.52"))
+
+    def test_a_moved_total_raises_with_the_restoring_rate(self) -> None:
+        with self.assertRaises(click.ClickException) as caught:
+            self._check(D("173.51"))
+        message = str(caught.exception)
+        self.assertIn("173,52", message)
+        self.assertIn("173,51", message)
+        self.assertIn("currency_rate]=1,146842", message)
+
+    def test_stranded_bindings_are_named(self) -> None:
+        with self.assertRaises(click.ClickException) as caught:
+            self._check(D("173.51"), unbound=[("Payment", 77)])
+        self.assertIn("payment 77", str(caught.exception))
+        self.assertIn("still unbound", str(caught.exception))
+
+    def test_an_unknown_starting_total_is_not_reported_as_drift(self) -> None:
+        self._check(D("173.51"), before=None)
+
+
 if __name__ == "__main__":
     unittest.main()

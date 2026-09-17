@@ -3157,6 +3157,16 @@ Then re-run `simplbooks doctor` to confirm.
                                                 entries. This is also the only
                                                 unbind path — `payments bind`
                                                 has no unbind-in-place.
+                                                On a FOREIGN-CURRENCY purchase
+                                                the exchange rate is re-derived
+                                                from the EUR total the books
+                                                carry, because SimpleBooks
+                                                renders the stored rate rounded
+                                                to 4 decimals and re-posting it
+                                                as shown re-values the invoice.
+                                                The EUR total is read back after
+                                                the edit and any movement is an
+                                                error, not a warning.
 
   simplbooks purchases delete <purchase_id>      Delete a purchase invoice by id.
                                                 Irreversible; unbind bound
@@ -7901,6 +7911,7 @@ def purchases_attachment_delete(purchase_id: int, attachment_id: int, dry_run: b
                 )
 
             fields, _row_index, _csrf = _scrape_purchase_edit_form(http, account, purchase_id)
+            eur_before = _purchase_eur_total(http, account, purchase_id)
             kept = [
                 pair for pair in fields
                 if pair != (ATTACHMENTS_EXISTING_FIELD, target)
@@ -7947,6 +7958,8 @@ def purchases_attachment_delete(purchase_id: int, attachment_id: int, dry_run: b
             remaining = _purchase_attachments_or_die(
                 _purchase_attachment_page(http, account, purchase_id), account, purchase_id
             )
+            # Bindings are restored by this block's handler, so none are stranded.
+            _verify_eur_total_unmoved(http, account, purchase_id, eur_before, [])
 
     except BaseException:
         if needs_rebind:
@@ -7982,6 +7995,125 @@ def purchases_attachment_delete(purchase_id: int, attachment_id: int, dry_run: b
                 + ". Restore the binding in SimpleBooks."
             )
         click.echo(f"  Bindings : {len(rebound)} restored and verified identical")
+
+
+PURCHASE_FT_RE = re.compile(r"financial_transactions\\?/edit\\?/(\d+)")
+
+
+def _purchase_eur_total(http: httpx.Client, account: str, purchase_id: int) -> Decimal | None:
+    """The purchase's EUR total, as the books actually carry it.
+
+    Read from the journal entry SimpleBooks posted for the purchase, whose
+    credit side is the EUR payable. The purchase's own pages render the
+    exchange rate rounded to 4 decimals, so nothing on them can be trusted to
+    reproduce this figure. None when the entry cannot be reached.
+    """
+    view = http.get(f"{BASE}/{account}/purchases/view/{purchase_id}")
+    if view.status_code != 200:
+        return None
+    match = PURCHASE_FT_RE.search(view.text)
+    if not match:
+        return None
+    edit = http.get(f"{BASE}/{account}/financial_transactions/edit/{match.group(1)}")
+    if edit.status_code != 200:
+        return None
+    credits = Decimal("0")
+    seen = False
+    for name, value in _kanne_leg_pairs(edit.text):
+        if name != "transaction_sum_credit" or not value.strip():
+            continue
+        try:
+            credits += Decimal(str(_amount_float(value)))
+        except (ValueError, click.ClickException):
+            return None
+        seen = True
+    return credits.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if seen else None
+
+
+def _kanne_leg_pairs(html: str):
+    """(attribute, value) for every journal leg input on a kanne edit form."""
+    form = BeautifulSoup(html, "html.parser").find("form", {"id": "FinancialTransactionForm"})
+    if not form:
+        return
+    for el in form.find_all(["input", "select"]):
+        m = KANNE_LINE_RE.fullmatch(el.get("name") or "")
+        if not m:
+            continue
+        if el.name == "select":
+            opt = el.find("option", selected=True)
+            yield m.group(2), (opt.get("value", "") if opt else "")
+        else:
+            yield m.group(2), el.get("value", "")
+
+
+def _purchase_rate_preserving_stored_total(
+    http: httpx.Client, account: str, purchase_id: int, rendered_rate: str
+) -> tuple[str | None, Decimal | None]:
+    """A currency_rate that re-posts without moving the purchase's EUR total.
+
+    SimpleBooks renders currency_rate rounded to 4 decimals but stores more, so
+    re-posting what the form shows silently re-values a foreign-currency
+    purchase. The EUR total is the figure the books actually carry, so it is the
+    one held fixed and the rate is re-derived from it.
+
+    Returns (rate to send, the EUR total it preserves). A None rate means the
+    caller must not re-post this purchase: no rate reproduces the stored total.
+    """
+    eur_total = _purchase_eur_total(http, account, purchase_id)
+    payable = _purchase_read_payable(http, account, purchase_id)
+    if eur_total is None or not payable:
+        return rendered_rate, None
+    doc_total = Decimal(normalize_number(payable))
+    if not doc_total or doc_total == eur_total:
+        return rendered_rate, eur_total
+    if _eur_from(doc_total, Decimal(normalize_number(rendered_rate))) == eur_total:
+        return rendered_rate, eur_total
+    exact = (doc_total / eur_total).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    if _eur_from(doc_total, exact) != eur_total:
+        return None, eur_total
+    return f"{exact:f}".replace(".", ","), eur_total
+
+
+def _verify_eur_total_unmoved(
+    http: httpx.Client, account: str, purchase_id: int,
+    before: Decimal | None, unbound: list[tuple[str, int]],
+) -> None:
+    """Refuse loudly when an edit moved the EUR total of a booked purchase.
+
+    A purchase that changes what it is worth after an unrelated edit is a
+    posted error, and SimpleBooks reports it nowhere.
+    """
+    if before is None:
+        return
+    after = _purchase_eur_total(http, account, purchase_id)
+    if after is None or after == before:
+        return
+    payable = _purchase_read_payable(http, account, purchase_id)
+    restore = ""
+    if payable:
+        rate = (Decimal(normalize_number(payable)) / before).quantize(
+            Decimal("0.000001"), rounding=ROUND_HALF_UP
+        )
+        restore = (
+            f" Restore it with `simplbooks purchases update {purchase_id} "
+            f"--set data[Purchase][currency_rate]={f'{rate:f}'.replace('.', ',')}`."
+        )
+    stranded = (
+        " Its " + ", ".join(f"{kind.lower()} {bid}" for kind, bid in unbound)
+        + " is still unbound and must be bound again after the total is correct."
+        if unbound else ""
+    )
+    raise click.ClickException(
+        f"Purchase {purchase_id}'s EUR total moved from {to_estonian_number(before)} to "
+        f"{to_estonian_number(after)} — the edit re-valued a booked invoice." + restore + stranded
+    )
+
+
+def _eur_from(doc_total: Decimal, rate: Decimal) -> Decimal | None:
+    """SimpleBooks' EUR total for a document total at a rate of 1 EUR = rate units."""
+    if not rate:
+        return None
+    return (doc_total / rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def _random_row_key() -> str:
@@ -8720,6 +8852,22 @@ def _scrape_purchase_edit_form(http: httpx.Client, account: str, purchase_id: in
     # currency_name select is empty in HTML; the canonical current value lives in base_currency_code.
     _ensure_field("data[Purchase][currency_name]", _get_field_value("data[Purchase][base_currency_code]") or "EUR")
 
+    # The rate input renders rounded to 4 decimals. Re-posting it as shown
+    # re-values a foreign-currency purchase and moves a total the books already
+    # carry, so every caller of this scrape gets the rate re-derived instead.
+    rate, eur_total = _purchase_rate_preserving_stored_total(
+        http, account, purchase_id, _get_field_value("data[Purchase][currency_rate]")
+    )
+    if rate is None:
+        raise click.ClickException(
+            f"Refusing to edit purchase {purchase_id}: it is in "
+            f"{_get_field_value('data[Purchase][base_currency_code]') or 'a foreign currency'} "
+            f"and no exchange rate reproduces the EUR total the books carry for it "
+            f"({to_estonian_number(eur_total)}). Re-posting the form would silently "
+            f"re-value the invoice. Correct the rate in SimpleBooks first."
+        )
+    _set_field(fields, "data[Purchase][currency_rate]", rate)
+
     return fields, row_index, csrf
 
 
@@ -8867,6 +9015,7 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
 
     with build_http(cookies, account) as http:
         fields, _row_index, csrf = _scrape_purchase_edit_form(http, account, purchase_id)
+        eur_before = _purchase_eur_total(http, account, purchase_id)
 
         # _csrfToken on edit form may be the GET-time token; rescrape from /purchases/add to be safe.
         csrf = fetch_fresh_csrf(http, account, path="purchases/add")
@@ -9011,8 +9160,12 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
             + "; ".join(verification_failures)
         )
     accounts_verified = True
-    if set_lines or add_lines:
-        with build_http(cookies, account) as verify_http:
+    with build_http(cookies, account) as verify_http:
+        _verify_eur_total_unmoved(
+            verify_http, account, purchase_id, eur_before,
+            saved_bindings if needs_rebind else [],
+        )
+        if set_lines or add_lines:
             accounts_verified = _verify_stored_row_accounts(
                 verify_http,
                 account,
@@ -9620,8 +9773,12 @@ def _do_bind(direction: str, money_id: int, bind_ids: list[int]) -> dict[int, st
         raise click.ClickException(
             f"Bind not applied — no allocation for {doc_path} {missing} on "
             f"{view_path[:-1]} {money_id}."
-            + (" SB says: " + " | ".join(errs) if errs
-               else " (Typical cause: the money document has no free remainder.)")
+            + (" SB says: " + " | ".join(errs) if errs else
+               f" SimpleBooks accepted the request, reported nothing and recorded no "
+               f"allocation. It currently covers: "
+               + (", ".join(f"{doc_path[:-1]} {doc} at {amount or '?'}"
+                            for doc, amount in sorted(bound.items())) or "nothing")
+               + ". The response does not say why, so no cause is claimed here.")
             + f" Response → {fail}"
         )
     return {b: bound[b] for b in bind_ids}
