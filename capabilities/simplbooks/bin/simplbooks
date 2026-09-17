@@ -3084,6 +3084,29 @@ Then re-run `simplbooks doctor` to confirm.
                                                 /purchases/add + cached to
                                                 purchases_meta.json.
   simplbooks purchases show <id>                 Read a purchase invoice.
+  simplbooks purchases attachments <purchase_id> [--json]
+                                                List the purchase's stored
+                                                attachments: attachment id,
+                                                filename, type, byte size and
+                                                which copy is primary. The same
+                                                file uploaded twice is two
+                                                attachments with two ids. Size
+                                                reads `?` on a payment-locked
+                                                purchase, which SimpleBooks
+                                                serves without it.
+  simplbooks purchases attachment-delete <purchase_id> <attachment_id>
+                                                Delete ONE stored attachment by
+                                                its id, as listed by `purchases
+                                                attachments`. Irreversible, and
+                                                one per call by design — prune a
+                                                duplicate set copy by copy.
+                                                Refused on a payment-locked
+                                                purchase; unbind its payment
+                                                first.
+  simplbooks purchases download <purchase_id> [--index N] [--out PATH]
+                                                Save a stored attachment to
+                                                disk. --index is 1-based over
+                                                `purchases attachments` order.
   simplbooks purchases create
         --supplier-id ID --number STR
         --date YYYY-MM-DD
@@ -7385,49 +7408,97 @@ def purchases_meta(as_json: bool, refresh: bool) -> None:
     click.secho("Expense account IDs: `simplbooks accounts list chart` (filter for 5xxx codes).", bold=True)
 
 
-_SHOW_FILE_PREVIEW_RE = re.compile(
-    r"showFilePreview\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)",
+ATTACHMENTS_SURFACE_MISSING = (
+    "no attachments-manager surface on this page — SimpleBooks changed its "
+    "markup and the parser can no longer tell an empty purchase from a full one"
 )
 
 
-def _parse_purchase_attachments(html: str, account: str) -> list[dict]:
-    """Attachment entries on a purchase view/edit page → [{file_id, type, url, name}].
+def _purchase_attachments_surface(soup: BeautifulSoup) -> bool:
+    """Whether the page carries the attachments-manager surface at all.
 
-    The read-only view uses `showFilePreview('<file_id>', '<type>')`; the edit
-    form uses a real `/purchases/view_file/<file_id>` href plus a hidden
-    `file_type` input. Both resolve to the same authenticated download endpoint.
-    The download command resolves the real filename from Content-Disposition.
+    A purchase with no attachments still renders it, so its absence means the
+    markup moved — which must read as unknown rather than as zero attachments.
     """
+    return bool(
+        soup.select_one("input.js-attachments-manager-input")
+        or soup.select_one(".attachments-manager")
+    )
+
+
+def _parse_purchase_attachments(html: str, account: str) -> list[dict]:
+    """Stored attachments on a purchase page → one entry per attachment.
+
+    The edit form carries the whole record as JSON on the attachments-manager
+    file input, size included. The view page — all SimpleBooks serves for a
+    payment-locked purchase — carries one `attachments-manager__row` per
+    attachment, which names the file but not its size.
+    """
+    soup = BeautifulSoup(html, "html.parser")
     out: list[dict] = []
     seen: set[str] = set()
 
-    def add(file_id: str, ftype: str) -> None:
-        if file_id in seen:
+    def add(raw_id, name: str, ftype: str, size, is_primary: bool, url: str) -> None:
+        attachment_id = str(raw_id or "").strip()
+        if not attachment_id or attachment_id in seen:
             return
-        seen.add(file_id)
-        clean_type = (ftype or "pdf").lower().lstrip(".")
-        url = urljoin(f"{BASE}/{account}/", f"purchases/view_file/{file_id}")
+        seen.add(attachment_id)
+        name = (name or "").strip()
+        clean_type = (ftype or Path(name).suffix or "").lower().lstrip(".")
         out.append({
-            "file_id": file_id,
+            "attachment_id": attachment_id,
+            "file_id": attachment_id,
+            "name": name or f"{attachment_id}.{clean_type or 'bin'}",
             "type": clean_type,
-            "url": url,
-            "name": f"{file_id}.{clean_type}",
+            "size": size if isinstance(size, int) else None,
+            "is_primary": bool(is_primary),
+            "url": urljoin(f"{BASE}/{account}/", url),
         })
 
-    for match in _SHOW_FILE_PREVIEW_RE.finditer(html):
-        file_id, ftype = match.group(1), match.group(2)
-        add(file_id, ftype)
+    manager_input = soup.select_one("input.js-attachments-manager-input")
+    if manager_input and manager_input.has_attr("data-files"):
+        try:
+            records = json.loads(manager_input["data-files"])
+        except ValueError:
+            records = []
+        for record in records:
+            add(
+                record.get("id"),
+                record.get("name") or "",
+                record.get("file_type") or "",
+                record.get("size"),
+                record.get("is_primary"),
+                record.get("download_url") or record.get("preview_url") or "",
+            )
 
-    # Editable purchases use a real /purchases/view_file/<id> href instead of
-    # showFilePreview(). The stored type sits in a sibling hidden input.
-    soup = BeautifulSoup(html, "html.parser")
-    type_input = soup.find("input", {"name": "data[Purchase][file_type]"})
-    edit_type = (type_input.get("value", "") if type_input else "") or "pdf"
-    for anchor in soup.find_all("a", href=True):
-        match = re.search(r"/purchases/view_file/(\d+)(?:[/?#]|$)", anchor["href"])
-        if match:
-            add(match.group(1), edit_type)
+    for row in soup.select("div.attachments-manager__row[data-attachment-id]"):
+        name_el = row.select_one(".attachments-manager__row-name")
+        name = ""
+        if name_el:
+            name = name_el.get("title") or name_el.get_text(" ", strip=True)
+        if not name:
+            # aria-label is "<preview verb> <filename>".
+            name = (row.get("aria-label") or "").split(" ", 1)[-1]
+        add(
+            row["data-attachment-id"],
+            name,
+            row.get("data-file-type") or "",
+            None,
+            row.select_one(".attachments-manager__row-star--primary") is not None,
+            row.get("data-preview-url") or "",
+        )
+
     return out
+
+
+def _echo_attachment_line(attachments: list[dict], surface: bool) -> None:
+    if not surface:
+        click.secho(f"Attach   : (unknown — {ATTACHMENTS_SURFACE_MISSING})", fg="yellow")
+    elif attachments:
+        click.echo(f"Attach   : {len(attachments)} — "
+                   + ", ".join(a["name"] for a in attachments))
+    else:
+        click.echo("Attach   : (none)")
 
 
 def _purchases_show_view(html: str, as_json: bool, account: str) -> None:
@@ -7469,6 +7540,7 @@ def _purchases_show_view(html: str, as_json: bool, account: str) -> None:
         break
 
     attachments = _parse_purchase_attachments(html, account)
+    attachments_surface = _purchase_attachments_surface(soup)
 
     info = {
         "supplier_id": supplier_id,
@@ -7484,6 +7556,7 @@ def _purchases_show_view(html: str, as_json: bool, account: str) -> None:
         "vat_total": pairs.get("Arve käibemaks", ""),
         "gross_total": pairs.get("Arve kokku", ""),
         "attachments": attachments,
+        "attachments_readable": attachments_surface,
         "source": "view page (payment-locked; row account/vat-type ids not exposed)",
     }
 
@@ -7506,11 +7579,7 @@ def _purchases_show_view(html: str, as_json: bool, account: str) -> None:
             f"{rw['amount']:>6} {rw['net']:>12}"
         )
     click.echo()
-    if attachments:
-        click.echo(f"Attach   : {len(attachments)} — "
-                   + ", ".join(a["name"] for a in attachments))
-    else:
-        click.echo("Attach   : (none)")
+    _echo_attachment_line(attachments, attachments_surface)
     click.echo("(read from the view page — invoice is payment-locked; "
                "row account / vat-type ids are not exposed there)")
 
@@ -7561,6 +7630,7 @@ def purchases_show(expense_id: int, as_json: bool) -> None:
         return ""
 
     attachments = _parse_purchase_attachments(edit_html, account)
+    attachments_surface = _purchase_attachments_surface(soup)
 
     info = {
         "supplier_id": field("data[Purchase][client_id]"),
@@ -7577,6 +7647,7 @@ def purchases_show(expense_id: int, as_json: bool) -> None:
         "vat_total": field("data[Purchase][vat]"),
         "row_sum_with_vat": field("data[Purchase][row_sum_with_vat]"),
         "attachments": attachments,
+        "attachments_readable": attachments_surface,
     }
 
     rows: list[dict] = []
@@ -7616,11 +7687,7 @@ def purchases_show(expense_id: int, as_json: bool) -> None:
             f"{r['amount']:>6} {r['sum']:>14}  {r['expense_account_id']}"
         )
     click.echo()
-    if attachments:
-        click.echo(f"Attach   : {len(attachments)} — "
-                   + ", ".join(a["name"] for a in attachments))
-    else:
-        click.echo("Attach   : (none)")
+    _echo_attachment_line(attachments, attachments_surface)
 
 
 def _filename_from_response(r: httpx.Response, fallback: str) -> str:
@@ -7663,6 +7730,10 @@ def purchases_download(expense_id: int, out_path: str | None, attach_index: int)
             raise click.ClickException(
                 f"GET /purchases/view/{expense_id} → HTTP {view.status_code}"
             )
+        if not _purchase_attachments_surface(BeautifulSoup(view.text, "html.parser")):
+            raise click.ClickException(
+                f"Cannot read purchase {expense_id}'s attachments: {ATTACHMENTS_SURFACE_MISSING}."
+            )
         attachments = _parse_purchase_attachments(view.text, account)
         if not attachments:
             click.secho(f"Purchase {expense_id} has no attachment.", fg="yellow")
@@ -7689,6 +7760,167 @@ def purchases_download(expense_id: int, out_path: str | None, attach_index: int)
         target = Path(out_path) if out_path else Path(default_name)
         target.write_bytes(r.content)
     click.secho(f"✓ Saved {target}", fg="green", bold=True)
+
+
+ATTACHMENTS_EXISTING_FIELD = "data[Purchase][attachments_existing][]"
+ATTACHMENTS_DELETED_FIELD = "data[Purchase][attachments_deleted][]"
+
+
+def _purchase_attachment_page(http: httpx.Client, account: str, purchase_id: int) -> str:
+    """Whichever page carries this purchase's attachment record.
+
+    The edit form carries the full record including byte size; a payment-locked
+    purchase has no edit form and is read from its view page, which names each
+    attachment but not its size.
+    """
+    edit = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
+    if edit.status_code == 200:
+        return edit.text
+    if edit.status_code not in (301, 302):
+        raise click.ClickException(
+            f"GET /purchases/edit/{purchase_id} → HTTP {edit.status_code}"
+        )
+    view = http.get(f"{BASE}/{account}/purchases/view/{purchase_id}")
+    if view.status_code != 200:
+        raise click.ClickException(
+            f"GET /purchases/view/{purchase_id} → HTTP {view.status_code}"
+        )
+    return view.text
+
+
+def _purchase_attachments_or_die(html: str, account: str, purchase_id: int) -> list[dict]:
+    if not _purchase_attachments_surface(BeautifulSoup(html, "html.parser")):
+        raise click.ClickException(
+            f"Cannot read purchase {purchase_id}'s attachments: {ATTACHMENTS_SURFACE_MISSING}."
+        )
+    return _parse_purchase_attachments(html, account)
+
+
+@purchases.command("attachments")
+@click.argument("purchase_id", type=int)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def purchases_attachments(purchase_id: int, as_json: bool) -> None:
+    """List a purchase's stored attachments: id, filename, type, size, primary.
+
+    The id is what `purchases attachment-delete` takes, and the same file
+    uploaded twice is two attachments with two ids. Size is exposed only on an
+    editable purchase; a payment-locked one reports it unknown.
+    """
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        html = _purchase_attachment_page(http, account, purchase_id)
+    attachments = _purchase_attachments_or_die(html, account, purchase_id)
+
+    if as_json:
+        click.echo(json.dumps(
+            {"purchase_id": purchase_id, "attachments": attachments},
+            indent=2, ensure_ascii=False,
+        ))
+        return
+    if not attachments:
+        click.secho(f"Purchase {purchase_id} has no attachments.", fg="yellow")
+        return
+    click.secho(f"{'ID':<8} {'FILENAME':<44} {'TYPE':<6} {'SIZE':>11}  PRIMARY", bold=True)
+    for attachment in attachments:
+        size = f"{attachment['size']:,}" if attachment["size"] is not None else "?"
+        click.echo(
+            f"{attachment['attachment_id']:<8} {attachment['name'][:44]:<44} "
+            f"{attachment['type']:<6} {size:>11}  "
+            + ("yes" if attachment["is_primary"] else "")
+        )
+
+
+@purchases.command("attachment-delete")
+@click.argument("purchase_id", type=int)
+@click.argument("attachment_id", type=int)
+@click.option("--dry-run", is_flag=True,
+              help="Resolve and print what would be deleted; post nothing.")
+def purchases_attachment_delete(purchase_id: int, attachment_id: int, dry_run: bool) -> None:
+    """Delete ONE stored attachment from a purchase, by its attachment id.
+
+    Ids come from `purchases attachments`. One call removes one attachment, so a
+    duplicate set is pruned copy by copy and the surviving copy is named before
+    each step. Irreversible. SimpleBooks edits only an unlocked purchase, so a
+    payment-bound one must have its payment unbound first.
+    """
+    target = str(attachment_id)
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        edit = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
+        if edit.status_code in (301, 302):
+            raise click.ClickException(
+                f"Purchase {purchase_id} is locked for editing, so its attachments "
+                f"cannot be changed. Unbind its payment first."
+            )
+        if edit.status_code != 200:
+            raise click.ClickException(
+                f"GET /purchases/edit/{purchase_id} → HTTP {edit.status_code}"
+            )
+        attachments = _purchase_attachments_or_die(edit.text, account, purchase_id)
+        doomed = next((a for a in attachments if a["attachment_id"] == target), None)
+        if doomed is None:
+            known = ", ".join(a["attachment_id"] for a in attachments) or "none"
+            raise click.ClickException(
+                f"Purchase {purchase_id} has no attachment {target} (it has: {known})."
+            )
+
+        fields, _row_index, _csrf = _scrape_purchase_edit_form(http, account, purchase_id)
+        kept = [
+            pair for pair in fields
+            if pair != (ATTACHMENTS_EXISTING_FIELD, target)
+        ]
+        if len(kept) == len(fields):
+            raise click.ClickException(
+                f"Purchase {purchase_id}'s edit form does not carry attachment {target} "
+                f"as an existing attachment — refusing to guess at the delete payload."
+            )
+        kept.append((ATTACHMENTS_DELETED_FIELD, target))
+        _set_field(kept, "_csrfToken", fetch_fresh_csrf(http, account, path="purchases/add"))
+        _validate_account_fields(kept)
+
+        if dry_run:
+            surviving = [
+                value for name, value in kept if name == ATTACHMENTS_EXISTING_FIELD
+            ]
+            click.secho(
+                f"DRY RUN — would delete attachment {target} ({doomed['name']}) "
+                f"from purchase {purchase_id}.", bold=True,
+            )
+            click.echo(f"  POST     : {BASE}/{account}/purchases/update")
+            click.echo(f"  {ATTACHMENTS_DELETED_FIELD} = {target}")
+            click.echo(f"  {ATTACHMENTS_EXISTING_FIELD} kept: "
+                       + (", ".join(surviving) or "(none)"))
+            return
+
+        http.headers["Referer"] = f"{BASE}/{account}/purchases/edit/{purchase_id}"
+        http.headers["Origin"] = BASE
+        response = http.post(
+            f"{BASE}/{account}/purchases/update",
+            files=_purchase_multipart_parts(kept, None),
+        )
+        location = response.headers.get("location", "")
+        if response.status_code not in (200, 302) or (
+            "/purchases/view/" not in location and "/purchases/edit/" not in location
+        ):
+            messages = _page_errors(response.text)
+            raise click.ClickException(
+                f"Deleting attachment {target} from purchase {purchase_id} failed "
+                f"(HTTP {response.status_code}, loc={location!r})."
+                + (" SB says: " + " | ".join(messages) if messages else "")
+            )
+        remaining = _purchase_attachments_or_die(
+            _purchase_attachment_page(http, account, purchase_id), account, purchase_id
+        )
+
+    if any(a["attachment_id"] == target for a in remaining):
+        raise click.ClickException(
+            f"Purchase {purchase_id} still carries attachment {target} after the delete."
+        )
+    click.secho(
+        f"✓ Deleted attachment {target} ({doomed['name']}) from purchase {purchase_id} — "
+        f"{len(remaining)} attachment(s) remaining",
+        fg="green", bold=True,
+    )
 
 
 def _random_row_key() -> str:
@@ -7884,6 +8116,12 @@ def _purchase_attachment_matches(
     view = http.get(f"{BASE}/{account}/purchases/view/{purchase_id}")
     if view.status_code != 200:
         return False
+    if not _purchase_attachments_surface(BeautifulSoup(view.text, "html.parser")):
+        raise click.ClickException(
+            f"Purchase {purchase_id} exists, but its stored attachment cannot be "
+            f"verified: {ATTACHMENTS_SURFACE_MISSING}. Check the purchase in "
+            f"SimpleBooks before uploading again."
+        )
     expected = hashlib.sha256(Path(expected_path).read_bytes()).digest()
     attachments = _parse_purchase_attachments(view.text, account)
     for attachment in attachments:

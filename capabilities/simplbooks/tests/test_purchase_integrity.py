@@ -32,37 +32,97 @@ def _load_module():
 simplbooks = _load_module()
 
 
+VIEW_ROWS = """
+<div class="attachments-manager attachments-manager--list">
+    <div class="attachments-manager__row"
+         data-attachment-id="9001"
+         data-file-type="pdf"
+         data-preview-url="/account/purchases/view_file/501?attachment_id=9001"
+         role="button"
+         aria-label="Eelvaade first.pdf">
+        <div class="attachments-manager__row-name" title="first.pdf">first.pdf</div>
+        <span class="attachments-manager__row-star attachments-manager__row-star--primary"></span>
+    </div>
+    <div class="attachments-manager__row"
+         data-attachment-id="9002"
+         data-file-type="pdf"
+         data-preview-url="/account/purchases/view_file/501?attachment_id=9002"
+         role="button"
+         aria-label="Eelvaade first.pdf">
+        <div class="attachments-manager__row-name" title="first.pdf">first.pdf</div>
+    </div>
+</div>
+"""
+
+VIEW_EMPTY = """
+<div class="attachments-manager attachments-manager--list">
+    <div class="attachments-manager__empty">Manuseid pole veel lisatud.</div>
+</div>
+"""
+
+EDIT_FILES = """
+<div class="attachments-manager col-12">
+  <input type="hidden" name="data[Purchase][attachments_existing][]" value="9101">
+  <input type="file" name="data[Purchase][attachments][]" class="js-attachments-manager-input"
+     data-files="[{&quot;id&quot;:9101,&quot;name&quot;:&quot;scan.png&quot;,&quot;size&quot;:690453,&quot;type&quot;:&quot;&quot;,&quot;file_type&quot;:&quot;png&quot;,&quot;is_primary&quot;:true,&quot;preview_url&quot;:&quot;\\/account\\/purchases\\/view_file\\/502?attachment_id=9101&quot;,&quot;download_url&quot;:&quot;\\/account\\/purchases\\/view_file\\/502?attachment_id=9101&quot;}]">
+</div>
+"""
+
+EDIT_EMPTY = """
+<div class="attachments-manager col-12">
+  <input type="file" name="data[Purchase][attachments][]" class="js-attachments-manager-input"
+         data-files="[]">
+</div>
+"""
+
+
+def _soup(html: str):
+    return simplbooks.BeautifulSoup(html, "html.parser")
+
+
 class AttachmentParserTests(unittest.TestCase):
-    def test_parses_read_only_preview(self) -> None:
-        html = """<a href="#" onclick="showFilePreview('1860', 'pdf'); return false;">view</a>"""
+    def test_view_page_rows_carry_id_name_type_and_primary(self) -> None:
+        attachments = simplbooks._parse_purchase_attachments(VIEW_ROWS, "account")
         self.assertEqual(
-            simplbooks._parse_purchase_attachments(html, "account"),
-            [
-                {
-                    "file_id": "1860",
-                    "type": "pdf",
-                    "url": "https://app.simplbooks.com/account/purchases/view_file/1860",
-                    "name": "1860.pdf",
-                }
-            ],
+            [a["attachment_id"] for a in attachments], ["9001", "9002"]
+        )
+        self.assertEqual(attachments[0], {
+            "attachment_id": "9001",
+            "file_id": "9001",
+            "name": "first.pdf",
+            "type": "pdf",
+            "size": None,
+            "is_primary": True,
+            "url": "https://app.simplbooks.com/account/purchases/view_file/501?attachment_id=9001",
+        })
+        self.assertFalse(attachments[1]["is_primary"])
+
+    def test_edit_form_json_carries_size(self) -> None:
+        attachments = simplbooks._parse_purchase_attachments(EDIT_FILES, "account")
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["attachment_id"], "9101")
+        self.assertEqual(attachments[0]["name"], "scan.png")
+        self.assertEqual(attachments[0]["type"], "png")
+        self.assertEqual(attachments[0]["size"], 690453)
+        self.assertTrue(attachments[0]["is_primary"])
+        self.assertEqual(
+            attachments[0]["url"],
+            "https://app.simplbooks.com/account/purchases/view_file/502?attachment_id=9101",
         )
 
-    def test_parses_edit_form_href_and_type(self) -> None:
-        html = """
-        <input type="hidden" name="data[Purchase][file_type]" value="PDF">
-        <a href="/account/purchases/view_file/1884" id="ViewCopyButton">view</a>
-        """
-        attachments = simplbooks._parse_purchase_attachments(html, "account")
-        self.assertEqual(attachments[0]["file_id"], "1884")
-        self.assertEqual(attachments[0]["type"], "pdf")
+    def test_rendered_empty_states_are_true_negatives(self) -> None:
+        for html in (VIEW_EMPTY, EDIT_EMPTY):
+            self.assertEqual(simplbooks._parse_purchase_attachments(html, "account"), [])
+            self.assertTrue(simplbooks._purchase_attachments_surface(_soup(html)))
 
-    def test_deduplicates_preview_and_href_for_same_file(self) -> None:
-        html = """
-        <input type="hidden" name="data[Purchase][file_type]" value="pdf">
-        <a href="/account/purchases/view_file/1884"
-           onclick="showFilePreview('1884', 'pdf'); return false;">view</a>
-        """
-        self.assertEqual(len(simplbooks._parse_purchase_attachments(html, "account")), 1)
+    def test_missing_surface_is_not_an_empty_purchase(self) -> None:
+        self.assertFalse(simplbooks._purchase_attachments_surface(_soup("<div>nothing</div>")))
+
+    def test_view_file_path_segment_is_the_purchase_not_an_attachment(self) -> None:
+        # The download URL names the purchase and carries the attachment in its
+        # query, so a bare link to it must never be read as an attachment of its own.
+        html = """<a href="/account/purchases/view_file/1884">view</a>"""
+        self.assertEqual(simplbooks._parse_purchase_attachments(html, "account"), [])
 
 
 class MultipartTests(unittest.TestCase):
@@ -117,10 +177,7 @@ class AttachmentVerificationTests(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             if "/purchases/view/42" in str(request.url):
-                return httpx.Response(
-                    200,
-                    text='<a onclick="showFilePreview(\'42\', \'pdf\'); return false;">view</a>',
-                )
+                return httpx.Response(200, text=VIEW_ROWS.replace("/501?", "/42?"))
             if "/purchases/view_file/42" in str(request.url):
                 return httpx.Response(200, content=expected)
             return httpx.Response(404)
@@ -132,6 +189,18 @@ class AttachmentVerificationTests(unittest.TestCase):
                 self.assertTrue(
                     simplbooks._purchase_attachment_matches(http, "account", 42, str(source))
                 )
+
+
+    def test_unreadable_markup_refuses_instead_of_reporting_a_miss(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="<div>markup moved</div>")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "invoice.pdf"
+            source.write_bytes(b"expected PDF")
+            with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+                with self.assertRaises(click.ClickException):
+                    simplbooks._purchase_attachment_matches(http, "account", 42, str(source))
 
 
 class CreateIntegrityTests(unittest.TestCase):
