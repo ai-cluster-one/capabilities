@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import sys
+import contextlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest import mock
 
 import click
 import httpx
+from click.testing import CliRunner
 
 
 CAPABILITY = Path(__file__).resolve().parents[1]
@@ -302,6 +304,104 @@ class CreateIntegrityTests(unittest.TestCase):
             )
         self.assertFalse(repaired)
         repair.assert_not_called()
+
+
+def _edit_form(*account_ids: str) -> str:
+    rows = "".join(
+        f"""<select name="data[PurchaseRows][row{i}][PurchaseRow][expense_account_id]">
+              <option value="{value}" selected="selected">chosen</option>
+              <option value="999">other</option>
+            </select>"""
+        for i, value in enumerate(account_ids)
+    )
+    return f'<form id="purchase-form">{rows}</form>'
+
+
+class RowAccountReadbackTests(unittest.TestCase):
+    CHART = {"by_id": {
+        "701": {"code": "6100", "name": "Asked account"},
+        "702": {"code": "6110", "name": "Stored account"},
+    }}
+
+    def _http(self, status: int, text: str) -> mock.Mock:
+        return mock.Mock(get=mock.Mock(return_value=mock.Mock(status_code=status, text=text)))
+
+    def test_reads_the_account_the_form_actually_has_selected(self) -> None:
+        stored = simplbooks._purchase_stored_row_accounts(
+            self._http(200, _edit_form("702", "701")), "account", 42
+        )
+        self.assertEqual(stored, ["702", "701"])
+
+    def test_a_locked_purchase_reads_back_as_unknown_not_as_a_mismatch(self) -> None:
+        with mock.patch.object(simplbooks, "_chart_index", return_value=self.CHART):
+            verified = simplbooks._verify_stored_row_accounts(
+                self._http(302, ""), "account", 42, ["701"]
+            )
+        self.assertFalse(verified)
+
+    def test_the_requested_account_surviving_is_a_pass(self) -> None:
+        with mock.patch.object(simplbooks, "_chart_index", return_value=self.CHART):
+            verified = simplbooks._verify_stored_row_accounts(
+                self._http(200, _edit_form("701")), "account", 42, ["701"]
+            )
+        self.assertTrue(verified)
+
+    def test_a_substituted_account_raises_and_names_both_codes(self) -> None:
+        with mock.patch.object(simplbooks, "_chart_index", return_value=self.CHART):
+            with self.assertRaises(click.ClickException) as caught:
+                simplbooks._verify_stored_row_accounts(
+                    self._http(200, _edit_form("702")), "account", 42, ["701"]
+                )
+        message = str(caught.exception)
+        self.assertIn("6100", message)
+        self.assertIn("6110", message)
+        self.assertIn("purchases update 42", message)
+        self.assertNotIn("create", message.split("rather than")[0])
+
+
+class AttachmentDeleteUnbindTests(unittest.TestCase):
+    """--force-unbind must never leave a purchase unbound after a failed delete."""
+
+    def setUp(self) -> None:
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.bound = [("Payment", 77)]
+        self.rebinds: list[tuple[str, int, list[int]]] = []
+        for patcher in (
+            mock.patch.object(simplbooks, "session_or_die", return_value=({}, "account")),
+            mock.patch.object(simplbooks, "_purchase_remove_all_bindings"),
+            mock.patch.object(
+                simplbooks, "_do_bind",
+                side_effect=lambda kind, bid, ids: self.rebinds.append((kind, bid, ids)),
+            ),
+        ):
+            self.stack.enter_context(patcher)
+        self.runner = CliRunner()
+
+    def run_delete(self, *args):
+        return self.runner.invoke(
+            simplbooks.cli, ["purchases", "attachment-delete", "501", "9001", *args]
+        )
+
+    def test_a_failed_delete_puts_the_bindings_back(self) -> None:
+        with (
+            mock.patch.object(simplbooks, "_purchase_bindings", return_value=self.bound),
+            mock.patch.object(
+                simplbooks, "build_http", side_effect=httpx.ConnectError("no route")
+            ),
+        ):
+            result = self.run_delete("--force-unbind")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(self.rebinds, [("Payment", 77, [501])])
+
+    def test_without_the_flag_nothing_is_unbound(self) -> None:
+        with (
+            mock.patch.object(simplbooks, "_purchase_bindings", return_value=self.bound),
+            mock.patch.object(simplbooks, "build_http", side_effect=httpx.ConnectError("x")),
+        ):
+            self.run_delete()
+        self.assertEqual(self.rebinds, [])
+        simplbooks._purchase_remove_all_bindings.assert_not_called()
 
 
 if __name__ == "__main__":

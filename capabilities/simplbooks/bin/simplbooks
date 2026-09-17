@@ -3095,14 +3095,18 @@ Then re-run `simplbooks doctor` to confirm.
                                                 purchase, which SimpleBooks
                                                 serves without it.
   simplbooks purchases attachment-delete <purchase_id> <attachment_id>
+        [--dry-run] [--force-unbind]
                                                 Delete ONE stored attachment by
                                                 its id, as listed by `purchases
                                                 attachments`. Irreversible, and
                                                 one per call by design — prune a
-                                                duplicate set copy by copy.
-                                                Refused on a payment-locked
-                                                purchase; unbind its payment
-                                                first.
+                                                duplicate set copy by copy. A
+                                                PAID purchase is locked for
+                                                editing: --force-unbind unbinds
+                                                the bound payment(s), deletes
+                                                the one id, re-binds the same
+                                                entries and verifies the
+                                                binding came back identical.
   simplbooks purchases download <purchase_id> [--index N] [--out PATH]
                                                 Save a stored attachment to
                                                 disk. --index is 1-based over
@@ -3137,7 +3141,7 @@ Then re-run `simplbooks doctor` to confirm.
         [--vat-total AMT] [--rounding AMT] [--reference TEXT]
         [--add-line "coa=<chart code>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amt>"]
         [--set-line "<idx>:coa=<chart code>"]
-        [--set "<field-name>=<value>"]
+        [--set "<field-name>=<value>"] [--attach PATH] [--force-unbind]
                                                 Edit an existing purchase
                                                 invoice. Scrapes the edit
                                                 form, applies the patch,
@@ -3145,6 +3149,14 @@ Then re-run `simplbooks doctor` to confirm.
                                                 Ümardamine cent-gap fixes
                                                 when the supplier's KOKKU
                                                 doesn't tie to net+VAT.
+                                                A PAID purchase is locked for
+                                                editing: --force-unbind is the
+                                                only way in. It unbinds the
+                                                bound payment(s), applies the
+                                                change, then re-binds the same
+                                                entries. This is also the only
+                                                unbind path — `payments bind`
+                                                has no unbind-in-place.
 
   simplbooks purchases delete <purchase_id>      Delete a purchase invoice by id.
                                                 Irreversible; unbind bound
@@ -7838,82 +7850,113 @@ def purchases_attachments(purchase_id: int, as_json: bool) -> None:
 @click.argument("attachment_id", type=int)
 @click.option("--dry-run", is_flag=True,
               help="Resolve and print what would be deleted; post nothing.")
-def purchases_attachment_delete(purchase_id: int, attachment_id: int, dry_run: bool) -> None:
+@click.option("--force-unbind/--no-force-unbind", default=False, show_default=True,
+              help="Paid purchases are locked for editing in SB. Pass --force-unbind to "
+                   "unbind the bound payment(s)/incoming(s), delete, then re-bind the same "
+                   "entries and verify the binding came back identical.")
+def purchases_attachment_delete(purchase_id: int, attachment_id: int, dry_run: bool,
+                                force_unbind: bool) -> None:
     """Delete ONE stored attachment from a purchase, by its attachment id.
 
     Ids come from `purchases attachments`. One call removes one attachment, so a
     duplicate set is pruned copy by copy and the surviving copy is named before
-    each step. Irreversible. SimpleBooks edits only an unlocked purchase, so a
-    payment-bound one must have its payment unbound first.
+    each step. Irreversible. SimpleBooks edits only an unlocked purchase; pass
+    --force-unbind to unbind a payment-bound one and re-bind it afterwards.
     """
     target = str(attachment_id)
     cookies, account = session_or_die()
-    with build_http(cookies, account) as http:
-        edit = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
-        if edit.status_code in (301, 302):
-            raise click.ClickException(
-                f"Purchase {purchase_id} is locked for editing, so its attachments "
-                f"cannot be changed. Unbind its payment first."
-            )
-        if edit.status_code != 200:
-            raise click.ClickException(
-                f"GET /purchases/edit/{purchase_id} → HTTP {edit.status_code}"
-            )
-        attachments = _purchase_attachments_or_die(edit.text, account, purchase_id)
-        doomed = next((a for a in attachments if a["attachment_id"] == target), None)
-        if doomed is None:
-            known = ", ".join(a["attachment_id"] for a in attachments) or "none"
-            raise click.ClickException(
-                f"Purchase {purchase_id} has no attachment {target} (it has: {known})."
-            )
 
-        fields, _row_index, _csrf = _scrape_purchase_edit_form(http, account, purchase_id)
-        kept = [
-            pair for pair in fields
-            if pair != (ATTACHMENTS_EXISTING_FIELD, target)
-        ]
-        if len(kept) == len(fields):
-            raise click.ClickException(
-                f"Purchase {purchase_id}'s edit form does not carry attachment {target} "
-                f"as an existing attachment — refusing to guess at the delete payload."
-            )
-        kept.append((ATTACHMENTS_DELETED_FIELD, target))
-        _set_field(kept, "_csrfToken", fetch_fresh_csrf(http, account, path="purchases/add"))
-        _validate_account_fields(kept)
-
-        if dry_run:
-            surviving = [
-                value for name, value in kept if name == ATTACHMENTS_EXISTING_FIELD
-            ]
+    saved_bindings: list[tuple[str, int]] = []
+    needs_rebind = False
+    if force_unbind and not dry_run:
+        saved_bindings = _purchase_bindings(purchase_id)
+        if saved_bindings:
             click.secho(
-                f"DRY RUN — would delete attachment {target} ({doomed['name']}) "
-                f"from purchase {purchase_id}.", bold=True,
+                f"  Unbinding {len(saved_bindings)} "
+                f"entr{'y' if len(saved_bindings) == 1 else 'ies'} from purchase {purchase_id} first…",
+                fg="yellow",
             )
-            click.echo(f"  POST     : {BASE}/{account}/purchases/update")
-            click.echo(f"  {ATTACHMENTS_DELETED_FIELD} = {target}")
-            click.echo(f"  {ATTACHMENTS_EXISTING_FIELD} kept: "
-                       + (", ".join(surviving) or "(none)"))
-            return
+            _purchase_remove_all_bindings(purchase_id)
+            needs_rebind = True
 
-        http.headers["Referer"] = f"{BASE}/{account}/purchases/edit/{purchase_id}"
-        http.headers["Origin"] = BASE
-        response = http.post(
-            f"{BASE}/{account}/purchases/update",
-            files=_purchase_multipart_parts(kept, None),
-        )
-        location = response.headers.get("location", "")
-        if response.status_code not in (200, 302) or (
-            "/purchases/view/" not in location and "/purchases/edit/" not in location
-        ):
-            messages = _page_errors(response.text)
-            raise click.ClickException(
-                f"Deleting attachment {target} from purchase {purchase_id} failed "
-                f"(HTTP {response.status_code}, loc={location!r})."
-                + (" SB says: " + " | ".join(messages) if messages else "")
+    try:
+        with build_http(cookies, account) as http:
+            edit = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
+            if edit.status_code in (301, 302):
+                raise click.ClickException(
+                    f"Purchase {purchase_id} is locked for editing, so its attachments "
+                    f"cannot be changed — it has a payment bound to it. Retry with "
+                    f"--force-unbind to unbind the payment, delete, and re-bind it."
+                )
+            if edit.status_code != 200:
+                raise click.ClickException(
+                    f"GET /purchases/edit/{purchase_id} → HTTP {edit.status_code}"
+                )
+            attachments = _purchase_attachments_or_die(edit.text, account, purchase_id)
+            doomed = next((a for a in attachments if a["attachment_id"] == target), None)
+            if doomed is None:
+                known = ", ".join(a["attachment_id"] for a in attachments) or "none"
+                raise click.ClickException(
+                    f"Purchase {purchase_id} has no attachment {target} (it has: {known})."
+                )
+
+            fields, _row_index, _csrf = _scrape_purchase_edit_form(http, account, purchase_id)
+            kept = [
+                pair for pair in fields
+                if pair != (ATTACHMENTS_EXISTING_FIELD, target)
+            ]
+            if len(kept) == len(fields):
+                raise click.ClickException(
+                    f"Purchase {purchase_id}'s edit form does not carry attachment {target} "
+                    f"as an existing attachment — refusing to guess at the delete payload."
+                )
+            kept.append((ATTACHMENTS_DELETED_FIELD, target))
+            _set_field(kept, "_csrfToken", fetch_fresh_csrf(http, account, path="purchases/add"))
+            _validate_account_fields(kept)
+
+            if dry_run:
+                surviving = [
+                    value for name, value in kept if name == ATTACHMENTS_EXISTING_FIELD
+                ]
+                click.secho(
+                    f"DRY RUN — would delete attachment {target} ({doomed['name']}) "
+                    f"from purchase {purchase_id}.", bold=True,
+                )
+                click.echo(f"  POST     : {BASE}/{account}/purchases/update")
+                click.echo(f"  {ATTACHMENTS_DELETED_FIELD} = {target}")
+                click.echo(f"  {ATTACHMENTS_EXISTING_FIELD} kept: "
+                           + (", ".join(surviving) or "(none)"))
+                return
+
+            http.headers["Referer"] = f"{BASE}/{account}/purchases/edit/{purchase_id}"
+            http.headers["Origin"] = BASE
+            response = http.post(
+                f"{BASE}/{account}/purchases/update",
+                files=_purchase_multipart_parts(kept, None),
             )
-        remaining = _purchase_attachments_or_die(
-            _purchase_attachment_page(http, account, purchase_id), account, purchase_id
-        )
+            location = response.headers.get("location", "")
+            if response.status_code not in (200, 302) or (
+                "/purchases/view/" not in location and "/purchases/edit/" not in location
+            ):
+                messages = _page_errors(response.text)
+                raise click.ClickException(
+                    f"Deleting attachment {target} from purchase {purchase_id} failed "
+                    f"(HTTP {response.status_code}, loc={location!r})."
+                    + (" SB says: " + " | ".join(messages) if messages else "")
+                )
+            remaining = _purchase_attachments_or_die(
+                _purchase_attachment_page(http, account, purchase_id), account, purchase_id
+            )
+
+    except BaseException:
+        if needs_rebind:
+            click.secho(
+                f"  Delete failed after unbinding — restoring purchase {purchase_id}'s bindings…",
+                fg="red",
+            )
+            for kind, bid in saved_bindings:
+                _do_bind(kind, bid, [purchase_id])
+        raise
 
     if any(a["attachment_id"] == target for a in remaining):
         raise click.ClickException(
@@ -7924,6 +7967,21 @@ def purchases_attachment_delete(purchase_id: int, attachment_id: int, dry_run: b
         f"{len(remaining)} attachment(s) remaining",
         fg="green", bold=True,
     )
+    if needs_rebind:
+        for kind, bid in saved_bindings:
+            _do_bind(kind, bid, [purchase_id])
+            click.echo(f"  re-bound {kind.lower()} {bid} → purchase {purchase_id}")
+        rebound = _purchase_bindings(purchase_id)
+        if sorted(rebound) != sorted(saved_bindings):
+            raise click.ClickException(
+                f"Purchase {purchase_id}'s attachment was deleted, but its bindings did "
+                f"not come back identical: had "
+                + ", ".join(f"{kind} {bid}" for kind, bid in saved_bindings)
+                + ", now "
+                + (", ".join(f"{kind} {bid}" for kind, bid in rebound) or "none")
+                + ". Restore the binding in SimpleBooks."
+            )
+        click.echo(f"  Bindings : {len(rebound)} restored and verified identical")
 
 
 def _random_row_key() -> str:
@@ -8134,6 +8192,69 @@ def _purchase_attachment_matches(
         if response.status_code == 200 and hashlib.sha256(response.content).digest() == expected:
             return True
     return False
+
+
+_ROW_ACCOUNT_FIELD_RE = re.compile(
+    r"data\[PurchaseRows\]\[[^\]]+\]\[PurchaseRow\]\[expense_account_id\]"
+)
+
+
+def _purchase_stored_row_accounts(
+    http: httpx.Client, account: str, purchase_id: int
+) -> list[str] | None:
+    """Row expense-account ids as SimpleBooks stored them.
+
+    None when the edit form is unreachable — a payment-locked purchase answers
+    302, and its view page carries no row account ids at all.
+    """
+    response = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
+    if response.status_code != 200:
+        return None
+    form = BeautifulSoup(response.text, "html.parser").find("form", {"id": "purchase-form"})
+    if not form:
+        return None
+    stored: list[str] = []
+    for el in form.find_all(["input", "select"]):
+        if not _ROW_ACCOUNT_FIELD_RE.fullmatch(el.get("name") or ""):
+            continue
+        if el.name == "select":
+            option = el.find("option", selected=True)
+            stored.append((option.get("value") or "").strip() if option else "")
+        else:
+            stored.append((el.get("value") or "").strip())
+    return stored
+
+
+def _describe_coa_id(account_id: str) -> str:
+    rec = _chart_index()["by_id"].get(str(account_id))
+    return f"{rec['code']} {rec['name']} (id {account_id})" if rec else f"id {account_id or '(empty)'}"
+
+
+def _verify_stored_row_accounts(
+    http: httpx.Client, account: str, purchase_id: int, requested: list[str]
+) -> bool:
+    """Prove the stored rows carry the accounts the caller asked for.
+
+    SimpleBooks accepts a row account and can still store a different one, so a
+    write that names an account is not finished until the account is read back.
+    Returns False when the purchase is locked and the readback is impossible; a
+    mismatch raises, because a wrong expense account is a posted error.
+    """
+    stored = _purchase_stored_row_accounts(http, account, purchase_id)
+    if stored is None:
+        return False
+    if sorted(stored) == sorted(str(value) for value in requested):
+        return True
+    raise click.ClickException(
+        f"Purchase {purchase_id} exists, but SimpleBooks stored a different expense "
+        f"account than the one requested: asked "
+        + ", ".join(_describe_coa_id(value) for value in requested)
+        + " — stored "
+        + ", ".join(_describe_coa_id(value) for value in stored)
+        + f". The invoice is booked to the wrong account. Correct it with "
+        f"`simplbooks purchases update {purchase_id} --set-line '<row>:coa=<code>'` "
+        f"rather than creating the invoice again."
+    )
 
 
 def _purchase_update_created_integrity(
@@ -8467,11 +8588,20 @@ def purchases_create(supplier_id: int, number: str, internal_number: str, invoic
                 expected_payable=expected_payable,
                 attachment_path=attachment_path,
             )
+            accounts_verified = _verify_stored_row_accounts(
+                verify_http, account, pid, [ln["expense_account_id"] for ln in lines]
+            )
         click.secho(f"✓ Created expense {pid} (number {number})", fg="green", bold=True)
         click.echo(f"  Supplier : {supplier.get('name')} [{supplier_id}]")
         click.echo(f"  Date     : {invoice_date}")
         click.echo(f"  Lines    : {len(lines)}  VAT total: {vat_label}")
         _echo_accounts(touched)
+        if not accounts_verified:
+            click.secho(
+                "  Accounts : NOT read back — the purchase locked before the check; "
+                "confirm the expense account in SimpleBooks.",
+                fg="yellow",
+            )
         if fx_doc_total is not None:
             click.echo(
                 f"  FX       : {fx_source_currency} "
@@ -8522,6 +8652,13 @@ def _scrape_purchase_edit_form(http: httpx.Client, account: str, purchase_id: in
     - `csrf` is the freshly-scraped token.
     """
     r = http.get(f"{BASE}/{account}/purchases/edit/{purchase_id}")
+    if r.status_code in (301, 302):
+        raise click.ClickException(
+            f"Purchase {purchase_id} is locked for editing — SimpleBooks redirects its "
+            f"edit form away while a payment is bound to it. Retry the same command with "
+            f"--force-unbind, which unbinds the bound entries, applies the change, and "
+            f"re-binds them."
+        )
     if r.status_code != 200:
         raise click.ClickException(f"GET /purchases/edit/{purchase_id} returned {r.status_code}")
     soup = BeautifulSoup(r.text, "html.parser")
@@ -8873,8 +9010,24 @@ def purchases_update(purchase_id, number, internal_number, new_date, new_due, va
             f"Purchase {purchase_id} update returned success but failed readback: "
             + "; ".join(verification_failures)
         )
+    accounts_verified = True
+    if set_lines or add_lines:
+        with build_http(cookies, account) as verify_http:
+            accounts_verified = _verify_stored_row_accounts(
+                verify_http,
+                account,
+                purchase_id,
+                [value for name, value in fields if _ROW_ACCOUNT_FIELD_RE.fullmatch(name)],
+            )
+
     click.secho(f"✓ Updated purchase {purchase_id}", fg="green", bold=True)
     _echo_accounts(touched)
+    if not accounts_verified:
+        click.secho(
+            "  Accounts : NOT read back — the purchase is locked; confirm the "
+            "expense account in SimpleBooks.",
+            fg="yellow",
+        )
     if set_lines:
         click.echo(f"  Edited line(s): {', '.join(r.split(':', 1)[0] for r in set_lines)}")
     if attach_path:
