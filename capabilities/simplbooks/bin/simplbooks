@@ -7764,6 +7764,9 @@ def purchases_download(expense_id: int, out_path: str | None, attach_index: int)
 
 ATTACHMENTS_EXISTING_FIELD = "data[Purchase][attachments_existing][]"
 ATTACHMENTS_DELETED_FIELD = "data[Purchase][attachments_deleted][]"
+# The attachments manager runs FilePond with storeAsFile, so a new file rides the
+# ordinary purchase-form POST under this input's own name rather than a temp endpoint.
+ATTACHMENTS_UPLOAD_FIELD = "data[Purchase][attachments][]"
 
 
 def _purchase_attachment_page(http: httpx.Client, account: str, purchase_id: int) -> str:
@@ -8063,9 +8066,10 @@ def _purchase_multipart_parts(
             if path.name.lower().endswith(".pdf")
             else "application/octet-stream"
         )
-        parts.append(("data[Purchase][copy]", (path.name, path.read_bytes(), content_type)))
+        parts.append((ATTACHMENTS_UPLOAD_FIELD, (path.name, path.read_bytes(), content_type)))
     else:
-        parts.append(("data[Purchase][copy]", ("", b"", "application/octet-stream")))
+        # The browser submits the empty file input too; an omitted part is not the same body.
+        parts.append((ATTACHMENTS_UPLOAD_FIELD, ("", b"", "application/octet-stream")))
     return parts
 
 
@@ -8231,10 +8235,16 @@ def _ensure_created_purchase_integrity(
     if not attachment_ok:
         missing.append("attachment bytes")
     if missing:
+        repair = (
+            f" Attach it to the purchase that exists: simplbooks purchases update "
+            f"{purchase_id} --attach {attachment_path}"
+            if not attachment_ok and rounding_ok
+            else ""
+        )
         raise click.ClickException(
-            f"Purchase {purchase_id} was created, but readback still does not match: "
-            + ", ".join(missing)
-            + "."
+            f"Purchase {purchase_id} is stored and its invoice is booked; only the readback "
+            f"failed: " + ", ".join(missing) + ". Do not run create again — the invoice exists "
+            f"and SimpleBooks will refuse the duplicate document number." + repair
         )
     return True
 
@@ -8531,7 +8541,7 @@ def _scrape_purchase_edit_form(http: httpx.Client, account: str, purchase_id: in
         name = el.get("name")
         if not name:
             continue
-        # File inputs (e.g. data[Purchase][copy]) — skip in scrape; we re-attach via the upload field at POST time.
+        # File inputs (the attachments upload field) — skip in scrape; re-attached at POST time.
         if el.get("type") == "file":
             continue
         # Submit / button inputs aren't required by /purchases/update.

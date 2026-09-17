@@ -126,6 +126,13 @@ class AttachmentParserTests(unittest.TestCase):
 
 
 class MultipartTests(unittest.TestCase):
+    def test_upload_field_is_the_attachments_manager_input(self) -> None:
+        # Pinned to the name SimpleBooks renders on #purchase-form; a file posted
+        # under any other name is accepted by the endpoint and silently dropped.
+        self.assertEqual(
+            simplbooks.ATTACHMENTS_UPLOAD_FIELD, "data[Purchase][attachments][]"
+        )
+
     def test_create_and_update_attachment_builder_carries_exact_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "invoice.pdf"
@@ -134,7 +141,17 @@ class MultipartTests(unittest.TestCase):
         self.assertEqual(parts[0], ("field", (None, "value")))
         self.assertEqual(
             parts[1],
-            ("data[Purchase][copy]", ("invoice.pdf", b"pdf bytes", "application/pdf")),
+            (
+                "data[Purchase][attachments][]",
+                ("invoice.pdf", b"pdf bytes", "application/pdf"),
+            ),
+        )
+
+    def test_no_attachment_still_submits_the_empty_file_part(self) -> None:
+        parts = simplbooks._purchase_multipart_parts([("field", "value")], None)
+        self.assertEqual(
+            parts[-1],
+            ("data[Purchase][attachments][]", ("", b"", "application/octet-stream")),
         )
 
     def test_build_fields_serializes_rounding(self) -> None:
@@ -246,7 +263,28 @@ class CreateIntegrityTests(unittest.TestCase):
                     expected_payable=simplbooks.Decimal("19.76"),
                     attachment_path="invoice.pdf",
                 )
-        self.assertIn("readback still does not match", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("is stored", message)
+        self.assertIn("Do not run create again", message)
+
+    def test_document_only_failure_points_at_update_rather_than_a_second_create(self) -> None:
+        with (
+            mock.patch.object(simplbooks, "_purchase_read_rounding", return_value="-0,01"),
+            mock.patch.object(simplbooks, "_purchase_attachment_matches", return_value=False),
+            mock.patch.object(simplbooks, "_purchase_update_created_integrity"),
+        ):
+            with self.assertRaises(click.ClickException) as caught:
+                simplbooks._ensure_created_purchase_integrity(
+                    mock.Mock(),
+                    "account",
+                    42,
+                    rounding="-0,01",
+                    expected_payable=simplbooks.Decimal("19.76"),
+                    attachment_path="/tmp/invoice.pdf",
+                )
+        message = str(caught.exception)
+        self.assertIn("Do not run create again", message)
+        self.assertIn("purchases update 42 --attach /tmp/invoice.pdf", message)
 
     def test_locked_purchase_uses_payable_readback(self) -> None:
         with (
