@@ -16,7 +16,12 @@ USAGE
                                  (tier, source, secrets masked). Local only.
   railwayc doctor [--connection <id>]
                                  Prove the token resolves and report the project —
-                                 every connection, or one.
+                                 every connection, or one — over both paths: the
+                                 `railway` CLI and railwayc's own API call.
+  railwayc backups [--connection <id>]
+                                 Every volume instance in the token's project +
+                                 environment with its backup schedules and its
+                                 backups. railwayc's own API call, read-only.
   railwayc help                  Print this contract.
 
 Contract commands (the same on every capability; railwayc's own, never forwarded):
@@ -36,9 +41,14 @@ MODEL
   front of `railway` and execs it. `railwayc logs -s web` runs `railway logs -s web`
   with RAILWAY_TOKEN set; stdout, stderr, and the exit code are railway's, passed
   through untouched, so streaming, --json, and colors behave exactly as in railway
-  itself. Only `help`, `doctor`, and the contract commands are railwayc's own; every
-  other word forwards (`railwayc help <cmd>` forwards too, so railway's own help
-  stays reachable).
+  itself. Only `help`, `doctor`, `backups`, and the contract commands are railwayc's
+  own; every other word forwards (`railwayc help <cmd>` forwards too, so railway's
+  own help stays reachable).
+
+  `backups` is the one domain verb railwayc answers itself: the railway CLI has no
+  command for volume backups, so railwayc queries Railway's GraphQL API directly
+  with the same project token, sent as the `Project-Access-Token` header. It is
+  queries only — nothing railwayc calls itself can mutate the project.
 
   It REQUIRES a project token and never falls back to interactive login or this
   machine's account session — that refusal is the point: access stays scoped to the
@@ -99,12 +109,36 @@ COMMANDS railwayc owns
 
   doctor [--connection <id>]
       Per connection (every configured one bare; one with --connection): resolve
-      its token and run `railway status --json` with it injected. Emits
+      its token and prove it over both paths railwayc uses. The CLI path runs
+      `railway status --json` with the token injected and fills the top-level
+      fields; the API path asks Railway's GraphQL API `{ projectToken {
+      projectId environmentId } }` under the same token and fills `api`, so a
+      reader can tell which of the two paths failed. Emits
       {ok, connections: {<id>: {project:{id,name}, workspace, environments:[…],
-      services:[…]}}}. Exit 0 all healthy / 2 token missing or rejected /
-      5 railway not installed or unreachable / 7 token resolved to a project
-      other than the expected one. Use this for health — `railway whoami` does
-      NOT work under a project token.
+      services:[…], api:{ok, project_id, environment_id | error, hint}}}}; a
+      failed CLI path carries `error` at the top level, a failed API path
+      carries it under `api`. Exit 0 all healthy / 2 token missing or rejected on
+      either path / 5 railway not installed, or either path unreachable / 7
+      token resolved to a project other than the expected one. Use this for
+      health — `railway whoami` does NOT work under a project token, and the
+      API's `me` query is refused for every token class, so neither is asked.
+
+  backups [--connection <id>]
+      railwayc's own read of Railway's GraphQL API (not a forward): the token's
+      project and environment (`projectToken`), the project's volumes, and for
+      every volume instance in that environment its backup schedules
+      (`volumeInstanceBackupScheduleList`) and its backups
+      (`volumeInstanceBackupList`), as JSON:
+      {connection, project_id, environment_id, volumes:[{id, name,
+      instances:[{id, service_id, environment_id, schedules:[{id, name, kind,
+      cron, retention_seconds, created_at}], backups:[{id, external_id, name,
+      created_at, expires_at, schedule_id, creator_id, used_mb, referenced_mb,
+      volume_instance_size_mb}]}]}]}. Instances in other environments are
+      outside the token's scope and are not listed. A read: it runs on a
+      connection with allow_write: false. Exit 0 / 2 the token is rejected or
+      an id is outside its scope (Railway answers both as "Not Authorized" and
+      never as not-found) / 5 network, timeout, rate-limited or 5xx after
+      bounded retries / 6 a bad argument, or a query Railway's schema rejects.
 
   help
       Print this document. (`railway help` is the real CLI's surface, a separate
@@ -122,17 +156,23 @@ EVERYTHING ELSE — forwarded verbatim to `railway`, token injected, I/O transpa
     run -- <cmd>                     run a local command with the environment's vars
 
 EXIT CODES (railwayc's own layer)
-  0 success · 2 auth (token missing or rejected) · 4 policy refusal — the
+  0 success · 2 auth (token missing or rejected; for backups also an id outside
+  the token's scope, which Railway reports identically) · 4 policy refusal — the
   project gate (capabilities/settings.json) on any verb, or a write verb on a
   read-only connection (allow_write: false); ask the user, never lift a gate
-  yourself · 5 environment (railway not on PATH, or unreachable) · 6 input (bad
-  use of a railwayc-owned command, or an unknown/ambiguous connection) · 7 wrong
-  project (doctor: token ≠ the expected project).
+  yourself · 5 environment (railway not on PATH, or unreachable; for backups
+  and doctor's API path a network error, timeout, rate limit or 5xx after
+  bounded retries) · 6 input (bad use of a railwayc-owned command, an
+  unknown/ambiguous connection, or a query Railway's schema rejects) · 7 wrong
+  project (doctor: token ≠ the expected project). railwayc's own verbs never
+  exit 3: Railway answers an unknown id as "Not Authorized" (2), not not-found.
   Forwarded commands return RAILWAY's own exit code, not these — railwayc is
   transparent for everything it forwards (after the gate).
 
 EXAMPLES
   railwayc doctor
+  railwayc backups
+  railwayc backups --connection <id>
   railwayc status --json
   railwayc logs -s web --json
   railwayc variables -s web --json
@@ -148,8 +188,11 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import NoReturn
+
+import httpx
 
 # --- Capability declaration — one home for every contract fact ---------------
 
@@ -177,6 +220,11 @@ WRITE_VERBS = {     # forwarded railway commands that mutate the Railway project
 # listed subcommand reads; anything else under that verb is a write, so a
 # subcommand this tool has not seen is refused rather than waved through.
 READ_SUBCOMMANDS = {"volume": {"list"}}
+# railwayc's own domain verbs that read the Railway API directly (never
+# forwarded, never mutating). Membership here is what lets a verb run on a
+# read-only connection; a native verb is declared a read, not assumed one.
+READ_VERBS = {"backups"}
+assert not (READ_VERBS & WRITE_VERBS), "a verb is a read or a write, never both"
 WRITE_DEFAULT = True    # writes stay inside a project the consumer owns
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
@@ -189,6 +237,14 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 TOKEN_NAME = "RAILWAY_TOKEN"
 EXPECT_PROJECT = "RAILWAYC_EXPECT_PROJECT"
 DOCTOR_TIMEOUT = 60.0
+
+# railwayc's own HTTP path: Railway's public GraphQL API, reached with the same
+# project token the forwarded CLI gets, sent as the header a PROJECT token is
+# accepted under (a project token under `Authorization: Bearer` is refused).
+RAILWAY_GRAPHQL_URL = "https://backboard.railway.com/graphql/v2"
+TOKEN_HEADER = "Project-Access-Token"
+TIMEOUT = httpx.Timeout(60.0)
+MAX_RETRIES = 3
 
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
@@ -3186,9 +3242,200 @@ def _check_connection(cfg: dict) -> dict:
     return result
 
 
+# ── railwayc's own API path (GraphQL, queries only) ─────────────────────────
+
+# Every query railwayc sends. Field names are Railway's schema's, exactly; the
+# set is closed so the read-only claim is checkable: a `mutation` never appears.
+Q_PROJECT_TOKEN = "query { projectToken { projectId environmentId } }"
+Q_VOLUMES = (
+    "query ($id: String!) { project(id: $id) { volumes { edges { node { "
+    "id name volumeInstances { edges { node { id serviceId environmentId } } } "
+    "} } } } }")
+Q_SCHEDULES = (
+    "query ($id: String!) { volumeInstanceBackupScheduleList(volumeInstanceId: $id) "
+    "{ id name kind cron retentionSeconds createdAt } }")
+Q_BACKUPS = (
+    "query ($id: String!) { volumeInstanceBackupList(volumeInstanceId: $id) "
+    "{ id externalId name createdAt expiresAt scheduleId creatorId usedMB "
+    "referencedMB volumeInstanceSizeMB } }")
+
+
+def _graphql_errors(body) -> list[dict]:
+    errs = body.get("errors") if isinstance(body, dict) else None
+    return [e for e in errs if isinstance(e, dict)] if isinstance(errs, list) else []
+
+
+def _error_codes(errs: list[dict]) -> set[str]:
+    return {str((e.get("extensions") or {}).get("code") or "") for e in errs}
+
+
+def _graphql_result(token: str, query: str, variables: dict | None = None
+                    ) -> tuple[dict | None, dict | None]:
+    """One query against Railway's API under the project token. Returns
+    (data, problem) — problem is {"category", "code", "error", "hint"?,
+    "status"?} rather than a die, so doctor can report it per connection.
+
+    Transport failures follow the standard's resilient loop (bounded retries,
+    429 honouring Retry-After, 5xx and timeouts backed off). The auth mapping
+    keys on the GraphQL envelope and not only the HTTP status: Railway answers
+    a rejected token AND an id outside the token's scope as HTTP 200 with
+    errors[].message "Not Authorized", byte-identical, and never as not-found.
+    """
+    headers = {TOKEN_HEADER: token, "Content-Type": "application/json",
+               "Accept": "application/json"}
+    payload = {"query": query, "variables": variables or {}}
+    resp = None
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    resp = client.post(RAILWAY_GRAPHQL_URL, json=payload,
+                                       headers=headers)
+                except httpx.TimeoutException:
+                    if attempt < MAX_RETRIES:
+                        time.sleep(attempt * 1.5); continue
+                    return None, {"category": 5, "code": "timeout",
+                                  "error": "Railway API request timed out",
+                                  "hint": "Railway was unresponsive"}
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("Retry-After",
+                                                         str(attempt * 1.5)))
+                    if attempt < MAX_RETRIES:
+                        time.sleep(retry_after); continue
+                    return None, {"category": 5, "code": "rate_limited",
+                                  "error": "Railway API rate-limited the request",
+                                  "status": 429}
+                if resp.status_code >= 500:
+                    if attempt < MAX_RETRIES:
+                        time.sleep(attempt * 1.5); continue
+                    return None, {"category": 5, "code": "server_error",
+                                  "error": f"Railway API returned {resp.status_code}",
+                                  "status": resp.status_code}
+                break
+    except httpx.RequestError as e:
+        return None, {"category": 5, "code": "network_error",
+                      "error": f"could not reach the Railway API: {e}",
+                      "hint": "check connectivity"}
+    if resp is None:
+        return None, {"category": 5, "code": "protocol_error",
+                      "error": "Railway API request completed without a response"}
+
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    errs = _graphql_errors(body)
+    codes = _error_codes(errs)
+    messages = "; ".join(str(e.get("message") or "") for e in errs) or None
+    not_authorized = any("not authorized" in str(e.get("message") or "").lower()
+                         for e in errs) or bool(codes & {"UNAUTHENTICATED",
+                                                        "UNAUTHORIZED", "FORBIDDEN"})
+
+    if resp.status_code in (401, 403) or not_authorized:
+        return None, {"category": 2, "code": "auth_failed",
+                      "error": messages or f"Railway API returned {resp.status_code}",
+                      "hint": "the token is invalid, revoked, or for a deleted "
+                              "project/environment — or an id lies outside the "
+                              "project and environment this token is scoped to; "
+                              "Railway reports both identically",
+                      "status": resp.status_code}
+    if resp.status_code == 404:
+        return None, {"category": 3, "code": "not_found",
+                      "error": "Railway API endpoint not found", "status": 404}
+    if codes & {"GRAPHQL_VALIDATION_FAILED", "GRAPHQL_PARSE_FAILED", "BAD_USER_INPUT"} \
+            or (400 <= resp.status_code < 500):
+        return None, {"category": 6, "code": "invalid_query",
+                      "error": messages or f"Railway API returned {resp.status_code}",
+                      "hint": "the query does not match Railway's current schema",
+                      "status": resp.status_code}
+    if errs:
+        return None, {"category": 5, "code": "graphql_error",
+                      "error": messages, "status": resp.status_code}
+    if not isinstance(body, dict) or not isinstance(body.get("data"), dict):
+        return None, {"category": 5, "code": "protocol_error",
+                      "error": "Railway API returned no data object",
+                      "status": resp.status_code}
+    return body["data"], None
+
+
+def _graphql(token: str, query: str, variables: dict | None = None) -> dict:
+    data, problem = _graphql_result(token, query, variables)
+    if problem:
+        _die(problem["category"], problem["code"], problem["error"],
+             problem.get("hint"), problem.get("status"))
+    return data
+
+
+def _check_api(cfg: dict) -> dict:
+    """doctor's second probe: the API path under the same token, reported."""
+    data, problem = _graphql_result(cfg["token"], Q_PROJECT_TOKEN)
+    if problem:
+        res = {"ok": False, "category": problem["category"],
+               "error": problem["error"]}
+        if problem.get("hint"):
+            res["hint"] = problem["hint"]
+        return res
+    tok = data.get("projectToken") or {}
+    return {"ok": True, "project_id": tok.get("projectId"),
+            "environment_id": tok.get("environmentId")}
+
+
+def _schedule_row(n: dict) -> dict:
+    return {"id": n.get("id"), "name": n.get("name"), "kind": n.get("kind"),
+            "cron": n.get("cron"), "retention_seconds": n.get("retentionSeconds"),
+            "created_at": n.get("createdAt")}
+
+
+def _backup_row(n: dict) -> dict:
+    return {"id": n.get("id"), "external_id": n.get("externalId"),
+            "name": n.get("name"), "created_at": n.get("createdAt"),
+            "expires_at": n.get("expiresAt"), "schedule_id": n.get("scheduleId"),
+            "creator_id": n.get("creatorId"), "used_mb": n.get("usedMB"),
+            "referenced_mb": n.get("referencedMB"),
+            "volume_instance_size_mb": n.get("volumeInstanceSizeMB")}
+
+
+def cmd_backups(cid: str, cfg: dict, args: list[str]) -> None:
+    """Every volume instance in the token's project + environment, with its
+    backup schedules and backups. Queries only; runs on a read-only connection."""
+    if args:
+        _die(6, "bad_usage", f"backups takes no arguments (got {' '.join(args)!r})",
+             "`railwayc backups [--connection <id>]`")
+    token = cfg["token"]
+    scope = _graphql(token, Q_PROJECT_TOKEN).get("projectToken") or {}
+    project_id, env_id = scope.get("projectId"), scope.get("environmentId")
+    if not project_id or not env_id:
+        _die(5, "protocol_error", "Railway did not report the token's project "
+             "and environment")
+    project = _graphql(token, Q_VOLUMES, {"id": project_id}).get("project") or {}
+    volumes = []
+    for ve in _edges(project.get("volumes")):
+        vol = ve.get("node") or {}
+        instances = []
+        for ie in _edges(vol.get("volumeInstances")):
+            inst = ie.get("node") or {}
+            if inst.get("environmentId") != env_id:
+                continue   # another environment: outside this token's scope
+            iid = inst.get("id")
+            schedules = _graphql(token, Q_SCHEDULES, {"id": iid}) \
+                .get("volumeInstanceBackupScheduleList") or []
+            backups = _graphql(token, Q_BACKUPS, {"id": iid}) \
+                .get("volumeInstanceBackupList") or []
+            instances.append({
+                "id": iid, "service_id": inst.get("serviceId"),
+                "environment_id": inst.get("environmentId"),
+                "schedules": [_schedule_row(x) for x in schedules if isinstance(x, dict)],
+                "backups": [_backup_row(x) for x in backups if isinstance(x, dict)]})
+        volumes.append({"id": vol.get("id"), "name": vol.get("name"),
+                        "instances": instances})
+    _emit({"connection": cid, "project_id": project_id, "environment_id": env_id,
+           "volumes": volumes})
+
+
 def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
     """Every connection bare; one with --connection. Exit 0 only when every
-    examined connection is healthy, else the first failure's category."""
+    examined connection is healthy on both paths, else the first failure's
+    category. The CLI path fills the top-level fields; the API path is `api`."""
     _doctor_gate(_connections_report(), wanted)
     if wanted is not None or reg is None:
         targets = [_select_connection(reg, wanted)]
@@ -3205,6 +3452,14 @@ def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
                 res["hint"] = problem["hint"]
         else:
             res = _check_connection(cfg)
+            api = _check_api(cfg)
+            if not res.get("ok") and not fail_exit:
+                fail_exit = res.get("category") or 5
+            if not api.get("ok") and not fail_exit:
+                fail_exit = api.get("category") or 5
+            api.pop("category", None)
+            res["api"] = api
+            res["ok"] = bool(res.get("ok")) and bool(api.get("ok"))
         if not res.get("ok") and not fail_exit:
             fail_exit = res.get("category") or 5
         res.pop("category", None)
@@ -3282,6 +3537,10 @@ def main() -> None:
     if problem:
         _die(problem["exit"], problem["code"], problem["message"],
              problem.get("hint"))
+
+    if verb in READ_VERBS:       # railwayc's own API read; needs no `railway`
+        cmd_backups(cid, cfg, cleaned[1:])
+        return
 
     if not shutil.which("railway"):
         _die(5, "railway_not_found", "the `railway` CLI is not on PATH",
