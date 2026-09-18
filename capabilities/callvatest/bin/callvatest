@@ -21,8 +21,8 @@ loads its production configuration and calls its production tools, so a passing
 run is evidence about production behaviour.
 
 Placing a call costs money and creates a real call record. `run`, `suite`,
-`probe`, and `session start` are therefore write verbs: a connection with
-"allow_write": false refuses them, and no flag lifts that gate.
+`probe`, `explore`, and `session start` are therefore write verbs: a connection
+with "allow_write": false refuses them, and no flag lifts that gate.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
@@ -243,6 +243,93 @@ SESSIONS
   or the holder dies, nothing is lost: `say` then refuses by naming the log, and
   `end` still reports from it plus whatever the platform can still be asked.
 
+EXPLORING
+  A scenario says every caller line in advance, so it can gate: red means the
+  agent changed. An exploration says only where the call must go and lets a
+  model play the caller, so it can find: the wording is invented on the spot,
+  a persona makes the caller unclear, wandering or insistent, and the run
+  reports what it saw instead of passing or failing.
+
+  explore <exploration> [--persona <id>] [--driver <id>] [--agent <id|label>]
+          [--report FILE]
+        Let the driver model choose every caller line until every stage is
+        reached, a budget is spent, or the caller gives up. Billable, exactly
+        as `run` is, and it may place more than one call: a call that ends
+        under the caller before the stages are done is followed by another
+        while the budget allows. Prints the exploratory report; --json for the
+        whole record. Exit 0 whatever was found; 5 only when the driver itself
+        could not answer, which is a fault of the run and not a finding.
+
+  Explorations, personas, the driver and the budget are one setting,
+  "explore", declared beside "judges" and resolved the same way, project then
+  global:
+
+    capabilities set callvatest setting explore '{
+      "driver": "gpt-oss",
+      "budget": {"turns": 12, "calls": 1},
+      "personas": {
+        "mumbler": "You speak in fragments, trail off mid-sentence, and about
+                    half the time answer a different question than the one
+                    you were asked.",
+        "insister": "You want the earliest possible slot and push back on
+                     every alternative twice before accepting anything."
+      },
+      "explorations": {
+        "books-any-afternoon": {
+          "agent": "<agent-label>",
+          "language": "en",
+          "intent": "Book a consultation next week, any afternoon, as a
+                     returning caller.",
+          "stages": ["state the reason for calling",
+                     "give a preferred day and time when asked",
+                     "confirm the details the agent reads back",
+                     "say goodbye"],
+          "persona": "mumbler"
+        }
+      }
+    }'
+
+  "driver" names an entry of the judges roster — the same providers, models
+  and keys, so no new account or key is needed; gpt-oss-120b on Cerebras is a
+  fitting one. --driver <id> switches it for one run. The driver answers while
+  the agent waits, so a fast model matters here where it does not for a judge.
+  A setting that names no driver is refused; nothing falls back to the judges
+  default.
+
+  "budget" is counted in what this harness can count. "turns" is the most
+  caller lines one run may send, across every call it places; "calls" is the
+  most calls it may place. Both are required, and the run stops at whichever
+  is spent first. The whole-call --budget in seconds still bounds each call
+  on its own. The price of a call is the tenant's to know, never this
+  harness's to guess, so no budget is money.
+
+  An exploration's "intent" is the caller's purpose and the facts they hold;
+  "stages" are the points the call must pass through, in order. The driver
+  invents the wording inside that direction and says which stages the
+  conversation has completed. "agent" and "language" are optional and read as
+  a scenario's are; "persona" names the persona this exploration plays by
+  default, and --persona <id> overrides it for one run.
+
+  "personas" are prose, one paragraph each, describing how a caller speaks
+  and behaves; a persona changes nothing about what the caller wants. They
+  are the project's own: this harness ships none and plays no particular
+  caller.
+
+  The report is its own shape, "kind": "exploration": the intent, each stage
+  with the call and turn that reached it, the persona, the driver, the budget
+  and what was spent of it, what stopped the run, one record per call placed
+  — room, call id, transcript, events, tool runs and post-call fields, what a
+  `run` report holds without its checks — and the driver's notes: one
+  sentence per turn where the agent did something a caller would find wrong,
+  odd or unhelpful. The verdict is one of:
+    explored   every stage was reached
+    stalled    a budget was spent first — turns or calls
+    dropped    the caller gave up first: the driver ended the call with
+               stages still to go
+    aborted    the driver could not answer; nothing about the agent is claimed
+  None of these is pass or fail, and none gates anything: a finding is turned
+  into a scenario, and the scenario is what gates.
+
   Contract verbs: help, doctor, connections, stub, manifest --json,
   guide [<topic>], ids list|get|set|rm, refs.
 
@@ -316,6 +403,10 @@ JUDGE_TIMEOUT_S = 60.0       # one judgement, off the call's critical path
 JUDGE_MAX_TOKENS = 1000      # a verdict is two fields; the room is for models that reason first
 
 JUDGES_SETTING = "judges"    # the setting record the judge roster is declared as
+EXPLORE_SETTING = "explore"  # the setting record the exploratory mode is declared as
+# A driver's answer is one spoken line plus its bookkeeping, and the agent is
+# waiting for it; the room is for models that reason before they speak.
+DRIVER_MAX_TOKENS = 1500
 AZURE_API_VERSION = "2025-04-01-preview"   # the default an azure judge overrides
 
 # The judge transports. A judge runs after the call has ended, so accuracy
@@ -358,7 +449,7 @@ CRED_KEYS = [
 ]
 # Each places a real, billable call; the other session verbs drive one already
 # placed.
-WRITE_VERBS = {"run", "suite", "probe", "session start"}
+WRITE_VERBS = {"run", "suite", "probe", "explore", "session start"}
 WRITE_DEFAULT = True    # calls land in a tenant the consumer owns
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/callvatest/guides/")
@@ -4289,24 +4380,29 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + " …[truncated]"
 
 
-def _judges_declared() -> tuple[Any, str | None, str]:
-    """The declared judge roster, the scope that supplied it, and the home a
-    project declares one in.
+def _setting_declared(key: str) -> tuple[Any, str | None, str]:
+    """One declared setting, the scope that supplied it, and the home a project
+    declares one in.
 
-    A judge is this harness's own configuration, not one of the CallVA tenants
-    it tests, so it is kept as a setting and read through the records adapter
-    like every other record — which is what lets a project hold it in files or
-    in the store without this asking which. The resolution says which scope
-    answered, so nothing here re-derives the precedence it already applied."""
+    A judge roster or an exploratory mode is this harness's own configuration,
+    not one of the CallVA tenants it tests, so it is kept as a setting and read
+    through the records adapter like every other record — which is what lets a
+    project hold it in files or in the store without this asking which. The
+    resolution says which scope answered, so nothing here re-derives the
+    precedence it already applied."""
     adapter = _records()
     try:
-        row = adapter.resolve(NAME, "setting").get(JUDGES_SETTING)
+        row = adapter.resolve(NAME, "setting").get(key)
         home = str(adapter.collection_source(NAME, "setting"))
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
     if row is None:
         return None, None, home
     return row["value"], row.get("scope"), home
+
+
+def _judges_declared() -> tuple[Any, str | None, str]:
+    return _setting_declared(JUDGES_SETTING)
 
 
 def _judges_roster() -> tuple[dict, str | None, str | None]:
@@ -4397,24 +4493,33 @@ def _select_judge(wanted: str | None) -> dict:
 
 def _judge_call(cfg: dict, user: str) -> str:
     """One judgement over whichever transport the judge declares."""
+    return _model_call(cfg, _JUDGE_SYSTEM, [{"role": "user", "content": user}],
+                       JUDGE_MAX_TOKENS)
+
+
+def _model_call(cfg: dict, system: str, messages: list, max_tokens: int,
+                role: str = "judge") -> str:
+    """One answer from a roster model over whichever transport it declares.
+
+    A judge asks once with everything in one message; a driver carries the
+    conversation so far as alternating turns. The shaping per provider, the
+    retry and the reading of the answer are the same either way, so they live
+    here once and `role` only names the caller in a refusal."""
     provider = cfg["provider"]
     if provider == "anthropic":
         headers = {"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"}
-        body = {"model": cfg["model"], "max_tokens": JUDGE_MAX_TOKENS,
-                "system": _JUDGE_SYSTEM,
-                "messages": [{"role": "user", "content": user}]}
+        body = {"model": cfg["model"], "max_tokens": max_tokens,
+                "system": system, "messages": messages}
     elif provider == "azure":
         # The deployment is already named in the URL, and this model family
         # counts the budget as completion tokens.
         headers = {"api-key": cfg["api_key"]}
-        body = {"max_completion_tokens": JUDGE_MAX_TOKENS,
-                "messages": [{"role": "system", "content": _JUDGE_SYSTEM},
-                             {"role": "user", "content": user}]}
+        body = {"max_completion_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system}, *messages]}
     else:
         headers = {"Authorization": f"Bearer {cfg['api_key']}"}
-        body = {"model": cfg["model"], "max_tokens": JUDGE_MAX_TOKENS,
-                "messages": [{"role": "system", "content": _JUDGE_SYSTEM},
-                             {"role": "user", "content": user}]}
+        body = {"model": cfg["model"], "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system}, *messages]}
     temperature = JUDGE_PROVIDERS[provider].get("temperature")
     if temperature is not None:
         body["temperature"] = temperature
@@ -4432,7 +4537,7 @@ def _judge_call(cfg: dict, user: str) -> str:
             if attempt < MAX_RETRIES:
                 time.sleep(attempt * 1.5)
                 continue
-            raise JudgeError(f"judge {cfg['id']} unreachable: {e}") from e
+            raise JudgeError(f"{role} {cfg['id']} unreachable: {e}") from e
         if resp.status_code in (429, 503) or resp.status_code >= 500:
             if attempt < MAX_RETRIES:
                 time.sleep(float(resp.headers.get("Retry-After", attempt * 2.0)))
@@ -4440,12 +4545,12 @@ def _judge_call(cfg: dict, user: str) -> str:
         break
     if resp is None or resp.status_code >= 400:
         status = resp.status_code if resp is not None else "no response"
-        raise JudgeError(f"judge {cfg['id']} returned HTTP {status}: "
+        raise JudgeError(f"{role} {cfg['id']} returned HTTP {status}: "
                          f"{_clip(resp.text if resp is not None else '', 200)}")
     try:
         data = resp.json()
     except ValueError as e:
-        raise JudgeError(f"judge {cfg['id']} returned non-JSON") from e
+        raise JudgeError(f"{role} {cfg['id']} returned non-JSON") from e
     if cfg["provider"] == "anthropic":
         return "".join(block.get("text", "")
                        for block in (data.get("content") or [])
@@ -4839,18 +4944,7 @@ def build_report(scenario: dict, conn: dict, agent_id: str, conn_details: dict,
     failure needs to be read; pass --with-results when debugging a specific
     mismatch.
     """
-    runs = []
-    for run in evidence["runs"]:
-        entry = {k: run[k] for k in ("name", "status", "duration_ms",
-                                     "started_at", "started_rel", "args")}
-        result = run.get("result")
-        if with_results:
-            entry["result"] = result
-        else:
-            entry["result_shape"] = (sorted(result.keys())
-                                     if isinstance(result, dict)
-                                     else type(result).__name__)
-        runs.append(entry)
+    runs = _tool_runs_view(evidence, with_results)
     return {
         "scenario": scenario.get("id"),
         "scenario_path": scenario.get("_path"),
@@ -5141,6 +5235,443 @@ def cmd_doctor(args) -> None:
         except JudgeError as e:
             entry.update({"ok": False, "error": str(e)})
     _emit(out)
+
+
+# ---------------------------------------------------------------------------
+# Exploration — a model plays the caller
+# ---------------------------------------------------------------------------
+
+# A scenario gates because its input never changes; an exploration finds
+# because its input is invented as the call goes. The driver is given the
+# caller's intent, the stages the call must pass through and, optionally, how
+# this caller behaves, and chooses each line after reading the agent's last
+# one. It never sees the tools or the platform: it is a caller, and a caller
+# only hears what the agent says.
+
+_DRIVER_SYSTEM = (
+    "You are playing a caller on a phone call with a voice agent. You are the "
+    "caller and never the agent.\n"
+    "Below are your intent for the call — what you want and the facts you "
+    "hold — and the stages the call must pass through, in order. Invent the "
+    "actual wording yourself: say what a real caller would say next, one short "
+    "spoken line at a time, in the language of the call, and never narrate, "
+    "explain or describe yourself.\n"
+    "Each user message is what the agent just said; each of your replies is "
+    "what you say back. Where a persona is given it says how you speak and "
+    "behave, and it changes nothing about what you want.\n"
+    "Answer with JSON and nothing else: "
+    '{"say": "<your next line>", "stages_done": <how many of the stages will '
+    "have been completed once you have said this line, counted from the "
+    'first, 0 if none>, "done": <true when the call is over — every stage is '
+    'done, or you are giving up and would hang up now>, "note": <one sentence '
+    "about anything the agent just did that a caller would find wrong, odd or "
+    "unhelpful, else null>}. When done is true, say is your closing line, or "
+    "an empty string to hang up without one."
+)
+
+# What a caller hears when the run dials again: the previous call ended before
+# the intent was done, and the conversation so far is still the caller's own.
+_DRIVER_REDIAL = ("(The previous call ended before you were done: {reason}. You "
+                  "are calling again; this is call {call}. What follows is what "
+                  "the agent says when it picks up.)")
+# How a call ended, in the words a caller would use for it; the codes are the
+# report's, and the driver is a caller rather than a reader of reports.
+_ENDED_PROSE = {"agent": "the agent hung up",
+                "agent_silent": "the agent went quiet and never finished its turn",
+                "seconds": "the call ran past its time ceiling"}
+
+# How an exploration stopped, and the verdict that follows from it. The words
+# are deliberately not pass and fail: two runs of one exploration are two
+# conversations, so nothing here is evidence that something changed.
+_EXPLORE_VERDICTS = {"stages": "explored", "turns": "stalled", "calls": "stalled",
+                     "caller": "dropped", "driver": "aborted"}
+
+_EXPLORE_DECLARATION = (
+    f"`capabilities set {NAME} setting explore "
+    '\'{"driver": "<judge id>", "budget": {"turns": <n>, "calls": <n>}, '
+    '"personas": {"<id>": "<how this caller speaks and behaves>"}, '
+    '"explorations": {"<id>": {"intent": "<what the caller wants>", '
+    '"stages": ["<first point the call must pass>", "..."]}}}\'`'
+)
+
+
+def _explore_budget(budget, dimension: str, scope: str | None) -> int:
+    """One required ceiling. The price of a call is not this harness's to know,
+    so the budget is counted in what it can count and never guessed for."""
+    value = budget.get(dimension) if isinstance(budget, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        _die(6, "no_budget",
+             f'the explore setting at {scope} scope declares no "budget" '
+             f'"{dimension}" — every exploratory run places real, billable '
+             "calls, so one runs only under a ceiling",
+             'declare "budget": {"turns": <n>, "calls": <n>} — the most caller '
+             "lines and the most calls one run may spend")
+    return value
+
+
+def _exploration_declared(declared: dict, wanted: str, scope: str | None) -> dict:
+    """The named exploration, checked for the two things the driver cannot do
+    without: an intent in prose and at least one stage."""
+    explorations = declared.get("explorations")
+    if not isinstance(explorations, dict) or not explorations:
+        _die(6, "no_explorations",
+             f'the explore setting at {scope} scope declares no "explorations"',
+             'declare "explorations": {"<id>": {"intent": "...", "stages": [...]}}')
+    entry = explorations.get(wanted)
+    if entry is None:
+        _die(6, "unknown_exploration",
+             f"no exploration named {wanted!r} in the explore setting at {scope} "
+             f"scope; known: {', '.join(explorations)}")
+    if not isinstance(entry, dict):
+        _die(6, "bad_exploration", f"exploration {wanted!r} is not an object")
+    intent = entry.get("intent")
+    if not isinstance(intent, str) or not intent.strip():
+        _die(6, "bad_exploration", f"exploration {wanted!r} needs an `intent` in prose")
+    stages = entry.get("stages")
+    if not isinstance(stages, list) or not stages:
+        _die(6, "bad_exploration",
+             f"exploration {wanted!r} needs at least one stage under `stages`")
+    for index, stage in enumerate(stages):
+        if not isinstance(stage, str) or not stage.strip():
+            _die(6, "bad_exploration",
+                 f"exploration {wanted!r}: stage {index} must be one line of prose")
+    return {"id": wanted, "intent": intent.strip(),
+            "stages": [stage.strip() for stage in stages],
+            "agent": entry.get("agent"), "language": entry.get("language"),
+            "persona": entry.get("persona")}
+
+
+def _explore_plan(args) -> dict:
+    """Everything a run needs settled before a call is placed: the exploration,
+    the driver, the budget and the persona. A refusal here costs nothing; the
+    same refusal after `platform_connect` costs a call, so every one is made
+    first, and an absent declaration is refused by name rather than filled in."""
+    declared, scope, home = _setting_declared(EXPLORE_SETTING)
+    if declared is None:
+        _die(6, "no_explore_setting",
+             f"no exploratory mode is declared in {home} — `explore` needs "
+             f"{_EXPLORE_DECLARATION}")
+    if not isinstance(declared, dict):
+        _die(6, "bad_explore_setting",
+             f"the explore setting at {scope} scope is not an object")
+    exploration = _exploration_declared(declared, args.exploration, scope)
+    driver_id = getattr(args, "driver", None) or declared.get("driver")
+    if not driver_id:
+        _die(6, "no_driver",
+             f'the explore setting at {scope} scope names no "driver"',
+             "name an entry of the judges roster, or pass --driver <id> for one run")
+    try:
+        driver = _select_judge(driver_id)
+    except JudgeError as e:
+        _die(6, "bad_driver", f"driver {driver_id!r}: {e}")
+    budget = declared.get("budget")
+    turns = _explore_budget(budget, "turns", scope)
+    calls = _explore_budget(budget, "calls", scope)
+    persona_id = getattr(args, "persona", None) or exploration.get("persona")
+    persona = None
+    if persona_id:
+        personas = declared.get("personas")
+        personas = personas if isinstance(personas, dict) else {}
+        text = personas.get(persona_id)
+        if not isinstance(text, str) or not text.strip():
+            known = ", ".join(personas) if personas else "none declared"
+            _die(6, "unknown_persona",
+                 f"no persona named {persona_id!r} in the explore setting at "
+                 f"{scope} scope; known: {known}",
+                 'personas are declared under "personas" in the explore setting, '
+                 "one paragraph of behaviour each")
+        persona = text.strip()
+    return {"exploration": exploration, "driver": driver, "turns": turns,
+            "calls": calls, "persona": persona_id if persona else None,
+            "persona_text": persona}
+
+
+def _driver_brief(plan: dict) -> str:
+    """The stable part of the driver's instructions: the intent, the stages
+    and the persona, after the rules of the role."""
+    exploration = plan["exploration"]
+    stages = "\n".join(f"{index + 1}. {stage}"
+                       for index, stage in enumerate(exploration["stages"]))
+    brief = [_DRIVER_SYSTEM, "", "=== YOUR INTENT ===", exploration["intent"],
+             "", "=== STAGES THE CALL MUST PASS THROUGH ===", stages]
+    if exploration.get("language"):
+        brief += ["", f"The call is in: {exploration['language']}"]
+    if plan.get("persona_text"):
+        brief += ["", "=== PERSONA — HOW YOU SPEAK AND BEHAVE ===",
+                  plan["persona_text"]]
+    return "\n".join(brief)
+
+
+def _driver_move(cfg: dict, brief: str, messages: list, stage_count: int) -> dict:
+    """One caller line from the driver, read from its JSON answer.
+
+    A reply without a legible line is a driver fault rather than a finding
+    about the agent, and it ends the run as one."""
+    text = _model_call(cfg, brief, messages, DRIVER_MAX_TOKENS, role="driver")
+    match = _JSON_OBJECT_RE.search(text or "")
+    answer = None
+    if match:
+        try:
+            answer = json.loads(match.group(0))
+        except ValueError:
+            answer = None
+    if not isinstance(answer, dict) or not isinstance(answer.get("say"), str):
+        raise JudgeError(f"driver {cfg['id']} answered without a caller line: "
+                         f"{_clip(text, 200)}")
+    stages_done = answer.get("stages_done")
+    if isinstance(stages_done, bool) or not isinstance(stages_done, int):
+        stages_done = 0
+    note = answer.get("note")
+    return {"say": answer["say"].strip(),
+            "stages_done": max(0, min(stages_done, stage_count)),
+            "done": answer.get("done") is True,
+            "note": note.strip() if isinstance(note, str) and note.strip() else None}
+
+
+async def _drive_exploration(conn_details: dict, plan: dict, state: dict,
+                             obs: Observed, turn_timeout: float,
+                             budget_s: float) -> str:
+    """Join the room, then let the driver choose each line until the stages are
+    done, a budget is spent, or the call ends under it. Returns what ended this
+    call; everything the run carries between calls lives in `state`."""
+    stages = plan["exploration"]["stages"]
+    call_no = len(state["calls"]) + 1
+    brief = _driver_brief(plan)
+    call = _CallRoom(conn_details, obs, turn_timeout)
+    try:
+        await call.join()
+        call_deadline = obs.t0 + budget_s
+        heard_since = obs.t0          # the greeting opens the conversation
+        preface = ""
+        if state["calls"]:
+            ended = state["calls"][-1]["ended_by"]
+            preface = _DRIVER_REDIAL.format(reason=_ENDED_PROSE.get(ended, ended),
+                                            call=call_no) + "\n"
+        while True:
+            call.raise_fault()
+            turn = state["turns"]
+            if call.closed:
+                obs.add("call_ended_early", reason=str(call.closed["reason"]),
+                        after_turn=turn - 1)
+                return "agent"
+            if time.time() > call_deadline:
+                obs.add("budget_exhausted", turn=turn, budget="seconds")
+                return "seconds"
+            if turn >= plan["turns"]:
+                obs.add("budget_exhausted", turn=turn, budget="turns")
+                return "turns"
+            heard = obs.said(since=heard_since - obs.t0) or "(the agent said nothing)"
+            state["messages"].append({"role": "user", "content": preface + heard})
+            preface = ""
+            # The model answers off the loop: the room keeps being observed
+            # while the driver thinks, so nothing the agent does meanwhile is
+            # lost.
+            try:
+                move = await asyncio.to_thread(_driver_move, plan["driver"], brief,
+                                               state["messages"], len(stages))
+            except JudgeError as e:
+                obs.add("driver_failed", turn=turn, detail=str(e))
+                state["driver_error"] = str(e)
+                return "driver"
+            state["messages"].append({"role": "assistant", "content": json.dumps(move)})
+            obs.add("driver_move", turn=turn, stages_done=move["stages_done"],
+                    done=move["done"], note=move["note"])
+            if move["note"]:
+                state["observations"].append({"call": call_no, "turn": turn,
+                                              "note": move["note"]})
+            if not move["say"]:
+                # Nothing to say is the caller hanging up, whether or not the
+                # driver called it done.
+                state["caller_done"] = True
+                return "caller"
+            sent_at = await call.send(move["say"], turn=turn)
+            if sent_at is None:
+                obs.add("call_ended_early", reason=str(call.closed["reason"]),
+                        after_turn=turn - 1)
+                return "agent"
+            state["turns"] = turn + 1
+            for number in range(state["stages_reached"] + 1, move["stages_done"] + 1):
+                state["reached"][number] = {"call": call_no, "turn": turn}
+            state["stages_reached"] = max(state["stages_reached"], move["stages_done"])
+            heard_since = sent_at
+            # A turn the agent never finishes is a finding here rather than a
+            # broken run: the report is the point, so the refusal is caught
+            # as written and the call is ended with what it holds.
+            with _captured_die() as box:
+                await call.await_turn(since=sent_at, turn=turn)
+            if move["done"]:
+                state["caller_done"] = True
+                return "caller"
+            if box:
+                return "agent_silent"
+            if state["stages_reached"] >= len(stages):
+                return "stages"
+    finally:
+        await call.close()
+
+
+def _tool_runs_view(evidence: dict, with_results: bool) -> list:
+    """Tool runs as a report carries them. Results stay out by default — they
+    carry whatever personal data the caller gave — and their shape is reported
+    instead; --with-results includes them for debugging a specific mismatch."""
+    runs = []
+    for run in evidence["runs"]:
+        entry = {k: run[k] for k in ("name", "status", "duration_ms",
+                                     "started_at", "started_rel", "args")}
+        result = run.get("result")
+        if with_results:
+            entry["result"] = result
+        else:
+            entry["result_shape"] = (sorted(result.keys())
+                                     if isinstance(result, dict)
+                                     else type(result).__name__)
+        runs.append(entry)
+    return runs
+
+
+def _explore_stop(plan: dict, state: dict) -> str | None:
+    """Why the run is over, or None while another call may be placed. Stages
+    are asked first so a run that finished on its last allowed turn is
+    explored rather than stalled."""
+    if state["stages_reached"] >= len(plan["exploration"]["stages"]):
+        return "stages"
+    if state["driver_error"]:
+        return "driver"
+    if state["caller_done"]:
+        return "caller"
+    if state["turns"] >= plan["turns"]:
+        return "turns"
+    if len(state["calls"]) >= plan["calls"]:
+        return "calls"
+    return None
+
+
+def _explore_run(plan: dict, agent_id: str, args) -> dict:
+    """Place calls until the run is over, and hand back everything it carried.
+
+    The driver's conversation persists across calls, so a caller that is cut
+    off dials again knowing what was already said; the budget is spent across
+    every call, so nothing a redial does escapes it."""
+    state: dict = {"messages": [], "turns": 0, "stages_reached": 0, "reached": {},
+                   "observations": [], "driver_error": None, "caller_done": False,
+                   "calls": []}
+    text_only = bool(getattr(args, "text", False))
+    with_results = bool(getattr(args, "with_results", False))
+    while _explore_stop(plan, state) is None:
+        call_no = len(state["calls"]) + 1
+        turns_before = state["turns"]
+        conn_details = platform_connect(agent_id, text_only)
+        obs = Observed(text_only=text_only)
+        try:
+            ended_by = asyncio.run(_drive_exploration(conn_details, plan, state, obs,
+                                                      args.timeout, args.budget))
+        finally:
+            evidence = gather_evidence(conn_details["room_name"], agent_id, obs,
+                                       SETTLE_TIMEOUT_S)
+        call = evidence.get("call") or {}
+        state["calls"].append({
+            "call": call_no,
+            "room": conn_details.get("room_name"),
+            "call_id": evidence.get("call_id"),
+            "call_settled": evidence.get("settled"),
+            "marked": evidence.get("marked"),
+            "ended_by": ended_by,
+            "turns": state["turns"] - turns_before,
+            "turn_signal": obs.turn_signal,
+            "audio_frames": obs.audio_frames,
+            "audio_first_t": obs.audio_first_t,
+            "transcript": obs.transcript(),
+            "events": obs.events,
+            "tool_runs": _tool_runs_view(evidence, with_results),
+            "post_call": {k: call[k] for k in _CALL_OUTCOME_FIELDS if k in call},
+        })
+    state["stopped_by"] = _explore_stop(plan, state)
+    return state
+
+
+def _explore_report(plan: dict, state: dict, agent_id: str, conn: dict,
+                    text_only: bool, budget_s: float) -> dict:
+    """The record of one exploratory run. It is its own shape: no checks, and a
+    verdict from a vocabulary a gate never uses, so nothing downstream can read
+    it as a scenario that passed or failed."""
+    exploration = plan["exploration"]
+    return {
+        "kind": "exploration",
+        "exploration": exploration["id"],
+        "agent": agent_id,
+        "connection": conn["id"],
+        "mode": "text" if text_only else "voice",
+        "language": exploration.get("language"),
+        "intent": exploration["intent"],
+        "persona": plan["persona"],
+        "driver": {k: plan["driver"][k] for k in ("id", "provider", "model")},
+        "stages": [{"stage": stage, "reached": state["reached"].get(number)}
+                   for number, stage in enumerate(exploration["stages"], start=1)],
+        "budget": {"turns": plan["turns"], "calls": plan["calls"],
+                   "seconds_per_call": budget_s},
+        "spent": {"turns": state["turns"], "calls": len(state["calls"])},
+        "stopped_by": state["stopped_by"],
+        "driver_error": state["driver_error"],
+        "observations": state["observations"],
+        "calls": state["calls"],
+        "verdict": _EXPLORE_VERDICTS[state["stopped_by"]],
+    }
+
+
+def _print_exploration(report: dict) -> None:
+    spent, budget = report["spent"], report["budget"]
+    head = (f"{report['verdict'].upper():8} {report['exploration']}  "
+            f"agent={report['agent'][:8]}  mode={report['mode']}  "
+            f"calls={spent['calls']}/{budget['calls']}  "
+            f"turns={spent['turns']}/{budget['turns']}")
+    sys.stdout.write(head + "\n")
+    driver = report["driver"]
+    line = f"  driver: {driver['id']} ({driver['provider']} {driver['model']})"
+    if report.get("persona"):
+        line += f"  persona: {report['persona']}"
+    sys.stdout.write(line + "\n")
+    reached = sum(1 for stage in report["stages"] if stage["reached"])
+    sys.stdout.write(f"  stages: {reached}/{len(report['stages'])} reached\n")
+    for stage in report["stages"]:
+        where = stage["reached"]
+        mark = (f"call {where['call']} turn {where['turn']}" if where else "not reached")
+        sys.stdout.write(f"    {stage['stage']}  ({mark})\n")
+    sys.stdout.write(f"  stopped by: {report['stopped_by']}\n")
+    if report.get("driver_error"):
+        sys.stdout.write(f"  driver: {report['driver_error']}\n")
+    for call in report["calls"]:
+        line = f"  call {call['call']}: ended by {call['ended_by']}, {call['turns']} turns"
+        if call.get("call_id"):
+            line += f", call={call['call_id']}"
+        sys.stdout.write(line + "\n")
+        if not call.get("call_id"):
+            sys.stdout.write(f"    warn  {_NO_TOOL_EVIDENCE}\n")
+        marked = call.get("marked")
+        if marked and not marked.get("ok"):
+            sys.stdout.write(f"    warn  this call is not flagged as a test — "
+                             f"{marked['field']}: {marked['error']}\n")
+        tools = ", ".join(f"{r['name'].strip()}({r['status']})"
+                          for r in call["tool_runs"])
+        if tools:
+            sys.stdout.write(f"    tools: {tools}\n")
+    for note in report["observations"]:
+        sys.stdout.write(f"  note  call {note['call']} turn {note['turn']}: "
+                         f"{note['note']}\n")
+
+
+def cmd_explore(args) -> None:
+    plan = _explore_plan(args)
+    agent_id = _resolve_agent(args.agent or plan["exploration"].get("agent") or "")
+    state = _explore_run(plan, agent_id, args)
+    report = _explore_report(plan, state, agent_id, _STATE["conn"],
+                             bool(getattr(args, "text", False)), args.budget)
+    if args.report:
+        _write_report(report, args.report)
+    if args.json:
+        _emit(report)
+    else:
+        _print_exploration(report)
+    sys.exit(5 if report["verdict"] == "aborted" else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -5580,6 +6111,15 @@ def main() -> None:
     suite.add_argument("--jobs", type=int, default=1)
     _add_common(suite)
     suite.set_defaults(func=cmd_suite)
+
+    explore = subparsers.add_parser("explore", add_help=False)
+    explore.add_argument("exploration")
+    explore.add_argument("--agent")
+    explore.add_argument("--persona")
+    explore.add_argument("--driver")
+    explore.add_argument("--report")
+    _add_common(explore)
+    explore.set_defaults(func=cmd_explore)
 
     fixtures = subparsers.add_parser("fixtures", add_help=False)
     fixtures.add_argument("path", nargs="?")

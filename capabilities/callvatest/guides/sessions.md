@@ -27,6 +27,8 @@ understand what the agent does wrong; write the smallest scenario that fails on
 it; keep that scenario as the gate. A finding that never becomes a scenario will
 be rediscovered by hand every time.
 
+`explore` finds the same way with a model in the caller's chair: a declared intent and stages, optionally a persona, and a driver model choosing every line. Reach for it when the question is what a real caller would do to this agent rather than what you would ask it next; `callvatest guide exploring` is its method.
+
 ## Ask a discriminating question
 
 A session is worth its cost when the second line tells you something the first
