@@ -266,7 +266,7 @@ def import_daemon(tmp: Path, service_settings: dict, *,
                "telethon.errors", "telethon.errors.common", "pytgcalls",
                "pytgcalls.filters", "pytgcalls.exceptions", "pytgcalls.types",
                "pytgcalls.types.raw", "ntgcalls", "call_recording_helpers",
-               "voice_agent")
+               "voice_agent", "workers")
 
     old_env = dict(os.environ)
     old_path = list(sys.path)

@@ -1,5 +1,6 @@
 """Strict, dependency-free validation for Telegram assistant settings."""
 
+import contextvars
 import re
 from pathlib import Path
 
@@ -169,11 +170,22 @@ def _worker_rule(value, path, worker):
               f"{path}.service_tier", nullable=True)
 
 
+# Set only while `declared_worker_models` is collecting; the walk below appends
+# every worker rule it validates to it, so the positions reported are exactly
+# the positions this schema admits a `workers` block at.
+_DECLARED_WORKER_MODELS = contextvars.ContextVar(
+    "telegram_declared_worker_models", default=None)
+
+
 def _workers(value, path):
     value = _object(value, path)
     _unknown(value, WORKERS, path)
+    declared = _DECLARED_WORKER_MODELS.get()
     for worker, rule in value.items():
         _worker_rule(rule, f"{path}.{worker}", worker)
+        if declared is not None:
+            declared.append({"path": f"{path}.{worker}.model",
+                             "worker": worker, "model": rule.get("model")})
 
 
 def _capability_rule(value, path):
@@ -515,6 +527,25 @@ def _defaults(value, path, project_root, service_dir):
     if "voice_agent" in value:
         _voice_agent(value["voice_agent"], f"{path}.voice_agent", defaults=True,
                      project_root=project_root, service_dir=service_dir)
+
+
+def declared_worker_models(settings, project_root, service_dir):
+    """Every (worker, model) a settings document declares, with where it did.
+
+    Collected by the validator's own walk rather than from a list of positions
+    kept beside it, so a position this schema admits a `workers` block at is a
+    position this reports, and one it does not admit cannot be. A rule that
+    names no model declares the binary's own default, reported as null. The
+    document is validated on the way, so an invalid one raises here exactly as
+    it does in `validate_settings`.
+    """
+    found = []
+    token = _DECLARED_WORKER_MODELS.set(found)
+    try:
+        validate_settings(settings, project_root, service_dir)
+    finally:
+        _DECLARED_WORKER_MODELS.reset(token)
+    return found
 
 
 def validate_settings(settings, project_root, service_dir):

@@ -1259,7 +1259,7 @@ class ServiceDoctorExitTests(unittest.TestCase):
     on, so its verdict has to reach the exit code. The payload is the contract a
     consuming project already reads; only the exit code answers for `ok`."""
 
-    PAYLOAD_KEYS = {"ok", "service", "connection", "note"}
+    PAYLOAD_KEYS = {"ok", "service", "workers", "connection", "note"}
 
     def _run_doctor(self, cli, tmp, health):
         """Drive the real dispatch for one runtime-health shape and return
@@ -1357,6 +1357,316 @@ class ServiceDoctorExitTests(unittest.TestCase):
             self.assertEqual(set(payload), self.PAYLOAD_KEYS)
             self.assertEqual(payload["connection"], "probe")
             self.assertIn("update sync", payload["note"])
+
+
+GUIDE_PATH = TELEGRAM_DIR / "guides" / "assistant-service.md"
+
+# What the stubbed binaries answer, shaped on what the real ones printed on
+# 2026-09-18: claude 2.1.267 answers one result document and, on a model it
+# will not run, exits 1 with `is_error` and a 404 sentence in `result`; codex
+# 0.152.1 answers a JSONL stream and, on such a model, exits 1 after a local
+# metadata note, `turn.started`, and the provider's 400 on `error` and
+# `turn.failed`. The stubs record every invocation so a test can count them.
+FAKE_CLAUDE = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+model = args[args.index("--model") + 1] if "--model" in args else None
+with open(os.environ["FAKE_WORKER_LOG"], "a") as log:
+    log.write(json.dumps({"binary": "claude", "model": model, "cwd": os.getcwd()}) + "\\n")
+if model in os.environ.get("FAKE_REFUSED_MODELS", "").split(","):
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": True,
+                      "result": f"There's an issue with the selected model ({model}). "
+                                "It may not exist or you may not have access to it.",
+                      "api_error_status": 404}))
+    sys.stderr.write("[claude-code:unrecognized_model] {}\\n")
+    sys.exit(1)
+if os.environ.get("FAKE_HANG"):
+    import time
+    time.sleep(30)
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "result": "OK", "usage": {}}))
+"""
+
+FAKE_CODEX = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+if args[:2] == ["exec", "--help"]:
+    print("usage: codex exec")
+    sys.exit(0)
+model = args[args.index("-m") + 1] if "-m" in args else None
+out = args[args.index("-o") + 1] if "-o" in args else None
+with open(os.environ["FAKE_WORKER_LOG"], "a") as log:
+    log.write(json.dumps({"binary": "codex", "model": model, "cwd": os.getcwd()}) + "\\n")
+sys.stderr.write("Reading additional input from stdin...\\n")
+if model in os.environ.get("FAKE_REFUSED_MODELS", "").split(","):
+    refusal = "unexpected status 400 Bad Request: " + json.dumps({"error": {
+        "type": "invalid_request_error",
+        "message": f"The '{model}' model is not supported when using Codex "
+                   "with a ChatGPT account."}})
+    print(json.dumps({"type": "item.completed", "item": {
+        "id": "item_0", "type": "error",
+        "message": f"Model metadata for `{model}` not found. Defaulting to fallback metadata"}}))
+    print(json.dumps({"type": "turn.started"}))
+    print(json.dumps({"type": "error", "message": refusal}))
+    print(json.dumps({"type": "turn.failed", "error": {"message": refusal}}))
+    sys.exit(1)
+print(json.dumps({"type": "thread.started", "thread_id": "thread-1"}))
+print(json.dumps({"type": "turn.completed", "usage": {}}))
+if out:
+    open(out, "w").write("OK")
+"""
+
+
+class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
+    """`service doctor` asks each configured worker binary, once per distinct
+    (worker, model) pair, whether it runs that model. The binaries on PATH here
+    are stubs written by the test: the real ones would spend money and need a
+    login, and the doctor's verdict has to come from the binary's own answer
+    rather than from anything this repository holds about models."""
+
+    ALL_POSITIONS = (
+        "settings.defaults.workers.{worker}.model",
+        "settings.defaults.voice_agent.workers.{worker}.model",
+        "settings.allowed_users.42.voice_agent.workers.{worker}.model",
+    )
+
+    @staticmethod
+    def _settings(*, defaults=None, voice=None, user=None, timeout=5):
+        """A schema-valid document declaring worker models at the three
+        positions the schema admits them, each block given as
+        {worker: model}."""
+        def block(models):
+            return {worker: {"model": model} for worker, model in (models or {}).items()}
+        return {
+            "connection": "probe",
+            "defaults": {"worker": "claude", "worker_timeout": timeout,
+                         "workers": block(defaults),
+                         "voice_agent": {"workers": block(voice)}},
+            "allowed_users": {"42": {"name": "A caller",
+                                     "voice_agent": {"mode": "enabled",
+                                                     "workers": block(user)}}},
+        }
+
+    def _run_doctor(self, cli, tmp, settings, *, refused=(), binaries=("claude", "codex"),
+                    hang=False):
+        """Drive the real dispatch with the stub binaries on PATH. The verdict
+        is computed by the real `cmd_service_doctor`, the real schema walk and
+        the real `workers.probe_worker`; only the initialization, connection
+        and daemon-status plumbing is stood in for. Returns (exit_code,
+        payload, invocations)."""
+        bindir = Path(tmp) / "bin"
+        bindir.mkdir(exist_ok=True)
+        for name, body in (("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX)):
+            if name in binaries:
+                (bindir / name).write_text(body)
+                (bindir / name).chmod(0o755)
+        log_path = Path(tmp) / "invocations.jsonl"
+        log_path.write_text("")
+        env = {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
+               "FAKE_WORKER_LOG": str(log_path),
+               "FAKE_REFUSED_MODELS": ",".join(refused)}
+        if hang:
+            env["FAKE_HANG"] = "1"
+
+        def fake_status(connection_flag, session_flag):
+            return {"initialized": True, "running": False, "healthy": False,
+                    "health": {"state": "stopped"}, "connection": "probe",
+                    "expectation_mismatches": []}
+
+        cfg = {"id": "probe", "allow_write": True,
+               "session": str(Path(tmp) / "probe")}
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(cli, "_gate", lambda: None), \
+                mock.patch.object(cli, "_contract", lambda argv: None), \
+                mock.patch.object(cli, "_service_project_root", lambda: Path(tmp)), \
+                mock.patch.object(cli, "_service_dir", lambda root: Path(tmp) / "service"), \
+                mock.patch.object(cli, "_require_service_initialized", lambda root: None), \
+                mock.patch.object(cli, "_service_settings", lambda root: settings), \
+                mock.patch.object(cli, "_service_wanted_connection",
+                                  lambda root, flag: "probe"), \
+                mock.patch.object(cli, "_load_config", lambda *a, **k: cfg), \
+                mock.patch.object(cli, "_write_gate", lambda *a: None), \
+                mock.patch.object(cli, "cmd_service_status", fake_status), \
+                mock.patch.object(sys, "argv", ["telegram", "service", "doctor"]), \
+                contextlib.redirect_stdout(captured):
+            try:
+                cli.main()
+                code = 0
+            except SystemExit as stopped:
+                code = stopped.code
+        invocations = [json.loads(line) for line in log_path.read_text().splitlines()]
+        return code, json.loads(captured.getvalue()), invocations
+
+    @staticmethod
+    def _row(payload, worker, model):
+        return next(row for row in payload["workers"]["checked"]
+                    if row["worker"] == worker and row["model"] == model)
+
+    def test_a_pair_the_binary_accepts_is_ok(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload, calls = self._run_doctor(
+                cli, tmp, self._settings(defaults={"claude": None, "codex": "fast-model"}))
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["workers"]["ok"])
+        default = self._row(payload, "claude", None)
+        pinned = self._row(payload, "codex", "fast-model")
+        for row in (default, pinned):
+            self.assertTrue(row["ok"])
+            self.assertEqual(row["verdict"], "accepted")
+        self.assertEqual(default["binary"], "claude")
+        self.assertEqual(pinned["binary"], "codex")
+        # The default pair is asked with no model flag at all — the binary's own
+        # default, not one this repository picked for it.
+        self.assertEqual(
+            sorted((c["binary"], c["model"]) for c in calls),
+            [("claude", None), ("codex", "fast-model")])
+
+    def test_a_pair_the_binary_refuses_fails_the_verdict_and_names_both(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload, _ = self._run_doctor(
+                cli, tmp,
+                self._settings(defaults={"claude": None, "codex": "bogus-model-x"}),
+                refused=("bogus-model-x",))
+        self.assertEqual(code, 5)
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["workers"]["ok"])
+        self.assertTrue(self._row(payload, "claude", None)["ok"])
+        refused = self._row(payload, "codex", "bogus-model-x")
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["verdict"], "model_refused")
+        self.assertEqual(refused["binary"], "codex")
+        self.assertIn("bogus-model-x", refused["notice"])
+        self.assertIn("codex", refused["notice"])
+        # The binary's own words travel with the verdict.
+        self.assertIn("is not supported when using Codex", refused["reason"])
+
+    def test_a_refusal_from_claude_is_read_the_same_way(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload, _ = self._run_doctor(
+                cli, tmp, self._settings(defaults={"claude": "bogus-model-x"}),
+                refused=("bogus-model-x",))
+        self.assertEqual(code, 5)
+        refused = self._row(payload, "claude", "bogus-model-x")
+        self.assertEqual(refused["verdict"], "model_refused")
+        self.assertEqual(refused["binary"], "claude")
+        self.assertIn("bogus-model-x", refused["notice"])
+        self.assertIn("may not exist", refused["reason"])
+
+    def test_every_position_the_schema_admits_a_model_at_is_checked(self):
+        """A refusal planted only at the third position is found, and the
+        positions the doctor reports are exactly the three the schema admits —
+        read off the schema's own walk, not a list kept beside it."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload, _ = self._run_doctor(
+                cli, tmp,
+                self._settings(defaults={"claude": None},
+                               voice={"claude": "fast-model"},
+                               user={"codex": "bogus-model-x"}),
+                refused=("bogus-model-x",))
+        self.assertEqual(code, 5)
+        refused = self._row(payload, "codex", "bogus-model-x")
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["declared_at"],
+                         ["settings.allowed_users.42.voice_agent.workers.codex.model"])
+        with tempfile.TemporaryDirectory() as tmp:
+            _, payload, _ = self._run_doctor(
+                cli, tmp,
+                self._settings(defaults={"claude": "m"}, voice={"claude": "m"},
+                               user={"claude": "m"}))
+        self.assertEqual(
+            sorted(self._row(payload, "claude", "m")["declared_at"]),
+            sorted(position.format(worker="claude") for position in self.ALL_POSITIONS))
+
+    def test_an_identical_pair_declared_in_several_positions_is_asked_once(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload, calls = self._run_doctor(
+                cli, tmp,
+                self._settings(defaults={"codex": "fast-model", "claude": None},
+                               voice={"codex": "fast-model"},
+                               user={"codex": "fast-model"}))
+        self.assertEqual(code, 0)
+        self.assertEqual([c for c in calls if c["binary"] == "codex"],
+                         [{"binary": "codex", "model": "fast-model",
+                           "cwd": mock.ANY}])
+        row = self._row(payload, "codex", "fast-model")
+        self.assertEqual(len(row["declared_at"]), 3)
+        self.assertEqual(len(payload["workers"]["checked"]), 2)
+
+    def test_the_in_process_stub_is_reported_without_a_binary(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload, calls = self._run_doctor(
+                cli, tmp, self._settings(defaults={"stub": None}))
+        self.assertEqual(code, 0)
+        row = self._row(payload, "stub", None)
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["verdict"], "in_process")
+        self.assertIsNone(row["binary"])
+        self.assertEqual(calls, [])
+
+    def test_a_binary_missing_from_path_cannot_accept_its_pair(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            bare = Path(tmp) / "bare"
+            bare.mkdir()
+            with mock.patch.dict(os.environ, {"PATH": str(bare)}):
+                code, payload, _ = self._run_doctor(
+                    cli, tmp, self._settings(defaults={"codex": None}),
+                    binaries=())
+        self.assertEqual(code, 5)
+        row = self._row(payload, "codex", None)
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["verdict"], "binary_missing")
+        self.assertIn("codex", row["reason"])
+
+    def test_a_binary_that_gives_no_verdict_in_time_is_not_ok(self):
+        """The round-trip is held to `defaults.worker_timeout`, so the doctor
+        finishes in bounded time whatever the binary does."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            started = time.monotonic()
+            code, payload, _ = self._run_doctor(
+                cli, tmp, self._settings(defaults={"claude": None}, timeout=0.5),
+                hang=True)
+            elapsed = time.monotonic() - started
+        self.assertEqual(code, 5)
+        row = self._row(payload, "claude", None)
+        self.assertEqual(row["verdict"], "timed_out")
+        self.assertIn("0.5s", row["reason"])
+        self.assertLess(elapsed, 10)
+
+    def test_the_probe_runs_in_scratch_rather_than_in_the_project(self):
+        """One minimal round-trip: no project context, no hooks, no files."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, calls = self._run_doctor(
+                cli, tmp, self._settings(defaults={"claude": None}))
+        self.assertEqual(len(calls), 1)
+        self.assertNotEqual(Path(calls[0]["cwd"]).resolve(), Path(tmp).resolve())
+        self.assertIn("telegram-doctor-", calls[0]["cwd"])
+
+    def test_the_guide_states_that_null_is_the_stable_setting(self):
+        guide = GUIDE_PATH.read_text()
+        self.assertIn("A worker's `model` is `null` by default and `null` is the "
+                      "stable setting: it is the binary's own default", guide)
+        self.assertIn("Every pin is an exception taken for a named reason", guide)
+        self.assertIn("`telegram service doctor` verifies each distinct (worker, model) "
+                      "pair the settings declare against the binary itself", guide)
+
+    def test_help_says_what_doctor_spends(self):
+        """An operator is told the cost before paying it: one live call per
+        distinct pair, each held to the turn's own window."""
+        help_text = " ".join(import_cli().__doc__.split())
+        self.assertIn("`doctor` also spends one live call on each worker binary per "
+                      "distinct configured (worker, model) pair", help_text)
+        self.assertIn("each held to `defaults.worker_timeout`", help_text)
 
 
 if __name__ == "__main__":

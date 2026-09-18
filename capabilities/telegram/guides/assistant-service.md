@@ -102,6 +102,8 @@ The accepted schema is deliberately finite:
 - Worker policy: `model`; Claude also accepts `effort`; Codex accepts `reasoning_effort` and `service_tier`. Voice defaults accept `worker`, `workers`, `model`, `voice`, `greeting`, `history`, `timezone`, `progress_interval`, `recording_caption`, and `prompt_file`.
 - Control policies contain `commands`; authority policies contain `allowed_capabilities` or `capabilities`. Capability rules accept booleans/`*`, verb lists, or `allow`/`deny`/`enabled`/`scope`/`verbs`/`connections` objects.
 
+A worker's `model` is `null` by default and `null` is the stable setting: it is the binary's own default, which moves with the binary and never goes stale. Every pin is an exception taken for a named reason — a fast model for work a caller waits on, a deeper one for work that earns it — and `telegram service doctor` verifies each distinct (worker, model) pair the settings declare against the binary itself, with one live call per pair, so a pin the binary refuses is found before a turn spends it.
+
 IDs must have the correct sign (users positive, groups negative, topics positive), context paths must resolve inside the Telegram service directory, and numeric settings use the bounds named by `/set help` or the shipped template. A `project` route is checked for shape at load and for reachability at dispatch, as described under Worker Project Routing. There is no permissive/legacy mode.
 
 ### Using a second account
@@ -457,7 +459,7 @@ How the channel behaves is `defaults.voice_agent`, beside the text worker's poli
 
 Every field is optional. `worker` and `workers` fall back to the project's existing worker settings (`defaults.worker`, `defaults.workers`). `voice`, `history` and the worker's `model` are also settable per user, which wins over these. `timezone` is an IANA zone name and is what the call states as "now" and stamps the chat tail with; unset or unparseable, it is UTC — never the host's zone, so a call never quietly reports the wrong time. `progress_interval` is how often a running task may report in, in seconds. `prompt_file` overrides which file the call speaks from, relative to the service directory unless absolute.
 
-Pick a **fast, non-reasoning model** here: work asked for by voice is operational and quick — look something up, check or file a ticket, note something down — not coding, and the caller is waiting on the line. The timeout is the text worker's `defaults.worker_timeout`; task size is bounded by the model choice, not by cutting the clock short.
+Pick a **fast, non-reasoning model** here: work asked for by voice is operational and quick — look something up, check or file a ticket, note something down — not coding, and the caller is waiting on the line. The timeout is the text worker's `defaults.worker_timeout`; task size is bounded by the model choice, not by cutting the clock short. That pin is an exception like any other, and `telegram service doctor` verifies it against the binary as described under the settings schema above.
 
 An answered call needs a Gemini API key, in the environment variable the selected connection names as `gemini_secret_env` (`GOOGLE_API_KEY` when the entry omits it), resolved like every other credential. Without the key, or without `voice-agent.md`, the daemon logs which one is missing and a caller who also has `call_recording` on is recorded as usual instead.
 

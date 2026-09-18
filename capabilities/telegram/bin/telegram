@@ -155,8 +155,21 @@ Commands:
                                                Status follows the account-global
                                                owner record and reports actual code,
                                                project and state provenance.
-                                               `doctor` exits 5 when its own
-                                               verdict is `ok: false`, so a
+                                               `doctor` also spends one live
+                                               call on each worker binary per
+                                               distinct configured (worker,
+                                               model) pair — every
+                                               `workers.<worker>.model` position
+                                               in settings, `null` meaning the
+                                               binary's own default — each held
+                                               to `defaults.worker_timeout`, and
+                                               reports the binary's own verdict.
+                                               A model the binary refuses, a
+                                               binary missing from PATH, one
+                                               that cannot authenticate, or one
+                                               that gives no verdict in time is
+                                               not ok. `doctor` exits 5 when its
+                                               own verdict is `ok: false`, so a
                                                script can gate on it.
 
 Chat references:
@@ -193,7 +206,8 @@ Exit codes:
      yourself
   5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx, and
      `service doctor` reporting `ok: false` — a running daemon whose update
-     sync is not fresh
+     sync is not fresh, or a configured (worker, model) pair its binary did
+     not accept
   6  input / validation — a malformed argument, a bad date
 
 Quirks worth knowing:
@@ -4622,6 +4636,10 @@ def _service_schema() -> Path:
     return _service_bundle_dir() / "service" / "settings_schema.py"
 
 
+def _service_workers() -> Path:
+    return _service_bundle_dir() / "service" / "workers.py"
+
+
 def _service_template(name: str) -> Path:
     return _service_bundle_dir() / "service" / "templates" / name
 
@@ -4751,13 +4769,14 @@ def _service_settings(root: Path) -> dict:
         _die(6, exc.slug, exc.message, exc.hint)
 
 
-def _validate_service_settings(root: Path, data: dict | None = None) -> dict:
-    settings_path = _service_settings_path(root)
-    if data is None:
-        data = _service_settings(root)
-        if not data:
-            _die(6, "service_settings_missing",
-                 f"no Telegram service settings in {_records().source}")
+_SETTINGS_SCHEMA_MODULE = None
+
+
+def _settings_schema_module():
+    """The bundle's settings schema, shared with the assistant service."""
+    global _SETTINGS_SCHEMA_MODULE
+    if _SETTINGS_SCHEMA_MODULE is not None:
+        return _SETTINGS_SCHEMA_MODULE
     schema_path = _service_schema()
     _require_service_bundle_files(schema_path)
     spec = importlib.util.spec_from_file_location("telegram_settings_schema", schema_path)
@@ -4765,12 +4784,77 @@ def _validate_service_settings(root: Path, data: dict | None = None) -> dict:
         _die(3, "service_bundle_missing", f"cannot load bundled settings schema: {schema_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _SETTINGS_SCHEMA_MODULE = module
+    return module
+
+
+_WORKERS_MODULE = None
+
+
+def _workers_module():
+    """The bundle's worker-binary knowledge, shared with the assistant service:
+    how each worker is invoked, how its answer is read, what a refusal is."""
+    global _WORKERS_MODULE
+    if _WORKERS_MODULE is not None:
+        return _WORKERS_MODULE
+    path = _service_workers()
+    _require_service_bundle_files(path)
+    spec = importlib.util.spec_from_file_location("telegram_service_workers", path)
+    if spec is None or spec.loader is None:
+        _die(3, "service_bundle_missing",
+             f"cannot load the bundled worker-binary knowledge: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _WORKERS_MODULE = module
+    return module
+
+
+def _validate_service_settings(root: Path, data: dict | None = None) -> dict:
+    if data is None:
+        data = _service_settings(root)
+        if not data:
+            _die(6, "service_settings_missing",
+                 f"no Telegram service settings in {_records().source}")
     try:
-        module.validate_settings(data, root.resolve(), _service_dir(root).resolve())
+        _settings_schema_module().validate_settings(
+            data, root.resolve(), _service_dir(root).resolve())
     except ValueError as exc:
         _die(6, "service_settings_invalid", str(exc),
              "fix the Telegram service settings record; unsupported properties are never ignored")
     return data
+
+
+def _declared_worker_models(root: Path, settings: dict) -> list[dict]:
+    """The distinct (worker, model) pairs the settings declare, each with every
+    position that declares it. The positions come from the schema's own walk,
+    so a place the schema admits a model at is a place this reports."""
+    schema = _settings_schema_module()
+    pairs: dict[tuple, dict] = {}
+    for item in schema.declared_worker_models(
+            settings, root.resolve(), _service_dir(root).resolve()):
+        row = pairs.setdefault((item["worker"], item["model"]), {
+            "worker": item["worker"], "model": item["model"], "declared_at": []})
+        row["declared_at"].append(item["path"])
+    return list(pairs.values())
+
+
+def _service_worker_preflight(root: Path, settings: dict) -> dict:
+    """Ask each worker binary, once per distinct configured (worker, model)
+    pair, whether it runs that model — the binary's own answer to one minimal
+    round-trip, never a list held here. Each call is held to the same window a
+    turn is, `defaults.worker_timeout`, so the whole check is bounded."""
+    workers = _workers_module()
+    timeout = float((settings.get("defaults") or {}).get("worker_timeout")
+                    or workers.DEFAULT_WORKER_TIMEOUT)
+    checked = []
+    pairs = _declared_worker_models(root, settings) if settings else []
+    with tempfile.TemporaryDirectory(prefix="telegram-doctor-") as scratch:
+        for pair in pairs:
+            verdict = workers.probe_worker(pair["worker"], pair["model"],
+                                           timeout=timeout, cwd=scratch)
+            checked.append({**pair, **verdict})
+    return {"ok": all(row["ok"] for row in checked),
+            "timeout_seconds": timeout, "checked": checked}
 
 
 def _service_wanted_connection(root: Path, connection_flag: str | None) -> str | None:
@@ -5828,7 +5912,7 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) ->
     `ok: false` into exit 5."""
     root = _service_project_root()
     _require_service_initialized(root)
-    _validate_service_settings(root)
+    settings = _validate_service_settings(root)
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
@@ -5836,11 +5920,16 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) ->
     session_file = Path(cfg["session"] + ".session")
     status["session_file_exists"] = session_file.exists()
     runtime_ok = not status["running"] or status["healthy"]
-    return {"ok": status["initialized"] and cfg["allow_write"] and runtime_ok,
+    workers = _service_worker_preflight(root, settings or {})
+    return {"ok": (status["initialized"] and cfg["allow_write"] and runtime_ok
+                   and workers["ok"]),
             "service": status,
+            "workers": workers,
             "connection": cfg["id"],
             "note": ("`telegram doctor` performs the authenticated Telegram round-trip; "
-                     "a running service is healthy only while its update sync stays fresh")}
+                     "a running service is healthy only while its update sync stays fresh; "
+                     "`workers` is each configured (worker, model) pair's own binary "
+                     "answering one live call")}
 
 
 def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> None:
@@ -6134,7 +6223,8 @@ def main() -> None:
             if not report["ok"]:
                 # An entrypoint or a deploy step gates on this, so the verdict
                 # has to reach the exit code. What reaches `ok: false` is a
-                # running daemon whose update sync is not fresh: a
+                # running daemon whose update sync is not fresh, or a configured
+                # (worker, model) pair its binary did not accept: a
                 # server/network outcome, category 5.
                 sys.exit(5)
         elif args.service_cmd == "run":
