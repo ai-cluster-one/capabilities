@@ -57,9 +57,14 @@ Four gates, not to be conflated:
   1. door         — direct_messages mode in private chats; allowed_groups in groups,
                     only when the assistant is explicitly addressed                  (HARD)
   2. control authority — who may run service control commands like /set and /stop    (HARD)
-  3. tool authority — what the worker (claude/codex) may call (later, via flags)     (HARD)
+  3. tool authority — which built-in tools and MCP servers the claude worker is
+                    launched holding: the `context` block on its worker rule,
+                    carried to the command `workers.claude_command` builds        (HARD)
   4. soft-gates   — behavioural guidance in context.md                              (SOFT)
-This file implements gates 1 and 2; context.md carries gate 4.
+This file implements gates 1 and 2 and carries gate 3's declaration to the
+worker command; context.md carries gate 4. Gate 3 reaches built-in tools and
+MCP servers only: skills, plugins and slash commands are not governed by it, and
+the codex worker has no such gate.
 
 Telegram is the source of truth: the worker rebuilds context from the live tail
 each turn. The register holds only what Telegram doesn't — the watermark and the
@@ -2944,6 +2949,7 @@ def _worker_flags(worker, cfg):
     out = {}
     if worker == "claude":
         out["effort"] = cfg.get("effort")
+        out["context"] = cfg.get("context")
     elif worker == "codex":
         out["reasoning_effort"] = cfg.get("reasoning_effort")
         out["service_tier"] = cfg.get("service_tier")

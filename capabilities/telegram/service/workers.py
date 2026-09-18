@@ -372,7 +372,13 @@ def claude_command(prompt, settings=None, *, resume_session=None):
     plus usage / cost / model / session metadata in one object.
     --dangerously-skip-permissions gives full tool access (this is the isolated
     agent box, mirroring the codex worker); the behavioural boundary is the
-    soft-gate in context.md, not a permission gate."""
+    soft-gate in context.md, not a permission gate.
+
+    A declared `context` narrows what the worker is launched holding. `tools`
+    goes out as --tools, which removes every built-in tool not named from the
+    worker's schema (--allowedTools would remove nothing from what is loaded);
+    `mcp: false` launches with no MCP servers at all. Without the block the
+    harness's own defaults stand, as they did before it existed."""
     settings = settings or {}
     cmd = [WORKER_BINARIES["claude"], "-p", prompt, "--output-format", "json",
            "--dangerously-skip-permissions"]
@@ -384,6 +390,12 @@ def claude_command(prompt, settings=None, *, resume_session=None):
     effort = settings.get("effort")
     if effort:
         cmd += ["--effort", effort]
+    context = settings.get("context") or {}
+    tools = context.get("tools")
+    if tools is not None:
+        cmd += ["--tools", ",".join(tools)]
+    if context.get("mcp") is False:
+        cmd += ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
     return cmd
 
 

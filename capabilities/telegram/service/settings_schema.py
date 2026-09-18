@@ -148,16 +148,30 @@ def _topics(value, path, project_root, service_dir):
         _overlay(entry, entry_path, project_root, service_dir)
 
 
+def _worker_context(value, path):
+    """What a claude worker is launched holding: the built-in tools it keeps
+    and whether it has MCP servers at all. Skills, plugins and slash commands
+    are not governed here."""
+    value = _object(value, path)
+    _unknown(value, {"tools", "mcp"}, path)
+    if "tools" in value:
+        _string_list(value["tools"], f"{path}.tools")
+    if "mcp" in value:
+        _boolean(value["mcp"], f"{path}.mcp")
+
+
 def _worker_rule(value, path, worker):
     value = _object(value, path)
     allowed = {"model"}
     if worker == "claude":
-        allowed.add("effort")
+        allowed.update({"effort", "context"})
     elif worker == "codex":
         allowed.update({"reasoning_effort", "service_tier"})
     _unknown(value, allowed, path)
     if "model" in value:
         _string(value["model"], f"{path}.model", nullable=True)
+    if "context" in value:
+        _worker_context(value["context"], f"{path}.context")
     if "effort" in value:
         _enum(value["effort"], {"default", "low", "medium", "high", "xhigh", "max"},
               f"{path}.effort", nullable=True)

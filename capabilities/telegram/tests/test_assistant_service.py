@@ -8140,5 +8140,200 @@ class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
             "deployment once its run has gone")
 
 
+class ClaudeWorkerContextTests(unittest.IsolatedAsyncioTestCase):
+    """The `context` block on the claude worker rule: which built-in tools and
+    MCP servers a worker is launched holding. Declared in settings only, read
+    at the two positions the daemon reads worker policy from, and turned into
+    flags by the one command builder every claude launch goes through."""
+
+    BASE = {"connection": "test", "assistant_name": "Assistant",
+            "direct_messages": {"mode": "anyone", "default_role": "direct_user"},
+            "allowed_users": {}, "allowed_groups": {}}
+    BLOCK = {"tools": ["Read", "Grep"], "mcp": False}
+    NO_MCP = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+
+    @staticmethod
+    def before(prompt, model, effort=None):
+        """The argv a claude launch had before the block existed."""
+        cmd = ["claude", "-p", prompt, "--output-format", "json",
+               "--dangerously-skip-permissions", "--model", model]
+        return cmd + (["--effort", effort] if effort else [])
+
+    def launched(self, daemon, state):
+        """The argv one claude turn is launched with, via `worker_claude`."""
+        seen = {}
+
+        def record(_key, cmd, *_args, **_kwargs):
+            seen["cmd"] = cmd
+            return (0, json.dumps({"result": "ok", "usage": {},
+                                   "session_id": "s"}), "")
+
+        with mock.patch.object(daemon, "run_worker_proc", side_effect=record):
+            daemon.worker_claude("123", [], state, {})
+        return seen["cmd"]
+
+    def probed(self, td, model):
+        """The argv the doctor's probe launches, via the real `probe_worker`."""
+        spec = importlib.util.spec_from_file_location(
+            f"telegram_workers_test_{time.time_ns()}",
+            TELEGRAM_DIR / "service" / "workers.py")
+        workers = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(workers)
+        bindir = Path(td) / "bin"
+        bindir.mkdir(exist_ok=True)
+        (bindir / "claude").write_text("#!/bin/sh\nexit 0\n")
+        (bindir / "claude").chmod(0o755)
+        seen = {}
+
+        class Started:
+            returncode = 0
+
+            def __init__(self, cmd, **_kwargs):
+                seen["cmd"] = cmd
+
+            def communicate(self, timeout=None):
+                return (json.dumps({"type": "result", "subtype": "success",
+                                    "is_error": False, "result": "OK"}), "")
+
+        with mock.patch.object(workers.subprocess, "Popen", Started):
+            verdict = workers.probe_worker(
+                "claude", model, timeout=1, cwd=Path(td),
+                environ={"PATH": str(bindir)})
+        self.assertEqual(verdict["verdict"], "accepted")
+        return seen["cmd"], workers.PROBE_PROMPT
+
+    def flags(self, cmd):
+        """The block's flags as they sit in `cmd`, and how often each appears."""
+        counts = {flag: cmd.count(flag)
+                  for flag in ("--tools", "--strict-mcp-config", "--mcp-config")}
+        tools = cmd[cmd.index("--tools") + 1] if "--tools" in cmd else None
+        mcp = (cmd[cmd.index("--strict-mcp-config"):][:3]
+               if "--strict-mcp-config" in cmd else None)
+        return counts, tools, mcp
+
+    async def test_without_the_block_every_launch_is_the_one_it_was(self):
+        """Element for element: the dialogue turn, the voice task and the
+        doctor's probe build the argv they built before the block existed."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(
+                worker="claude",
+                workers={"claude": {"model": "text-model", "effort": "high"}},
+                voice_agent={"workers": {"claude": {"model": "fast-model"}}}))
+            turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
+            self.assertEqual(turn, self.before(turn[2], "text-model", "high"))
+            task = self.launched(daemon, {"settings": daemon.voice_agent_settings()})
+            self.assertEqual(task, self.before(task[2], "fast-model", "high"))
+            probe, prompt = self.probed(td, "text-model")
+            self.assertEqual(probe, self.before(prompt, "text-model"))
+
+        # `mcp: true`, and a block with nothing to say, are today's launch too.
+        for block in ({"mcp": True}, {}):
+            with tempfile.TemporaryDirectory() as td:
+                daemon = import_daemon(Path(td), settings(
+                    worker="claude",
+                    workers={"claude": {"model": "text-model", "context": block}}))
+                turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
+                self.assertEqual(turn, self.before(turn[2], "text-model"))
+
+    async def test_the_block_reaches_the_launch_once_from_each_position(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(
+                worker="claude",
+                workers={"claude": {"model": "text-model", "effort": "high",
+                                    "context": self.BLOCK}}))
+            # The dialogue turn, and the voice task that inherits the project's
+            # worker policy.
+            for state in ({"settings": daemon.channel_settings({}, "123")},
+                          {"settings": daemon.voice_agent_settings()}):
+                cmd = self.launched(daemon, state)
+                counts, tools, mcp = self.flags(cmd)
+                self.assertEqual(counts, {"--tools": 1, "--strict-mcp-config": 1,
+                                          "--mcp-config": 1})
+                self.assertEqual(tools, "Read,Grep")
+                self.assertEqual(mcp, self.NO_MCP)
+                self.assertEqual(cmd[:cmd.index("--tools")],
+                                 self.before(cmd[2], "text-model", "high"))
+            # The durable job re-resolves the engine's policy through the same
+            # lift the turn uses.
+            self.assertEqual(
+                daemon._worker_flags("claude", daemon._worker_settings({}, "claude"))["context"],
+                self.BLOCK)
+
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(
+                worker="claude",
+                workers={"claude": {"model": "text-model"}},
+                voice_agent={"workers": {"claude": {"context": self.BLOCK}}}))
+            turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
+            self.assertEqual(turn, self.before(turn[2], "text-model"))
+            task = self.launched(daemon, {"settings": daemon.voice_agent_settings()})
+            counts, tools, mcp = self.flags(task)
+            self.assertEqual(counts, {"--tools": 1, "--strict-mcp-config": 1,
+                                      "--mcp-config": 1})
+            self.assertEqual(tools, "Read,Grep")
+            self.assertEqual(mcp, self.NO_MCP)
+
+        # Each key stands on its own.
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(
+                worker="claude",
+                workers={"claude": {"model": "text-model",
+                                    "context": {"tools": ["Read"]}}}))
+            turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
+            self.assertEqual(turn, self.before(turn[2], "text-model") + ["--tools", "Read"])
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(
+                worker="claude",
+                workers={"claude": {"model": "text-model",
+                                    "context": {"mcp": False}}}))
+            turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
+            self.assertEqual(turn, self.before(turn[2], "text-model") + self.NO_MCP)
+
+    async def test_the_schema_admits_the_block_for_claude_and_nothing_else_in_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td)
+
+            def validated(defaults):
+                return daemon.validate_settings(
+                    {**self.BASE, "defaults": defaults}, root, root)
+
+            positions = (
+                lambda rule: {"workers": {"claude": rule}},
+                lambda rule: {"voice_agent": {"workers": {"claude": rule}}},
+            )
+            for position in positions:
+                validated(position({"context": self.BLOCK}))
+                validated(position({"context": {"tools": []}}))
+                validated(position({"context": {"mcp": True}}))
+                validated(position({"context": {}}))
+                with self.assertRaisesRegex(
+                        Exception, r"claude\.context\.plugins: unsupported property"):
+                    validated(position({"context": {"plugins": ["x"]}}))
+                with self.assertRaisesRegex(
+                        Exception, r"claude\.context: must be a JSON object"):
+                    validated(position({"context": ["Read"]}))
+                with self.assertRaisesRegex(
+                        Exception, r"claude\.context\.tools: must be a JSON array"):
+                    validated(position({"context": {"tools": "Read"}}))
+                with self.assertRaisesRegex(
+                        Exception, r"claude\.context\.tools\[0\]: must be a string"):
+                    validated(position({"context": {"tools": [1]}}))
+                with self.assertRaisesRegex(
+                        Exception, r"claude\.context\.tools\[0\]: must not be empty"):
+                    validated(position({"context": {"tools": [" "]}}))
+                with self.assertRaisesRegex(
+                        Exception, r"claude\.context\.mcp: must be a boolean"):
+                    validated(position({"context": {"mcp": "no"}}))
+            for worker in ("codex", "stub"):
+                with self.assertRaisesRegex(
+                        Exception, rf"workers\.{worker}\.context: unsupported property"):
+                    validated({"workers": {worker: {"context": {"mcp": False}}}})
+            # The rule's own refusal of a key it never heard of stands.
+            with self.assertRaisesRegex(
+                    Exception, r"workers\.claude\.plugins: unsupported property"):
+                validated({"workers": {"claude": {"plugins": []}}})
+
+
 if __name__ == "__main__":
     unittest.main()
