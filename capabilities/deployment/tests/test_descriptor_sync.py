@@ -582,11 +582,19 @@ def test_declared_system_packages_reach_the_image(tmp_path: Path) -> None:
     runtime_path = root / "deployment" / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
     runtime["compiler"]["container"]["system_packages"] = ["poppler-utils", "tesseract-ocr"]
+    runtime.setdefault("volumes", {})["scratch"] = {
+        "description": "a workspace beside the home", "kind": "state", "mount": "/workspace/scratch"}
     runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
 
     proc = _run(root, env, "sync")
     assert proc.returncode == 0, proc.stderr
     dockerfile = (root / "Dockerfile").read_text()
+    # A mount outside the home cannot be made by the agent user; it is made as root
+    # and handed over, in one layer, so the volume still inherits the agent's ownership.
+    mkdir = dockerfile[dockerfile.index('RUN mkdir -p "$HOME/.local/state"'):]
+    assert '"/workspace/scratch"' in mkdir.split("\n")[0]
+    assert "chown ${USERNAME}:${USERNAME}" in mkdir.split("\n")[1]
+    assert dockerfile[:dockerfile.index('RUN mkdir -p "$HOME/.local/state"')].rstrip().endswith("USER root")
     # Appended to the base set, so the base set is still what the other tests read.
     assert "python3 procps supervisor poppler-utils tesseract-ocr \\" in dockerfile
     # The declaration survives the sync that read it.

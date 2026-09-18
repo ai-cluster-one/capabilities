@@ -3998,8 +3998,12 @@ RUN while read -r name; do \\
     done < {lock_path}
 
 # Capability service state is mounted at descriptor-declared targets. Each one is
-# created here so a fresh named volume inherits the agent's ownership.
-RUN mkdir -p {state_mkdir} {project_root}/capabilities
+# created here, as root and handed to the agent, so a fresh named volume inherits
+# the agent's ownership wherever the mount sits - inside the home or beside it.
+USER root
+RUN mkdir -p {state_mkdir} {project_root}/capabilities \\
+ && chown ${{USERNAME}}:${{USERNAME}} {state_mkdir} {project_root}/capabilities
+USER ${{USERNAME}}
 {contextkit_build}
 ENTRYPOINT [{json.dumps(entrypoint_path)}]
 """
