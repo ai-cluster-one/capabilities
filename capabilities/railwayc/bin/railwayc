@@ -3193,6 +3193,20 @@ def _edges(obj) -> list:
     return obj.get("edges") or [] if isinstance(obj, dict) else []
 
 
+# The one classification of "Railway rejected the token" for both paths.
+# The CLI answers in prose on stderr; the API answers HTTP 200 with a GraphQL
+# error whose message is "Project Token not found" for a bad token and
+# "Not Authorized" for an id outside the token's scope (never a not-found of a
+# resource). Both paths ask this so the same case cannot be classed two ways.
+_AUTH_PHRASES = ("token", "unauthor", "not authorized", "not found",
+                 "log in", "login")
+
+
+def _rejected_token(text: str) -> bool:
+    low = (text or "").lower()
+    return any(s in low for s in _AUTH_PHRASES)
+
+
 def _check_connection(cfg: dict) -> dict:
     """One connection's round-trip (`railway status --json` under its token),
     reported rather than died — doctor covers every connection, so a broken
@@ -3208,8 +3222,7 @@ def _check_connection(cfg: dict) -> dict:
         return {"ok": False, "category": 5, "error": f"could not run railway: {e}"}
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
-        low = err.lower()
-        if any(s in low for s in ("token", "unauthor", "not found", "log in", "login")):
+        if _rejected_token(err):
             return {"ok": False, "category": 2,
                     "error": err or "railway rejected the token",
                     "hint": "the token is invalid, revoked, or for a deleted "
@@ -3278,8 +3291,9 @@ def _graphql_result(token: str, query: str, variables: dict | None = None
     Transport failures follow the standard's resilient loop (bounded retries,
     429 honouring Retry-After, 5xx and timeouts backed off). The auth mapping
     keys on the GraphQL envelope and not only the HTTP status: Railway answers
-    a rejected token AND an id outside the token's scope as HTTP 200 with
-    errors[].message "Not Authorized", byte-identical, and never as not-found.
+    a rejected token as HTTP 200 with errors[].message "Project Token not
+    found", and an id outside the token's scope (or an unknown id) as HTTP 200
+    with "Not Authorized" — never as a not-found of a resource.
     """
     headers = {TOKEN_HEADER: token, "Content-Type": "application/json",
                "Accept": "application/json"}
@@ -3327,7 +3341,7 @@ def _graphql_result(token: str, query: str, variables: dict | None = None
     errs = _graphql_errors(body)
     codes = _error_codes(errs)
     messages = "; ".join(str(e.get("message") or "") for e in errs) or None
-    not_authorized = any("not authorized" in str(e.get("message") or "").lower()
+    not_authorized = any(_rejected_token(str(e.get("message") or ""))
                          for e in errs) or bool(codes & {"UNAUTHENTICATED",
                                                         "UNAUTHORIZED", "FORBIDDEN"})
 

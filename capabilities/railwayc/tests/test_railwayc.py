@@ -32,6 +32,9 @@ OTHER_ENV_ID = "environment-9999"
 NOT_AUTHORIZED = {"errors": [{"message": "Not Authorized",
                               "extensions": {"code": "INTERNAL_SERVER_ERROR"}}],
                   "data": None}
+TOKEN_NOT_FOUND = {"errors": [{"message": "Project Token not found",
+                               "extensions": {"code": "INTERNAL_SERVER_ERROR"}}],
+                   "data": None}
 
 
 @pytest.fixture(autouse=True)
@@ -247,6 +250,34 @@ def test_not_authorized_envelope_on_http_200_maps_to_exit_2(project, capsys):
     assert error["code"] == "auth_failed"
     assert "Not Authorized" in error["message"]
     assert len(fake.requests) == 1          # auth is not retried
+
+
+def test_rejected_token_envelope_on_http_200_maps_to_exit_2(project, capsys):
+    with FakeRailway([httpx.Response(200, json=TOKEN_NOT_FOUND)]) as fake:
+        code, _, err = run(capsys, "backups")
+    assert code == 2
+    error = json.loads(err)["error"]
+    assert error["code"] == "auth_failed"
+    assert "Project Token not found" in error["message"]
+    assert len(fake.requests) == 1
+
+
+def test_rejected_token_is_classed_once_for_both_paths():
+    for text in ("Project Token not found", "Not Authorized",
+                 "Unauthorized. Please provide a valid token"):
+        assert module._rejected_token(text), text
+    assert not module._rejected_token("ordinary upstream failure")
+
+
+def test_doctor_api_block_names_a_rejected_token_as_auth(project, capsys):
+    with FakeRailway([httpx.Response(200, json=TOKEN_NOT_FOUND)]), \
+            patch.object(module.subprocess, "run", _fake_status()):
+        code, out, _ = run(capsys, "doctor")
+    assert code == 2
+    api = json.loads(out)["connections"]["prod"]["api"]
+    assert api["ok"] is False
+    assert "Project Token not found" in api["error"]
+    assert "invalid, revoked" in api["hint"]
 
 
 def test_not_authorized_on_an_instance_id_maps_to_exit_2_not_3(project, capsys):
