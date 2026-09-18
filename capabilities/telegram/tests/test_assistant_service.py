@@ -7121,6 +7121,151 @@ class RecordingFailureIsNotSilentTests(unittest.IsolatedAsyncioTestCase):
             "tells the chat, and nothing else ever reads that record again")
 
 
+class RecordingAttemptLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """The p2p and conference recording lifecycle is driven here with no daemon
+    running: an attempt is started, the watchdogs it spawns are seen, and it is
+    finalized. What the lifecycle reaches beyond itself is handed in, the way
+    `run_session` hands its own in."""
+
+    WATCHDOGS = {"watch_capture_stall", "settle_conference_audio_map",
+                 "watch_conference_audio_map", "watch_conference_coverage",
+                 "watch_conference_peers"}
+
+    class Calls:
+        def __init__(self):
+            self.recorded = []
+            self.left = []
+
+        async def record(self, chat_id, stream, config=None):
+            self.recorded.append((chat_id, stream, config))
+
+        async def leave_call(self, chat_id):
+            self.left.append(chat_id)
+
+    class Client:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, chat_id, text):
+            self.messages.append((chat_id, text))
+            return SimpleNamespace(id=31)
+
+    def lifecycle(self, daemon, td, calls, client, *, chains=None):
+        folder = Path(td) / "recordings"
+
+        async def require_conference_chain(caller_id, invite_msg_id):
+            (chains if chains is not None else []).append((caller_id, invite_msg_id))
+
+        async def refresh_conference_audio_map(chat_id, reason):
+            return None
+
+        async def conference_others(chat_id):
+            return [SimpleNamespace(user_id=99)]
+
+        return daemon.call_recording_lifecycle(
+            calls=calls, client=client,
+            recording_output=lambda caller_id, mode: folder / f"{mode}-{caller_id}.ogg",
+            require_conference_chain=require_conference_chain,
+            conference_audio_map=lambda chat_id: None,
+            refresh_conference_audio_map=refresh_conference_audio_map,
+            conference_others=conference_others,
+            voice_call_busy=lambda: False)
+
+    def watchdogs(self):
+        """The lifecycle's detached watchdogs still alive on this loop, by name."""
+        return {task.get_coro().__name__: task for task in asyncio.all_tasks()
+                if task.get_coro().__name__ in self.WATCHDOGS}
+
+    def deliverable(self, daemon):
+        """Stand in for the conversion and the send, which reach ffmpeg and Telegram."""
+        sent = []
+
+        async def render_recording(parts, output):
+            output.write_bytes(b"ogg")
+            return {"status": "complete", "error": None, "output_bytes": 4096,
+                    "source_bytes": 4096, "source_retained": False,
+                    "duration_seconds": 61.0}
+
+        async def send_recording_to_chat(client, chat_id, output, metadata_path,
+                                         metadata, **kwargs):
+            sent.append((chat_id, output))
+            return True
+
+        daemon.render_recording = render_recording
+        daemon.send_recording_to_chat = send_recording_to_chat
+        return sent
+
+    async def test_a_p2p_attempt_is_started_watched_and_finalized(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.CAPTURE_STALL_INTERVAL = 0.01
+            sent = self.deliverable(daemon)
+            calls, client = self.Calls(), self.Client()
+            recording = self.lifecycle(daemon, td, calls, client)
+            slot = recording.active_recording
+            self.assertIsNone(slot["task"])
+
+            await recording.start_call_recording(
+                4242, "p2p", daemon.CallConfig(timeout=60))
+            task = slot["task"]
+            self.assertIsNotNone(task)
+            await task
+
+            self.assertEqual([(chat, config.timeout) for chat, _, config in calls.recorded],
+                             [(4242, 60)])
+            self.assertEqual(slot["caller_id"], 4242)
+            self.assertEqual(slot["mode"], "p2p")
+            record = json.loads(slot["metadata_path"].read_text())
+            self.assertEqual(record["status"], "recording")
+            self.assertEqual(record["caller_id"], "4242")
+            self.assertEqual(set(self.watchdogs()), {"watch_capture_stall"})
+            stall = self.watchdogs()["watch_capture_stall"]
+            metadata_path = slot["metadata_path"]
+
+            await recording.finalize_call_recording("call_closed")
+
+            self.assertEqual(sent, [(4242, metadata_path.with_suffix(".ogg"))])
+            self.assertEqual(calls.left, [])
+            self.assertEqual(slot, {key: None for key in slot})
+            record = json.loads(metadata_path.read_text())
+            self.assertEqual(record["status"], "complete")
+            self.assertEqual(record["stop_reason"], "call_closed")
+            # The watchdog reads the slot it was spawned for, so it ends with it.
+            await asyncio.wait_for(stall, 1)
+            self.assertEqual(self.watchdogs(), {})
+
+    async def test_a_conference_attempt_spawns_every_watchdog(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            sent = self.deliverable(daemon)
+            calls, client, chains = self.Calls(), self.Client(), []
+            recording = self.lifecycle(daemon, td, calls, client, chains=chains)
+            slot = recording.active_recording
+
+            await recording.start_call_recording(
+                4242, "conference", daemon.CallConfig(conference=77))
+            await slot["task"]
+
+            self.assertEqual(chains, [(4242, 77)])
+            self.assertEqual([(chat, config.conference) for chat, _, config in calls.recorded],
+                             [(4242, 77)])
+            self.assertEqual(slot["mode"], "conference")
+            self.assertEqual(
+                json.loads(slot["metadata_path"].read_text())["conference_invite_msg_id"], 77)
+            self.assertEqual(set(self.watchdogs()), self.WATCHDOGS)
+            spawned = list(self.watchdogs().values())
+
+            await recording.finalize_call_recording("call_deserted")
+
+            self.assertEqual(calls.left, [4242])
+            self.assertEqual([chat for chat, _ in sent], [4242])
+            self.assertIsNone(slot["caller_id"])
+            self.assertIsNone(slot["task"])
+            for task in spawned:
+                task.cancel()
+            await asyncio.gather(*spawned, return_exceptions=True)
+
+
 class StitchedRecordingTests(unittest.IsolatedAsyncioTestCase):
     """A call split by a crash is one conversation, and is delivered as one."""
 

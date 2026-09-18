@@ -86,6 +86,7 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import telethon
 from telethon import TelegramClient, events
@@ -5315,6 +5316,487 @@ class WorkerStopped(Exception):
 DIALOGUE_HANDOFF_GRACE_SECONDS = 8
 
 
+def call_recording_lifecycle(*, calls, client, recording_output,
+                             require_conference_chain, conference_audio_map,
+                             refresh_conference_audio_map, conference_others,
+                             voice_call_busy):
+    """One recorder slot, and the lifecycle of the attempts that pass through it.
+
+    The p2p and conference recorder holds one attempt at a time. Starting one
+    fills the slot and spawns the watchdogs that can end it; finalizing it
+    empties the slot and delivers what was captured. The session that owns the
+    call client hands in what an attempt reaches beyond itself - the media
+    client, the chat client, and the session's own readers of a conference -
+    so the lifecycle can be driven by a test with no daemon running.
+    """
+    active_recording = {
+        "task": None,
+        "caller_id": None,
+        "output": None,
+        "capture": None,
+        "metadata_path": None,
+        "metadata": None,
+        "started_at": None,
+        "mode": None,
+    }
+
+    async def settle_conference_audio_map(chat_id: int):
+        """Re-ask a few times over the first seconds of a conference.
+
+        A participant who is still being admitted when the join completes
+        carries no stream to map yet. Each attempt names the clock rather
+        than the schedule, so one that spent its timeout says when it ran."""
+        joined_at = time.monotonic()
+        for delay in CONFERENCE_AUDIO_MAP_RETRIES:
+            await asyncio.sleep(delay)
+            if active_recording["caller_id"] != chat_id:
+                return
+            await refresh_conference_audio_map(
+                chat_id,
+                f"+{time.monotonic() - joined_at:.0f}s after join")
+
+    async def watch_conference_audio_map(chat_id: int):
+        """Keep this call's map answerable for as long as the call lasts."""
+
+        def mapped():
+            audio = conference_audio_map(chat_id)
+            return None if audio is None else set(audio.values())
+
+        await reconcile_conference_audio_map(
+            live=lambda: active_recording["caller_id"] == chat_id,
+            channels=lambda: set(MEDIA_AUDIO_PEERS),
+            mapped=mapped,
+            refresh=lambda reason: refresh_conference_audio_map(
+                chat_id, reason))
+
+    async def watch_conference_coverage(chat_id: int):
+        """Say, during the call, when it is not recording everyone on it.
+
+        Everything else here repairs a call or explains it afterwards. This
+        one exists so the caller can act while acting is still possible:
+        hang up and start again, rather than find out from the recording
+        that half the conversation is missing.
+
+        It speaks once. A second message about the same call tells the
+        caller nothing they do not already know, and the first one already
+        said the only thing they can act on.
+        """
+        joined_at = time.monotonic()
+        strikes = {}
+        while active_recording["caller_id"] == chat_id:
+            await asyncio.sleep(CONFERENCE_ROSTER_INTERVAL)
+            if active_recording["caller_id"] != chat_id:
+                return
+            if time.monotonic() - joined_at < CONFERENCE_ROSTER_GRACE:
+                continue
+            others = await conference_others(chat_id)
+            # None is an unanswerable question and an empty list is a call
+            # this account is alone in; the peer watchdog owns the second.
+            if not others:
+                strikes = {}
+                continue
+            audio = conference_audio_map(chat_id)
+            missing = uncovered_participants(
+                others,
+                None if audio is None else audio.values(),
+                MEDIA_AUDIO_PEERS)
+            strikes = coverage_strikes(strikes, missing)
+            if not strikes:
+                continue
+            if max(strikes.values()) < CONFERENCE_ROSTER_STRIKES:
+                continue
+            named = "; ".join(
+                f"{row['user_id']} — {row['why']}" for row in missing)
+            log(f"call: recording {len(others) - len(missing)} of "
+                f"{len(others)} participant(s) — {named}")
+            with contextlib.suppress(Exception):
+                await client.send_message(
+                    chat_id, conference_shortfall_notice(
+                        len(others), len(missing)))
+            return
+
+    async def record_call(caller_id: int, mode: str, call_config: CallConfig,
+                          continues=None):
+        output = recording_output(caller_id, mode)
+        capture = output.with_suffix(".mp3")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path = output.with_suffix(".json")
+        started_at = datetime.now(timezone.utc)
+        metadata = {
+            "schema_version": 3,
+            "status": "joining",
+            "connection": CONNECTION,
+            "caller_id": str(caller_id),
+            "mode": mode,
+            # The one handle that can reach this conference again. A
+            # conference grown out of a p2p call is keyed by the caller's
+            # user id, which resolves to nothing in a process that did not
+            # join it, so a restart has no way back in without this.
+            "conference_invite_msg_id": getattr(call_config, "conference", None),
+            # The record this one carries on from, when a crash split one
+            # call across two processes. What the caller wants is the
+            # conversation, not the pieces it happened to be stored in, so
+            # the last piece is the one that stitches and sends them all.
+            "continues": str(continues) if continues else None,
+            "started_at": iso_utc(started_at),
+            "recording_started_at": None,
+            "recording_ended_at": None,
+            "duration_seconds": None,
+            "stop_reason": None,
+            "audio": {
+                "path": str(output),
+                "format": output.suffix.lstrip("."),
+                "codec": "opus",
+                "bytes": 0,
+                "settled": False,
+                "capture_method": "pytgcalls_mp3_then_ffmpeg_ogg",
+                "source": {
+                    "path": str(capture),
+                    "format": "mp3",
+                    "bytes": 0,
+                    "retained": False,
+                },
+                "conversion": {
+                    "status": "pending",
+                    "error": None,
+                },
+            },
+            "delivery": {
+                "enabled": True,
+                "status": "pending",
+                "attempts": 0,
+                "message_id": None,
+                "sent_at": None,
+                "error": None,
+            },
+        }
+        write_metadata(metadata_path, metadata)
+
+        active_recording.update({
+            "caller_id": caller_id,
+            "output": output,
+            "capture": capture,
+            "metadata_path": metadata_path,
+            "metadata": metadata,
+            "started_at": started_at,
+            "mode": mode,
+        })
+
+        try:
+            if mode == "conference":
+                await join_conference_on_a_current_chain(
+                    prepare=lambda: require_conference_chain(
+                        caller_id, call_config.conference),
+                    join=lambda: calls.record(
+                        caller_id, RecordStream(capture),
+                        config=call_config),
+                    leave=lambda: calls.leave_call(caller_id))
+            else:
+                await calls.record(caller_id, RecordStream(capture),
+                                   config=call_config)
+            metadata["status"] = "recording"
+            metadata["recording_started_at"] = iso_utc()
+            write_metadata(metadata_path, metadata)
+            log(f"call: recording {mode} from {caller_id} to {output}")
+            asyncio.create_task(watch_capture_stall(caller_id, capture))
+            if mode == "conference":
+                asyncio.create_task(settle_conference_audio_map(caller_id))
+                asyncio.create_task(watch_conference_audio_map(caller_id))
+                asyncio.create_task(watch_conference_coverage(caller_id))
+                asyncio.create_task(watch_conference_peers(caller_id))
+        except Exception as exc:
+            # A media connection that never reached CONNECTED is reported as
+            # an argument-less exception, so the type carries the message.
+            log(f"call: failed to start {mode} recording from {caller_id}: "
+                f"{type(exc).__name__}: {exc}")
+            if mode == "conference":
+                # Two different things go wrong here and the caller can act
+                # on only one of them. A conference that never came into
+                # existence is not one this account failed to join.
+                # A chain that never filled is named by this account's own
+                # pre-check and, if it empties between that and the join, by
+                # the library's ConferenceChainNotReady.
+                if ("empty" in str(exc)
+                        or type(exc).__name__ == "ConferenceChainNotReady"):
+                    notice = (
+                        "Конференция не создалась — Telegram не довёл "
+                        "перевод звонка в групповой, это у него бывает "
+                        "через раз. Я в неё не заходил. Перезвони и позови "
+                        "снова.")
+                elif CONFERENCE_CHAIN_INVALID in str(exc):
+                    notice = (
+                        "Не смог зайти в конференцию: Telegram отклонил "
+                        "вход, конференция менялась быстрее, чем я успевал "
+                        "зайти. Позови ещё раз.")
+                else:
+                    notice = (
+                        "Не подключился к конференции: она всё ещё "
+                        "собиралась, я подождал сколько мог. Позови ещё раз "
+                        "через несколько секунд.")
+                with contextlib.suppress(Exception):
+                    await client.send_message(caller_id, notice)
+            metadata.update({
+                "status": "join_failed",
+                "stop_reason": "join_failed",
+            })
+            metadata["delivery"].update({
+                "status": "skipped",
+                "error": "join_failed",
+            })
+            write_metadata(metadata_path, metadata)
+            active_recording.update({
+                "task": None,
+                "caller_id": None,
+                "output": None,
+                "capture": None,
+                "metadata_path": None,
+                "metadata": None,
+                "started_at": None,
+                "mode": None,
+            })
+            return
+
+    async def start_call_recording(caller_id: int, mode: str,
+                                   call_config: CallConfig, continues=None):
+        if voice_call_busy():
+            log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
+            return
+        if active_recording["task"] is not None:
+            # A recording with no incoming audio is a call that already
+            # ended, and holding the slot for it turns one lost call into
+            # every later one being refused while the caller watches an
+            # account that says Invited and never joins.
+            if MEDIA_AUDIO_PEERS:
+                log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
+                return
+            held = active_recording["caller_id"]
+            others = await conference_others(held) if held is not None else None
+            if others:
+                log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
+                return
+            # An unanswerable question counts as deserted here, unlike in the
+            # watchdog: a caller is waiting on this slot right now, and the
+            # recording it holds has had no audio at all.
+            log(f"call: preempting a deserted recording for {mode} "
+                f"from {caller_id}")
+            preempted_task = active_recording["task"]
+            await _cancel_recording_task(preempted_task)
+            await finalize_call_recording("preempted")
+        # A previous call's channels are not this call's silence.
+        MEDIA_AUDIO_PEERS.clear()
+        task = asyncio.create_task(
+            record_call(caller_id, mode, call_config, continues))
+        active_recording["task"] = task
+
+    async def finalize_call_recording(stop_reason: str = "call_closed"):
+        """Close the active p2p or conference recording and deliver it.
+
+        A conference is not chat-bound and announces neither its start nor
+        its end through the chat-update stream, so this is reached from the
+        capture watchdog as well as from the call-ended handler."""
+        caller_id = active_recording["caller_id"]
+        if caller_id is None:
+            return
+        if stop_reason != "call_closed":
+            with contextlib.suppress(Exception):
+                await calls.leave_call(caller_id)
+        output = active_recording["output"]
+        capture = active_recording["capture"]
+        metadata_path = active_recording["metadata_path"]
+        metadata = active_recording["metadata"]
+        started_at = active_recording["started_at"]
+        mode = active_recording["mode"]
+
+        log(f"call: ended from {caller_id} ({stop_reason})")
+
+        # Clear active state immediately
+        active_recording.update({
+            "task": None,
+            "caller_id": None,
+            "output": None,
+            "capture": None,
+            "metadata_path": None,
+            "metadata": None,
+            "started_at": None,
+            "mode": None,
+        })
+
+        if output is None or capture is None or metadata is None:
+            log(f"call: cannot finalize — incomplete recording state")
+            return
+
+        # Finalize: convert MP3→OGG
+        recording_ended_at = iso_utc()
+        wall_duration = (datetime.now(timezone.utc) - started_at).total_seconds()
+
+        # One call may have been recorded by several processes, each
+        # picking up where a crash left the last. The final piece is the
+        # one that renders them all, so what gets delivered is the
+        # conversation rather than the pieces it was stored in.
+        parts = gather_recording_parts(metadata, metadata_path)
+        if not parts:
+            parts = [{"path": capture, "gap_before": 0.0,
+                      "record": metadata, "record_path": metadata_path}]
+        finalized = await render_recording(parts, output)
+        if mode != "conference" and len(parts) == 1:
+            with contextlib.suppress(OSError):
+                capture.unlink()
+            finalized["source_retained"] = capture.exists()
+        status = "complete" if finalized["status"] == "complete" else "conversion_failed"
+        media_duration = finalized.get("duration_seconds") or wall_duration
+        if len(parts) > 1:
+            metadata["stitched_from_parts"] = len(parts)
+            metadata["gap_seconds"] = round(
+                sum(part["gap_before"] for part in parts), 3)
+
+        metadata.update({
+            "status": status,
+            "recording_ended_at": recording_ended_at,
+            "duration_seconds": media_duration,
+            "wall_duration_seconds": round(wall_duration, 3),
+            "stop_reason": stop_reason,
+        })
+        metadata["audio"]["bytes"] = finalized["output_bytes"]
+        metadata["audio"]["settled"] = finalized["status"] == "complete"
+        metadata["audio"]["source"].update({
+            "bytes": finalized["source_bytes"],
+            "retained": finalized["source_retained"],
+        })
+        metadata["audio"]["conversion"].update({
+            "status": finalized["status"],
+            "error": finalized["error"],
+        })
+        if finalized.get("cleanup_error"):
+            metadata["audio"]["source"]["cleanup_error"] = finalized["cleanup_error"]
+
+        # Empty-capture guard (same as conference path in call_recorder.py)
+        MIN_BYTES = 1024
+        MIN_DURATION = 1.0
+        is_empty = (
+            finalized["status"] == "complete"
+            and (finalized["output_bytes"] < MIN_BYTES or (media_duration or 0) < MIN_DURATION)
+        )
+
+        if is_empty:
+            metadata["delivery"].update({
+                "status": "skipped",
+                "error": "audio_not_received",
+            })
+            write_metadata(metadata_path, metadata)
+            log(f"call: recording empty (bytes={finalized['output_bytes']}, duration={media_duration:.1f}s) — not delivered")
+        else:
+            if finalized["status"] == "complete" and len(parts) > 1:
+                mark_parts_merged(parts, metadata_path)
+            write_metadata(metadata_path, metadata)
+            # Deliver to caller's direct chat
+            if metadata["delivery"]["enabled"] and finalized["status"] == "complete":
+                await send_recording_to_chat(
+                    client,
+                    caller_id,
+                    output,
+                    metadata_path,
+                    metadata,
+                    emit_event_fn=lambda event, **fields: log(f"call-delivery: {event} {fields}"),
+                    caption=stitched_caption(metadata, media_duration),
+                )
+                log(f"call: recording delivered to {caller_id}")
+            elif finalized["status"] != "complete":
+                log(f"call: recording conversion failed — {finalized['error']}")
+                await report_recording_failure(
+                    client,
+                    caller_id,
+                    metadata_path,
+                    metadata,
+                    emit_event_fn=lambda event, **fields: log(f"call-delivery: {event} {fields}"),
+                )
+            else:
+                log(f"call: recording complete, delivery disabled")
+
+    async def watch_conference_peers(caller_id: int):
+        """Close a conference recording once nobody else is in the call.
+
+        Being alone in a group call is legal, so the transport reports no
+        disconnect and keeps handing over frames — silence, encoded for as
+        long as the process lives. The byte-growth watchdog cannot see that,
+        because silence has bytes; the recording that prompted this ran for
+        an hour after its call was over, holding the only recorder slot.
+
+        What ends a call is the last participant leaving, not the room going
+        quiet, so quiet only decides when to ask. Telegram's own list gives
+        the answer.
+        """
+        joined_at = time.monotonic()
+        quiet_for = 0.0
+        empty_answers = 0
+        while active_recording["caller_id"] == caller_id:
+            await asyncio.sleep(CONFERENCE_PEER_INTERVAL)
+            if MEDIA_AUDIO_PEERS:
+                quiet_for = 0.0
+                empty_answers = 0
+                continue
+            # Measured from the join rather than from the first channel: a
+            # conference that never produces one at all is the failure this
+            # watches for, and waiting for a channel before starting to
+            # count made that the one case it could not see.
+            if time.monotonic() - joined_at < CONFERENCE_JOIN_GRACE:
+                continue
+            quiet_for += CONFERENCE_PEER_INTERVAL
+            if quiet_for < CONFERENCE_QUIET_BEFORE_CHECK:
+                continue
+            quiet_for = 0.0
+            others = await conference_others(caller_id)
+            if others is None or others:
+                empty_answers = 0
+                continue
+            empty_answers += 1
+            if empty_answers >= CONFERENCE_EMPTY_ANSWERS:
+                log("call: no one left in the call — closing the recording")
+                await finalize_call_recording("call_deserted")
+                return
+
+    async def watch_capture_stall(caller_id: int, capture: Path):
+        """Close a conference recording once its capture stops growing.
+
+        A normal hangup arrives as a chat update, but being removed from a
+        conference emits nothing at all. The MP3 encoder writes continuously
+        while the call is up — silence included — so a file that stops
+        growing is the call being over, and it is the only end signal a
+        kicked conference gives us."""
+        still = 0.0
+        last_size = -1
+        joined_at = time.monotonic()
+        first_frames = False
+        while active_recording["caller_id"] == caller_id:
+            await asyncio.sleep(CAPTURE_STALL_INTERVAL)
+            size = capture.stat().st_size if capture.exists() else 0
+            if size and not first_frames:
+                first_frames = True
+                log(f"call: first frames written "
+                    f"{time.monotonic() - joined_at:.1f}s after the join")
+            if size != last_size:
+                last_size = size
+                still = 0.0
+                continue
+            still += CAPTURE_STALL_INTERVAL
+            if still >= CAPTURE_STALL_TIMEOUT and size > 0:
+                log(f"call: capture stopped growing for {still:.0f}s "
+                    f"at {size} bytes — closing the recording")
+                await finalize_call_recording("capture_stalled")
+                return
+
+    return SimpleNamespace(
+        active_recording=active_recording,
+        settle_conference_audio_map=settle_conference_audio_map,
+        watch_conference_audio_map=watch_conference_audio_map,
+        watch_conference_coverage=watch_conference_coverage,
+        record_call=record_call,
+        start_call_recording=start_call_recording,
+        finalize_call_recording=finalize_call_recording,
+        watch_conference_peers=watch_conference_peers,
+        watch_capture_stall=watch_capture_stall,
+    )
+
+
 async def run_session(client):
     await client.connect()
     if not await client.is_user_authorized():
@@ -7125,16 +7607,6 @@ async def run_session(client):
     # P2P direct calls: recorded, answered by the voice agent, or both
     if has_p2p_calls:
         allowed_callers = set(users["allowed_callers"])
-        active_recording = {
-            "task": None,
-            "caller_id": None,
-            "output": None,
-            "capture": None,
-            "metadata_path": None,
-            "metadata": None,
-            "started_at": None,
-            "mode": None,
-        }
         seen_invite_ids = set()
 
         def recording_output(caller_id: int, mode: str) -> Path:
@@ -7288,254 +7760,6 @@ async def run_session(client):
             except Exception as exc:
                 log(f"call: conference audio map refresh failed ({reason}) — "
                     f"{type(exc).__name__}: {exc}")
-
-        async def settle_conference_audio_map(chat_id: int):
-            """Re-ask a few times over the first seconds of a conference.
-
-            A participant who is still being admitted when the join completes
-            carries no stream to map yet. Each attempt names the clock rather
-            than the schedule, so one that spent its timeout says when it ran."""
-            joined_at = time.monotonic()
-            for delay in CONFERENCE_AUDIO_MAP_RETRIES:
-                await asyncio.sleep(delay)
-                if active_recording["caller_id"] != chat_id:
-                    return
-                await refresh_conference_audio_map(
-                    chat_id,
-                    f"+{time.monotonic() - joined_at:.0f}s after join")
-
-        async def watch_conference_audio_map(chat_id: int):
-            """Keep this call's map answerable for as long as the call lasts."""
-
-            def mapped():
-                audio = conference_audio_map(chat_id)
-                return None if audio is None else set(audio.values())
-
-            await reconcile_conference_audio_map(
-                live=lambda: active_recording["caller_id"] == chat_id,
-                channels=lambda: set(MEDIA_AUDIO_PEERS),
-                mapped=mapped,
-                refresh=lambda reason: refresh_conference_audio_map(
-                    chat_id, reason))
-
-        async def watch_conference_coverage(chat_id: int):
-            """Say, during the call, when it is not recording everyone on it.
-
-            Everything else here repairs a call or explains it afterwards. This
-            one exists so the caller can act while acting is still possible:
-            hang up and start again, rather than find out from the recording
-            that half the conversation is missing.
-
-            It speaks once. A second message about the same call tells the
-            caller nothing they do not already know, and the first one already
-            said the only thing they can act on.
-            """
-            joined_at = time.monotonic()
-            strikes = {}
-            while active_recording["caller_id"] == chat_id:
-                await asyncio.sleep(CONFERENCE_ROSTER_INTERVAL)
-                if active_recording["caller_id"] != chat_id:
-                    return
-                if time.monotonic() - joined_at < CONFERENCE_ROSTER_GRACE:
-                    continue
-                others = await conference_others(chat_id)
-                # None is an unanswerable question and an empty list is a call
-                # this account is alone in; the peer watchdog owns the second.
-                if not others:
-                    strikes = {}
-                    continue
-                audio = conference_audio_map(chat_id)
-                missing = uncovered_participants(
-                    others,
-                    None if audio is None else audio.values(),
-                    MEDIA_AUDIO_PEERS)
-                strikes = coverage_strikes(strikes, missing)
-                if not strikes:
-                    continue
-                if max(strikes.values()) < CONFERENCE_ROSTER_STRIKES:
-                    continue
-                named = "; ".join(
-                    f"{row['user_id']} — {row['why']}" for row in missing)
-                log(f"call: recording {len(others) - len(missing)} of "
-                    f"{len(others)} participant(s) — {named}")
-                with contextlib.suppress(Exception):
-                    await client.send_message(
-                        chat_id, conference_shortfall_notice(
-                            len(others), len(missing)))
-                return
-
-        async def record_call(caller_id: int, mode: str, call_config: CallConfig,
-                              continues=None):
-            output = recording_output(caller_id, mode)
-            capture = output.with_suffix(".mp3")
-            output.parent.mkdir(parents=True, exist_ok=True)
-            metadata_path = output.with_suffix(".json")
-            started_at = datetime.now(timezone.utc)
-            metadata = {
-                "schema_version": 3,
-                "status": "joining",
-                "connection": CONNECTION,
-                "caller_id": str(caller_id),
-                "mode": mode,
-                # The one handle that can reach this conference again. A
-                # conference grown out of a p2p call is keyed by the caller's
-                # user id, which resolves to nothing in a process that did not
-                # join it, so a restart has no way back in without this.
-                "conference_invite_msg_id": getattr(call_config, "conference", None),
-                # The record this one carries on from, when a crash split one
-                # call across two processes. What the caller wants is the
-                # conversation, not the pieces it happened to be stored in, so
-                # the last piece is the one that stitches and sends them all.
-                "continues": str(continues) if continues else None,
-                "started_at": iso_utc(started_at),
-                "recording_started_at": None,
-                "recording_ended_at": None,
-                "duration_seconds": None,
-                "stop_reason": None,
-                "audio": {
-                    "path": str(output),
-                    "format": output.suffix.lstrip("."),
-                    "codec": "opus",
-                    "bytes": 0,
-                    "settled": False,
-                    "capture_method": "pytgcalls_mp3_then_ffmpeg_ogg",
-                    "source": {
-                        "path": str(capture),
-                        "format": "mp3",
-                        "bytes": 0,
-                        "retained": False,
-                    },
-                    "conversion": {
-                        "status": "pending",
-                        "error": None,
-                    },
-                },
-                "delivery": {
-                    "enabled": True,
-                    "status": "pending",
-                    "attempts": 0,
-                    "message_id": None,
-                    "sent_at": None,
-                    "error": None,
-                },
-            }
-            write_metadata(metadata_path, metadata)
-
-            active_recording.update({
-                "caller_id": caller_id,
-                "output": output,
-                "capture": capture,
-                "metadata_path": metadata_path,
-                "metadata": metadata,
-                "started_at": started_at,
-                "mode": mode,
-            })
-
-            try:
-                if mode == "conference":
-                    await join_conference_on_a_current_chain(
-                        prepare=lambda: require_conference_chain(
-                            caller_id, call_config.conference),
-                        join=lambda: calls.record(
-                            caller_id, RecordStream(capture),
-                            config=call_config),
-                        leave=lambda: calls.leave_call(caller_id))
-                else:
-                    await calls.record(caller_id, RecordStream(capture),
-                                       config=call_config)
-                metadata["status"] = "recording"
-                metadata["recording_started_at"] = iso_utc()
-                write_metadata(metadata_path, metadata)
-                log(f"call: recording {mode} from {caller_id} to {output}")
-                asyncio.create_task(watch_capture_stall(caller_id, capture))
-                if mode == "conference":
-                    asyncio.create_task(settle_conference_audio_map(caller_id))
-                    asyncio.create_task(watch_conference_audio_map(caller_id))
-                    asyncio.create_task(watch_conference_coverage(caller_id))
-                    asyncio.create_task(watch_conference_peers(caller_id))
-            except Exception as exc:
-                # A media connection that never reached CONNECTED is reported as
-                # an argument-less exception, so the type carries the message.
-                log(f"call: failed to start {mode} recording from {caller_id}: "
-                    f"{type(exc).__name__}: {exc}")
-                if mode == "conference":
-                    # Two different things go wrong here and the caller can act
-                    # on only one of them. A conference that never came into
-                    # existence is not one this account failed to join.
-                    # A chain that never filled is named by this account's own
-                    # pre-check and, if it empties between that and the join, by
-                    # the library's ConferenceChainNotReady.
-                    if ("empty" in str(exc)
-                            or type(exc).__name__ == "ConferenceChainNotReady"):
-                        notice = (
-                            "Конференция не создалась — Telegram не довёл "
-                            "перевод звонка в групповой, это у него бывает "
-                            "через раз. Я в неё не заходил. Перезвони и позови "
-                            "снова.")
-                    elif CONFERENCE_CHAIN_INVALID in str(exc):
-                        notice = (
-                            "Не смог зайти в конференцию: Telegram отклонил "
-                            "вход, конференция менялась быстрее, чем я успевал "
-                            "зайти. Позови ещё раз.")
-                    else:
-                        notice = (
-                            "Не подключился к конференции: она всё ещё "
-                            "собиралась, я подождал сколько мог. Позови ещё раз "
-                            "через несколько секунд.")
-                    with contextlib.suppress(Exception):
-                        await client.send_message(caller_id, notice)
-                metadata.update({
-                    "status": "join_failed",
-                    "stop_reason": "join_failed",
-                })
-                metadata["delivery"].update({
-                    "status": "skipped",
-                    "error": "join_failed",
-                })
-                write_metadata(metadata_path, metadata)
-                active_recording.update({
-                    "task": None,
-                    "caller_id": None,
-                    "output": None,
-                    "capture": None,
-                    "metadata_path": None,
-                    "metadata": None,
-                    "started_at": None,
-                    "mode": None,
-                })
-                return
-
-        async def start_call_recording(caller_id: int, mode: str,
-                                       call_config: CallConfig, continues=None):
-            if voice_call_busy():
-                log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
-                return
-            if active_recording["task"] is not None:
-                # A recording with no incoming audio is a call that already
-                # ended, and holding the slot for it turns one lost call into
-                # every later one being refused while the caller watches an
-                # account that says Invited and never joins.
-                if MEDIA_AUDIO_PEERS:
-                    log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
-                    return
-                held = active_recording["caller_id"]
-                others = await conference_others(held) if held is not None else None
-                if others:
-                    log(f"call: ignoring incoming {mode} from {caller_id} — recorder busy")
-                    return
-                # An unanswerable question counts as deserted here, unlike in the
-                # watchdog: a caller is waiting on this slot right now, and the
-                # recording it holds has had no audio at all.
-                log(f"call: preempting a deserted recording for {mode} "
-                    f"from {caller_id}")
-                preempted_task = active_recording["task"]
-                await _cancel_recording_task(preempted_task)
-                await finalize_call_recording("preempted")
-            # A previous call's channels are not this call's silence.
-            MEDIA_AUDIO_PEERS.clear()
-            task = asyncio.create_task(
-                record_call(caller_id, mode, call_config, continues))
-            active_recording["task"] = task
 
         # --- Gemini Live voice agent (answers a direct call by talking) -------
         # The two media slots of one p2p call are independent: record() takes the
@@ -8471,130 +8695,6 @@ async def run_session(client):
                 return
             await start_call_recording(caller_id, "p2p", CallConfig(timeout=60))
 
-        async def finalize_call_recording(stop_reason: str = "call_closed"):
-            """Close the active p2p or conference recording and deliver it.
-
-            A conference is not chat-bound and announces neither its start nor
-            its end through the chat-update stream, so this is reached from the
-            capture watchdog as well as from the call-ended handler."""
-            caller_id = active_recording["caller_id"]
-            if caller_id is None:
-                return
-            if stop_reason != "call_closed":
-                with contextlib.suppress(Exception):
-                    await calls.leave_call(caller_id)
-            output = active_recording["output"]
-            capture = active_recording["capture"]
-            metadata_path = active_recording["metadata_path"]
-            metadata = active_recording["metadata"]
-            started_at = active_recording["started_at"]
-            mode = active_recording["mode"]
-
-            log(f"call: ended from {caller_id} ({stop_reason})")
-
-            # Clear active state immediately
-            active_recording.update({
-                "task": None,
-                "caller_id": None,
-                "output": None,
-                "capture": None,
-                "metadata_path": None,
-                "metadata": None,
-                "started_at": None,
-                "mode": None,
-            })
-
-            if output is None or capture is None or metadata is None:
-                log(f"call: cannot finalize — incomplete recording state")
-                return
-
-            # Finalize: convert MP3→OGG
-            recording_ended_at = iso_utc()
-            wall_duration = (datetime.now(timezone.utc) - started_at).total_seconds()
-
-            # One call may have been recorded by several processes, each
-            # picking up where a crash left the last. The final piece is the
-            # one that renders them all, so what gets delivered is the
-            # conversation rather than the pieces it was stored in.
-            parts = gather_recording_parts(metadata, metadata_path)
-            if not parts:
-                parts = [{"path": capture, "gap_before": 0.0,
-                          "record": metadata, "record_path": metadata_path}]
-            finalized = await render_recording(parts, output)
-            if mode != "conference" and len(parts) == 1:
-                with contextlib.suppress(OSError):
-                    capture.unlink()
-                finalized["source_retained"] = capture.exists()
-            status = "complete" if finalized["status"] == "complete" else "conversion_failed"
-            media_duration = finalized.get("duration_seconds") or wall_duration
-            if len(parts) > 1:
-                metadata["stitched_from_parts"] = len(parts)
-                metadata["gap_seconds"] = round(
-                    sum(part["gap_before"] for part in parts), 3)
-
-            metadata.update({
-                "status": status,
-                "recording_ended_at": recording_ended_at,
-                "duration_seconds": media_duration,
-                "wall_duration_seconds": round(wall_duration, 3),
-                "stop_reason": stop_reason,
-            })
-            metadata["audio"]["bytes"] = finalized["output_bytes"]
-            metadata["audio"]["settled"] = finalized["status"] == "complete"
-            metadata["audio"]["source"].update({
-                "bytes": finalized["source_bytes"],
-                "retained": finalized["source_retained"],
-            })
-            metadata["audio"]["conversion"].update({
-                "status": finalized["status"],
-                "error": finalized["error"],
-            })
-            if finalized.get("cleanup_error"):
-                metadata["audio"]["source"]["cleanup_error"] = finalized["cleanup_error"]
-
-            # Empty-capture guard (same as conference path in call_recorder.py)
-            MIN_BYTES = 1024
-            MIN_DURATION = 1.0
-            is_empty = (
-                finalized["status"] == "complete"
-                and (finalized["output_bytes"] < MIN_BYTES or (media_duration or 0) < MIN_DURATION)
-            )
-
-            if is_empty:
-                metadata["delivery"].update({
-                    "status": "skipped",
-                    "error": "audio_not_received",
-                })
-                write_metadata(metadata_path, metadata)
-                log(f"call: recording empty (bytes={finalized['output_bytes']}, duration={media_duration:.1f}s) — not delivered")
-            else:
-                if finalized["status"] == "complete" and len(parts) > 1:
-                    mark_parts_merged(parts, metadata_path)
-                write_metadata(metadata_path, metadata)
-                # Deliver to caller's direct chat
-                if metadata["delivery"]["enabled"] and finalized["status"] == "complete":
-                    await send_recording_to_chat(
-                        client,
-                        caller_id,
-                        output,
-                        metadata_path,
-                        metadata,
-                        emit_event_fn=lambda event, **fields: log(f"call-delivery: {event} {fields}"),
-                        caption=stitched_caption(metadata, media_duration),
-                    )
-                    log(f"call: recording delivered to {caller_id}")
-                elif finalized["status"] != "complete":
-                    log(f"call: recording conversion failed — {finalized['error']}")
-                    await report_recording_failure(
-                        client,
-                        caller_id,
-                        metadata_path,
-                        metadata,
-                        emit_event_fn=lambda event, **fields: log(f"call-delivery: {event} {fields}"),
-                    )
-                else:
-                    log(f"call: recording complete, delivery disabled")
-
         @calls.on_update()
         async def log_call_update(_call_client: PyTgCalls, update):
             """Name every update the library emits during a live recording.
@@ -8648,77 +8748,17 @@ async def run_session(client):
             return [p for p in (participants or [])
                     if int(getattr(p, "user_id", 0)) != int(me.id)]
 
-        async def watch_conference_peers(caller_id: int):
-            """Close a conference recording once nobody else is in the call.
-
-            Being alone in a group call is legal, so the transport reports no
-            disconnect and keeps handing over frames — silence, encoded for as
-            long as the process lives. The byte-growth watchdog cannot see that,
-            because silence has bytes; the recording that prompted this ran for
-            an hour after its call was over, holding the only recorder slot.
-
-            What ends a call is the last participant leaving, not the room going
-            quiet, so quiet only decides when to ask. Telegram's own list gives
-            the answer.
-            """
-            joined_at = time.monotonic()
-            quiet_for = 0.0
-            empty_answers = 0
-            while active_recording["caller_id"] == caller_id:
-                await asyncio.sleep(CONFERENCE_PEER_INTERVAL)
-                if MEDIA_AUDIO_PEERS:
-                    quiet_for = 0.0
-                    empty_answers = 0
-                    continue
-                # Measured from the join rather than from the first channel: a
-                # conference that never produces one at all is the failure this
-                # watches for, and waiting for a channel before starting to
-                # count made that the one case it could not see.
-                if time.monotonic() - joined_at < CONFERENCE_JOIN_GRACE:
-                    continue
-                quiet_for += CONFERENCE_PEER_INTERVAL
-                if quiet_for < CONFERENCE_QUIET_BEFORE_CHECK:
-                    continue
-                quiet_for = 0.0
-                others = await conference_others(caller_id)
-                if others is None or others:
-                    empty_answers = 0
-                    continue
-                empty_answers += 1
-                if empty_answers >= CONFERENCE_EMPTY_ANSWERS:
-                    log("call: no one left in the call — closing the recording")
-                    await finalize_call_recording("call_deserted")
-                    return
-
-        async def watch_capture_stall(caller_id: int, capture: Path):
-            """Close a conference recording once its capture stops growing.
-
-            A normal hangup arrives as a chat update, but being removed from a
-            conference emits nothing at all. The MP3 encoder writes continuously
-            while the call is up — silence included — so a file that stops
-            growing is the call being over, and it is the only end signal a
-            kicked conference gives us."""
-            still = 0.0
-            last_size = -1
-            joined_at = time.monotonic()
-            first_frames = False
-            while active_recording["caller_id"] == caller_id:
-                await asyncio.sleep(CAPTURE_STALL_INTERVAL)
-                size = capture.stat().st_size if capture.exists() else 0
-                if size and not first_frames:
-                    first_frames = True
-                    log(f"call: first frames written "
-                        f"{time.monotonic() - joined_at:.1f}s after the join")
-                if size != last_size:
-                    last_size = size
-                    still = 0.0
-                    continue
-                still += CAPTURE_STALL_INTERVAL
-                if still >= CAPTURE_STALL_TIMEOUT and size > 0:
-                    log(f"call: capture stopped growing for {still:.0f}s "
-                        f"at {size} bytes — closing the recording")
-                    await finalize_call_recording("capture_stalled")
-                    return
+        recording = call_recording_lifecycle(
+            calls=calls, client=client,
+            recording_output=recording_output,
+            require_conference_chain=require_conference_chain,
+            conference_audio_map=conference_audio_map,
+            refresh_conference_audio_map=refresh_conference_audio_map,
+            conference_others=conference_others,
+            voice_call_busy=voice_call_busy)
+        active_recording = recording.active_recording
+        start_call_recording = recording.start_call_recording
+        finalize_call_recording = recording.finalize_call_recording
 
         @client.on(events.Raw)
         async def conference_invite(event):
