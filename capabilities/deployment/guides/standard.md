@@ -82,7 +82,8 @@ and `compiler.container` resolves portable service mount targets:
       "dockerignore": {"path": ".dockerignore", "ownership": "external"}
     },
     "compose_overlays": ["deployment/compose.local.yaml"],
-    "container": {"agent_home": "/home/jess", "project_root": "/app"}
+    "container": {"agent_home": "/home/jess", "project_root": "/app",
+                  "system_packages": ["poppler-utils"]}
   }
 }
 ```
@@ -98,6 +99,10 @@ mapping is absent or empty, generated Compose has no `build.args`, so an
 external Dockerfile's own `ARG` defaults remain authoritative.
 
 Capability descriptors use `{agent_home}` and `{project_root}` mount targets.
+`compiler.container.system_packages` lists the Debian packages the box's workers
+need beyond the base image - a PDF renderer, an OCR engine. The generated
+Dockerfile installs them with the base set, so a need is declared once and
+survives every re-sync instead of living in a hand-edited rendered file.
 Compilation resolves those tokens through `compiler.container`; an existing
 runtime volume mount is an explicit project override and is never relocated.
 Descriptor-owned command, doctor, required environment, and state requirements

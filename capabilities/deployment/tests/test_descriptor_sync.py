@@ -574,3 +574,30 @@ def test_mixed_ownership_nested_layout_preserves_external_files_and_compose_sema
     assert not any("TELEGRAM_API_ID" in finding["message"]
                    for finding in doctor_payload["findings"])
     assert overlay.read_text() == overlay_content
+
+
+def test_declared_system_packages_reach_the_image(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["compiler"]["container"]["system_packages"] = ["poppler-utils", "tesseract-ocr"]
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    proc = _run(root, env, "sync")
+    assert proc.returncode == 0, proc.stderr
+    dockerfile = (root / "Dockerfile").read_text()
+    # Appended to the base set, so the base set is still what the other tests read.
+    assert "python3 procps supervisor poppler-utils tesseract-ocr \\" in dockerfile
+    # The declaration survives the sync that read it.
+    compiled = json.loads(runtime_path.read_text())
+    assert compiled["compiler"]["container"]["system_packages"] == ["poppler-utils", "tesseract-ocr"]
+
+    runtime["compiler"]["container"]["system_packages"] = "poppler-utils; rm -rf /"
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    proc = _run(root, env, "doctor")
+    report = json.loads(proc.stdout)
+    assert any("system_packages" in f["message"] for f in report["findings"]), report
+    proc = _run(root, env, "sync")
+    assert "poppler-utils;" not in (root / "Dockerfile").read_text()
+
