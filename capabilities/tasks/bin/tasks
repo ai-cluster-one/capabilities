@@ -65,8 +65,9 @@ EXECUTION  (also needs allow_write)
   it even if two dispatchers try.
 
   `--outcome ok` completes the task, `failed` returns it to the queue, and
-  `handback` puts it back in draft for a person. `--status` overrides that
-  landing in the open.
+  `handback` hands it to its assignee in `waiting` - or back in `draft` when the
+  task names nobody, which the answer says rather than inventing somebody to
+  wait for. `--status` overrides that landing in the open.
 
   `--run` records where the work actually ran, as a system and its handle - a
   pointer to the run's own record, wherever that is kept. `--metrics` takes a
@@ -88,9 +89,21 @@ FIELDS  (add and set take the same set)
                         the reasoning below.
   --description TEXT    what was seen when the task was raised. A snapshot; say so
                         in it, and let the worker re-check reality before acting.
-  --status VALUE        draft | todo | in_progress | complete | closed. Defaults
-                        to draft on add. `draft` means a person has not released
-                        it, and `ready` never returns one.
+  --status VALUE        draft | todo | in_progress | waiting | complete | closed.
+                        Defaults to draft on add. `draft` means one thing and
+                        only one: nobody has released it yet. `ready` never
+                        returns one and `claim` never takes one.
+
+                        `waiting` means the task is over to its assignee, and it
+                        names whom it waits for: setting it needs an assignee,
+                        because a task that waits on nobody is a stall with a
+                        name missing. It leaves the queue the way a draft does -
+                        `ready` never returns one and `claim` never takes one -
+                        and it comes back on its own: the next claim returns it
+                        to `todo` once its pickup moment has passed, or once
+                        every task its metadata's `blocked_by` names has ended.
+                        Waiting on neither, it waits on the name it carries, and
+                        nothing but a person or that assignee moves it.
 
                         Two states end a task and they do not mean the same
                         thing. `complete` says the work was done. `closed` says
@@ -151,8 +164,8 @@ WORKER SCOPE
   that raise rather than by what the connection would otherwise allow.
 
   On the task its raise holds, a worker writes as anyone does, with two limits:
-  it lands that task on draft, todo, complete or closed and nowhere else, and it
-  never changes a type. Which pipeline work belongs to is not a worker's call.
+  it lands that task on draft, todo, waiting, complete or closed and nowhere
+  else, and it never changes a type. Which pipeline work belongs to is not a worker's call.
 
   On every other task a worker adds and never takes away: an activity, a tag, a
   metadata key not already there. It may not remove a tag or a key, overwrite a
@@ -173,7 +186,7 @@ WORKER SCOPE
 
 FILTERS  (list, ready, search)
   --type VALUE          exact match
-  --status VALUE        exact match, one of the four above
+  --status VALUE        exact match, one of those above
   --assignee TEXT       exact match
   --tag TEXT            repeats; every one given must be present
 
@@ -207,6 +220,10 @@ COLLECTIONS
 
   `ready` reads: every field and the whole trail, because it is the queue a
   worker consumes to act, and what is actionable now is short by construction.
+
+  `list` carries one more thing: `waiting_on` groups the waiting tasks in that
+  same answer under the name each one waits for, so who owes what is read
+  without walking the rows.
 
   --full                widen a scan to every field, objective and description
                         included
@@ -295,7 +312,7 @@ DOCS_BASE = ""
 STATE = False
 POST_INSTALL: list[dict] = []
 
-STATUSES = ("draft", "todo", "in_progress", "complete", "closed")
+STATUSES = ("draft", "todo", "in_progress", "waiting", "complete", "closed")
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
@@ -3445,7 +3462,27 @@ def _attach_activities(cur, tasks: list[dict], opts: dict, *, embed: bool) -> li
     return tasks
 
 
+def _address(task: dict) -> str:
+    """How to name one task back to the CLI. `unique_key` is nullable by design,
+    so a task raised here rather than seeded from a source is named by its id."""
+    return task.get("unique_key") or str(task["id"])
+
+
+def _waiting_on(tasks: list[dict]) -> dict:
+    """The waiting tasks in this answer, under the name each one waits for.
+
+    Grouped from the rows the answer already carries rather than from a second
+    question, so the grouping can never disagree with the page beside it."""
+    groups: dict = {}
+    for task in tasks:
+        if task.get("status") == "waiting":
+            groups.setdefault(task.get("assignee") or "", []).append(_address(task))
+    return groups
+
+
 def cmd_list(entry, args: list[str]) -> None:
+    """A scan, plus who is waited on. `waiting_on` reads the answer's own rows,
+    so a page that carries no waiting task carries an empty one."""
     opts = _flags(args, _LIST_FLAGS, multi=("tag",), bools=_LIST_BOOLS)
     where, params = _where(opts, _zone(entry))
     with _connect(entry) as conn, conn.cursor() as cur:
@@ -3455,14 +3492,16 @@ def cmd_list(entry, args: list[str]) -> None:
         cur.execute(f"""select {'*' if opts.get('full') else _LEAN} from {SCHEMA}.tasks{where}
                          order by pickup_at asc nulls last, created_at asc
                          limit %s offset %s""", params + [per, offset])
-        _emit({"pagination": pagination,
-               "tasks": _attach_activities(cur, _rows(cur), opts, embed=False)})
+        tasks = _attach_activities(cur, _rows(cur), opts, embed=False)
+        _emit({"pagination": pagination, "tasks": tasks,
+               "waiting_on": _waiting_on(tasks)})
 
 
 def cmd_ready(entry, args: list[str]) -> None:
     """What may be picked up now: an open status, and no pickup moment still in
-    the future. A task in draft is never ready - draft means a person has not
-    released it.
+    the future. Two statuses are never ready, and by being what they are rather
+    than by any moment: `draft`, which nobody has released, and `waiting`, which
+    is over to its assignee until something returns it.
 
     This is the one collection that answers in full - every field and the whole
     trail - because it is the queue a worker consumes to act, and it is short by
@@ -3548,6 +3587,19 @@ def _scalar_updates(opts: dict, tz) -> dict:
     return out
 
 
+def _wait_has_a_name(status: str | None, assignee: str | None) -> None:
+    """Refuse a write that would leave a task waiting on nobody.
+
+    Asked of the task as it would stand after the write and not of the flags
+    that were passed, so naming the assignee in the same call is permitted and
+    emptying the name of a task already waiting is not. One rule either way: a
+    task in `waiting` says whom it waits for, or it is not in `waiting`."""
+    if status != "waiting" or (assignee or "").strip():
+        return
+    _die(6, "input", "a task that waits on nobody is a stall with a name missing",
+         "name whom it waits for in the same call: --status waiting --assignee <who>")
+
+
 def _os_user() -> str:
     """The account this process runs as, read from the system rather than
     from a variable somebody may have set."""
@@ -3592,10 +3644,11 @@ def _actor(flag: str | None = None, env: Mapping[str, str] | None = None) -> str
 # --- Worker scope ------------------------------------------------------------
 
 # Where a worker may land the task it holds. These are the states a run ends in:
-# it finished, it goes back to the queue, it is over without having been done,
-# or it goes back to a person. `in_progress` is absent because claiming is what
-# puts a task there and releasing is what takes it out.
-WORKER_STATUSES = ("draft", "todo", "complete", "closed")
+# it finished, it goes back to the queue, it goes over to somebody it names, it
+# is over without having been done, or it goes back to a person. `in_progress`
+# is absent because claiming is what puts a task there and releasing is what
+# takes it out.
+WORKER_STATUSES = ("draft", "todo", "waiting", "complete", "closed")
 
 # What a worker may do to any task: add to it. Answered before the raise is even
 # read, because no state of the raise takes these away.
@@ -3704,6 +3757,9 @@ def cmd_add(entry, args: list[str]) -> None:
         # does not reach the store, and the answer says so rather than letting
         # the caller believe what it sent.
         values["status"] = coerced["status"] = "draft"
+    # After the coercion, so a worker's `waiting` that became a draft is not
+    # refused for the assignee a draft does not need.
+    _wait_has_a_name(values["status"], values.get("assignee"))
     values["created_by"] = _actor(opts.get("actor"))
     with _connect(entry) as conn, conn.cursor() as cur:
         key = values.get("unique_key")
@@ -3761,6 +3817,9 @@ def cmd_set(entry, args: list[str]) -> None:
         # nobody asked about open on somebody else's task.
         _worker_gate("set", tid, lookup)
         before = _task_row(cur, tid)
+        _wait_has_a_name(values.get("status", before.get("status")),
+                         values["assignee"] if "assignee" in values
+                         else before.get("assignee"))
         cols = list(values)
         assignments = [c + " = %s" for c in cols] + ["updated_at = now()"]
         cur.execute(f"""update {SCHEMA}.tasks set {', '.join(assignments)}
@@ -3880,7 +3939,7 @@ def cmd_activity(entry, args: list[str]) -> None:
 # caller so that two workers reporting the same outcome leave the task in the
 # same place; `--status` overrides it in the open, for the case the table does
 # not cover.
-_OUTCOMES = {"ok": "complete", "failed": "todo", "handback": "draft"}
+_OUTCOMES = {"ok": "complete", "failed": "todo", "handback": "waiting"}
 _LEASE_DEFAULT = 3600
 
 
@@ -3953,6 +4012,82 @@ def _sweep_leases(cur) -> list[dict]:
     return swept
 
 
+# Who an automatic return is recorded as. A change row carrying neither a raise
+# nor an actor reads as somebody's move, and the one thing a reader of an
+# automatic return has to be able to see is that nobody made it.
+SWEEP_ACTOR = "tasks:sweep"
+
+
+def _blocked_by(task: dict) -> list[str]:
+    """The tasks this one says it is waiting on, as it names them. Anything that
+    is not a list of names is no list of blockers at all, and a task carrying one
+    waits on its assignee like any other."""
+    named = (task.get("metadata") or {}).get("blocked_by")
+    if not isinstance(named, list):
+        return []
+    return [str(k).strip() for k in named if str(k).strip()]
+
+
+def _wait_over(task: dict, ended: set) -> str | None:
+    """Why this waiting task's wait is over, or None while it still waits.
+
+    Two things end a wait and neither of them needs a person: the appointed
+    moment passing, and everything the task named having ended. A task that
+    named neither is waiting on the assignee it carries, and no clock answers
+    for a person - so nothing here moves it, which is the whole of the third
+    case."""
+    if task.get("due"):
+        return "its pickup moment has passed"
+    blockers = _blocked_by(task)
+    if blockers and all(key in ended for key in blockers):
+        return "every task it was waiting on has ended"
+    return None
+
+
+def _sweep_waiting(cur) -> list[dict]:
+    """Return to the queue every waiting task whose wait is over.
+
+    Run from `claim` for the reason the lapsed-lease sweep is: one mechanism
+    puts work back, and it runs exactly when something is looking for work to do
+    rather than on a schedule of its own.
+
+    The store decides whether the moment has come, as it does everywhere else; a
+    second opinion computed here would disagree with it the one time the two
+    machines differ. Which blockers have ended is read from the store too, and a
+    name matching no task has not ended - so an unknown blocker holds the task
+    rather than freeing it."""
+    cur.execute(f"""select *, (pickup_at is not null and pickup_at <= now()) as due
+                      from {SCHEMA}.tasks where status = 'waiting'
+                     for update skip locked""")
+    waiting = _rows(cur)
+    if not waiting:
+        return []
+    named = sorted({key for task in waiting for key in _blocked_by(task)})
+    ended: set = set()
+    if named:
+        cur.execute(f"""select id, unique_key from {SCHEMA}.tasks
+                         where status in ('complete','closed')
+                           and (unique_key = any(%s) or id::text = any(%s))""",
+                    (named, named))
+        for row in _rows(cur):
+            ended.update(k for k in (str(row["id"]), row["unique_key"]) if k)
+    returned = []
+    for task in waiting:
+        why = _wait_over(task, ended)
+        if not why:
+            continue
+        tid = str(task["id"])
+        cur.execute(f"""update {SCHEMA}.tasks set status = 'todo', updated_at = now()
+                         where id = %s returning *""", (tid,))
+        after = _rows(cur)[0]
+        _record_moves(cur, tid, task, after, actor=SWEEP_ACTOR)
+        cur.execute(f"""insert into {SCHEMA}.task_activities (task_id, description, actor)
+                        values (%s, %s, %s)""",
+                    (tid, f"Returned to the queue from waiting: {why}.", SWEEP_ACTOR))
+        returned.append(after)
+    return returned
+
+
 def _open_execution(cur, tid: str) -> dict | None:
     cur.execute(f"""select * from {SCHEMA}.task_executions
                      where task_id = %s and status = 'running'""", (tid,))
@@ -3979,6 +4114,9 @@ def cmd_claim(entry, args: list[str]) -> None:
     joiner = " and " if where else " where "
     with _connect(entry) as conn, conn.cursor() as cur:
         swept = _sweep_leases(cur)
+        # Before the selection, so a wait that ended is work this same call can
+        # take rather than work the next call finds.
+        returned = _sweep_waiting(cur)
         if opts.get("key"):
             # Naming a task asks a different question from asking for work, and
             # it deserves a different answer. Finding nothing is the ordinary
@@ -4000,7 +4138,8 @@ def cmd_claim(entry, args: list[str]) -> None:
             due = task.pop("due")
             if task["status"] != "todo":
                 _die(6, "conflict", f"{opts['key']} is {task['status']}, not todo",
-                     "a draft has not been released, and one in progress is already held")
+                     "a draft has not been released, one waiting is over to its "
+                     "assignee, and one in progress is already held")
             if not due:
                 _die(6, "conflict", f"{opts['key']} is held until {task['pickup_at']}",
                      "clear the pickup to take it now")
@@ -4014,7 +4153,8 @@ def cmd_claim(entry, args: list[str]) -> None:
             rows = _rows(cur)
             if not rows:
                 conn.commit()
-                _emit({"claimed": None, "swept": [str(r["id"]) for r in swept]})
+                _emit({"claimed": None, "swept": [str(r["id"]) for r in swept],
+                       "returned": [_address(t) for t in returned]})
                 return
         before = rows[0]
         tid = str(before["id"])
@@ -4039,7 +4179,8 @@ def cmd_claim(entry, args: list[str]) -> None:
         conn.commit()
         _emit({"claimed": tid, "attempt": attempt, "execution": execution,
                "task": after, "activities": trail,
-               "swept": [str(r["id"]) for r in swept]})
+               "swept": [str(r["id"]) for r in swept],
+               "returned": [_address(t) for t in returned]})
 
 
 def cmd_release(entry, args: list[str]) -> None:
@@ -4052,7 +4193,10 @@ def cmd_release(entry, args: list[str]) -> None:
     printed this id; `runs` shows it again.
 
     `--outcome` decides where the task lands; `--status` overrides that landing
-    in the open, for the case the outcome does not describe it."""
+    in the open, for the case the outcome does not describe it. A handback goes
+    over to the task's assignee, in `waiting`; a task naming nobody lands in
+    `draft` instead and the answer says so, because a runner cannot invent whom
+    the task waits for."""
     opts = _flags(args, ("outcome", "status", "detail", "run", "metrics"), takes=1)
     if not opts["_loose"]:
         _die(6, "input", "release needs the raise it is closing",
@@ -4094,6 +4238,12 @@ def cmd_release(entry, args: list[str]) -> None:
                     f"it was already closed as {execution['status']}")
             _die(6, "conflict", "that raise is not open", hint)
         tid = str(execution["task_id"])
+        landing = _task_row(cur, tid)
+        instead = None
+        if status == "waiting" and not (landing.get("assignee") or "").strip():
+            status = "draft"
+            instead = ("the task names no assignee, so it landed in draft: a "
+                       "runner cannot invent whom the task waits for")
         cur.execute(f"""update {SCHEMA}.task_executions
                            set status = %s, ended_at = now(), detail = %s,
                                run_system = %s, run_ref = %s, metrics = %s::jsonb
@@ -4108,8 +4258,11 @@ def cmd_release(entry, args: list[str]) -> None:
         moved = _record_moves(cur, tid, before, after, execution_id=str(closed["id"]),
                               actor=execution.get("worker"))
         conn.commit()
-        _emit({"released": tid, "outcome": outcome, "moved": moved,
-               "execution": closed, "task": after})
+        answer = {"released": tid, "outcome": outcome, "moved": moved,
+                  "execution": closed, "task": after}
+        if instead:
+            answer["instead_of_waiting"] = instead
+        _emit(answer)
 
 
 def cmd_runs(entry, args: list[str]) -> None:
@@ -4158,6 +4311,13 @@ _TABLES = ("tasks", "task_activities", "task_executions", "task_changes")
 _COLUMNS = (("task_executions", "metrics"), ("tasks", "created_by"),
             ("task_activities", "actor"))
 
+# Values a later version added to a check constraint an earlier one created.
+# `create table if not exists` never revisits the constraint it created, so a
+# store with every table and every column can still refuse a status this version
+# writes. Named the way a missing column is, so a store one value behind reads as
+# behind rather than as current.
+_CONSTRAINTS = (("tasks", "tasks_status_check", "waiting"),)
+
 
 def _bundle_dir() -> Path:
     executable = Path(__file__).resolve()
@@ -4200,11 +4360,29 @@ def _columns_absent(cur, schema: str, tables: list[str]) -> list[str]:
     return [f"{t}.{c}" for t, c in _COLUMNS if t in tables and (t, c) not in present]
 
 
+def _constraints_behind(cur, schema: str, tables: list[str]) -> list[str]:
+    """Check constraints on tables that are present which do not admit a value a
+    later version added, as table.constraint. A table that is absent is reported
+    as a table, not as its constraints; a constraint that is absent outright is
+    behind too, since applying the schema is what creates it."""
+    cur.execute("""select t.relname as table_name, c.conname as name,
+                          pg_get_constraintdef(c.oid) as definition
+                     from pg_constraint c
+                     join pg_class t on t.oid = c.conrelid
+                     join pg_namespace n on n.oid = t.relnamespace
+                    where n.nspname = %s and c.contype = 'c'""", (schema,))
+    defined = {(r["table_name"], r["name"]): r["definition"] for r in cur.fetchall()}
+    return [f"{table}.{name}" for table, name, value in _CONSTRAINTS
+            if table in tables
+            and f"'{value}'" not in (defined.get((table, name)) or "")]
+
+
 def cmd_migrate(entry, args: list[str]) -> None:
     """Create what this connection's schema is missing, and nothing else.
 
-    Every statement is `if not exists`, so a store that is already current is
-    left exactly as it is and running this again costs a round trip. That is
+    Every statement either says `if not exists` or replaces what it writes with
+    the same thing, so a store that is already current is left exactly as it is
+    and running this again costs a round trip. That is
     what makes it safe to run on a consumer that has been live for months, and
     it is how a consumer picks up tables a later version of the capability adds.
 
@@ -4220,19 +4398,23 @@ def cmd_migrate(entry, args: list[str]) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         before = _tables_present(cur, schema)
         missing = [t for t in _TABLES if t not in before]
-        lacking = _columns_absent(cur, schema, before)
+        lacking = (_columns_absent(cur, schema, before)
+                   + _constraints_behind(cur, schema, before))
         if not opts.get("apply"):
             _emit({"schema": schema, "present": before, "would_create": missing,
                    "would_add": lacking, "applied": False})
             return
         # Applied whole even when every table is present. The file carries
         # additive `alter ... add column if not exists` for columns a later
-        # version introduced, and running only when a table is missing would
-        # leave a store that has all four tables one column behind forever.
+        # version introduced, and a constraint that replaces itself for values a
+        # later version admits; running only when a table is missing would leave
+        # a store that has all four tables a column or a status behind forever.
         cur.execute(ddl)
         conn.commit()
         after = _tables_present(cur, schema)
-        still = [t for t in _TABLES if t not in after] + _columns_absent(cur, schema, after)
+        still = ([t for t in _TABLES if t not in after]
+                 + _columns_absent(cur, schema, after)
+                 + _constraints_behind(cur, schema, after))
     if still:
         _die(5, "schema_incomplete",
              f"schema {schema} is still missing {', '.join(still)} after applying",

@@ -14,7 +14,7 @@ create table if not exists tasks.tasks (
   objective    text,
   description  text,
   status       text        not null default 'draft'
-               check (status in ('draft','todo','in_progress','complete','closed')),
+               check (status in ('draft','todo','in_progress','waiting','complete','closed')),
   assignee     text,
   tags         text[]      not null default '{}',
   metadata     jsonb       not null default '{}'::jsonb,
@@ -38,6 +38,8 @@ comment on column tasks.tasks.metadata is
   'Only what code filters on. Anything a person reads belongs in description.';
 comment on column tasks.tasks.status is
   'draft is unreleased, todo is releasable, in_progress is held by a claim, '
+  'waiting is over to the assignee it names and returns to todo at its pickup '
+  'moment or when everything metadata.blocked_by names has ended, '
   'complete is done, closed is over without having been done - superseded, '
   'obsolete, or answered somewhere else. Both terminal states leave the queue; '
   'only one of them claims the work happened.';
@@ -49,12 +51,13 @@ comment on column tasks.tasks.created_by is
   'Who created the task, as the CLI resolved it: the raise it ran under, the '
   'actor it was told, or the account it ran as.';
 
--- A store created before `closed` existed keeps the check it was created with,
+-- A store created before a status existed keeps the check it was created with,
 -- and `create table if not exists` never revisits one. The constraint therefore
--- replaces itself, which is safe to repeat and rejects nothing a live row holds.
+-- replaces itself, which is safe to repeat and rejects nothing a live row holds:
+-- every statement here only ever widens the set.
 alter table tasks.tasks drop constraint if exists tasks_status_check;
 alter table tasks.tasks add constraint tasks_status_check
-  check (status in ('draft','todo','in_progress','complete','closed'));
+  check (status in ('draft','todo','in_progress','waiting','complete','closed'));
 
 create index if not exists tasks_status_pickup_idx on tasks.tasks (status, pickup_at);
 create index if not exists tasks_assignee_idx       on tasks.tasks (assignee);

@@ -71,8 +71,8 @@ def test_the_variable_is_read_in_one_place():
     assert mod._actor("person:flag", WORKER) == "execution:exec-1"
 
 
-def test_a_worker_lands_its_own_task_on_the_four():
-    assert mod.WORKER_STATUSES == ("draft", "todo", "complete", "closed")
+def test_a_worker_lands_its_own_task_on_the_five():
+    assert mod.WORKER_STATUSES == ("draft", "todo", "waiting", "complete", "closed")
     for status in mod.WORKER_STATUSES:
         assert refusal(f"status:{status}", HELD) is None
 
@@ -84,10 +84,12 @@ def test_in_progress_is_not_a_landing():
         assert landing in message
 
 
-def test_waiting_is_nowhere_yet():
-    assert "waiting" not in mod.WORKER_STATUSES
-    assert "waiting" not in mod.STATUSES
-    assert refusal("status:waiting", HELD) is not None
+def test_a_worker_hands_its_own_task_over_and_nobody_elses():
+    # Handing the work to somebody named is an ending a run reaches, so it is a
+    # landing; it is still only a landing for the task the raise holds.
+    assert "waiting" in mod.STATUSES and "waiting" in mod.WORKER_STATUSES
+    assert refusal("status:waiting", HELD) is None
+    assert refusal("status:waiting", OTHER) is not None
 
 
 def test_another_task_is_not_a_workers_to_move():
@@ -179,7 +181,8 @@ def test_the_raise_is_read_once_however_often_it_is_asked_for():
 
 def test_help_names_the_scope():
     assert "WORKER SCOPE" in mod.__doc__
-    for needle in ("TASKS_EXECUTION", "coerced", "exit 4", "draft, todo, complete or closed"):
+    for needle in ("TASKS_EXECUTION", "coerced", "exit 4",
+                   "draft, todo, waiting, complete or closed"):
         assert needle in mod.__doc__
 
 
