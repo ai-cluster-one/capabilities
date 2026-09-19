@@ -1,0 +1,27 @@
+# rclonec deviations
+
+This file's sole purpose is to hold `rclonec`'s deliberate, justified departures from the [SHEBANG](../../SHEBANG.md) defaults, kept apart so an audit reads them as choices, not drift (DOCTRINE — *[Deviations are allowed — and recorded](../../DOCTRINE.md#deviations-are-allowed--and-recorded)*). Each realizes the *intent* of the pattern in the terms of a tool that **wraps another binary's configuration rather than calling an API** — rclonec materializes one remote in front of the official `rclone` and forwards to it.
+
+## Transport is a subprocess passthrough to `rclone`, not an HTTP/JSON API
+
+rclonec's forwarded verbs make no network call of their own: rclonec resolves a connection into an rclone remote definition, places it in the child environment, and `subprocess`-execs `rclone` (the [railwayc](../railwayc/) precedent of putting credentials in front of an official CLI). The *resilient-HTTP* intent — backoff, retry, status mapping — is realized by `rclone` itself, which owns retries, chunking and rate-limit handling for every backend it speaks. rclonec makes no HTTP call anywhere, including in `doctor`: its readiness probe is `rclone lsd <remote>:` under the connection's own configuration, so readiness is proven over exactly the path the work verbs use rather than a parallel one.
+
+## Forwarding is transparent — rclone owns the forwarded command's contract
+
+For everything except `help` and `doctor`, rclonec inherits stdio and execs `rclone` with the args verbatim: `rclone`'s stdout, stderr, and **exit code pass through unchanged**. This is what lets progress meters, `--json`, `--progress` and colors behave exactly as in `rclone` itself, and it is why rclonec never maps or re-documents the surface (the surface is `rclone help`). Consequently the `_emit`/`_die` JSON envelope and the exit-code taxonomy apply **only to rclonec's own layer** — connection resolution, the write gate, `doctor`, and `rclone`-not-on-PATH. A forwarded command returns an `rclone` exit code, which is not drawn from rclonec's taxonomy.
+
+## The write gate is positional, because rclone's transfer verbs are directional
+
+rclone's transfer verbs are the same word in both directions: `copy <remote>: /local` reads the remote while `copy /local <remote>:` writes it. A verb-name gate would therefore either block every download or wave through every upload. `WRITE_VERBS` still holds the verbs that mutate whatever path they are given (`delete`, `purge`, `mkdir`, `touch`, `link`, and the rest), and those are refused by the vendored gate on membership alone. On top of that, a connection resolving to read-only refuses a **directional** verb whose destination addresses this remote, refuses `move`/`moveto` naming it on either side because the source is emptied, refuses a destination-valued flag such as `--backup-dir` pointed at it, and refuses `backend` outside its read-only subcommands. A verb in neither the read nor the write set is refused rather than waved through. This is the one place rclonec reasons about a surface it otherwise treats as opaque.
+
+## The flag table is asked of rclone, never transcribed
+
+Deciding which argument is the destination requires knowing which flags consume the next argument, or `--transfers 8` makes `8` look like the destination and an upload passes as a read. rclonec therefore asks the installed binary — `rclone help flags` — and derives the value-taking flags from its output, rather than carrying a list that would drift from whatever rclone is actually installed (DOCTRINE — *[Discoverable knowledge belongs in the tool, not the docs](../../DOCTRINE.md#the-standing-rules)*). The answer is computed at most once per invocation and only on the read-only path, so the ordinary case pays nothing. When `rclone` cannot answer, a directional verb on a read-only connection is **refused rather than guessed at**.
+
+## `CRED_KEYS` is empty because secrets are per-connection and backend-shaped
+
+Which secrets exist depends on the backend a connection declares: a Google Drive entry carries a service-account blob or an OAuth token, an S3 entry carries an access key and a secret. There is no fixed set of credential keys for the capability as a whole, so the manifest declares none and each connection names its own under `secret_env` as a map of rclone option name to env key. Those values still resolve through the standard cascade, and `rclonec connections` reports every one of them with its winning tier and source, secrets masked — so the intent of a declared, inspectable credential surface holds per connection instead of per capability.
+
+## The child's configuration is the environment, and only the environment
+
+`RCLONE_CONFIG` is pointed at the null device so rclone keeps its configuration in memory: no config file is read, and none is written. Inherited `RCLONE_*` variables are dropped from the child environment, so ambient environment can neither redirect a remote nor soften a setting the connection declared. Two consequences are deliberate. The child knows exactly one remote — the selected connection — so a connection declared for one backend cannot address another; the containment is a property of the environment handed down, not a check rclonec performs. And an OAuth token refreshed during a run is held in memory and never persisted, so `STATE` is `False` and the same connection runs identically on a laptop and on a server, carrying nothing between runs but the credential it was given.

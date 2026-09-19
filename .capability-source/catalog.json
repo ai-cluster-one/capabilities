@@ -105,6 +105,11 @@
       "payload_sha256": "4c9132b0b9227e355b2f3ac5777b9ee7763eeda4ab8a8086529225bed2cd8f94",
       "summary": "Credential harness around the official `railway` CLI — resolves a project-scoped Railway token, injects it, and forwards your command straight to `railway` (everything but railwayc's own verbs passes through untouched); the command surface is `railway help`."
     },
+    "rclonec": {
+      "path": "capabilities/rclonec",
+      "payload_sha256": "60381644bc371e446fe8874e808e994f73fc9aba6a26dd26ec0f5b9a2aa73527",
+      "summary": "Credential harness around the official `rclone` binary — resolves one named connection into a single rclone remote (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV and rclone's other backends), injects it as configuration, and forwards your command straight to `rclone` (everything but rclonec's own verbs passes through untouched); the command surface is `rclone help`."
+    },
     "resend": {
       "path": "capabilities/resend",
       "payload_sha256": "2f463c57213d11fca9847a5e49a4574d040197c44a5738ec7bc4286da1b275e0",
