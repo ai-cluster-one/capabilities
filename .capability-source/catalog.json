@@ -140,6 +140,11 @@
       "payload_sha256": "980aa6508ce8ab6833d37a5e68ece4300cecc93e19530ff98387fe7fa82450fe",
       "summary": "Read-only Stripe CLI over the REST API — emit a neutral JSON contract of account activity (sync-plan), check identity/reachability (doctor), list invoices and download their PDFs, and read balance-transactions and payouts."
     },
+    "tasks": {
+      "path": "capabilities/tasks",
+      "payload_sha256": "2ca353525be176f948c6d527f67fc490fbb92c11d6fadf17909a3497a72e547b",
+      "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
+    },
     "telegram": {
       "path": "capabilities/telegram",
       "payload_sha256": "1341bd439d01fd400031ecf33a37197d241f5a1ef8e125a958062b0fb40ff979",
