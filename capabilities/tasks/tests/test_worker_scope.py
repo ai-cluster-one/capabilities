@@ -38,7 +38,7 @@ SWEPT = {"id": "exec-1", "task_id": HELD, "status": "abandoned"}
 OVER = (CLOSED, SWEPT, None)
 
 ADDITIVE = ("tag", "meta-set", "activity")
-HELD_ONLY = ("untag", "meta-rm", "meta-overwrite")
+HELD_ONLY = ("set", "untag", "meta-rm", "meta-overwrite")
 
 
 def lookup_of(row):
@@ -183,6 +183,135 @@ def test_help_names_the_scope():
         assert needle in mod.__doc__
 
 
+# --- The verb, with the two reads faked and no store -------------------------
+
+# `set` decides on the verb and not on the field, so the proof has to name every
+# field the verb accepts: one left out of the gate is exactly the hole this
+# closes. The values are only shaped well enough to parse.
+SET_VALUES = {"type": "change", "title": "a title", "objective": "why",
+              "description": "what was seen", "status": "todo",
+              "assignee": "somebody", "pickup": "2026-09-10", "unique-key": "k-1"}
+PLAIN_FIELDS = tuple(f for f in mod._SCALARS + ("unique-key",)
+                     if f not in ("status", "type"))
+ENTRY = {"timezone": "UTC"}
+
+
+class Reached(Exception):
+    """A write got past the gate and addressed the store."""
+
+
+class FakeCursor:
+    """The two reads `set` makes before it writes - the task by reference and the
+    raise by id - answered from memory. Every other query is a write, and a write
+    arriving here means the gate let it through."""
+
+    def __init__(self, row):
+        self.row, self.answer = row, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        if "task_executions" in sql:
+            self.answer = [dict(self.row)] if self.row else []
+        elif sql.strip().startswith("select id from"):
+            self.answer = [{"id": params[0]}]
+        else:
+            raise Reached(sql.strip().split("\n")[0])
+
+    def fetchall(self):
+        return self.answer
+
+
+class FakeConn:
+    def __init__(self, cur):
+        self.cur = cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self):
+        return self.cur
+
+    def commit(self):
+        pass
+
+
+@pytest.fixture
+def setting(monkeypatch):
+    """`set` run as a worker against the fake reads; the argument is the raise."""
+    monkeypatch.setenv("TASKS_EXECUTION", "exec-1")
+
+    def run(args: list[str], row=OPEN):
+        monkeypatch.setattr(mod, "_connect", lambda entry: FakeConn(FakeCursor(row)))
+        mod.cmd_set(ENTRY, args)
+
+    return run
+
+
+def _set_refused(setting, capsys, args, row=OPEN) -> str:
+    with pytest.raises(SystemExit) as exit_info:
+        setting(args, row)
+    assert exit_info.value.code == 4
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "policy"
+    return error["message"]
+
+
+@pytest.mark.parametrize("field", PLAIN_FIELDS)
+def test_no_field_of_another_task_is_a_workers_to_write(field, setting, capsys):
+    assert _set_refused(setting, capsys, [OTHER, f"--{field}", SET_VALUES[field]]) == \
+        refusal("set", OTHER)
+
+
+@pytest.mark.parametrize("field", mod._CLEARABLE)
+def test_no_field_of_another_task_is_a_workers_to_clear(field, setting, capsys):
+    assert _set_refused(setting, capsys, [OTHER, "--clear", field]) == refusal("set", OTHER)
+
+
+def test_a_bare_save_on_another_task_is_a_write_too(setting, capsys):
+    # It names no field and still moves the task's moment, so it is the holder's.
+    assert _set_refused(setting, capsys, [OTHER]) == refusal("set", OTHER)
+
+
+def test_status_and_type_keep_naming_their_own_rule(setting, capsys):
+    assert _set_refused(setting, capsys, [OTHER, "--status", "todo"]) == \
+        refusal("status:todo", OTHER)
+    assert _set_refused(setting, capsys, [OTHER, "--type", "change"]) == \
+        refusal("type", OTHER)
+
+
+@pytest.mark.parametrize("field", PLAIN_FIELDS)
+def test_the_task_it_holds_keeps_every_field_open(field, setting):
+    with pytest.raises(Reached):
+        setting([HELD, f"--{field}", SET_VALUES[field]])
+
+
+@pytest.mark.parametrize("field", mod._CLEARABLE)
+def test_the_task_it_holds_can_still_be_emptied(field, setting):
+    with pytest.raises(Reached):
+        setting([HELD, "--clear", field])
+
+
+@pytest.mark.parametrize("row", OVER, ids=("closed", "swept", "missing"))
+def test_a_raise_that_is_over_writes_no_field_on_its_own_former_task(row, setting, capsys):
+    assert _set_refused(setting, capsys, [HELD, "--assignee", "x"], row) == \
+        refusal("set", HELD, row)
+    assert "does not hold" in refusal("set", HELD, row)
+
+
+def test_nothing_is_a_worker_without_the_variable(setting, monkeypatch):
+    monkeypatch.delenv("TASKS_EXECUTION")
+    with pytest.raises(Reached):
+        setting([OTHER, "--assignee", "x"])
+
+
 # --- Store: the same rules through the verbs ---------------------------------
 
 DSN = os.environ.get("TASKS_TEST_DSN")
@@ -263,6 +392,37 @@ def test_a_worker_writes_inside_its_raise(store, capsys, monkeypatch):
                                       entry, ["w-other", "--status", "todo"])
     mod.cmd_show(entry, ["w-other"])
     assert _answer(capsys)["task"]["status"] == "todo"  # the refusal wrote nothing
+
+
+@needs_store
+def test_a_worker_writes_no_field_on_a_task_it_does_not_hold(store, capsys, monkeypatch):
+    entry, schema, conn = store
+    for key in ("f-held", "f-other"):
+        mod.cmd_add(entry, ["--type", "probe", "--title", key, "--key", key,
+                            "--status", "todo", "--objective", "as raised",
+                            "--assignee", "the owner"])
+        capsys.readouterr()
+    execution = _claim(entry, capsys, "f-held")
+    monkeypatch.setenv("TASKS_EXECUTION", execution)
+
+    for args in (["f-other", "--assignee", "somebody else"],
+                 ["f-other", "--objective", "mine now"],
+                 ["f-other", "--clear", "assignee"],
+                 ["f-other"]):
+        assert "does not hold" in _refused(capsys, mod.cmd_set, entry, args)
+    mod.cmd_show(entry, ["f-other"])
+    other = _answer(capsys)["task"]
+    assert other["assignee"] == "the owner" and other["objective"] == "as raised"
+
+    # On the task it holds, the whole verb is open.
+    mod.cmd_set(entry, ["f-held", "--assignee", "me", "--clear", "objective"])
+    assert set(_answer(capsys)["fields"]) == {"assignee", "objective"}
+
+    # And once the raise is over, its own former task is another task too.
+    mod.cmd_release(entry, [execution, "--outcome", "ok"])
+    capsys.readouterr()
+    assert "does not hold" in _refused(capsys, mod.cmd_set,
+                                       entry, ["f-held", "--assignee", "nobody"])
 
 
 @needs_store

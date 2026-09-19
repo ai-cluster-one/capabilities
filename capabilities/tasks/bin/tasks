@@ -160,7 +160,7 @@ WORKER SCOPE
   --status says, and the answer reports the coercion under `coerced`.
 
   A raise that has been closed or swept holds nothing, so a worker whose raise
-  is over writes no status at all, its own former task included. A lapse
+  is over writes no field on any task, its own former task included. A lapse
   narrows what a worker may do; it never widens it.
 
   The scope is the ledger's and not the machine's. It follows the variable, so
@@ -3605,6 +3605,8 @@ _WORKER_ADDITIVE = ("tag", "meta-set", "activity")
 # of these takes something away from a task or writes over what is already on
 # it, which is exactly what a worker passing by must not do to somebody's work.
 _WORKER_HELD_ONLY = {
+    "set": "a worker may not write a field on a task it does not hold; another "
+           "task's fields belong to whoever released the work",
     "untag": "a worker may not remove a tag from a task it does not hold",
     "meta-rm": "a worker may not remove metadata from a task it does not hold",
     "meta-overwrite": "a worker may not write over a metadata key a task it does "
@@ -3627,10 +3629,11 @@ def _worker_refusal(op: str, target: str, lookup,
     its lease passes - and the wrong way round would make a dead lease the moment
     a worker gained authority over the whole ledger.
 
-    `op` is the write being attempted: `status:<value>`, `type`, or one of the
-    annotation verbs. `target` is the task it lands on. `lookup` answers with the
-    raise for an id, or with None when there is none; it is asked only when the
-    answer depends on it, so an additive write costs no query."""
+    `op` is the write being attempted: `status:<value>`, `type`, `set` for any
+    other field the verb edits, or one of the annotation verbs. `target` is the
+    task it lands on. `lookup` answers with the raise for an id, or with None
+    when there is none; it is asked only when the answer depends on it, so an
+    additive write costs no query."""
     execution = _worker_execution(env)
     if not execution:
         return None
@@ -3752,6 +3755,11 @@ def cmd_set(entry, args: list[str]) -> None:
             _worker_gate(f"status:{values['status']}", tid, lookup)
         if "type" in values:
             _worker_gate("type", tid, lookup)
+        # Every other field, and the bare save that moves nothing but the moment,
+        # is the holder's alone: the two gates above name their own rule, and
+        # this one answers for the rest of the verb rather than leaving a field
+        # nobody asked about open on somebody else's task.
+        _worker_gate("set", tid, lookup)
         before = _task_row(cur, tid)
         cols = list(values)
         assignments = [c + " = %s" for c in cols] + ["updated_at = now()"]
