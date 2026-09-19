@@ -33,6 +33,7 @@ def test_manager_guide_menu_uses_the_capability_guide_shape() -> None:
         "reporting",
         "repositories",
         "sanitizing",
+        "surfaces",
     ]
     for entry in menu:
         assert set(entry) == {"topic", "title", "preview", "command"}

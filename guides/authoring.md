@@ -27,7 +27,7 @@ authentication shape, and where the capability will be used.
 
 ## Shape the contract
 
-- Define the smallest domain verb surface and identify mutating verbs.
+- Identify the mutating verbs; `capabilities guide surfaces` shapes the verbs, arguments, and help body themselves.
 - Use `WRITE_DEFAULT = False` when writes leave the system.
 - Declare credentials and choose project or user scope.
 - Declare state when credentials mint sessions or caches.
