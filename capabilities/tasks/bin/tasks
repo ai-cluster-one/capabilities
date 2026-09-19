@@ -1,7 +1,10 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["psycopg[binary]>=3.2"]
+# dependencies = [
+#     "psycopg[binary]>=3.2",
+#     "callva-agentworker==0.1.2",
+# ]
 # ///
 """tasks — what has to be done, and what was done about it.
 
@@ -50,6 +53,12 @@ EXECUTION  (also needs allow_write)
   tasks release <execution> --outcome ok|failed|handback [--detail TEXT]
                      [--status S] [--run SYSTEM:REF] [--metrics JSON]
                                   close that claim and say what came of it
+  tasks run <worker> [--key KEY] [--apply]
+                                  one turn of the conveyor: claim by that
+                                  worker's selector, boot one engine turn on
+                                  what it took, and settle the raise from where
+                                  the turn left the task. Reports what it would
+                                  take and writes nothing without `--apply`
 
   A claim is held by a lease and nothing else. Give one longer than the work
   itself can take: when the moment passes, the next claim closes the raise as
@@ -75,6 +84,105 @@ EXECUTION  (also needs allow_write)
   price. The store keeps it and reads none of it, so a runner declares its own
   vocabulary instead of every consumer inheriting columns for one runner's. Bookkeeping stays out of `show` and out of the trail, so what a worker
   reads to act on a task is only what was learned about it.
+
+ONE TURN OF THE CONVEYOR
+  `run` is claim, boot and release in one call, and it is the only verb that
+  starts an engine. It takes the next task the named worker's selector matches,
+  boots one headless turn on it, and closes the raise against wherever that turn
+  left the task. It never reads the turn's answer: the worker moves the status
+  and writes the trail itself, through these same verbs, and `run` measures.
+
+  `--key` takes exactly that task instead of the next one, and refuses out loud
+  when it cannot be taken, the way `claim --key` does. `--apply` gates every
+  write: without it nothing is claimed, no turn is started, and the answer says
+  which task a claim would have taken.
+
+  The turn is bounded twice and neither bound is the prompt's. The profile's
+  fence decides what it may run and its timeout kills the whole process tree;
+  the raise decides what it may write, because `TASKS_EXECUTION` goes down with
+  the turn and worker scope answers for every write it makes.
+
+  Where the task stands when the turn is over is what scores the raise, so a
+  turn that reports success and moved nothing is not believed:
+
+    complete, closed            ok - the work was done, or decided against
+    todo, held until a moment
+    still ahead                 ok, marked `waiting` - the turn was told to wait
+                                on somebody and did, and the mark keeps a daily
+                                check from spending an attempt
+    todo, `stage` changed       ok, marked `handoff` - the turn ended at a
+                                boundary it named and the next one continues
+    waiting, draft              handback - it stopped at a gate, and the task is
+                                over to whoever has to answer
+    in_progress                 forced to todo, failed - the turn never reached
+                                an ending of its own, and a task left here is
+                                one no claim would take and no lease would free
+    todo otherwise              failed - put back without saying why
+
+  A turn the engine's own report says ran out of quota, and one that fails in
+  seconds having written nothing, are not attempts at the work: the raise is
+  marked `exhausted`, the task is held for a while rather than handed straight
+  back into a limit that has not lifted, and the count that parks a task does
+  not spend it. At the ceiling the task is handed back to a person instead of
+  dispatched again.
+
+  Every raise leaves exactly one entry. A turn that wrote nothing gets one
+  saying so, because a task picked up that left no trace reads exactly like one
+  never picked up, and telling those apart is how a stalled queue is noticed.
+
+WORKERS
+  A worker is declared by the consuming project in its capability envelope, at
+  `capabilities/tasks/workers.toml`. The shape of that file is this capability's
+  contract; everything in it is the project's.
+
+    [workers.<name>]
+    selector = { types = ["defect", "change"], tags = [], assignee = "" }
+    park_hint = "one sentence added to the handback when a task is parked"
+
+    [workers.<name>.profile]      # the engine profile, validated against the
+    engine = "claude"             # schema `callva-agentworker` ships
+    fence = "act"                 # read | write | act
+    model = "claude-opus-5"
+    effort = "max"
+    timeout_seconds = 10800
+
+    [workers.<name>.routines]     # which routines the turn is told to load
+    defect = ["capability-development"]
+
+    [workers.<name>.instructions] # whose text is embedded in the prompt
+    defect = "implementation.md"
+
+    [workers.<name>.limits]
+    attempts = 3                  # raises that did work before it is parked
+    lease_seconds = 11400         # longer than the turn itself can run
+    hold_seconds_on_exhaustion = 1200
+    idle_failure_seconds = 120    # under this, having written nothing, a failed
+                                  # turn is one that never started
+
+  `types` is tried in order, one claim per type, stopping at the first that
+  yields: the order is the whole of the arbitration, because something broken is
+  taken before something that could merely be better.
+
+  `routines` and `instructions` are keyed by task type, and a task carrying a
+  `stage` in its metadata takes `"<type>:<stage>"` when that key is present. A
+  routine name resolves to `routines/<name>.md` at the project root and an
+  instruction name to `capabilities/tasks/instructions/<name>` in the envelope;
+  a worker whose type has neither key, or names a file that is not there, is
+  refused rather than run with half a prompt. `tasks doctor` names it first.
+
+  `${VAR}` inside a declared string is read from the environment, then from the
+  project's `.env` and `.env.local`, and a name nothing answers for is refused.
+  Machine-local paths belong there rather than in a versioned file.
+
+  The prompt is this capability's frame around the project's text: who the
+  worker is, the task in full, its whole trail, the routines to load, how to
+  write back, and what the store will and will not let the turn write. What the
+  work is and how this project wants it done is the instruction file's, and
+  nothing here reads or repeats it.
+
+  A worker's cadence is not declared here. Something outside runs `tasks run
+  <worker> --apply` on whatever schedule it keeps, and a worker nothing runs
+  never runs.
 
 ADDRESSING
   <task> is a uuid or the task's unique_key. Both are exact; nothing is guessed.
@@ -278,11 +386,13 @@ I/O
 
 EXIT CODES
   0 success
-  3 not found - no task for that uuid or unique key
+  3 not found - no task for that uuid or unique key, no worker of that name, or
+    a routine or instruction file a worker names that is not there
   4 policy - the capability is disabled, the connection does not allow writes,
     or worker scope refuses the write; ask the user, never lift the gate yourself
   5 store - unreachable, or the schema is not present; `tasks doctor` proves both
-  6 input - a malformed argument, an unknown flag, or a value outside its set
+  6 input - a malformed argument, an unknown flag, a value outside its set, or a
+    worker declaration this capability cannot read
 """
 import json
 import os
@@ -315,7 +425,7 @@ CRED_KEYS = [
 ]
 DEFAULT_SECRET_ENV = "TASKS_DB_PASSWORD"
 WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
-               "release", "migrate"}
+               "release", "run", "migrate"}
 WRITE_DEFAULT = False
 DOCS_BASE = ""
 STATE = False
@@ -3967,6 +4077,14 @@ def cmd_meta(entry, args: list[str]) -> None:
         _emit({"task": tid, "metadata": meta})
 
 
+def _add_activity(cur, tid: str, text: str, actor: str) -> dict:
+    """One entry on the trail. Every caller writes it the same way, so what an
+    entry is - a moment, a sentence and who recorded it - stays one fact."""
+    cur.execute(f"""insert into {SCHEMA}.task_activities (task_id, description, actor)
+                    values (%s, %s, %s) returning id, created_at""", (tid, text, actor))
+    return _rows(cur)[0]
+
+
 def cmd_activity(entry, args: list[str]) -> None:
     """Record work that actually happened, in plain words. Creating a task,
     changing a field or thinking about one are not activity and do not belong
@@ -3984,15 +4102,26 @@ def cmd_activity(entry, args: list[str]) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, loose[0])
         _worker_gate("activity", tid, _execution_lookup(cur))
-        cur.execute(f"""insert into {SCHEMA}.task_activities (task_id, description, actor)
-                        values (%s, %s, %s) returning id, created_at""",
-                    (tid, loose[1], _actor(opts.get("actor"))))
-        row = _rows(cur)[0]
+        row = _add_activity(cur, tid, loose[1], _actor(opts.get("actor")))
         conn.commit()
         _emit({"task": tid, "activity": row["id"], "created_at": row["created_at"]})
 
 
 # --- Execution ---------------------------------------------------------------
+
+class Refusal(Exception):
+    """A refusal a caller inside this process may decide to survive.
+
+    `_die` is the right ending for a verb answering a person: one error shape on
+    stderr and the exit code that says which kind. It is the wrong ending for a
+    step inside a longer act, where the caller has something left to do and
+    ending the process would throw that away. So the store's own refusals are
+    raised here and turned into `_die` by whichever verb is the outermost."""
+
+    def __init__(self, exit_code: int, code: str, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.exit_code, self.code, self.message, self.hint = exit_code, code, message, hint
+
 
 # What an outcome means for the task itself. Stated here rather than left to the
 # caller so that two workers reporting the same outcome leave the task in the
@@ -4178,6 +4307,15 @@ def cmd_claim(entry, args: list[str]) -> None:
     claim gone when it comes to release."""
     opts = _flags(args, ("type", "assignee", "tag", "lease", "worker", "handler", "key"),
                   multi=("tag",))
+    _emit(_claim(entry, opts))
+
+
+def _claim(entry, opts: dict) -> dict:
+    """The claim itself, answered rather than printed, so `run` takes a task the
+    same way a caller of the verb does and there is one transaction either way.
+
+    The flags arrive already parsed: what a claim is remains here, and how a
+    caller spells it belongs to whoever parsed it."""
     lease = _duration(opts.get("lease") or _LEASE_DEFAULT)
     where, params = _where({k: v for k, v in opts.items() if k in ("type", "assignee", "tag")},
                            _zone(entry))
@@ -4223,9 +4361,8 @@ def cmd_claim(entry, args: list[str]) -> None:
             rows = _rows(cur)
             if not rows:
                 conn.commit()
-                _emit({"claimed": None, "swept": [str(r["id"]) for r in swept],
-                       "returned": [_address(t) for t in returned]})
-                return
+                return {"claimed": None, "swept": [str(r["id"]) for r in swept],
+                        "returned": [_address(t) for t in returned]}
         before = rows[0]
         tid = str(before["id"])
         cur.execute(f"select count(*) as n from {SCHEMA}.task_executions where task_id = %s",
@@ -4247,10 +4384,10 @@ def cmd_claim(entry, args: list[str]) -> None:
                          order by created_at asc""", (tid,))
         trail = _rows(cur)
         conn.commit()
-        _emit({"claimed": tid, "attempt": attempt, "execution": execution,
-               "task": after, "activities": trail,
-               "swept": [str(r["id"]) for r in swept],
-               "returned": [_address(t) for t in returned]})
+        return {"claimed": tid, "attempt": attempt, "execution": execution,
+                "task": after, "activities": trail,
+                "swept": [str(r["id"]) for r in swept],
+                "returned": [_address(t) for t in returned]}
 
 
 def cmd_release(entry, args: list[str]) -> None:
@@ -4294,19 +4431,36 @@ def cmd_release(entry, args: list[str]) -> None:
             _die(6, "input", "--run names the system and the handle",
                  "--run automations:0f1c2b, --run <system>:<handle>")
     ref = opts["_loose"][0]
+    try:
+        answer = _release(entry, ref, outcome, status, opts.get("detail"),
+                          run_system, run_ref, metrics)
+    except Refusal as refused:
+        _die(refused.exit_code, refused.code, refused.message, refused.hint)
+    _emit(answer)
+
+
+def _release(entry, ref: str, outcome: str, status: str, detail: str | None,
+             run_system: str | None, run_ref: str | None, metrics: str) -> dict:
+    """Closing the raise itself, answered rather than printed, and refusing by
+    exception rather than by exit.
+
+    `run` closes the raise it opened, and a lapse is exactly the case where it
+    must go on: the task may already be with somebody else, and saying so on the
+    trail is the last useful thing that turn can do. A refusal that ended the
+    process would take that with it."""
     with _connect(entry) as conn, conn.cursor() as cur:
         cur.execute(f"""select * from {SCHEMA}.task_executions where id::text = %s""", (ref,))
         found = _rows(cur)
         if not found:
-            _die(3, "not_found", f"no raise for {ref!r}",
-                 f"`{NAME} runs <task>` lists the raises of one task")
+            raise Refusal(3, "not_found", f"no raise for {ref!r}",
+                          f"`{NAME} runs <task>` lists the raises of one task")
         execution = found[0]
         if execution["status"] != "running":
             hint = ("the lease lapsed and this claim was swept, so the task may "
                     "already be with someone else - claim it again to continue"
                     if execution["status"] == "abandoned" else
                     f"it was already closed as {execution['status']}")
-            _die(6, "conflict", "that raise is not open", hint)
+            raise Refusal(6, "conflict", "that raise is not open", hint)
         tid = str(execution["task_id"])
         landing = _task_row(cur, tid)
         instead = None
@@ -4318,7 +4472,7 @@ def cmd_release(entry, args: list[str]) -> None:
                            set status = %s, ended_at = now(), detail = %s,
                                run_system = %s, run_ref = %s, metrics = %s::jsonb
                          where id = %s returning *""",
-                    (outcome, opts.get("detail"), run_system, run_ref, metrics,
+                    (outcome, detail, run_system, run_ref, metrics,
                      execution["id"]))
         closed = _rows(cur)[0]
         before = _task_row(cur, tid)
@@ -4338,7 +4492,736 @@ def cmd_release(entry, args: list[str]) -> None:
             answer["instead_of_waiting"] = instead
         if spent:
             answer["blocked_by_spent"] = spent
-        _emit(answer)
+        return answer
+
+
+# --- The conveyor ------------------------------------------------------------
+
+# What a worker's declaration leaves unsaid. Each is a number one turn is run
+# by, and a project with no opinion about one gets this capability's rather than
+# nothing at all.
+_LIMIT_DEFAULTS = {"attempts": 3, "lease_seconds": 11400,
+                   "hold_seconds_on_exhaustion": 1200, "idle_failure_seconds": 120}
+
+# Marks on a raise that say it was never an attempt at the work, so the count
+# that parks a task does not spend it. A turn stopped by the account's own limit
+# happened and keeps its row; a turn told to wait on somebody and holding the
+# task until tomorrow did exactly what it was told. Neither is the task's fault,
+# and parking on the third of either would punish the work for the weather.
+_UNSPENT_MARKS = ("exhausted", "waiting")
+
+
+def _agentworker():
+    """The engine library, imported at the moment a turn is about to run.
+
+    Every other verb here works without it, and a reading verb should not wait
+    on a dependency it never reaches."""
+    try:
+        from callva import agentworker
+    except ImportError as exc:  # pragma: no cover - a broken install, not a path
+        _die(5, "engine_library_missing",
+             f"the engine library is not importable: {exc}",
+             "reinstall the capability; its script header declares "
+             "callva-agentworker and uv resolves it")
+    return agentworker
+
+
+def _project_here() -> Path:
+    """The project whose queue and declarations this is. A worker belongs to a
+    project; there is nowhere else for one to be declared."""
+    root = _project_root()
+    if root is None:
+        _die(6, "input", "worker declarations live in a project, and this is not one",
+             "run this where the project that declares the worker is")
+    return root
+
+
+def _workers_file() -> Path:
+    return _project_capabilities_dir(_project_here()) / NAME / "workers.toml"
+
+
+def _instruction_dir() -> Path:
+    return _project_capabilities_dir(_project_here()) / NAME / "instructions"
+
+
+def _routine_dir() -> Path:
+    return _project_here() / "routines"
+
+
+_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand(value: str, where: str) -> str:
+    """`${VAR}` read from the environment, then from the project's own .env files.
+
+    A machine-local path belongs in local environment configuration rather than
+    in a versioned declaration, so the declaration names it instead of carrying
+    it. A name nothing answers for is refused rather than expanded to nothing:
+    an empty expansion would quietly drop the directory a fenced turn was meant
+    to be able to reach, and the turn would fail at something else."""
+    def one(match) -> str:
+        found = (os.environ.get(match.group(1))
+                 or _project_env().get(match.group(1)) or "").strip()
+        if not found:
+            raise Refusal(6, "worker_invalid",
+                          f"{where} names ${{{match.group(1)}}} and nothing sets it",
+                          f"set {match.group(1)} in the environment or in the "
+                          "project's .env.local")
+        return found
+    return _VARIABLE.sub(one, value)
+
+
+def _expanded(value, where: str):
+    if isinstance(value, str):
+        return _expand(value, where)
+    if isinstance(value, list):
+        return [_expanded(v, where) for v in value]
+    if isinstance(value, dict):
+        return {k: _expanded(v, where) for k, v in value.items()}
+    return value
+
+
+def _declarations() -> dict:
+    """Every worker this project declares.
+
+    A project that declares none is not an error until something asks for one,
+    so an absent file answers with nothing rather than refusing. A file that is
+    there and unreadable is refused, because it was meant to say something."""
+    import tomllib
+    path = _workers_file()
+    if not path.is_file():
+        return {}
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        _die(6, "worker_invalid", f"{path} could not be read: {exc}",
+             "one table per worker, under [workers.<name>]")
+    workers = data.get("workers")
+    if not isinstance(workers, dict):
+        _die(6, "worker_invalid", f"{path} declares no [workers] table",
+             "one table per worker, under [workers.<name>]")
+    return workers
+
+
+def _handler(profile) -> str:
+    """What held the task, in the words that would start it again."""
+    parts = [profile.engine]
+    if profile.model:
+        parts += ["--model", profile.model]
+    if profile.effort:
+        parts += ["--effort", profile.effort]
+    return " ".join(parts)
+
+
+def _read_worker(name: str, table) -> tuple[dict | None, list[tuple]]:
+    """One worker as this capability reads it, and everything wrong with it.
+
+    Answering with the problems rather than raising on the first is what lets
+    `doctor` report a whole file in one pass. `run` refuses on the first, because
+    a turn is the expensive thing and a worker that is half declared should never
+    reach one."""
+    problems: list[tuple] = []
+
+    def wrong(sentence: str, exit_code: int = 6) -> None:
+        problems.append((exit_code, "worker_invalid" if exit_code == 6 else "not_found",
+                         sentence))
+
+    if not isinstance(table, dict):
+        return None, [(6, "worker_invalid", "its declaration is not a table")]
+    try:
+        table = _expanded(table, f"worker {name!r}")
+    except Refusal as refused:
+        return None, [(refused.exit_code, refused.code, refused.message)]
+
+    selector = table.get("selector")
+    types: list[str] = []
+    tags: list[str] = []
+    assignee = None
+    if not isinstance(selector, dict):
+        wrong("it declares no selector table")
+    else:
+        declared = selector.get("types")
+        if (not isinstance(declared, list) or not declared
+                or not all(isinstance(t, str) and t.strip() for t in declared)):
+            wrong("its selector needs `types`, an ordered list of task types")
+        else:
+            types = [t.strip() for t in declared]
+        tags = selector.get("tags") or []
+        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+            wrong("its selector's `tags` is a list of tag names")
+            tags = []
+        assignee = selector.get("assignee") or None
+        if assignee is not None and not isinstance(assignee, str):
+            wrong("its selector's `assignee` is one name")
+            assignee = None
+        for unknown in sorted(set(selector) - {"types", "tags", "assignee"}):
+            wrong(f"its selector names {unknown!r}, which nothing reads")
+
+    profile = None
+    declared_profile = table.get("profile")
+    if not isinstance(declared_profile, dict):
+        wrong("it declares no profile table")
+    else:
+        try:
+            profile = _agentworker().Profile.from_dict(declared_profile)
+        except (ValueError, TypeError, KeyError) as exc:
+            wrong(f"its profile is refused by the engine schema: {exc}")
+
+    routines = table.get("routines") or {}
+    if not isinstance(routines, dict):
+        wrong("its `routines` is a table keyed by task type")
+        routines = {}
+    for key, named in routines.items():
+        if (not isinstance(named, list) or not named
+                or not all(isinstance(n, str) and n.strip() for n in named)):
+            wrong(f"its routines for {key!r} must be a list of routine names")
+            continue
+        for one in named:
+            path = _routine_dir() / f"{one}.md"
+            if not path.is_file():
+                wrong(f"the routine {one!r} it names for {key!r} is not at {path}", 3)
+
+    instructions = table.get("instructions") or {}
+    if not isinstance(instructions, dict):
+        wrong("its `instructions` is a table keyed by task type")
+        instructions = {}
+    for key, filename in instructions.items():
+        if not isinstance(filename, str) or not filename.strip():
+            wrong(f"its instruction for {key!r} must name one file")
+            continue
+        path = _instruction_dir() / filename
+        if not path.is_file():
+            wrong(f"the instruction file it names for {key!r} is not at {path}", 3)
+
+    limits = dict(_LIMIT_DEFAULTS)
+    declared_limits = table.get("limits") or {}
+    if not isinstance(declared_limits, dict):
+        wrong("its `limits` is a table of whole numbers")
+        declared_limits = {}
+    for key, value in declared_limits.items():
+        if key not in _LIMIT_DEFAULTS:
+            wrong(f"its limits name {key!r}, which nothing reads")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            wrong(f"its limit {key} must be a whole number above zero")
+        else:
+            limits[key] = value
+
+    # Every type the selector takes has to have somewhere to send the turn. A
+    # type declared in one table and not the other is a hole that would only
+    # show when a task of that type was already claimed and holding a raise.
+    for kind in types:
+        if not _for_pair(routines, kind, None):
+            wrong(f"its selector takes {kind!r} and its routines name none for it")
+        if not _for_pair(instructions, kind, None):
+            wrong(f"its selector takes {kind!r} and its instructions name none for it")
+
+    hint = table.get("park_hint") or ""
+    if not isinstance(hint, str):
+        wrong("its `park_hint` is one sentence")
+        hint = ""
+    for unknown in sorted(set(table) - {"selector", "profile", "routines",
+                                        "instructions", "limits", "park_hint"}):
+        wrong(f"it names {unknown!r}, which nothing reads")
+
+    if problems:
+        return None, problems
+    return {"name": name, "types": types, "tags": tags, "assignee": assignee,
+            "profile": profile, "routines": routines, "instructions": instructions,
+            "limits": limits, "park_hint": hint.strip(),
+            "handler": _handler(profile)}, []
+
+
+def _worker(name: str) -> dict:
+    """The named worker, or the refusal that says why there is no turn to run."""
+    declared = _declarations()
+    if name not in declared:
+        _die(3, "not_found", f"no worker named {name!r} in {_workers_file()}",
+             f"declared here: {', '.join(sorted(declared)) or 'none'}")
+    worker, problems = _read_worker(name, declared[name])
+    if problems:
+        exit_code, code, sentence = problems[0]
+        _die(exit_code, code, f"worker {name!r}: {sentence}",
+             f"`{NAME} doctor` reports every worker this project declares")
+    return worker
+
+
+def _workers_report() -> tuple[list[dict], list[str]]:
+    """Every declared worker and what is wrong with it, for `doctor`."""
+    rows, broken = [], []
+    for name, table in sorted(_declarations().items()):
+        worker, problems = _read_worker(name, table)
+        row = {"worker": name, "ok": not problems}
+        if worker:
+            row["types"] = worker["types"]
+            row["engine"] = worker["profile"].engine
+            row["fence"] = worker["profile"].fence
+        if problems:
+            row["problems"] = [sentence for _code, _slug, sentence in problems]
+            broken += [f"{name}: {sentence}" for _code, _slug, sentence in problems]
+        rows.append(row)
+    return rows, broken
+
+
+# --- What the turn is told ---------------------------------------------------
+
+# The frame this capability puts around the project's own instructions. It
+# carries what is true of every worker on every queue - who it is, what it
+# holds, where the procedure is, how to report, and what the store will refuse -
+# and nothing about what the work is or how this project wants it done. That is
+# the instruction file's, and nothing here reads it.
+
+_OPENING = """You are the worker `{worker}` for one task in this project's queue.
+
+You hold exactly the task below, for the length of a lease, and nothing else holds it while you do."""
+
+_RESUMED = """This task was raised before and the previous turn did not finish. Read the trail below for what has already happened and continue from there rather than starting again."""
+
+_AT_STAGE = """This task is at stage `{stage}`. The entry that set it is on the trail below, and it is the state you start from."""
+
+_LOAD_ROUTINES = """LOAD THESE ROUTINES
+
+Load each of these from this project's `routines/` and follow it. Do not work from memory of them and do not ask for them. Each says when it applies; the first is the procedure for this work, and the rest apply at the moments they name."""
+
+_WRITE_BACK = """THE TRAIL IS HOW YOU REPORT
+
+Write to the task's trail with `{cli} activity {key} "..."` as work happens, not once at the end. If this turn dies, the trail is all that survives, and the next turn reads it to continue.
+
+Write for that next agent, not for a person reading a story. Name the session, the commit, the verdict, the file and the line. "Investigated and found problems" is worthless to the reader it is for.
+
+Act first, then record, then move the status. Never record an intention: if the record is written before the act and the act fails, the trail claims something that did not happen and the next turn believes it.
+
+The trail is append-only. Correct a wrong entry with a later entry saying so; there is no verb that edits one, and the record of having been wrong is part of what the next turn needs.
+
+Creating a task, editing a field, and thinking about the work are not activity and do not belong in the trail."""
+
+_STORE_AUTHORITY = """WHAT THE STORE WILL LET YOU WRITE
+
+This is enforced by the ledger rather than asked of you. `TASKS_EXECUTION` is set for this turn and everything it starts; it signs every write you make and it bounds them.
+
+On this task, the one your raise holds, you write as anyone does, with two limits: you land it on `draft`, `todo`, `waiting`, `complete` or `closed` and nowhere else, and you never change its type.
+
+On every other task you add and never take away: an activity, a tag, a metadata key that is not already there. You cannot remove a tag or a key, write over a key already present, or move another task's status. A task you create is created in `draft` whatever you asked for.
+
+`waiting` says the task is over to somebody and names whom: set it with an assignee in the same call, or the store refuses it.
+
+Do not close your own raise. Whatever started this turn opened it and closes it from wherever you leave the task, so the measurement and the landing cannot disagree.
+
+A refusal exits 4 and names the rule it enforces. That is the rule, not an obstacle to route around."""
+
+
+def _prompt(worker: dict, task: dict, trail: list, routines: list[str],
+            instruction: str, attempt: int, stage: str | None) -> str:
+    """What the turn is given: this capability's frame around the project's text.
+
+    The trail is lifted out of the task and printed as its own section. Left
+    inside, what has already been done would bury the statement of what to do,
+    and it is the half that grows without bound. The raise log goes entirely:
+    it is bookkeeping for somebody auditing the queue and the worker can act on
+    none of it."""
+    task = dict(task)
+    task.pop("activities", None)
+    task["metadata"] = {k: v for k, v in (task.get("metadata") or {}).items()
+                        if k != "raises"}
+    opening = _OPENING.format(worker=worker["name"])
+    if attempt > 1:
+        opening += "\n\n" + _RESUMED
+    if stage:
+        opening += "\n\n" + _AT_STAGE.format(stage=stage)
+    return "\n\n".join([
+        opening,
+        _LOAD_ROUTINES,
+        "\n".join(f"- `{one}`" for one in routines),
+        "THE TASK",
+        json.dumps(task, indent=2, ensure_ascii=False),
+        "WHAT HAS ALREADY HAPPENED, oldest first",
+        json.dumps(trail, indent=2, ensure_ascii=False) if trail else "(empty)",
+        instruction.strip(),
+        _WRITE_BACK.format(cli=NAME, key=_address(task)),
+        _STORE_AUTHORITY,
+    ]) + "\n"
+
+
+# --- One turn ----------------------------------------------------------------
+
+def _stage_of(task: dict) -> str | None:
+    """The boundary a routine left this task at, if it named one. Anything that
+    is not a plain name is no stage: the runner reads this key and nothing else
+    in the task's metadata."""
+    value = (task.get("metadata") or {}).get("stage")
+    return str(value).strip() or None if isinstance(value, (str, int)) else None
+
+
+def _for_pair(table: dict, kind: str, stage: str | None):
+    """What is declared for this task's type, or for its type at this stage when
+    the file names one. A stage nothing is declared for is the type's own work
+    carrying on, so it falls back rather than refusing."""
+    if stage and f"{kind}:{stage}" in table:
+        return table[f"{kind}:{stage}"]
+    return table.get(kind)
+
+
+def _selector_filters(worker: dict) -> dict:
+    opts: dict = {}
+    if worker["tags"]:
+        opts["tag"] = list(worker["tags"])
+    if worker["assignee"]:
+        opts["assignee"] = worker["assignee"]
+    return opts
+
+
+def _take(entry, worker: dict, key: str | None) -> dict:
+    """Take the next task this worker matches, or exactly the one named.
+
+    One claim per type, in the order the selector lists them, stopping at the
+    first that yields: the order is the whole of the arbitration, and a claim
+    takes one type per call, so asking in order is the only way to express a
+    priority at all. A sweep can happen on a call that claims nothing, so what
+    each attempt swept is carried forward rather than lost with the empty answer
+    that reported it."""
+    base = {"lease": str(worker["limits"]["lease_seconds"]),
+            "worker": worker["name"], "handler": worker["handler"]}
+    base.update(_selector_filters(worker))
+    if key:
+        return _claim(entry, {**base, "key": key})
+    swept: list = []
+    answer: dict = {"claimed": None, "swept": [], "returned": []}
+    for kind in worker["types"]:
+        answer = _claim(entry, {**base, "type": kind})
+        swept += answer.get("swept") or []
+        if answer.get("claimed") is not None:
+            break
+    answer["swept"] = swept
+    return answer
+
+
+def _would_take(entry, worker: dict, key: str | None) -> dict:
+    """The task a claim would take, asked in the order the claim asks in, and
+    writing nothing: no sweep, no raise, no status move."""
+    tz = _zone(entry)
+    with _connect(entry) as conn, conn.cursor() as cur:
+        take = None
+        if key:
+            tid = _task_id(cur, key)
+            cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
+                              from {SCHEMA}.tasks where id = %s""", (tid,))
+            row = _rows(cur)[0]
+            take = row if row.pop("due") and row["status"] == "todo" else None
+        else:
+            for kind in worker["types"]:
+                where, params = _where({**_selector_filters(worker), "type": kind}, tz)
+                joiner = " and " if where else " where "
+                cur.execute(f"""select * from {SCHEMA}.tasks{where}{joiner}
+                                  status = 'todo'
+                                  and (pickup_at is null or pickup_at <= now())
+                                order by pickup_at asc nulls last, created_at asc
+                                limit 1""", params)
+                rows = _rows(cur)
+                if rows:
+                    take = rows[0]
+                    break
+    return {"worker": worker["name"], "would_claim": _address(take) if take else None,
+            "applied": False}
+
+
+def _spent(rows: list[dict]) -> int:
+    """How many of these raises got as far as doing something. The row says so
+    itself, so this is counted rather than tracked."""
+    return sum(1 for row in rows
+               if not any((row.get("metrics") or {}).get(mark) for mark in _UNSPENT_MARKS))
+
+
+def _spent_attempts(entry, tid: str) -> int:
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"select metrics from {SCHEMA}.task_executions where task_id = %s",
+                    (tid,))
+        return _spent(_rows(cur))
+
+
+def _state(entry, tid: str) -> tuple[dict, int]:
+    """Where the task stands and how long its trail is, in one look."""
+    with _connect(entry) as conn, conn.cursor() as cur:
+        task = _task_row(cur, tid)
+        cur.execute(f"select count(*) as n from {SCHEMA}.task_activities where task_id = %s",
+                    (tid,))
+        grown = cur.fetchone()["n"]
+    return task, grown
+
+
+def _note(entry, tid: str, text: str) -> None:
+    with _connect(entry) as conn, conn.cursor() as cur:
+        _add_activity(cur, tid, text, _actor())
+        conn.commit()
+
+
+def _hold_off(entry, tid: str, seconds: int) -> str:
+    """Hold the task for a while rather than leave it at the head of the queue,
+    so the next tick does not hand the same task straight back into a limit that
+    has not lifted. The moment is the store's, as every other moment is."""
+    with _connect(entry) as conn, conn.cursor() as cur:
+        before = _task_row(cur, tid)
+        cur.execute(f"""update {SCHEMA}.tasks
+                           set pickup_at = now() + make_interval(secs => %s),
+                               updated_at = now()
+                         where id = %s returning *""", (seconds, tid))
+        after = _rows(cur)[0]
+        _record_moves(cur, tid, before, after, actor=_actor())
+        conn.commit()
+    return after["pickup_at"]
+
+
+def _accumulate_cost(entry, tid: str, cost: float) -> float:
+    """What the task has cost so far, kept beside what each raise cost rather
+    than instead of it: the raise answers what this turn cost, and this answers
+    the question a queue-wide scan asks."""
+    with _connect(entry) as conn, conn.cursor() as cur:
+        prior = (_task_row(cur, tid)["metadata"] or {}).get("cost_total") or 0
+        total = round(float(prior) + float(cost), 4)
+        cur.execute(f"""update {SCHEMA}.tasks
+                           set metadata = metadata || jsonb_build_object('cost_total', %s::jsonb)
+                         where id = %s""", (json.dumps(total), tid))
+        conn.commit()
+    return total
+
+
+def _held_ahead(task: dict) -> bool:
+    """Whether the store is holding this task until a moment still to come.
+
+    A pickup already passed is not a hold: the claim does not clear the field,
+    so a task that waited yesterday still carries yesterday's moment today."""
+    import datetime
+    stamp = task.get("pickup_at")
+    if not stamp:
+        return False
+    try:
+        moment = datetime.datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment > datetime.datetime.now(datetime.timezone.utc)
+
+
+def _settle(landed: str, held_ahead: bool, stage_moved: bool,
+            unspent: bool) -> tuple[str, str, dict]:
+    """Where the task ends up, what the raise is scored, and the marks that say
+    why - decided by where the task stands and never by what the turn said.
+
+    A turn that reports success and moved nothing is not believed, and a turn
+    that says nothing while the task is finished is not doubted."""
+    if unspent:
+        # The account is out of quota, or the engine never got to the work. Not
+        # an attempt at it, so the task goes back and the raise says so.
+        return "todo", "failed", {"exhausted": True}
+    if landed in ("complete", "closed"):
+        # Both are endings reached on purpose: `complete` says the work was
+        # done, `closed` that it was decided against. Scoring the second a
+        # failure would send a settled question back to be re-decided.
+        return landed, "ok", {}
+    if landed in ("todo", "in_progress") and held_ahead:
+        # A hold still ahead when the turn is over was set inside the turn, and
+        # only a turn waiting on somebody sets one. Whether it also moved the
+        # status or left the claim's `in_progress` is the same wait.
+        return "todo", "ok", {"waiting": True}
+    if landed == "todo" and stage_moved:
+        # It ended at a boundary it named and handed on. The next claim starts a
+        # fresh turn at the new stage with the handoff already on the trail.
+        return "todo", "ok", {"handoff": True}
+    if landed in ("waiting", "draft"):
+        # `waiting` is where a turn stopping at a gate leaves the task, over to
+        # whoever must answer. `draft` is scored the same: a handback the store
+        # could hand to nobody lands there, and so does a turn that put the task
+        # back without naming a name.
+        return landed, "handback", {}
+    if landed == "in_progress":
+        # Nobody moved it, so the turn never reached an ending of its own. Left
+        # alone the task would hold a status no live raise backs: no claim would
+        # take it, and no lease would free it.
+        return "todo", "failed", {}
+    return "todo", "failed", {}
+
+
+def _boot(worker: dict, prompt: str, execution: str, cwd: Path):
+    """One engine turn, and the wall time it took. The only thing here that
+    knows how a turn is started.
+
+    The raise goes down with it: `TASKS_EXECUTION` signs every write the turn
+    makes and bounds what those writes may reach. The fence cannot do that - it
+    decides which commands may run, not which rows one of them may move. It is
+    passed rather than exported, so it reaches the turn and its children and
+    nothing else in this process.
+
+    The time is measured here rather than read from the result, because a turn
+    that never reported carries no duration of its own, and telling a turn that
+    died in seconds from one that worked for an hour is exactly what the caller
+    needs in order to decide whether an attempt was spent."""
+    import time
+    import uuid
+    engine = _agentworker()
+    profile = worker["profile"]
+    # A pinned id makes the transcript addressable before the turn starts, so a
+    # turn that is killed still has one. Only claude takes it; codex learns its
+    # own from the stream, and the pointer is then whatever came back.
+    pinned = str(uuid.uuid4())
+    session = (engine.Session.pinned(pinned) if profile.engine == "claude"
+               else engine.Session.fresh())
+    started = time.monotonic()
+    result = engine.run(prompt, profile, str(cwd), session=session,
+                        environ=os.environ, extra_env={"TASKS_EXECUTION": execution})
+    return result, pinned, int((time.monotonic() - started) * 1000)
+
+
+def _close(entry, execution: str, outcome: str, status: str, detail: str | None,
+           system: str, pointer: str, metrics: dict, tid: str, report: dict) -> None:
+    """Close the raise, and say on the trail when it could not be closed.
+
+    A lease that lapsed under the turn frees the task for somebody else, and the
+    sweep closes the claim. Failing quietly there would hide that the work of
+    this turn may already have been redone."""
+    try:
+        _release(entry, execution, outcome, status, detail or None,
+                 system, pointer, json.dumps(metrics))
+    except Refusal as refused:
+        _note(entry, tid, f"This raise could not be closed: {refused.message}")
+        report["release_refused"] = refused.message
+
+
+def _park(entry, worker: dict, tid: str, execution: str, why: str) -> None:
+    """Hand a task back to a person, carrying why it came back. The project's own
+    sentence goes with it: what a person about to read a parked task needs to
+    check is the project's knowledge, not this capability's."""
+    if worker["park_hint"]:
+        why = f"{why} {worker['park_hint']}"
+    _note(entry, tid, why)
+    try:
+        _release(entry, execution, "handback", _OUTCOMES["handback"], why[:200],
+                 None, None, "{}")
+    except Refusal as refused:
+        _note(entry, tid, f"This raise could not be closed: {refused.message}")
+
+
+def cmd_run(entry, args: list[str]) -> None:
+    """One turn of the conveyor: claim, boot, settle.
+
+    This holds no opinion about the work. It selects by the worker's selector,
+    stamps, boots exactly one turn, and stamps what that turn cost. It never
+    reads the turn's answer and decides nothing about the task: the worker moves
+    the status and writes the trail itself, through these same verbs.
+
+    Selection is the store's. `claim` takes the next task, holds it for a lease,
+    opens the raise and moves the status in one transaction, and refuses a
+    second claim on a row that already has one. A turn that dies renews nothing,
+    so the lease lapses and the next claim sweeps it: there is no window here to
+    invent and no stranded run to detect."""
+    opts = _flags(args, ("key",), bools=("apply",), takes=1)
+    if not opts["_loose"]:
+        _die(6, "input", "run needs a worker",
+             f"{NAME} run <worker> [--key KEY] [--apply]")
+    worker = _worker(opts["_loose"][0])
+    if not opts.get("apply"):
+        # Nothing is claimed without --apply, so this says which task a claim
+        # would find rather than pretending to have taken it.
+        _emit(_would_take(entry, worker, opts.get("key")))
+        return
+
+    held = _take(entry, worker, opts.get("key"))
+    report = {"worker": worker["name"], "claimed": None,
+              "swept": held.get("swept") or [], "applied": True}
+    if held.get("claimed") is None:
+        _emit(report)
+        return
+
+    task = held["task"]
+    tid = held["claimed"]
+    execution = str(held["execution"]["id"])
+    attempt = held["attempt"]
+    report.update(claimed=_address(task), attempt=attempt, execution=execution)
+
+    # Counted after the claim, because the claim is what made this raise exist.
+    if _spent_attempts(entry, tid) > worker["limits"]["attempts"]:
+        _park(entry, worker, tid, execution,
+              f"Raised {worker['limits']['attempts']} times without finishing; handed "
+              "back for a decision rather than dispatched again.")
+        report["parked"] = True
+        _emit(report)
+        return
+
+    stage = _stage_of(task)
+    kind = task.get("type") or ""
+    routines = _for_pair(worker["routines"], kind, stage)
+    filename = _for_pair(worker["instructions"], kind, stage)
+    pair = f"{kind}:{stage}" if stage else kind
+    if not routines or not filename:
+        _park(entry, worker, tid, execution,
+              f"Worker {worker['name']!r} declares no "
+              f"{'routines' if not routines else 'instruction file'} for {pair}, so "
+              "there was nothing to give a turn; handed back rather than dispatched "
+              "with half a prompt.")
+        report["parked"] = True
+        _emit(report)
+        return
+    instruction = (_instruction_dir() / filename).read_text()
+
+    prompt = _prompt(worker, task, held.get("activities") or [], routines,
+                     instruction, attempt, stage)
+    _before, grew_from = _state(entry, tid)
+    result, pinned, elapsed_ms = _boot(worker, prompt, execution, _project_here())
+    landing, grew_to = _state(entry, tid)
+
+    engine = _agentworker()
+    detail = result.failure.message[:300] if result.failure else ""
+    # Two ways of recognising a turn that never got to the work, because one is
+    # exact and the other covers what the exact one cannot name. The engine
+    # saying it ran out is the fact, and the library names it from the engine's
+    # own answer rather than from how long the turn lasted. Failing in seconds
+    # while writing nothing is the shape of a turn that never started, whatever
+    # it was.
+    idle = (not result.ok and grew_to == grew_from
+            and elapsed_ms < worker["limits"]["idle_failure_seconds"] * 1000)
+    unspent = idle or (result.failure is not None
+                       and result.failure.kind == engine.FailureKind.QUOTA)
+
+    landed, outcome, marks = _settle(landing["status"], _held_ahead(landing),
+                                     _stage_of(landing) != stage, unspent)
+    # What the turn cost is kept whenever the engine reported it, on every path:
+    # a turn stopped by the account's limit after real work still spent that.
+    measured = (("cost_usd", result.cost_usd), ("duration_ms", result.duration_ms),
+                ("num_turns", result.num_turns), ("elapsed_ms", elapsed_ms),
+                ("model", result.model))
+    metrics = {k: v for k, v in measured if v is not None}
+    metrics.update(marks)
+    pointer = pinned if result.engine == "claude" else (result.session_id or pinned)
+    # A returned id that is not the one the turn was given means it did not
+    # honour the pin, and the pointer would otherwise name a transcript that was
+    # never written.
+    if result.session_id and result.session_id != pointer:
+        metrics["session_id_actual"] = result.session_id
+    report.update({k: True for k in marks if k in ("waiting", "handoff")})
+    if unspent:
+        report["returned_unspent"] = True
+
+    _close(entry, execution, outcome, landed, detail if not result.ok else None,
+           result.engine, pointer, metrics, tid, report)
+    if unspent:
+        report["held_until"] = _hold_off(entry, tid,
+                                         worker["limits"]["hold_seconds_on_exhaustion"])
+    if result.cost_usd is not None:
+        report["cost_total"] = _accumulate_cost(entry, tid, result.cost_usd)
+    # Every raise leaves exactly one entry, including a raise that did nothing. A
+    # task picked up that left no trace is indistinguishable from one never
+    # picked up, and telling those apart is how a stalled queue is noticed.
+    if grew_to == grew_from:
+        _note(entry, tid,
+              "Raised and left no record: the turn ended without writing to the trail "
+              f"({'no answer' if not result.ok else 'answered but recorded nothing'}"
+              f"{': ' + detail if detail else ''}).")
+    # The reading of the turn, not the turn itself: the answer and the engine's
+    # raw report are the worker's, and this verb reads neither.
+    turn = {k: v for k, v in result.to_dict().items()
+            if k not in ("answer", "structured", "raw")}
+    turn["elapsed_ms"] = elapsed_ms
+    report["turn"] = turn
+    report["trail_grew_by"] = grew_to - grew_from
+    _emit(report)
 
 
 def cmd_runs(entry, args: list[str]) -> None:
@@ -4518,8 +5401,16 @@ def cmd_doctor(wanted: str | None) -> None:
         _die(5, "schema_missing",
              f"schema {schema} is incomplete: missing {', '.join(missing)}",
              f"`{NAME} migrate --apply` creates them in {schema}")
+    # A worker that cannot be read is a turn that will not run, and finding that
+    # out here costs nothing while finding it out from a claim costs a task
+    # sitting in `in_progress` holding a raise.
+    workers, broken = _workers_report()
+    if broken:
+        _die(6, "worker_invalid",
+             f"{len(broken)} problem(s) in {_workers_file()}: " + "; ".join(broken),
+             "the file's shape is this capability's contract; `tasks help` states it")
     _emit({"ok": True, "connection": conn_id, "server": server,
-           "schema": schema, "tables": tables})
+           "schema": schema, "tables": tables, "workers": workers})
 
 
 def _guarded(handler, entry, rest) -> None:
@@ -4566,7 +5457,7 @@ def main() -> None:
     handlers = {
         "list": cmd_list, "ready": cmd_ready, "show": cmd_show, "search": cmd_search,
         "add": cmd_add, "set": cmd_set, "meta": cmd_meta, "activity": cmd_activity,
-        "claim": cmd_claim, "release": cmd_release,
+        "claim": cmd_claim, "release": cmd_release, "run": cmd_run,
         "runs": cmd_runs, "history": cmd_history, "migrate": cmd_migrate,
     }
     if verb == "tag":
