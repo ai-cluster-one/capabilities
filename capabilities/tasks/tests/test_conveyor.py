@@ -51,8 +51,8 @@ change = ["development"]
 "defect:verify" = ["development", "reachability"]
 
 [workers.implementation.instructions]
-defect = "implementation.md"
-change = "implementation.md"
+defect = ["implementation.md", "standing.md"]
+change = ["implementation.md", "standing.md"]
 "defect:verify" = "verify.md"
 
 [workers.implementation.limits]
@@ -90,7 +90,7 @@ def project(tmp_path, monkeypatch):
         (tmp_path / "routines" / f"{name}.md").write_text(f"# {name}\n")
     envelope = tmp_path / "capabilities" / "tasks"
     (envelope / "instructions").mkdir(parents=True)
-    for name in ("implementation.md", "verify.md", "evaluation.md"):
+    for name in ("implementation.md", "verify.md", "evaluation.md", "standing.md"):
         (envelope / "instructions" / name).write_text(f"HOW TO RUN IT\n\n{name} text.\n")
     (envelope / "workers.toml").write_text(WORKERS)
     monkeypatch.setattr(mod, "_project_root", lambda: tmp_path)
@@ -144,7 +144,7 @@ def test_an_unknown_worker_is_refused_and_the_known_ones_named(project, capsys):
 
 
 def test_a_missing_instruction_file_is_refused_by_worker_and_pair(project, capsys):
-    (project / "capabilities" / "tasks" / "instructions" / "implementation.md").unlink()
+    (project / "capabilities" / "tasks" / "instructions" / "standing.md").unlink()
     with pytest.raises(SystemExit) as exit_code:
         mod._worker("implementation")
     assert exit_code.value.code == 3
@@ -199,6 +199,18 @@ def test_a_stage_takes_its_own_pair_and_falls_back_when_it_has_none(project):
                                                                     "reachability"]
     assert mod._for_pair(worker["routines"], "defect", "elsewhere") == ["development"]
     assert mod._for_pair(worker["instructions"], "defect", "verify") == "verify.md"
+
+
+def test_several_instruction_files_are_read_in_the_order_they_are_named(
+        project, monkeypatch, capsys):
+    """A rule that holds for every pair a worker takes is written once."""
+    store = Store()
+    engine = Engine(Result(ok=True, engine="claude", cost_usd=0.1, duration_ms=10,
+                           num_turns=1), lands="complete", writes=True)
+    one_turn(monkeypatch, capsys, store, engine)
+    prompt = engine.seen["prompt"]
+    assert "implementation.md text." in prompt and "standing.md text." in prompt
+    assert prompt.index("implementation.md text.") < prompt.index("standing.md text.")
 
 
 def test_a_stage_is_a_plain_name_or_nothing():

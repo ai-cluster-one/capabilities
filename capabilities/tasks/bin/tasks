@@ -150,7 +150,8 @@ WORKERS
     defect = ["capability-development"]
 
     [workers.<name>.instructions] # whose text is embedded in the prompt
-    defect = "implementation.md"
+    defect = "implementation.md"   # or several, read in the order named
+    change = ["implementation.md", "standing.md"]
 
     [workers.<name>.limits]
     attempts = 3                  # raises that did work before it is parked
@@ -169,6 +170,9 @@ WORKERS
   instruction name to `capabilities/tasks/instructions/<name>` in the envelope;
   a worker whose type has neither key, or names a file that is not there, is
   refused rather than run with half a prompt. `tasks doctor` names it first.
+
+  An instruction may name several files, read in the order given, so a rule that
+  holds for every pair a worker takes is written once and named by each.
 
   `${VAR}` inside a declared string is read from the environment, then from the
   project's `.env` and `.env.local`, and a name nothing answers for is refused.
@@ -4685,13 +4689,16 @@ def _read_worker(name: str, table) -> tuple[dict | None, list[tuple]]:
     if not isinstance(instructions, dict):
         wrong("its `instructions` is a table keyed by task type")
         instructions = {}
-    for key, filename in instructions.items():
-        if not isinstance(filename, str) or not filename.strip():
-            wrong(f"its instruction for {key!r} must name one file")
+    for key, named in instructions.items():
+        named = [named] if isinstance(named, str) else named
+        if (not isinstance(named, list) or not named
+                or not all(isinstance(n, str) and n.strip() for n in named)):
+            wrong(f"its instruction for {key!r} must name a file, or several")
             continue
-        path = _instruction_dir() / filename
-        if not path.is_file():
-            wrong(f"the instruction file it names for {key!r} is not at {path}", 3)
+        for one in named:
+            path = _instruction_dir() / one
+            if not path.is_file():
+                wrong(f"the instruction file it names for {key!r} is not at {path}", 3)
 
     limits = dict(_LIMIT_DEFAULTS)
     declared_limits = table.get("limits") or {}
@@ -5148,9 +5155,9 @@ def cmd_run(entry, args: list[str]) -> None:
     stage = _stage_of(task)
     kind = task.get("type") or ""
     routines = _for_pair(worker["routines"], kind, stage)
-    filename = _for_pair(worker["instructions"], kind, stage)
+    named = _for_pair(worker["instructions"], kind, stage)
     pair = f"{kind}:{stage}" if stage else kind
-    if not routines or not filename:
+    if not routines or not named:
         _park(entry, worker, tid, execution,
               f"Worker {worker['name']!r} declares no "
               f"{'routines' if not routines else 'instruction file'} for {pair}, so "
@@ -5159,7 +5166,12 @@ def cmd_run(entry, args: list[str]) -> None:
         report["parked"] = True
         _emit(report)
         return
-    instruction = (_instruction_dir() / filename).read_text()
+    # Several files are read in the order they are named. A standing rule that
+    # holds for every pair this worker takes then has one home, rather than a
+    # copy per pair that rots from whichever copy is edited first.
+    named = [named] if isinstance(named, str) else named
+    instruction = "\n\n".join((_instruction_dir() / one).read_text().strip()
+                              for one in named)
 
     prompt = _prompt(worker, task, held.get("activities") or [], routines,
                      instruction, attempt, stage)
