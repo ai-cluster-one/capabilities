@@ -574,3 +574,32 @@ def test_mixed_ownership_nested_layout_preserves_external_files_and_compose_sema
     assert not any("TELEGRAM_API_ID" in finding["message"]
                    for finding in doctor_payload["findings"])
     assert overlay.read_text() == overlay_content
+
+
+def test_a_mount_beside_the_home_is_created_as_root_and_handed_to_the_agent(
+        tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime.setdefault("volumes", {})["scratch"] = {
+        "description": "a workspace beside the home", "kind": "state",
+        "mount": "/workspace/scratch"}
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    proc = _run(root, env, "sync")
+    assert proc.returncode == 0, proc.stderr
+    dockerfile = (root / "Dockerfile").read_text()
+    lines = dockerfile.split("\n")
+    start = next(i for i, line in enumerate(lines) if line.startswith("RUN mkdir -p \"$HOME/.local/state\""))
+    # The agent user cannot make a directory outside its own home, so the layer
+    # runs as root and hands the result over before anything else is built.
+    assert lines[start - 1] == "USER root"
+    assert "chown ${USERNAME}:${USERNAME}" in lines[start + 1]
+    assert lines[start + 2] == "USER ${USERNAME}"
+    # Every declared mount is both made and handed over, wherever it sits.
+    for mount in ('"/workspace/scratch"', '"$HOME/.local/state/telegram"', '"$HOME/.claude"'):
+        assert mount in lines[start], mount
+        assert mount in lines[start + 1], mount
+    # Root is confined to that one layer: the build ends as the agent.
+    assert dockerfile.rindex("USER ${USERNAME}") > dockerfile.rindex("USER root")
