@@ -68,7 +68,10 @@ def test_the_help_says_what_waiting_means():
                    "a task that waits on nobody is a stall with a name missing",
                    "once its pickup moment has passed",
                    "`blocked_by` names has ended",
-                   "it lands that task on draft, todo, waiting, complete or closed"):
+                   "it lands that task on draft, todo, waiting, complete or closed",
+                   "A wait begins clean, because a hold from before the wait "
+                   "does not say when the wait is over",
+                   "Appoint the moment in the same call"):
         assert needle in said
     # And `draft` keeps the one meaning it had.
     assert "`draft` means one thing and only one: nobody has released it yet" in said
@@ -123,6 +126,68 @@ def test_a_blocker_that_names_no_task_holds_it():
     # Nothing ended it, so it did not end. The conservative answer is the only
     # safe one: the alternative frees a task because a name was mistyped.
     assert mod._wait_over(waits(metadata={"blocked_by": ["gone"]}), {"a"}) is None
+
+
+# --- The hold a wait must not inherit ----------------------------------------
+
+class Ended:
+    """The one read a settlement makes of the store: which of the names a task
+    is waiting on belong to a task that has already ended."""
+
+    def __init__(self, ended: list[dict] | None = None) -> None:
+        self.ended = [dict(r) for r in (ended or [])]
+        self.asked_for: tuple | None = None
+        self.answer: list[dict] = []
+
+    def execute(self, sql, params=None):
+        assert "status in ('complete','closed')" in " ".join(sql.split())
+        self.asked_for = params
+        self.answer = [dict(r) for r in self.ended]
+
+    def fetchall(self):
+        return self.answer
+
+
+def test_a_wait_drops_a_pickup_written_before_it():
+    # Whatever that moment was for, it was not this wait, and left in place the
+    # next claim reads it as the wait being over.
+    cur = Ended()
+    assert mod._settle_the_wait(cur, "waiting", waits(pickup_at="then"), False) == (
+        ["pickup_at = null"], [])
+    # Nothing to drop is nothing written.
+    assert mod._settle_the_wait(cur, "waiting", waits(), False) == ([], [])
+
+
+def test_a_moment_appointed_in_the_same_call_stands():
+    assert mod._settle_the_wait(Ended(), "waiting", waits(pickup_at="then"), True) == ([], [])
+
+
+def test_no_other_landing_settles_anything():
+    for status in mod.STATUSES:
+        if status != "waiting":
+            assert mod._settle_the_wait(
+                Ended(), status, waits(pickup_at="then"), False) == ([], [])
+
+
+def test_a_spent_blocked_by_is_dropped():
+    task = waits(metadata={"blocked_by": ["k-9", "k-8"]})
+    cur = Ended([{"id": "t-9", "unique_key": "k-9"}, {"id": "t-8", "unique_key": "k-8"}])
+    assert mod._settle_the_wait(cur, "waiting", task, True) == (
+        ["metadata = metadata - 'blocked_by'"], ["k-9", "k-8"])
+    assert cur.asked_for == (["k-8", "k-9"], ["k-8", "k-9"])
+
+
+def test_a_blocked_by_with_one_task_still_open_is_kept():
+    task = waits(metadata={"blocked_by": ["k-9", "k-8"]})
+    half = Ended([{"id": "t-9", "unique_key": "k-9"}])
+    assert mod._settle_the_wait(half, "waiting", task, True) == ([], [])
+    # And a name matching no task has not ended here either, exactly as in the
+    # sweep: an unknown blocker holds the wait rather than clearing it away.
+    assert mod._settle_the_wait(Ended(), "waiting", task, True) == ([], [])
+    # A task naming no blockers asks the store nothing.
+    bare = Ended()
+    assert mod._settle_the_wait(bare, "waiting", waits(), True) == ([], [])
+    assert bare.asked_for is None
 
 
 # --- The sweep, against fake reads -------------------------------------------
@@ -202,11 +267,24 @@ def test_the_sweep_asks_nothing_when_nothing_waits():
 EXECUTION = {"id": "exec-1", "task_id": "t-1", "status": "running", "worker": "a worker"}
 
 
+def landed(cur, text: str) -> None:
+    """Apply to the fake task whatever the write settled without a parameter.
+
+    Both settlements are literals in the SQL rather than values, which is what
+    lets a fake prove they were written at all."""
+    if "pickup_at = null" in text:
+        cur.task["pickup_at"] = None
+    if "metadata - 'blocked_by'" in text:
+        cur.task["metadata"] = {k: v for k, v in (cur.task.get("metadata") or {}).items()
+                                if k != "blocked_by"}
+
+
 class ReleaseCursor:
     """The reads and writes `release` makes, answered from memory."""
 
-    def __init__(self, task: dict) -> None:
+    def __init__(self, task: dict, ended: list[dict] | None = None) -> None:
         self.task = dict(task)
+        self.ended = [dict(r) for r in (ended or [])]
         self.answer: list[dict] = []
         self.changes: list[tuple] = []
 
@@ -224,8 +302,11 @@ class ReleaseCursor:
             self.answer = [{**EXECUTION, "status": params[0], "ended_at": "now"}]
         elif text.startswith("select * from") and "tasks where id" in text:
             self.answer = [dict(self.task)]
+        elif "status in ('complete','closed')" in text:
+            self.answer = [dict(r) for r in self.ended]
         elif text.startswith("update") and "tasks set status" in text:
             self.task["status"] = params[0]
+            landed(self, text)
             self.answer = [dict(self.task)]
         elif "task_changes" in text:
             self.changes.append(params)
@@ -237,7 +318,51 @@ class ReleaseCursor:
         return self.answer
 
 
-class ReleaseConn:
+class SetCursor:
+    """The reads and writes `set` makes, answered from memory."""
+
+    def __init__(self, task: dict, ended: list[dict] | None = None) -> None:
+        self.task = dict(task)
+        self.ended = [dict(r) for r in (ended or [])]
+        self.answer: list[dict] = []
+        self.changes: list[tuple] = []
+        self.written = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        text = " ".join(sql.split())
+        if "where id::text = %s or unique_key" in text:
+            self.answer = [{"id": self.task["id"]}]
+        elif "status in ('complete','closed')" in text:
+            self.answer = [dict(r) for r in self.ended]
+        elif text.startswith("select * from") and "tasks where id" in text:
+            self.answer = [dict(self.task)]
+        elif text.startswith("update") and "tasks set" in text:
+            self.written = text
+            body = text.split(" set ", 1)[1].split(" where ", 1)[0]
+            named = [one.split(" = ")[0] for one in body.split(", ") if one.endswith("= %s")]
+            for column, value in zip(named, params):
+                self.task[column] = value
+            landed(self, body)
+            self.answer = [dict(self.task)]
+        elif "task_executions" in text:
+            self.answer = []
+        elif "task_changes" in text:
+            self.changes.append(params)
+            self.answer = []
+        else:
+            raise AssertionError(f"unexpected query: {text}")
+
+    def fetchall(self):
+        return self.answer
+
+
+class FakeConn:
     def __init__(self, cur):
         self.cur = cur
 
@@ -256,12 +381,80 @@ class ReleaseConn:
 
 @pytest.fixture
 def releasing(monkeypatch):
-    def run(task: dict, args: list[str]) -> dict:
-        cur = ReleaseCursor(task)
-        monkeypatch.setattr(mod, "_connect", lambda entry: ReleaseConn(cur))
+    def run(task: dict, args: list[str], ended: list[dict] | None = None) -> ReleaseCursor:
+        cur = ReleaseCursor(task, ended)
+        monkeypatch.setattr(mod, "_connect", lambda entry: FakeConn(cur))
         mod.cmd_release({"timezone": "UTC"}, ["exec-1", *args])
         return cur
     return run
+
+
+@pytest.fixture
+def setting(monkeypatch):
+    monkeypatch.delenv("TASKS_EXECUTION", raising=False)
+
+    def run(task: dict, args: list[str], ended: list[dict] | None = None) -> SetCursor:
+        cur = SetCursor(task, ended)
+        monkeypatch.setattr(mod, "_connect", lambda entry: FakeConn(cur))
+        mod.cmd_set({"timezone": "UTC"}, [str(task["id"]), *args])
+        return cur
+    return run
+
+
+def held(**fields) -> dict:
+    return {"id": "t-1", "unique_key": "k-1", "status": "todo", "assignee": None,
+            "type": "probe", "metadata": {}, "pickup_at": None, **fields}
+
+
+THEN = "2026-09-18T09:00:00+00:00"
+
+
+def test_set_drops_a_hold_from_before_the_wait(setting, capsys):
+    cur = setting(held(pickup_at=THEN), ["--status", "waiting", "--assignee", "the owner"])
+    answer = _answer(capsys)
+    assert answer["task"]["status"] == "waiting" and answer["task"]["pickup_at"] is None
+    # The drop is a field move like any other, so `history` carries it and a
+    # reader sees what the wait let go of.
+    assert answer["moved"] == ["status", "pickup", "assignee"]
+    assert [c[1:4] for c in cur.changes if c[1] == "pickup"] == [("pickup", THEN, None)]
+
+
+def test_set_keeps_a_moment_appointed_in_the_same_call(setting, capsys):
+    cur = setting(held(pickup_at=THEN),
+                  ["--status", "waiting", "--assignee", "the owner",
+                   "--pickup", "2026-12-01T09:00:00+00:00"])
+    answer = _answer(capsys)
+    assert answer["task"]["pickup_at"].startswith("2026-12-01")
+    assert "pickup_at = null" not in cur.written
+
+
+def test_set_drops_a_spent_blocked_by_and_says_so(setting, capsys):
+    cur = setting(held(metadata={"blocked_by": ["k-9"], "cost_total": "1.5"}),
+                  ["--status", "waiting", "--assignee", "the owner"],
+                  ended=[{"id": "t-9", "unique_key": "k-9"}])
+    answer = _answer(capsys)
+    assert answer["blocked_by_spent"] == ["k-9"]
+    # That key and nothing else: the rest of the metadata is not this verb's.
+    assert answer["task"]["metadata"] == {"cost_total": "1.5"}
+    assert cur.changes and all(c[1] != "pickup" for c in cur.changes)
+
+
+def test_set_keeps_a_blocked_by_still_naming_an_open_task(setting, capsys):
+    setting(held(metadata={"blocked_by": ["k-9"]}),
+            ["--status", "waiting", "--assignee", "the owner"])
+    answer = _answer(capsys)
+    assert "blocked_by_spent" not in answer
+    assert answer["task"]["metadata"] == {"blocked_by": ["k-9"]}
+
+
+def test_set_settles_nothing_on_a_landing_that_is_not_a_wait(setting, capsys):
+    cur = setting(held(pickup_at=THEN, metadata={"blocked_by": ["k-9"]}),
+                  ["--assignee", "the owner"],
+                  ended=[{"id": "t-9", "unique_key": "k-9"}])
+    answer = _answer(capsys)
+    assert answer["task"]["pickup_at"] == THEN
+    assert answer["task"]["metadata"] == {"blocked_by": ["k-9"]}
+    assert "pickup_at = null" not in cur.written
 
 
 def test_a_handback_lands_the_task_with_its_assignee(releasing, capsys):
@@ -296,6 +489,49 @@ def test_status_still_overrides_the_landing(releasing, capsys):
               ["--outcome", "ok", "--status", "waiting"])
     landed = _answer(capsys)
     assert landed["task"]["status"] == "draft" and landed["instead_of_waiting"]
+
+
+def test_a_handback_drops_a_hold_from_before_the_wait(releasing, capsys):
+    cur = releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+                     "pickup_at": THEN, "type": "defect", "metadata": {}},
+                    ["--outcome", "handback"])
+    answer = _answer(capsys)
+    assert answer["task"]["status"] == "waiting" and answer["task"]["pickup_at"] is None
+    assert answer["moved"] == ["status", "pickup"]
+    assert [c[1:4] for c in cur.changes if c[1] == "pickup"] == [("pickup", THEN, None)]
+
+
+def test_a_handback_drops_a_spent_blocked_by_and_keeps_a_live_one(releasing, capsys):
+    releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+               "pickup_at": None, "type": "defect", "metadata": {"blocked_by": ["k-9"]}},
+              ["--outcome", "handback"], ended=[{"id": "t-9", "unique_key": "k-9"}])
+    spent = _answer(capsys)
+    assert spent["blocked_by_spent"] == ["k-9"] and spent["task"]["metadata"] == {}
+
+    releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+               "pickup_at": None, "type": "defect", "metadata": {"blocked_by": ["k-9"]}},
+              ["--outcome", "handback"])
+    kept = _answer(capsys)
+    assert "blocked_by_spent" not in kept
+    assert kept["task"]["metadata"] == {"blocked_by": ["k-9"]}
+
+
+def test_a_landing_that_is_not_a_wait_keeps_the_hold(releasing, capsys):
+    # Completed, the task is over and nothing about it is a wait.
+    releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+               "pickup_at": THEN, "type": "defect", "metadata": {"blocked_by": ["k-9"]}},
+              ["--outcome", "ok"], ended=[{"id": "t-9", "unique_key": "k-9"}])
+    done = _answer(capsys)
+    assert done["task"]["pickup_at"] == THEN
+    assert done["task"]["metadata"] == {"blocked_by": ["k-9"]}
+
+    # And a handback the store could hand to nobody lands in `draft`, which is
+    # backlog carrying a hold rather than a wait beginning.
+    releasing({"id": "t-1", "status": "in_progress", "assignee": None,
+               "pickup_at": THEN, "type": "defect", "metadata": {}},
+              ["--outcome", "handback"])
+    drafted = _answer(capsys)
+    assert drafted["task"]["status"] == "draft" and drafted["task"]["pickup_at"] == THEN
 
 
 # --- What a scan says about who is waited on ---------------------------------
@@ -469,6 +705,90 @@ def test_a_returned_task_is_taken_by_the_same_claim(store, capsys):
     assert claimed["returned"] == ["s-4"]
     assert claimed["task"]["unique_key"] == "s-4"
     assert claimed["task"]["status"] == "in_progress"
+
+
+@needs_store
+def test_a_gate_stop_survives_the_claim_that_follows_it(store, capsys):
+    entry, schema, conn = store
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    seed(entry, capsys, "g-1", status="todo", pickup=past)
+    seed(entry, capsys, "g-2", status="todo")
+    seed(entry, capsys, "g-blocker", status="todo")
+    mod.cmd_meta(entry, ["set", "g-2", "blocked_by", '["g-blocker"]'])
+    mod.cmd_set(entry, ["g-blocker", "--status", "complete"])
+    capsys.readouterr()
+
+    # A hold from before the wait is dropped on the way in, and the drop is a
+    # field move like any other.
+    mod.cmd_set(entry, ["g-1", "--status", "waiting", "--assignee", "the owner"])
+    stopped = _answer(capsys)
+    assert stopped["task"]["status"] == "waiting" and stopped["task"]["pickup_at"] is None
+    assert "pickup" in stopped["moved"]
+    mod.cmd_history(entry, ["g-1", "--field", "pickup"])
+    [dropped] = _answer(capsys)["changes"]
+    assert dropped["new_value"] is None and dropped["old_value"]
+
+    # A blocked_by with nothing left to wait on goes with it, said out loud.
+    mod.cmd_set(entry, ["g-2", "--status", "waiting", "--assignee", "the owner"])
+    spent = _answer(capsys)
+    assert spent["blocked_by_spent"] == ["g-blocker"]
+    assert "blocked_by" not in spent["task"]["metadata"]
+
+    # The next claim is where a stop used to evaporate. Both are still waiting.
+    mod.cmd_claim(entry, ["--type", "nothing"])
+    assert _answer(capsys)["returned"] == []
+    for key in ("g-1", "g-2"):
+        mod.cmd_show(entry, [key])
+        assert _answer(capsys)["task"]["status"] == "waiting"
+
+
+@needs_store
+def test_a_handback_hands_over_a_wait_that_begins_clean(store, capsys):
+    entry, schema, conn = store
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    seed(entry, capsys, "g-3", status="todo", assignee="the owner", pickup=past)
+    mod.cmd_claim(entry, ["--key", "g-3", "--worker", "a worker"])
+    mod.cmd_release(entry, [_answer(capsys)["execution"]["id"], "--outcome", "handback"])
+    handed = _answer(capsys)
+    assert handed["task"]["status"] == "waiting" and handed["task"]["pickup_at"] is None
+    assert "pickup" in handed["moved"]
+
+    mod.cmd_claim(entry, ["--type", "nothing"])
+    assert _answer(capsys)["returned"] == []
+    mod.cmd_show(entry, ["g-3"])
+    assert _answer(capsys)["task"]["status"] == "waiting"
+
+
+@needs_store
+def test_a_wait_keeps_what_was_chosen_for_it(store, capsys):
+    entry, schema, conn = store
+    soon = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    seed(entry, capsys, "g-4", status="todo")
+    seed(entry, capsys, "g-5", status="todo")
+    seed(entry, capsys, "g-open", status="todo")
+    mod.cmd_meta(entry, ["set", "g-5", "blocked_by", '["g-open"]'])
+    capsys.readouterr()
+
+    # A moment appointed in the same call was chosen for this wait, so it stands.
+    mod.cmd_set(entry, ["g-4", "--status", "waiting", "--assignee", "the owner",
+                        "--pickup", soon])
+    appointed = _answer(capsys)
+    assert appointed["task"]["pickup_at"] is not None
+
+    # A blocker still open is a live reason to wait, and the key is untouched.
+    mod.cmd_set(entry, ["g-5", "--status", "waiting", "--assignee", "the owner"])
+    kept = _answer(capsys)
+    assert kept["task"]["metadata"]["blocked_by"] == ["g-open"]
+    assert "blocked_by_spent" not in kept
+
+    mod.cmd_claim(entry, ["--type", "nothing"])
+    assert _answer(capsys)["returned"] == []
+
+    # And the wait still ends the way it did: when the task it named is over.
+    mod.cmd_set(entry, ["g-open", "--status", "complete"])
+    capsys.readouterr()
+    mod.cmd_claim(entry, ["--type", "nothing"])
+    assert _answer(capsys)["returned"] == ["g-5"]
 
 
 @needs_store

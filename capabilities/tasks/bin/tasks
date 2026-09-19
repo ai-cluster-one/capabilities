@@ -105,6 +105,15 @@ FIELDS  (add and set take the same set)
                         Waiting on neither, it waits on the name it carries, and
                         nothing but a person or that assignee moves it.
 
+                        A wait begins clean, because a hold from before the wait
+                        does not say when the wait is over: entering `waiting`
+                        drops a pickup the task was already carrying, and drops a
+                        `blocked_by` whose tasks have all ended. Appoint the
+                        moment in the same call - `--status waiting --assignee
+                        <who> --pickup <when>` - and it stands, because it was
+                        chosen for the wait. A `blocked_by` still naming an open
+                        task is left alone: that is a live reason to wait.
+
                         Two states end a task and they do not mean the same
                         thing. `complete` says the work was done. `closed` says
                         the task is over without having been done - superseded by
@@ -3600,6 +3609,48 @@ def _wait_has_a_name(status: str | None, assignee: str | None) -> None:
          "name whom it waits for in the same call: --status waiting --assignee <who>")
 
 
+def _spent_blockers(cur, task: dict) -> list[str]:
+    """The tasks a wait names when every one of them has already ended.
+
+    A `blocked_by` is spent once nothing it names is still open: it cannot be
+    what a wait beginning now is for, and left in place the next claim reads it
+    and returns the task within the minute. One name still open is a live reason
+    to wait, so this answers with nothing and the key is left exactly as it is."""
+    named = _blocked_by(task)
+    if not named:
+        return []
+    ended = _ended_among(cur, sorted(set(named)))
+    return named if all(key in ended for key in named) else []
+
+
+def _settle_the_wait(cur, status: str | None, before: dict,
+                     pickup_named: bool) -> tuple[list[str], list[str]]:
+    """What a transition into `waiting` lets go of: assignments to splice into
+    the write, and the blockers it found spent.
+
+    Two fields already mean "do not raise this yet" to somebody else: a
+    `pickup_at` a runner set as a hold, and a `blocked_by` naming other tasks.
+    `waiting` gives both a second meaning - the moment the wait ends - and a hold
+    written before the wait is no answer to when the wait is over, so the sweep
+    inside the next claim reads a lapsed pickup or a spent list and returns the
+    task within the minute. A decision asked for would evaporate unanswered.
+
+    So a wait begins clean. The pickup is dropped unless this same call appoints
+    one, which is a moment chosen for the wait rather than inherited, and the
+    spent `blocked_by` goes with it. Both are visible where a field move always
+    is: the dropped pickup as a change row, the removed key in the verb's own
+    answer."""
+    if status != "waiting":
+        return [], []
+    assignments = []
+    if not pickup_named and before.get("pickup_at") is not None:
+        assignments.append("pickup_at = null")
+    spent = _spent_blockers(cur, before)
+    if spent:
+        assignments.append("metadata = metadata - 'blocked_by'")
+    return assignments, spent
+
+
 def _os_user() -> str:
     """The account this process runs as, read from the system rather than
     from a variable somebody may have set."""
@@ -3820,8 +3871,13 @@ def cmd_set(entry, args: list[str]) -> None:
         _wait_has_a_name(values.get("status", before.get("status")),
                          values["assignee"] if "assignee" in values
                          else before.get("assignee"))
+        # Only a call that names the status is a transition into the wait, and
+        # naming `--pickup` - or clearing it - is what says the moment was chosen
+        # for this wait rather than inherited from whatever held the task before.
+        settled, spent = _settle_the_wait(cur, values.get("status"), before,
+                                          "pickup_at" in values)
         cols = list(values)
-        assignments = [c + " = %s" for c in cols] + ["updated_at = now()"]
+        assignments = [c + " = %s" for c in cols] + settled + ["updated_at = now()"]
         cur.execute(f"""update {SCHEMA}.tasks set {', '.join(assignments)}
                          where id = %s returning *""", [values[c] for c in cols] + [tid])
         row = _rows(cur)[0]
@@ -3831,7 +3887,10 @@ def cmd_set(entry, args: list[str]) -> None:
                               execution_id=(_open_execution(cur, tid) or {}).get("id"),
                               actor=_actor(opts.get("actor")))
         conn.commit()
-        _emit({"updated": row["id"], "fields": cols, "moved": moved, "task": row})
+        answer = {"updated": row["id"], "fields": cols, "moved": moved, "task": row}
+        if spent:
+            answer["blocked_by_spent"] = spent
+        _emit(answer)
 
 
 def cmd_tag(entry, args: list[str], remove: bool = False) -> None:
@@ -4028,6 +4087,24 @@ def _blocked_by(task: dict) -> list[str]:
     return [str(k).strip() for k in named if str(k).strip()]
 
 
+def _ended_among(cur, names: list[str]) -> set:
+    """Which of these names belong to a task that has already ended.
+
+    A name is matched as a key and as an id, because a blocker is written either
+    way, and a name matching no task is simply absent from the answer: wherever
+    this is read, an unknown name holds the wait rather than freeing it."""
+    if not names:
+        return set()
+    cur.execute(f"""select id, unique_key from {SCHEMA}.tasks
+                     where status in ('complete','closed')
+                       and (unique_key = any(%s) or id::text = any(%s))""",
+                (names, names))
+    ended: set = set()
+    for row in _rows(cur):
+        ended.update(k for k in (str(row["id"]), row["unique_key"]) if k)
+    return ended
+
+
 def _wait_over(task: dict, ended: set) -> str | None:
     """Why this waiting task's wait is over, or None while it still waits.
 
@@ -4062,15 +4139,8 @@ def _sweep_waiting(cur) -> list[dict]:
     waiting = _rows(cur)
     if not waiting:
         return []
-    named = sorted({key for task in waiting for key in _blocked_by(task)})
-    ended: set = set()
-    if named:
-        cur.execute(f"""select id, unique_key from {SCHEMA}.tasks
-                         where status in ('complete','closed')
-                           and (unique_key = any(%s) or id::text = any(%s))""",
-                    (named, named))
-        for row in _rows(cur):
-            ended.update(k for k in (str(row["id"]), row["unique_key"]) if k)
+    ended = _ended_among(cur, sorted({key for task in waiting
+                                      for key in _blocked_by(task)}))
     returned = []
     for task in waiting:
         why = _wait_over(task, ended)
@@ -4252,7 +4322,11 @@ def cmd_release(entry, args: list[str]) -> None:
                      execution["id"]))
         closed = _rows(cur)[0]
         before = _task_row(cur, tid)
-        cur.execute(f"""update {SCHEMA}.tasks set status = %s, updated_at = now()
+        # `release` appoints no moment of its own, so a pickup it finds on the
+        # way into `waiting` is always one from before the wait.
+        settled, spent = _settle_the_wait(cur, status, before, False)
+        extra = "".join(f", {one}" for one in settled)
+        cur.execute(f"""update {SCHEMA}.tasks set status = %s{extra}, updated_at = now()
                          where id = %s returning *""", (status, tid))
         after = _rows(cur)[0]
         moved = _record_moves(cur, tid, before, after, execution_id=str(closed["id"]),
@@ -4262,6 +4336,8 @@ def cmd_release(entry, args: list[str]) -> None:
                   "execution": closed, "task": after}
         if instead:
             answer["instead_of_waiting"] = instead
+        if spent:
+            answer["blocked_by_spent"] = spent
         _emit(answer)
 
 
