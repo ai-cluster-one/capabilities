@@ -603,3 +603,56 @@ def test_a_mount_beside_the_home_is_created_as_root_and_handed_to_the_agent(
         assert mount in lines[start + 1], mount
     # Root is confined to that one layer: the build ends as the agent.
     assert dockerfile.rindex("USER ${USERNAME}") > dockerfile.rindex("USER root")
+
+
+def test_declared_system_packages_reach_the_image(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["compiler"]["container"]["system_packages"] = ["poppler-utils", "tesseract-ocr"]
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    proc = _run(root, env, "sync")
+    assert proc.returncode == 0, proc.stderr
+    dockerfile = (root / "Dockerfile").read_text()
+    # Appended to the base set, so the base set is still what the other tests read.
+    assert "python3 procps supervisor poppler-utils tesseract-ocr \\" in dockerfile
+    # The declaration survives the sync that read it.
+    compiled = json.loads(runtime_path.read_text())
+    assert compiled["compiler"]["container"]["system_packages"] == ["poppler-utils", "tesseract-ocr"]
+
+    # A name apt would not accept stops the whole sync rather than being quietly
+    # dropped from the apt line, so the image is never built from a list the
+    # project did not write.
+    runtime["compiler"]["container"]["system_packages"] = ["poppler-utils; rm -rf /"]
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    report = json.loads(_run(root, env, "doctor").stdout)
+    assert [f for f in report["findings"]
+            if "system_packages" in f["message"] and f["severity"] == "error"], report
+    proc = _run(root, env, "sync")
+    assert json.loads(proc.stdout)["ok"] is False
+    assert (root / "Dockerfile").read_text() == dockerfile
+
+
+def test_system_packages_are_reported_as_ignored_under_an_external_dockerfile(
+        tmp_path: Path) -> None:
+    root, env = _project(tmp_path)
+    _setup(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    (root / "Dockerfile").write_text("FROM debian:bookworm-slim\n")
+    runtime["compiler"]["artifacts"]["dockerfile"] = {
+        "path": "Dockerfile", "ownership": "external"}
+    runtime["compiler"]["container"]["system_packages"] = ["poppler-utils"]
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+    report = json.loads(_run(root, env, "doctor").stdout)
+    ignored = [f for f in report["findings"] if "system_packages" in f["message"]]
+    # The project keeps its own Dockerfile and the build still runs; it is only
+    # told that this declaration is not what put a package in the image.
+    assert [f["severity"] for f in ignored] == ["warning"], report
+    assert "externally owned" in ignored[0]["message"]
+    proc = _run(root, env, "sync")
+    assert proc.returncode == 0, proc.stderr
+    assert (root / "Dockerfile").read_text() == "FROM debian:bookworm-slim\n"

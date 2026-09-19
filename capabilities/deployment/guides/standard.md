@@ -68,7 +68,8 @@ New setup uses root artifact paths, but runtime v1 can explicitly declare a
 custom compiler layout. `compose_file` selects the generated base Compose file;
 `compiler.artifacts` selects the Dockerfile, entrypoint, env example,
 dockerignore, and optional supervisor paths; `compiler.compose_overlays` lists project-owned overlays;
-and `compiler.container` resolves portable service mount targets:
+and `compiler.container` describes the container the compiler renders - the
+portable service mount targets and the packages the image installs:
 
 ```json
 {
@@ -96,6 +97,19 @@ overlays remain external.
 Compose build arguments are emitted only from `compiler.build_args`. When that
 mapping is absent or empty, generated Compose has no `build.args`, so an
 external Dockerfile's own `ARG` defaults remain authoritative.
+
+`compiler.container.system_packages` lists the Debian packages the box's workers
+need beyond the base image - a PDF renderer, an OCR engine:
+
+```json
+{"compiler": {"container": {"system_packages": ["poppler-utils"]}}}
+```
+
+The generated Dockerfile installs them with the base set, so a need is declared
+once and survives every re-sync instead of living in a hand-edited rendered
+file. A name apt would not accept is a doctor error and never reaches a build.
+The list reaches the image through that generated Dockerfile alone, so doctor
+reports it as ignored while `compiler.artifacts.dockerfile` is externally owned.
 
 Capability descriptors use `{agent_home}` and `{project_root}` mount targets.
 Compilation resolves those tokens through `compiler.container`; an existing

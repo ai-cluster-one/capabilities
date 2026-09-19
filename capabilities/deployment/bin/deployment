@@ -3148,6 +3148,11 @@ def _watchdog_config(raw) -> dict:
     return config
 
 
+def _safe_package_name(value: object) -> bool:
+    """One Debian package name: what apt accepts and nothing a shell would read."""
+    return isinstance(value, str) and re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", value) is not None
+
+
 def _compiler_config(runtime: dict) -> dict:
     """Normalized compiler layout. Missing fields retain the original root layout."""
     defaults = {
@@ -3183,6 +3188,14 @@ def _compiler_config(runtime: dict) -> dict:
         for key in container:
             if _safe_container_path(raw_container.get(key)):
                 container[key] = raw_container[key]
+        # Packages the box's workers need beyond the base image - a PDF renderer, an
+        # OCR engine. Declared here rather than added to a rendered Dockerfile, so a
+        # re-sync keeps them. A name apt would not accept is dropped here and named by
+        # doctor, never passed through to a build.
+        declared = raw_container.get("system_packages")
+        if isinstance(declared, list):
+            container["system_packages"] = [
+                name for name in declared if _safe_package_name(name)]
     host = dict(defaults["host"])
     raw_host = raw.get("host")
     if isinstance(raw_host, dict):
@@ -3902,6 +3915,8 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
               if checkout else
               "# Agent box: project brain + agent CLIs + capability CLIs.")
     supervisor_package = " supervisor" if with_supervisor else ""
+    extra_packages = "".join(
+        " " + name for name in compiler["container"].get("system_packages") or [])
     # Every declared mount is created here: a fresh named volume inherits the
     # ownership of whatever the image left at its mount point, so a directory the
     # image never made arrives owned by root and the agent cannot write into it.
@@ -3916,7 +3931,7 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-        ca-certificates curl git openssh-client ripgrep file ffmpeg python3 procps{supervisor_package} \\
+        ca-certificates curl git openssh-client ripgrep file ffmpeg python3 procps{supervisor_package}{extra_packages} \\
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
@@ -5317,6 +5332,17 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
             if isinstance(home, str) and Path(home).parent.as_posix() != "/home":
                 findings.append({"severity": "error", "path": _rel(root, path),
                                  "message": "compiler.container.agent_home must be /home/<user> for the generated agent image"})
+            packages = container.get("system_packages")
+            if packages is not None and (not isinstance(packages, list) or not all(
+                    _safe_package_name(name) for name in packages)):
+                findings.append({"severity": "error", "path": _rel(root, path),
+                                 "message": "compiler.container.system_packages must be a list of Debian package names"})
+            declaration = artifacts.get("dockerfile") if isinstance(artifacts, dict) else None
+            if packages and _artifact_declaration(declaration)[1] == "external":
+                findings.append({"severity": "warning", "path": _rel(root, path),
+                                 "message": "compiler.container.system_packages reaches the image through the "
+                                            "generated Dockerfile and is ignored while that artifact is "
+                                            "externally owned"})
         build_args = compiler_raw.get("build_args", {})
         if (not isinstance(build_args, dict)
                 or not all(_safe_env_key(key) and isinstance(value, str)
