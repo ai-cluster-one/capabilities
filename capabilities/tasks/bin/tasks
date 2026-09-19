@@ -145,6 +145,32 @@ ACTOR
   environment; else the account the process runs as, which is never empty.
   `claim` and `release` attribute their moves to `--worker`.
 
+WORKER SCOPE
+  TASKS_EXECUTION does not only sign a write, it bounds one. With it set the
+  process is a worker holding one raise, and what it may write is decided by
+  that raise rather than by what the connection would otherwise allow.
+
+  On the task its raise holds, a worker writes as anyone does, with two limits:
+  it lands that task on draft, todo, complete or closed and nowhere else, and it
+  never changes a type. Which pipeline work belongs to is not a worker's call.
+
+  On every other task a worker adds and never takes away: an activity, a tag, a
+  metadata key not already there. It may not remove a tag or a key, overwrite a
+  key already present, or move a status. `add` creates in draft whatever
+  --status says, and the answer reports the coercion under `coerced`.
+
+  A raise that has been closed or swept holds nothing, so a worker whose raise
+  is over writes no status at all, its own former task included. A lapse
+  narrows what a worker may do; it never widens it.
+
+  The scope is the ledger's and not the machine's. It follows the variable, so
+  a turn that passes TASKS_EXECUTION on hands the same bounds to whatever it
+  starts, and a process without it is not a worker however it was launched.
+
+  Refusals exit 4, the policy code, and each names the rule it enforces.
+  `claim` and `release` stand outside the scope: a runner sets the variable for
+  the worker it starts, never for itself.
+
 FILTERS  (list, ready, search)
   --type VALUE          exact match
   --status VALUE        exact match, one of the four above
@@ -227,8 +253,8 @@ I/O
 EXIT CODES
   0 success
   3 not found - no task for that uuid or unique key
-  4 policy - the capability is disabled, or the connection does not allow writes;
-    ask the user, never lift the gate yourself
+  4 policy - the capability is disabled, the connection does not allow writes,
+    or worker scope refuses the write; ask the user, never lift the gate yourself
   5 store - unreachable, or the schema is not present; `tasks doctor` proves both
   6 input - a malformed argument, an unknown flag, or a value outside its set
 """
@@ -3533,6 +3559,16 @@ def _os_user() -> str:
         return getpass.getuser()
 
 
+def _worker_execution(env: Mapping[str, str] | None = None) -> str:
+    """The raise this process is working under, or empty when it is not a worker.
+
+    One reading of TASKS_EXECUTION, because it answers two questions at once:
+    who a write is signed by, and what that write is allowed to reach. An empty
+    value is an unset one."""
+    env = os.environ if env is None else env
+    return (env.get("TASKS_EXECUTION") or "").strip()
+
+
 def _actor(flag: str | None = None, env: Mapping[str, str] | None = None) -> str:
     """Who is making this write.
 
@@ -3542,7 +3578,7 @@ def _actor(flag: str | None = None, env: Mapping[str, str] | None = None) -> str
     caller's word (`--actor`), then the shell's (TASKS_ACTOR), then the account
     the process runs as, which is never empty. An empty value is an unset one."""
     env = os.environ if env is None else env
-    execution = (env.get("TASKS_EXECUTION") or "").strip()
+    execution = _worker_execution(env)
     if execution:
         return f"execution:{execution}"
     if flag and flag.strip():
@@ -3551,6 +3587,99 @@ def _actor(flag: str | None = None, env: Mapping[str, str] | None = None) -> str
     if named:
         return named
     return _os_user()
+
+
+# --- Worker scope ------------------------------------------------------------
+
+# Where a worker may land the task it holds. These are the states a run ends in:
+# it finished, it goes back to the queue, it is over without having been done,
+# or it goes back to a person. `in_progress` is absent because claiming is what
+# puts a task there and releasing is what takes it out.
+WORKER_STATUSES = ("draft", "todo", "complete", "closed")
+
+# What a worker may do to any task: add to it. Answered before the raise is even
+# read, because no state of the raise takes these away.
+_WORKER_ADDITIVE = ("tag", "meta-set", "activity")
+
+# What only the holder may do, and the sentence each refusal is owed. Every one
+# of these takes something away from a task or writes over what is already on
+# it, which is exactly what a worker passing by must not do to somebody's work.
+_WORKER_HELD_ONLY = {
+    "untag": "a worker may not remove a tag from a task it does not hold",
+    "meta-rm": "a worker may not remove metadata from a task it does not hold",
+    "meta-overwrite": "a worker may not write over a metadata key a task it does "
+                      "not hold already carries",
+}
+
+_WORKER_HINT = ("a worker records what it found on the task - an activity, a tag, "
+                "or a metadata key not already there - and leaves the rest to "
+                "whoever released the work")
+
+
+def _worker_refusal(op: str, target: str, lookup,
+                    env: Mapping[str, str] | None = None) -> str | None:
+    """Whether worker scope refuses this write, and why in one sentence.
+
+    TASKS_EXECUTION is what applies the scope, and it applies whether or not the
+    raise it names is still open: a raise that lapsed or was closed holds
+    nothing, so it narrows what a worker may write rather than widening it. That
+    matters because the variable outlives the claim - a turn keeps running after
+    its lease passes - and the wrong way round would make a dead lease the moment
+    a worker gained authority over the whole ledger.
+
+    `op` is the write being attempted: `status:<value>`, `type`, or one of the
+    annotation verbs. `target` is the task it lands on. `lookup` answers with the
+    raise for an id, or with None when there is none; it is asked only when the
+    answer depends on it, so an additive write costs no query."""
+    execution = _worker_execution(env)
+    if not execution:
+        return None
+    if op in _WORKER_ADDITIVE:
+        return None
+    if op == "type":
+        return ("a worker may not change a task's type; which pipeline work "
+                "belongs to is not a worker's decision")
+    row = lookup(execution)
+    held = str(row["task_id"]) if row and row.get("status") == "running" else None
+    if op.startswith("status:"):
+        wanted = op.split(":", 1)[1]
+        if held is None:
+            return ("a worker whose raise is no longer open may not write a "
+                    "status, on its own former task or on any other")
+        if target != held:
+            return (f"a worker may not move another task to {wanted}; it holds "
+                    "only the task its raise names")
+        if wanted not in WORKER_STATUSES:
+            return (f"a worker may not set its own task to {wanted}; it lands "
+                    f"that task on {', '.join(WORKER_STATUSES)}")
+        return None
+    if op not in _WORKER_HELD_ONLY:
+        raise ValueError(f"unknown worker-scope operation {op!r}")
+    return None if target == held else _WORKER_HELD_ONLY[op]
+
+
+def _worker_gate(op: str, target: str, lookup) -> None:
+    """Refuse, with the policy code, a write worker scope does not permit."""
+    message = _worker_refusal(op, target, lookup)
+    if message:
+        _die(4, "policy", message, _WORKER_HINT)
+
+
+def _execution_lookup(cur):
+    """A raise by id, read at most once per command however often it is asked
+    for. `id::text` compares rather than casts, so an id that is not a uuid is
+    simply no raise instead of an error from the store."""
+    seen: dict = {}
+
+    def lookup(execution_id: str) -> dict | None:
+        if execution_id not in seen:
+            cur.execute(f"""select id, task_id, status from {SCHEMA}.task_executions
+                             where id::text = %s""", (execution_id,))
+            rows = _rows(cur)
+            seen[execution_id] = rows[0] if rows else None
+        return seen[execution_id]
+
+    return lookup
 
 
 def cmd_add(entry, args: list[str]) -> None:
@@ -3565,6 +3694,13 @@ def cmd_add(entry, args: list[str]) -> None:
         opts["unique-key"] = opts.pop("key")
     values = _scalar_updates(opts, tz)
     values.setdefault("status", "draft")
+    coerced: dict = {}
+    if _worker_execution() and values["status"] != "draft":
+        # A worker creates, it does not release. The status it asked for is not
+        # refused - refusing would lose the task it was writing down - it simply
+        # does not reach the store, and the answer says so rather than letting
+        # the caller believe what it sent.
+        values["status"] = coerced["status"] = "draft"
     values["created_by"] = _actor(opts.get("actor"))
     with _connect(entry) as conn, conn.cursor() as cur:
         key = values.get("unique_key")
@@ -3581,7 +3717,10 @@ def cmd_add(entry, args: list[str]) -> None:
                     [values[c] for c in cols])
         row = _rows(cur)[0]
         conn.commit()
-        _emit({"created": row["id"], **{k: row[k] for k in ("type", "title", "status")}})
+        answer = {"created": row["id"], **{k: row[k] for k in ("type", "title", "status")}}
+        if coerced:
+            answer["coerced"] = coerced
+        _emit(answer)
 
 
 def cmd_set(entry, args: list[str]) -> None:
@@ -3608,6 +3747,11 @@ def cmd_set(entry, args: list[str]) -> None:
         values[_COLUMN[field]] = None
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0])
+        lookup = _execution_lookup(cur)
+        if "status" in values:
+            _worker_gate(f"status:{values['status']}", tid, lookup)
+        if "type" in values:
+            _worker_gate("type", tid, lookup)
         before = _task_row(cur, tid)
         cols = list(values)
         assignments = [c + " = %s" for c in cols] + ["updated_at = now()"]
@@ -3636,6 +3780,7 @@ def cmd_tag(entry, args: list[str], remove: bool = False) -> None:
     ref, names = loose[0], loose[1:]
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, ref)
+        _worker_gate("untag" if remove else "tag", tid, _execution_lookup(cur))
         if remove:
             cur.execute(f"""update {SCHEMA}.tasks
                                set tags = array(select unnest(tags) except select unnest(%s::text[]))
@@ -3670,8 +3815,16 @@ def cmd_meta(entry, args: list[str]) -> None:
         if action == "show":
             _emit({"task": tid, "metadata": _task_row(cur, tid)["metadata"]})
             return
+        lookup = _execution_lookup(cur)
+        if action == "rm":
+            _worker_gate("meta-rm", tid, lookup)
         if action == "set":
             key, raw = rest[1], rest[2]
+            # Adding a key and writing over one are different acts to a worker,
+            # and only the store knows which this is. Asked only when there is a
+            # worker to answer for, so an ordinary caller pays nothing for it.
+            over = bool(_worker_execution()) and key in (_task_row(cur, tid)["metadata"] or {})
+            _worker_gate("meta-overwrite" if over else "meta-set", tid, lookup)
             try:
                 value = json.loads(raw)
             except json.JSONDecodeError:
@@ -3704,6 +3857,7 @@ def cmd_activity(entry, args: list[str]) -> None:
              f'{NAME} activity <task> "what happened"')
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, loose[0])
+        _worker_gate("activity", tid, _execution_lookup(cur))
         cur.execute(f"""insert into {SCHEMA}.task_activities (task_id, description, actor)
                         values (%s, %s, %s) returning id, created_at""",
                     (tid, loose[1], _actor(opts.get("actor"))))
