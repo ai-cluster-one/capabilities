@@ -3243,6 +3243,24 @@ def _forward_gate(cid: str, allow_write: bool, argv: list[str]) -> None:
 
 # ── doctor ──────────────────────────────────────────────────────────────────
 
+
+def _summarize_failure(text: str) -> str | None:
+    """One line a reader can act on. rclone reports a failure as a log line and then,
+    for an OAuth refusal, a JSON body whose description is the part that says what to
+    change — so the two are joined rather than the output's last line taken, which is
+    usually the closing brace of that body."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    head = next((line for line in lines
+                 if any(tag in line for tag in ("CRITICAL", "ERROR", "Failed"))), lines[0])
+    for field in ("error_description", "error"):
+        match = re.search(rf'"{field}"\s*:\s*"([^"]+)"', text or "")
+        if match:
+            return f"{head} — {match.group(1)}"
+    return head
+
+
 def _check_connection(cfg: dict) -> dict:
     """One connection's round-trip: list the remote's top level under its own
     configuration. Reported rather than died, so doctor covers every connection."""
@@ -3265,8 +3283,8 @@ def _check_connection(cfg: dict) -> dict:
         "auth", "credential", "token", "unauthor", "permission", "401", "403",
         "invalid_grant", "login", "private key", "pem", "pkcs", "accesskeyid",
         "signature", "forbidden", "denied", "expired")) else 5
-    return {"ok": False, "category": category, "error": text.splitlines()[-1] if text
-            else f"rclone exited {proc.returncode}"}
+    return {"ok": False, "category": category,
+            "error": _summarize_failure(text) or f"rclone exited {proc.returncode}"}
 
 
 def cmd_doctor(reg: dict | None, wanted: str | None) -> None:

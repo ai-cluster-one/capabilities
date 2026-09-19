@@ -254,3 +254,35 @@ def test_connections_report_masks_every_secret(project):
     assert "key-value" not in rendered and "secret-value" not in rendered
     assert report["connections"]["gd"]["remote"] == "gd:"
     assert report["connections"]["r2"]["allow_write"] is True
+
+
+# --- a failure is reported as something a reader can act on ------------------
+
+RCLONE_OAUTH_REFUSAL = '''2026/09/19 16:30:38 CRITICAL: Failed to create file system for "gd:": couldn't find root directory ID: Get "https://www.googleapis.com/drive/v3/files/root?alt=json": oauth2: cannot fetch token: 401 Unauthorized
+Response: {
+  "error": "unauthorized_client",
+  "error_description": "Client is unauthorized to retrieve access tokens using this method, or client not authorized for any of the scopes requested."
+}'''
+
+
+def test_a_failure_summary_carries_the_actionable_description():
+    """The last line of this output is `}`; the part worth reading is the description."""
+    summary = module._summarize_failure(RCLONE_OAUTH_REFUSAL)
+    assert "unauthorized to retrieve access tokens" in summary
+    assert "CRITICAL" in summary
+    assert not summary.strip().endswith("}")
+
+
+def test_a_single_line_failure_survives_unchanged():
+    summary = module._summarize_failure("2026/09/19 ERROR: directory not found")
+    assert summary == "2026/09/19 ERROR: directory not found"
+
+
+def test_an_empty_failure_reports_nothing_rather_than_raising():
+    assert module._summarize_failure("") is None
+    assert module._summarize_failure(None) is None
+
+
+def test_an_oauth_refusal_is_classified_as_a_credential_problem():
+    """`unauthorized_client` is a grant to fix, not a network to retry."""
+    assert "unauthor" in RCLONE_OAUTH_REFUSAL.lower()
