@@ -21,8 +21,8 @@ READING
                                   assignee and the metadata JSON
   tasks runs <task>               every raise of it: what held it, how long,
                                   and what came of each
-  tasks history <task> [--field F]   how its status and pickup moved, and what
-                                  caused each move
+  tasks history <task> [--field F]   how its status, pickup, type and assignee
+                                  moved, and what caused each move
 
 WRITING  (needs allow_write on the connection; exit 4 otherwise)
   tasks add --type T --title TEXT [fields]      create one
@@ -128,6 +128,23 @@ METADATA VALUES
   description: a copy of the conversation in here will disagree with the
   conversation, and the worker will believe the copy.
 
+ACTOR
+  Every write carries who made it. `add` keeps it as the task's `created_by`,
+  a tracked move keeps it on the change row, and `activity` keeps it on the
+  entry; `show` and `history` print it back. Tags and metadata keep no trail,
+  so on `tag`, `untag` and `meta` it is accepted and recorded nowhere.
+
+  --actor TEXT          who is making this write, when it is not the account
+                        running the command. Accepted by add, set, tag, untag,
+                        meta set, meta rm and activity.
+
+  Identity resolves in this order: TASKS_EXECUTION in the environment, set to
+  an execution id, gives `execution:<id>` and wins over everything, so a runner
+  sets it once and every write its worker makes is attributed to that raise,
+  whatever the worker passes; else `--actor`; else TASKS_ACTOR in the
+  environment; else the account the process runs as, which is never empty.
+  `claim` and `release` attribute their moves to `--worker`.
+
 FILTERS  (list, ready, search)
   --type VALUE          exact match
   --status VALUE        exact match, one of the four above
@@ -183,10 +200,10 @@ ACTIVITY
   activity and do not belong here. The trail is append-only - there is no verb
   that edits or removes an entry.
 
-  An entry is a moment and a sentence, and carries no kind. That is deliberate:
-  a vocabulary invented before there are entries to look at would be guessed,
-  and every caller would guess differently. Once real entries show what kinds
-  exist, a kind can be added over them.
+  An entry is a moment, a sentence and who recorded it, and carries no kind.
+  That is deliberate: a vocabulary invented before there are entries to look
+  at would be guessed, and every caller would guess differently. Once real
+  entries show what kinds exist, a kind can be added over them.
 
   `show` always returns a task together with its whole activity trail, oldest
   first, so what was done is read in the same breath as what is to be done.
@@ -219,7 +236,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import NoReturn
+from typing import Mapping, NoReturn
 
 NAME = 'tasks'
 SUMMARY = ("Task tracker over a PostgreSQL store - tasks with a goal and the "
@@ -3387,7 +3404,7 @@ def _attach_activities(cur, tasks: list[dict], opts: dict, *, embed: bool) -> li
     # say that: rows[-0:] is the whole list, which is the opposite of the ask.
     embed = (embed if want is None else True) and depth != 0
     ids = [t["id"] for t in tasks]
-    cur.execute(f"""select id, task_id, description, created_at
+    cur.execute(f"""select id, task_id, description, actor, created_at
                       from {SCHEMA}.task_activities where task_id = any(%s::uuid[])
                      order by created_at asc""", (ids,))
     trail: dict = {}
@@ -3448,7 +3465,7 @@ def cmd_show(entry, args: list[str]) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0])
         task = _task_row(cur, tid)
-        cur.execute(f"""select id, description, created_at
+        cur.execute(f"""select id, description, actor, created_at
                           from {SCHEMA}.task_activities where task_id = %s
                          order by created_at asc""", (tid,))
         trail = _rows(cur)
@@ -3505,10 +3522,41 @@ def _scalar_updates(opts: dict, tz) -> dict:
     return out
 
 
+def _os_user() -> str:
+    """The account this process runs as, read from the system rather than
+    from a variable somebody may have set."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, AttributeError, OSError):
+        import getpass
+        return getpass.getuser()
+
+
+def _actor(flag: str | None = None, env: Mapping[str, str] | None = None) -> str:
+    """Who is making this write.
+
+    A raise wins over everything: a runner sets TASKS_EXECUTION once, and every
+    write its worker makes is attributed to that raise whatever the worker
+    passes, so a claim's trail cannot be signed by someone else. Below it, the
+    caller's word (`--actor`), then the shell's (TASKS_ACTOR), then the account
+    the process runs as, which is never empty. An empty value is an unset one."""
+    env = os.environ if env is None else env
+    execution = (env.get("TASKS_EXECUTION") or "").strip()
+    if execution:
+        return f"execution:{execution}"
+    if flag and flag.strip():
+        return flag.strip()
+    named = (env.get("TASKS_ACTOR") or "").strip()
+    if named:
+        return named
+    return _os_user()
+
+
 def cmd_add(entry, args: list[str]) -> None:
     """Create one task. `--key` makes it re-runnable: a key already present
     creates nothing, changes nothing, and reports the task that holds it."""
-    opts = _flags(args, _SCALARS + ("key",))
+    opts = _flags(args, _SCALARS + ("key", "actor"))
     if not opts.get("type") or not opts.get("title"):
         _die(6, "input", "add needs --type and --title",
              "the goal belongs in --objective, the reasoning in --description")
@@ -3517,6 +3565,7 @@ def cmd_add(entry, args: list[str]) -> None:
         opts["unique-key"] = opts.pop("key")
     values = _scalar_updates(opts, tz)
     values.setdefault("status", "draft")
+    values["created_by"] = _actor(opts.get("actor"))
     with _connect(entry) as conn, conn.cursor() as cur:
         key = values.get("unique_key")
         if key:
@@ -3546,7 +3595,8 @@ def cmd_set(entry, args: list[str]) -> None:
     without putting anything in the trail. The answer reports `fields: []`, so a
     save meant to change something and missing its flag is visible rather than
     silent."""
-    opts = _flags(args, _SCALARS + ("unique-key", "clear"), multi=("clear",), takes=1)
+    opts = _flags(args, _SCALARS + ("unique-key", "clear", "actor"),
+                  multi=("clear",), takes=1)
     if not opts["_loose"]:
         _die(6, "input", "set needs a task", f"{NAME} set <uuid|unique_key> [fields]")
     tz = _zone(entry)
@@ -3567,7 +3617,8 @@ def cmd_set(entry, args: list[str]) -> None:
         # The move is recorded here, under the verb that made it, rather than by
         # whoever remembered to write it down afterwards.
         moved = _record_moves(cur, tid, before, row,
-                              execution_id=(_open_execution(cur, tid) or {}).get("id"))
+                              execution_id=(_open_execution(cur, tid) or {}).get("id"),
+                              actor=_actor(opts.get("actor")))
         conn.commit()
         _emit({"updated": row["id"], "fields": cols, "moved": moved, "task": row})
 
@@ -3576,7 +3627,7 @@ def cmd_tag(entry, args: list[str], remove: bool = False) -> None:
     """Tags are added and removed by name, one at a time, and never assigned as
     a whole list. There is no flag here that could overwrite what is already
     there."""
-    opts = _flags(args, (), takes=99)
+    opts = _flags(args, ("actor",), takes=99)
     loose = opts["_loose"]
     if len(loose) < 2:
         verb = "untag" if remove else "tag"
@@ -3601,7 +3652,7 @@ def cmd_tag(entry, args: list[str], remove: bool = False) -> None:
 def cmd_meta(entry, args: list[str]) -> None:
     """Metadata is edited one key at a time. No verb takes a whole object, so a
     call meaning to set one key cannot drop the others."""
-    opts = _flags(args, (), takes=99)
+    opts = _flags(args, ("actor",), takes=99)
     loose = opts["_loose"]
     if not loose:
         _die(6, "input", "meta needs an action",
@@ -3644,7 +3695,7 @@ def cmd_activity(entry, args: list[str]) -> None:
 
     An entry has no shape beyond its text on purpose: we cannot name the kinds
     before we can see, from real entries, what kinds there are."""
-    opts = _flags(args, (), takes=2)
+    opts = _flags(args, ("actor",), takes=2)
     loose = opts["_loose"]
     if len(loose) < 2 or not loose[1].strip():
         # An empty entry is worse than no entry: the trail is append-only, so a
@@ -3653,8 +3704,9 @@ def cmd_activity(entry, args: list[str]) -> None:
              f'{NAME} activity <task> "what happened"')
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, loose[0])
-        cur.execute(f"""insert into {SCHEMA}.task_activities (task_id, description)
-                        values (%s, %s) returning id, created_at""", (tid, loose[1]))
+        cur.execute(f"""insert into {SCHEMA}.task_activities (task_id, description, actor)
+                        values (%s, %s, %s) returning id, created_at""",
+                    (tid, loose[1], _actor(opts.get("actor"))))
         row = _rows(cur)[0]
         conn.commit()
         _emit({"task": tid, "activity": row["id"], "created_at": row["created_at"]})
@@ -3700,7 +3752,8 @@ def _record_change(cur, tid: str, field: str, old, new,
     return True
 
 
-_TRACKED = (("status", "status"), ("pickup", "pickup_at"))
+_TRACKED = (("status", "status"), ("pickup", "pickup_at"),
+            ("type", "type"), ("assignee", "assignee"))
 
 
 def _record_moves(cur, tid: str, before: dict, after: dict,
@@ -3817,7 +3870,7 @@ def cmd_claim(entry, args: list[str]) -> None:
         after = _rows(cur)[0]
         _record_moves(cur, tid, before, after,
                       execution_id=str(execution["id"]), actor=opts.get("worker"))
-        cur.execute(f"""select id, description, created_at
+        cur.execute(f"""select id, description, actor, created_at
                           from {SCHEMA}.task_activities where task_id = %s
                          order by created_at asc""", (tid,))
         trail = _rows(cur)
@@ -3937,6 +3990,12 @@ def cmd_history(entry, args: list[str]) -> None:
 
 _TABLES = ("tasks", "task_activities", "task_executions", "task_changes")
 
+# Columns a later version added to a table an earlier one created. `migrate`
+# names the ones a store lacks, so a store that has every table and is still a
+# column behind reads as behind rather than as current.
+_COLUMNS = (("task_executions", "metrics"), ("tasks", "created_by"),
+            ("task_activities", "actor"))
+
 
 def _bundle_dir() -> Path:
     executable = Path(__file__).resolve()
@@ -3970,6 +4029,15 @@ def _tables_present(cur, schema: str) -> list[str]:
     return [r["table_name"] for r in cur.fetchall()]
 
 
+def _columns_absent(cur, schema: str, tables: list[str]) -> list[str]:
+    """Later columns missing from tables that are present, as table.column. A
+    table that is absent is reported as a table, not as each of its columns."""
+    cur.execute("""select table_name, column_name from information_schema.columns
+                    where table_schema = %s""", (schema,))
+    present = {(r["table_name"], r["column_name"]) for r in cur.fetchall()}
+    return [f"{t}.{c}" for t, c in _COLUMNS if t in tables and (t, c) not in present]
+
+
 def cmd_migrate(entry, args: list[str]) -> None:
     """Create what this connection's schema is missing, and nothing else.
 
@@ -3990,9 +4058,10 @@ def cmd_migrate(entry, args: list[str]) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         before = _tables_present(cur, schema)
         missing = [t for t in _TABLES if t not in before]
+        lacking = _columns_absent(cur, schema, before)
         if not opts.get("apply"):
             _emit({"schema": schema, "present": before, "would_create": missing,
-                   "applied": False})
+                   "would_add": lacking, "applied": False})
             return
         # Applied whole even when every table is present. The file carries
         # additive `alter ... add column if not exists` for columns a later
@@ -4001,12 +4070,13 @@ def cmd_migrate(entry, args: list[str]) -> None:
         cur.execute(ddl)
         conn.commit()
         after = _tables_present(cur, schema)
-    still = [t for t in _TABLES if t not in after]
+        still = [t for t in _TABLES if t not in after] + _columns_absent(cur, schema, after)
     if still:
         _die(5, "schema_incomplete",
              f"schema {schema} is still missing {', '.join(still)} after applying",
              "the connection's role may not be allowed to create objects in that schema")
-    _emit({"schema": schema, "present": after, "created": missing, "applied": True})
+    _emit({"schema": schema, "present": after, "created": missing, "added": lacking,
+           "applied": True})
 
 
 # --- Doctor ------------------------------------------------------------------

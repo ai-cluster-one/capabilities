@@ -19,6 +19,7 @@ create table if not exists tasks.tasks (
   tags         text[]      not null default '{}',
   metadata     jsonb       not null default '{}'::jsonb,
   pickup_at    timestamptz,
+  created_by   text,
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );
@@ -42,6 +43,11 @@ comment on column tasks.tasks.status is
   'only one of them claims the work happened.';
 comment on column tasks.tasks.pickup_at is
   'Do not raise the task before this moment. Empty means no appointed moment, not permission.';
+-- In the create above for a new store, and added here for one that predates it.
+alter table tasks.tasks add column if not exists created_by text;
+comment on column tasks.tasks.created_by is
+  'Who created the task, as the CLI resolved it: the raise it ran under, the '
+  'actor it was told, or the account it ran as.';
 
 -- A store created before `closed` existed keeps the check it was created with,
 -- and `create table if not exists` never revisits one. The constraint therefore
@@ -59,6 +65,7 @@ create table if not exists tasks.task_activities (
   id          uuid primary key default gen_random_uuid(),
   task_id     uuid not null references tasks.tasks (id) on delete cascade,
   description text not null,
+  actor       text,
   created_at  timestamptz not null default now()
 );
 
@@ -66,6 +73,11 @@ comment on table tasks.task_activities is
   'Work that actually happened, in plain words: at this moment, this occurred. '
   'Creating a task or editing a field is not activity. Entries carry no shape yet - '
   'a kind will be added once we can see from real entries what kinds there are.';
+-- In the create above for a new store, and added here for one that predates it.
+alter table tasks.task_activities add column if not exists actor text;
+comment on column tasks.task_activities.actor is
+  'Who recorded the entry, as the CLI resolved it: the raise it ran under, the '
+  'actor it was told, or the account it ran as.';
 
 create index if not exists task_activities_task_idx on tasks.task_activities (task_id, created_at desc);
 
@@ -138,11 +150,14 @@ create table if not exists tasks.task_changes (
 );
 
 comment on table tasks.task_changes is
-  'Status and pickup moves, written by the CLI under whatever verb made them, '
+  'Status, pickup, type and assignee moves, written by the CLI under whatever verb made them, '
   'never by whoever remembered to. Extended to another field by decision, and '
   'never by recording everything that can change.';
 comment on column tasks.task_changes.execution_id is
   'The raise that caused the move, where one did. Null for a move a person made.';
+comment on column tasks.task_changes.actor is
+  'Who made the move: the worker holding the raise for claim and release, and '
+  'otherwise the identity the CLI resolved - a raise, a named actor, or the account it ran as.';
 
 create index if not exists task_changes_task_idx
   on tasks.task_changes (task_id, changed_at desc);
