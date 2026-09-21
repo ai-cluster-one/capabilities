@@ -6,6 +6,7 @@
 #     "py-tgcalls==3.0.0rc3",
 #     "ntgcalls==3.0.0rc3",
 #     "google-genai>=1.36.0",
+#     "openai>=3.16.0",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs
@@ -126,7 +127,7 @@ from call_recording_helpers import (
 import jobs
 import voice_agent
 from forum import GENERAL_TOPIC_ID, message_topic_id
-from settings_schema import validate_settings
+from settings_schema import VOICE_PROVIDER_INCUMBENT, validate_settings
 from workers import (
     DEFAULT_WORKER_TIMEOUT,
     MODEL_REFUSED_RE,
@@ -549,6 +550,9 @@ def _runtime_settings(settings, project_layout=None):
         raise SettingsError("settings.defaults.voice_agent.progress_interval must be positive")
     voice_timezone, voice_timezone_name = voice_agent.resolve_timezone(
         voice_defaults.get("timezone"))
+    voice_prompt_file_explicit = bool(
+        os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
+        or voice_defaults.get("prompt_file"))
     voice_prompt_file = str(
         os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
         or voice_defaults.get("prompt_file")
@@ -606,6 +610,7 @@ def _runtime_settings(settings, project_layout=None):
         "VOICE_RECORDING_CAPTION": str(voice_defaults.get("recording_caption") or "").strip(),
         "VOICE_PROGRESS_INTERVAL": voice_progress_interval,
         "VOICE_CONTEXT_FILE": voice_context_file,
+        "VOICE_PROMPT_FILE_EXPLICIT": voice_prompt_file_explicit,
         "ASSISTANT_NAME": assistant_name,
         "DEFAULT_GROUP_ALIASES": group_aliases or (assistant_name,),
         "DEFAULT_WORKER": default_worker,
@@ -1905,6 +1910,11 @@ def resolve_creds():
 
 GEMINI_SECRET_ENV = ((CONNECTION_ENTRY or {}).get("gemini_secret_env")
                      or "GOOGLE_API_KEY")
+OPENAI_SECRET_ENV = ((CONNECTION_ENTRY or {}).get("openai_secret_env")
+                     or "OPENAI_API_KEY")
+# Which environment name holds the key each speech stack answers to. The
+# connection names them, so a project that keeps its keys elsewhere says so once.
+VOICE_SECRET_ENVS = {"gemini": GEMINI_SECRET_ENV, "gptlive": OPENAI_SECRET_ENV}
 
 
 NAME = "telegram"
@@ -1960,22 +1970,46 @@ def _service_document(path):
     return _records().document_read(NAME, _document_key(path))
 
 
-def read_voice_context():
-    """The voice channel's own system prompt, owned by the project."""
-    return read_service_document(VOICE_CONTEXT_FILE)
+def read_voice_document(kind, provider):
+    """One of a provider's two voice prompts, by its own key.
+
+    Each provider's prompts are its own: the stacks differ in what they can do,
+    so words written for one are wrong for the other. The incumbent falls back
+    to the unsuffixed key, which is what a project that predates the split
+    wrote and still owns."""
+    adapter = _records()
+    doc = adapter.document_read(NAME, f"{kind}-{provider}")
+    if not doc and provider == VOICE_PROVIDER_INCUMBENT:
+        doc = adapter.document_read(NAME, kind)
+    return (doc["body"] if doc else "").strip()
 
 
-def voice_call_readiness():
+def read_voice_context(provider=None):
+    """The voice channel's own system prompt, owned by the project: how it
+    speaks, and how it hands work over. Two files because they are edited for
+    different reasons; one prompt because the model reads them as one."""
+    provider = provider or voice_agent.DEFAULT_PROVIDER
+    if VOICE_PROMPT_FILE_EXPLICIT:
+        # A project that names a file has said exactly what it wants read.
+        return read_service_document(VOICE_CONTEXT_FILE)
+    parts = [read_voice_document("voice-agent", provider),
+             read_voice_document("voice-delegation", provider)]
+    return "\n\n".join(part for part in parts if part)
+
+
+def voice_call_readiness(provider=None):
     """What answering a call by voice needs, resolved when the phone rings: the
-    Gemini key the connection names, and the project's own voice prompt. Neither
-    is substituted — missing either, the call falls through to the recording
-    path, so a caller with call_recording on is still recorded."""
-    api_key = _env_value(GEMINI_SECRET_ENV)
+    key this provider's connection names, and the project's own voice prompt.
+    Neither is substituted — missing either, the call falls through to the
+    recording path, so a caller with call_recording on is still recorded."""
+    provider = provider or voice_agent.DEFAULT_PROVIDER
+    secret_env = VOICE_SECRET_ENVS.get(provider, GEMINI_SECRET_ENV)
+    api_key = _env_value(secret_env)
     if not api_key:
-        return None, None, f"{GEMINI_SECRET_ENV} not resolved"
-    voice_context = read_voice_context()
+        return None, None, f"{secret_env} not resolved"
+    voice_context = read_voice_context(provider)
     if not voice_context:
-        return None, None, f"no voice prompt at {VOICE_CONTEXT_FILE}"
+        return None, None, f"no voice prompt for {provider}"
     return api_key, voice_context, None
 
 
@@ -2087,7 +2121,18 @@ def configured_voice_agent_users():
         # names the set its calls run on, and a caller turns one on or off
         # without restating the rest. Everything starts off — a tool the model
         # is holding is a tool it will reach for.
-        tools = {name: False for name in voice_agent.TOOL_NAMES}
+        # Which speech stack answers this caller, and therefore which module
+        # answers for the model, the voice and the tools. A provider with no
+        # tool channel declares none, and every tool callback is simply not
+        # passed — the set intersects to empty without a special case.
+        provider_name = str(resolved("provider", voice_agent.DEFAULT_PROVIDER)).strip().lower()
+        try:
+            spec = voice_agent.provider(provider_name)
+        except voice_agent.VoiceAgentError as exc:
+            log(f"voice: {exc}; falling back to {voice_agent.DEFAULT_PROVIDER}")
+            provider_name = voice_agent.DEFAULT_PROVIDER
+            spec = voice_agent.provider(provider_name)
+        tools = {name: False for name in spec.TOOL_NAMES}
         for layer in (VOICE_AGENT_DEFAULTS.get("tools"),
                       voice_policy.get("tools")):
             for name, on in _as_mapping(layer).items():
@@ -2095,8 +2140,9 @@ def configured_voice_agent_users():
                     tools[name] = bool(on)
         users[user_id] = {
             "name": policy.get("name") or str(user_id),
-            "model": resolved("model", voice_agent.DEFAULT_MODEL),
-            "voice": resolved("voice", voice_agent.DEFAULT_VOICE),
+            "provider": provider_name,
+            "model": resolved("model", spec.DEFAULT_MODEL),
+            "voice": resolved("voice", spec.DEFAULT_VOICE),
             "greeting": resolved("greeting", None),
             "history": max(0, history),
             "tools": tools,
@@ -3806,7 +3852,7 @@ def _channel_context(policies):
     return "\n\n".join(parts).strip(), exclusive
 
 
-def resumed_prompt(st):
+def resumed_prompt(st, tail=None):
     """The next turn inside a thread the worker is already holding.
 
     Everything the full prompt establishes — the soft gate, who is on the other
@@ -3814,7 +3860,13 @@ def resumed_prompt(st):
     carries. Restating it every turn would grow the thread for nothing and invite
     the model to re-argue instructions it has already accepted, which is most of
     what resuming was meant to avoid. Only what has actually moved on since the
-    last turn is worth sending: the clock, and the new request."""
+    last turn is worth sending: the clock, and the new request.
+
+    A call is the exception, and by that same rule rather than against it. What
+    moved on there is the conversation itself: its request names no task,
+    because the turn was handed over mid-sentence and the work is whatever was
+    being said. A dialogue's tail is not sent for the opposite reason - the
+    thread was holding that conversation all along and already has it."""
     req = st.get("current_request") or {}
     lines = []
     if st.get("now"):
@@ -3824,6 +3876,10 @@ def resumed_prompt(st):
     if lines:
         lines.append("")
     lines.append(req.get("text") or "")
+    if st.get("voice_task") and tail:
+        lines.append("")
+        lines.append("--- Conversation ---")
+        lines.append(_format_conversation(tail))
     return "\n".join(lines)
 
 
@@ -3859,7 +3915,7 @@ def build_prompt(tail, state=None):
     context rather than inferring it from chat history."""
     st = state or {}
     if st.get("resume_session") and not st.get("resume_reanchor"):
-        return resumed_prompt(st)
+        return resumed_prompt(st, tail)
     # An exclusive channel answers with its own prose alone. Both project-level
     # prose layers go with the room's, which is the point of the mode and its
     # declared cost. The daemon-owned job protocol below is structural and is
@@ -7483,7 +7539,7 @@ async def run_session(client):
 
         async def run_voice_task(caller_id, caller_name, text,
                                  delivery=VOICE_TASK_DELIVERY, on_progress=None,
-                                 lane=None):
+                                 lane=None, tail=None):
             """One task the caller asked for mid-call, run by the project's own
             worker — the same machinery a message runs, under the authority the
             same user's messages resolve to.
@@ -7580,7 +7636,8 @@ async def run_session(client):
                         progress_task = asyncio.create_task(
                             tail_voice_progress(progress_outbox, on_progress))
                     loop = asyncio.get_running_loop()
-                    future = worker_turn(loop, s["worker"], key, [], state, procs)
+                    future = worker_turn(loop, s["worker"], key, tail or [],
+                                         state, procs)
                     done, _ = await asyncio.wait({future},
                                                  timeout=float(s["worker_timeout"]))
                     if not done:
@@ -8064,9 +8121,17 @@ async def run_session(client):
                 next prompt, so anything the worker reports about itself has to
                 stop here — on this side of the boundary — rather than rely on
                 every later caller remembering not to pass it on."""
+                # A provider that hands the turn over mid-conversation sends the
+                # conversation with it: its request names no task, because the
+                # task is what was being said. One that reaches the worker
+                # through a tool sends the tool's own words and no tail, which
+                # is what it has always sent.
+                live = active_voice_call.get("session")
+                tail = (live.conversation_tail()
+                        if hasattr(live, "conversation_tail") else [])
                 result = await run_voice_task(caller_id, caller_name, text,
                                               on_progress=note_task_progress,
-                                              lane=lane)
+                                              lane=lane, tail=tail)
                 return result["reply"]
 
             task_runner = voice_agent.VoiceTaskRunner(
@@ -8075,7 +8140,8 @@ async def run_session(client):
                 log=log,
                 elsewhere=lambda: voice_tasks_running.get(str(caller_id), 0) > 0,
             )
-            session = voice_agent.VoiceCallSession(
+            spec = voice_agent.provider(policy.get("provider"))
+            session = spec.VoiceCallSession(
                 calls,
                 caller_id,
                 api_key=api_key,
@@ -8085,10 +8151,17 @@ async def run_session(client):
                 # reading the chat tail, and that must not delay the pickup.
                 system_instruction="",
                 caller_name=caller_name,
+                assistant_name=ASSISTANT_NAME,
                 greeting=policy.get("greeting"),
                 caller_track=caller_pcm,
                 agent_track=agent_pcm,
-                task_runner=task_runner if tool_enabled("agent_task") else None,
+                # A provider whose delegation IS the worker always gets the
+                # runner: it has no tool to enable, and withholding it leaves a
+                # call that can only say it cannot have anything done.
+                task_runner=(task_runner
+                             if (getattr(spec, "DELEGATES_TO_WORKER", False)
+                                 or tool_enabled("agent_task"))
+                             else None),
                 send_to_chat=(
                     (lambda body: send_channel_message(caller_id, body, True))
                     if tool_enabled("send_to_chat") else None),
@@ -8105,6 +8178,11 @@ async def run_session(client):
             )
             active_voice_call.update({
                 "session": session,
+                # The join happens after the call, where the provider is no
+                # longer in hand. A track joined at another stack's rate is a
+                # recording played at the wrong speed, which nothing reports.
+                "caller_rate": spec.CALLER_RATE,
+                "agent_rate": spec.AGENT_RATE,
                 "caller_id": caller_id,
                 "caller_name": caller_name,
                 # Per call, not per daemon: what one caller was shown the help
@@ -8127,7 +8205,7 @@ async def run_session(client):
                     caller_id,
                     RecordStream(
                         audio=True,
-                        audio_parameters=AudioParameters(voice_agent.CALLER_RATE, 1),
+                        audio_parameters=AudioParameters(spec.CALLER_RATE, 1),
                     ),
                     config=CallConfig(timeout=60),
                 )
@@ -8135,7 +8213,7 @@ async def run_session(client):
                     caller_id,
                     MediaStream(
                         ExternalMedia.AUDIO,
-                        audio_parameters=AudioParameters(voice_agent.AGENT_RATE, 1),
+                        audio_parameters=AudioParameters(spec.AGENT_RATE, 1),
                         audio_flags=MediaStream.Flags.REQUIRED,
                         video_flags=MediaStream.Flags.IGNORE,
                     ),
@@ -8282,7 +8360,11 @@ async def run_session(client):
                 return
 
             finalized = await voice_agent.join_tracks_to_stereo(
-                caller_pcm, agent_pcm, output)
+                caller_pcm, agent_pcm, output,
+                caller_rate=active_voice_call.get("caller_rate",
+                                                  voice_agent.CALLER_RATE),
+                agent_rate=active_voice_call.get("agent_rate",
+                                                 voice_agent.AGENT_RATE))
             status = "complete" if finalized["status"] == "complete" else "conversion_failed"
             media_duration = finalized.get("duration_seconds") or wall_duration
             metadata.update({
@@ -8346,7 +8428,8 @@ async def run_session(client):
             current_allowed_callers = set(
                 configured_call_recording_users()["allowed_callers"])
             if caller_id in current_voice_users:
-                api_key, voice_context, blocked = voice_call_readiness()
+                api_key, voice_context, blocked = voice_call_readiness(
+                    current_voice_users[caller_id].get("provider"))
                 if blocked:
                     log(f"voice: {blocked} — cannot answer {caller_id} by voice")
                 else:
@@ -8851,12 +8934,20 @@ async def run_session(client):
         if has_p2p_recording:
             features.append(f"p2p(allowed_callers={sorted(allowed_callers)})")
         if has_voice_agent:
-            key_state = (GEMINI_SECRET_ENV if _env_value(GEMINI_SECRET_ENV)
-                         else f"NO {GEMINI_SECRET_ENV}")
-            prompt_state = ("prompt" if read_voice_context()
-                            else f"NO {VOICE_CONTEXT_FILE}")
+            # Readiness is per provider: the callers on this daemon may not all
+            # answer on the same stack, and one stack's key says nothing about
+            # the other's.
+            states = []
+            for name in sorted({policy.get("provider", voice_agent.DEFAULT_PROVIDER)
+                                for policy in voice_users.values()}):
+                secret_env = VOICE_SECRET_ENVS.get(name, GEMINI_SECRET_ENV)
+                key_state = (secret_env if _env_value(secret_env)
+                             else f"NO {secret_env}")
+                prompt_state = ("prompt" if read_voice_context(name)
+                                else "NO prompt")
+                states.append(f"{name}({key_state}, {prompt_state})")
             features.append(
-                f"voice_agent(callers={sorted(voice_users)}, {key_state}, {prompt_state})")
+                f"voice_agent(callers={sorted(voice_users)}, {', '.join(states)})")
         if has_group_recording:
             features.append(f"groups(auto={len(auto_groups)}, on_request={len(on_request_groups)})")
         log(f"call listener: started on daemon client; {', '.join(features)}")

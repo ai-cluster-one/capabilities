@@ -4644,6 +4644,13 @@ def _service_template(name: str) -> Path:
     return _service_bundle_dir() / "service" / "templates" / name
 
 
+def _voice_template(provider: str, name: str) -> Path:
+    """A voice template of one provider. Each provider owns its own prompts, so
+    the two stacks can be given different words and compared on their own
+    terms."""
+    return _service_bundle_dir() / "service" / provider / "templates" / name
+
+
 def _require_service_bundle_files(*paths: Path) -> None:
     missing = [str(p) for p in paths if not p.is_file()]
     if missing:
@@ -5194,10 +5201,15 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     context_template = _service_template("context.md")
     delegation_template = _service_template("delegation.md")
     job_worker_template = _service_template("job-worker.md")
-    voice_template = _service_template("voice-agent.md")
+    schema = _settings_schema_module()
+    voice_templates = {
+        (provider, kind): _voice_template(provider, f"{kind}.md")
+        for provider in sorted(schema.VOICE_PROVIDERS)
+        for kind in ("voice-agent", "voice-delegation")
+    }
     _require_service_bundle_files(
         settings_template, context_template, delegation_template,
-        job_worker_template, voice_template)
+        job_worker_template, *voice_templates.values())
     target = _service_dir(root)
     target.mkdir(parents=True, exist_ok=True)
     written = []
@@ -5239,13 +5251,36 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
         else:
             skipped.append(f"{adapter.source}:telegram/{key}")
 
-    if force or adapter.document_read(NAME, "voice-agent") is None:
-        adapter.document_put(NAME, "voice-agent", voice_template.read_text(),
+    # Each provider's prompts are its own, so the incumbent's key gains a
+    # provider suffix. A project that already carries the unsuffixed
+    # `voice-agent` wrote it itself: it is carried onto the suffixed key rather
+    # than shadowed by a fresh template, which would lose the project's words
+    # silently.
+    # A project that already carries the unsuffixed `voice-agent` wrote that
+    # prompt itself, and wrote it whole: the split is ours, not theirs, so their
+    # one file still holds both what it says and how it hands work over. Carrying
+    # it onto the suffixed key keeps their words; seeding a delegation template
+    # beside it would append a second, competing set of instructions to a prompt
+    # that already has its own. So the incumbent is carried or seeded, never both.
+    incumbent = schema.VOICE_PROVIDER_INCUMBENT
+    whole = adapter.document_read(NAME, "voice-agent")
+    carried_body = (whole or {}).get("body") or None
+
+    for (provider, kind), template in sorted(voice_templates.items()):
+        key = f"{kind}-{provider}"
+        if not force and adapter.document_read(NAME, key) is not None:
+            skipped.append(f"{adapter.source}:telegram/{key}")
+            continue
+        body, note = template.read_text(), ""
+        if provider == incumbent and carried_body:
+            if kind == "voice-delegation":
+                skipped.append(f"{adapter.source}:telegram/{key} (carried prompt is whole)")
+                continue
+            body, note = carried_body, " (carried)"
+        adapter.document_put(NAME, key, body,
                              author="telegram service init",
                              media_type="text/markdown")
-        written.append(f"{adapter.source}:telegram/voice-agent")
-    else:
-        skipped.append(f"{adapter.source}:telegram/voice-agent")
+        written.append(f"{adapter.source}:telegram/{key}{note}")
 
     return {"initialized": NAME, "project": str(root), "service_dir": str(target),
             "written": written, "skipped": skipped,

@@ -24,6 +24,14 @@ VOICE_MODES = {"disabled", "enabled", "auto", "on"}
 DELEGATION_MODES = {"allowed", "disabled", "on", "enabled", "auto"}
 VOICE_TOOLS = {"agent_task", "send_to_chat", "run_capability",
                "read_project_file", "reload_service"}
+# Which speech stack answers a call. Each provider carries its own wire, its own
+# prompts and its own defaults, so the two can be given different words and
+# compared on their own terms rather than through one set of settings that
+# happens to suit whichever was written first.
+VOICE_PROVIDERS = {"gemini", "gptlive"}
+# The provider whose document keys predate the split, and whose prompts a
+# project may already have written under the unsuffixed key.
+VOICE_PROVIDER_INCUMBENT = "gemini"
 VOICE_SESSION_MODES = {"carry", "fresh"}
 TRANSCRIPTION_MODES = {"disabled", "auto"}
 CALL_GROUP_MODES = {
@@ -339,7 +347,8 @@ def _voice_session(value, path):
 
 def _voice_agent(value, path, *, defaults=False, project_root=None, service_dir=None):
     value = _object(value, path)
-    allowed = {"worker", "workers", "model", "voice", "greeting", "history", "tools"}
+    allowed = {"worker", "workers", "model", "voice", "greeting", "history", "tools",
+               "provider"}
     if defaults:
         allowed.update({"timezone", "progress_interval", "recording_caption",
                         "prompt_file", "session"})
@@ -352,6 +361,8 @@ def _voice_agent(value, path, *, defaults=False, project_root=None, service_dir=
         _voice_session(value["session"], f"{path}.session")
     if "mode" in value:
         _enum(value["mode"], VOICE_MODES, f"{path}.mode")
+    if "provider" in value:
+        _enum(value["provider"], VOICE_PROVIDERS, f"{path}.provider", nullable=True)
     if "worker" in value:
         _enum(value["worker"], WORKERS, f"{path}.worker", nullable=True)
     if "workers" in value:

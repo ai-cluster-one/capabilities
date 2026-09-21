@@ -26,6 +26,7 @@ import contextlib
 import inspect
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -314,6 +315,35 @@ ALL_TOOLS = (AGENT_TASK_TOOL, SEND_TO_CHAT_TOOL, RUN_CAPABILITY_TOOL,
              READ_PROJECT_FILE_TOOL, RELOAD_SERVICE_TOOL)
 TOOL_NAMES = tuple(tool["name"] for tool in ALL_TOOLS)
 
+# --- providers ----------------------------------------------------------------
+
+# The speech stack a call runs on. Each provider owns its own wire, its own
+# media rates, its own prompts and its own defaults, and answers for all of them
+# rather than having them read off this module.
+DEFAULT_PROVIDER = "gemini"
+PROVIDER_NAMES = ("gemini", "gptlive")
+
+# This provider reaches the worker through the `agent_task` tool, so whether it
+# gets a task runner is the tool set's decision.
+DELEGATES_TO_WORKER = False
+
+
+def provider(name=None):
+    """The module one provider's calls run on.
+
+    This module is itself the Gemini provider, so the lookup returns it
+    unchanged. Anything else is imported when it is asked for: a provider
+    imports the shared pieces from here, and importing it back at module scope
+    would close the circle."""
+    key = str(name or DEFAULT_PROVIDER).strip().lower()
+    if key in ("", DEFAULT_PROVIDER):
+        return sys.modules[__name__]
+    if key == "gptlive":
+        import gptlive
+        return gptlive
+    raise VoiceAgentError(
+        f"unknown voice provider {key!r}; known: {', '.join(PROVIDER_NAMES)}")
+
 
 class VoiceAgentError(RuntimeError):
     pass
@@ -409,12 +439,18 @@ class VoiceTaskRunner:
     def running(self):
         return len(self._jobs)
 
-    def start(self, task):
+    def start(self, task, signature=None):
+        """`signature` is what "the same task twice" means for this caller.
+
+        It defaults to the task text, which is what a tool call carries. A
+        provider whose request text is the same technical wrapper every time
+        says so with its own key, or every delegation after the first would be
+        refused as a repeat of the one before it."""
         text = " ".join(str(task or "").split())
         if not text:
             return {"ok": False, "status": "empty_task",
                     "instruction": "Ask the caller what they want done, then call again."}
-        signature = text.lower()
+        signature = str(signature).strip().lower() if signature else text.lower()
         running = self._signatures.get(signature)
         if running is not None:
             return {"ok": True, "status": "already_running", "job_id": running,
@@ -704,7 +740,7 @@ class VoiceCallSession:
                  system_instruction, caller_name, caller_track=None,
                  agent_track=None, task_runner=None, send_to_chat=None,
                  capability_runner=None, file_reader=None, on_stream_end=None,
-                 reload_service=None, greeting=None,
+                 reload_service=None, greeting=None, assistant_name=None,
                  progress_interval=DEFAULT_PROGRESS_INTERVAL, log=print):
         self._calls = calls
         self._chat_id = chat_id
@@ -713,6 +749,10 @@ class VoiceCallSession:
         self._voice = voice or DEFAULT_VOICE
         self._system_instruction = system_instruction
         self._caller_name = caller_name
+        # Accepted so both providers are constructed identically. This one has
+        # no use for it: its worker is reached through a tool and is handed no
+        # transcript to attribute.
+        self._assistant_name = assistant_name
         self._task_runner = task_runner
         self._send_to_chat = send_to_chat
         self._capability_runner = capability_runner
@@ -1463,9 +1503,15 @@ def transcript_text(turns, assistant_name, caller_name):
     )
 
 
-async def join_tracks_to_stereo(caller_pcm, agent_pcm, output):
+async def join_tracks_to_stereo(caller_pcm, agent_pcm, output, *,
+                                caller_rate=CALLER_RATE, agent_rate=AGENT_RATE):
     """Join the two raw tracks into one stereo Opus file — caller left, agent
-    right — so the delivered recording carries real speaker separation."""
+    right — so the delivered recording carries real speaker separation.
+
+    The rates are the session's own, not this module's: a second speech stack
+    runs its media at whatever its own wire asks for, and a track joined at the
+    wrong rate is a recording played at the wrong speed rather than an error
+    anything reports."""
     result = {
         "status": "failed",
         "error": None,
@@ -1487,8 +1533,8 @@ async def join_tracks_to_stereo(caller_pcm, agent_pcm, output):
             "ffmpeg",
             "-y",
             "-loglevel", "error",
-            "-f", "s16le", "-ar", str(CALLER_RATE), "-ac", "1", "-i", str(caller_pcm),
-            "-f", "s16le", "-ar", str(AGENT_RATE), "-ac", "1", "-i", str(agent_pcm),
+            "-f", "s16le", "-ar", str(caller_rate), "-ac", "1", "-i", str(caller_pcm),
+            "-f", "s16le", "-ar", str(agent_rate), "-ac", "1", "-i", str(agent_pcm),
             "-filter_complex",
             "[0:a]aresample=48000[l];[1:a]aresample=48000[r];"
             "[l][r]join=inputs=2:channel_layout=stereo[a]",
