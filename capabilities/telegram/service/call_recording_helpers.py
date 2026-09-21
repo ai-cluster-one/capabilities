@@ -25,6 +25,20 @@ from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeFilename
 # stop_reason goes on saying which of the two happened.
 DELIVERABLE_STATUSES = ("complete", "recovered")
 
+# How a finished recording is encoded, wherever it was captured. Speech at 24
+# kbit/s mono is a quarter of the file a stereo 96 kbit/s encode makes of the
+# same conference, and a recording reaches whoever asked for it when it has
+# been both encoded and uploaded: on a 1:40 conference the narrow encode turned
+# five minutes of waiting into a minute and a half. Both capture paths mix down
+# to one channel because the sources are a room, not a stage.
+_OPUS_MONO_ARGS = (
+    "-codec:a", "libopus",
+    "-b:a", "24k",
+    "-vbr", "on",
+    "-application", "voip",
+    "-ac", "1",
+)
+
 
 async def probe_audio_duration(path: Path) -> float | None:
     """Return the finalized media duration without making delivery depend on probing."""
@@ -164,8 +178,8 @@ async def concat_captures(parts: list[dict], output: Path) -> dict:
             *inputs,
             "-filter_complex", filtergraph,
             "-map", "[out]",
-            "-codec:a", "libopus", "-b:a", "96k", "-vbr", "on",
-            "-application", "voip", "-f", "ogg", str(temporary),
+            *_OPUS_MONO_ARGS,
+            "-f", "ogg", str(temporary),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -229,10 +243,7 @@ async def finalize_mp3_capture(capture: Path, output: Path,
             "-i", str(capture),
             *(("-t", f"{trim_to:.3f}") if trim_to and trim_to > 0 else ()),
             "-map", "0:a:0",
-            "-codec:a", "libopus",
-            "-b:a", "96k",
-            "-vbr", "on",
-            "-application", "voip",
+            *_OPUS_MONO_ARGS,
             "-f", "ogg",
             str(temporary),
             stdout=asyncio.subprocess.DEVNULL,
