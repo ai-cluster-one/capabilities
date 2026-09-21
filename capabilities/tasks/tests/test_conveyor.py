@@ -621,6 +621,8 @@ def test_run_is_a_write_verb():
 
 # --- Against a real store ----------------------------------------------------
 
+HERE = "prj_conveyor"
+
 DSN = os.environ.get("TASKS_TEST_DSN")
 needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 
@@ -639,6 +641,9 @@ def store(monkeypatch):
     monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
+    # The ledger is scoped by project, so a verb called straight has to stand
+    # somewhere the way `main` makes it stand somewhere.
+    monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
         conn.execute(mod._schema_ddl(schema))
         try:

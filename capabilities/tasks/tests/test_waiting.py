@@ -200,6 +200,7 @@ class SweepCursor:
         self.ended = [dict(r) for r in (ended or [])]
         self.answer: list[dict] = []
         self.asked_for: tuple | None = None
+        self.scoped: tuple | None = None
         self.changes: list[tuple] = []
         self.activities: list[tuple] = []
 
@@ -207,6 +208,8 @@ class SweepCursor:
         text = " ".join(sql.split())
         if "status = 'waiting'" in text:
             assert "for update skip locked" in text
+            # The sweep is a write and names the project it may reach.
+            self.scoped = params
             self.answer = [dict(t) for t in self.waiting]
         elif "status in ('complete','closed')" in text:
             self.asked_for = params
@@ -230,7 +233,7 @@ class SweepCursor:
 
 def test_the_sweep_returns_a_wait_that_is_over():
     cur = SweepCursor([waits(due=True)])
-    [returned] = mod._sweep_waiting(cur)
+    [returned] = mod._sweep_waiting(cur, HERE)
     assert returned["status"] == "todo"
     # The move says who made it, because nobody did: a change row with neither a
     # raise nor an actor reads as a person's.
@@ -244,7 +247,7 @@ def test_the_sweep_returns_a_task_whose_blockers_have_ended():
     cur = SweepCursor([waits(metadata={"blocked_by": ["k-9", "k-8"]})],
                       ended=[{"id": "t-9", "unique_key": "k-9"},
                              {"id": "t-8", "unique_key": "k-8"}])
-    [returned] = mod._sweep_waiting(cur)
+    [returned] = mod._sweep_waiting(cur, HERE)
     assert returned["status"] == "todo"
     assert cur.asked_for == (["k-8", "k-9"], ["k-8", "k-9"])
     assert cur.activities[0][1].endswith("every task it was waiting on has ended.")
@@ -252,13 +255,13 @@ def test_the_sweep_returns_a_task_whose_blockers_have_ended():
 
 def test_the_sweep_leaves_a_task_waiting_on_a_person():
     cur = SweepCursor([waits(), waits(id="t-2", metadata={"blocked_by": ["k-9"]})])
-    assert mod._sweep_waiting(cur) == []
+    assert mod._sweep_waiting(cur, HERE) == []
     assert cur.changes == [] and cur.activities == []
 
 
 def test_the_sweep_asks_nothing_when_nothing_waits():
     cur = SweepCursor([])
-    assert mod._sweep_waiting(cur) == []
+    assert mod._sweep_waiting(cur, HERE) == []
     assert cur.asked_for is None
 
 
@@ -298,6 +301,8 @@ class ReleaseCursor:
         text = " ".join(sql.split())
         if "task_executions where id::text" in text:
             self.answer = [dict(EXECUTION)]
+        elif text.startswith("select project_id from"):
+            self.answer = [{"project_id": HERE}]
         elif text.startswith("update") and "task_executions" in text:
             self.answer = [{**EXECUTION, "status": params[0], "ended_at": "now"}]
         elif text.startswith("select * from") and "tasks where id" in text:
@@ -337,7 +342,7 @@ class SetCursor:
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
         if "where id::text = %s or unique_key" in text:
-            self.answer = [{"id": self.task["id"]}]
+            self.answer = [{"id": self.task["id"], "project_id": HERE}]
         elif "status in ('complete','closed')" in text:
             self.answer = [dict(r) for r in self.ended]
         elif text.startswith("select * from") and "tasks where id" in text:
@@ -381,6 +386,8 @@ class FakeConn:
 
 @pytest.fixture
 def releasing(monkeypatch):
+    monkeypatch.setattr(mod, "PROJECT", HERE)
+
     def run(task: dict, args: list[str], ended: list[dict] | None = None) -> ReleaseCursor:
         cur = ReleaseCursor(task, ended)
         monkeypatch.setattr(mod, "_connect", lambda entry: FakeConn(cur))
@@ -392,6 +399,7 @@ def releasing(monkeypatch):
 @pytest.fixture
 def setting(monkeypatch):
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
+    monkeypatch.setattr(mod, "PROJECT", HERE)
 
     def run(task: dict, args: list[str], ended: list[dict] | None = None) -> SetCursor:
         cur = SetCursor(task, ended)
@@ -550,6 +558,8 @@ def test_list_groups_the_waiting_tasks_it_carries():
 DSN = os.environ.get("TASKS_TEST_DSN")
 needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 
+HERE = "prj_waiting"
+
 OLD_CHECK = "check (status in ('draft','todo','in_progress','complete','closed'))"
 NEW_CHECK = "check (status in ('draft','todo','in_progress','waiting','complete','closed'))"
 
@@ -569,6 +579,9 @@ def store(monkeypatch):
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
+    # The ledger is scoped by project, so a verb called straight has to stand
+    # somewhere the way `main` makes it stand somewhere.
+    monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
         conn.execute(mod._schema_ddl(schema))
         try:

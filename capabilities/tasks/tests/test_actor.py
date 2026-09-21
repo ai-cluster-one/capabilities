@@ -80,6 +80,8 @@ def test_every_named_write_verb_accepts_the_flag():
 
 # --- Store: where the identity lands ----------------------------------------
 
+HERE = "prj_actor"
+
 DSN = os.environ.get("TASKS_TEST_DSN")
 needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 
@@ -99,6 +101,9 @@ def store(monkeypatch):
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
+    # The ledger is scoped by project, so a verb called straight has to stand
+    # somewhere the way `main` makes it stand somewhere.
+    monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
         conn.execute(mod._schema_ddl(schema))
         conn.execute(mod._schema_ddl(schema))  # additive, so twice is once

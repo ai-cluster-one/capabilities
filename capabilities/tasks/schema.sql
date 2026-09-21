@@ -8,6 +8,7 @@ create schema if not exists tasks;
 
 create table if not exists tasks.tasks (
   id           uuid primary key default gen_random_uuid(),
+  project_id   text        not null,
   type         text        not null,
   unique_key   text        unique,
   title        text        not null,
@@ -51,6 +52,39 @@ comment on column tasks.tasks.created_by is
   'Who created the task, as the CLI resolved it: the raise it ran under, the '
   'actor it was told, or the account it ran as.';
 
+-- In the create above for a new store, and added, filled and tightened here for
+-- one that predates it. Add, backfill, set not null - in that order, forward
+-- only: nothing is dropped, nothing is truncated, and running it again costs a
+-- round trip and changes no row.
+--
+-- The value every existing row is filled with is not written here, because a
+-- project id written into this file would be right for exactly one store. A
+-- store that predates the column holds one project's tasks, and that project is
+-- the one running the migration, so the backfill takes the id that project
+-- declares. `tasks migrate --apply` reads it from the project's own identity
+-- and sets it below; run this file by hand and set it first:
+--
+--   select set_config('tasks_migration.project_id', 'the-project-id', false);
+--
+-- Unset, the backfill refuses rather than inventing a project - and it is
+-- reached at all only where there is a row to fill, so a store created by this
+-- same file needs no setting.
+-- The backfill writes every row, and the trigger below would read that as the
+-- task having moved: a store of a hundred tasks would come out of the migration
+-- with one `updated_at` between them and no record of when anything last
+-- happened. The trigger is dropped and recreated on every apply anyway, so it
+-- is dropped before the row is written rather than after.
+drop trigger if exists tasks_touch_updated_at on tasks.tasks;
+alter table tasks.tasks add column if not exists project_id text;
+update tasks.tasks set project_id = current_setting('tasks_migration.project_id')
+ where project_id is null;
+alter table tasks.tasks alter column project_id set not null;
+comment on column tasks.tasks.project_id is
+  'Which project the task belongs to, as that project declares its own id. The '
+  'only key: a readable name for a project lives in the project, and a copy of '
+  'it here would be a second source of one fact. Reads may name another '
+  'project; a write only ever reaches the project it runs in.';
+
 -- A store created before a status existed keeps the check it was created with,
 -- and `create table if not exists` never revisits one. The constraint therefore
 -- replaces itself, which is safe to repeat and rejects nothing a live row holds:
@@ -59,6 +93,7 @@ alter table tasks.tasks drop constraint if exists tasks_status_check;
 alter table tasks.tasks add constraint tasks_status_check
   check (status in ('draft','todo','in_progress','waiting','complete','closed'));
 
+create index if not exists tasks_project_idx        on tasks.tasks (project_id);
 create index if not exists tasks_status_pickup_idx on tasks.tasks (status, pickup_at);
 create index if not exists tasks_assignee_idx       on tasks.tasks (assignee);
 create index if not exists tasks_metadata_gin      on tasks.tasks using gin (metadata jsonb_path_ops);
@@ -91,7 +126,6 @@ begin
 end;
 $$ language plpgsql;
 
-drop trigger if exists tasks_touch_updated_at on tasks.tasks;
 create trigger tasks_touch_updated_at before update on tasks.tasks
     for each row execute function tasks.touch_updated_at();
 

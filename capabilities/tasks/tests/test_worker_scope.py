@@ -31,6 +31,7 @@ import _cli  # noqa: E402
 mod = _cli.load()
 
 HELD, OTHER = "task-held", "task-other"
+HERE = "prj_worker_scope"
 WORKER = {"TASKS_EXECUTION": "exec-1"}
 OPEN = {"id": "exec-1", "task_id": HELD, "status": "running"}
 CLOSED = {"id": "exec-1", "task_id": HELD, "status": "ok"}
@@ -220,8 +221,10 @@ class FakeCursor:
     def execute(self, sql, params=None):
         if "task_executions" in sql:
             self.answer = [dict(self.row)] if self.row else []
-        elif sql.strip().startswith("select id from"):
-            self.answer = [{"id": params[0]}]
+        elif sql.strip().startswith("select id, project_id from"):
+            # Every task the fake holds is this project's, so what is proven
+            # below is worker scope and never the project boundary above it.
+            self.answer = [{"id": params[0], "project_id": HERE}]
         else:
             raise Reached(sql.strip().split("\n")[0])
 
@@ -250,6 +253,7 @@ class FakeConn:
 def setting(monkeypatch):
     """`set` run as a worker against the fake reads; the argument is the raise."""
     monkeypatch.setenv("TASKS_EXECUTION", "exec-1")
+    monkeypatch.setattr(mod, "PROJECT", HERE)
 
     def run(args: list[str], row=OPEN):
         monkeypatch.setattr(mod, "_connect", lambda entry: FakeConn(FakeCursor(row)))
@@ -336,6 +340,9 @@ def store(monkeypatch):
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
+    # The ledger is scoped by project, so a verb called straight has to stand
+    # somewhere the way `main` makes it stand somewhere.
+    monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
         conn.execute(mod._schema_ddl(schema))
         try:

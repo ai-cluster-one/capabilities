@@ -279,6 +279,27 @@ ACTOR
   environment; else the account the process runs as, which is never empty.
   `claim` and `release` attribute their moves to `--worker`.
 
+PROJECT SCOPE
+  Reads cross the project boundary and writes never do.
+
+  Several projects may share one store, and every task belongs to exactly one of
+  them. Which one is the project's own declared id, read from the envelope's
+  `project.json` and from nowhere else, so a row can only ever be attributed to
+  a project that declared itself.
+
+  `--project <id>` is a filter on `list`, `ready` and `search`, and unsaid it
+  means the project the command runs in. `show`, `runs` and `history` name one
+  task and answer about it whichever project it belongs to.
+
+  No write takes that flag. `add`, `set`, `claim`, `release`, `run`, `tag`,
+  `untag`, `meta` and `activity` take the project from `project.json`, and a
+  write addressed to a task of another project is refused the way worker scope
+  refuses one: exit 4, the policy code, and the rule named.
+
+  Outside a project there is nothing to take. A read has to name a project and a
+  write is refused with exit 6, because a task belonging to nobody is worse than
+  a task not written: nothing here ever stores an empty project.
+
 WORKER SCOPE
   TASKS_EXECUTION does not only sign a write, it bounds one. With it set the
   process is a worker holding one raise, and what it may write is decided by
@@ -306,6 +327,8 @@ WORKER SCOPE
   the worker it starts, never for itself.
 
 FILTERS  (list, ready, search)
+  --project ID          exact match. Unsaid, the project the command runs in;
+                        outside a project it has to be given. No write accepts it
   --type VALUE          exact match
   --status VALUE        exact match, one of those above
   --assignee TEXT       exact match
@@ -378,9 +401,11 @@ CONTRACT
 
 STORE
   The two tables live in the schema the connection names as `db_schema`,
-  defaulting to `tasks`. Two projects sharing one database keep separate stores
-  by naming different schemas. `doctor` reports which schema it looked in and
-  refuses when either table is absent from it.
+  defaulting to `tasks`. Several projects may share one schema and are kept
+  apart inside it by the project each task carries; naming different schemas
+  keeps them apart outright, for the case where one store must not see another
+  at all. `doctor` reports which schema it looked in and refuses when either
+  table is absent from it.
 
   A schema is an identifier, not a value, so it is validated as one: anything but
   letters, digits and underscore is refused rather than quoted.
@@ -393,10 +418,12 @@ EXIT CODES
   3 not found - no task for that uuid or unique key, no worker of that name, or
     a routine or instruction file a worker names that is not there
   4 policy - the capability is disabled, the connection does not allow writes,
-    or worker scope refuses the write; ask the user, never lift the gate yourself
+    or worker scope or project scope refuses the write; ask the user, never lift
+    the gate yourself
   5 store - unreachable, or the schema is not present; `tasks doctor` proves both
-  6 input - a malformed argument, an unknown flag, a value outside its set, or a
-    worker declaration this capability cannot read
+  6 input - a malformed argument, an unknown flag, a value outside its set, a
+    worker declaration this capability cannot read, or a command run outside a
+    project that needs one to know whose tasks it means
 """
 import json
 import os
@@ -3386,6 +3413,68 @@ def _zone(entry) -> "ZoneInfo":
              "use an IANA name such as Europe/Moscow")
 
 
+# --- Project scope -----------------------------------------------------------
+
+PROJECT = None            # replaced per run from the project the command stands in
+
+_PROJECT_HINT = ("a write belongs to the project it runs in; run it from that "
+                 "project, or read across the boundary with `--project`")
+
+
+def _declared_project() -> str | None:
+    """Which project this command stands in, as that project declares itself.
+
+    The envelope's `project.json` is the only source: the id is read from the
+    project rather than taken from a flag, an environment variable or a stored
+    value, which is the whole of the promise that a row can never be attributed
+    to a project that did not declare itself. Reading it is independent of where
+    the project keeps its records, so this answers the same whether that project
+    is on the store or on files.
+
+    A project that declares no usable id is no project here, and so is no
+    project at all: both leave a write with nothing to belong to and are refused
+    in the same words, naming the one command that settles either."""
+    root = _project_root()
+    if root is None:
+        return None
+    identity = _project_capabilities_dir(root) / "project.json"
+    try:
+        declared = json.loads(identity.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(declared, dict):
+        return None
+    return (str(declared.get("id") or "").strip()) or None
+
+
+def _writing_project() -> str:
+    """The project a write lands in, or the refusal that there is none.
+
+    No write names its project, so there is one answer to ask for and one place
+    that refuses when there is no answer. An empty project is never written:
+    a task belonging to nobody is worse than a task not written, because nothing
+    afterwards can tell whose it was."""
+    if not PROJECT:
+        _die(6, "no_project",
+             "this is not a project, and a write has to belong to one",
+             "run `capabilities init` here, or run the write from the project "
+             "whose tasks you mean")
+    return PROJECT
+
+
+def _reading_project(named: str | None) -> str:
+    """The project a read answers about: the one it names, else the one it
+    stands in. A read crosses the boundary, so naming another project is an
+    ordinary filter; outside a project there is nothing to fall back to and the
+    read has to say whose tasks it means rather than answer for the store."""
+    project = (named or PROJECT or "").strip()
+    if not project:
+        _die(6, "no_project",
+             "this is not a project, so a read has to say which project it means",
+             "--project <id>, or run it from the project whose tasks you mean")
+    return project
+
+
 # --- Value plumbing ----------------------------------------------------------
 
 def _jsonable(v):
@@ -3481,16 +3570,35 @@ def _moment(v: str, tz) -> str:
     return stamp.isoformat()
 
 
-def _task_id(cur, ref: str) -> str:
+def _task_id(cur, ref: str, *, writing: bool = False) -> str:
     """A task is addressed by its uuid or by its unique key. Both are exact:
-    guessing which task a person meant is not a service this offers."""
-    cur.execute(f"select id from {SCHEMA}.tasks where id::text = %s or unique_key = %s",
-                (ref, ref))
+    guessing which task a person meant is not a service this offers.
+
+    Every verb that addresses one task comes through here, which is why the
+    project boundary is drawn here too: `writing` is the verb saying which side
+    of it that verb stands on. A read answers about the task whichever project
+    it belongs to; a write reaches only the project it runs in, and is refused
+    the way worker scope refuses - the policy code, and the rule in one
+    sentence. The task is found either way, so the refusal can say whose it is
+    rather than pretending there is no such task."""
+    cur.execute(f"select id, project_id from {SCHEMA}.tasks "
+                f"where id::text = %s or unique_key = %s", (ref, ref))
     hit = cur.fetchall()
     if not hit:
         _die(3, "not_found", f"no task for {ref!r}",
              "address a task by its uuid or by its unique_key")
+    if writing:
+        _project_gate(ref, hit[0]["project_id"])
     return str(hit[0]["id"])
+
+
+def _project_gate(ref: str, owner: str | None) -> None:
+    """Refuse, with the policy code, a write that reaches out of its project."""
+    here = _writing_project()
+    if owner != here:
+        _die(4, "policy",
+             f"{ref} belongs to {owner}, and a write reaches only the project it "
+             f"runs in, which is {here}", _PROJECT_HINT)
 
 
 def _task_row(cur, tid: str) -> dict:
@@ -3516,22 +3624,28 @@ _DATE_FILTERS = {
     "created-after": ("created_at", ">="), "created-before": ("created_at", "<"),
     "updated-after": ("updated_at", ">="), "updated-before": ("updated_at", "<"),
 }
-_LIST_FLAGS = (("type", "status", "tag", "assignee", "per-page", "page", "limit",
-                "activities") + tuple(_DATE_FILTERS))
+_LIST_FLAGS = (("project", "type", "status", "tag", "assignee", "per-page",
+                "page", "limit", "activities") + tuple(_DATE_FILTERS))
 
 # What a scan needs to choose where to look next. `objective` and `description`
 # are the expensive half of a task and stay out until asked for: a list is read
 # to pick one row, not to read every row's reasoning.
-_LEAN = ("id, type, unique_key, title, status, assignee, tags, pickup_at, "
-         "created_at, updated_at")
+_LEAN = ("id, project_id, type, unique_key, title, status, assignee, tags, "
+         "pickup_at, created_at, updated_at")
 _LIST_BOOLS = ("pickup-set", "pickup-unset", "full")
 
 
 def _where(opts: dict, tz=None) -> tuple[str, list]:
     """Every filter narrows; none widens. A moment filter reads a bare date as
     midnight in the connection's zone, so `--created-before 2026-09-03` means
-    everything up to the end of the second."""
-    clauses, params = [], []
+    everything up to the end of the second.
+
+    The project is a filter like the others and is the one that is never absent:
+    unsaid it is the project the command stands in. Every question the store is
+    asked comes through here, so a question can never be asked of the whole
+    store by forgetting to narrow it."""
+    clauses = ["project_id = %s"]
+    params = [_reading_project(opts.get("project"))]
     for flag, (column, op) in _DATE_FILTERS.items():
         if opts.get(flag):
             clauses.append(f"{column} {op} %s")
@@ -3926,6 +4040,9 @@ def cmd_add(entry, args: list[str]) -> None:
     # refused for the assignee a draft does not need.
     _wait_has_a_name(values["status"], values.get("assignee"))
     values["created_by"] = _actor(opts.get("actor"))
+    # Taken from the project rather than from the caller, so a task is only ever
+    # created where the process that created it stands.
+    values["project_id"] = _writing_project()
     with _connect(entry) as conn, conn.cursor() as cur:
         key = values.get("unique_key")
         if key:
@@ -3970,7 +4087,7 @@ def cmd_set(entry, args: list[str]) -> None:
                  f"clearable: {', '.join(_CLEARABLE)}")
         values[_COLUMN[field]] = None
     with _connect(entry) as conn, conn.cursor() as cur:
-        tid = _task_id(cur, opts["_loose"][0])
+        tid = _task_id(cur, opts["_loose"][0], writing=True)
         lookup = _execution_lookup(cur)
         if "status" in values:
             _worker_gate(f"status:{values['status']}", tid, lookup)
@@ -4019,7 +4136,7 @@ def cmd_tag(entry, args: list[str], remove: bool = False) -> None:
              f"{NAME} {verb} <uuid|unique_key> <tag> [tag...]")
     ref, names = loose[0], loose[1:]
     with _connect(entry) as conn, conn.cursor() as cur:
-        tid = _task_id(cur, ref)
+        tid = _task_id(cur, ref, writing=True)
         _worker_gate("untag" if remove else "tag", tid, _execution_lookup(cur))
         if remove:
             cur.execute(f"""update {SCHEMA}.tasks
@@ -4051,7 +4168,9 @@ def cmd_meta(entry, args: list[str]) -> None:
     if action in ("rm", "show") and not rest:
         _die(6, "input", f"meta {action} needs a task")
     with _connect(entry) as conn, conn.cursor() as cur:
-        tid = _task_id(cur, rest[0])
+        # `meta show` reads and the other two write, so the boundary is drawn
+        # by which of them this is rather than by the verb's name.
+        tid = _task_id(cur, rest[0], writing=action != "show")
         if action == "show":
             _emit({"task": tid, "metadata": _task_row(cur, tid)["metadata"]})
             return
@@ -4104,7 +4223,7 @@ def cmd_activity(entry, args: list[str]) -> None:
         _die(6, "input", "activity needs a task and what happened",
              f'{NAME} activity <task> "what happened"')
     with _connect(entry) as conn, conn.cursor() as cur:
-        tid = _task_id(cur, loose[0])
+        tid = _task_id(cur, loose[0], writing=True)
         _worker_gate("activity", tid, _execution_lookup(cur))
         row = _add_activity(cur, tid, loose[1], _actor(opts.get("actor")))
         conn.commit()
@@ -4179,19 +4298,25 @@ def _record_moves(cur, tid: str, before: dict, after: dict,
     return moved
 
 
-def _sweep_leases(cur) -> list[dict]:
-    """Close every claim whose lease has passed, and free the task it held.
+def _sweep_leases(cur, project: str) -> list[dict]:
+    """Close every claim of this project whose lease has passed, and free the
+    task it held.
 
     A worker that dies renews nothing; the moment simply arrives. Doing this
     inside `claim` rather than on a schedule of its own means there is one
     mechanism for recovering abandoned work, and it runs exactly when something
-    is looking for work to do."""
+    is looking for work to do.
+
+    It is still a write, so it reaches no further than the project it runs in: a
+    claim looking for its own work never closes somebody else's raise."""
     cur.execute(f"""update {SCHEMA}.task_executions
                        set status = 'abandoned', ended_at = now(),
                            detail = coalesce(detail, 'lease lapsed before release')
                      where status = 'running' and lease_until is not null
                        and lease_until < now()
-                 returning id, task_id, attempt""")
+                       and task_id in (select id from {SCHEMA}.tasks
+                                        where project_id = %s)
+                 returning id, task_id, attempt""", (project,))
     swept = _rows(cur)
     for row in swept:
         tid = str(row["task_id"])
@@ -4254,8 +4379,8 @@ def _wait_over(task: dict, ended: set) -> str | None:
     return None
 
 
-def _sweep_waiting(cur) -> list[dict]:
-    """Return to the queue every waiting task whose wait is over.
+def _sweep_waiting(cur, project: str) -> list[dict]:
+    """Return to the queue every waiting task of this project whose wait is over.
 
     Run from `claim` for the reason the lapsed-lease sweep is: one mechanism
     puts work back, and it runs exactly when something is looking for work to do
@@ -4265,10 +4390,14 @@ def _sweep_waiting(cur) -> list[dict]:
     second opinion computed here would disagree with it the one time the two
     machines differ. Which blockers have ended is read from the store too, and a
     name matching no task has not ended - so an unknown blocker holds the task
-    rather than freeing it."""
+    rather than freeing it.
+
+    It is still a write, so it returns only this project's waits: a claim
+    looking for its own work never moves somebody else's task."""
     cur.execute(f"""select *, (pickup_at is not null and pickup_at <= now()) as due
-                      from {SCHEMA}.tasks where status = 'waiting'
-                     for update skip locked""")
+                      from {SCHEMA}.tasks
+                     where status = 'waiting' and project_id = %s
+                     for update skip locked""", (project,))
     waiting = _rows(cur)
     if not waiting:
         return []
@@ -4319,22 +4448,29 @@ def _claim(entry, opts: dict) -> dict:
     same way a caller of the verb does and there is one transaction either way.
 
     The flags arrive already parsed: what a claim is remains here, and how a
-    caller spells it belongs to whoever parsed it."""
+    caller spells it belongs to whoever parsed it.
+
+    A claim is a write and takes no project of its own: the selection, and both
+    sweeps that run before it, are the project's alone, so a worker in one
+    project can neither take another project's work nor move another project's
+    tasks while it looks for its own."""
     lease = _duration(opts.get("lease") or _LEASE_DEFAULT)
-    where, params = _where({k: v for k, v in opts.items() if k in ("type", "assignee", "tag")},
-                           _zone(entry))
+    project = _writing_project()
+    where, params = _where({**{k: v for k, v in opts.items()
+                               if k in ("type", "assignee", "tag")},
+                            "project": project}, _zone(entry))
     joiner = " and " if where else " where "
     with _connect(entry) as conn, conn.cursor() as cur:
-        swept = _sweep_leases(cur)
+        swept = _sweep_leases(cur, project)
         # Before the selection, so a wait that ended is work this same call can
         # take rather than work the next call finds.
-        returned = _sweep_waiting(cur)
+        returned = _sweep_waiting(cur, project)
         if opts.get("key"):
             # Naming a task asks a different question from asking for work, and
             # it deserves a different answer. Finding nothing is the ordinary
             # reply to "is there anything"; it is never the reply to "take this
             # one", where silence would leave the caller believing it ran.
-            tid = _task_id(cur, opts["key"])
+            tid = _task_id(cur, opts["key"], writing=True)
             # The store decides whether the moment has come, not this process:
             # a pickup is compared against the database clock everywhere else,
             # and a second opinion computed here would disagree with it the one
@@ -4459,6 +4595,19 @@ def _release(entry, ref: str, outcome: str, status: str, detail: str | None,
             raise Refusal(3, "not_found", f"no raise for {ref!r}",
                           f"`{NAME} runs <task>` lists the raises of one task")
         execution = found[0]
+        # A raise names a task, so closing one reaches a task: the same boundary
+        # every other write is held to, refused in the same words, and asked
+        # before the raise's own state so that a foreign raise is never told
+        # whether it is still open.
+        cur.execute(f"select project_id from {SCHEMA}.tasks where id = %s",
+                    (execution["task_id"],))
+        owner = _rows(cur)[0]["project_id"]
+        here = _writing_project()
+        if owner != here:
+            raise Refusal(4, "policy",
+                          f"that raise holds a task of {owner}, and a write "
+                          f"reaches only the project it runs in, which is {here}",
+                          _PROJECT_HINT)
         if execution["status"] != "running":
             hint = ("the lease lapsed and this claim was swept, so the task may "
                     "already be with someone else - claim it again to continue"
@@ -4903,19 +5052,24 @@ def _take(entry, worker: dict, key: str | None) -> dict:
 
 def _would_take(entry, worker: dict, key: str | None) -> dict:
     """The task a claim would take, asked in the order the claim asks in, and
-    writing nothing: no sweep, no raise, no status move."""
+    writing nothing: no sweep, no raise, no status move.
+
+    It answers for the claim that would follow, so it is bounded where that
+    claim is bounded - by the project, and not by what the store holds."""
     tz = _zone(entry)
+    project = _writing_project()
     with _connect(entry) as conn, conn.cursor() as cur:
         take = None
         if key:
-            tid = _task_id(cur, key)
+            tid = _task_id(cur, key, writing=True)
             cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
                               from {SCHEMA}.tasks where id = %s""", (tid,))
             row = _rows(cur)[0]
             take = row if row.pop("due") and row["status"] == "todo" else None
         else:
             for kind in worker["types"]:
-                where, params = _where({**_selector_filters(worker), "type": kind}, tz)
+                where, params = _where({**_selector_filters(worker), "type": kind,
+                                        "project": project}, tz)
                 joiner = " and " if where else " where "
                 cur.execute(f"""select * from {SCHEMA}.tasks{where}{joiner}
                                   status = 'todo'
@@ -5280,7 +5434,7 @@ _TABLES = ("tasks", "task_activities", "task_executions", "task_changes")
 # names the ones a store lacks, so a store that has every table and is still a
 # column behind reads as behind rather than as current.
 _COLUMNS = (("task_executions", "metrics"), ("tasks", "created_by"),
-            ("task_activities", "actor"))
+            ("tasks", "project_id"), ("task_activities", "actor"))
 
 # Values a later version added to a check constraint an earlier one created.
 # `create table if not exists` never revisits the constraint it created, so a
@@ -5366,15 +5520,27 @@ def cmd_migrate(entry, args: list[str]) -> None:
     opts = _flags(args, (), bools=("apply",))
     schema = _schema(entry)
     ddl = _schema_ddl(schema)
+    # Asked before anything is read, because it is also the value the backfill
+    # below needs and there is no sense reporting on a store this command has no
+    # standing to change.
+    project = _writing_project()
     with _connect(entry) as conn, conn.cursor() as cur:
         before = _tables_present(cur, schema)
         missing = [t for t in _TABLES if t not in before]
         lacking = (_columns_absent(cur, schema, before)
                    + _constraints_behind(cur, schema, before))
         if not opts.get("apply"):
-            _emit({"schema": schema, "present": before, "would_create": missing,
-                   "would_add": lacking, "applied": False})
+            _emit({"schema": schema, "project": project, "present": before,
+                   "would_create": missing, "would_add": lacking, "applied": False})
             return
+        # What the schema backfills a row that predates the project column with.
+        # Passed as a value rather than written into the file, because a project
+        # id in the file would be right for exactly one store; a store that
+        # predates the column holds one project's tasks, and the project running
+        # the migration is that project. `set_config` binds it, so nothing the
+        # project declares is interpolated into SQL.
+        cur.execute("select set_config('tasks_migration.project_id', %s, false)",
+                    (project,))
         # Applied whole even when every table is present. The file carries
         # additive `alter ... add column if not exists` for columns a later
         # version introduced, and a constraint that replaces itself for values a
@@ -5390,8 +5556,8 @@ def cmd_migrate(entry, args: list[str]) -> None:
         _die(5, "schema_incomplete",
              f"schema {schema} is still missing {', '.join(still)} after applying",
              "the connection's role may not be allowed to create objects in that schema")
-    _emit({"schema": schema, "present": after, "created": missing, "added": lacking,
-           "applied": True})
+    _emit({"schema": schema, "project": project, "present": after,
+           "created": missing, "added": lacking, "applied": True})
 
 
 # --- Doctor ------------------------------------------------------------------
@@ -5464,6 +5630,9 @@ def main() -> None:
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
     globals()["SCHEMA"] = _schema(entry)
+    # Read once per run, from the project and not from the command line, so
+    # every verb below asks the same question of the same answer.
+    globals()["PROJECT"] = _declared_project()
     if verb in WRITE_VERBS:
         _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), verb)
     handlers = {
