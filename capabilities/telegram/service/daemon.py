@@ -4,7 +4,7 @@
 # dependencies = [
 #     "telethon==1.43.2",
 #     "py-tgcalls==3.0.0rc3",
-#     "ntgcalls==3.0.0rc3",
+#     "ntgcalls==3.0.0rc5",
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 # ]
@@ -26,14 +26,27 @@
 # the familiar null +0x58 and once on a pointer that failed authentication -
 # the same code path reading an object that had been freed and reused.
 #
-# rc3 is here because the maintainer asked for it against those four, not
-# because it claims to fix them: between the commit b20 was built from
-# (ee078f4) and rc3 there is no commit naming #61. What it does carry is
-# WebRTC m150 to m152, a fix for a deadlock when spawning shell processes -
-# which this capability does, for every recording's ffmpeg - and an
-# Android-only Oboe use-after-free that cannot be this one. So rc3 is a fresh
-# base to measure from, and any verdict on #61 has to come from live
-# conference traffic on it rather than from its changelog.
+# rc3 closed #61. It carries WebRTC m150 to m152, and the fix rides inside that
+# bump rather than in any commit naming the issue: a voice receive channel
+# handed Call::DeliverRtpPacket a handler holding its own raw `this`, guarded
+# only by Call's safety flag, so a channel destroyed before the posted task ran
+# left the handler reading freed memory. Their m152 build checks the channel's
+# own safety flag first. Measured on live traffic rather than read off the
+# changelog: 580 incoming channel teardowns across 12 conference joins between
+# 2026-09-12 and 2026-09-22 with no fault, where b20's rate expected about
+# four. The issue was closed as completed on 2026-09-22.
+#
+# rc5 is here because it is the newest of the line and is where the maintainer
+# is heading for stable. py-tgcalls stays at rc3, which is its newest release
+# and accepts any ntgcalls 3.x. The pin moved only after a live probe of the
+# surface this daemon actually touches - the constructors, the filters, the
+# private participant cache and source map, and the media-stack log strings
+# the audio-map reconciler parses - because the tests stub the library and
+# cannot see a native change at all.
+#
+# Still open on rc3 and carried into rc5: ntgcalls#75, one SIGSEGV on ntg-work
+# shortly after a P2P-to-conference migration, faulting at 0x10 under six
+# frames rather than #61's four at 0x58. Seen once, on 2026-09-14.
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
 
