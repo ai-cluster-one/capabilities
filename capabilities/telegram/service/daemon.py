@@ -1714,6 +1714,77 @@ def report_unclean_exit():
         f"last sync {previous.get('updated_at')}")
 
 
+# Where the system leaves a crash report, and where one has to be put to still
+# be there later. macOS retires a report into Retired/ within hours and prunes
+# it after that, so a fault stays diagnosable only for as long as nothing looks
+# away: the daemon death mid-conference on 2026-09-16 was already gone when the
+# daily watch came round, and can never be classified now. The process that
+# finds the body is this one, seconds later, so it is the one that keeps it.
+SYSTEM_CRASH_DIRS = (
+    Path.home() / "Library" / "Logs" / "DiagnosticReports",
+    Path.home() / "Library" / "Logs" / "DiagnosticReports" / "Retired",
+)
+CRASH_REPORT_DIR = SERVICE_STATE_DIR / "crash-reports"
+# The report is written after the process is already gone, and a restart can
+# beat it there. These are the delays, in seconds, at which the search repeats.
+CRASH_REPORT_ATTEMPTS = (0, 15, 60)
+# No report older than this can belong to the process that just died.
+CRASH_REPORT_MAX_AGE_SECONDS = 3600
+
+
+def _crash_report_for(pid):
+    """The system's crash report for `pid`, if it has been written yet."""
+    for directory in SYSTEM_CRASH_DIRS:
+        try:
+            reports = sorted(directory.glob("*.ips"),
+                             key=lambda path: path.stat().st_mtime,
+                             reverse=True)
+        except OSError:
+            continue
+        for report in reports:
+            try:
+                if time.time() - report.stat().st_mtime > CRASH_REPORT_MAX_AGE_SECONDS:
+                    break                        # sorted newest first — the rest are older still
+                _, _, body = report.read_text(errors="replace").partition("\n")
+                payload = json.loads(body)
+            except (OSError, ValueError):
+                continue
+            if payload.get("pid") == pid:
+                return report
+    return None
+
+
+async def preserve_crash_report(pid):
+    """Copy the dead process's crash report somewhere it will survive.
+
+    Called only when the process before this one was killed rather than
+    stopped. Nothing here recovers anything; it exists so that the question
+    'what killed it' is still answerable tomorrow, which on this system it
+    otherwise is not.
+    """
+    if pid is None or not any(path.is_dir() for path in SYSTEM_CRASH_DIRS):
+        return None                              # no system that writes these
+    for delay in CRASH_REPORT_ATTEMPTS:
+        if delay:
+            await asyncio.sleep(delay)
+        report = _crash_report_for(pid)
+        if report is None:
+            continue
+        kept = CRASH_REPORT_DIR / report.name
+        try:
+            CRASH_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+            if not kept.exists():
+                shutil.copy2(report, kept)
+        except OSError as e:
+            log(f"daemon: could not keep the crash report for pid {pid} — {e}")
+            return None
+        log(f"daemon: kept the crash report for pid {pid} at {kept}")
+        return kept
+    log(f"daemon: pid {pid} left no crash report within "
+        f"{CRASH_REPORT_ATTEMPTS[-1]}s — it was killed without faulting")
+    return None
+
+
 def write_health(state=None, **updates):
     """Atomically publish update-stream liveness for `telegram service status`."""
     health = {}
@@ -9244,6 +9315,8 @@ async def main():
         PID_FILE.write_text(f"{os.getpid()}\n")
         wrote_pid = True
         report_unclean_exit()
+        if PREVIOUS_EXIT["unclean"]:
+            asyncio.create_task(preserve_crash_report(PREVIOUS_EXIT["pid"]))
         write_health("starting", last_error=None)
         if call_recorder_command() is not None:
             call_recorder_task = asyncio.create_task(supervise_call_recorder())

@@ -7495,6 +7495,78 @@ class UncleanExitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(daemon._test_logs, [])
 
 
+class CrashReportPreservationTests(unittest.IsolatedAsyncioTestCase):
+    """macOS prunes its own crash reports, so whoever finds the body keeps it."""
+
+    def write_report(self, directory, name, pid):
+        directory.mkdir(parents=True, exist_ok=True)
+        report = directory / name
+        report.write_text('{"app_name":"python3.12"}\n'
+                          + json.dumps({"pid": pid, "procName": "python3.12"}))
+        return report
+
+    def system_dirs(self, daemon, root):
+        daemon.SYSTEM_CRASH_DIRS = (root, root / "Retired")
+        daemon.CRASH_REPORT_ATTEMPTS = (0,)
+        return root
+
+    async def test_the_dead_process_report_is_copied_where_it_will_keep(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = self.system_dirs(daemon, Path(td) / "DiagnosticReports")
+            self.write_report(root, "python3.12-2026-09-16-114843.ips", 4242)
+            self.write_report(root, "python3.12-2026-09-16-090000.ips", 99)
+
+            kept = await daemon.preserve_crash_report(4242)
+
+            self.assertIsNotNone(kept)
+            self.assertEqual(kept.name, "python3.12-2026-09-16-114843.ips")
+            self.assertEqual(json.loads(kept.read_text().split("\n", 1)[1])["pid"], 4242)
+            self.assertTrue(any("kept the crash report for pid 4242" in line
+                                for line in daemon._test_logs))
+
+    async def test_a_retired_report_is_still_found(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = self.system_dirs(daemon, Path(td) / "DiagnosticReports")
+            root.mkdir(parents=True, exist_ok=True)
+            self.write_report(root / "Retired", "python3.12-2026-09-16-114843.ips", 4242)
+
+            kept = await daemon.preserve_crash_report(4242)
+
+            self.assertIsNotNone(kept)
+
+    async def test_a_kill_that_left_no_report_is_said_so(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = self.system_dirs(daemon, Path(td) / "DiagnosticReports")
+            self.write_report(root, "python3.12-2026-09-16-114843.ips", 99)
+
+            kept = await daemon.preserve_crash_report(4242)
+
+            self.assertIsNone(kept)
+            self.assertTrue(any("left no crash report" in line
+                                for line in daemon._test_logs))
+
+    async def test_a_report_too_old_to_be_this_death_is_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = self.system_dirs(daemon, Path(td) / "DiagnosticReports")
+            stale = self.write_report(root, "python3.12-2026-09-01-114843.ips", 4242)
+            old = time.time() - daemon.CRASH_REPORT_MAX_AGE_SECONDS - 60
+            os.utime(stale, (old, old))
+
+            self.assertIsNone(await daemon.preserve_crash_report(4242))
+
+    async def test_a_system_that_writes_no_reports_says_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.system_dirs(daemon, Path(td) / "nowhere")
+
+            self.assertIsNone(await daemon.preserve_crash_report(4242))
+            self.assertEqual(daemon._test_logs, [])
+
+
 class ChannelStopTests(unittest.IsolatedAsyncioTestCase):
     """`/stop` stops the channel's running work, whatever started it.
 
