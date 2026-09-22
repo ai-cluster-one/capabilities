@@ -323,6 +323,32 @@ TOOL_NAMES = tuple(tool["name"] for tool in ALL_TOOLS)
 DEFAULT_PROVIDER = "gemini"
 PROVIDER_NAMES = ("gemini", "gptlive")
 
+class _Self:
+    """This module, reached through its own namespace rather than by name.
+
+    `sys.modules` is the obvious way and the wrong one twice over: anything may
+    put the table back the way it found it, so a later lookup answers with
+    whichever module now holds the name rather than the one whose code is
+    asking - and a module executed without being registered there is not in the
+    table at all. Both happen in this capability's own tests, and the first
+    reads as a call that opens a connection nobody meant to open.
+
+    `globals()` is the module's own `__dict__`, so this follows the module
+    wherever it goes and sees anything set on it afterwards."""
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(
+                f"module {__name__!r} has no attribute {name!r}") from None
+
+    def __repr__(self):
+        return f"<{__name__} as a provider>"
+
+
+_THIS_MODULE = _Self()
+
 # This provider reaches the worker through the `agent_task` tool, so whether it
 # gets a task runner is the tool set's decision.
 DELEGATES_TO_WORKER = False
@@ -332,12 +358,13 @@ def provider(name=None):
     """The module one provider's calls run on.
 
     This module is itself the Gemini provider, so the lookup returns it
-    unchanged. Anything else is imported when it is asked for: a provider
-    imports the shared pieces from here, and importing it back at module scope
-    would close the circle."""
+    unchanged — the very object whose code is asking, so anything done to this
+    module is what the caller gets. Anything else is imported when it is asked
+    for: a provider imports the shared pieces from here, and importing it back
+    at module scope would close the circle."""
     key = str(name or DEFAULT_PROVIDER).strip().lower()
     if key in ("", DEFAULT_PROVIDER):
-        return sys.modules[__name__]
+        return _THIS_MODULE
     if key == "gptlive":
         import gptlive
         return gptlive

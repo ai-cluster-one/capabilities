@@ -2641,6 +2641,10 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(users[1], {
                 "name": "Default",
+                # Which speech stack answers this caller, resolved here so every
+                # later step - the credential, the prompts, the media rates -
+                # asks one settled question rather than each its own.
+                "provider": "gemini",
                 "model": daemon.voice_agent.DEFAULT_MODEL,
                 "voice": daemon.voice_agent.DEFAULT_VOICE,
                 # Unset by default: the shipped greeting is the engine's own.
@@ -2992,7 +2996,10 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             api_key, voice_context, blocked = daemon.voice_call_readiness()
             self.assertIsNone(api_key)
             self.assertIsNone(voice_context)
-            self.assertIn(str(daemon.VOICE_CONTEXT_FILE), blocked)
+            # The document, not a path: which file a document is kept in is the
+            # records surface's business and there is not always one, but the
+            # person who has to write the missing prompt needs it named.
+            self.assertIn("gemini-voice-agent", blocked)
 
     async def test_empty_voice_prompt_is_not_a_prompt(self):
         with tempfile.TemporaryDirectory() as td:

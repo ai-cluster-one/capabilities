@@ -2032,7 +2032,11 @@ def voice_call_readiness(provider=None):
         return None, None, f"{secret_env} not resolved"
     voice_context = read_voice_context(provider)
     if not voice_context:
-        return None, None, f"no voice prompt for {provider}"
+        # Named, not merely reported: whoever reads this log line is the person
+        # who has to write the thing that is missing.
+        missing = (str(VOICE_CONTEXT_FILE) if VOICE_PROMPT_FILE_EXPLICIT
+                   else f"{provider}-voice-agent")
+        return None, None, f"no voice prompt at {missing}"
     return api_key, voice_context, None
 
 
