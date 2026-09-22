@@ -3022,17 +3022,22 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("gptlive stack's own prompt", context)
             self.assertNotIn("Gemini's own prompt", context)
 
-    async def test_a_project_that_does_name_a_file_still_gets_that_file(self):
+    async def test_a_project_that_does_name_a_file_gets_that_file(self):
+        """A name of its own, not the one the launcher exports - the two have to
+        differ or the test passes whichever wins."""
         with tempfile.TemporaryDirectory() as td:
             named = settings()
-            named["defaults"]["voice_agent"] = {"prompt_file": "voice-agent.md"}
+            named["defaults"]["voice_agent"] = {"prompt_file": "my-voice.md"}
             daemon = import_daemon(
-                Path(td), named, voice_context="The named file.",
+                Path(td), named, voice_context="The launcher's default file.",
                 project_env={"GOOGLE_API_KEY": "k"})
             service_dir = Path(td) / "project" / "capabilities" / "telegram" / "service"
+            (service_dir / "my-voice.md").write_text("The file the project named.")
             (service_dir / "gemini-voice-agent.md").write_text("Not this one.")
 
-            self.assertIn("The named file.", daemon.read_voice_context("gemini"))
+            self.assertEqual(daemon.VOICE_CONTEXT_FILE.name, "my-voice.md")
+            self.assertIn("The file the project named.",
+                          daemon.read_voice_context("gemini"))
 
     async def test_empty_voice_prompt_is_not_a_prompt(self):
         with tempfile.TemporaryDirectory() as td:

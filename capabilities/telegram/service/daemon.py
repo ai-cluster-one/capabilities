@@ -557,9 +557,14 @@ def _runtime_settings(settings, project_layout=None):
     # plumbing as a decision - and answers yes always, which leaves every
     # provider reading one file and none of them reading their own.
     voice_prompt_file_explicit = bool(voice_defaults.get("prompt_file"))
+    # The setting first. The environment name is the launcher's own export,
+    # carrying the default path on every start, so letting it win means a
+    # project that named a file never gets it - and now that naming one also
+    # decides which prompts a provider reads, that is the difference between a
+    # stack running on its own words and on the other stack's.
     voice_prompt_file = str(
-        os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
-        or voice_defaults.get("prompt_file")
+        voice_defaults.get("prompt_file")
+        or os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
         or "voice-agent.md")
     voice_context_file = Path(voice_prompt_file)
     if not voice_context_file.is_absolute():
