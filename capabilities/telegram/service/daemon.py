@@ -551,9 +551,12 @@ def _runtime_settings(settings, project_layout=None):
         raise SettingsError("settings.defaults.voice_agent.progress_interval must not be negative")
     voice_timezone, voice_timezone_name = voice_agent.resolve_timezone(
         voice_defaults.get("timezone"))
-    voice_prompt_file_explicit = bool(
-        os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
-        or voice_defaults.get("prompt_file"))
+    # Only the setting. The launcher exports TELEGRAM_SERVICE_VOICE_CONTEXT on
+    # every start, carrying the default path rather than a choice, so reading
+    # its presence as "the project named a file" is reading the launcher's own
+    # plumbing as a decision - and answers yes always, which leaves every
+    # provider reading one file and none of them reading their own.
+    voice_prompt_file_explicit = bool(voice_defaults.get("prompt_file"))
     voice_prompt_file = str(
         os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
         or voice_defaults.get("prompt_file")
@@ -7553,7 +7556,7 @@ async def run_session(client):
         def voice_call_busy():
             return active_voice_call["starting"] or active_voice_call["session"] is not None
 
-        async def tail_voice_progress(path, on_progress):
+        async def tail_voice_progress(path, on_progress, caller_id):
             """Follow one task's progress file. Every line the worker writes is
             collected; what reaches the conversation is the call's decision, not
             this reader's."""
@@ -7689,7 +7692,8 @@ async def run_session(client):
                         f"authority={_authority_summary(authority)}")
                     if on_progress is not None:
                         progress_task = asyncio.create_task(
-                            tail_voice_progress(progress_outbox, on_progress))
+                            tail_voice_progress(progress_outbox, on_progress,
+                                                caller_id))
                     loop = asyncio.get_running_loop()
                     future = worker_turn(loop, s["worker"], key, tail or [],
                                          state, procs)

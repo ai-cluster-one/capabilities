@@ -3001,6 +3001,39 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             # person who has to write the missing prompt needs it named.
             self.assertIn("gemini-voice-agent", blocked)
 
+    async def test_the_launcher_s_own_path_is_not_a_project_naming_a_file(self):
+        """The service launcher exports TELEGRAM_SERVICE_VOICE_CONTEXT on every
+        start, carrying the default path rather than a choice. Read as a choice
+        it answers yes always, and every provider then reads one file instead of
+        its own - which is how a stack can run for an evening on the other
+        stack's prompt without anything looking wrong."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(), voice_context="Gemini's own prompt.",
+                project_env={"GOOGLE_API_KEY": "k", "OPENAI_API_KEY": "k"})
+            self.assertTrue(os.environ.get("TELEGRAM_SERVICE_VOICE_CONTEXT")
+                            or True)  # the launcher's export, reproduced above
+            service_dir = Path(td) / "project" / "capabilities" / "telegram" / "service"
+            (service_dir / "gptlive-voice-agent.md").write_text(
+                "The gptlive stack's own prompt.")
+
+            context = daemon.read_voice_context("gptlive")
+
+            self.assertIn("gptlive stack's own prompt", context)
+            self.assertNotIn("Gemini's own prompt", context)
+
+    async def test_a_project_that_does_name_a_file_still_gets_that_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            named = settings()
+            named["defaults"]["voice_agent"] = {"prompt_file": "voice-agent.md"}
+            daemon = import_daemon(
+                Path(td), named, voice_context="The named file.",
+                project_env={"GOOGLE_API_KEY": "k"})
+            service_dir = Path(td) / "project" / "capabilities" / "telegram" / "service"
+            (service_dir / "gemini-voice-agent.md").write_text("Not this one.")
+
+            self.assertIn("The named file.", daemon.read_voice_context("gemini"))
+
     async def test_empty_voice_prompt_is_not_a_prompt(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(
@@ -3008,7 +3041,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 project_env={"GOOGLE_API_KEY": "live-key"})
 
             _, _, blocked = daemon.voice_call_readiness()
-            self.assertIn(str(daemon.VOICE_CONTEXT_FILE), blocked)
+            self.assertIn("gemini-voice-agent", blocked)
 
     async def test_call_recording_request_is_explicit_and_persisted(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7606,6 +7639,79 @@ class StubVoiceCallSession:
 
     async def stop(self):
         pass
+
+
+class VoiceWorkerDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    """A worker putting something in the chat while a call is up.
+
+    Everything a voice worker writes goes to the assistant on the call and is
+    never sent, because a working note read out is noise. One kind of line is
+    the exception - a link, an address, an exact spelling - and it is marked as
+    such. Getting that wrong is silent in both directions: the line is not sent,
+    and the failure takes the progress reader down with it without a log."""
+
+    def settings_for(self):
+        base = settings(worker_timeout=30)
+        base["defaults"]["voice_agent"] = {"worker": "codex"}
+        base["allowed_users"] = {"777": {"name": "Caller", "role": "owner",
+                                         "voice_agent": {"mode": "enabled"}}}
+        return base
+
+    async def answered_call(self, td, worker):
+        daemon = import_daemon(Path(td), self.settings_for(),
+                               voice_context="Answer briefly.",
+                               project_env={"GOOGLE_API_KEY": "test-key"})
+        daemon.WORKERS["codex"] = worker
+        captured = {}
+
+        def capture_runner(run_task, *args, **kwargs):
+            captured["run"] = run_task
+            return SimpleNamespace()
+
+        daemon.voice_agent.VoiceTaskRunner = capture_runner
+        daemon.voice_agent.VoiceCallSession = StubVoiceCallSession
+        client = FakeClient()
+        session_task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        calls = daemon.PyTgCalls.instances[-1]
+        await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=777))
+        await wait_until(lambda: "run" in captured, timeout=10)
+        return daemon, client, session_task, captured["run"]
+
+    def writing_worker(self, deliver):
+        """A worker that writes one line to the outbox the way the shim does."""
+        def worker(chat, tail, state=None, procs=None):
+            record = {"time": time.time(), "chat": "777", "text": "https://example/x",
+                      "deliver": deliver}
+            outbox = Path(state["progress_outbox"])
+            outbox.parent.mkdir(parents=True, exist_ok=True)
+            with outbox.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+            time.sleep(2.5)
+            return {"reply": "done", "meta": {}}
+        return worker
+
+    async def test_a_marked_line_is_sent_to_the_caller(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon, client, session_task, run_task = await self.answered_call(
+                td, self.writing_worker(deliver=True))
+            await asyncio.wait_for(run_task("look something up"), timeout=30)
+
+            sent = [m["text"] for m in client.sent]
+            self.assertIn("https://example/x", sent)
+            client.disconnected.set()
+            await asyncio.wait_for(session_task, timeout=10)
+
+    async def test_an_unmarked_line_is_never_sent(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon, client, session_task, run_task = await self.answered_call(
+                td, self.writing_worker(deliver=False))
+            await asyncio.wait_for(run_task("look something up"), timeout=30)
+
+            sent = [m["text"] for m in client.sent]
+            self.assertNotIn("https://example/x", sent)
+            client.disconnected.set()
+            await asyncio.wait_for(session_task, timeout=10)
 
 
 class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):

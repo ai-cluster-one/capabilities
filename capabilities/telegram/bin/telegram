@@ -5576,9 +5576,17 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
         "context": str(_service_context_path(root)),
         "delegation": str(_service_delegation_path(root)),
         "job_worker": str(_service_job_worker_path(root)),
+        # Every prompt a project may hold, the voice ones named per provider so
+        # a project initialized with this build does not read as having none.
+        # The unsuffixed `voice-agent` is still listed: a project that predates
+        # the split owns one, and it is what the default provider falls back to.
         "prompts": {key: _records().document_read(NAME, key) is not None
-                    for key in ("context", "delegation", "job-worker",
-                                "voice-agent")},
+                    for key in (
+                        "context", "delegation", "job-worker", "voice-agent",
+                        *(f"{provider}-{kind}"
+                          for provider, kinds in sorted(
+                              _settings_schema_module().VOICE_PROVIDER_DOCUMENTS.items())
+                          for kind in kinds))},
         "voice_context": str(_service_voice_context_path(root)),
         "session": str(paths["session"]),
         "state_dir": str(paths["state"]),
