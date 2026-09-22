@@ -22,9 +22,10 @@ from pathlib import Path
 
 
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
-CLI_PATH = next((path for path in (
-    TELEGRAM_DIR / "bin" / "telegram", TELEGRAM_DIR / "telegram")
-    if path.is_file()), TELEGRAM_DIR / "bin" / "telegram")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _cli import CLI_PATH  # noqa: E402
+
 WORKER_SHIM_PATH = TELEGRAM_DIR / "service" / "worker-bin" / "telegram"
 
 

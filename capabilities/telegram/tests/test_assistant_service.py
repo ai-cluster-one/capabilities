@@ -26,6 +26,9 @@ from unittest import mock
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
 DAEMON_PATH = TELEGRAM_DIR / "service" / "daemon.py"
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _cli import CLI_PATH  # noqa: E402
+
 
 def settings(**default_overrides):
     defaults = {
@@ -3216,9 +3219,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_telethon_compatibility_version_is_pinned_across_bundle(self):
         expected = '"telethon==1.43.2"'
         for path in (
-            next((candidate for candidate in (
-                TELEGRAM_DIR / "bin" / "telegram", TELEGRAM_DIR / "telegram")
-                if candidate.is_file()), TELEGRAM_DIR / "bin" / "telegram"),
+            CLI_PATH,
             TELEGRAM_DIR / "service" / "daemon.py",
             TELEGRAM_DIR / "service" / "call_recorder.py",
         ):

@@ -25,6 +25,9 @@ from pathlib import Path
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
 SERVICE_DIR = TELEGRAM_DIR / "service"
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _cli import CLI_PATH  # noqa: E402
+
 
 class DummyType:
     def __init__(self, *args, **kwargs):
@@ -472,7 +475,7 @@ class PromptOwnershipTests(unittest.TestCase):
         """The key says who the instructions are addressed to."""
         schema_source = (SERVICE_DIR / "settings_schema.py").read_text()
         self.assertIn("VOICE_PROVIDER_DOCUMENTS", schema_source)
-        cli = (SERVICE_DIR.parent / "bin" / "telegram").read_text()
+        cli = CLI_PATH.read_text()
         self.assertIn('key = f"{provider}-{kind}"', cli)
 
 

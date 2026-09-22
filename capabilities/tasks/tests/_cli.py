@@ -5,6 +5,11 @@ The capability is one script, so a test reaches its internals the way the
 manager installs it: as that file. The store driver is imported where a verb
 connects, so the parser, the identity resolver and the schema plumbing load
 with no store and nothing installed.
+
+A source checkout keeps that file under `bin/` and an installed bundle keeps
+it at the bundle root, so the path is resolved rather than named: naming one
+layout passes where the test was written and fails where the capability is
+installed.
 """
 
 from __future__ import annotations
@@ -13,7 +18,11 @@ import importlib.util
 from pathlib import Path
 
 CAPABILITY_DIR = Path(__file__).resolve().parents[1]
-CLI_PATH = CAPABILITY_DIR / "bin" / "tasks"
+CLI_PATH = next(
+    (path for path in (CAPABILITY_DIR / "bin" / "tasks",
+                       CAPABILITY_DIR / "tasks")
+     if path.is_file()),
+    CAPABILITY_DIR / "bin" / "tasks")
 
 
 def load() -> object:

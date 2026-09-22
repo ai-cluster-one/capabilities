@@ -5,6 +5,11 @@ The capability is one script, so a test reaches its internals the way the
 manager installs it: as that file. The engine is imported lazily by the script,
 so everything below the network — the store, the parser, the envelope — is
 reachable with no engine present and no dependency to install.
+
+A source checkout keeps that file under `bin/` and an installed bundle keeps
+it at the bundle root, so the path is resolved rather than named: naming one
+layout passes where the test was written and fails where the capability is
+installed.
 """
 
 from __future__ import annotations
@@ -14,7 +19,11 @@ import sys
 from pathlib import Path
 
 CAPABILITY_DIR = Path(__file__).resolve().parents[1]
-CLI_PATH = CAPABILITY_DIR / "bin" / "whatsapp"
+CLI_PATH = next(
+    (path for path in (CAPABILITY_DIR / "bin" / "whatsapp",
+                       CAPABILITY_DIR / "whatsapp")
+     if path.is_file()),
+    CAPABILITY_DIR / "bin" / "whatsapp")
 
 
 class _Unused:

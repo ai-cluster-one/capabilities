@@ -32,7 +32,7 @@
     },
     "callvatest": {
       "path": "capabilities/callvatest",
-      "payload_sha256": "f3ab7b4a23f82cb024b08598b08fb58b62d59fc651c94a9037745b775f1a9d9a",
+      "payload_sha256": "711dfbe167a07316b6c5f2acfe0823a6476c9946efa5ab5803c90b3fd7bf243e",
       "summary": "CallVA agent test harness — drives a deployed voice agent through a real LiveKit room over text, then asserts the transcript, the tools it called, the arguments it generated, the results it answered from, and the fields stored after the call."
     },
     "clickup": {
@@ -142,12 +142,12 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "2cf3682c729382581bbcdbe46844c9918241a5e3b43621e144ca9ab8afacf4be",
+      "payload_sha256": "ac84c66f5ea4188fb825c030ad3e6660b55c5b34c984207d06e0fdb67b8e7176",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "29c3604304db19e11a99bdfeafe8f7d57821fc08fc88efbb076a107f87754815",
+      "payload_sha256": "f89045e30bfb08143a5c7afd53e7c3678ca8080f95597639309fb25da88524c7",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
@@ -157,7 +157,7 @@
     },
     "whatsapp": {
       "path": "capabilities/whatsapp",
-      "payload_sha256": "80e123ba43668aa60df9324889abfc8da8f55e79b6b9568498d675600f194058",
+      "payload_sha256": "f42f9b4c6af200772cacf9fa5403651579e3ad8422a6c588f0129362b35b4ed1",
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a local store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {

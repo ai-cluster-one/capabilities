@@ -22,7 +22,11 @@ from unittest import mock
 
 
 CAPABILITY = Path(__file__).resolve().parents[1]
-SCRIPT = CAPABILITY / "bin" / "callvatest"
+SCRIPT = next(
+    (path for path in (CAPABILITY / "bin" / "callvatest",
+                       CAPABILITY / "callvatest")
+     if path.is_file()),
+    CAPABILITY / "bin" / "callvatest")
 AGENT = "11111111-2222-4333-8444-555555555555"
 
 
