@@ -144,6 +144,11 @@ HANDED_TURN_REQUEST = (
     "what was said earlier on the call.\n\n"
     "Do that one thing, and answer it.")
 
+# How often the assistant is brought up to date when it is not narrating. Not
+# silence: a caller who asks what is taking so long is owed a real answer, and
+# one is only possible if the assistant was told.
+QUIET_PROGRESS_SECONDS = 10.0
+
 CONNECT_TIMEOUT = 20.0
 CLOSE_DRAIN_TIMEOUT = 5.0
 
@@ -265,8 +270,17 @@ class VoiceCallSession:
         # Progress, coalesced per delegation.
         self._progress_window = []
         self._progress_flushed_at = 0.0
-        self._progress_interval = max(1.0, float(
-            progress_interval or common.DEFAULT_PROGRESS_INTERVAL))
+        # The project decides whether the call is narrated. A cadence means the
+        # assistant reports at it; zero means it still hears everything the
+        # worker says and can answer about it when asked, and volunteers none of
+        # it. Either way the notes arrive - what changes is what each one says
+        # to do with itself, which is the only instruction the model reads at
+        # the moment it matters.
+        interval = (common.DEFAULT_PROGRESS_INTERVAL if progress_interval is None
+                    else float(progress_interval))
+        self._announces_progress = interval > 0
+        self._progress_interval = (max(1.0, interval) if interval > 0
+                                   else QUIET_PROGRESS_SECONDS)
 
         self._speaking = False
         self._usage_seconds = 0.0
@@ -661,8 +675,10 @@ class VoiceCallSession:
                       f"caller last said: {heard[-160:]}")
             await self._append(
                 "thinking",
-                "Background, not something to say: the work is running and has not "
-                "come back yet. Do not tell the caller this unless they ask.",
+                ("The work is running and has not come back yet."
+                 if self._announces_progress else
+                 "Background, not something to say: the work is running and has "
+                 "not come back yet. Do not tell the caller this unless they ask."),
                 delegation_id)
             await self._await_completion(job_id, delegation_id)
         except asyncio.CancelledError:
@@ -772,9 +788,12 @@ class VoiceCallSession:
                   or " · ".join(text for _, text in window[-4:]))
         await self._append(
             "thinking",
-            ("Background, not something to say. Where the work stands: "
-             f"{digest} — answer from this only if the caller asks how it is "
-             "going.")[:APPEND_CHAR_BUDGET],
+            ((f"Where the work stands: {digest} — worth saying, in one short "
+              "sentence, at the next natural pause."
+              if self._announces_progress else
+              f"Background, not something to say. Where the work stands: "
+              f"{digest} — answer from this only if the caller asks how it is "
+              "going."))[:APPEND_CHAR_BUDGET],
             delegation_id)
 
     # --- teardown and reporting -------------------------------------------

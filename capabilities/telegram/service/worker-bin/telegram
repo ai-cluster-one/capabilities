@@ -22,7 +22,14 @@ def worker_scope():
 
 
 def parse_progress_send(argv):
-    """The complete worker-send grammar: send CHAT TEXT, exactly."""
+    """The complete worker-send grammar: send CHAT TEXT [--deliver], exactly.
+
+    Without the flag a send is a note about the work, which the daemon decides
+    what to do with — on a call it is told to the model and never spoken as
+    written. With it the worker is saying this belongs in the chat itself: a
+    link, an address, an exact spelling, a number the caller will act on. The
+    destination is still the authorized chat and still the daemon's to send;
+    the flag says which of the two things the worker meant."""
     args = list(argv[1:])
     if not args or args[0] != "send":
         return None
@@ -31,10 +38,13 @@ def parse_progress_send(argv):
             fail("worker_scope_denied",
                  f"{forbidden} cannot be overridden inside a Telegram worker request",
                  exit_code=4)
+    deliver = "--deliver" in args
+    if deliver:
+        args = [item for item in args if item != "--deliver"]
     if len(args) != 3:
         fail("worker_send_invalid",
-             "worker send syntax is: telegram send <authorized-chat> <one text argument>",
-             "quote the complete message; flags and extra arguments are unsupported")
+             "worker send syntax is: telegram send <authorized-chat> <one text argument> [--deliver]",
+             "quote the complete message; --deliver is the only supported flag")
     _, chat, message = args
     if chat.startswith("-") and not chat.lstrip("-").isdigit():
         fail("worker_send_invalid", f"invalid chat argument: {chat!r}")
@@ -42,7 +52,7 @@ def parse_progress_send(argv):
         fail("worker_send_invalid",
              f"unsupported or misplaced flag in worker send: {message!r}")
     text = sys.stdin.read().strip() if message == "-" else message.strip()
-    return chat, text
+    return chat, text, deliver
 
 
 def write_progress(argv):
@@ -52,7 +62,7 @@ def write_progress(argv):
     if not outbox:
         return False
     parsed = parse_progress_send(argv)
-    chat, text = parsed
+    chat, text, deliver = parsed
     allowed_chat, allowed_topic, allowed_connection = worker_scope()
     if not allowed_chat:
         fail("worker_authority_missing",
@@ -75,12 +85,14 @@ def write_progress(argv):
         "topic_id": allowed_topic,
         "connection": allowed_connection,
         "text": text,
+        "deliver": deliver,
         "reply_to": os.environ.get("TELEGRAM_PROGRESS_REPLY_TO") or None,
         "chat_type": os.environ.get("TELEGRAM_PROGRESS_CHAT_TYPE") or None,
     }
     with open(outbox, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    print(json.dumps({"ok": True, "queued": "telegram-service-progress"}))
+    print(json.dumps({"ok": True, "queued": ("telegram-service-message" if deliver
+                                             else "telegram-service-progress")}))
     return True
 
 

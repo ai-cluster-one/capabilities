@@ -4949,6 +4949,39 @@ class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Owner", prompt)
             self.assertNotIn("Conversation", prompt)
 
+    async def test_a_resumed_voice_task_carries_the_call_it_was_handed(self):
+        """A call hands the turn over mid-sentence and its request names no
+        task, so the conversation is what the worker has to read. A resumed
+        thread was never holding that conversation, which is why this one tail
+        is sent where a dialogue's is not."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            tail = [{"id": 1, "sender": "Owner", "is_assistant": False,
+                     "text": "how many groups are configured"}]
+            state = {"resume_session": "thread-1", "voice_task": "voice-1",
+                     "now": "Monday",
+                     "current_request": {"text": "you have been handed the turn",
+                                         "delivery": "spoken"}}
+
+            prompt = daemon.build_prompt(tail, state)
+
+            self.assertIn("Conversation", prompt)
+            self.assertIn("how many groups are configured", prompt)
+
+    async def test_a_resumed_dialogue_turn_still_carries_no_tail(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            tail = [{"id": 1, "sender": "Owner", "is_assistant": False,
+                     "text": "something said earlier"}]
+            state = {"resume_session": "thread-1", "now": "Monday",
+                     "current_request": {"text": "and now file it",
+                                         "delivery": "spoken"}}
+
+            prompt = daemon.build_prompt(tail, state)
+
+            self.assertNotIn("Conversation", prompt)
+            self.assertNotIn("something said earlier", prompt)
+
     async def test_only_a_thread_start_event_yields_a_thread_id(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())

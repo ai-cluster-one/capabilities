@@ -29,6 +29,16 @@ VOICE_TOOLS = {"agent_task", "send_to_chat", "run_capability",
 # compared on their own terms rather than through one set of settings that
 # happens to suit whichever was written first.
 VOICE_PROVIDERS = {"gemini", "gptlive"}
+# The project-owned documents each provider seeds, by the second half of their
+# key. `<provider>-voice-agent` is addressed to the model that speaks and
+# `<provider>-backend` to the worker behind it. `<provider>-delegation` is read
+# where a project writes one and seeded for nobody: how a hand-off works is the
+# capability's own, and this is only room to add to it.
+VOICE_PROVIDER_DOCUMENTS = {
+    "gemini": ("voice-agent",),
+    "gptlive": ("voice-agent", "backend"),
+}
+VOICE_PROVIDER_OPTIONAL_DOCUMENTS = ("delegation",)
 # The provider whose document keys predate the split, and whose prompts a
 # project may already have written under the unsuffixed key.
 VOICE_PROVIDER_INCUMBENT = "gemini"
@@ -373,7 +383,10 @@ def _voice_agent(value, path, *, defaults=False, project_root=None, service_dir=
     if "history" in value:
         _number(value["history"], f"{path}.history", 0, 500, integer=True, nullable=defaults)
     if "progress_interval" in value:
-        _number(value["progress_interval"], f"{path}.progress_interval", 0.1, 3600,
+        # Zero is the setting's off position, not a bad value: the assistant
+        # still receives what the worker reports and can answer about it when
+        # asked, and simply stops volunteering it.
+        _number(value["progress_interval"], f"{path}.progress_interval", 0, 3600,
                 nullable=True)
     if "prompt_file" in value:
         _safe_service_path(value["prompt_file"], f"{path}.prompt_file",

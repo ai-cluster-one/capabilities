@@ -5202,10 +5202,16 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     delegation_template = _service_template("delegation.md")
     job_worker_template = _service_template("job-worker.md")
     schema = _settings_schema_module()
+    # A key says who its instructions are addressed to, and its provider comes
+    # first so that is plain at a glance: `gptlive-voice-agent` is written for
+    # the model that speaks, `gptlive-backend` for the worker behind it. Which
+    # of them a provider seeds is that provider's own business - one whose
+    # worker has always run on `context.md` alone gains nothing from a second
+    # file it never had.
     voice_templates = {
         (provider, kind): _voice_template(provider, f"{kind}.md")
-        for provider in sorted(schema.VOICE_PROVIDERS)
-        for kind in ("voice-agent", "voice-delegation")
+        for provider, kinds in sorted(schema.VOICE_PROVIDER_DOCUMENTS.items())
+        for kind in kinds
     }
     _require_service_bundle_files(
         settings_template, context_template, delegation_template,
@@ -5267,15 +5273,12 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     carried_body = (whole or {}).get("body") or None
 
     for (provider, kind), template in sorted(voice_templates.items()):
-        key = f"{kind}-{provider}"
+        key = f"{provider}-{kind}"
         if not force and adapter.document_read(NAME, key) is not None:
             skipped.append(f"{adapter.source}:telegram/{key}")
             continue
         body, note = template.read_text(), ""
-        if provider == incumbent and carried_body:
-            if kind == "voice-delegation":
-                skipped.append(f"{adapter.source}:telegram/{key} (carried prompt is whole)")
-                continue
+        if provider == incumbent and kind == "voice-agent" and carried_body:
             body, note = carried_body, " (carried)"
         adapter.document_put(NAME, key, body,
                              author="telegram service init",

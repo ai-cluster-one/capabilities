@@ -540,14 +540,15 @@ def _runtime_settings(settings, project_layout=None):
     direct_mode = str(direct_messages.get("mode") or "allowed_users").strip().lower()
     voice_defaults = (defaults.get("voice_agent")
                       if isinstance(defaults.get("voice_agent"), dict) else {})
+    raw_progress = voice_defaults.get("progress_interval")
     try:
-        voice_progress_interval = float(
-            voice_defaults.get("progress_interval")
-            or voice_agent.DEFAULT_PROGRESS_INTERVAL)
+        voice_progress_interval = (
+            float(raw_progress) if raw_progress is not None
+            else float(voice_agent.DEFAULT_PROGRESS_INTERVAL))
     except (TypeError, ValueError) as exc:
         raise SettingsError("settings.defaults.voice_agent.progress_interval must be a number") from exc
-    if voice_progress_interval <= 0:
-        raise SettingsError("settings.defaults.voice_agent.progress_interval must be positive")
+    if voice_progress_interval < 0:
+        raise SettingsError("settings.defaults.voice_agent.progress_interval must not be negative")
     voice_timezone, voice_timezone_name = voice_agent.resolve_timezone(
         voice_defaults.get("timezone"))
     voice_prompt_file_explicit = bool(
@@ -1971,29 +1972,51 @@ def _service_document(path):
 
 
 def read_voice_document(kind, provider):
-    """One of a provider's two voice prompts, by its own key.
+    """One project-owned voice document, by the key its provider gives it.
 
-    Each provider's prompts are its own: the stacks differ in what they can do,
-    so words written for one are wrong for the other. The incumbent falls back
-    to the unsuffixed key, which is what a project that predates the split
-    wrote and still owns."""
+    The provider comes first in the key because the key says who the
+    instructions are addressed to: `gptlive-voice-agent` is written for the
+    model that speaks. The incumbent falls back to the unsuffixed `voice-agent`,
+    which is what a project that predates the split wrote and still owns."""
     adapter = _records()
-    doc = adapter.document_read(NAME, f"{kind}-{provider}")
-    if not doc and provider == VOICE_PROVIDER_INCUMBENT:
+    doc = adapter.document_read(NAME, f"{provider}-{kind}")
+    if not doc and provider == VOICE_PROVIDER_INCUMBENT and kind == "voice-agent":
         doc = adapter.document_read(NAME, kind)
     return (doc["body"] if doc else "").strip()
 
 
+def read_voice_mechanism(provider):
+    """How a hand-off works on this stack, as the capability itself states it.
+
+    It ships inside the bundle rather than in the project's envelope, and is
+    read from there: it describes what the connection can and cannot do, so a
+    project's edit of it could only be wrong. It is prose in a file rather than
+    a string in this module for the same reason every other prompt is - so it
+    can be read and rewritten as prose."""
+    path = HERE / provider / "prompts" / "delegation.md"
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def read_voice_context(provider=None):
-    """The voice channel's own system prompt, owned by the project: how it
-    speaks, and how it hands work over. Two files because they are edited for
-    different reasons; one prompt because the model reads them as one."""
+    """Everything the speaking model is told, in the order it has to be told.
+
+    The project's own prose sits in the middle: what the assistant is like is
+    the project's, and a project that writes nonsense there gets an assistant
+    that sounds wrong rather than one that stops working. The mechanism goes
+    last, closest to the action, because where two pieces of prose disagree the
+    later one wins - and the mechanism is the one that cannot be allowed to
+    lose. A project's own delegation prose follows it, adding rather than
+    replacing."""
     provider = provider or voice_agent.DEFAULT_PROVIDER
     if VOICE_PROMPT_FILE_EXPLICIT:
         # A project that names a file has said exactly what it wants read.
         return read_service_document(VOICE_CONTEXT_FILE)
     parts = [read_voice_document("voice-agent", provider),
-             read_voice_document("voice-delegation", provider)]
+             read_voice_mechanism(provider),
+             read_voice_document("delegation", provider)]
     return "\n\n".join(part for part in parts if part)
 
 
@@ -3215,6 +3238,13 @@ def voice_task_preamble(chat_id, seconds):
         "message the caller yourself and do not address them; the assistant "
         "decides what to say aloud. The answer you return at the end is the "
         "result — the progress lines are not.\n\n"
+        "One exception, and only for what speech carries badly: a link, an "
+        "address, an exact spelling, a long number, a list they will want to "
+        "keep. Add --deliver to the same command and that line is sent to the "
+        "caller as a message instead of reaching the assistant:\n"
+        f'    {WORKER_BIN / "telegram"} send {chat_id} "<the exact thing>" --deliver\n'
+        "Use it for the thing itself, never to report progress or to repeat "
+        "aloud what you are about to answer anyway.\n\n"
         "The task:\n"
     )
 
@@ -3929,6 +3959,13 @@ def build_prompt(tail, state=None):
         channel_context = ""
     else:
         context = "" if st.get("context_exclusive") else read_service_document(CONTEXT_FILE)
+        # What this project's worker is told when the ask came from a call. The
+        # assistant's ordinary prose reaches it everywhere; this reaches it only
+        # here, so a project can say what a caller habitually wants without
+        # putting it in front of every message it ever answers.
+        backend = (st.get("voice_backend") or "").strip()
+        if backend:
+            context = f"{context}\n\n{backend}" if context else backend
         # Delegation prose describes a capability that either exists for this
         # requester or does not, so it follows the register rather than the
         # room's prose choice.
@@ -7534,12 +7571,23 @@ async def run_session(client):
                     except ValueError:
                         continue
                     note = str(item.get("text") or "").strip()
-                    if note and note not in ("-", ".", "..."):
-                        on_progress(note, "worker")
+                    if not note or note in ("-", ".", "..."):
+                        continue
+                    if item.get("deliver"):
+                        # Not a note about the work: something the caller is
+                        # meant to keep. Speech carries a link or an exact
+                        # spelling badly, and on a stack whose model has no
+                        # tools this is the only way anything reaches the chat.
+                        asyncio.create_task(
+                            send_channel_message(caller_id, note, True))
+                        log(f"voice: worker delivered a message to {caller_id} "
+                            f"({len(note)} chars)")
+                        continue
+                    on_progress(note, "worker")
 
         async def run_voice_task(caller_id, caller_name, text,
                                  delivery=VOICE_TASK_DELIVERY, on_progress=None,
-                                 lane=None, tail=None):
+                                 lane=None, tail=None, provider=None):
             """One task the caller asked for mid-call, run by the project's own
             worker — the same machinery a message runs, under the authority the
             same user's messages resolve to.
@@ -7554,6 +7602,7 @@ async def run_session(client):
             run stands alone, which is what a summary wants."""
             s = voice_agent_settings()
             key = str(caller_id)
+            provider = provider or voice_agent.DEFAULT_PROVIDER
 
             async def attempt(resume_session, seen):
                 """One worker run, from its own clean slate.
@@ -7620,6 +7669,8 @@ async def run_session(client):
                              "authority": authority,
                              "authority_context": authority_context,
                              "voice_task": task_id,
+                             "voice_backend": read_voice_document(
+                                 "backend", provider),
                              "progress_outbox": str(progress_outbox),
                              "on_worker_line": (_offer_stage if on_progress is not None
                                                 else None),
@@ -8131,7 +8182,8 @@ async def run_session(client):
                         if hasattr(live, "conversation_tail") else [])
                 result = await run_voice_task(caller_id, caller_name, text,
                                               on_progress=note_task_progress,
-                                              lane=lane, tail=tail)
+                                              lane=lane, tail=tail,
+                                              provider=policy.get("provider"))
                 return result["reply"]
 
             task_runner = voice_agent.VoiceTaskRunner(
