@@ -115,6 +115,7 @@ Contract commands:
   deployment connections
   deployment ids list|get <label>|set <label> <value>|rm <label> [--note <text>]
   deployment refs
+  deployment inventory [--network]
 
 FILES
   deployment/runtime.json
@@ -187,6 +188,7 @@ WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/deployment/guides/")
 STATE = False
+INVENTORY = {"network": "none"}   # the declarations are files in this project
 POST_INSTALL: list = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -1158,6 +1160,50 @@ def _cmd_context(argv: list[str]) -> None:
          f"{NAME} context list|show|edit|put")
 
 
+INVENTORY_NETWORK_MODES = ("none", "optional", "required")
+
+
+def _inventory_declaration() -> dict | None:
+    """The manifest's `inventory` block, derived from the INVENTORY constant.
+
+    `None` says the capability has nothing of its own to report here, so a
+    reader assembling a whole project knows before it asks; the verb still
+    answers, with the empty envelope, so nothing branches on absence."""
+    if not INVENTORY:
+        return None
+    network = INVENTORY.get("network", "none")
+    return {"network": network if network in INVENTORY_NETWORK_MODES else "none"}
+
+
+def _cmd_inventory(argv: list[str]) -> None:
+    """What this capability holds in this project, in one shape for all of them.
+
+    The read is local, secret-free, and leaves nothing changed behind it.
+    `--network` is the caller's explicit consent to reach the remote system for
+    detail a local read cannot supply; without it that detail is named in
+    `deferred` rather than fetched, so assembling a whole project never waits
+    on a network the caller did not choose. `--json` is accepted for
+    explicitness; the output is always this JSON."""
+    network = False
+    for arg in argv:
+        if arg == "--network":
+            network = True
+        elif arg != "--json":
+            _die(6, "input", f"unknown inventory option {arg!r}",
+                 f"{NAME} inventory [--network]")
+    root = _project_root()
+    report: dict = {"capability": NAME,
+                    "project": str(root) if root is not None else None,
+                    "network": network,
+                    "metrics": [], "items": [], "service": None, "deferred": []}
+    if INVENTORY:
+        built = _inventory(network) or {}
+        for field in ("metrics", "items", "deferred"):
+            report[field] = list(built.get(field) or [])
+        report["service"] = built.get("service")
+    _emit(report)
+
+
 def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
     parser. Runs after _gate(), before any credential is resolved.
@@ -1173,7 +1219,8 @@ def _contract(argv: list[str]) -> None:
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
                "docs": {"base": DOCS_BASE,
                         "topics": [entry["topic"] for entry in _guide_menu()]},
-               "state": STATE, "post_install": POST_INSTALL})
+               "state": STATE, "inventory": _inventory_declaration(),
+               "post_install": POST_INSTALL})
     elif cmd == "guide":
         _cmd_guide(argv[1:])
     elif cmd == "ids":
@@ -1184,6 +1231,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_context(argv[1:])
     elif cmd == "connections":
         _cmd_connections()
+    elif cmd == "inventory":
+        _cmd_inventory(argv[1:])
     elif cmd == "help" and len(argv) == 1:
         _cmd_help()
     else:
@@ -2894,6 +2943,54 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                         ("project", slug))
 
 # <<< contract: store <<<
+
+
+def _inventory(_network: bool) -> dict:
+    """The services this project declares and the targets they deploy to.
+
+    Every fact here is a file in the project, so the report reads them and
+    stops: whether a target is actually up is the provider capability's
+    question, and asking it is not this read's business."""
+    root = _project_root()
+    if root is None:
+        return {"metrics": [{"label": "services", "value": 0,
+                             "note": "not inside a project"}]}
+    runtime, err = _read_json(_runtime_path(root))
+    if err or not isinstance(runtime, dict):
+        return {"metrics": [{"label": "services", "value": 0,
+                             "note": f"no deployment declaration ({err or 'unreadable'})"}]}
+    services = runtime.get("services")
+    services = services if isinstance(services, dict) else {}
+    targets = sorted(p.stem for p in _target_files(root))
+    items = []
+    for name in sorted(services):
+        spec = services[name] if isinstance(services[name], dict) else {}
+        mode = spec.get("mode") or (runtime.get("service_policy") or {}).get(
+            "default_mode") or "enabled"
+        attributes = []
+        if spec.get("capability"):
+            attributes.append({"label": "capability", "value": spec["capability"]})
+        command = spec.get("command")
+        if isinstance(command, list) and command:
+            attributes.append({"label": "command", "value": " ".join(map(str, command))})
+        items.append({"group": "services", "name": name, "state": str(mode),
+                      "detail": spec.get("description") or "",
+                      "attributes": attributes})
+    for name in targets:
+        target, terr = _read_json(_target_path(root, name))
+        target = target if isinstance(target, dict) and not terr else {}
+        items.append({"group": "targets", "name": name,
+                      "state": str(target.get("provider") or "unknown"),
+                      "detail": str(target.get("description")
+                                    or target.get("host") or "")})
+    return {
+        "metrics": [
+            {"label": "services", "value": len(services)},
+            {"label": "targets", "value": len(targets)},
+            {"label": "profile", "value": str(runtime.get("profile") or "generic")},
+        ],
+        "items": items,
+    }
 
 
 def _cmd_connections() -> None:

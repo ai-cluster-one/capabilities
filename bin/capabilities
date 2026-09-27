@@ -229,6 +229,20 @@ PROJECT VERBS (run inside a consuming project)
         ContextKit owns both host bindings and the combined context; the host
         modes delegate without writing and point to `contextkit build`, while
         --fragment remains the read-only provider surface ContextKit calls.
+  inventory [NAME ...] [--detail] [--network]
+        What this project's capabilities are and what they hold. One row per
+        effective-enabled capability: gate and the scope that set it,
+        the connections it may act on and the ones a grant withholds,
+        the declared service, and whether the
+        capability reports an inventory of its own and how much of it needs
+        the network. The survey runs no capability at all. --detail also asks
+        each one for its own report — `<name> inventory`, local and effect-free
+        — running them together, so a reader assembling a whole project spends
+        one process per capability here instead of several in every caller.
+        --network implies --detail and passes the caller's consent down, so a
+        capability may then reach its service for detail a local read cannot
+        supply. NAME limits the answer to named capabilities.
+        `list` answers for the machine; this answers for the project.
   ids <name>
         Render <name>'s project identifiers as markdown — the full labelled
         list the session context points to. (`<name> ids get|set|rm` is the
@@ -286,6 +300,7 @@ I/O CONTRACT
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import fcntl
 import importlib.util
@@ -1161,7 +1176,7 @@ def _bin_dir() -> Path:
 # ---------------------------------------------------------------- manifest
 
 REQUIRED_MANIFEST_FIELDS = ("name", "summary", "credentials",
-                            "docs", "state", "post_install")
+                            "docs", "state", "inventory", "post_install")
 SERVICE_DEPLOY_SCHEMA = "capabilities.service.deploy.v1"
 SERVICE_MOUNT_TOKENS = ("{agent_home}", "{project_root}")
 
@@ -1239,6 +1254,9 @@ def _validate_service_deploy(deploy: object) -> list[str]:
     return problems
 
 
+INVENTORY_NETWORK_MODES = ("none", "optional", "required")
+
+
 def _validate_manifest(name: str, manifest) -> list[str]:
     """Mechanical shape check; returns a list of problems (empty = conformant)."""
     problems: list[str] = []
@@ -1280,6 +1298,15 @@ def _validate_manifest(name: str, manifest) -> list[str]:
         problems.append("docs is not an object")
     if not isinstance(manifest.get("state"), bool):
         problems.append("state is not a boolean")
+    if "inventory" in manifest:
+        inventory = manifest["inventory"]
+        if inventory is not None:
+            if not isinstance(inventory, dict):
+                problems.append("inventory is not null or an object")
+            elif inventory.get("network") not in INVENTORY_NETWORK_MODES:
+                problems.append(
+                    f"inventory.network {inventory.get('network')!r} not "
+                    f"{'|'.join(INVENTORY_NETWORK_MODES)}")
     post = manifest.get("post_install")
     if not isinstance(post, list):
         problems.append("post_install is not a list")
@@ -2103,6 +2130,109 @@ def cmd_list() -> None:
     if enabled_not_installed:
         out["enabled_not_installed"] = enabled_not_installed
     _emit(out)
+
+def _inventory_rows(root: Path) -> list[dict]:
+    """One row per effective-enabled capability, from the registry snapshots
+    and the project's own records — no capability is executed to build it."""
+    project_caps, global_caps = _policy_views(root)
+    installed = _installed()
+    adapter = _records_for(root)
+    rows: list[dict] = []
+    try:
+        for name in sorted(installed):
+            effective, source = _effective_gate_state(
+                project_caps.get(name), global_caps.get(name))
+            if effective != "enabled":
+                continue
+            _stub, manifest = _load_snapshots(name)
+            manifest = manifest or {}
+            try:
+                declared = adapter.connections(name, include_disabled=True) or {}
+                default = adapter.get(name, "setting", "connection.default")
+            except _store_module().StoreError as exc:
+                declared, default = {}, None
+                _warn(f"{name}: cannot read connections — {exc.message}")
+            # A connection this project may not act on is still declared, and a
+            # count that silently drops it reads as "none configured" when the
+            # truth is "one, withheld".
+            usable = sorted(cid for cid, e in declared.items() if e["enabled"])
+            withheld = sorted(cid for cid, e in declared.items() if not e["enabled"])
+            service = manifest.get("service") or None
+            rows.append({
+                "name": name,
+                "summary": manifest.get("summary", ""),
+                "gate": {"effective": effective, "source": source},
+                "connections": {"count": len(usable), "default": default,
+                                "ids": usable, "withheld": withheld},
+                "service": None if service is None else {
+                    "name": service.get("name"),
+                    "summary": service.get("summary"),
+                    "verbs": service.get("verbs") or []},
+                "inventory": {"declared": manifest.get("inventory") is not None,
+                              "network": ((manifest.get("inventory") or {})
+                                          .get("network"))},
+            })
+    finally:
+        adapter.close()
+    return rows
+
+
+def _inventory_report(root: Path, name: str, network: bool) -> dict:
+    """One capability's own report, or what went wrong asking for it."""
+    script = _script_path(name)
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(root)
+    args = ["inventory"] + (["--network"] if network else [])
+    rc, out, err = _run_script(script, args, cwd=root, env=env,
+                               timeout=120 if network else 30)
+    if rc == 0:
+        try:
+            return {"report": json.loads(out)}
+        except ValueError:
+            return {"error": {"code": "bad_report", "message": "inventory was not JSON"}}
+    try:
+        return {"error": json.loads(err.strip().splitlines()[-1])["error"]}
+    except (ValueError, IndexError, KeyError):
+        return {"error": {"code": "inventory_failed",
+                          "message": f"`{name} inventory` exited {rc}",
+                          "hint": (err.strip().splitlines() or [""])[-1] or None}}
+
+
+def cmd_inventory(detail: bool, network: bool, wanted: list[str]) -> None:
+    """What this project's capabilities are and what they hold.
+
+    `list` answers for the machine — everything installed and how each is
+    gated. This answers for one project: the capabilities an agent here can
+    actually use, with their connections, their service, and — with --detail —
+    each capability's own report of what it holds. The survey costs no
+    capability process at all; --detail spends exactly one per capability and
+    spends them at the same time, which is the whole reason it lives here
+    rather than in every caller."""
+    root = _require_project()
+    rows = _inventory_rows(root)
+    if wanted:
+        known = {row["name"] for row in rows}
+        missing = [n for n in wanted if n not in known]
+        if missing:
+            _die(3, "not_found",
+                 f"not enabled in this project: {', '.join(missing)}",
+                 "run `capabilities list` for the gate")
+        rows = [row for row in rows if row["name"] in set(wanted)]
+    if network:
+        detail = True
+    if detail and rows:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(rows))) as pool:
+            answers = dict(zip(
+                [row["name"] for row in rows],
+                pool.map(lambda row: _inventory_report(root, row["name"], network),
+                         rows)))
+        for row in rows:
+            row["inventory"].update(answers[row["name"]])
+    _emit({"project": {"root": str(root),
+                       "envelope": str(_project_capabilities_dir(root))},
+           "detail": detail, "network": network, "capabilities": rows})
+
 
 # ---------------------------------------------------------------- dev sessions
 
@@ -5210,6 +5340,62 @@ def cmd_sync_contract(check_only: bool) -> None:
 
 # ---------------------------------------------------------------- audit
 
+def _tree_digest(root: Path) -> str:
+    """A stable digest of every file under one tree, contents included.
+
+    `inventory` claims to leave nothing behind it; this is what turns the claim
+    into an observation rather than a promise."""
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError as exc:
+            digest.update(f"<unreadable: {exc}>".encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _validate_inventory(name: str, out: str, manifest) -> list[str]:
+    """The envelope shape a reader renders without knowing the capability."""
+    problems: list[str] = []
+    try:
+        report = json.loads(out)
+    except ValueError:
+        return ["not JSON"]
+    if not isinstance(report, dict):
+        return ["output is not a JSON object"]
+    for field in ("capability", "project", "network", "metrics", "items",
+                  "service", "deferred"):
+        if field not in report:
+            problems.append(f"missing field: {field}")
+    if report.get("capability") != name:
+        problems.append(f"capability {report.get('capability')!r} != {name!r}")
+    if report.get("network") is not False:
+        problems.append("a bare report must state network: false")
+    for field, shape in (("metrics", ("label", "value")), ("deferred", ("label",))):
+        rows = report.get(field)
+        if not isinstance(rows, list):
+            problems.append(f"{field} is not a list")
+            continue
+        for row in rows:
+            if not isinstance(row, dict) or any(k not in row for k in shape):
+                problems.append(f"{field} entry malformed: {row!r}")
+    items = report.get("items")
+    if not isinstance(items, list):
+        problems.append("items is not a list")
+    else:
+        for item in items:
+            if not isinstance(item, dict) or not str(item.get("name") or "").strip():
+                problems.append(f"items entry malformed: {item!r}")
+    service = report.get("service")
+    if service is not None and (not isinstance(service, dict)
+                                or not str(service.get("state") or "").strip()):
+        problems.append(f"service is neither null nor {{state, detail?}}: {service!r}")
+    return problems
+
+
 def _audit_script(
     name: str, script: Path, manifest_result: list[dict] | None = None
 ) -> list[str]:
@@ -5295,6 +5481,29 @@ def _audit_script(
     if manifest is not None and manifest_result is not None:
         manifest_result.append(manifest)
 
+    # The declaration and the builder are one fact in two places, and a
+    # capability that declares an inventory it cannot build fails only when
+    # someone asks for it. This is that question asked here instead.
+    _fences = [r for r in (_split_region(script_text, region)
+                           for region in _CONTRACT_REGIONS) if r]
+    own_code = script_text
+    for _head, interior, _tail in _fences:
+        own_code = own_code.replace(interior, "")
+    declares = re.search(r"^INVENTORY\s*=\s*(?!None\b)\S", own_code, re.M) is not None
+    builds = "def _inventory(" in own_code
+    if declares and not builds:
+        failures.append(
+            "inventory: INVENTORY is declared but the capability defines no "
+            "_inventory(network) builder")
+    if builds and not declares:
+        failures.append(
+            "inventory: an _inventory(network) builder is defined but "
+            "INVENTORY is not declared, so nothing ever calls it")
+    if manifest is not None and (manifest.get("inventory") is not None) != declares:
+        failures.append(
+            "inventory: the manifest declaration and the INVENTORY constant "
+            "disagree")
+
     if "Replace this scaffold check with" in script_text:
         failures.append("doctor: scaffold readiness placeholder remains")
 
@@ -5302,7 +5511,8 @@ def _audit_script(
     if rc != 0:
         failures.append(f"help: exit {rc}")
     else:
-        for verb in ("doctor", "connections", "stub", "manifest", "guide", "ids", "refs"):
+        for verb in ("doctor", "connections", "stub", "manifest", "guide", "ids",
+                     "refs", "inventory"):
             if verb not in out:
                 failures.append(f"help: contract verb {verb!r} undocumented")
 
@@ -5403,6 +5613,23 @@ def _audit_script(
                                         cwd=sandbox, env=genv)
             if rc != 0:
                 failures.append(f"ids rm: exit {rc}")
+
+        # inventory — the project self-report every reader renders the same way
+        # (DOCTRINE rule 20). Bare, it costs nothing: the sandbox tree is
+        # compared byte for byte across the call, so a report that writes into
+        # the project or its state is a failure rather than a surprise later.
+        before = _tree_digest(sandbox)
+        rc, out, errs = _run_script(script, ["inventory"], cwd=sandbox, env=genv)
+        if rc != 0:
+            failures.append(f"inventory: exit {rc} "
+                            f"(the report renders even unconfigured)")
+        else:
+            failures += [f"inventory: {p}" for p in _validate_inventory(
+                name, out, manifest)]
+        if _tree_digest(sandbox) != before:
+            failures.append(
+                "inventory: the bare report changed the project tree — it is a "
+                "read and must leave nothing behind it")
 
         # connections — registry required for connection-bearing capabilities
         def _check_connections(expect_ids: set[str], label: str,
@@ -7228,6 +7455,7 @@ Contract:
   {name} guide [topic]
   {name} ids list|get|set|rm
   {name} refs
+  {name} inventory [--network]
 
 Add the smallest useful domain verb surface below the generated contract
 regions. Never edit text inside those regions. Success is JSON on stdout;
@@ -7248,6 +7476,7 @@ WRITE_VERBS = set()
 WRITE_DEFAULT = True
 DOCS_BASE = ""
 STATE = False
+INVENTORY = None  # {{"network": "none"|"optional"|"required"}} + an _inventory(network) builder
 POST_INSTALL: list[dict] = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -7382,6 +7611,7 @@ def cmd_source_sync(source_id: str) -> None:
 _AUDIT_CHECKS = {
     "contract-drift", "stub", "manifest", "help", "gate",
     "refs", "ids", "connections", "connections/core-only", "guide", "doctor",
+    "inventory",
 }
 
 
@@ -7792,6 +8022,8 @@ def main() -> None:
         cmd_self_update(opt("--from"))
     elif cmd == "list":
         cmd_list()
+    elif cmd == "inventory":
+        cmd_inventory(flag("--detail"), flag("--network"), pos)
     elif cmd == "path" and pos and pos[0] == "store":
         cmd_path_store()
     elif cmd == "path":

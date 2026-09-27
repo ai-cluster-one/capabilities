@@ -31,6 +31,9 @@ Contract commands (the same on every capability; railwayc's own, never forwarded
   railwayc ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
            [--note <text>]                      (capabilities/railwayc/identifiers.json).
   railwayc refs                                 Menu of the project's reference files.
+  railwayc inventory [--network]                What this capability holds in
+                                                this project (--network adds
+                                                remote detail).
 
 Agent-invoked. Run `railwayc help` to reload this contract; run `railway help` (the
 real CLI) for the full command surface — railwayc does NOT re-document or re-map it.
@@ -228,6 +231,7 @@ assert not (READ_VERBS & WRITE_VERBS), "a verb is a read or a write, never both"
 WRITE_DEFAULT = True    # writes stay inside a project the consumer owns
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
+INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL: list = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -1143,6 +1147,50 @@ def _cmd_context(argv: list[str]) -> None:
          f"{NAME} context list|show|edit|put")
 
 
+INVENTORY_NETWORK_MODES = ("none", "optional", "required")
+
+
+def _inventory_declaration() -> dict | None:
+    """The manifest's `inventory` block, derived from the INVENTORY constant.
+
+    `None` says the capability has nothing of its own to report here, so a
+    reader assembling a whole project knows before it asks; the verb still
+    answers, with the empty envelope, so nothing branches on absence."""
+    if not INVENTORY:
+        return None
+    network = INVENTORY.get("network", "none")
+    return {"network": network if network in INVENTORY_NETWORK_MODES else "none"}
+
+
+def _cmd_inventory(argv: list[str]) -> None:
+    """What this capability holds in this project, in one shape for all of them.
+
+    The read is local, secret-free, and leaves nothing changed behind it.
+    `--network` is the caller's explicit consent to reach the remote system for
+    detail a local read cannot supply; without it that detail is named in
+    `deferred` rather than fetched, so assembling a whole project never waits
+    on a network the caller did not choose. `--json` is accepted for
+    explicitness; the output is always this JSON."""
+    network = False
+    for arg in argv:
+        if arg == "--network":
+            network = True
+        elif arg != "--json":
+            _die(6, "input", f"unknown inventory option {arg!r}",
+                 f"{NAME} inventory [--network]")
+    root = _project_root()
+    report: dict = {"capability": NAME,
+                    "project": str(root) if root is not None else None,
+                    "network": network,
+                    "metrics": [], "items": [], "service": None, "deferred": []}
+    if INVENTORY:
+        built = _inventory(network) or {}
+        for field in ("metrics", "items", "deferred"):
+            report[field] = list(built.get(field) or [])
+        report["service"] = built.get("service")
+    _emit(report)
+
+
 def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
     parser. Runs after _gate(), before any credential is resolved.
@@ -1158,7 +1206,8 @@ def _contract(argv: list[str]) -> None:
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
                "docs": {"base": DOCS_BASE,
                         "topics": [entry["topic"] for entry in _guide_menu()]},
-               "state": STATE, "post_install": POST_INSTALL})
+               "state": STATE, "inventory": _inventory_declaration(),
+               "post_install": POST_INSTALL})
     elif cmd == "guide":
         _cmd_guide(argv[1:])
     elif cmd == "ids":
@@ -1169,6 +1218,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_context(argv[1:])
     elif cmd == "connections":
         _cmd_connections()
+    elif cmd == "inventory":
+        _cmd_inventory(argv[1:])
     elif cmd == "help" and len(argv) == 1:
         _cmd_help()
     else:
@@ -3001,6 +3052,27 @@ def _connections_composed() -> dict:
         "withheld": {cid: {"scope": entry["scope"][0]}
                      for cid, entry in withheld.items()},
     }
+
+
+def _inventory_connections() -> dict:
+    """Every connection this project declares, granted or not.
+
+    An inventory reports where selection refuses, so this is deliberately the
+    one connection read that never dies: no registry is zero connections, and
+    a connection the project may not act on is still a connection worth
+    showing. `granted` carries which is which."""
+    try:
+        adapter = _records()
+        effective = adapter.connections(NAME, write_default=WRITE_DEFAULT,
+                                        include_disabled=True) or {}
+        default = adapter.get(NAME, "setting", "connection.default")
+    except StoreError:
+        return {"default": None, "connections": {}}
+    return {"default": default,
+            "connections": {
+                cid: {**entry["value"], "allow_write": entry["allow_write"],
+                      "granted": bool(entry["enabled"])}
+                for cid, entry in effective.items()}}
 
 
 def _connections_registry() -> tuple[dict | None, Path | str | None]:

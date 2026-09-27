@@ -34,6 +34,7 @@ Every script implements the same contract verbs alongside its domain verbs. This
 | `guide` / `guide <topic>` | The shipped guide menu with previews / one guide's body, fetched live from the docs base. |
 | `ids list\|get\|set\|rm` | The project identifiers envelope, managed. |
 | `refs` | The menu of the project's reference files, from front-matter. |
+| `inventory` | What the capability holds in this project: headline metrics and the things inside. Local only by default — no network, no writes. |
 
 The declaration facts feed the contract from **constants at the top of the script** — one home each. Guide topics are the exception: their one home is the set of shipped Markdown filenames. Contract verbs render from these sources so they cannot disagree with one another:
 
@@ -48,6 +49,7 @@ WRITE_VERBS = {"create", "comment", "complete"}   # domain verbs that mutate the
 WRITE_DEFAULT = True    # a connection's allow_write when its entry is silent; False when writes leave the system
 DOCS_BASE = "https://raw.githubusercontent.com/<org>/capabilities/main/capabilities/asana/guides/"
 STATE = False       # True when the capability writes session/cache state
+INVENTORY = None    # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL = []   # [{"cmd": …, "note": …}] steps the manager offers at install
 SERVICE = None      # or {"name", "summary", "verbs", ...} when a bundled service ships
 ```
@@ -99,6 +101,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
     "topics": ["authoring", "boards"]
   },
   "state": false,
+  "inventory": { "network": "optional" },
   "post_install": [],
   "service": {
     "name": "assistant",
@@ -131,6 +134,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `docs.base` | The upstream guides base URL; `""` when no guides ship. Overridable through the cascade as `<NAME>_DOCS_BASE`, so storage can move without touching the contract. |
 | `docs.topics` | The sorted stems of the shipped `guides/*.md` files; `[]` when no guides ship. |
 | `state` | `true` declares the capability writes session/cache state (see [state](#state)). |
+| `inventory` | `null` when the capability reports nothing of its own; otherwise `{ "network": "none" \| "optional" \| "required" }` — how much of its report needs the remote system (see [inventory](#inventory--what-the-capability-holds-here)). |
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
 | `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
 | `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Mount targets are absolute or start with `{agent_home}` / `{project_root}` and are resolved by the consuming runtime. Generic CLI credentials do not become service requirements unless the descriptor declares them. |
@@ -174,6 +178,47 @@ Resolution order, per topic:
 3. **Network failure or 5xx** → print the cache, with a one-line staleness warning on stderr. No cache → `_die(5, …)` naming the URL that failed.
 
 The cache is the **offline floor, never the authority**: `$XDG_STATE_HOME/<name>/guides/<topic>.md` (plus `<topic>.etag`) — user-level regardless of credential scope, because guide content is capability-scoped, project-independent, and non-secret.
+
+## `inventory` — what the capability holds here
+
+`<name> inventory` prints what the capability amounts to in **this** project: a few headline metrics and, where they exist, the things behind them. It is the capability's own answer, so a reader assembling a whole project renders every capability through one template and holds no knowledge of any of them.
+
+```json
+{
+  "capability": "<name>",
+  "project": "/path/to/project",
+  "network": false,
+  "metrics": [
+    { "label": "jobs", "value": 8 },
+    { "label": "active here", "value": 6, "note": "environment: development" }
+  ],
+  "items": [
+    { "group": "jobs", "name": "nightly-sync", "state": "enabled",
+      "detail": "0 3 * * *",
+      "attributes": [{ "label": "environment", "value": "production" }] }
+  ],
+  "service": { "state": "running", "detail": "pid 4211" },
+  "deferred": []
+}
+```
+
+Every field is present on every answer, so a consumer never branches on absence. `capability` and `project` say who answered and about where (`project` is `null` outside a project). `metrics[]` are the headline figures, each `{ "label", "value", "note"? }`, rendered in the order given. `items[]` are the things inside, each `{ "name", "group"?, "state"?, "detail"?, "attributes"? }` — `group` sorts an answer that carries more than one kind of thing (scripts and schedules), `state` is one word a reader shows as a chip, `detail` is one line beside the name, and `attributes[]` are further `{ "label", "value" }` pairs. Ordered arrays rather than objects throughout: a reader that decodes JSON into a map loses the author's order, and the order is what makes the rendering legible. `service` is `null` unless the capability ships one, else `{ "state", "detail"? }`. `deferred[]` names what this run did not fetch, each `{ "label", "note"? }`.
+
+**The read is local, fast, secret-free, and leaves nothing changed.** No network, no login, no writes — not to the project, not to state, not to a cache. A secret never appears, masked or otherwise; where credentials resolve from is `connections`' question and whether they work is `doctor`'s.
+
+**Network-backed detail is declared and opt-in.** A capability whose figures live in the remote system declares it once, in the `INVENTORY` constant, and the manifest carries the declaration so a caller knows before it asks:
+
+```python
+INVENTORY = {"network": "optional"}   # "none" | "optional" | "required"
+```
+
+`none` — the whole report is local. `optional` — the local report stands on its own and `--network` adds to it. `required` — without `--network` there is nothing local to say. Bare, the verb never reaches the network whatever the mode; what it left behind it names in `deferred`. `<name> inventory --network` is the caller's explicit consent, and only then may the capability make the read remote. The answer always states which it was in its own `network` field.
+
+A capability with nothing of its own to report leaves `INVENTORY = None` and answers the same envelope, empty. That absence is the contract, not a gap.
+
+The envelope, the flag parsing and the empty answer are vendored in the contract preamble; a capability that declares `INVENTORY` supplies `_inventory(network: bool) -> dict` beside its `_cmd_connections`, returning any of `metrics`, `items`, `service`, and `deferred`.
+
+`inventory` is an **operational** verb: it reads project content rather than the capability's own declaration, so the policy gate applies to it exactly as it applies to `refs` and `ids` ([the capability policy gate](#the-capability-policy-gate)). The safe-discovery set stays `help`, `stub`, `manifest`, `connections`.
 
 ## Project records and the envelope
 

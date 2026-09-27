@@ -115,6 +115,7 @@ Contract commands:
   automations guide [<topic>]
   automations ids list|get|set|rm
   automations refs
+  automations inventory [--network]
 
 Exit codes:
   0 success · 3 not found · 4 disabled by project policy · 5 runtime failure ·
@@ -154,6 +155,7 @@ DOCS_BASE = (
     "main/capabilities/automations/guides/"
 )
 STATE = True
+INVENTORY = {"network": "none"}   # config and daemon state are both local
 POST_INSTALL: list = []
 SERVICE = {
     "name": "scheduler",
@@ -1091,6 +1093,50 @@ def _cmd_context(argv: list[str]) -> None:
          f"{NAME} context list|show|edit|put")
 
 
+INVENTORY_NETWORK_MODES = ("none", "optional", "required")
+
+
+def _inventory_declaration() -> dict | None:
+    """The manifest's `inventory` block, derived from the INVENTORY constant.
+
+    `None` says the capability has nothing of its own to report here, so a
+    reader assembling a whole project knows before it asks; the verb still
+    answers, with the empty envelope, so nothing branches on absence."""
+    if not INVENTORY:
+        return None
+    network = INVENTORY.get("network", "none")
+    return {"network": network if network in INVENTORY_NETWORK_MODES else "none"}
+
+
+def _cmd_inventory(argv: list[str]) -> None:
+    """What this capability holds in this project, in one shape for all of them.
+
+    The read is local, secret-free, and leaves nothing changed behind it.
+    `--network` is the caller's explicit consent to reach the remote system for
+    detail a local read cannot supply; without it that detail is named in
+    `deferred` rather than fetched, so assembling a whole project never waits
+    on a network the caller did not choose. `--json` is accepted for
+    explicitness; the output is always this JSON."""
+    network = False
+    for arg in argv:
+        if arg == "--network":
+            network = True
+        elif arg != "--json":
+            _die(6, "input", f"unknown inventory option {arg!r}",
+                 f"{NAME} inventory [--network]")
+    root = _project_root()
+    report: dict = {"capability": NAME,
+                    "project": str(root) if root is not None else None,
+                    "network": network,
+                    "metrics": [], "items": [], "service": None, "deferred": []}
+    if INVENTORY:
+        built = _inventory(network) or {}
+        for field in ("metrics", "items", "deferred"):
+            report[field] = list(built.get(field) or [])
+        report["service"] = built.get("service")
+    _emit(report)
+
+
 def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
     parser. Runs after _gate(), before any credential is resolved.
@@ -1106,7 +1152,8 @@ def _contract(argv: list[str]) -> None:
                "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
                "docs": {"base": DOCS_BASE,
                         "topics": [entry["topic"] for entry in _guide_menu()]},
-               "state": STATE, "post_install": POST_INSTALL})
+               "state": STATE, "inventory": _inventory_declaration(),
+               "post_install": POST_INSTALL})
     elif cmd == "guide":
         _cmd_guide(argv[1:])
     elif cmd == "ids":
@@ -1117,6 +1164,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_context(argv[1:])
     elif cmd == "connections":
         _cmd_connections()
+    elif cmd == "inventory":
+        _cmd_inventory(argv[1:])
     elif cmd == "help" and len(argv) == 1:
         _cmd_help()
     else:
@@ -2841,6 +2890,59 @@ def _cmd_connections() -> None:
     _emit({"connections": {}})
 
 
+def _inventory(_network: bool) -> dict:
+    """The automations this project declares, and whether the daemon is up.
+
+    Everything here is already on this machine - the config file and the pid
+    the daemon left beside its state - so the report never opens the store and
+    never counts a run: a reader asking every capability at once must not pay
+    a query for the asking."""
+    root = _project_root()
+    if root is None or not _config_path(root).is_file():
+        return {"metrics": [{"label": "automations", "value": 0,
+                             "note": "no configuration in this project"}]}
+    try:
+        runtime, config = _load(root)
+    except SystemExit:
+        return {"metrics": [{"label": "automations", "value": 0,
+                             "note": "configuration does not load"}]}
+    environment = config["engine"]["environment"]
+    declared = config["automations"]
+    active = [item for item in declared if runtime.applies(item, environment)]
+    items = []
+    for item in declared:
+        if item["schedule"]:
+            when = item["schedule"]
+        elif item["every_seconds"]:
+            when = f"every {item['every_seconds']}s"
+        else:
+            when = "manual"
+        attributes = [{"label": "script", "value": item["script"]}]
+        if item["environments"]:
+            attributes.append({"label": "environments",
+                               "value": ", ".join(item["environments"])})
+        items.append({
+            "group": "automations",
+            "name": item["name"] or item["id"],
+            "state": "active" if runtime.applies(item, environment)
+                     else ("disabled" if not item["enabled"] else "other environment"),
+            "detail": when,
+            "attributes": attributes,
+        })
+    pid = _read_pid(_state_path(root) / "daemon.pid")
+    running = _pid_alive(pid)
+    return {
+        "metrics": [
+            {"label": "automations", "value": len(declared)},
+            {"label": "active here", "value": len(active),
+             "note": f"environment: {environment}"},
+        ],
+        "items": items,
+        "service": {"state": "running" if running else "stopped",
+                    "detail": f"pid {pid}" if running else f"environment: {environment}"},
+    }
+
+
 def _manifest_payload() -> dict[str, Any]:
     return {
         "name": NAME,
@@ -2848,6 +2950,7 @@ def _manifest_payload() -> dict[str, Any]:
         "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
         "docs": {"base": DOCS_BASE, "topics": [entry["topic"] for entry in _guide_menu()]},
         "state": STATE,
+        "inventory": _inventory_declaration(),
         "post_install": POST_INSTALL,
         "service": SERVICE,
     }

@@ -1,11 +1,11 @@
 {
   "assets": {
-    "DOCTRINE.md": "8230128b730cbb30cb833191c15ce636f3f38979d30e2f5e7ed29c2bb4cba5fc",
+    "DOCTRINE.md": "c165ecdc15f57975c14579173342806886ae2642aecd6bb659ef6563f08a4d44",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "f49a3026b63734eddedb9daf646b56c10a7174bcfa36a85017e5e57e442edc40",
+    "SHEBANG.md": "3f6ce2b50c4c2dd1f0252537c6c7ad97654adccb8e4a52ff349657e6fefa848e",
     "SOURCES.md": "8e8b7f1f500b8ebe3d1abb2874616071e8142c69b897110be5cbc0f0194b0085",
     "TEMPLATE.md": "f0eb0069570509b7669be7a9c660703e86924ade416ccf87983eaa447169233d",
-    "contract/preamble.py": "2e11a9dca96067eaa0260de987ea8b20537f599995f875426cdd53b86eef815a",
+    "contract/preamble.py": "160c7138e092f9c0cef6a261743979ec56994a44ebe4376b13496b3b6ac70dc6",
     "contract/store.py": "eebb1f849aa8be51e30aaf9566fbc3f8c02e96c0b788342ad58fcfb8f89598c5",
     "guides/authoring.md": "e467e5343a54e99c991592d06233fd98b7be13fa32a174d0f27d3a8a06478724",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
@@ -21,7 +21,7 @@
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "419999eaa72a1589e0c56a4f3107018008f2456741d480781a46f69f702d092e"
+    "sha256": "a349ff7d3ab290fc02113f728feacc404fd08ce107a5a89c75edd81ff5df8d3d"
   },
   "schema": "capabilities.manager-release.v1"
 }
