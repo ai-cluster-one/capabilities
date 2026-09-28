@@ -860,6 +860,258 @@ schedule = "0 3 * * *"
             daemon.terminate()
             daemon.wait(timeout=15)
 
+    def test_inventory_item_carries_id_description_and_schedule_as_data(self) -> None:
+        # A reader addresses an automation by its id and reads its schedule
+        # without parsing display text; the contract's item has no such fields,
+        # so they ride in `attributes` under fixed labels.
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "nightly"
+name = "Nightly digest"
+description = "Summarises yesterday's runs."
+environments = ["test"]
+script = "capabilities/automations/scripts/job.py"
+schedule = "0 3 * * *"
+
+[[automations]]
+id = "poller"
+script = "capabilities/automations/scripts/job.py"
+every_seconds = 30
+""")
+        items = json.loads(self.cli("inventory").stdout)["items"]
+        by_id = {}
+        for item in items:
+            self.assertEqual(set(item), {"group", "name", "state", "detail", "attributes"})
+            attributes = [(row["label"], row["value"]) for row in item["attributes"]]
+            by_id[dict(attributes)["id"]] = (item, attributes)
+
+        nightly, attrs = by_id["nightly"]
+        self.assertEqual(nightly["name"], "Nightly digest")
+        self.assertEqual(nightly["detail"], "0 3 * * *")
+        self.assertEqual(attrs, [
+            ("id", "nightly"), ("description", "Summarises yesterday's runs."),
+            ("schedule_kind", "cron"), ("schedule_value", "0 3 * * *"),
+            ("script", "capabilities/automations/scripts/job.py"),
+            ("environments", "test")])
+
+        poller, attrs = by_id["poller"]
+        self.assertEqual(poller["name"], "poller")
+        self.assertEqual(poller["detail"], "every 30s")
+        self.assertEqual(attrs, [
+            ("id", "poller"), ("schedule_kind", "interval"), ("schedule_value", 30),
+            ("script", "capabilities/automations/scripts/job.py")])
+
+        job, attrs = by_id["job"]
+        self.assertEqual(job["detail"], "manual")
+        self.assertEqual(attrs[:2], [("id", "job"), ("schedule_kind", "manual")])
+        labels = [label for label, _ in attrs]
+        self.assertNotIn("description", labels)
+        self.assertNotIn("schedule_value", labels)
+
+    SET_CONFIG = (
+        "# Header comment - must survive.\n"
+        "version = 1\n"
+        "\n"
+        "[engine]\n"
+        "tick_seconds = 0.1   # fast\n"
+        "environment = \"test\"\n"
+        "\n"
+        "# Why nightly exists.\n"
+        "[[automations]]\n"
+        "id = \"nightly\"\n"
+        "  name = 'Nightly'   # tile label\n"
+        "description = \"\"\"old \\\n"
+        "text\"\"\"\n"
+        "script = \"capabilities/automations/scripts/job.py\"\n"
+        "schedule = \"0 3 * * *\"\n"
+        "environments = [\n"
+        "  \"test\",  # here\n"
+        "]\n"
+        "\n"
+        "[[ automations ]]   # manual\n"
+        "\"id\" = \"job\"\n"
+        "script = \"capabilities/automations/scripts/job.py\"\n"
+        "enabled = true\n"
+    )
+
+    def _set_config(self, text: str | None = None, newline: str = "\n") -> Path:
+        path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        path.write_bytes((text or self.SET_CONFIG).replace("\n", newline).encode())
+        return path
+
+    def test_set_inserts_each_flag_as_one_line_and_touches_nothing_else(self) -> None:
+        path = self._set_config()
+        answer = json.loads(self.cli(
+            "set", "job", "--name", 'Job "quoted" \\ back', "--description",
+            "Runs on demand", "--enabled", "false").stdout)
+        self.assertEqual(answer["changed"], ["name", "description", "enabled"])
+        self.assertEqual(path.read_text(), self.SET_CONFIG.replace(
+            '"id" = "job"\n',
+            '"id" = "job"\nname = "Job \\"quoted\\" \\\\ back"\n'
+            'description = "Runs on demand"\n').replace(
+            "enabled = true\n", "enabled = false\n"))
+        item = answer["item"]
+        self.assertEqual(item["name"], 'Job "quoted" \\ back')
+        self.assertEqual(item["state"], "disabled")
+        self.assertEqual(item["attributes"][:3], [
+            {"label": "id", "value": "job"},
+            {"label": "description", "value": "Runs on demand"},
+            {"label": "schedule_kind", "value": "manual"}])
+        # The answer is the item `inventory` reports for the same automation.
+        inventory = json.loads(self.cli("inventory").stdout)["items"]
+        self.assertIn(item, inventory)
+        self.assertFalse(answer["daemon"]["running"])
+        self.assertFalse(answer["daemon"]["reloaded"])
+
+    def test_set_replaces_values_in_place_and_clears_them(self) -> None:
+        path = self._set_config()
+        self.cli("set", "nightly", "--name", "Renamed", "--description", "One line")
+        self.assertEqual(path.read_text(), self.SET_CONFIG.replace(
+            "  name = 'Nightly'   # tile label\n", '  name = "Renamed"   # tile label\n').replace(
+            'description = """old \\\ntext"""\n', 'description = "One line"\n'))
+
+        answer = json.loads(self.cli("set", "nightly", "--name", "", "--description=").stdout)
+        self.assertEqual(answer["changed"], ["name", "description"])
+        self.assertEqual(path.read_text(), self.SET_CONFIG.replace(
+            "  name = 'Nightly'   # tile label\n", "").replace(
+            'description = """old \\\ntext"""\n', ""))
+        # Cleared, the name falls back to the id and no description is carried.
+        self.assertEqual(answer["item"]["name"], "nightly")
+        self.assertNotIn("description", [a["label"] for a in answer["item"]["attributes"]])
+
+        # Clearing what is not declared, and enabling what omits `enabled`,
+        # change nothing and write nothing.
+        before = path.read_bytes()
+        again = json.loads(self.cli("set", "nightly", "--name", "", "--enabled", "true").stdout)
+        self.assertEqual(again["changed"], [])
+        self.assertEqual(path.read_bytes(), before)
+
+        # A key added later lands after the nearest earlier key the entry has.
+        self.cli("set", "nightly", "--enabled", "false", "--name", "-dash-first")
+        self.assertIn('id = "nightly"\nname = "-dash-first"\nenabled = false\nscript',
+                      path.read_text())
+
+    def test_set_keeps_crlf_line_endings(self) -> None:
+        path = self._set_config(newline="\r\n")
+        self.cli("set", "job", "--name", "Job")
+        self.assertEqual(path.read_bytes(), self.SET_CONFIG.replace(
+            '"id" = "job"\n', '"id" = "job"\nname = "Job"\n').replace(
+            "\n", "\r\n").encode())
+
+    def test_set_refuses_invalid_requests_and_writes_nothing(self) -> None:
+        path = self._set_config()
+        before = path.read_bytes()
+        refused = [
+            (3, "not_found", ("set", "missing", "--name", "x")),
+            (6, "input", ("set", "job")),
+            (6, "input", ("set",)),
+            (6, "input", ("set", "job", "--title", "x")),
+            (6, "input", ("set", "job", "--name", "a", "--name", "b")),
+            (6, "input", ("set", "job", "--name")),
+            (6, "invalid_enabled", ("set", "job", "--enabled", "yes")),
+            (6, "invalid_enabled", ("set", "job", "--enabled", "True")),
+            (6, "invalid_enabled", ("set", "job", "--enabled", "1")),
+            (6, "invalid_text", ("set", "job", "--name", "a\tb")),
+            (6, "invalid_text", ("set", "job", "--name", "a\x7fb")),
+            (6, "invalid_text", ("set", "job", "--description", "a\nb")),
+            (6, "invalid_text", ("set", "job", "--description", "a b")),
+            (6, "invalid_text", ("set", "job", "--description", "a b")),
+            (6, "invalid_text", ("set", "job", "--name", "   ")),
+            (6, "too_long", ("set", "job", "--name", "n" * 81)),
+            (6, "too_long", ("set", "job", "--description", "d" * 501)),
+            # Valid text with an invalid flag beside it writes nothing either.
+            (6, "invalid_enabled", ("set", "job", "--name", "ok", "--enabled", "no")),
+        ]
+        for code, slug, args in refused:
+            with self.subTest(args=args):
+                proc = self.cli(*args, check=False)
+                self.assertEqual(proc.returncode, code, proc.stderr)
+                self.assertEqual(json.loads(proc.stderr)["error"]["code"], slug)
+                self.assertEqual(path.read_bytes(), before)
+        # The limits themselves are allowed, counted in characters.
+        self.cli("set", "job", "--name", "n" * 80, "--description", "é" * 500)
+
+    def test_set_refuses_an_edit_that_leaves_an_invalid_configuration(self) -> None:
+        # The edited file is loaded exactly as the daemon loads it before it
+        # replaces anything, so a file that would not load stays as it was.
+        for broken in (self.SET_CONFIG + "\n[[automations]]\nid = \"x\"\n"
+                       "script = \"capabilities/automations/scripts/job.py\"\nbogus = 1\n",
+                       self.SET_CONFIG + "\nthis is not toml [[[\n"):
+            with self.subTest(broken=broken[-20:]):
+                path = self._set_config(broken)
+                proc = self.cli("set", "job", "--name", "x", check=False)
+                self.assertEqual(proc.returncode, 6, proc.stderr)
+                self.assertIn("invalid_config", proc.stderr)
+                self.assertEqual(path.read_text(), broken)
+                self.assertEqual(sorted(p.name for p in path.parent.iterdir()),
+                                 ["config.toml"])
+
+    def test_set_requires_an_explicit_project_enable(self) -> None:
+        # Global inheritance runs the other verbs, but writing the project's
+        # config.toml is gated as `service init` is.
+        config_home = Path(self.tmp.name) / "xdg-config"
+        (config_home / "capabilities").mkdir(parents=True)
+        (config_home / "capabilities" / "settings.json").write_text(
+            json.dumps({"capabilities": {"automations": {"enabled": True}}}) + "\n")
+        (self.root / "capabilities" / "settings.json").write_text(
+            json.dumps({"capabilities": {}}) + "\n")
+        self.env["XDG_CONFIG_HOME"] = str(config_home)
+        path = self._set_config()
+        self.cli("list")
+        proc = self.cli("set", "job", "--name", "x", check=False)
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        self.assertIn("project_enable_required", proc.stderr)
+        self.assertEqual(path.read_text(), self.SET_CONFIG)
+
+    def test_set_publishes_the_change_to_a_running_daemon(self) -> None:
+        self.cli("service", "start")
+        pid = json.loads(self.cli("service", "status").stdout)["pid"]
+        answer = json.loads(self.cli("set", "job", "--enabled", "false").stdout)
+        self.assertEqual(answer["daemon"], {"running": True, "reloaded": True, "pid": pid})
+        self.assertEqual(answer["item"]["state"], "disabled")
+        # The same process took it up and is current: no restart, no stale config.
+        self.assertTrue(json.loads(self.cli("service", "doctor").stdout)["ok"])
+        self.assertEqual(json.loads(self.cli("service", "status").stdout)["pid"], pid)
+        state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
+        loaded = RUNTIME.read_config_fingerprint(state)
+
+        # Nothing changed: the daemon is not signalled.
+        same = json.loads(self.cli("set", "job", "--enabled", "false").stdout)
+        self.assertFalse(same["daemon"]["reloaded"])
+        self.assertEqual(RUNTIME.read_config_fingerprint(state), loaded)
+
+        on = json.loads(self.cli("set", "job", "--enabled", "true").stdout)
+        self.assertTrue(on["daemon"]["reloaded"])
+        self.assertEqual(on["item"]["state"], "active")
+
+        self.cli("service", "stop")
+        stopped = json.loads(self.cli("set", "job", "--name", "Job").stdout)
+        self.assertEqual(stopped["daemon"]["running"], False)
+        self.assertEqual(stopped["daemon"]["reloaded"], False)
+        self.assertEqual(stopped["changed"], ["name"])
+
+    def test_set_refuses_a_project_that_keeps_its_automations_in_the_store(self) -> None:
+        sys.path.insert(0, str(CAPABILITY / "service"))
+        try:
+            import store as store_mod
+        finally:
+            sys.path.pop(0)
+        st = store_mod.SQLiteStore.open(str(self.store_path))
+        st.migrate()
+        st.project_register(self.project_id, self.project_slug)
+        st.config_set("capabilities", "policy", "automations", {"enabled": True},
+                      ("project", self.project_slug))
+        st.close()
+        identity = self.root / "capabilities" / "project.json"
+        identity.write_text(json.dumps({**json.loads(identity.read_text()),
+                                        "store": "db"}) + "\n")
+        path = self._set_config()
+        proc = self.cli("set", "job", "--name", "x", check=False)
+        self.assertEqual(proc.returncode, 6, proc.stderr)
+        self.assertIn("config_in_store", proc.stderr)
+        self.assertEqual(path.read_text(), self.SET_CONFIG)
+
     def test_manual_run_history_and_logs(self) -> None:
         doctor = json.loads(self.cli("doctor").stdout)
         self.assertTrue(doctor["ok"])

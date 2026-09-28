@@ -40,6 +40,37 @@ Commands:
       table in place, keeping every row.
   automations list
       List configured automations and whether they apply to this environment.
+  automations set <automation-id> [--name TEXT] [--description TEXT] [--enabled true|false]
+      Rename, describe, or switch one automation on or off without editing
+      config.toml by hand. At least one flag is required; `--flag=VALUE` also
+      works. Only the named values of the [[automations]] entry with that id
+      change: every other byte of the file - comments, order, other entries,
+      whitespace - stays as it was, and a key the entry does not declare yet is
+      added as one line directly after the entry's id, name or description.
+      --name is at most 80 characters and --description at most 500, each
+      single-line text: control characters and line or paragraph separators
+      are refused, as is a value that is only whitespace. An empty value
+      (--name '') clears the field: its line, with any comment on that line, is
+      removed, so the entry no longer declares it and the name falls back to
+      the id. --enabled takes exactly true or false; an entry that omits
+      enabled is enabled, so --enabled true leaves such an entry as it is.
+      Nothing is written unless the whole request is valid and the edited file
+      loads exactly as the daemon loads it (exit 6 otherwise; an unknown id
+      exits 3), and the file is replaced atomically, so a failed write leaves
+      it as it was. Writing config.toml requires an explicit project enable,
+      as `service init` does (exit 4 otherwise). A project that keeps its
+      automations in the store has no config.toml to edit and exits 6.
+      When the project's daemon is running and a value changed, the change is
+      published through the `service reload` path and the verb returns once
+      the daemon has taken it up, so a new enabled state is in force without a
+      restart; a daemon that does not take it up exits 5 with the file change
+      standing. With no daemon running the file change alone stands and is
+      read when one starts. The answer is
+      {"item": <the automation's inventory item, as `inventory` reports it>,
+       "changed": [fields whose value changed; empty when none did],
+       "config": <path of the file>,
+       "daemon": {"running": bool, "reloaded": bool, "pid"?: int,
+                  "reason"?: text}}.
   automations run <automation-id>
       Enqueue one manual run. The daemon dispatches it asynchronously.
   automations runs [--limit N] [--status STATUS]
@@ -117,6 +148,22 @@ Contract commands:
   automations refs
   automations inventory [--network]
 
+Inventory:
+  `automations inventory` reports one item per declared automation, in
+  declaration order. `name` is the display name (name, else id); `state` is
+  disabled | active | other environment | enabled, judged by the running
+  daemon's environment, else this invocation's, and `enabled` when a running
+  daemon published none; `detail` is the schedule as display text. The facts
+  a program reads are `attributes`, by these fixed labels, in this order:
+    id              the config id, exactly as declared
+    description     the declared description; absent when none is declared
+    schedule_kind   cron | interval | manual
+    schedule_value  cron: the expression as declared (text); interval: the
+                    seconds (integer); absent for manual
+    script          the script path as declared
+    environments    the declared environments, comma-separated; absent when
+                    none are declared
+
 Exit codes:
   0 success · 3 not found · 4 disabled by project policy · 5 runtime failure ·
   6 malformed input, invalid config, or missing project setup
@@ -126,17 +173,21 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import json
 import os
 import signal
 import shutil
+import stat
 import tempfile
 import sqlite3
 import subprocess
 import sys
 import time
+import tomllib
+import unicodedata
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -2890,6 +2941,56 @@ def _cmd_connections() -> None:
     _emit({"connections": {}})
 
 
+def _judging_environment(runtime, config: dict, state: Path, running: bool) -> str | None:
+    """The environment an automation's state is judged against: the running
+    daemon's published one, else this invocation's; None when a running daemon
+    published none."""
+    if running:
+        return runtime.read_daemon_environment(state)
+    return config["engine"]["environment"]
+
+
+def _inventory_item(runtime, item: dict, environment: str | None) -> dict:
+    """One automation as an inventory item.
+
+    The contract's item has no field for an id, a description or a schedule
+    as data, so they ride in `attributes` under fixed labels (documented in
+    `automations help`), and `detail` stays the schedule as display text."""
+    attributes = [{"label": "id", "value": item["id"]}]
+    if item["description"]:
+        attributes.append({"label": "description", "value": item["description"]})
+    if item["schedule"]:
+        when = item["schedule"]
+        attributes += [{"label": "schedule_kind", "value": "cron"},
+                       {"label": "schedule_value", "value": item["schedule"]}]
+    elif item["every_seconds"]:
+        when = f"every {item['every_seconds']}s"
+        attributes += [{"label": "schedule_kind", "value": "interval"},
+                       {"label": "schedule_value", "value": item["every_seconds"]}]
+    else:
+        when = "manual"
+        attributes.append({"label": "schedule_kind", "value": "manual"})
+    attributes.append({"label": "script", "value": item["script"]})
+    if item["environments"]:
+        attributes.append({"label": "environments",
+                           "value": ", ".join(item["environments"])})
+    if not item["enabled"]:
+        state_word = "disabled"
+    elif environment is None:
+        state_word = "enabled"
+    elif runtime.applies(item, environment):
+        state_word = "active"
+    else:
+        state_word = "other environment"
+    return {
+        "group": "automations",
+        "name": item["name"] or item["id"],
+        "state": state_word,
+        "detail": when,
+        "attributes": attributes,
+    }
+
+
 def _inventory(_network: bool) -> dict:
     """The automations this project declares, and whether the daemon is up.
 
@@ -2930,42 +3031,11 @@ def _inventory(_network: bool) -> dict:
                              "note": "configuration does not load"}],
                 "service": live or {"state": "stopped",
                                     "detail": "configuration does not load"}}
-    if running:
-        environment = runtime.read_daemon_environment(state)
-        whose = "the running daemon's"
-    else:
-        environment = config["engine"]["environment"]
-        whose = "no daemon running"
+    environment = _judging_environment(runtime, config, state, running)
+    whose = "the running daemon's" if running else "no daemon running"
     declared = config["automations"]
-    items = []
-    active = 0
-    for item in declared:
-        if item["schedule"]:
-            when = item["schedule"]
-        elif item["every_seconds"]:
-            when = f"every {item['every_seconds']}s"
-        else:
-            when = "manual"
-        attributes = [{"label": "script", "value": item["script"]}]
-        if item["environments"]:
-            attributes.append({"label": "environments",
-                               "value": ", ".join(item["environments"])})
-        if not item["enabled"]:
-            state_word = "disabled"
-        elif environment is None:
-            state_word = "enabled"
-        elif runtime.applies(item, environment):
-            state_word = "active"
-            active += 1
-        else:
-            state_word = "other environment"
-        items.append({
-            "group": "automations",
-            "name": item["name"] or item["id"],
-            "state": state_word,
-            "detail": when,
-            "attributes": attributes,
-        })
+    items = [_inventory_item(runtime, item, environment) for item in declared]
+    active = sum(1 for item in items if item["state"] == "active")
     if environment is None:
         active_metric = {"label": "enabled",
                          "value": sum(1 for item in declared if item["enabled"]),
@@ -3578,6 +3648,419 @@ def cmd_list() -> dict[str, Any]:
     return {"environment": environment, "automations": items}
 
 
+# --- set: editing one entry of config.toml in place ---------------------------
+#
+# config.toml is a person's file: its comments carry why each automation exists.
+# So `set` never round-trips it through a serializer. A small scanner locates the
+# byte span of each value, the edit replaces that span (or inserts or removes
+# the one key line), and the candidate is proven twice before it replaces the
+# file: re-parsed to show that only the requested values moved, and loaded by
+# the runtime exactly as the daemon loads it.
+
+SET_TEXT_LIMITS = {"name": 80, "description": 500}
+SET_FIELDS = ("name", "description", "enabled")
+# Where a key the entry does not declare yet is inserted: after the nearest
+# earlier key of this order that it does declare (`id` always exists).
+_SET_KEY_ORDER = ("id", "name", "description", "enabled")
+_SET_SEPARATORS = {" ", " "}
+
+
+class _TomlScanError(ValueError):
+    pass
+
+
+def _toml_skip(text: str, i: int, newlines: bool = False) -> int:
+    """Skip spaces and tabs; inside an array also newlines and comments."""
+    while i < len(text):
+        c = text[i]
+        if c in " \t":
+            i += 1
+        elif newlines and c in "\r\n":
+            i += 1
+        elif newlines and c == "#":
+            while i < len(text) and text[i] != "\n":
+                i += 1
+        else:
+            break
+    return i
+
+
+def _toml_string_end(text: str, i: int) -> int:
+    """Index just past the string starting at `i` (any of TOML's four kinds)."""
+    for quote in ('"""', "'''"):
+        if text.startswith(quote, i):
+            j = i + 3
+            while True:
+                if j >= len(text):
+                    raise _TomlScanError("unterminated multi-line string")
+                if quote == '"""' and text[j] == "\\":
+                    j += 2
+                    continue
+                if text.startswith(quote, j):
+                    end = j + 3
+                    # Up to two quotes may sit directly before the delimiter.
+                    extra = 0
+                    while extra < 2 and end < len(text) and text[end] == quote[0]:
+                        end += 1
+                        extra += 1
+                    return end
+                j += 1
+    quote = text[i]
+    j = i + 1
+    while j < len(text) and text[j] != quote:
+        if text[j] == "\n":
+            raise _TomlScanError("newline in a single-line string")
+        if quote == '"' and text[j] == "\\":
+            j += 1
+        j += 1
+    if j >= len(text):
+        raise _TomlScanError("unterminated string")
+    return j + 1
+
+
+def _toml_key_end(text: str, i: int, stop: str) -> int:
+    """Index of `stop` ending a (possibly dotted, possibly quoted) key at `i`."""
+    while i < len(text):
+        c = text[i]
+        if c in "\"'":
+            i = _toml_string_end(text, i)
+        elif c == stop:
+            return i
+        elif c in "\r\n":
+            break
+        else:
+            i += 1
+    raise _TomlScanError(f"expected {stop!r} after a key")
+
+
+def _toml_value_end(text: str, i: int) -> int:
+    """Index just past the value starting at `i`."""
+    if i >= len(text):
+        raise _TomlScanError("missing value")
+    c = text[i]
+    if c in "\"'":
+        return _toml_string_end(text, i)
+    if c == "[":
+        j = i + 1
+        while True:
+            j = _toml_skip(text, j, newlines=True)
+            if j >= len(text):
+                raise _TomlScanError("unterminated array")
+            if text[j] == "]":
+                return j + 1
+            j = _toml_skip(text, _toml_value_end(text, j), newlines=True)
+            if j < len(text) and text[j] == ",":
+                j += 1
+    if c == "{":
+        j = i + 1
+        while True:
+            j = _toml_skip(text, j)
+            if j >= len(text):
+                raise _TomlScanError("unterminated inline table")
+            if text[j] == "}":
+                return j + 1
+            j = _toml_skip(text, _toml_key_end(text, j, "=") + 1)
+            j = _toml_skip(text, _toml_value_end(text, j))
+            if j < len(text) and text[j] == ",":
+                j += 1
+    j = i
+    while j < len(text) and text[j] not in " \t\r\n#,]}":
+        j += 1
+    if j == i:
+        raise _TomlScanError("missing value")
+    return j
+
+
+def _toml_key_path(key_text: str) -> tuple:
+    """A dotted, possibly quoted key as the tuple of names TOML reads it as."""
+    node = tomllib.loads(key_text + " = 0")
+    path = []
+    while isinstance(node, dict) and len(node) == 1:
+        name = next(iter(node))
+        path.append(name)
+        node = node[name]
+    return tuple(path)
+
+
+def _toml_scan(text: str) -> list[dict]:
+    """Every table header and key/value line of a document, with byte spans.
+
+    Headers are {"kind": "table"|"array", "path", "start", "end"}; key/values
+    are {"kind": "key", "path", "header" (index of the enclosing header or
+    None), "start" (line start), "value": (start, end), "end" (past the line's
+    newline)}. Positions are str indices into `text`."""
+    rows: list[dict] = []
+    header: int | None = None
+    i = 0
+    while i < len(text):
+        line_start = i
+        i = _toml_skip(text, i)
+        if i >= len(text):
+            break
+        c = text[i]
+        if c in "\r\n#":
+            nl = text.find("\n", i)
+            i = len(text) if nl < 0 else nl + 1
+            continue
+        if c == "[":
+            array = text.startswith("[[", i)
+            open_len = 2 if array else 1
+            close = _toml_key_end(text, i + open_len, "]")
+            path = _toml_key_path(text[i + open_len:close])
+            nl = text.find("\n", close)
+            end = len(text) if nl < 0 else nl + 1
+            rows.append({"kind": "array" if array else "table", "path": path,
+                         "start": line_start, "end": end})
+            header = len(rows) - 1
+            i = end
+            continue
+        eq = _toml_key_end(text, i, "=")
+        path = _toml_key_path(text[i:eq])
+        value_start = _toml_skip(text, eq + 1)
+        value_end = _toml_value_end(text, value_start)
+        nl = text.find("\n", value_end)
+        end = len(text) if nl < 0 else nl + 1
+        rows.append({"kind": "key", "path": path, "header": header,
+                     "start": line_start, "value": (value_start, value_end),
+                     "end": end})
+        i = end
+    return rows
+
+
+def _toml_string(value: str) -> str:
+    """A TOML basic string. Control characters are refused before this, so
+    only the backslash and the quote need escaping."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _set_text_value(field: str, raw: str) -> str | None:
+    """The validated value for --name/--description; None means clear."""
+    if raw == "":
+        return None
+    limit = SET_TEXT_LIMITS[field]
+    for ch in raw:
+        if unicodedata.category(ch) in {"Cc", "Cs"} or ch in _SET_SEPARATORS:
+            _die(6, "invalid_text",
+                 f"--{field} must be single-line text: control characters and "
+                 f"line or paragraph separators are refused (found U+{ord(ch):04X})")
+    if not raw.strip():
+        _die(6, "invalid_text", f"--{field} must not be only whitespace",
+             f"pass --{field} '' to clear it")
+    if len(raw) > limit:
+        _die(6, "too_long",
+             f"--{field} is {len(raw)} characters; the limit is {limit}")
+    return raw
+
+
+def _parse_set_args(argv: list[str]) -> tuple[str, dict[str, Any]]:
+    usage = "automations set <automation-id> [--name TEXT] [--description TEXT] [--enabled true|false]"
+    automation_id: str | None = None
+    raw: dict[str, str] = {}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--"):
+            flag, eq, value = arg[2:].partition("=")
+            if flag not in SET_FIELDS:
+                _die(6, "input", f"unknown set option {arg!r}", usage)
+            if not eq:
+                if i + 1 >= len(argv):
+                    _die(6, "input", f"--{flag} needs a value", usage)
+                i += 1
+                value = argv[i]
+            if flag in raw:
+                _die(6, "input", f"--{flag} given more than once", usage)
+            raw[flag] = value
+        elif automation_id is None:
+            automation_id = arg
+        else:
+            _die(6, "input", f"unexpected argument {arg!r}", usage)
+        i += 1
+    if automation_id is None:
+        _die(6, "input", "set needs an automation id", usage)
+    if not raw:
+        _die(6, "input", "set needs at least one of --name, --description, --enabled", usage)
+    changes: dict[str, Any] = {}
+    for field in ("name", "description"):
+        if field in raw:
+            changes[field] = _set_text_value(field, raw[field])
+    if "enabled" in raw:
+        if raw["enabled"] not in {"true", "false"}:
+            _die(6, "invalid_enabled",
+                 f"--enabled takes exactly true or false, not {raw['enabled']!r}")
+        changes["enabled"] = raw["enabled"] == "true"
+    return automation_id, changes
+
+
+def _edit_entry(text: str, index: int, entry: dict, changes: dict[str, Any]) -> tuple[str, list[str]]:
+    """The document with `changes` applied to the index-th [[automations]]
+    entry, touching only those values' spans; and the fields that changed."""
+    rows = _toml_scan(text)
+    headers = [n for n, row in enumerate(rows)
+               if row["kind"] == "array" and row["path"] == ("automations",)]
+    if len(headers) <= index:
+        raise _TomlScanError("the entry is not written as an [[automations]] table")
+    header = headers[index]
+    keys = {row["path"][0]: row for row in rows
+            if row["kind"] == "key" and row["header"] == header and len(row["path"]) == 1}
+    newline = "\r\n" if "\r\n" in text else "\n"
+    edits: list[tuple[int, int, str]] = []
+    changed: list[str] = []
+    for field in SET_FIELDS:
+        if field not in changes:
+            continue
+        wanted = changes[field]
+        current = entry.get(field)
+        if field == "enabled":
+            # An entry that omits `enabled` is enabled; saying so adds nothing.
+            if (current if field in entry else True) == wanted:
+                continue
+            literal = "true" if wanted else "false"
+        else:
+            if current == wanted or (wanted is None and field not in entry):
+                continue
+            literal = None if wanted is None else _toml_string(wanted)
+        changed.append(field)
+        row = keys.get(field)
+        if row is not None and literal is not None:
+            edits.append((*row["value"], literal))
+        elif row is not None:
+            edits.append((row["start"], row["end"], ""))
+        else:
+            anchor = next(keys[k] for k in reversed(_SET_KEY_ORDER[:_SET_KEY_ORDER.index(field)])
+                          if k in keys)
+            line = text[anchor["start"]:anchor["end"]]
+            indent = line[:len(line) - len(line.lstrip(" \t"))]
+            lead = "" if line.endswith("\n") else newline
+            edits.append((anchor["end"], anchor["end"],
+                          f"{lead}{indent}{field} = {literal}{newline}"))
+    # Applied from the end so earlier spans keep their positions; lines
+    # inserted at one point are applied last-field-first to read in field order.
+    for start, end, replacement in sorted(edits, key=lambda e: (e[0], edits.index(e)),
+                                          reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text, changed
+
+
+def _write_atomically(runtime, root: Path, target: Path, data: bytes) -> None:
+    """Replace `target` with `data` only if the result loads as the daemon
+    would load it; on any failure the file is left exactly as it was."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.",
+                                    suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, stat.S_IMODE(target.stat().st_mode))
+        try:
+            runtime.load_config(root, tmp)
+        except runtime.ConfigError as exc:
+            _die(6, "invalid_config",
+                 f"the edited configuration would not load: {exc}",
+                 "nothing was written; repair config.toml and retry")
+        os.replace(tmp, target)
+    except OSError as exc:
+        _die(5, "write_failed", f"cannot write {target}: {exc}",
+             "nothing was written")
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def cmd_set(argv: list[str], timeout: float = 20.0) -> dict[str, Any]:
+    automation_id, changes = _parse_set_args(argv)
+    root = _root_required()
+    if not _project_enabled_explicitly():
+        _die(4, "project_enable_required",
+             f"`{NAME} set` writes the project's config.toml, which requires an "
+             "explicit project enable",
+             f"ask the user, then run `capabilities enable {NAME} --project`")
+    runtime = _runtime_module()
+    try:
+        mode = runtime._store_mode(root)[0]
+    except runtime.ConfigError as exc:
+        _die(6, "invalid_config", str(exc))
+    if mode == "db":
+        _die(6, "config_in_store",
+             "this project keeps its automations in the store, not in config.toml",
+             "set edits config.toml only")
+    config_path = _config_path(root)
+    target = config_path.resolve()
+    try:
+        original = target.read_bytes()
+    except FileNotFoundError:
+        _die(6, "invalid_config", f"config not found: {config_path}",
+             "run `automations service init`")
+    except OSError as exc:
+        _die(5, "read_failed", f"cannot read {config_path}: {exc}")
+    try:
+        text = original.decode("utf-8")
+        document = tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        _die(6, "invalid_config", f"cannot read config {config_path}: {exc}",
+             "nothing was written; repair config.toml and retry")
+    entries = document.get("automations")
+    entries = entries if isinstance(entries, list) else []
+    index = next((n for n, entry in enumerate(entries)
+                  if isinstance(entry, dict) and entry.get("id") == automation_id), None)
+    if index is None:
+        _die(3, "not_found", f"unknown automation {automation_id!r}",
+             "run `automations list`")
+    try:
+        edited, changed = _edit_entry(text, index, entries[index], changes)
+    except (_TomlScanError, tomllib.TOMLDecodeError, StopIteration) as exc:
+        _die(6, "config_not_editable",
+             f"cannot locate the entry for {automation_id!r} in {config_path}: {exc}",
+             "nothing was written; edit config.toml by hand")
+    # The scanner is proven on every write: the candidate must parse to exactly
+    # the original document with the requested values changed.
+    expected = copy.deepcopy(document)
+    for field, value in changes.items():
+        if value is None:
+            expected["automations"][index].pop(field, None)
+        elif field == "enabled" and "enabled" not in changed:
+            continue
+        else:
+            expected["automations"][index][field] = value
+    try:
+        actual = tomllib.loads(edited)
+    except tomllib.TOMLDecodeError:
+        actual = None
+    if actual != expected:
+        _die(5, "edit_failed",
+             f"the edit to {config_path} did not come out as requested",
+             "nothing was written; edit config.toml by hand")
+    if changed:
+        _write_atomically(runtime, root, target, edited.encode("utf-8"))
+    _, config = _load(root)
+    state = _state_path(root)
+    pid = _read_pid(state / "daemon.pid")
+    running = _pid_alive(pid)
+    if not running:
+        daemon = {"running": False, "reloaded": False,
+                  "reason": "no daemon is running; the file change stands and is "
+                            "read when one starts"}
+    elif not changed:
+        daemon = {"running": True, "reloaded": False, "pid": pid,
+                  "reason": "nothing changed"}
+    else:
+        try:
+            daemon = _publish_reload(runtime, state, pid, config, timeout)
+        except _ReloadFailed as exc:
+            _die(exc.exit_code, exc.code,
+                 f"config.toml was updated, but the running daemon did not take it "
+                 f"up: {exc.message}",
+                 "the file change stands; retry with `automations service reload`")
+        daemon.pop("automations", None)
+        running = _pid_alive(pid)
+    item = runtime.automation_map(config)[automation_id]
+    environment = _judging_environment(runtime, config, state, running)
+    return {"item": _inventory_item(runtime, item, environment),
+            "changed": changed, "config": str(config_path), "daemon": daemon}
+
+
 def cmd_run(automation_id: str) -> dict[str, Any]:
     root = _root_required()
     runtime, config = _load(root)
@@ -3706,6 +4189,22 @@ def cmd_service_reload(timeout: float) -> dict[str, Any]:
     except runtime.ConfigError as exc:
         _die(6, "invalid_config", str(exc),
              "the daemon keeps the declaration it has; repair config.toml and retry")
+    try:
+        return _publish_reload(runtime, state, pid, config, timeout)
+    except _ReloadFailed as exc:
+        _die(exc.exit_code, exc.code, exc.message, exc.hint)
+
+
+class _ReloadFailed(Exception):
+    def __init__(self, exit_code: int, code: str, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.exit_code, self.code, self.message, self.hint = exit_code, code, message, hint
+
+
+def _publish_reload(runtime, state: Path, pid: int, config: dict,
+                    timeout: float) -> dict[str, Any]:
+    """Signal the running daemon to take up `config` and wait until it
+    publishes that declaration's fingerprint. Raises _ReloadFailed."""
     target = runtime.config_fingerprint(config)
     declared = len(runtime.automation_map(config))
     if runtime.read_config_fingerprint(state) == target:
@@ -3715,22 +4214,25 @@ def cmd_service_reload(timeout: float) -> dict[str, Any]:
     try:
         os.kill(pid, signal.SIGHUP)
     except ProcessLookupError:
-        _die(5, "service_not_running", "automations daemon exited before the reload")
+        raise _ReloadFailed(5, "service_not_running",
+                            "automations daemon exited before the reload") from None
     except PermissionError as exc:
-        _die(6, "service_reload_failed", f"cannot signal daemon process {pid}: {exc}")
+        raise _ReloadFailed(6, "service_reload_failed",
+                            f"cannot signal daemon process {pid}: {exc}") from None
 
     deadline = time.time() + max(timeout, 0.0)
     while time.time() < deadline:
         if not _pid_alive(pid):
-            _die(5, "service_reload_failed", "automations daemon exited during the reload",
-                 "inspect `automations service logs`")
+            raise _ReloadFailed(5, "service_reload_failed",
+                                "automations daemon exited during the reload",
+                                "inspect `automations service logs`")
         if runtime.read_config_fingerprint(state) == target:
             return {"reloaded": True, "running": True, "pid": pid,
                     "automations": declared}
         time.sleep(0.1)
-    _die(5, "service_reload_failed",
-         f"the daemon did not publish the new declaration within {timeout:g}s",
-         "it may have rejected it; inspect `automations service logs`")
+    raise _ReloadFailed(5, "service_reload_failed",
+                        f"the daemon did not publish the new declaration within {timeout:g}s",
+                        "it may have rejected it; inspect `automations service logs`")
 
 
 def cmd_service_stop(timeout: float, force: bool) -> dict[str, Any]:
@@ -4024,6 +4526,11 @@ def main() -> None:
         _emit(_manifest_payload())
         return
     _contract(argv)
+    if argv[:1] == ["set"]:
+        # Parsed by hand so a value may start with a dash and every refusal
+        # carries the error envelope and exit 6.
+        _emit(cmd_set(argv[1:]))
+        return
 
     parser = argparse.ArgumentParser(prog=NAME, add_help=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
