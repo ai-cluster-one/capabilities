@@ -50,11 +50,24 @@ def _init_repo(path: Path) -> None:
     _git(path, "init", "-b", "main")
 
 
+def _copy_manager(dest: Path) -> None:
+    """Carry the manager into a fixture source.
+
+    Source verification holds a tree's core declaration to that tree's own
+    catalogue. A fixture carries a sliver of the catalogue and removes parts of
+    it, so its manager declares no core capability at all."""
+    text = MANAGER.read_text()
+    line = next(entry for entry in text.splitlines()
+                if entry.startswith("CORE_CAPABILITIES = "))
+    dest.write_text(text.replace(line, "CORE_CAPABILITIES = ()", 1))
+    shutil.copymode(MANAGER, dest)
+
+
 def _source_repo(tmp_path: Path) -> Path:
     source = tmp_path / "source-repo"
     _init_repo(source)
     (source / "bin").mkdir()
-    shutil.copy2(MANAGER, source / "bin" / "capabilities")
+    _copy_manager(source / "bin" / "capabilities")
     shutil.copy2(REPO / "capabilities.repo.json", source / "capabilities.repo.json")
     for name in ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
                  "ROUTINES.md"):
@@ -92,7 +105,7 @@ def _release_source_repo(tmp_path: Path) -> tuple[Path, Path]:
     source = tmp_path / "release-source"
     _init_repo(source)
     (source / "bin").mkdir()
-    shutil.copy2(MANAGER, source / "bin" / "capabilities")
+    _copy_manager(source / "bin" / "capabilities")
     shutil.copy2(REPO / "capabilities.repo.json", source / "capabilities.repo.json")
     for name in ("SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md",
                  "ROUTINES.md"):

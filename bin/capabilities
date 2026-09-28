@@ -93,9 +93,14 @@ MACHINE VERBS
         do this; run it after installing a new agent host, or to repair the
         drift `doctor` reports.
   list
-        Installed capabilities with summaries and explicit project/global gate,
-        effective state, the scope that supplied it, and — in a project — the
-        resolved envelope path.
+        Installed capabilities with summaries, tier, and explicit project/global
+        gate, effective state, the scope that supplied it, and — in a project —
+        the resolved envelope path. `tier` is on every row, "core" or
+        "standard": the manager declares the catalogue's core set once, as
+        CORE_CAPABILITIES in its own executable, and every other capability is
+        standard. The tier is a mark to group by; it changes no gate, policy,
+        enablement or grant. Source verification refuses a core name the
+        catalogue does not carry.
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources.
         Listing never executes catalogue capability code.
@@ -231,7 +236,8 @@ PROJECT VERBS (run inside a consuming project)
         --fragment remains the read-only provider surface ContextKit calls.
   inventory [NAME ...] [--detail] [--network]
         What this project's capabilities are and what they hold. One row per
-        effective-enabled capability: gate and the scope that set it,
+        effective-enabled capability: its tier (as in `list`), gate and the
+        scope that set it,
         the connections it may act on and the ones a grant withholds,
         the declared service and its state, and whether the
         capability reports an inventory of its own and how much of it needs
@@ -422,6 +428,14 @@ SERVICE_SUPERVISION_POINTER = (
     "  Keeping it running - on this machine or on a server - is the "
     f"`{SERVICE_SUPERVISION_CAPABILITY}` capability's domain: "
 )
+CORE_CAPABILITIES = ("askproject", "automations", "deployment", "tasks")
+# The catalogue's core tier, and its only declaration. Which capabilities are
+# foundational is a fact about the catalogue, which no single capability is
+# part of deciding, so the manager declares it rather than any manifest. Every
+# catalogue capability not named here is standard. The tier is a mark readers
+# group by and nothing more: it changes no gate, policy, enablement or grant.
+# Source verification reads this assignment from the tree it verifies and
+# refuses a name that tree's catalogue does not carry.
 CAPABILITIES_CONTEXT_INTRO = (
     "Capabilities are self-contained CLIs installed on PATH and "
     "managed by `capabilities`. Use `capabilities list` to inspect the installed "
@@ -2101,6 +2115,11 @@ def cmd_self_update(from_ref: str | None = None) -> None:
         _emit(result)
 
 
+def _capability_tier(name: str) -> str:
+    """`core` for a capability the manager declares core, else `standard`."""
+    return "core" if name in CORE_CAPABILITIES else "standard"
+
+
 def cmd_list() -> None:
     entries = []
     root = _project_root()
@@ -2108,7 +2127,8 @@ def cmd_list() -> None:
     for name, meta in _installed().items():
         stub, manifest = _load_snapshots(name)
         entry: dict = {"name": name,
-                       "summary": (manifest or {}).get("summary", "")}
+                       "summary": (manifest or {}).get("summary", ""),
+                       "tier": _capability_tier(name)}
         local = _gate_state(project_caps.get(name)) if root else "absent"
         machine = _gate_state(global_caps.get(name))
         effective, source = _effective_gate_state(
@@ -2163,6 +2183,7 @@ def _inventory_rows(root: Path) -> list[dict]:
             rows.append({
                 "name": name,
                 "summary": manifest.get("summary", ""),
+                "tier": _capability_tier(name),
                 "gate": {"effective": effective, "source": source},
                 "connections": {"count": len(usable), "default": default,
                                 "ids": usable, "withheld": withheld},
@@ -6522,6 +6543,47 @@ def _source_contract_failures(root: Path) -> list[str]:
     return failures
 
 
+def _core_declaration_failures(root: Path) -> list[str]:
+    """Check the core set the tree's own manager declares against its catalogue.
+
+    The declaration is read from the tree being verified, never from the
+    running manager, so any manager verifies a tree against the set that tree
+    declares. A tree that carries no manager, or a manager that predates the
+    declaration, has nothing to check."""
+    import ast as _ast
+    manager = root / MANAGER_EXECUTABLE_REL
+    if not manager.is_file():
+        return []
+    try:
+        module = _ast.parse(manager.read_text())
+    except (OSError, SyntaxError) as exc:
+        return [f"cannot read the core declaration from {MANAGER_EXECUTABLE_REL}: {exc}"]
+    values = [
+        node.value for node in module.body
+        if isinstance(node, _ast.Assign)
+        and any(isinstance(t, _ast.Name) and t.id == "CORE_CAPABILITIES"
+                for t in node.targets)
+    ]
+    if not values:
+        return []
+    try:
+        declared = _ast.literal_eval(values[-1])
+    except ValueError:
+        declared = None
+    if not isinstance(declared, (tuple, list)) or \
+            not all(isinstance(n, str) for n in declared):
+        return ["CORE_CAPABILITIES must be a literal tuple of capability names"]
+    cap_root = root / "capabilities"
+    catalogue = {
+        p.name for p in cap_root.iterdir()
+        if p.is_dir() and (p / "bin" / p.name).is_file()
+    } if cap_root.is_dir() else set()
+    return [
+        f"CORE_CAPABILITIES names {name!r}, which is not in this catalogue"
+        for name in sorted(set(declared) - catalogue)
+    ]
+
+
 def _source_snapshot_report(
     root: Path,
     git_ref: str,
@@ -6577,6 +6639,9 @@ def _source_snapshot_report(
         elif manager_release_current != manager_release_expected:
             failures.setdefault("manager-release", []).append(
                 "generated manager release manifest does not describe this Git tree")
+        core_failures = _core_declaration_failures(snapshot)
+        if core_failures:
+            failures.setdefault("core", []).extend(core_failures)
         manager = snapshot / "bin" / "capabilities"
         if manager_selfcheck and manager.is_file():
             rc, _out, err = _run_script(
