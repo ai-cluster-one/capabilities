@@ -233,9 +233,11 @@ PROJECT VERBS (run inside a consuming project)
         What this project's capabilities are and what they hold. One row per
         effective-enabled capability: gate and the scope that set it,
         the connections it may act on and the ones a grant withholds,
-        the declared service, and whether the
+        the declared service and its state, and whether the
         capability reports an inventory of its own and how much of it needs
-        the network. The survey runs no capability at all. --detail also asks
+        the network. The survey runs only the capabilities that ship a
+        service, each once for its service's state from its own local report
+        (`unknown`, with the reason, when it cannot answer). --detail also asks
         each one for its own report — `<name> inventory`, local and effect-free
         — running them together, so a reader assembling a whole project spends
         one process per capability here instead of several in every caller.
@@ -2167,7 +2169,8 @@ def _inventory_rows(root: Path) -> list[dict]:
                 "service": None if service is None else {
                     "name": service.get("name"),
                     "summary": service.get("summary"),
-                    "verbs": service.get("verbs") or []},
+                    "verbs": service.get("verbs") or [],
+                    "state": None, "detail": None},
                 "inventory": {"declared": manifest.get("inventory") is not None,
                               "network": ((manifest.get("inventory") or {})
                                           .get("network"))},
@@ -2198,16 +2201,31 @@ def _inventory_report(root: Path, name: str, network: bool) -> dict:
                           "hint": (err.strip().splitlines() or [""])[-1] or None}}
 
 
+def _inventory_service_state(answer: dict) -> dict:
+    """The service state a capability's own report gave, or why there is none.
+
+    `unknown` is a state rather than a missing one, so a row whose capability
+    could not be asked still says that it could not, and why."""
+    service = (answer.get("report") or {}).get("service")
+    if isinstance(service, dict) and str(service.get("state") or "").strip():
+        return {"state": service["state"], "detail": service.get("detail")}
+    if "error" in answer:
+        return {"state": "unknown", "detail": answer["error"].get("message")}
+    return {"state": "unknown",
+            "detail": "the capability's inventory reports no service state"}
+
+
 def cmd_inventory(detail: bool, network: bool, wanted: list[str]) -> None:
     """What this project's capabilities are and what they hold.
 
     `list` answers for the machine — everything installed and how each is
     gated. This answers for one project: the capabilities an agent here can
     actually use, with their connections, their service, and — with --detail —
-    each capability's own report of what it holds. The survey costs no
-    capability process at all; --detail spends exactly one per capability and
-    spends them at the same time, which is the whole reason it lives here
-    rather than in every caller."""
+    each capability's own report of what it holds. The survey costs one
+    process for each capability that ships a service, because that service's
+    state is the capability's to read, and none for the rest; --detail spends
+    exactly one per capability. Either way they are spent at the same time,
+    which is the whole reason this lives here rather than in every caller."""
     root = _require_project()
     rows = _inventory_rows(root)
     if wanted:
@@ -2220,15 +2238,23 @@ def cmd_inventory(detail: bool, network: bool, wanted: list[str]) -> None:
         rows = [row for row in rows if row["name"] in set(wanted)]
     if network:
         detail = True
-    if detail and rows:
+    # A declared service's state is part of every answer, and only the
+    # capability can read it, so a capability that ships a service is asked for
+    # its report even when no detail was asked for; the rest cost nothing.
+    asked = [row for row in rows if detail or row["service"] is not None]
+    if asked:
         with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(8, len(rows))) as pool:
+                max_workers=min(8, len(asked))) as pool:
             answers = dict(zip(
-                [row["name"] for row in rows],
+                [row["name"] for row in asked],
                 pool.map(lambda row: _inventory_report(root, row["name"], network),
-                         rows)))
-        for row in rows:
-            row["inventory"].update(answers[row["name"]])
+                         asked)))
+        for row in asked:
+            answer = answers[row["name"]]
+            if row["service"] is not None:
+                row["service"].update(_inventory_service_state(answer))
+            if detail:
+                row["inventory"].update(answer)
     _emit({"project": {"root": str(root),
                        "envelope": str(_project_capabilities_dir(root))},
            "detail": detail, "network": network, "capabilities": rows})
@@ -5393,6 +5419,8 @@ def _validate_inventory(name: str, out: str, manifest) -> list[str]:
     if service is not None and (not isinstance(service, dict)
                                 or not str(service.get("state") or "").strip()):
         problems.append(f"service is neither null nor {{state, detail?}}: {service!r}")
+    if service is None and isinstance(manifest, dict) and manifest.get("service"):
+        problems.append("the capability ships a service and reports no state for it")
     return problems
 
 

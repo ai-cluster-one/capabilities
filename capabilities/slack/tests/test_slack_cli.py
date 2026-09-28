@@ -190,3 +190,56 @@ def test_audit_rejects_guide_without_preview(tmp_path):
     assert proc.returncode == 7
     failures = json.loads(proc.stdout)["failures"]
     assert any("incomplete menu entry" in failure for failure in failures)
+
+
+def test_manager_inventory_carries_the_declared_service_state(tmp_path):
+    # A reader assembling a project takes each service's state from the one
+    # aggregated read, so the state is there without asking for detail, and a
+    # project that cannot run the service says why rather than saying nothing.
+    project = _project(tmp_path)
+    env = _env(tmp_path, project)
+    env.update({"CAPABILITIES_HOME": str(tmp_path / "registry"),
+                "CAPABILITIES_BIN": str(tmp_path / "bin")})
+    (tmp_path / "bin").mkdir()
+    installed = _run(
+        [str(MANAGER), "install", "slack", "--from", str(BUNDLE), "--yes"], env, project
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    def service_row():
+        proc = _run([str(MANAGER), "inventory", "slack"], env, project)
+        assert proc.returncode == 0, proc.stderr
+        (row,) = json.loads(proc.stdout)["capabilities"]
+        return row["service"]
+
+    unconfigured = service_row()
+    assert unconfigured["name"] == "assistant"
+    assert unconfigured["state"] == "not configured"
+    assert "connections registry" in unconfigured["detail"]
+
+    assert _run([str(SCRIPT), "service", "init"], env, project).returncode == 0
+    (project / "capabilities" / "slack" / "connections.json").write_text(
+        json.dumps({"default": "workspace",
+                    "connections": {"workspace": {"allow_write": False}}}) + "\n"
+    )
+    configured = service_row()
+    assert configured["state"] == "stopped"
+    assert configured["detail"] == "connection workspace"
+
+
+def test_audit_rejects_a_service_whose_inventory_reports_no_state(tmp_path):
+    bundle = tmp_path / "slack"
+    shutil.copytree(BUNDLE, bundle)
+    script = bundle / "bin" / "slack"
+    script.write_text(
+        script.read_text().replace(
+            "def _inventory(_network: bool) -> dict:\n",
+            "def _inventory(_network: bool) -> dict:\n    return {}\n", 1
+        )
+    )
+    proc = _run(
+        [str(MANAGER), "audit", "slack", "--from", str(bundle)], dict(os.environ), REPO
+    )
+    assert proc.returncode == 7
+    failures = json.loads(proc.stdout)["failures"]
+    assert any("ships a service and reports no state" in failure for failure in failures)

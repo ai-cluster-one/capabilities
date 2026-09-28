@@ -2896,20 +2896,49 @@ def _inventory(_network: bool) -> dict:
     Everything here is already on this machine - the config file and the pid
     the daemon left beside its state - so the report never opens the store and
     never counts a run: a reader asking every capability at once must not pay
-    a query for the asking."""
+    a query for the asking.
+
+    Whether an automation is active is the running daemon's question, not this
+    invocation's: the daemon selects by the environment it was started under,
+    which a terminal opened later does not share. So a running daemon's
+    published environment is the one each automation is judged against, and
+    this invocation's stands in only when no daemon is running. A running
+    daemon that published none leaves the environment undecided, and the
+    report says `enabled` rather than guessing which side of it each one is.
+
+    The service's state is part of every answer, a project with no
+    configuration included, because a reader assembling a project takes it
+    from here and nowhere else."""
     root = _project_root()
-    if root is None or not _config_path(root).is_file():
+    if root is None:
         return {"metrics": [{"label": "automations", "value": 0,
-                             "note": "no configuration in this project"}]}
+                             "note": "not inside a project"}],
+                "service": {"state": "not configured", "detail": "not inside a project"}}
+    state = _state_path(root)
+    pid = _read_pid(state / "daemon.pid")
+    running = _pid_alive(pid)
+    live = ({"state": "running", "detail": f"pid {pid}"} if running else None)
+    if not _config_path(root).is_file():
+        return {"metrics": [{"label": "automations", "value": 0,
+                             "note": "no configuration in this project"}],
+                "service": live or {"state": "not initialized",
+                                    "detail": "no configuration in this project"}}
     try:
         runtime, config = _load(root)
     except SystemExit:
         return {"metrics": [{"label": "automations", "value": 0,
-                             "note": "configuration does not load"}]}
-    environment = config["engine"]["environment"]
+                             "note": "configuration does not load"}],
+                "service": live or {"state": "stopped",
+                                    "detail": "configuration does not load"}}
+    if running:
+        environment = runtime.read_daemon_environment(state)
+        whose = "the running daemon's"
+    else:
+        environment = config["engine"]["environment"]
+        whose = "no daemon running"
     declared = config["automations"]
-    active = [item for item in declared if runtime.applies(item, environment)]
     items = []
+    active = 0
     for item in declared:
         if item["schedule"]:
             when = item["schedule"]
@@ -2921,25 +2950,39 @@ def _inventory(_network: bool) -> dict:
         if item["environments"]:
             attributes.append({"label": "environments",
                                "value": ", ".join(item["environments"])})
+        if not item["enabled"]:
+            state_word = "disabled"
+        elif environment is None:
+            state_word = "enabled"
+        elif runtime.applies(item, environment):
+            state_word = "active"
+            active += 1
+        else:
+            state_word = "other environment"
         items.append({
             "group": "automations",
             "name": item["name"] or item["id"],
-            "state": "active" if runtime.applies(item, environment)
-                     else ("disabled" if not item["enabled"] else "other environment"),
+            "state": state_word,
             "detail": when,
             "attributes": attributes,
         })
-    pid = _read_pid(_state_path(root) / "daemon.pid")
-    running = _pid_alive(pid)
+    if environment is None:
+        active_metric = {"label": "enabled",
+                         "value": sum(1 for item in declared if item["enabled"]),
+                         "note": "the running daemon published no environment"}
+    else:
+        active_metric = {"label": "active here", "value": active,
+                         "note": f"environment: {environment} ({whose})"}
     return {
         "metrics": [
             {"label": "automations", "value": len(declared)},
-            {"label": "active here", "value": len(active),
-             "note": f"environment: {environment}"},
+            active_metric,
         ],
         "items": items,
         "service": {"state": "running" if running else "stopped",
-                    "detail": f"pid {pid}" if running else f"environment: {environment}"},
+                    "detail": (f"pid {pid}, environment {environment or 'unpublished'}"
+                               if running else
+                               f"environment: {environment}")},
     }
 
 

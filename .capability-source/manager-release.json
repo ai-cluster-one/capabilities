@@ -2,7 +2,7 @@
   "assets": {
     "DOCTRINE.md": "c165ecdc15f57975c14579173342806886ae2642aecd6bb659ef6563f08a4d44",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "3f6ce2b50c4c2dd1f0252537c6c7ad97654adccb8e4a52ff349657e6fefa848e",
+    "SHEBANG.md": "0432b4d0d16bb01157bea85742cf151294343af078319e925a25754aa9729fe7",
     "SOURCES.md": "8e8b7f1f500b8ebe3d1abb2874616071e8142c69b897110be5cbc0f0194b0085",
     "TEMPLATE.md": "f0eb0069570509b7669be7a9c660703e86924ade416ccf87983eaa447169233d",
     "contract/preamble.py": "160c7138e092f9c0cef6a261743979ec56994a44ebe4376b13496b3b6ac70dc6",
@@ -21,7 +21,7 @@
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "a349ff7d3ab290fc02113f728feacc404fd08ce107a5a89c75edd81ff5df8d3d"
+    "sha256": "4acac293f90fc941fde3f457fc49b061fd50878c69c21481d3b58042618f0725"
   },
   "schema": "capabilities.manager-release.v1"
 }

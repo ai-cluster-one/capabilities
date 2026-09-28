@@ -20,6 +20,8 @@ regions. Never edit text inside those regions. Success is JSON on stdout;
 errors are JSON on stderr. Exit 4 is policy refusal.
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -54,7 +56,7 @@ DOCS_BASE = (
     "main/capabilities/slack/guides/"
 )
 STATE = True
-INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
+INVENTORY = {"network": "none"}   # the daemon's state is a pid file on this machine
 POST_INSTALL: list[dict] = []
 
 HELP = """\
@@ -3677,12 +3679,16 @@ def cmd_service_init(flag: str | None) -> None:
 
 
 def cmd_service_status(flag: str | None) -> None:
+    _emit(_service_status(flag))
+
+
+def _service_status(flag: str | None) -> dict:
     root = _service_root()
     cid = _service_connection_id(root, flag)
     state = _service_state_dir(cid)
     pid = _read_pid(state / "daemon.pid")
     running = _pid_matches_service(pid)
-    _emit(
+    return (
         {
             "initialized": bool(_service_settings(root)),
             "running": running,
@@ -3695,6 +3701,38 @@ def cmd_service_status(flag: str | None) -> None:
             "inbox": str(state / "inbox.jsonl"),
         }
     )
+
+
+def _inventory(_network: bool) -> dict:
+    """The assistant daemon's state in this project, from what it left here.
+
+    A capability that ships a service answers for that service's state, so a
+    reader assembling a project learns it without a second process per
+    capability. The answer is `service status` read, not a new judgement of
+    liveness: a pid file on this machine and the process it names. A project
+    that cannot select a connection has no daemon to be in any state, and
+    says why instead of failing the whole report."""
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as refused:
+            status = _service_status(None)
+    except SystemExit:
+        return {"service": {"state": "not configured",
+                            "detail": _inventory_refusal(refused.getvalue())}}
+    if status["running"]:
+        return {"service": {"state": "running",
+                            "detail": f"pid {status['pid']}, connection {status['connection']}"}}
+    return {"service": {"state": "stopped" if status["initialized"] else "not initialized",
+                        "detail": f"connection {status['connection']}"}}
+
+
+def _inventory_refusal(stderr: str) -> str:
+    """The message a refused status read left on stderr, as one line."""
+    for line in reversed(stderr.strip().splitlines()):
+        try:
+            return json.loads(line)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            continue
+    return "the service status could not be read"
 
 
 def _service_tokens() -> tuple[str, str]:

@@ -810,6 +810,56 @@ schedule = "0 3 * * *"
         self.assertTrue(stopped["ok"])
         self.assertNotIn("environment_unknown", stopped)
 
+    def test_inventory_judges_automations_by_the_running_daemons_environment(self) -> None:
+        # Whether an automation is active is decided by the daemon that runs it,
+        # under the environment it was started with, and a terminal asking later
+        # carries a different one. Judged from the asker, every automation a
+        # supervised daemon is running reads as inactive.
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "nightly"
+environments = ["production"]
+script = "capabilities/automations/scripts/job.py"
+schedule = "0 3 * * *"
+""")
+
+        def states(report: dict) -> dict:
+            return {item["name"]: item["state"] for item in report["items"]}
+
+        def active(report: dict) -> dict:
+            return next(m for m in report["metrics"] if m["label"] == "active here")
+
+        # No daemon: this invocation's environment is the only one there is.
+        idle = json.loads(self.cli("inventory").stdout)
+        self.assertEqual(idle["service"]["state"], "stopped")
+        self.assertEqual(states(idle)["job"], "active")
+        self.assertEqual(states(idle)["nightly"], "other environment")
+        self.assertIn("test", active(idle)["note"])
+
+        daemon = self._supervised_daemon("production")
+        try:
+            report = json.loads(self.cli("inventory").stdout)
+            self.assertEqual(report["service"]["state"], "running")
+            self.assertIn("production", report["service"]["detail"])
+            self.assertEqual(states(report)["nightly"], "active")
+            self.assertEqual(states(report)["job"], "other environment")
+            self.assertEqual(active(report)["value"], 1)
+            self.assertIn("production", active(report)["note"])
+
+            # A daemon that published no environment leaves the question open,
+            # and the report says enabled rather than guessing either way.
+            state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
+            legacy = state / RUNTIME.DAEMON_FINGERPRINT_FILE
+            legacy.write_text(RUNTIME.read_config_fingerprint(state) + "\n")
+            unknown = json.loads(self.cli("inventory").stdout)
+            self.assertEqual(states(unknown)["nightly"], "enabled")
+            self.assertEqual(states(unknown)["job"], "enabled")
+            self.assertNotIn("active here", [m["label"] for m in unknown["metrics"]])
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=15)
+
     def test_manual_run_history_and_logs(self) -> None:
         doctor = json.loads(self.cli("doctor").stdout)
         self.assertTrue(doctor["ok"])

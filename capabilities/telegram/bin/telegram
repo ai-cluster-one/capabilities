@@ -279,7 +279,7 @@ WRITE_DEFAULT = False    # outbound messages and reactions need an explicit conn
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/telegram/guides/")
 STATE = True       # True when the capability writes session/cache state
-INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
+INVENTORY = {"network": "none"}   # the daemon's state is pid and health files on this machine
 SERVICE_STATE_VERSION = 1
 POST_INSTALL: list = []
 SERVICE = {
@@ -5592,12 +5592,16 @@ def _service_runtime_health(path: Path, running: bool) -> dict:
     return health
 
 
-def cmd_service_status(connection_flag: str | None, session_flag: str | None) -> dict:
-    """Report the actual account-global owner and its recorded health paths."""
-    root = _service_project_root()
-    envelope = _project_capabilities_dir(root).resolve()
-    initialized = bool(_service_settings(root)) and \
+def _service_initialized(root: Path) -> bool:
+    return bool(_service_settings(root)) and \
         _records().document_read(NAME, "context") is not None
+
+
+def _service_liveness(root: Path, connection_flag: str | None,
+                      session_flag: str | None) -> dict:
+    """Whether the assistant is running for this project, and which process
+    answers for it: the account-global owner where one is recorded, since that
+    is the daemon actually holding the account, else this project's pid file."""
     cid, paths = _service_state_dir(root, connection_flag, session_flag)
     pid = _read_pid(paths["pid"])
     running = _pid_alive(pid)
@@ -5620,6 +5624,59 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
         owner_health_path = Path(str(owner.get("health_file") or ""))
         if owner_health_path.is_file():
             actual_health = _service_runtime_health(owner_health_path, owner_running)
+    return {"connection": cid, "paths": paths, "pid": pid, "running": running,
+            "account_id": account_id, "control": control, "owner": owner,
+            "owner_running": owner_running, "health": actual_health}
+
+
+def _inventory(_network: bool) -> dict:
+    """The assistant daemon's state in this project, from what it left here.
+
+    A capability that ships a service answers for that service's state, so a
+    reader assembling a project learns it without a second process per
+    capability. The answer is the liveness `service status` reports - the pid
+    files and health record on this machine - and nothing a status read does
+    not already do. A project that cannot select a connection has no daemon to
+    be in any state, and says why instead of failing the whole report."""
+    root = _project_root()
+    if root is None:
+        return {"service": {"state": "not configured", "detail": "not inside a project"}}
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as refused:
+            live = _service_liveness(root, None, None)
+            initialized = _service_initialized(root)
+    except SystemExit:
+        return {"service": {"state": "not configured",
+                            "detail": _inventory_refusal(refused.getvalue())}}
+    if live["owner_running"]:
+        owner = live["owner"] if isinstance(live["owner"], dict) else {}
+        pid = owner.get("pid") or live["pid"]
+        return {"service": {"state": "running",
+                            "detail": f"pid {pid}, health {live['health']['state']}, "
+                                      f"connection {live['connection']}"}}
+    return {"service": {"state": "stopped" if initialized else "not initialized",
+                        "detail": f"connection {live['connection']}"}}
+
+
+def _inventory_refusal(stderr: str) -> str:
+    """The message a refused status read left on stderr, as one line."""
+    for line in reversed(stderr.strip().splitlines()):
+        try:
+            return json.loads(line)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            continue
+    return "the service status could not be read"
+
+
+def cmd_service_status(connection_flag: str | None, session_flag: str | None) -> dict:
+    """Report the actual account-global owner and its recorded health paths."""
+    root = _service_project_root()
+    envelope = _project_capabilities_dir(root).resolve()
+    initialized = _service_initialized(root)
+    live = _service_liveness(root, connection_flag, session_flag)
+    cid, paths, pid, running = live["connection"], live["paths"], live["pid"], live["running"]
+    account_id, control, owner = live["account_id"], live["control"], live["owner"]
+    owner_running, actual_health = live["owner_running"], live["health"]
     expectation_mismatches = []
     if isinstance(owner, dict):
         if owner.get("project_root") != str(root):
