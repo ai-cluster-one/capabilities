@@ -420,7 +420,9 @@ STORE
 
   `list` and `search` carry `store`, an opaque digest of the database and schema
   that answered, equal for two callers reaching the same store and different
-  otherwise, so a reader surveying several projects asks each store once.
+  otherwise, so a reader surveying several projects asks each store once; it is
+  null when the connection's role may not read the cluster's identifier, which
+  proves nothing either way.
 
   A schema is an identifier, not a value, so it is validated as one: anything but
   letters, digits and underscore is refused rather than quoted.
@@ -3725,27 +3727,26 @@ def _page(opts: dict, total: int) -> tuple[int, int, dict]:
                          "to": offset + shown if shown else None}
 
 
-def _store_identity(cur, entry) -> str:
-    """Which store answered, as an opaque digest a reader compares for equality.
+def _store_identity(cur) -> str | None:
+    """Which store answered, as an opaque digest a reader compares for equality,
+    or None when this connection cannot prove it.
 
     It is asked of the database rather than built from the connection, so two
     callers reaching one database by different hostnames still agree: the
     cluster's system identifier, which initdb fixes once, then the database and
     the schema within it. A role the server does not let read that identifier
-    falls back to the address the server itself reports. Only the digest leaves
-    this function, and nothing the connection marks secret is ever fed to it."""
+    gets None, because nothing else every role can read names the cluster the
+    same way for every caller, and a value that differed between two callers of
+    one store would read as two stores. Only the digest leaves this function,
+    and nothing the connection marks secret is ever fed to it."""
     import hashlib
     cur.execute("select has_function_privilege('pg_control_system()', 'execute') as ok")
-    if cur.fetchone()["ok"]:
-        cur.execute("select system_identifier::text as cluster from pg_control_system()")
-    else:
-        cur.execute("""select coalesce(host(inet_server_addr()), %s) || ':'
-                              || coalesce(inet_server_port()::text, %s) as cluster""",
-                    (_conf(entry, "db_host") or "", _conf(entry, "db_port", "5432")))
-    cluster = cur.fetchone()["cluster"]
-    cur.execute("select current_database() as db")
-    database = cur.fetchone()["db"]
-    material = "\x1f".join(("postgresql", cluster, database, SCHEMA))
+    if not cur.fetchone()["ok"]:
+        return None
+    cur.execute("select system_identifier::text as cluster, current_database() as db "
+                "from pg_control_system()")
+    row = cur.fetchone()
+    material = "\x1f".join(("postgresql", row["cluster"], row["db"], SCHEMA))
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
@@ -3866,7 +3867,7 @@ def cmd_list(entry, args: list[str]) -> None:
     opts = _flags(args, _LIST_FLAGS, multi=("tag",), bools=_SCAN_BOOLS)
     where, params = _where(opts, _zone(entry))
     with _connect(entry) as conn, conn.cursor() as cur:
-        store = _store_identity(cur, entry)
+        store = _store_identity(cur)
         cur.execute(f"select count(*) as n from {SCHEMA}.tasks{where}", params)
         total = cur.fetchone()["n"]
         per, offset, pagination = _page(opts, total)
@@ -3938,7 +3939,7 @@ def cmd_search(entry, args: list[str]) -> None:
                                   or description ilike %s or unique_key ilike %s
                                   or assignee ilike %s or metadata::text ilike %s)"""
     with _connect(entry) as conn, conn.cursor() as cur:
-        store = _store_identity(cur, entry)
+        store = _store_identity(cur)
         cur.execute(f"""select {'*' if opts.get('full') else _LEAN} from {SCHEMA}.tasks{where}
                          order by created_at asc""", params + [q] * 6)
         _emit({"store": store, "query": opts["_loose"][0],

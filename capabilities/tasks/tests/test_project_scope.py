@@ -223,6 +223,50 @@ def test_the_queue_a_worker_consumes_takes_no_all_projects(monkeypatch, capsys):
     assert _error(capsys)["message"] == "unknown flag --all-projects"
 
 
+class ControlCursor:
+    """The reads the store identity makes, answered from memory: whether this
+    role may read the cluster's identifier, and the identifier when it may."""
+
+    def __init__(self, readable: bool) -> None:
+        self.readable = readable
+        self.asked: list[str] = []
+        self.answer: dict | None = None
+
+    def execute(self, sql, params=None):
+        self.asked.append(sql)
+        if "has_function_privilege" in sql:
+            self.answer = {"ok": self.readable}
+        elif "pg_control_system()" in sql:
+            assert self.readable, "read the identifier without the right to"
+            self.answer = {"cluster": "7000000000000000001", "db": "a_database"}
+        else:
+            raise AssertionError(f"unexpected query: {sql}")
+
+    def fetchone(self):
+        return self.answer
+
+
+def test_a_store_it_cannot_prove_is_named_as_no_store(monkeypatch):
+    """Without the cluster's identifier there is nothing every caller of one store
+    reads the same way, so the answer is an explicit absence rather than a value
+    that would differ between two callers of the same store."""
+    monkeypatch.setattr(mod, "SCHEMA", "tasks")
+    unprovable = ControlCursor(readable=False)
+    assert mod._store_identity(unprovable) is None
+    assert len(unprovable.asked) == 1
+    proven = ControlCursor(readable=True)
+    first = mod._store_identity(proven)
+    assert first == mod._store_identity(ControlCursor(readable=True))
+    assert len(first) == 16 and int(first, 16) >= 0
+    monkeypatch.setattr(mod, "SCHEMA", "tasks_elsewhere")
+    assert mod._store_identity(ControlCursor(readable=True)) != first
+
+
+def test_the_help_says_the_store_can_be_absent():
+    store = mod.__doc__.split("\nSTORE\n")[1].split("\nI/O\n")[0]
+    assert "null when" in store
+
+
 def test_all_projects_drops_the_project_clause_and_nothing_else(monkeypatch):
     monkeypatch.setattr(mod, "PROJECT", None)
     where, params = mod._where({"all-projects": True})
