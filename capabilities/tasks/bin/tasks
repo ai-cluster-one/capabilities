@@ -15,13 +15,18 @@ happened.
 
 READING
   tasks list [filters]            a scan: identity, state, and how much activity
-                                  each task has. Soonest pickup first
+                                  each task has. Soonest pickup first, or most
+                                  recently moved first with `--sort updated`
   tasks ready [filters]           the queue a worker consumes: every field and
                                   the whole trail, for what may be picked up now
   tasks show <task>               one task, every field, whole activity trail
   tasks search <text> [filters]   the same scan, narrowed by substring over
                                   title, objective, description, unique key,
-                                  assignee and the metadata JSON
+                                  assignee and the metadata JSON. Earliest
+                                  created first, or `--sort updated`
+  tasks counts [filters]          how many tasks hold each status, every status
+                                  named and zero included, plus the total, for
+                                  the filters `list` takes. Answers no rows
   tasks runs <task>               every raise of it: what held it, how long,
                                   and what came of each
   tasks history <task> [--field F]   how its status, pickup, type and assignee
@@ -188,6 +193,11 @@ WORKERS
   <worker> --apply` on whatever schedule it keeps, and a worker nothing runs
   never runs.
 
+ARGUMENTS
+  A lone `--` ends the flags: everything after it is positional text as written,
+  so `tasks search -- --literal` searches for `--literal` and `tasks activity
+  <task> -- "--dry-run was skipped"` records that sentence.
+
 ADDRESSING
   <task> is a uuid or the task's unique_key. Both are exact; nothing is guessed.
   A uuid names its task wherever it is. A key is unique within a project, so it
@@ -335,11 +345,12 @@ WORKER SCOPE
   `claim` and `release` stand outside the scope: a runner sets the variable for
   the worker it starts, never for itself.
 
-FILTERS  (list, ready, search)
+FILTERS  (list, ready, search, counts)
   --project ID          exact match. Unsaid, the project the command runs in;
                         outside a project it has to be given. No write accepts it
-  --all-projects        every project in the store, for `list` and `search`
-                        only. Works outside a project; refused beside --project
+  --all-projects        every project in the store, for `list`, `search` and
+                        `counts` only. Works outside a project; refused beside
+                        --project
   --type VALUE          exact match
   --status VALUE        exact match, one of those above
   --assignee TEXT       exact match
@@ -358,12 +369,23 @@ FILTERS  (list, ready, search)
   `--pickup-after 2026-09-03` includes that whole day. Filters only narrow: give
   two and both must hold.
 
-PAGING  (list, ready)
-  --per-page N          rows in this answer; 50 when unsaid (--limit is a synonym)
+ORDER  (list, search)
+  --sort updated        most recently moved first: updated_at, newest first,
+                        applied before the page is cut, so page 1 holds the
+                        most recently moved tasks of everything matching.
+                        `updated` is the one accepted value. Unsaid, `list`
+                        answers soonest pickup first and `search` earliest
+                        created first
+
+PAGING  (list, ready, search)
+  --per-page N          rows in this answer, a whole number of 1 or more
+                        (--limit is a synonym). Unsaid, 50 on `list` and
+                        `ready`, and on `search` every match in one page
   --page N              which page, from 1
-  Every list answer carries `pagination`: current_page, last_page, per_page,
-  total, from, to. `total` counts everything matching the question, not the rows
-  returned, so a truncated answer is visible rather than something to suspect.
+  Every list, ready and search answer carries `pagination`: current_page,
+  last_page, per_page, total, from, to. `total` counts everything matching the
+  question, not the rows returned, so a truncated answer is visible rather than
+  something to suspect.
 
 COLLECTIONS
   A scan and a read want different answers, so they give different ones.
@@ -3594,12 +3616,18 @@ def _flags(args: list[str], names: tuple, multi: tuple = (), bools: tuple = (), 
     declares how many it takes. Anything past that is refused rather than
     dropped: an unquoted value with a space in it arrives as two tokens, and
     swallowing the second loses half of what the caller wrote while reporting
-    success."""
+    success.
+
+    A lone `--` ends the flags: every token after it is positional as written,
+    so a text that begins with dashes can still be given."""
     out: dict = {}
     loose: list[str] = []
     i = 0
     while i < len(args):
         a = args[i]
+        if a == "--":
+            loose.extend(args[i + 1:])
+            break
         if a.startswith("--"):
             key, _, inline = a[2:].partition("=")
             if key == "activities" and not inline:
@@ -3716,8 +3744,26 @@ def _task_row(cur, tid: str) -> dict:
     return _rows(cur)[0]
 
 
-def _page(opts: dict, total: int) -> tuple[int, int, dict]:
-    per = int(opts.get("per-page") or opts.get("limit") or 50)
+def _per_page(opts: dict) -> int | None:
+    """The page size a caller asked for, or None when it asked for none. A size
+    is a whole number of 1 or more; anything else is refused in one line rather
+    than reaching the arithmetic below it."""
+    for flag in ("per-page", "limit"):
+        if flag in opts:
+            raw = opts[flag]
+            try:
+                size = int(raw)
+            except (TypeError, ValueError):
+                size = 0
+            if size < 1:
+                _die(6, "input", f"--{flag} takes a whole number of 1 or more, not {raw!r}",
+                     "--per-page 50 answers fifty rows a page")
+            return size
+    return None
+
+
+def _page(opts: dict, total: int, default: int = 50) -> tuple[int, int, dict]:
+    per = _per_page(opts) or default
     page = max(1, int(opts.get("page") or 1))
     last = max(1, -(-total // per)) if total else 1
     offset = (page - 1) * per
@@ -3769,6 +3815,25 @@ _LIST_BOOLS = ("pickup-set", "pickup-unset", "full")
 # `ready` is the queue one project's worker consumes, so the whole store is a
 # question only the two scans answer.
 _SCAN_BOOLS = _LIST_BOOLS + ("all-projects",)
+# The order a scan may be asked for. Each verb keeps its own order unsaid.
+_SORTS = {"updated": "updated_at desc, id desc"}
+_SCAN_FLAGS = _LIST_FLAGS + ("sort",)
+# What `counts` narrows by: the filters `list` takes, and nothing that shapes rows.
+_COUNT_FLAGS = ("project", "type", "status", "tag", "assignee") + tuple(_DATE_FILTERS)
+_COUNT_BOOLS = ("pickup-set", "pickup-unset", "all-projects")
+
+
+def _order(opts: dict, unsaid: str) -> str:
+    """The order a scan answers in: the one `--sort` names, or the verb's own.
+    Applied in the query, before the page is cut, so the first page holds the
+    first rows of everything that matched and not of one page of it."""
+    wanted = opts.get("sort")
+    if wanted is None:
+        return unsaid
+    if wanted not in _SORTS:
+        _die(6, "input", f"unknown sort {wanted!r}",
+             f"accepted: {', '.join(sorted(_SORTS))}")
+    return _SORTS[wanted]
 
 
 def _where(opts: dict, tz=None) -> tuple[str, list]:
@@ -3864,7 +3929,9 @@ def _waiting_on(tasks: list[dict]) -> dict:
 def cmd_list(entry, args: list[str]) -> None:
     """A scan, plus who is waited on. `waiting_on` reads the answer's own rows,
     so a page that carries no waiting task carries an empty one."""
-    opts = _flags(args, _LIST_FLAGS, multi=("tag",), bools=_SCAN_BOOLS)
+    opts = _flags(args, _SCAN_FLAGS, multi=("tag",), bools=_SCAN_BOOLS)
+    order = _order(opts, "pickup_at asc nulls last, created_at asc")
+    _per_page(opts)
     where, params = _where(opts, _zone(entry))
     with _connect(entry) as conn, conn.cursor() as cur:
         store = _store_identity(cur)
@@ -3872,7 +3939,7 @@ def cmd_list(entry, args: list[str]) -> None:
         total = cur.fetchone()["n"]
         per, offset, pagination = _page(opts, total)
         cur.execute(f"""select {'*' if opts.get('full') else _LEAN} from {SCHEMA}.tasks{where}
-                         order by pickup_at asc nulls last, created_at asc
+                         order by {order}
                          limit %s offset %s""", params + [per, offset])
         tasks = _attach_activities(cur, _rows(cur), opts, embed=False)
         _emit({"store": store, "pagination": pagination, "tasks": tasks,
@@ -3889,6 +3956,7 @@ def cmd_ready(entry, args: list[str]) -> None:
     trail - because it is the queue a worker consumes to act, and it is short by
     construction. `list` and `search` are scans and stay lean."""
     opts = _flags(args, _LIST_FLAGS, multi=("tag",), bools=_LIST_BOOLS)
+    _per_page(opts)
     where, params = _where(opts, _zone(entry))
     joiner = " and " if where else " where "
     where = where + joiner + "status in ('todo','in_progress') and (pickup_at is null or pickup_at <= now())"
@@ -3928,22 +3996,54 @@ def cmd_show(entry, args: list[str]) -> None:
 
 def cmd_search(entry, args: list[str]) -> None:
     """Substring across every text a person writes, plus the metadata JSON. The
-    same filters `list` takes narrow it, so a query can be scoped to one type."""
-    opts = _flags(args, _LIST_FLAGS, multi=("tag",), bools=_SCAN_BOOLS, takes=1)
+    same filters `list` takes narrow it, so a query can be scoped to one type.
+
+    It pages the way `list` does and carries the same `pagination`, so a cut
+    answer is visible as one. Asked for no page size, the one page holds every
+    match: a search is as large as the text asked for, and a size nobody chose
+    would cut answers that are whole."""
+    opts = _flags(args, _SCAN_FLAGS, multi=("tag",), bools=_SCAN_BOOLS, takes=1)
     if not opts["_loose"]:
         _die(6, "input", "search needs a query", f"{NAME} search <text> [filters]")
+    order = _order(opts, "created_at asc")
+    _per_page(opts)
     q = f"%{opts['_loose'][0]}%"
     where, params = _where(opts, _zone(entry))
     joiner = " and " if where else " where "
     where = where + joiner + """(title ilike %s or objective ilike %s
                                   or description ilike %s or unique_key ilike %s
                                   or assignee ilike %s or metadata::text ilike %s)"""
+    params = params + [q] * 6
     with _connect(entry) as conn, conn.cursor() as cur:
         store = _store_identity(cur)
+        cur.execute(f"select count(*) as n from {SCHEMA}.tasks{where}", params)
+        total = cur.fetchone()["n"]
+        per, offset, pagination = _page(opts, total, default=max(total, 1))
         cur.execute(f"""select {'*' if opts.get('full') else _LEAN} from {SCHEMA}.tasks{where}
-                         order by created_at asc""", params + [q] * 6)
-        _emit({"store": store, "query": opts["_loose"][0],
+                         order by {order}
+                         limit %s offset %s""", params + [per, offset])
+        _emit({"store": store, "query": opts["_loose"][0], "pagination": pagination,
                "tasks": _attach_activities(cur, _rows(cur), opts, embed=False)})
+
+
+def cmd_counts(entry, args: list[str]) -> None:
+    """How many tasks hold each status under the filters `list` takes, and how
+    many in all, without a row. One query: every status is counted in the same
+    pass, so the numbers can never come from two different moments."""
+    opts = _flags(args, _COUNT_FLAGS, multi=("tag",), bools=_COUNT_BOOLS)
+    if "activities" in opts:
+        # The flag parser reads `--activities` for every verb; an answer with no
+        # rows has no trail to embed, so here it is refused like any unknown flag.
+        _die(6, "input", "unknown flag --activities",
+             f"accepted: {', '.join('--' + n for n in sorted(_COUNT_FLAGS + _COUNT_BOOLS))}")
+    where, params = _where(opts, _zone(entry))
+    tallies = ", ".join(f"count(*) filter (where status = '{s}') as \"{s}\""
+                        for s in STATUSES)
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"select {tallies}, count(*) as total from {SCHEMA}.tasks{where}",
+                    params)
+        row = cur.fetchone()
+    _emit({"counts": {s: row[s] for s in STATUSES}, "total": row["total"]})
 
 
 # --- Writing -----------------------------------------------------------------
@@ -5798,6 +5898,10 @@ def main() -> None:
     cleaned = []
     i = 0
     while i < len(argv):
+        if argv[i] == "--":
+            # Past the end of the flags nothing is a flag, this one included.
+            cleaned.extend(argv[i:])
+            break
         if argv[i] == "--connection" and i + 1 < len(argv):
             wanted = argv[i + 1]; i += 2; continue
         if argv[i].startswith("--connection="):
@@ -5818,6 +5922,7 @@ def main() -> None:
         _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), verb)
     handlers = {
         "list": cmd_list, "ready": cmd_ready, "show": cmd_show, "search": cmd_search,
+        "counts": cmd_counts,
         "add": cmd_add, "set": cmd_set, "meta": cmd_meta, "activity": cmd_activity,
         "claim": cmd_claim, "release": cmd_release, "run": cmd_run,
         "runs": cmd_runs, "history": cmd_history, "migrate": cmd_migrate,

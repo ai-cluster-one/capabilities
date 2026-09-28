@@ -183,7 +183,7 @@ def test_every_scan_takes_one(verb):
 
 def test_the_help_states_the_rule_and_files_the_filter_with_the_others():
     assert "Reads cross the project boundary and writes never do." in mod.__doc__
-    filters = mod.__doc__.split("FILTERS  (list, ready, search)")[1]
+    filters = mod.__doc__.split("FILTERS  (list, ready, search, counts)")[1]
     assert "--project ID" in filters.split("PAGING")[0]
     assert "--all-projects" in filters.split("PAGING")[0]
 
