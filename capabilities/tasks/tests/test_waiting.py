@@ -97,9 +97,9 @@ def test_every_other_status_needs_no_name():
 # --- What ends a wait --------------------------------------------------------
 
 def waits(**fields) -> dict:
-    return {"id": "t-1", "unique_key": "k-1", "status": "waiting",
-            "assignee": "the owner", "metadata": {}, "pickup_at": None,
-            "due": False, **fields}
+    return {"id": "t-1", "unique_key": "k-1", "project_id": HERE,
+            "status": "waiting", "assignee": "the owner", "metadata": {},
+            "pickup_at": None, "due": False, **fields}
 
 
 def test_a_moment_that_has_passed_ends_it():
@@ -171,15 +171,16 @@ def test_no_other_landing_settles_anything():
 
 def test_a_spent_blocked_by_is_dropped():
     task = waits(metadata={"blocked_by": ["k-9", "k-8"]})
-    cur = Ended([{"id": "t-9", "unique_key": "k-9"}, {"id": "t-8", "unique_key": "k-8"}])
+    cur = Ended([{"id": "t-9", "unique_key": "k-9", "project_id": HERE},
+                 {"id": "t-8", "unique_key": "k-8", "project_id": HERE}])
     assert mod._settle_the_wait(cur, "waiting", task, True) == (
         ["metadata = metadata - 'blocked_by'"], ["k-9", "k-8"])
-    assert cur.asked_for == (["k-8", "k-9"], ["k-8", "k-9"])
+    assert cur.asked_for == (["k-8", "k-9"], ["k-8", "k-9"], HERE)
 
 
 def test_a_blocked_by_with_one_task_still_open_is_kept():
     task = waits(metadata={"blocked_by": ["k-9", "k-8"]})
-    half = Ended([{"id": "t-9", "unique_key": "k-9"}])
+    half = Ended([{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
     assert mod._settle_the_wait(half, "waiting", task, True) == ([], [])
     # And a name matching no task has not ended here either, exactly as in the
     # sweep: an unknown blocker holds the wait rather than clearing it away.
@@ -245,11 +246,11 @@ def test_the_sweep_returns_a_wait_that_is_over():
 
 def test_the_sweep_returns_a_task_whose_blockers_have_ended():
     cur = SweepCursor([waits(metadata={"blocked_by": ["k-9", "k-8"]})],
-                      ended=[{"id": "t-9", "unique_key": "k-9"},
-                             {"id": "t-8", "unique_key": "k-8"}])
+                      ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE},
+                             {"id": "t-8", "unique_key": "k-8", "project_id": HERE}])
     [returned] = mod._sweep_waiting(cur, HERE)
     assert returned["status"] == "todo"
-    assert cur.asked_for == (["k-8", "k-9"], ["k-8", "k-9"])
+    assert cur.asked_for == (["k-8", "k-9"], ["k-8", "k-9"], HERE)
     assert cur.activities[0][1].endswith("every task it was waiting on has ended.")
 
 
@@ -341,7 +342,7 @@ class SetCursor:
 
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
-        if "where id::text = %s or unique_key" in text:
+        if "where id::text = %s or (unique_key" in text:
             self.answer = [{"id": self.task["id"], "project_id": HERE}]
         elif "status in ('complete','closed')" in text:
             self.answer = [dict(r) for r in self.ended]
@@ -410,8 +411,9 @@ def setting(monkeypatch):
 
 
 def held(**fields) -> dict:
-    return {"id": "t-1", "unique_key": "k-1", "status": "todo", "assignee": None,
-            "type": "probe", "metadata": {}, "pickup_at": None, **fields}
+    return {"id": "t-1", "unique_key": "k-1", "project_id": HERE, "status": "todo",
+            "assignee": None, "type": "probe", "metadata": {}, "pickup_at": None,
+            **fields}
 
 
 THEN = "2026-09-18T09:00:00+00:00"
@@ -439,7 +441,7 @@ def test_set_keeps_a_moment_appointed_in_the_same_call(setting, capsys):
 def test_set_drops_a_spent_blocked_by_and_says_so(setting, capsys):
     cur = setting(held(metadata={"blocked_by": ["k-9"], "cost_total": "1.5"}),
                   ["--status", "waiting", "--assignee", "the owner"],
-                  ended=[{"id": "t-9", "unique_key": "k-9"}])
+                  ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
     answer = _answer(capsys)
     assert answer["blocked_by_spent"] == ["k-9"]
     # That key and nothing else: the rest of the metadata is not this verb's.
@@ -458,7 +460,7 @@ def test_set_keeps_a_blocked_by_still_naming_an_open_task(setting, capsys):
 def test_set_settles_nothing_on_a_landing_that_is_not_a_wait(setting, capsys):
     cur = setting(held(pickup_at=THEN, metadata={"blocked_by": ["k-9"]}),
                   ["--assignee", "the owner"],
-                  ended=[{"id": "t-9", "unique_key": "k-9"}])
+                  ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
     answer = _answer(capsys)
     assert answer["task"]["pickup_at"] == THEN
     assert answer["task"]["metadata"] == {"blocked_by": ["k-9"]}
@@ -466,7 +468,7 @@ def test_set_settles_nothing_on_a_landing_that_is_not_a_wait(setting, capsys):
 
 
 def test_a_handback_lands_the_task_with_its_assignee(releasing, capsys):
-    cur = releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+    cur = releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
                      "pickup_at": None, "type": "defect"}, ["--outcome", "handback"])
     answer = _answer(capsys)
     assert mod._OUTCOMES["handback"] == "waiting"
@@ -477,7 +479,7 @@ def test_a_handback_lands_the_task_with_its_assignee(releasing, capsys):
 
 def test_a_handback_on_a_task_naming_nobody_lands_in_draft(releasing, capsys):
     for nobody in (None, "  "):
-        cur = releasing({"id": "t-1", "status": "in_progress", "assignee": nobody,
+        cur = releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": nobody,
                          "pickup_at": None, "type": "defect"}, ["--outcome", "handback"])
         answer = _answer(capsys)
         assert answer["task"]["status"] == "draft"
@@ -487,12 +489,12 @@ def test_a_handback_on_a_task_naming_nobody_lands_in_draft(releasing, capsys):
 
 
 def test_status_still_overrides_the_landing(releasing, capsys):
-    releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
                "pickup_at": None, "type": "defect"},
               ["--outcome", "handback", "--status", "todo"])
     assert _answer(capsys)["task"]["status"] == "todo"
     # And an override naming `waiting` answers to the same rule as the outcome.
-    releasing({"id": "t-1", "status": "in_progress", "assignee": None,
+    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": None,
                "pickup_at": None, "type": "defect"},
               ["--outcome", "ok", "--status", "waiting"])
     landed = _answer(capsys)
@@ -500,7 +502,7 @@ def test_status_still_overrides_the_landing(releasing, capsys):
 
 
 def test_a_handback_drops_a_hold_from_before_the_wait(releasing, capsys):
-    cur = releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+    cur = releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
                      "pickup_at": THEN, "type": "defect", "metadata": {}},
                     ["--outcome", "handback"])
     answer = _answer(capsys)
@@ -510,13 +512,13 @@ def test_a_handback_drops_a_hold_from_before_the_wait(releasing, capsys):
 
 
 def test_a_handback_drops_a_spent_blocked_by_and_keeps_a_live_one(releasing, capsys):
-    releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
                "pickup_at": None, "type": "defect", "metadata": {"blocked_by": ["k-9"]}},
-              ["--outcome", "handback"], ended=[{"id": "t-9", "unique_key": "k-9"}])
+              ["--outcome", "handback"], ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
     spent = _answer(capsys)
     assert spent["blocked_by_spent"] == ["k-9"] and spent["task"]["metadata"] == {}
 
-    releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
                "pickup_at": None, "type": "defect", "metadata": {"blocked_by": ["k-9"]}},
               ["--outcome", "handback"])
     kept = _answer(capsys)
@@ -526,16 +528,16 @@ def test_a_handback_drops_a_spent_blocked_by_and_keeps_a_live_one(releasing, cap
 
 def test_a_landing_that_is_not_a_wait_keeps_the_hold(releasing, capsys):
     # Completed, the task is over and nothing about it is a wait.
-    releasing({"id": "t-1", "status": "in_progress", "assignee": "the owner",
+    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
                "pickup_at": THEN, "type": "defect", "metadata": {"blocked_by": ["k-9"]}},
-              ["--outcome", "ok"], ended=[{"id": "t-9", "unique_key": "k-9"}])
+              ["--outcome", "ok"], ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
     done = _answer(capsys)
     assert done["task"]["pickup_at"] == THEN
     assert done["task"]["metadata"] == {"blocked_by": ["k-9"]}
 
     # And a handback the store could hand to nobody lands in `draft`, which is
     # backlog carrying a hold rather than a wait beginning.
-    releasing({"id": "t-1", "status": "in_progress", "assignee": None,
+    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": None,
                "pickup_at": THEN, "type": "defect", "metadata": {}},
               ["--outcome", "handback"])
     drafted = _answer(capsys)

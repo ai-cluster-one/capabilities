@@ -190,6 +190,9 @@ WORKERS
 
 ADDRESSING
   <task> is a uuid or the task's unique_key. Both are exact; nothing is guessed.
+  A uuid names its task wherever it is. A key is unique within a project, so it
+  names a task only in the project the command runs in, and outside a project a
+  key names nothing.
 
 FIELDS  (add and set take the same set)
   --type TEXT           which pipeline this task belongs to. Free text, and the
@@ -241,9 +244,11 @@ FIELDS  (add and set take the same set)
                         Empty means no appointed moment, not permission: what
                         grants permission is `status`.
   --key TEXT            stable identity of the material this task came from,
-                        unique across the store. `add --key` is idempotent: a key
-                        already present creates nothing, changes nothing, and
-                        reports {"exists": id}. That is what makes a seed re-runnable.
+                        unique within the project. `add --key` is idempotent: a
+                        key this project already holds creates nothing, changes
+                        nothing, and reports {"exists": id}. That is what makes a
+                        seed re-runnable. Another project holding the same key
+                        does not stop the add.
   --clear FIELD         empty a field outright; repeatable. Clearable: objective,
                         description, assignee, pickup, unique-key. Type, title and
                         status cannot be cleared. A field not passed is left alone,
@@ -288,17 +293,21 @@ PROJECT SCOPE
   a project that declared itself.
 
   `--project <id>` is a filter on `list`, `ready` and `search`, and unsaid it
-  means the project the command runs in. `show`, `runs` and `history` name one
-  task and answer about it whichever project it belongs to.
+  means the project the command runs in. `--all-projects` removes that filter
+  from `list` and `search`, so one call reads every project in the store; each
+  row still carries its `project_id`. `show`, `runs` and `history` name one task
+  and answer about it whichever project it belongs to when it is named by its
+  uuid; a key names a task only in the project the command runs in.
 
   No write takes that flag. `add`, `set`, `claim`, `release`, `run`, `tag`,
   `untag`, `meta` and `activity` take the project from `project.json`, and a
   write addressed to a task of another project is refused the way worker scope
   refuses one: exit 4, the policy code, and the rule named.
 
-  Outside a project there is nothing to take. A read has to name a project and a
-  write is refused with exit 6, because a task belonging to nobody is worse than
-  a task not written: nothing here ever stores an empty project.
+  Outside a project there is nothing to take. A read has to name a project, or
+  ask for all of them, and a write is refused with exit 6, because a task
+  belonging to nobody is worse than a task not written: nothing here ever stores
+  an empty project.
 
 WORKER SCOPE
   TASKS_EXECUTION does not only sign a write, it bounds one. With it set the
@@ -329,6 +338,8 @@ WORKER SCOPE
 FILTERS  (list, ready, search)
   --project ID          exact match. Unsaid, the project the command runs in;
                         outside a project it has to be given. No write accepts it
+  --all-projects        every project in the store, for `list` and `search`
+                        only. Works outside a project; refused beside --project
   --type VALUE          exact match
   --status VALUE        exact match, one of those above
   --assignee TEXT       exact match
@@ -406,6 +417,10 @@ STORE
   keeps them apart outright, for the case where one store must not see another
   at all. `doctor` reports which schema it looked in and refuses when either
   table is absent from it.
+
+  `list` and `search` carry `store`, an opaque digest of the database and schema
+  that answered, equal for two callers reaching the same store and different
+  otherwise, so a reader surveying several projects asks each store once.
 
   A schema is an identifier, not a value, so it is validated as one: anything but
   letters, digits and underscore is refused rather than quoted.
@@ -3643,22 +3658,46 @@ def _task_id(cur, ref: str, *, writing: bool = False) -> str:
     """A task is addressed by its uuid or by its unique key. Both are exact:
     guessing which task a person meant is not a service this offers.
 
+    A key is unique within a project and nowhere else, so it names a task only
+    in the project the command runs in, and outside a project it names nothing.
+    A uuid is unique in the store and names its task wherever it is.
+
     Every verb that addresses one task comes through here, which is why the
     project boundary is drawn here too: `writing` is the verb saying which side
     of it that verb stands on. A read answers about the task whichever project
     it belongs to; a write reaches only the project it runs in, and is refused
     the way worker scope refuses - the policy code, and the rule in one
-    sentence. The task is found either way, so the refusal can say whose it is
-    rather than pretending there is no such task."""
+    sentence. A task named by its uuid is found either way, so the refusal can
+    say whose it is rather than pretending there is no such task."""
+    if writing:
+        # A write outside a project is refused for that before anything is
+        # looked up, whichever way the task is named.
+        _writing_project()
     cur.execute(f"select id, project_id from {SCHEMA}.tasks "
-                f"where id::text = %s or unique_key = %s", (ref, ref))
+                f"where id::text = %s or (unique_key = %s and project_id = %s)",
+                (ref, ref, PROJECT))
     hit = cur.fetchall()
+    if not hit and not PROJECT and not _is_uuid(ref):
+        _die(6, "no_project",
+             f"this is not a project, so the key {ref!r} names no task",
+             "a unique key names a task only in its own project: address it by "
+             "its uuid, or run the command from that project")
     if not hit:
         _die(3, "not_found", f"no task for {ref!r}",
-             "address a task by its uuid or by its unique_key")
+             "address a task by its uuid, or by a unique_key of the project the "
+             "command runs in")
     if writing:
         _project_gate(ref, hit[0]["project_id"])
     return str(hit[0]["id"])
+
+
+def _is_uuid(ref: str) -> bool:
+    import uuid as _uuid
+    try:
+        _uuid.UUID(ref)
+    except ValueError:
+        return False
+    return True
 
 
 def _project_gate(ref: str, owner: str | None) -> None:
@@ -3686,6 +3725,30 @@ def _page(opts: dict, total: int) -> tuple[int, int, dict]:
                          "to": offset + shown if shown else None}
 
 
+def _store_identity(cur, entry) -> str:
+    """Which store answered, as an opaque digest a reader compares for equality.
+
+    It is asked of the database rather than built from the connection, so two
+    callers reaching one database by different hostnames still agree: the
+    cluster's system identifier, which initdb fixes once, then the database and
+    the schema within it. A role the server does not let read that identifier
+    falls back to the address the server itself reports. Only the digest leaves
+    this function, and nothing the connection marks secret is ever fed to it."""
+    import hashlib
+    cur.execute("select has_function_privilege('pg_control_system()', 'execute') as ok")
+    if cur.fetchone()["ok"]:
+        cur.execute("select system_identifier::text as cluster from pg_control_system()")
+    else:
+        cur.execute("""select coalesce(host(inet_server_addr()), %s) || ':'
+                              || coalesce(inet_server_port()::text, %s) as cluster""",
+                    (_conf(entry, "db_host") or "", _conf(entry, "db_port", "5432")))
+    cluster = cur.fetchone()["cluster"]
+    cur.execute("select current_database() as db")
+    database = cur.fetchone()["db"]
+    material = "\x1f".join(("postgresql", cluster, database, SCHEMA))
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
 # --- Reading -----------------------------------------------------------------
 
 _DATE_FILTERS = {
@@ -3702,6 +3765,9 @@ _LIST_FLAGS = (("project", "type", "status", "tag", "assignee", "per-page",
 _LEAN = ("id, project_id, type, unique_key, title, status, assignee, tags, "
          "pickup_at, created_at, updated_at")
 _LIST_BOOLS = ("pickup-set", "pickup-unset", "full")
+# `ready` is the queue one project's worker consumes, so the whole store is a
+# question only the two scans answer.
+_SCAN_BOOLS = _LIST_BOOLS + ("all-projects",)
 
 
 def _where(opts: dict, tz=None) -> tuple[str, list]:
@@ -3712,9 +3778,17 @@ def _where(opts: dict, tz=None) -> tuple[str, list]:
     The project is a filter like the others and is the one that is never absent:
     unsaid it is the project the command stands in. Every question the store is
     asked comes through here, so a question can never be asked of the whole
-    store by forgetting to narrow it."""
-    clauses = ["project_id = %s"]
-    params = [_reading_project(opts.get("project"))]
+    store by forgetting to narrow it: the whole store is answered only when
+    `--all-projects` asks for it, and never beside a project it would contradict."""
+    if opts.get("all-projects"):
+        if opts.get("project"):
+            _die(6, "input", "--all-projects and --project cannot be given together",
+                 "--project <id> reads one project; --all-projects reads every "
+                 "project in the store")
+        clauses, params = [], []
+    else:
+        clauses = ["project_id = %s"]
+        params = [_reading_project(opts.get("project"))]
     for flag, (column, op) in _DATE_FILTERS.items():
         if opts.get(flag):
             clauses.append(f"{column} {op} %s")
@@ -3789,9 +3863,10 @@ def _waiting_on(tasks: list[dict]) -> dict:
 def cmd_list(entry, args: list[str]) -> None:
     """A scan, plus who is waited on. `waiting_on` reads the answer's own rows,
     so a page that carries no waiting task carries an empty one."""
-    opts = _flags(args, _LIST_FLAGS, multi=("tag",), bools=_LIST_BOOLS)
+    opts = _flags(args, _LIST_FLAGS, multi=("tag",), bools=_SCAN_BOOLS)
     where, params = _where(opts, _zone(entry))
     with _connect(entry) as conn, conn.cursor() as cur:
+        store = _store_identity(cur, entry)
         cur.execute(f"select count(*) as n from {SCHEMA}.tasks{where}", params)
         total = cur.fetchone()["n"]
         per, offset, pagination = _page(opts, total)
@@ -3799,7 +3874,7 @@ def cmd_list(entry, args: list[str]) -> None:
                          order by pickup_at asc nulls last, created_at asc
                          limit %s offset %s""", params + [per, offset])
         tasks = _attach_activities(cur, _rows(cur), opts, embed=False)
-        _emit({"pagination": pagination, "tasks": tasks,
+        _emit({"store": store, "pagination": pagination, "tasks": tasks,
                "waiting_on": _waiting_on(tasks)})
 
 
@@ -3853,7 +3928,7 @@ def cmd_show(entry, args: list[str]) -> None:
 def cmd_search(entry, args: list[str]) -> None:
     """Substring across every text a person writes, plus the metadata JSON. The
     same filters `list` takes narrow it, so a query can be scoped to one type."""
-    opts = _flags(args, _LIST_FLAGS, multi=("tag",), bools=_LIST_BOOLS, takes=1)
+    opts = _flags(args, _LIST_FLAGS, multi=("tag",), bools=_SCAN_BOOLS, takes=1)
     if not opts["_loose"]:
         _die(6, "input", "search needs a query", f"{NAME} search <text> [filters]")
     q = f"%{opts['_loose'][0]}%"
@@ -3863,9 +3938,10 @@ def cmd_search(entry, args: list[str]) -> None:
                                   or description ilike %s or unique_key ilike %s
                                   or assignee ilike %s or metadata::text ilike %s)"""
     with _connect(entry) as conn, conn.cursor() as cur:
+        store = _store_identity(cur, entry)
         cur.execute(f"""select {'*' if opts.get('full') else _LEAN} from {SCHEMA}.tasks{where}
                          order by created_at asc""", params + [q] * 6)
-        _emit({"query": opts["_loose"][0],
+        _emit({"store": store, "query": opts["_loose"][0],
                "tasks": _attach_activities(cur, _rows(cur), opts, embed=False)})
 
 
@@ -3916,7 +3992,7 @@ def _spent_blockers(cur, task: dict) -> list[str]:
     named = _blocked_by(task)
     if not named:
         return []
-    ended = _ended_among(cur, sorted(set(named)))
+    ended = _ended_among(cur, sorted(set(named)), task["project_id"])
     return named if all(key in ended for key in named) else []
 
 
@@ -4087,8 +4163,10 @@ def _execution_lookup(cur):
 
 
 def cmd_add(entry, args: list[str]) -> None:
-    """Create one task. `--key` makes it re-runnable: a key already present
-    creates nothing, changes nothing, and reports the task that holds it."""
+    """Create one task. `--key` makes it re-runnable: a key this project already
+    holds creates nothing, changes nothing, and reports the task that holds it. A
+    key is unique within a project, so another project holding it is no reason
+    to refuse."""
     opts = _flags(args, _SCALARS + ("key", "actor"))
     if not opts.get("type") or not opts.get("title"):
         _die(6, "input", "add needs --type and --title",
@@ -4115,7 +4193,9 @@ def cmd_add(entry, args: list[str]) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         key = values.get("unique_key")
         if key:
-            cur.execute(f"select id from {SCHEMA}.tasks where unique_key = %s", (key,))
+            cur.execute(f"select id from {SCHEMA}.tasks "
+                        f"where unique_key = %s and project_id = %s",
+                        (key, values["project_id"]))
             found = cur.fetchall()
             if found:
                 _emit({"exists": str(found[0]["id"]), "unique_key": key})
@@ -4414,21 +4494,25 @@ def _blocked_by(task: dict) -> list[str]:
     return [str(k).strip() for k in named if str(k).strip()]
 
 
-def _ended_among(cur, names: list[str]) -> set:
+def _ended_among(cur, names: list[str], project: str) -> set:
     """Which of these names belong to a task that has already ended.
 
     A name is matched as a key and as an id, because a blocker is written either
     way, and a name matching no task is simply absent from the answer: wherever
-    this is read, an unknown name holds the wait rather than freeing it."""
+    this is read, an unknown name holds the wait rather than freeing it. A key
+    is matched within the waiting task's project, the one place it is unique."""
     if not names:
         return set()
-    cur.execute(f"""select id, unique_key from {SCHEMA}.tasks
+    cur.execute(f"""select id, unique_key, project_id from {SCHEMA}.tasks
                      where status in ('complete','closed')
-                       and (unique_key = any(%s) or id::text = any(%s))""",
-                (names, names))
+                       and (id::text = any(%s)
+                            or (unique_key = any(%s) and project_id = %s))""",
+                (names, names, project))
     ended: set = set()
     for row in _rows(cur):
-        ended.update(k for k in (str(row["id"]), row["unique_key"]) if k)
+        ended.add(str(row["id"]))
+        if row["unique_key"] and row["project_id"] == project:
+            ended.add(row["unique_key"])
     return ended
 
 
@@ -4471,7 +4555,7 @@ def _sweep_waiting(cur, project: str) -> list[dict]:
     if not waiting:
         return []
     ended = _ended_among(cur, sorted({key for task in waiting
-                                      for key in _blocked_by(task)}))
+                                      for key in _blocked_by(task)}), project)
     returned = []
     for task in waiting:
         why = _wait_over(task, ended)
@@ -5512,6 +5596,12 @@ _COLUMNS = (("task_executions", "metrics"), ("tasks", "created_by"),
 # behind rather than as current.
 _CONSTRAINTS = (("tasks", "tasks_status_check", "waiting"),)
 
+# A key is unique within its project. A store created while it was unique across
+# the store carries that constraint and lacks this index, and reads as behind
+# until both have changed, the way a store a column behind does.
+_KEY_INDEX = ("tasks", "tasks_project_unique_key_idx")
+_STORE_WIDE_KEY = "tasks_unique_key_key"
+
 
 def _bundle_dir() -> Path:
     executable = Path(__file__).resolve()
@@ -5571,6 +5661,25 @@ def _constraints_behind(cur, schema: str, tables: list[str]) -> list[str]:
             and f"'{value}'" not in (defined.get((table, name)) or "")]
 
 
+def _key_scope_behind(cur, schema: str, tables: list[str]) -> list[str]:
+    """The per-project key index, as table.index, when the store still keys
+    tasks across the whole store or does not yet key them per project."""
+    table, index = _KEY_INDEX
+    if table not in tables:
+        return []
+    cur.execute("""select 1 from pg_indexes
+                    where schemaname = %s and tablename = %s and indexname = %s""",
+                (schema, table, index))
+    has_index = cur.fetchone() is not None
+    cur.execute("""select 1 from pg_constraint c
+                     join pg_class t on t.oid = c.conrelid
+                     join pg_namespace n on n.oid = t.relnamespace
+                    where n.nspname = %s and t.relname = %s and c.conname = %s""",
+                (schema, table, _STORE_WIDE_KEY))
+    store_wide = cur.fetchone() is not None
+    return [] if has_index and not store_wide else [f"{table}.{index}"]
+
+
 def cmd_migrate(entry, args: list[str]) -> None:
     """Create what this connection's schema is missing, and nothing else.
 
@@ -5597,7 +5706,8 @@ def cmd_migrate(entry, args: list[str]) -> None:
         before = _tables_present(cur, schema)
         missing = [t for t in _TABLES if t not in before]
         lacking = (_columns_absent(cur, schema, before)
-                   + _constraints_behind(cur, schema, before))
+                   + _constraints_behind(cur, schema, before)
+                   + _key_scope_behind(cur, schema, before))
         if not opts.get("apply"):
             _emit({"schema": schema, "project": project, "present": before,
                    "would_create": missing, "would_add": lacking, "applied": False})
@@ -5620,7 +5730,8 @@ def cmd_migrate(entry, args: list[str]) -> None:
         after = _tables_present(cur, schema)
         still = ([t for t in _TABLES if t not in after]
                  + _columns_absent(cur, schema, after)
-                 + _constraints_behind(cur, schema, after))
+                 + _constraints_behind(cur, schema, after)
+                 + _key_scope_behind(cur, schema, after))
     if still:
         _die(5, "schema_incomplete",
              f"schema {schema} is still missing {', '.join(still)} after applying",
@@ -5672,7 +5783,7 @@ def _guarded(handler, entry, rest) -> None:
              f"statuses are: {', '.join(STATUSES)}")
     except psycopg.errors.UniqueViolation as exc:
         _die(6, "conflict", f"that value is already taken: {exc.diag.message_detail or exc}",
-             "unique_key identifies exactly one task")
+             "a unique_key identifies exactly one task within its project")
     except psycopg.Error as exc:
         _die(5, "store_error", f"{type(exc).__name__}: {str(exc).strip()}",
              f"`{NAME} doctor` proves the store is reachable and the schema is present")

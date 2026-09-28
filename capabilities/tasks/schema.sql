@@ -10,7 +10,7 @@ create table if not exists tasks.tasks (
   id           uuid primary key default gen_random_uuid(),
   project_id   text        not null,
   type         text        not null,
-  unique_key   text        unique,
+  unique_key   text,
   title        text        not null,
   objective    text,
   description  text,
@@ -28,7 +28,8 @@ create table if not exists tasks.tasks (
 comment on column tasks.tasks.type is
   'Which pipeline this task belongs to. Extended by decision, not in passing.';
 comment on column tasks.tasks.unique_key is
-  'Idempotency handle computed by whoever seeds the row. Nullable: many nulls coexist.';
+  'Idempotency handle computed by whoever seeds the row, unique within its '
+  'project. Nullable: many nulls coexist.';
 comment on column tasks.tasks.objective is
   'Why the task exists and what counts as done. Does not go stale while the task lives.';
 comment on column tasks.tasks.description is
@@ -92,6 +93,16 @@ comment on column tasks.tasks.project_id is
 alter table tasks.tasks drop constraint if exists tasks_status_check;
 alter table tasks.tasks add constraint tasks_status_check
   check (status in ('draft','todo','in_progress','waiting','complete','closed'));
+
+-- A key is unique within its project, so several projects sharing one store each
+-- own their keys. The index is created before the store-wide constraint a store
+-- created earlier carries is dropped, so no moment exists where a key is not
+-- unique at all; every key unique across the store is already unique within its
+-- project, so the index rejects no row a live store holds. Nulls are distinct,
+-- so many unkeyed tasks still coexist.
+create unique index if not exists tasks_project_unique_key_idx
+  on tasks.tasks (project_id, unique_key);
+alter table tasks.tasks drop constraint if exists tasks_unique_key_key;
 
 create index if not exists tasks_project_idx        on tasks.tasks (project_id);
 create index if not exists tasks_status_pickup_idx on tasks.tasks (status, pickup_at);

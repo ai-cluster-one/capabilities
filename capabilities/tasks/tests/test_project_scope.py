@@ -185,6 +185,50 @@ def test_the_help_states_the_rule_and_files_the_filter_with_the_others():
     assert "Reads cross the project boundary and writes never do." in mod.__doc__
     filters = mod.__doc__.split("FILTERS  (list, ready, search)")[1]
     assert "--project ID" in filters.split("PAGING")[0]
+    assert "--all-projects" in filters.split("PAGING")[0]
+
+
+def test_the_help_says_what_the_store_identity_is_for():
+    store = mod.__doc__.split("\nSTORE\n")[1].split("\nI/O\n")[0]
+    assert "`store`" in store and "asks each store once" in store
+
+
+def test_the_help_says_a_key_is_unique_within_a_project():
+    assert "unique within the project" in mod.__doc__
+    assert "unique across the store" not in mod.__doc__
+    addressing = mod.__doc__.split("ADDRESSING")[1].split("FIELDS")[0]
+    assert "A key is unique within a project" in addressing
+
+
+@pytest.mark.parametrize("verb", ("list", "search"))
+def test_all_projects_is_refused_beside_a_project_naming_both(verb, monkeypatch,
+                                                              capsys):
+    monkeypatch.setattr(mod, "PROJECT", HERE)
+    monkeypatch.setattr(mod, "_connect", lambda entry: pytest.fail(
+        f"{verb} reached the store with a contradiction in its filters"))
+    handler = {"list": mod.cmd_list, "search": mod.cmd_search}[verb]
+    args = ["--all-projects", "--project", THERE] + (["q"] if verb == "search" else [])
+    with pytest.raises(SystemExit) as exit_info:
+        handler({"timezone": "UTC"}, args)
+    assert exit_info.value.code == 6
+    message = _error(capsys)["message"]
+    assert "--all-projects" in message and "--project" in message
+
+
+def test_the_queue_a_worker_consumes_takes_no_all_projects(monkeypatch, capsys):
+    monkeypatch.setattr(mod, "PROJECT", HERE)
+    with pytest.raises(SystemExit) as exit_info:
+        mod.cmd_ready({"timezone": "UTC"}, ["--all-projects"])
+    assert exit_info.value.code == 6
+    assert _error(capsys)["message"] == "unknown flag --all-projects"
+
+
+def test_all_projects_drops_the_project_clause_and_nothing_else(monkeypatch):
+    monkeypatch.setattr(mod, "PROJECT", None)
+    where, params = mod._where({"all-projects": True})
+    assert where == "" and params == []
+    where, params = mod._where({"all-projects": True, "status": "todo"})
+    assert "project_id" not in where and params == ["todo"]
 
 
 # --- The migration -----------------------------------------------------------
@@ -279,6 +323,14 @@ def seed(monkeypatch, entry, capsys, project: str, key: str, **fields) -> None:
     monkeypatch.setattr(mod, "PROJECT", HERE)
 
 
+def task_uuid(conn, schema: str, project: str, key: str) -> str:
+    """A task's uuid, which names it wherever it is; a key names it only in its
+    own project."""
+    row = conn.execute(f"select id from {schema}.tasks where project_id = %s "
+                       f"and unique_key = %s", (project, key)).fetchone()
+    return str(row[0])
+
+
 @pytest.fixture
 def two_projects(store, monkeypatch, capsys):
     entry, schema, conn = store
@@ -290,10 +342,10 @@ def two_projects(store, monkeypatch, capsys):
 
 @needs_store
 def test_a_task_is_created_in_the_project_that_created_it(two_projects, capsys):
-    entry, _schema, _conn = two_projects
+    entry, schema, conn = two_projects
     mod.cmd_show(entry, ["h-1"])
     assert _answer(capsys)["task"]["project_id"] == HERE
-    mod.cmd_show(entry, ["t-1"])
+    mod.cmd_show(entry, [task_uuid(conn, schema, THERE, "t-1")])
     assert _answer(capsys)["task"]["project_id"] == THERE
 
 
@@ -331,48 +383,203 @@ def test_a_scan_that_names_a_project_crosses_to_it(two_projects, capsys):
 
 
 @needs_store
-def test_naming_one_task_answers_about_it_whichever_project_it_is_in(
-        two_projects, capsys):
+def test_all_projects_reads_the_whole_store_from_inside_a_project(two_projects,
+                                                                  capsys):
     entry, _schema, _conn = two_projects
-    mod.cmd_show(entry, ["t-1"])
+    mod.cmd_list(entry, ["--all-projects"])
+    listed = _answer(capsys)
+    assert sorted((t["unique_key"], t["project_id"]) for t in listed["tasks"]) == [
+        ("h-1", HERE), ("h-2", HERE), ("t-1", THERE)]
+    assert listed["pagination"]["total"] == 3
+    mod.cmd_list(entry, ["--all-projects", "--full"])
+    assert all(t["project_id"] for t in _answer(capsys)["tasks"])
+    mod.cmd_search(entry, ["-1", "--all-projects"])
+    searched = _answer(capsys)
+    assert sorted((t["unique_key"], t["project_id"]) for t in searched["tasks"]) == [
+        ("h-1", HERE), ("t-1", THERE)]
+    # The other filters still narrow it.
+    mod.cmd_list(entry, ["--all-projects", "--status", "todo"])
+    assert sorted(t["unique_key"] for t in _answer(capsys)["tasks"]) == ["h-1", "t-1"]
+    # And without it, the scan still answers for where it stands.
+    mod.cmd_list(entry, [])
+    assert {t["project_id"] for t in _answer(capsys)["tasks"]} == {HERE}
+
+
+@needs_store
+def test_all_projects_is_a_read_that_works_outside_a_project(two_projects, capsys,
+                                                             monkeypatch):
+    entry, _schema, _conn = two_projects
+    monkeypatch.setattr(mod, "PROJECT", None)
+    mod.cmd_list(entry, ["--all-projects"])
+    assert len(_answer(capsys)["tasks"]) == 3
+    mod.cmd_search(entry, ["t-", "--all-projects"])
+    assert [t["unique_key"] for t in _answer(capsys)["tasks"]] == ["t-1"]
+    error = _refused(capsys, mod.cmd_list, entry, ["--all-projects", "--project", HERE])
+    assert error["exit"] == 6
+    assert "--all-projects" in error["message"] and "--project" in error["message"]
+
+
+@needs_store
+def test_the_store_is_named_the_same_for_the_same_store_and_not_for_another(
+        store, capsys, monkeypatch):
+    import psycopg
+    entry, schema, conn = store
+    mod.cmd_list(entry, [])
+    first = _answer(capsys)["store"]
+    mod.cmd_search(entry, ["anything", "--all-projects"])
+    assert _answer(capsys)["store"] == first
+    # Another caller, standing elsewhere, reaching the same schema.
+    monkeypatch.setattr(mod, "PROJECT", THERE)
+    mod.cmd_list(entry, ["--all-projects"])
+    assert _answer(capsys)["store"] == first
+    # Another schema in the same database is another store.
+    other = schema + "_other"
+    conn.execute(mod._schema_ddl(other))
+    try:
+        monkeypatch.setattr(mod, "SCHEMA", other)
+        mod.cmd_list({**entry, "db_schema": other}, ["--all-projects"])
+        second = _answer(capsys)["store"]
+    finally:
+        conn.execute(f"drop schema {other} cascade")
+    assert second != first
+    # Nothing secret is in it: it is a digest, and the password is not.
+    password = os.environ.get("TASKS_TEST_PASSWORD") or ""
+    for identity in (first, second):
+        assert len(identity) == 16 and int(identity, 16) >= 0
+        assert not password or password not in identity
+
+
+@needs_store
+def test_naming_one_task_by_uuid_answers_about_it_whichever_project_it_is_in(
+        two_projects, capsys):
+    entry, schema, conn = two_projects
+    theirs = task_uuid(conn, schema, THERE, "t-1")
+    mod.cmd_show(entry, [theirs])
     assert _answer(capsys)["task"]["unique_key"] == "t-1"
-    mod.cmd_runs(entry, ["t-1"])
+    mod.cmd_runs(entry, [theirs])
     assert _answer(capsys)["attempts"] == 0
-    mod.cmd_history(entry, ["t-1"])
+    mod.cmd_history(entry, [theirs])
     assert _answer(capsys)["changes"] == []
 
 
 @needs_store
+def test_a_key_never_reaches_another_projects_task(two_projects, capsys,
+                                                   monkeypatch):
+    """A key is unique within its project, so it names a task only there: from
+    here, their key is no task at all, for a read and for a write alike."""
+    entry, schema, conn = two_projects
+    for call, args in ((mod.cmd_show, ["t-1"]), (mod.cmd_runs, ["t-1"]),
+                       (mod.cmd_history, ["t-1"]), (mod.cmd_meta, ["show", "t-1"]),
+                       (mod.cmd_set, ["t-1", "--title", "mine now"]),
+                       (mod.cmd_activity, ["t-1", "reached across"]),
+                       (mod.cmd_claim, ["--key", "t-1"])):
+        error = _refused(capsys, call, entry, args)
+        assert error["exit"] == 3 and error["code"] == "not_found", call
+    # Nothing moved on their task.
+    mod.cmd_show(entry, [task_uuid(conn, schema, THERE, "t-1")])
+    other = _answer(capsys)
+    assert other["task"]["title"] == "t-1" and other["task"]["status"] == "todo"
+    assert other["activities"] == []
+    # Standing in their project, the same key is theirs.
+    monkeypatch.setattr(mod, "PROJECT", THERE)
+    mod.cmd_show(entry, ["t-1"])
+    assert _answer(capsys)["task"]["project_id"] == THERE
+
+
+@needs_store
+def test_two_projects_each_own_the_same_key(two_projects, capsys, monkeypatch):
+    entry, schema, conn = two_projects
+    # Their project already holds t-1; here it is free.
+    mod.cmd_add(entry, ["--type", "probe", "--title", "ours", "--key", "t-1"])
+    created = _answer(capsys)
+    assert "created" in created
+    ours = created["created"]
+    assert ours != task_uuid(conn, schema, THERE, "t-1")
+    # Each project's key names its own task.
+    mod.cmd_show(entry, ["t-1"])
+    assert _answer(capsys)["task"]["title"] == "ours"
+    monkeypatch.setattr(mod, "PROJECT", THERE)
+    mod.cmd_show(entry, ["t-1"])
+    assert _answer(capsys)["task"]["title"] == "t-1"
+    # Idempotent within a project: a second add creates nothing on either side.
+    for project, holder in ((HERE, ours), (THERE, task_uuid(conn, schema, THERE, "t-1"))):
+        monkeypatch.setattr(mod, "PROJECT", project)
+        mod.cmd_add(entry, ["--type", "probe", "--title", "again", "--key", "t-1"])
+        assert _answer(capsys) == {"exists": holder, "unique_key": "t-1"}
+    count = conn.execute(f"select count(*) from {schema}.tasks "
+                         f"where unique_key = 't-1'").fetchone()[0]
+    assert count == 2
+    # The store itself refuses a second holder inside one project.
+    monkeypatch.setattr(mod, "PROJECT", HERE)
+    error = _refused(capsys, mod._guarded, mod.cmd_set, entry,
+                     ["h-1", "--unique-key", "t-1"])
+    assert error["exit"] == 6 and error["code"] == "conflict"
+
+
+@needs_store
+def test_a_wait_is_freed_only_by_its_own_projects_key(two_projects, capsys,
+                                                      monkeypatch):
+    """A blocker named by key is read in the waiting task's project. Another
+    project's task of the same key ending frees nothing here."""
+    entry, schema, conn = two_projects
+    monkeypatch.setattr(mod, "PROJECT", THERE)
+    mod.cmd_add(entry, ["--type", "probe", "--title", "theirs", "--key", "gate",
+                        "--status", "complete"])
+    capsys.readouterr()
+    monkeypatch.setattr(mod, "PROJECT", HERE)
+    mod.cmd_add(entry, ["--type", "probe", "--title", "ours", "--key", "gate",
+                        "--status", "todo"])
+    capsys.readouterr()
+    mod.cmd_meta(entry, ["set", "h-2", "blocked_by", '["gate"]'])
+    mod.cmd_set(entry, ["h-2", "--status", "waiting", "--assignee", "someone"])
+    capsys.readouterr()
+    from psycopg.rows import dict_row
+    with conn.cursor(row_factory=dict_row) as cur:
+        assert mod._ended_among(cur, ["gate"], HERE) == set()
+    mod.cmd_claim(entry, ["--worker", "a worker"])
+    assert _answer(capsys)["returned"] == []
+    mod.cmd_show(entry, ["h-2"])
+    assert _answer(capsys)["task"]["status"] == "waiting"
+    # Our own gate ending is what frees it.
+    mod.cmd_set(entry, ["gate", "--status", "complete"])
+    capsys.readouterr()
+    mod.cmd_claim(entry, ["--worker", "a worker"])
+    assert _answer(capsys)["returned"] == ["h-2"]
+
+
+@needs_store
 def test_no_write_reaches_another_projects_task(two_projects, capsys):
-    entry, _schema, _conn = two_projects
-    for call, args in ((mod.cmd_set, [["t-1", "--title", "mine now"]]),
-                       (mod.cmd_set, [["t-1", "--clear", "objective"]]),
-                       (mod.cmd_tag, [["t-1", "mine"]]),
-                       (mod.cmd_meta, [["set", "t-1", "mine", "1"]]),
-                       (mod.cmd_meta, [["rm", "t-1", "mine"]]),
-                       (mod.cmd_activity, [["t-1", "reached across"]])):
+    entry, schema, conn = two_projects
+    theirs = task_uuid(conn, schema, THERE, "t-1")
+    for call, args in ((mod.cmd_set, [[theirs, "--title", "mine now"]]),
+                       (mod.cmd_set, [[theirs, "--clear", "objective"]]),
+                       (mod.cmd_tag, [[theirs, "mine"]]),
+                       (mod.cmd_meta, [["set", theirs, "mine", "1"]]),
+                       (mod.cmd_meta, [["rm", theirs, "mine"]]),
+                       (mod.cmd_activity, [[theirs, "reached across"]])):
         error = _refused(capsys, call, entry, *args)
         assert error["exit"] == 4 and error["code"] == "policy"
         assert THERE in error["message"] and HERE in error["message"]
-    error = _refused(capsys, mod.cmd_tag, entry, ["t-1", "mine"], True)
+    error = _refused(capsys, mod.cmd_tag, entry, [theirs, "mine"], True)
     assert error["exit"] == 4
     # The refusals wrote nothing.
-    mod.cmd_show(entry, ["t-1"])
+    mod.cmd_show(entry, [theirs])
     other = _answer(capsys)
     assert other["task"]["title"] == "t-1" and other["task"]["tags"] == []
     assert other["task"]["metadata"] == {} and other["activities"] == []
     # Reading the other project's metadata is still a read.
-    mod.cmd_meta(entry, ["show", "t-1"])
+    mod.cmd_meta(entry, ["show", theirs])
     assert _answer(capsys)["metadata"] == {}
 
 
 @needs_store
 def test_a_claim_cannot_take_another_projects_task(two_projects, capsys):
-    entry, _schema, _conn = two_projects
-    error = _refused(capsys, mod.cmd_claim, entry, ["--key", "t-1"])
+    entry, schema, conn = two_projects
+    theirs = task_uuid(conn, schema, THERE, "t-1")
+    error = _refused(capsys, mod.cmd_claim, entry, ["--key", theirs])
     assert error["exit"] == 4 and error["code"] == "policy"
     assert THERE in error["message"]
-    mod.cmd_show(entry, ["t-1"])
+    mod.cmd_show(entry, [theirs])
     assert _answer(capsys)["task"]["status"] == "todo"  # untouched
 
 
@@ -398,7 +605,7 @@ def test_a_release_cannot_close_another_projects_raise(two_projects, capsys,
     error = _refused(capsys, mod.cmd_release, entry, [execution, "--outcome", "ok"])
     assert error["exit"] == 4 and error["code"] == "policy"
     assert THERE in error["message"]
-    mod.cmd_show(entry, ["t-1"])
+    mod.cmd_show(entry, [task_uuid(_conn, _schema, THERE, "t-1")])
     assert _answer(capsys)["task"]["status"] == "in_progress"  # still held
 
 
@@ -425,9 +632,9 @@ def test_a_claim_sweeps_nothing_of_another_projects(two_projects, capsys,
     answer = _answer(capsys)
     assert answer["task"]["unique_key"] == "h-1"
     assert answer["swept"] == [] and answer["returned"] == []
-    mod.cmd_show(entry, ["t-1"])
+    mod.cmd_show(entry, [task_uuid(conn, schema, THERE, "t-1")])
     assert _answer(capsys)["task"]["status"] == "in_progress"
-    mod.cmd_show(entry, ["t-2"])
+    mod.cmd_show(entry, [task_uuid(conn, schema, THERE, "t-2")])
     assert _answer(capsys)["task"]["status"] == "waiting"
 
     # Their own claim sweeps both, so what was proven is the boundary and not
@@ -448,9 +655,13 @@ def test_outside_a_project_a_read_names_one_and_a_write_is_refused(
     assert error["exit"] == 6 and error["code"] == "no_project"
     mod.cmd_list(entry, ["--project", HERE])
     assert sorted(t["unique_key"] for t in _answer(capsys)["tasks"]) == ["h-1", "h-2"]
-    # Naming one task needs no project at all.
-    mod.cmd_show(entry, ["h-1"])
+    # Naming one task by its uuid needs no project at all.
+    mod.cmd_show(entry, [task_uuid(_conn, _schema, HERE, "h-1")])
     assert _answer(capsys)["task"]["unique_key"] == "h-1"
+    # A key is unique only within a project, so outside one it names nothing.
+    error = _refused(capsys, mod.cmd_show, entry, ["h-1"])
+    assert error["exit"] == 6 and error["code"] == "no_project"
+    assert "uuid" in error["hint"]
 
     for call, args in ((mod.cmd_add, ["--type", "probe", "--title", "orphan"]),
                        (mod.cmd_set, ["h-1", "--title", "renamed"]),
@@ -477,7 +688,10 @@ def test_the_migration_fills_a_store_that_predates_the_column(
     the id that project declares, and only then is the column tightened."""
     from psycopg.rows import dict_row
     entry, schema, conn = two_projects
+    # A store from before the column also keyed its tasks across the whole store.
     conn.execute(f"alter table {schema}.tasks drop column project_id")
+    conn.execute(f"alter table {schema}.tasks add constraint tasks_unique_key_key "
+                 f"unique (unique_key)")
 
     with conn.cursor(row_factory=dict_row) as cur:
         tables = mod._tables_present(cur, schema)
@@ -485,7 +699,8 @@ def test_the_migration_fills_a_store_that_predates_the_column(
 
     mod.cmd_migrate(entry, [])
     reported = _answer(capsys)
-    assert reported["would_add"] == ["tasks.project_id"]
+    assert reported["would_add"] == ["tasks.project_id",
+                                     "tasks.tasks_project_unique_key_idx"]
     assert reported["project"] == HERE and reported["applied"] is False
 
     # What each task's moment was before the column arrived. Filling a column is
@@ -498,7 +713,9 @@ def test_the_migration_fills_a_store_that_predates_the_column(
 
     mod.cmd_migrate(entry, ["--apply"])
     applied = _answer(capsys)
-    assert applied["added"] == ["tasks.project_id"] and applied["applied"] is True
+    assert applied["added"] == ["tasks.project_id",
+                                "tasks.tasks_project_unique_key_idx"]
+    assert applied["applied"] is True
 
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(f"select project_id, count(*) as n from {schema}.tasks "
@@ -528,6 +745,20 @@ def test_the_migration_fills_a_store_that_predates_the_column(
         cur.execute(f"select count(*) as n from {schema}.tasks "
                     f"where project_id = %s", (HERE,))
         assert cur.fetchone()["n"] == 3
+
+    # The migrated store keys per project: the store-wide constraint is gone, and
+    # another project may now hold a key this one already holds.
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""select count(*) as n from pg_constraint c
+                         join pg_namespace n on n.oid = c.connamespace
+                        where n.nspname = %s and c.conname = 'tasks_unique_key_key'""",
+                    (schema,))
+        assert cur.fetchone()["n"] == 0
+    seed(monkeypatch, entry, capsys, THERE, "h-1")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(f"select project_id from {schema}.tasks where unique_key = 'h-1' "
+                    f"order by project_id")
+        assert [r["project_id"] for r in cur.fetchall()] == [HERE, THERE]
 
 
 if __name__ == "__main__":
