@@ -376,10 +376,16 @@ ORDER  (list, search)
   --sort pickup         soonest pickup first: pickup_at, earliest first, and
                         tasks with no pickup last
 
+  --order asc|desc      turn the sort either way: its key in that direction, and
+                        ties by id in the same direction, so one direction is
+                        the exact mirror of the other - except that tasks with
+                        no pickup stay last both ways. Needs --sort
+
   A sort is applied before the page is cut, so page 1 holds the first rows of
-  everything matching, and ties go to the higher id first. Those four are the
-  accepted values. Unsaid, `list` answers soonest pickup first and `search`
-  earliest created first.
+  everything matching. Without --order each sort runs the way it is listed and
+  ties go to the higher id first. Those four are the accepted sorts, and asc
+  and desc the accepted orders. Unsaid, `list` answers soonest pickup first and
+  `search` earliest created first.
 
 PAGING  (list, ready, search)
   --per-page N          rows in this answer, a whole number of 1 or more
@@ -3829,7 +3835,13 @@ _SORTS = {"touched": "last_touched_at desc, id desc",
           "updated": "updated_at desc, id desc",
           "created": "created_at desc, id desc",
           "pickup": "pickup_at asc nulls last, id desc"}
-_SCAN_FLAGS = _LIST_FLAGS + ("sort",)
+# Each sort's key, for `--order` to turn either way. Unsaid, a sort answers as
+# `_SORTS` states it; said, the key and its tie-break go the same way, so one
+# direction is the exact mirror of the other.
+_SORT_KEYS = {"touched": "last_touched_at", "updated": "updated_at",
+              "created": "created_at", "pickup": "pickup_at"}
+_DIRECTIONS = ("asc", "desc")
+_SCAN_FLAGS = _LIST_FLAGS + ("sort", "order")
 # What `counts` narrows by: the filters `list` takes, and nothing that shapes rows.
 _COUNT_FLAGS = ("project", "type", "status", "tag", "assignee") + tuple(_DATE_FILTERS)
 _COUNT_BOOLS = ("pickup-set", "pickup-unset", "all-projects")
@@ -3851,16 +3863,30 @@ def _scan_columns(opts: dict) -> str:
 
 
 def _order(opts: dict, unsaid: str) -> str:
-    """The order a scan answers in: the one `--sort` names, or the verb's own.
-    Applied in the query, before the page is cut, so the first page holds the
-    first rows of everything that matched and not of one page of it."""
-    wanted = opts.get("sort")
+    """The order a scan answers in: the one `--sort` names, turned the way
+    `--order` says, or the verb's own. Applied in the query, before the page is
+    cut, so the first page holds the first rows of everything that matched and
+    not of one page of it.
+
+    A task with no pickup has no place on that axis in either direction, so it
+    stays last whichever way the pickups run."""
+    wanted, direction = opts.get("sort"), opts.get("order")
+    if direction is not None and wanted is None:
+        _die(6, "input", "--order needs a --sort to turn; accepted: --sort "
+             f"{'|'.join(sorted(_SORTS))} with --order {'|'.join(_DIRECTIONS)}",
+             "--sort touched --order asc")
     if wanted is None:
         return unsaid
     if wanted not in _SORTS:
         _die(6, "input", f"unknown sort {wanted!r}",
              f"accepted: {', '.join(sorted(_SORTS))}")
-    return _SORTS[wanted]
+    if direction is None:
+        return _SORTS[wanted]
+    if direction not in _DIRECTIONS:
+        _die(6, "input", f"unknown order {direction!r}; accepted: "
+             f"{', '.join(_DIRECTIONS)}", f"accepted: {', '.join(_DIRECTIONS)}")
+    nulls = " nulls last" if wanted == "pickup" else ""
+    return f"{_SORT_KEYS[wanted]} {direction}{nulls}, id {direction}"
 
 
 def _where(opts: dict, tz=None) -> tuple[str, list]:

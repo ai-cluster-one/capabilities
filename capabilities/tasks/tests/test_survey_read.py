@@ -552,5 +552,150 @@ def test_unsaid_the_order_and_the_trail_fields_are_what_they_were(four_orders, c
     assert all(t["last_touched_at"] for t in listed["tasks"])
 
 
+# --- Direction ---------------------------------------------------------------
+
+@pytest.mark.parametrize("verb", ("list", "search"))
+def test_order_without_a_sort_is_refused_naming_what_is_accepted(verb, no_store,
+                                                                 capsys):
+    handler, args = SIZED[verb]
+    error = _refused(capsys, handler, no_store, [*args, "--order", "asc"])
+    assert error["exit"] == 6 and error["code"] == "input"
+    assert "--sort" in error["message"] and "asc|desc" in error["message"]
+    assert len(error["_stderr"].strip().splitlines()) == 1
+
+
+@pytest.mark.parametrize("verb", ("list", "search"))
+@pytest.mark.parametrize("value", ("up", "ASC", "", "descending"))
+def test_an_unknown_order_is_refused_naming_what_is_accepted(verb, value, no_store,
+                                                             capsys):
+    handler, args = SIZED[verb]
+    error = _refused(capsys, handler, no_store,
+                     [*args, "--sort", "created", "--order", value])
+    assert error["exit"] == 6 and error["code"] == "input"
+    assert "asc, desc" in error["message"]
+    assert len(error["_stderr"].strip().splitlines()) == 1
+
+
+@pytest.mark.parametrize("call", (mod.cmd_ready, mod.cmd_counts))
+def test_only_the_two_scans_take_an_order(call, no_store, capsys):
+    error = _refused(capsys, call, no_store, ["--order", "asc"])
+    assert error["exit"] == 6 and error["message"] == "unknown flag --order"
+
+
+def test_without_an_order_every_sort_runs_as_it_did():
+    for value, order in mod._SORTS.items():
+        assert mod._order({"sort": value}, "unsaid") == order
+    assert mod._order({}, "unsaid") == "unsaid"
+
+
+def test_an_order_turns_the_key_and_its_tie_break_together():
+    assert mod._order({"sort": "touched", "order": "asc"}, "") == \
+        "last_touched_at asc, id asc"
+    assert mod._order({"sort": "created", "order": "desc"}, "") == \
+        "created_at desc, id desc"
+    for direction in ("asc", "desc"):
+        assert mod._order({"sort": "pickup", "order": direction}, "") == \
+            f"pickup_at {direction} nulls last, id {direction}"
+
+
+@needs_store
+@pytest.mark.parametrize("scope", ("project", "all"))
+@pytest.mark.parametrize("verb", ("list", "search"))
+def test_both_directions_of_every_sort_across_pages(four_orders, capsys, scope, verb):
+    entry, ids = four_orders
+    here = ["h-0", "h-1", "h-2", "h-3", "h-4"]
+    there = ["t-0", "t-1"] if scope == "all" else []
+    nulls = ["h-1", "h-4"] + there
+    newest_first = {
+        "touched": ["h-3", "h-1", "h-0", "h-2", "h-4"] + there,
+        "updated": here + there,
+        "created": there[::-1] + here[::-1],
+    }
+    expected = {}
+    for value, keys in newest_first.items():
+        expected[(value, "desc")] = keys
+        expected[(value, "asc")] = keys[::-1]
+    expected[("pickup", "asc")] = ["h-2", "h-3", "h-0"] + sorted(nulls, key=ids.get)
+    expected[("pickup", "desc")] = ["h-0", "h-3", "h-2"] + sorted(
+        nulls, key=ids.get, reverse=True)
+    call = {"list": mod.cmd_list, "search": mod.cmd_search}[verb]
+    lead = ["title"] if verb == "search" else []
+    narrow = ["--all-projects"] if scope == "all" else ["--project", HERE]
+    for (value, direction), keys in expected.items():
+        walked = _walk(call, entry, capsys,
+                       [*lead, *narrow, "--sort", value, "--order", direction], 2)
+        assert walked == keys, (value, direction)
+
+
+@pytest.fixture
+def ties(four_orders):
+    """The four orders, with a tie on every key: two tasks created at one
+    moment, moved at one moment, touched at one moment, and due at one moment."""
+    entry, ids = four_orders
+    import psycopg
+    schema = mod.SCHEMA
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
+        conn.execute(f"update {schema}.tasks set created_at = (select created_at from "
+                     f"{schema}.tasks where unique_key = 'h-2') where unique_key = 'h-1'")
+        conn.execute(f"update {schema}.tasks set updated_at = (select updated_at from "
+                     f"{schema}.tasks where unique_key = 'h-3') where unique_key = 'h-4'")
+        conn.execute(f"update {schema}.tasks set updated_at = '2026-03-24T00:00Z' "
+                     f"where unique_key = 'h-2'")
+        conn.execute(f"update {schema}.tasks set pickup_at = (select pickup_at from "
+                     f"{schema}.tasks where unique_key = 'h-2') where unique_key = 'h-3'")
+        conn.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
+    return entry, ids
+
+
+@needs_store
+@pytest.mark.parametrize("verb", ("list", "search"))
+def test_a_reversed_order_is_the_exact_mirror_ties_included(ties, capsys, verb):
+    entry, ids = ties
+    call = {"list": mod.cmd_list, "search": mod.cmd_search}[verb]
+    lead = ["title"] if verb == "search" else []
+    tied = {"created": ("h-1", "h-2"), "updated": ("h-3", "h-4"),
+            "touched": ("h-1", "h-2"), "pickup": ("h-2", "h-3")}
+    for value, pair in tied.items():
+        up = _walk(call, entry, capsys, [*lead, "--all-projects", "--sort", value,
+                                         "--order", "asc"], 3)
+        down = _walk(call, entry, capsys, [*lead, "--all-projects", "--sort", value,
+                                           "--order", "desc"], 3)
+        low, high = sorted(pair, key=ids.get)
+        assert up.index(low) + 1 == up.index(high), (value, up)
+        assert down.index(high) + 1 == down.index(low), (value, down)
+        if value == "pickup":
+            # No pickup has no place on the axis, so it is last both ways and
+            # only the two halves mirror.
+            dated = [k for k in up if k not in ("h-1", "h-4", "t-0", "t-1")]
+            assert up[:len(dated)] == dated and down[:len(dated)] == dated[::-1]
+            assert up[len(dated):] == down[len(dated):][::-1]
+        else:
+            assert up == down[::-1], value
+
+
+@needs_store
+def test_an_order_costs_no_more_questions(four_orders, capsys, statements):
+    entry, _ids = four_orders
+    counts = []
+    for per in ("1", "7"):
+        for call, lead in ((mod.cmd_list, []), (mod.cmd_search, ["title"])):
+            statements.clear()
+            call(entry, [*lead, "--all-projects", "--sort", "touched", "--order", "asc",
+                         "--per-page", per])
+            capsys.readouterr()
+            counts.append(len(statements))
+    statements.clear()
+    mod.cmd_list(entry, ["--all-projects", "--sort", "touched", "--per-page", "7"])
+    capsys.readouterr()
+    assert counts[:2] == counts[2:] and counts[0] == len(statements)
+
+
+def test_the_help_files_order_beside_sort():
+    order = mod.__doc__.split("ORDER  (list, search)")[1].split("PAGING")[0]
+    assert "--order asc|desc" in order and "Needs --sort" in order
+    assert "no pickup stay last both ways" in order
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
