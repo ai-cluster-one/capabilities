@@ -45,6 +45,13 @@ ENVIRONMENT
   CAPABILITIES_PROJECT_ID_ROOT
                        the project root that id answers for, scoping it the way
                        CAPABILITIES_PROJECT_ENVELOPE_ROOT scopes the envelope.
+  CAPABILITIES_READ_ONLY
+                       `1` or `true` (any case) puts the process and everything
+                       it starts under the read-only switch: every capability
+                       reads but changes nothing (write verbs, project-record
+                       writes and service activation exit 4), and this manager
+                       refuses enable, disable, inherit, init, relabel and set.
+                       doctor reports it. Unset, `0` or `false` leaves it off.
 
 PROJECT PATH VERB
   path --json [--identity]
@@ -580,6 +587,32 @@ def _store_module():
     spec.loader.exec_module(module)
     _STORE_MODULE = module
     return module
+
+
+# The verbs that write a project record — policy, configuration, the project's
+# identity and its wiring. Under the read-only switch the manager refuses them;
+# whether the switch is on is the store tier's answer, never the manager's own.
+READ_ONLY_REFUSED_VERBS = ("disable", "enable", "inherit", "init", "relabel", "set")
+
+
+def _read_only_gate(verb: str) -> None:
+    store = _store_module()
+    if store.read_only_switch():
+        _die(4, "read_only_switch",
+             f"`capabilities {verb}` is refused: {store.READ_ONLY_ENV} is set, "
+             "so this process changes no project record",
+             "Do not lift the switch yourself — ask the user; the change has to "
+             f"run in a process without {store.READ_ONLY_ENV}.")
+
+
+def _read_only_report() -> dict | None:
+    """What doctor says about the switch: nothing while it is off."""
+    store = _store_module()
+    if not store.read_only_switch():
+        return None
+    return {"variable": store.READ_ONLY_ENV, "on": True,
+            "effect": store.READ_ONLY_EFFECT,
+            "refused_here": list(READ_ONLY_REFUSED_VERBS)}
 
 
 def _records_for(root: Path, *, project_only: bool = False):
@@ -5758,6 +5791,9 @@ def cmd_doctor() -> None:
     report = {"ok": not findings, "findings": findings}
     if identity is not None:
         report["project_identity"] = identity
+    read_only = _read_only_report()
+    if read_only is not None:
+        report["read_only_switch"] = read_only
     if findings:
         _emit(report)
         sys.exit(7)
@@ -8495,6 +8531,8 @@ def main() -> None:
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
     cmd, rest = argv[0], argv[1:]
+    if cmd in READ_ONLY_REFUSED_VERBS:
+        _read_only_gate(cmd)
 
     def flag(name: str) -> bool:
         return name in rest

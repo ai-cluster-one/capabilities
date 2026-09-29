@@ -599,6 +599,47 @@ script = "capabilities/automations/scripts/job.py"
         self.assertEqual(listed["default"], "sonnet")
         self.assertIn("haiku", listed["workers"])
 
+    def _under_switch(self, value: str | None, *args: str) -> subprocess.CompletedProcess[str]:
+        env = dict(self.env)
+        env.pop("CAPABILITIES_READ_ONLY", None)
+        if value is not None:
+            env["CAPABILITIES_READ_ONLY"] = value
+        return subprocess.run([str(CLI), *args], cwd=self.root, env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_the_read_only_switch_refuses_what_changes_and_keeps_reads(self) -> None:
+        # A writing agent profile, so the refusal of a turn that may change the
+        # project is proven without ever starting an engine.
+        config = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config.write_text(config.read_text() + (
+            '\n[agents.workers.writer]\nengine = "claude"\nmodel = "sonnet"\n'
+            'mode = "act"\n'))
+        before = config.read_text()
+        for args in (("service", "start"), ("service", "run"), ("service", "reload"),
+                     ("service", "init", "--force"), ("run", "job"),
+                     ("cancel", "some-run"), ("retry", "some-run"),
+                     ("set", "job", "--enabled", "false"),
+                     ("agent", "--profile", "writer", "change it")):
+            with self.subTest(args=args):
+                proc = self._under_switch("1", *args)
+                self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+                error = json.loads(proc.stderr.strip().splitlines()[-1])["error"]
+                self.assertEqual(error["code"], "read_only_switch")
+                self.assertIn("CAPABILITIES_READ_ONLY", error["message"])
+        self.assertEqual(config.read_text(), before)
+        self.assertFalse(json.loads(self.cli("service", "status").stdout)["running"])
+        # Reads keep working, and the run store they open is operational state.
+        for args in (("list",), ("runs",), ("agents",), ("service", "status")):
+            with self.subTest(args=args):
+                proc = self._under_switch("true", *args)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_with_the_switch_off_a_manual_run_is_still_enqueued(self) -> None:
+        for value in (None, "0", "false"):
+            with self.subTest(value=value):
+                proc = self._under_switch(value, "run", "job")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
     def test_agent_rejects_unknown_profile(self) -> None:
         proc = self.cli("agent", "--profile", "absent", "hello", check=False)
         self.assertEqual(proc.returncode, 3)

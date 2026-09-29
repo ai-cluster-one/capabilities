@@ -666,6 +666,20 @@ def _require_project_enabled_for_service() -> Path:
     return root
 
 
+def _read_only_gate(action: str) -> None:
+    """Refuse `action` when this process runs under the read-only switch.
+
+    The switch is decided by the store tier's `read_only_switch`; this is the
+    one refusal every writer that consults it gives, so a caller branches on one
+    code, and that code is distinct from a connection's own read-only grant."""
+    if read_only_switch():
+        _die(4, "read_only_switch",
+             f"{action} is refused: {READ_ONLY_ENV} is set, so {NAME} may read "
+             "but change nothing in this process",
+             "Do not lift the switch yourself — ask the user; the change has to "
+             f"run in a process without {READ_ONLY_ENV}.")
+
+
 def _gate() -> None:
     """Project policy overrides global policy; absence inherits, and absence at
     both scopes is default deny. Safe local discovery verbs remain available so
@@ -673,11 +687,17 @@ def _gate() -> None:
 
     If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
     is stricter and runs first, before credentials or network calls.
+
+    Under the read-only switch a bundled service is neither set up nor started
+    nor handed a new declaration.
     """
     _auth_gate()
     verb = sys.argv[1] if len(sys.argv) > 1 else "help"
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
     service_contract = globals().get("SERVICE")
+    if isinstance(service_contract, dict) and verb == "service" \
+            and service_action in {"init", "start", "run", "reload"}:
+        _read_only_gate(f"`{NAME} service {service_action}`")
     if isinstance(service_contract, dict) and verb == "service" \
             and service_action in {"init", "start", "run"}:
         _require_project_enabled_for_service()
@@ -985,6 +1005,8 @@ def _cmd_ids(argv: list[str]) -> None:
             _die(3, "not_found", "unknown identifier label",
                  f"`{NAME} ids list` shows the labels")
         _emit((data[argv[1]] or {}).get("value")); return
+    if sub in ("set", "rm"):
+        _read_only_gate(f"`{NAME} ids {sub}`")
     if sub == "set":
         if len(argv) < 3:
             _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
@@ -1104,6 +1126,8 @@ def _cmd_context(argv: list[str]) -> None:
     if len(argv) < 2:
         _die(6, "input", f"usage: {NAME} context show|edit|put <key>")
     key = argv[1]
+    if sub in ("edit", "put"):
+        _read_only_gate(f"`{NAME} context {sub}`")
     if sub == "show":
         doc = adapter.document_read(NAME, key)
         if doc is None:
@@ -1202,6 +1226,26 @@ def _cmd_inventory(argv: list[str]) -> None:
     _emit(report)
 
 
+def _cmd_connections_read_only() -> None:
+    """The capability's own connections report, told that the read-only switch
+    is on. The report stays the capability's: it is taken whole, every
+    connection in it is marked read-only, and the switch is named beside it, so
+    a reader sees why no connection may write."""
+    import contextlib
+    import io
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        _cmd_connections()
+    report = json.loads(captured.getvalue())
+    for entry in (report.get("connections") or {}).values():
+        if isinstance(entry, dict):
+            entry["allow_write"] = False
+    report["read_only_switch"] = {
+        "variable": READ_ONLY_ENV, "on": True,
+        "effect": READ_ONLY_EFFECT}
+    _emit(report)
+
+
 def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
     parser. Runs after _gate(), before any credential is resolved.
@@ -1228,7 +1272,10 @@ def _contract(argv: list[str]) -> None:
     elif cmd == "context":
         _cmd_context(argv[1:])
     elif cmd == "connections":
-        _cmd_connections()
+        if read_only_switch():
+            _cmd_connections_read_only()
+        else:
+            _cmd_connections()
     elif cmd == "inventory":
         _cmd_inventory(argv[1:])
     elif cmd == "help" and len(argv) == 1:
@@ -1436,7 +1483,10 @@ def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict 
 
 
 def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
-    """Policy from the committed registry; nothing in the cascade lifts it."""
+    """Policy from the committed registry; nothing in the cascade lifts it.
+    The read-only switch closes it for every connection and names itself."""
+    if verb in WRITE_VERBS:
+        _read_only_gate(f"write verb {verb!r} on connection {conn_id!r}")
     if verb in WRITE_VERBS and not allow_write:
         _die(4, "read_only",
              f"connection {conn_id!r} does not allow writes",

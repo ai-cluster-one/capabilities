@@ -175,6 +175,38 @@ class StoreError(Exception):
         self.hint = hint
 
 
+# The process-wide read-only switch. A caller hands a whole process tree to
+# something that may read through the capabilities but change nothing through
+# them by setting this one variable, which every descendant inherits. It is
+# decided here and nowhere else, because this tier is the one every capability
+# carries and the one the manager and the bundled services import. It only ever
+# closes: nothing it says makes a connection writable, and unset, `0` or
+# `false` leave every record and every gate exactly as declared.
+READ_ONLY_ENV = "CAPABILITIES_READ_ONLY"
+READ_ONLY_EFFECT = ("every connection resolves read-only whatever its grant or "
+                    "WRITE_DEFAULT; write verbs, project-record writes and "
+                    "service activation exit 4")
+
+
+def read_only_switch() -> bool:
+    """True when this process runs under the read-only switch: the variable
+    holds `1` or `true`, in any case."""
+    return os.environ.get(READ_ONLY_ENV, "").strip().lower() in ("1", "true")
+
+
+def _refuse_record_write(capability: str, collection: str) -> None:
+    """A project record is the human's or the manager's, so under the switch
+    nothing writes one. Operational state (the `state` rows and a capability's
+    state directory) is not a record and keeps working."""
+    if read_only_switch():
+        raise StoreError(
+            "read_only_switch",
+            f"writing {capability} {collection} records is refused: "
+            f"{READ_ONLY_ENV} is set, so this process changes no project record",
+            "Do not lift the switch yourself — ask the user; the change has to "
+            f"run in a process without {READ_ONLY_ENV}.")
+
+
 def _now() -> str:
     return _store_datetime.now(_store_timezone.utc).isoformat(timespec="seconds")
 
@@ -643,6 +675,7 @@ class Store:
         _store_check("capability", capability, CAPABILITY_RE)
         _store_check("key", key, KEY_RE)
         self._semantics(collection)
+        _refuse_record_write(capability, collection)
         kind, pid = self._target(scope)
         with self.transaction():
             cur = self._execute(
@@ -672,6 +705,7 @@ class Store:
                       scope: tuple, actor: str | None = None) -> bool:
         _store_check("capability", capability, CAPABILITY_RE)
         self._semantics(collection)
+        _refuse_record_write(capability, collection)
         kind, pid = self._target(scope)
         with self.transaction():
             cur = self._execute(
@@ -723,6 +757,9 @@ class Store:
         made about it — the one read a capability needs before it acts."""
         identities = self.config_resolve(capability, "connection", scopes)
         layers = self.config_layers(capability, "grant", scopes)
+        # Under the read-only switch every connection is a source, whatever its
+        # grant or the capability's WRITE_DEFAULT says.
+        writable = not read_only_switch()
         out: dict[str, dict[str, Any]] = {}
         for cid, entry in identities.items():
             rows = [layer[cid] for layer in layers if cid in layer]
@@ -751,7 +788,7 @@ class Store:
                 "value": entry["value"],
                 "scope": (entry["scope"], entry["project_id"]),
                 "enabled": enabled,
-                "allow_write": bool(decided.get("allow_write", write_default)),
+                "allow_write": writable and bool(decided.get("allow_write", write_default)),
                 "grant_scope": (grant["scope"], grant["project_id"]) if grant else None,
             }
         return out
@@ -808,6 +845,7 @@ class Store:
         `context_activate` names the hash later."""
         _store_check("capability", capability, CAPABILITY_RE)
         _store_check("key", key, KEY_RE)
+        _refuse_record_write(capability, "document")
         kind, pid = self._target(scope)
         if not isinstance(body, str):
             raise StoreError("bad_context", "a context body must be text")
@@ -839,6 +877,7 @@ class Store:
         """Put one version in force — the deploy step. At most one version of one
         item is active in one scope, and the unique index is what says so rather
         than a convention the writers are trusted to keep."""
+        _refuse_record_write(capability, "document")
         kind, pid = self._target(scope)
         with self.transaction():
             self._activate(kind, pid, capability, key, digest, actor)
@@ -1575,6 +1614,7 @@ class FileRecords(Records):
         _store_check("capability", capability, CAPABILITY_RE)
         _store_check("key", key, KEY_RE)
         Store._semantics(collection)
+        _refuse_record_write(capability, collection)
         target_scope = scope or "project"
         if target_scope not in SCOPE_KINDS:
             raise StoreError("bad_scope",
@@ -1613,6 +1653,7 @@ class FileRecords(Records):
 
     def delete(self, capability: str, collection: str, key: str,
                scope: str | None = None) -> bool:
+        _refuse_record_write(capability, collection)
         target_scope = scope or "project"
         if target_scope not in SCOPE_KINDS:
             raise StoreError("bad_scope",
@@ -1692,6 +1733,7 @@ class FileRecords(Records):
     def document_put(self, capability: str, key: str, body: str,
                      author: str | None = None, media_type: str | None = None,
                      base: str | None = None) -> str:
+        _refuse_record_write(capability, "document")
         path = self._documents(self.envelope, capability).get(key)
         if path is None:
             path = self._new_document_path(capability, key)
