@@ -192,7 +192,9 @@ WORKERS
   The task and its trail are quoted as data: between two marker lines drawn for
   that prompt alone, after one line saying instructions come only from the
   frame and the instruction files. A trail entry another project wrote carries
-  `written_by_another_project` with that project's id.
+  `written_by_another_project` with that project's id. Outside the markers the
+  frame names the task only by its uuid, and its stage only when it is one this
+  worker declares here.
 
   A worker's cadence is not declared here. Something outside runs `tasks run
   <worker> --apply` on whatever schedule it keeps, and a worker nothing runs
@@ -3959,8 +3961,17 @@ def _task_id(cur, ref: str, *, writing: bool = False, answering: bool = False) -
         _die(3, "not_found", f"no task for {ref!r}",
              "address a task by its uuid, or by a unique_key of the project the "
              "command runs in")
-    if writing and not (answering and _assigned_here(hit[0])):
-        _project_gate(ref, hit[0]["project_id"], hit[0].get("assignee"))
+    if writing:
+        if answering and _assigned_here(hit[0]):
+            # An entry another project writes must say so. A store that cannot
+            # record whose it is would pass it off as the task's own.
+            if not _origin_kept(cur):
+                _die(6, "schema_behind",
+                     "this store does not record which project wrote an entry yet, "
+                     "so another project's entry would read as the task's own",
+                     f"run `{NAME} migrate --apply` against this store")
+        else:
+            _project_gate(ref, hit[0]["project_id"], hit[0].get("assignee"))
     return str(hit[0]["id"])
 
 
@@ -4199,7 +4210,8 @@ def _attach_activities(cur, tasks: list[dict], opts: dict, *, embed: bool) -> li
     # say that: rows[-0:] is the whole list, which is the opposite of the ask.
     embed = (embed if want is None else True) and depth != 0
     ids = [t["id"] for t in tasks]
-    cur.execute(f"""select id, task_id, description, actor, origin_project, created_at
+    cur.execute(f"""select id, task_id, description, actor, {_origin_column(cur)},
+                           created_at
                       from {SCHEMA}.task_activities where task_id = any(%s::uuid[])
                      order by created_at asc""", (ids,))
     trail: dict = {}
@@ -4286,7 +4298,7 @@ def cmd_show(entry, args: list[str]) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0])
         task = _task_row(cur, tid)
-        cur.execute(f"""select id, description, actor, origin_project, created_at
+        cur.execute(f"""select id, description, actor, {_origin_column(cur)}, created_at
                           from {SCHEMA}.task_activities where task_id = %s
                          order by created_at asc""", (tid,))
         trail = _rows(cur)
@@ -4769,9 +4781,45 @@ def cmd_meta(entry, args: list[str]) -> None:
         _emit({"task": tid, "metadata": meta})
 
 
+# Whether the store keeps `origin_project`, asked once per connection. A store
+# that has not been migrated since the column arrived still answers every read,
+# with no origin, and takes every write of its own project, recording none.
+_ORIGIN_KEPT = __import__("weakref").WeakKeyDictionary()
+
+
+def _origin_kept(cur) -> bool:
+    """Whether both trail tables carry `origin_project`, from one catalog query
+    per connection."""
+    holder = getattr(cur, "connection", None) or cur
+    try:
+        return _ORIGIN_KEPT[holder]
+    except (KeyError, TypeError):
+        pass
+    cur.execute("""select count(*) as n from information_schema.columns
+                    where table_schema = %s and column_name = 'origin_project'
+                      and table_name in ('task_activities', 'task_changes')""",
+                (SCHEMA,))
+    kept = _rows(cur)[0]["n"] == 2
+    try:
+        _ORIGIN_KEPT[holder] = kept
+    except TypeError:
+        pass
+    return kept
+
+
+def _origin_column(cur) -> str:
+    """The origin as a trail read selects it: the column, or null where the store
+    does not keep one yet, so every answer has the same shape either way."""
+    return "origin_project" if _origin_kept(cur) else "null::text as origin_project"
+
+
 def _add_activity(cur, tid: str, text: str, actor: str) -> dict:
     """One entry on the trail. Every caller writes it the same way, so what an
     entry is - a moment, a sentence and who recorded it - stays one fact."""
+    if not _origin_kept(cur):
+        cur.execute(f"""insert into {SCHEMA}.task_activities (task_id, description, actor)
+                        values (%s, %s, %s) returning id, created_at""", (tid, text, actor))
+        return {**_rows(cur)[0], "origin_project": None}
     cur.execute(f"""insert into {SCHEMA}.task_activities
                       (task_id, description, actor, origin_project)
                     values (%s, %s, %s, %s) returning id, created_at, origin_project""",
@@ -4849,6 +4897,12 @@ def _record_change(cur, tid: str, field: str, old, new,
     after = None if new is None else str(new)
     if before == after:
         return False
+    if not _origin_kept(cur):
+        cur.execute(f"""insert into {SCHEMA}.task_changes
+                          (task_id, field, old_value, new_value, execution_id, actor)
+                        values (%s, %s, %s, %s, %s, %s)""",
+                    (tid, field, before, after, execution_id, actor))
+        return True
     cur.execute(f"""insert into {SCHEMA}.task_changes
                       (task_id, field, old_value, new_value, execution_id, actor,
                        origin_project)
@@ -4996,11 +5050,15 @@ def _sweep_waiting(cur, project: str) -> list[dict]:
                          where id = %s returning *""", (tid,))
         after = _rows(cur)[0]
         _record_moves(cur, tid, task, after, actor=SWEEP_ACTOR, origin=project)
-        cur.execute(f"""insert into {SCHEMA}.task_activities
-                          (task_id, description, actor, origin_project)
-                        values (%s, %s, %s, %s)""",
-                    (tid, f"Returned to the queue from waiting: {why}.", SWEEP_ACTOR,
-                     project))
+        said = f"Returned to the queue from waiting: {why}."
+        if _origin_kept(cur):
+            cur.execute(f"""insert into {SCHEMA}.task_activities
+                              (task_id, description, actor, origin_project)
+                            values (%s, %s, %s, %s)""", (tid, said, SWEEP_ACTOR, project))
+        else:
+            cur.execute(f"""insert into {SCHEMA}.task_activities
+                              (task_id, description, actor)
+                            values (%s, %s, %s)""", (tid, said, SWEEP_ACTOR))
         returned.append(after)
     return returned
 
@@ -5104,7 +5162,7 @@ def _claim(entry, opts: dict) -> dict:
         after = _rows(cur)[0]
         _record_moves(cur, tid, before, after,
                       execution_id=str(execution["id"]), actor=opts.get("worker"))
-        cur.execute(f"""select id, description, actor, origin_project, created_at
+        cur.execute(f"""select id, description, actor, {_origin_column(cur)}, created_at
                           from {SCHEMA}.task_activities where task_id = %s
                          order by created_at asc""", (tid,))
         trail = _rows(cur)
@@ -5519,6 +5577,8 @@ _RESUMED = """This task was raised before and the previous turn did not finish. 
 
 _AT_STAGE = """This task is at stage `{stage}`. The entry that set it is on the trail below, and it is the state you start from."""
 
+_AT_UNDECLARED_STAGE = """This task carries a stage this worker does not declare. It is in the task's metadata in the quoted data below, the entry that set it is on the trail, and it is the state you start from."""
+
 _LOAD_ROUTINES = """LOAD THESE ROUTINES
 
 Load each of these from this project's `routines/` and follow it. Do not work from memory of them and do not ask for them. Each says when it applies; the first is the procedure for this work, and the rest apply at the moments they name."""
@@ -5583,7 +5643,12 @@ def _prompt(worker: dict, task: dict, trail: list, routines: list[str],
     The task and its trail are written by people and by agents of this project
     and of others, so they reach the turn as quoted data: between two marker
     lines, with one line of precedence before them. The markers carry a value
-    drawn for this prompt alone, so nothing quoted inside can close them."""
+    drawn for this prompt alone, so nothing quoted inside can close them.
+
+    Nothing the task carries is printed outside them. The frame names the task
+    by its uuid, which the store drew, and names a stage only when it is one
+    this worker declares in workers.toml - a value of the project's file rather
+    than of the task."""
     import secrets as _secrets
     task = dict(task)
     task.pop("activities", None)
@@ -5595,7 +5660,12 @@ def _prompt(worker: dict, task: dict, trail: list, routines: list[str],
     if attempt > 1:
         opening += "\n\n" + _RESUMED
     if stage:
-        opening += "\n\n" + _AT_STAGE.format(stage=stage)
+        declared = {key.split(":", 1)[1]
+                    for table in (worker["routines"], worker["instructions"])
+                    for key in table
+                    if key.startswith(f"{task.get('type')}:")}
+        opening += "\n\n" + (_AT_STAGE.format(stage=stage) if stage in declared
+                             else _AT_UNDECLARED_STAGE)
     return "\n\n".join([
         opening,
         _LOAD_ROUTINES,
@@ -5609,7 +5679,7 @@ def _prompt(worker: dict, task: dict, trail: list, routines: list[str],
          if trail else "(empty)"),
         end,
         instruction.strip(),
-        _WRITE_BACK.format(cli=NAME, key=_address(task)),
+        _WRITE_BACK.format(cli=NAME, key=str(task["id"])),
         _STORE_AUTHORITY,
     ]) + "\n"
 
@@ -6040,6 +6110,9 @@ def cmd_history(entry, args: list[str]) -> None:
                          where task_id = %s{clause} order by changed_at asc""",
                     [tid] + params)
         rows = _rows(cur)
+    for row in rows:
+        # A store not yet migrated keeps no origin; the answer's shape is the same.
+        row.setdefault("origin_project", None)
     _emit({"task": tid, "changes": rows})
 
 
@@ -6219,6 +6292,11 @@ def cmd_doctor(wanted: str | None) -> None:
         cur.execute("""select table_name from information_schema.tables
                         where table_schema = %s order by table_name""", (schema,))
         tables = [r["table_name"] for r in cur.fetchall()]
+        # What `migrate` would add, asked the way `migrate` asks it. A store a
+        # column behind still answers, so it is a warning rather than a failure.
+        behind = (_columns_absent(cur, schema, tables)
+                  + _constraints_behind(cur, schema, tables)
+                  + _key_scope_behind(cur, schema, tables))
     missing = [t for t in _TABLES if t not in tables]
     if missing:
         _die(5, "schema_missing",
@@ -6232,8 +6310,13 @@ def cmd_doctor(wanted: str | None) -> None:
         _die(6, "worker_invalid",
              f"{len(broken)} problem(s) in {_workers_file()}: " + "; ".join(broken),
              "the file's shape is this capability's contract; `tasks help` states it")
-    _emit({"ok": True, "connection": conn_id, "server": server,
-           "schema": schema, "tables": tables, "workers": workers})
+    answer = {"ok": True, "connection": conn_id, "server": server,
+              "schema": schema, "tables": tables, "workers": workers}
+    if behind:
+        answer["behind"] = behind
+        answer["warning"] = (f"schema {schema} is behind this version: "
+                             f"{', '.join(behind)}; `{NAME} migrate --apply` adds it")
+    _emit(answer)
 
 
 def _guarded(handler, entry, rest) -> None:

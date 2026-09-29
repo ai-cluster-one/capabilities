@@ -207,6 +207,10 @@ class SweepCursor:
 
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
+        if "information_schema.columns" in text:
+            # The store keeps the origin of every entry and move.
+            self.answer = [{"n": 2}]
+            return
         if "status = 'waiting'" in text:
             assert "for update skip locked" in text
             # The sweep is a write and names the project it may reach.
@@ -303,6 +307,10 @@ class ReleaseCursor:
 
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
+        if "information_schema.columns" in text:
+            # The store keeps the origin of every entry and move.
+            self.answer = [{"n": 2}]
+            return
         if "task_executions where id::text" in text:
             self.answer = [dict(EXECUTION)]
         elif text.startswith("select project_id from"):
@@ -345,6 +353,10 @@ class SetCursor:
 
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
+        if "information_schema.columns" in text:
+            # The store keeps the origin of every entry and move.
+            self.answer = [{"n": 2}]
+            return
         if "where id::text = %s or (unique_key" in text:
             self.answer = [{"id": self.task["id"], "project_id": HERE}]
         elif "status in ('complete','closed')" in text:

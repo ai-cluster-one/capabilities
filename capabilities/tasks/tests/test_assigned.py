@@ -394,5 +394,148 @@ def test_the_migration_adds_the_origin_to_a_store_without_it(store, capsys,
     assert _answer(capsys)["activities"][0]["origin_project"] is None
 
 
+# --- A store not yet migrated -------------------------------------------------
+
+def _unmigrate(conn, schema):
+    """The store as it was before origins were kept."""
+    conn.execute(f"alter table {schema}.task_activities drop column origin_project")
+    conn.execute(f"alter table {schema}.task_changes drop column origin_project")
+
+
+@needs_store
+def test_a_store_without_origins_still_answers_every_read(assigned, capsys,
+                                                         monkeypatch):
+    entry, schema, conn, tid = assigned
+    mod.cmd_activity(entry, [tid, "asked the agent"])
+    mod.cmd_set(entry, [tid, "--status", "todo", "--assignee", "the owner"])
+    capsys.readouterr()
+    _unmigrate(conn, schema)
+
+    mod.cmd_list(entry, ["--activities"])
+    [row] = _answer(capsys)["tasks"]
+    assert row["activities"][0]["origin_project"] is None
+    assert row["activities_count"] == 1 and row["last_touched_at"]
+    mod.cmd_search(entry, ["please", "--activities"])
+    assert _answer(capsys)["tasks"][0]["activities"][0]["origin_project"] is None
+    mod.cmd_ready(entry, [])
+    assert _answer(capsys)["tasks"][0]["activities"][0]["origin_project"] is None
+    shown = _show(entry, capsys, tid, monkeypatch)
+    assert shown["activities"][0]["origin_project"] is None
+    mod.cmd_history(entry, [tid])
+    changes = _answer(capsys)["changes"]
+    assert changes and all(c["origin_project"] is None for c in changes)
+    mod.cmd_runs(entry, [tid])
+    assert _answer(capsys)["attempts"] == 0
+    mod.cmd_counts(entry, [])
+    assert _answer(capsys)["total"] == 1
+
+
+@needs_store
+def test_a_store_without_origins_takes_its_own_projects_writes(assigned, capsys,
+                                                              monkeypatch):
+    entry, schema, conn, tid = assigned
+    _unmigrate(conn, schema)
+    mod.cmd_add(entry, ["--type", "request", "--title", "another", "--key", "ask-2",
+                        "--status", "todo"])
+    assert "created" in _answer(capsys)
+    mod.cmd_activity(entry, ["ask-2", "worked on it"])
+    assert _answer(capsys)["activity"]
+    mod.cmd_set(entry, ["ask-2", "--title", "renamed", "--assignee", "someone"])
+    assert sorted(_answer(capsys)["moved"]) == ["assignee"]
+    mod.cmd_claim(entry, ["--key", "ask-2", "--worker", "w"])
+    execution = _answer(capsys)["execution"]["id"]
+    mod.cmd_release(entry, [execution, "--outcome", "ok"])
+    capsys.readouterr()
+    mod.cmd_show(entry, ["ask-2"])
+    shown = _answer(capsys)
+    assert shown["task"]["status"] == "complete"
+    assert [a["origin_project"] for a in shown["activities"]] == [None]
+    mod.cmd_history(entry, ["ask-2"])
+    assert {c["field"] for c in _answer(capsys)["changes"]} >= {"assignee", "status"}
+
+
+@needs_store
+def test_a_foreign_write_waits_for_the_migration(assigned, capsys, monkeypatch):
+    """An entry another project writes has to say so. A store that cannot record
+    whose it is refuses it and names the migration, and after it takes it."""
+    entry, schema, conn, tid = assigned
+    _unmigrate(conn, schema)
+    _as(monkeypatch, AGENT)
+    for call, args in ((mod.cmd_activity, [tid, "answered"]),
+                       (mod.cmd_set, [tid, "--assignee", "the owner"])):
+        error = _refused(capsys, call, entry, args)
+        assert error["exit"] == 6 and error["code"] == "schema_behind"
+        assert "tasks migrate --apply" in error["hint"]
+    shown = _show(entry, capsys, tid, monkeypatch)
+    assert shown["activities"] == [] and shown["task"]["status"] == "waiting"
+
+    _as(monkeypatch, OWNER)
+    mod.cmd_migrate(entry, ["--apply"])
+    capsys.readouterr()
+    _as(monkeypatch, AGENT)
+    mod.cmd_activity(entry, [tid, "answered"])
+    mod.cmd_set(entry, [tid, "--assignee", "the owner"])
+    capsys.readouterr()
+    shown = _show(entry, capsys, tid, monkeypatch)
+    assert [a["origin_project"] for a in shown["activities"]] == [AGENT]
+    assert shown["task"]["status"] == "todo"
+
+
+@needs_store
+def test_a_page_costs_the_same_on_either_shape(assigned, capsys, monkeypatch):
+    """Whether the store keeps origins is asked once per connection, so a page
+    still costs a fixed number of questions on a store of either shape."""
+    entry, schema, conn, _tid = assigned
+    real = mod._connect
+    counted = []
+
+    def counting(e):
+        c = real(e)
+        original = c.cursor
+
+        class Cur:
+            def __init__(self, cur):
+                self.cur = cur
+
+            def execute(self, sql, *a, **k):
+                counted.append(sql)
+                return self.cur.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self.cur, name)
+
+            def __enter__(self):
+                self.cur.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self.cur.__exit__(*exc)
+
+        class Conn:
+            def cursor(self, *a, **k):
+                return Cur(original(*a, **k))
+
+            def __enter__(self):
+                c.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return c.__exit__(*exc)
+
+        return Conn()
+
+    monkeypatch.setattr(mod, "_connect", counting)
+    sizes = []
+    for shape in ("kept", "not kept"):
+        if shape == "not kept":
+            _unmigrate(conn, schema)
+        for per in ("1", "9"):
+            counted.clear()
+            mod.cmd_list(entry, ["--all-projects", "--activities", "--per-page", per])
+            capsys.readouterr()
+            sizes.append(len(counted))
+    assert len(set(sizes)) == 1, sizes
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
