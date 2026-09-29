@@ -1,19 +1,19 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-agentworker==0.2.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.4.0"]
 # ///
 """One turn of the conveyor: what is declared, what is claimed, what is settled.
 
 The rules that decide a turn are pure and are checked with no store and no
-engine at all. The verb itself is driven over a project written into a temp
-directory, with the engine replaced by one that records what it was asked and
+harness at all. The verb itself is driven over a project written into a temp
+directory, with the harness replaced by one that records what it was asked and
 moves the fake store the way a worker would. The store-backed checks read
 TASKS_TEST_DSN and skip when it is unset; every run works in a schema of its own
 and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'callva-agentworker==0.2.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.4.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from callva import agentworker
-from callva.agentworker import Failure, FailureKind, Result
+from callva import harness_runner
+from callva.harness_runner import Failure, FailureKind, Result
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _cli  # noqa: E402
@@ -39,7 +39,7 @@ selector = { types = ["defect", "change"] }
 park_hint = "Check the lane before reading the task as stuck."
 
 [workers.implementation.profile]
-engine = "claude"
+harness = "claude"
 model = "claude-opus-5"
 effort = "max"
 timeout_seconds = 10800
@@ -65,7 +65,7 @@ idle_failure_seconds = 120
 selector = { types = ["proposal"] }
 
 [workers.evaluation.profile]
-engine = "claude"
+harness = "claude"
 model = "claude-opus-5"
 effort = "high"
 timeout_seconds = 1800
@@ -116,7 +116,7 @@ def rewrite(project: Path, old: str, new: str) -> None:
 def test_a_worker_is_read_whole(project):
     worker = mod._worker("implementation")
     assert worker["types"] == ["defect", "change"]
-    assert worker["profile"].engine == "claude"
+    assert worker["profile"].harness == "claude"
     assert worker["profile"].permission_mode == "bypassPermissions"
     assert worker["profile"].timeout_seconds == 10800
     assert worker["limits"]["attempts"] == 3
@@ -175,18 +175,18 @@ def test_a_profile_the_library_refuses_names_its_worker_and_the_librarys_words(p
     rewrite(project, 'permission_mode = "bypassPermissions"', 'fence = "act"')
     _rows, broken = mod._workers_report()
     [said] = [one for one in broken if one.startswith("implementation:")]
-    assert "refused by callva-agentworker" in said
+    assert "refused by callva-harness-runner" in said
     assert "'fence' was removed in 0.2.0" in said
 
 
 def test_true_in_claude_extra_args_is_a_bare_flag_and_nothing_else_moves():
-    declared = {"engine": "claude", "claude_extra_args": {"restricted": True,
+    declared = {"harness": "claude", "claude_extra_args": {"restricted": True,
                                                           "name": "turn"},
                 "strict_mcp": True}
     assert mod._bare_flags(declared) == {
-        "engine": "claude", "claude_extra_args": {"restricted": None, "name": "turn"},
+        "harness": "claude", "claude_extra_args": {"restricted": None, "name": "turn"},
         "strict_mcp": True}
-    assert mod._bare_flags({"engine": "claude"}) == {"engine": "claude"}
+    assert mod._bare_flags({"harness": "claude"}) == {"harness": "claude"}
 
 
 def test_the_evaluation_shape_is_read_whole(project):
@@ -227,6 +227,143 @@ def test_the_report_names_every_worker_and_what_is_wrong(project):
     assert len(broken) == 1 and broken[0].startswith("evaluation:")
 
 
+# --- A profile by name ---------------------------------------------------------
+
+IMPLEMENTATION_PROFILE = """[claude]
+model = "claude-opus-5"
+effort = "max"
+timeout_seconds = 10800
+permission_mode = "bypassPermissions"
+"""
+
+EVALUATION_PROFILE = """[claude]
+harness = "claude"
+model = "claude-opus-5"
+effort = "high"
+timeout_seconds = 1800
+budget_usd = 10
+tools = ["Read", "Glob", "Grep", "Bash"]
+allowed_tools = ["Read", "Glob", "Grep", "Bash(tasks:*)"]
+permission_mode = "default"
+strict_mcp = true
+mcp_config = { mcpServers = {} }
+claude_extra_args = { restricted = true }
+add_dirs = ["${A_CHECKOUT}"]
+"""
+
+
+def by_name(project: Path, worker: str, name: str, harness: str = "claude",
+            text: str | None = None) -> Path:
+    """Turn a worker's inline table into a named profile, and write the file it
+    names into the project's own profiles folder when text is given."""
+    path = project / "capabilities" / "tasks" / "workers.toml"
+    body = path.read_text()
+    start = body.index(f"[workers.{worker}.profile]")
+    end = body.index("\n\n", start)
+    body = body[:start] + body[end + 2:]
+    head = f"[workers.{worker}]\n"
+    body = body.replace(head, head + f'profile = "{name}"\nharness = "{harness}"\n', 1)
+    path.write_text(body)
+    folder = project / "capabilities" / "tasks" / "profiles"
+    if text is not None:
+        folder.mkdir(exist_ok=True)
+        (folder / f"{name}.toml").write_text(text)
+    return folder / f"{name}.toml"
+
+
+def test_a_named_profile_is_read_from_the_projects_own_folder(project):
+    path = by_name(project, "implementation", "implementation", text=IMPLEMENTATION_PROFILE)
+    by_name(project, "evaluation", "evaluation", text=EVALUATION_PROFILE)
+    worker = mod._worker("implementation")
+    assert worker["profile"].harness == "claude"
+    assert worker["profile"].permission_mode == "bypassPermissions"
+    assert worker["handler"] == "claude --model claude-opus-5 --effort max"
+    assert worker["profile_source"] == {"name": "implementation", "source": "folder",
+                                        "path": str(path)}
+    rows, broken = mod._workers_report()
+    assert broken == []
+    by_worker = {row["worker"]: row for row in rows}
+    assert by_worker["implementation"]["profile_source"]["source"] == "folder"
+    assert by_worker["implementation"]["harness"] == "claude"
+
+
+def test_a_named_profile_expands_variables_and_reads_bare_flags(project, tmp_path,
+                                                               monkeypatch):
+    by_name(project, "evaluation", "evaluation", text=EVALUATION_PROFILE)
+    profile = mod._worker("evaluation")["profile"]
+    assert profile.add_dirs == (str(tmp_path / "elsewhere"),)
+    assert profile.claude_extra_args == {"restricted": None}
+    assert profile.tools == ("Read", "Glob", "Grep", "Bash")
+    monkeypatch.delenv("A_CHECKOUT")
+    _rows, broken = mod._workers_report()
+    [said] = [one for one in broken if one.startswith("evaluation:")]
+    assert "A_CHECKOUT" in said and "evaluation.toml" in said
+
+
+def test_the_projects_file_comes_before_the_machines_and_the_shipped_one(
+        project, tmp_path, monkeypatch):
+    machine = tmp_path / "xdg" / "callva-harness-runner" / "profiles"
+    machine.mkdir(parents=True)
+    (machine / "act.toml").write_text('[claude]\nmodel = "machine-model"\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    by_name(project, "implementation", "act")
+    # No file of that name in the project: the machine's comes first.
+    worker = mod._worker("implementation")
+    assert worker["profile_source"]["source"] == "machine"
+    assert worker["profile"].model == "machine-model"
+    # A file in the project hides it.
+    folder = project / "capabilities" / "tasks" / "profiles"
+    folder.mkdir()
+    (folder / "act.toml").write_text('[claude]\nmodel = "project-model"\n')
+    worker = mod._worker("implementation")
+    assert (worker["profile_source"]["source"], worker["profile"].model) == (
+        "folder", "project-model")
+    # With neither, the library's own shipped profile answers.
+    (folder / "act.toml").unlink()
+    (machine / "act.toml").unlink()
+    worker = mod._worker("implementation")
+    assert worker["profile_source"]["source"] == "shipped"
+    assert worker["profile"].permission_mode == "bypassPermissions"
+
+
+def test_a_name_nothing_resolves_is_refused_in_the_librarys_words(project, capsys):
+    by_name(project, "implementation", "no-such-profile")
+    with pytest.raises(SystemExit) as exit_info:
+        mod._worker("implementation")
+    assert exit_info.value.code == 6
+    message = json.loads(capsys.readouterr().err)["error"]["message"]
+    assert "refused by callva-harness-runner" in message
+    assert "no profile named 'no-such-profile'" in message
+
+
+def test_a_file_without_the_harness_is_refused_in_the_librarys_words(project):
+    by_name(project, "implementation", "codex-only",
+            text='[codex]\nmodel = "gpt-6-sol"\n')
+    _rows, broken = mod._workers_report()
+    [said] = [one for one in broken if one.startswith("implementation:")]
+    assert "has no [claude] table" in said
+    by_name(project, "evaluation", "mismatch", text='[claude]\nharness = "codex"\n')
+    _rows, broken = mod._workers_report()
+    [said] = [one for one in broken if one.startswith("evaluation:")]
+    assert "the table name is the harness" in said
+
+
+def test_a_worker_names_its_profile_or_carries_it_never_both(project):
+    rewrite(project, "[workers.implementation]\n",
+            '[workers.implementation]\nharness = "claude"\n')
+    _rows, broken = mod._workers_report()
+    [said] = [one for one in broken if one.startswith("implementation:")]
+    assert "beside an inline profile" in said
+    rewrite(project, '[workers.implementation]\nharness = "claude"\n',
+            "[workers.implementation]\n")
+    path = by_name(project, "implementation", "implementation", text=IMPLEMENTATION_PROFILE)
+    workers = project / "capabilities" / "tasks" / "workers.toml"
+    workers.write_text(workers.read_text().replace('harness = "claude"\n', "", 1))
+    _rows, broken = mod._workers_report()
+    [said] = [one for one in broken if one.startswith("implementation:")]
+    assert "no `harness`" in said and path.is_file()
+
+
 def test_a_stage_takes_its_own_pair_and_falls_back_when_it_has_none(project):
     worker = mod._worker("implementation")
     assert mod._for_pair(worker["routines"], "defect", "verify") == ["development",
@@ -239,10 +376,10 @@ def test_several_instruction_files_are_read_in_the_order_they_are_named(
         project, monkeypatch, capsys):
     """A rule that holds for every pair a worker takes is written once."""
     store = Store()
-    engine = Engine(Result(ok=True, engine="claude", cost_usd=0.1, duration_ms=10,
+    harness = Harness(Result(ok=True, harness="claude", cost_usd=0.1, duration_ms=10,
                            num_turns=1), lands="complete", writes=True)
-    one_turn(monkeypatch, capsys, store, engine)
-    prompt = engine.seen["prompt"]
+    one_turn(monkeypatch, capsys, store, harness)
+    prompt = harness.seen["prompt"]
     assert "implementation.md text." in prompt and "standing.md text." in prompt
     assert prompt.index("implementation.md text.") < prompt.index("standing.md text.")
 
@@ -409,13 +546,13 @@ def test_the_raise_log_never_reaches_the_prompt(project):
 
 # --- One whole turn ----------------------------------------------------------
 
-class Engine:
+class Harness:
     """The library, with the turn itself replaced. `Profile` and `FailureKind`
     stay the real ones: what a profile is and what a failure is called are the
     library's, and a test that faked them would prove nothing about either."""
 
-    Profile = agentworker.Profile
-    Session = agentworker.Session
+    Profile = harness_runner.Profile
+    Session = harness_runner.Session
     FailureKind = FailureKind
 
     def __init__(self, result, *, lands=None, holds=None, writes=False, stage=None):
@@ -448,9 +585,9 @@ class Store:
         self.held: list = []
         self.costs: list = []
 
-    def install(self, monkeypatch, engine):
-        engine.store = self
-        monkeypatch.setattr(mod, "_agentworker", lambda: engine)
+    def install(self, monkeypatch, harness):
+        harness.store = self
+        monkeypatch.setattr(mod, "_harness_runner", lambda: harness)
         monkeypatch.setattr(mod, "_claim", lambda entry, opts: {
             "claimed": "id-1", "attempt": len(self.raises) + 1,
             "execution": {"id": "exec-1"}, "task": dict(self.task),
@@ -473,8 +610,8 @@ class Store:
         return {}
 
 
-def one_turn(monkeypatch, capsys, store, engine, worker="implementation"):
-    store.install(monkeypatch, engine)
+def one_turn(monkeypatch, capsys, store, harness, worker="implementation"):
+    store.install(monkeypatch, harness)
     mod.cmd_run(None, [worker, "--apply"])
     return json.loads(capsys.readouterr().out), store.released[0]
 
@@ -482,24 +619,24 @@ def one_turn(monkeypatch, capsys, store, engine, worker="implementation"):
 def test_a_finished_turn_carries_its_measurements_and_its_pinned_session(
         project, monkeypatch, capsys):
     store = Store()
-    engine = Engine(Result(ok=True, engine="claude", answer="done",
+    harness = Harness(Result(ok=True, harness="claude", answer="done",
                            session_id=None, model="claude-opus-5-actual",
                            cost_usd=3.21, duration_ms=1_234_567, num_turns=42),
                     lands="complete", writes=True)
-    report, released = one_turn(monkeypatch, capsys, store, engine)
+    report, released = one_turn(monkeypatch, capsys, store, harness)
 
-    profile = engine.seen["profile"]
-    assert (profile.engine, profile.permission_mode) == ("claude", "bypassPermissions")
-    assert engine.seen["session"].kind == "pinned"
-    assert engine.seen["cwd"] == str(project)
-    assert engine.seen["environ"] is os.environ
+    profile = harness.seen["profile"]
+    assert (profile.harness, profile.permission_mode) == ("claude", "bypassPermissions")
+    assert harness.seen["session"].kind == "pinned"
+    assert harness.seen["cwd"] == str(project)
+    assert harness.seen["environ"] is os.environ
     # Handed to the turn, not exported: this process keeps writing as itself.
-    assert engine.seen["extra"]["extra_env"] == {"TASKS_EXECUTION": "exec-1"}
+    assert harness.seen["extra"]["extra_env"] == {"TASKS_EXECUTION": "exec-1"}
     assert "TASKS_EXECUTION" not in os.environ
 
     assert (released["outcome"], released["status"]) == ("ok", "complete")
     assert released["detail"] is None
-    assert released["run"] == f"claude:{engine.seen['session'].id}"
+    assert released["run"] == f"claude:{harness.seen['session'].id}"
     assert released["metrics"]["cost_usd"] == 3.21
     assert released["metrics"]["num_turns"] == 42
     assert released["metrics"]["model"] == "claude-opus-5-actual"
@@ -514,11 +651,11 @@ def test_a_finished_turn_carries_its_measurements_and_its_pinned_session(
 def test_a_quota_failure_returns_the_attempt_and_holds_the_task(
         project, monkeypatch, capsys):
     store = Store()
-    engine = Engine(Result(ok=False, engine="claude", session_id=None,
+    harness = Harness(Result(ok=False, harness="claude", session_id=None,
                            model="claude-opus-5", cost_usd=0.42, duration_ms=331_000,
                            num_turns=8,
                            failure=Failure(FailureKind.QUOTA, "You've hit your limit")))
-    report, released = one_turn(monkeypatch, capsys, store, engine)
+    report, released = one_turn(monkeypatch, capsys, store, harness)
 
     assert (released["outcome"], released["status"]) == ("failed", "todo")
     assert released["detail"] == "You've hit your limit"
@@ -533,11 +670,11 @@ def test_a_quota_failure_returns_the_attempt_and_holds_the_task(
 
 def test_a_long_failure_that_did_work_is_a_plain_attempt(project, monkeypatch, capsys):
     store = Store()
-    engine = Engine(Result(ok=False, engine="claude", session_id=None,
+    harness = Harness(Result(ok=False, harness="claude", session_id=None,
                            model="claude-opus-5", duration_ms=10_800_100,
                            failure=Failure(FailureKind.TIMEOUT, "timed out after 10800s")),
                     writes=True)
-    report, released = one_turn(monkeypatch, capsys, store, engine)
+    report, released = one_turn(monkeypatch, capsys, store, harness)
 
     assert (released["outcome"], released["status"]) == ("failed", "todo")
     assert released["detail"] == "timed out after 10800s"
@@ -549,9 +686,9 @@ def test_a_long_failure_that_did_work_is_a_plain_attempt(project, monkeypatch, c
 def test_a_failure_in_seconds_that_wrote_nothing_never_started(
         project, monkeypatch, capsys):
     store = Store()
-    engine = Engine(Result(ok=False, engine="claude", session_id=None,
+    harness = Harness(Result(ok=False, harness="claude", session_id=None,
                            failure=Failure(FailureKind.ERROR, "connection reset")))
-    report, released = one_turn(monkeypatch, capsys, store, engine)
+    report, released = one_turn(monkeypatch, capsys, store, harness)
     assert released["metrics"]["exhausted"] is True
     assert store.held == [1200] and report["returned_unspent"] is True
 
@@ -561,10 +698,10 @@ def test_a_turn_that_waits_on_somebody_is_ok_and_left_held(project, monkeypatch,
     tomorrow = (datetime.datetime.now(datetime.timezone.utc)
                 + datetime.timedelta(days=1)).isoformat()
     store = Store()
-    engine = Engine(Result(ok=True, engine="claude", session_id=None, cost_usd=0.3,
+    harness = Harness(Result(ok=True, harness="claude", session_id=None, cost_usd=0.3,
                            duration_ms=10, num_turns=2),
                     lands="todo", holds=tomorrow, writes=True)
-    report, released = one_turn(monkeypatch, capsys, store, engine)
+    report, released = one_turn(monkeypatch, capsys, store, harness)
 
     assert (released["outcome"], released["status"]) == ("ok", "todo")
     assert released["metrics"]["waiting"] is True
@@ -575,19 +712,19 @@ def test_a_turn_that_waits_on_somebody_is_ok_and_left_held(project, monkeypatch,
 
 def test_a_handoff_at_a_stage_is_ok_and_named(project, monkeypatch, capsys):
     store = Store()
-    engine = Engine(Result(ok=True, engine="claude", session_id=None, cost_usd=0.2,
+    harness = Harness(Result(ok=True, harness="claude", session_id=None, cost_usd=0.2,
                            duration_ms=10, num_turns=2),
                     lands="todo", stage="verify", writes=True)
-    report, released = one_turn(monkeypatch, capsys, store, engine)
+    report, released = one_turn(monkeypatch, capsys, store, harness)
     assert (released["outcome"], released["status"]) == ("ok", "todo")
     assert released["metrics"]["handoff"] is True and report["handoff"] is True
 
 
 def test_a_gate_stop_hands_the_task_back(project, monkeypatch, capsys):
     store = Store()
-    engine = Engine(Result(ok=True, engine="claude", session_id=None, cost_usd=0.7,
+    harness = Harness(Result(ok=True, harness="claude", session_id=None, cost_usd=0.7,
                            duration_ms=10, num_turns=5), lands="waiting", writes=True)
-    _report, released = one_turn(monkeypatch, capsys, store, engine)
+    _report, released = one_turn(monkeypatch, capsys, store, harness)
     assert (released["outcome"], released["status"]) == ("handback", "waiting")
     assert "waiting" not in released["metrics"]
 
@@ -595,9 +732,9 @@ def test_a_gate_stop_hands_the_task_back(project, monkeypatch, capsys):
 def test_a_task_at_the_ceiling_is_parked_and_no_turn_is_started(
         project, monkeypatch, capsys):
     store = Store(raises=[{"metrics": {}} for _ in range(4)])
-    engine = Engine(Result(ok=True, engine="claude"))
-    report, released = one_turn(monkeypatch, capsys, store, engine)
-    assert report["parked"] is True and engine.seen == {}
+    harness = Harness(Result(ok=True, harness="claude"))
+    report, released = one_turn(monkeypatch, capsys, store, harness)
+    assert report["parked"] is True and harness.seen == {}
     assert released["outcome"] == "handback"
     assert "Raised 3 times without finishing" in store.notes[0]
     # The project's own sentence goes back with it.
@@ -609,27 +746,27 @@ def test_a_type_the_worker_has_no_pair_for_is_parked_rather_than_dispatched(
     """`--key` reaches past the selector, so a task of a type this worker does
     not declare can be claimed. It must not reach a turn with half a prompt."""
     store = Store(kind="triage")
-    engine = Engine(Result(ok=True, engine="claude"))
-    report, released = one_turn(monkeypatch, capsys, store, engine)
-    assert report["parked"] is True and engine.seen == {}
+    harness = Harness(Result(ok=True, harness="claude"))
+    report, released = one_turn(monkeypatch, capsys, store, harness)
+    assert report["parked"] is True and harness.seen == {}
     assert "declares no routines for triage" in store.notes[0]
 
 
 def test_a_session_id_other_than_the_pinned_one_is_recorded(project, monkeypatch, capsys):
     store = Store()
-    engine = Engine(Result(ok=True, engine="claude", session_id="not-the-pinned-one",
+    harness = Harness(Result(ok=True, harness="claude", session_id="not-the-pinned-one",
                            cost_usd=1.0, duration_ms=10, num_turns=1),
                     lands="complete", writes=True)
-    _report, released = one_turn(monkeypatch, capsys, store, engine)
+    _report, released = one_turn(monkeypatch, capsys, store, harness)
     assert released["metrics"]["session_id_actual"] == "not-the-pinned-one"
 
 
 def test_a_lapsed_raise_is_said_on_the_trail_rather_than_thrown(
         project, monkeypatch, capsys):
     store = Store()
-    engine = Engine(Result(ok=True, engine="claude", cost_usd=0.1, duration_ms=10,
+    harness = Harness(Result(ok=True, harness="claude", cost_usd=0.1, duration_ms=10,
                            num_turns=1), lands="complete", writes=True)
-    store.install(monkeypatch, engine)
+    store.install(monkeypatch, harness)
 
     def swept(*a, **kw):
         raise mod.Refusal(6, "conflict", "that raise is not open", "it lapsed")
@@ -652,8 +789,8 @@ def test_nothing_claimable_is_an_answer_and_not_a_failure(project, monkeypatch, 
 def test_without_apply_nothing_is_claimed_and_no_turn_is_started(
         project, monkeypatch, capsys):
     claimed: list = []
-    engine = Engine(Result(ok=True, engine="claude"))
-    monkeypatch.setattr(mod, "_agentworker", lambda: engine)
+    harness = Harness(Result(ok=True, harness="claude"))
+    monkeypatch.setattr(mod, "_harness_runner", lambda: harness)
     monkeypatch.setattr(mod, "_claim",
                         lambda entry, opts: claimed.append(opts) or {"claimed": None})
     monkeypatch.setattr(mod, "_would_take",
@@ -662,7 +799,7 @@ def test_without_apply_nothing_is_claimed_and_no_turn_is_started(
                                                     "applied": False})
     mod.cmd_run(None, ["implementation"])
     assert json.loads(capsys.readouterr().out)["applied"] is False
-    assert claimed == [] and engine.seen == {}
+    assert claimed == [] and harness.seen == {}
 
 
 def test_run_needs_a_worker(project, capsys):
@@ -715,7 +852,7 @@ def _answer(capsys) -> dict:
 
 @needs_store
 def test_a_whole_turn_against_the_store(project, store, monkeypatch, capsys):
-    """The claim, the raise, the landing and the release, with only the engine
+    """The claim, the raise, the landing and the release, with only the harness
     replaced: everything else is the ledger doing what it does."""
     entry, _schema, _conn = store
     mod.cmd_add(entry, ["--type", "defect", "--title", "A probe", "--key", "t-probe",
@@ -733,15 +870,15 @@ def test_a_whole_turn_against_the_store(project, store, monkeypatch, capsys):
             capsys.readouterr()
             monkeypatch.delenv("TASKS_EXECUTION")
             self.prompt = prompt
-            return Result(ok=True, engine="claude", answer="done", session_id=session.id,
+            return Result(ok=True, harness="claude", answer="done", session_id=session.id,
                           model="claude-opus-5", cost_usd=1.5, duration_ms=900,
                           num_turns=7)
 
     worker = Worker()
-    worker.Profile, worker.Session, worker.FailureKind = (agentworker.Profile,
-                                                          agentworker.Session,
+    worker.Profile, worker.Session, worker.FailureKind = (harness_runner.Profile,
+                                                          harness_runner.Session,
                                                           FailureKind)
-    monkeypatch.setattr(mod, "_agentworker", lambda: worker)
+    monkeypatch.setattr(mod, "_harness_runner", lambda: worker)
 
     mod.cmd_run(entry, ["implementation"])
     assert _answer(capsys) == {"worker": "implementation", "would_claim": "t-probe",
@@ -775,7 +912,7 @@ def test_a_whole_turn_against_the_store(project, store, monkeypatch, capsys):
 @needs_store
 def test_the_task_and_its_trail_reach_the_turn_as_marked_data(project, store,
                                                              monkeypatch, capsys):
-    """The prompt a real claim composes, captured by an engine that only records
+    """The prompt a real claim composes, captured by a harness that only records
     it: the task and its trail between two markers drawn for this prompt, one
     line of precedence before them, and an entry another project wrote marked
     with that project's id."""
@@ -796,14 +933,14 @@ def test_the_task_and_its_trail_reach_the_turn_as_marked_data(project, store,
     class Recorder:
         def run(self, prompt, profile, cwd, *, session=None, environ=None, **kw):
             self.prompt = prompt
-            return Result(ok=True, engine="claude", answer="done",
+            return Result(ok=True, harness="claude", answer="done",
                           session_id=session.id, model="claude-opus-5", cost_usd=0.1,
                           duration_ms=900, num_turns=1)
 
     recorder = Recorder()
     recorder.Profile, recorder.Session, recorder.FailureKind = (
-        agentworker.Profile, agentworker.Session, FailureKind)
-    monkeypatch.setattr(mod, "_agentworker", lambda: recorder)
+        harness_runner.Profile, harness_runner.Session, FailureKind)
+    monkeypatch.setattr(mod, "_harness_runner", lambda: recorder)
     mod.cmd_run(entry, ["implementation", "--apply"])
     capsys.readouterr()
     prompt = recorder.prompt
@@ -847,14 +984,14 @@ def test_no_value_the_task_carries_is_printed_outside_the_markers(project, store
     class Recorder:
         def run(self, prompt, profile, cwd, *, session=None, environ=None, **kw):
             self.prompt = prompt
-            return Result(ok=True, engine="claude", answer="done",
+            return Result(ok=True, harness="claude", answer="done",
                           session_id=session.id, model="claude-opus-5", cost_usd=0.1,
                           duration_ms=900, num_turns=1)
 
     recorder = Recorder()
     recorder.Profile, recorder.Session, recorder.FailureKind = (
-        agentworker.Profile, agentworker.Session, FailureKind)
-    monkeypatch.setattr(mod, "_agentworker", lambda: recorder)
+        harness_runner.Profile, harness_runner.Session, FailureKind)
+    monkeypatch.setattr(mod, "_harness_runner", lambda: recorder)
     mod.cmd_run(entry, ["implementation", "--apply"])
     capsys.readouterr()
     prompt = recorder.prompt
@@ -871,13 +1008,13 @@ def test_no_value_the_task_carries_is_printed_outside_the_markers(project, store
 FAKE_CLAUDE = Path(__file__).resolve().parent / "fakes" / "claude"
 
 
-def _engine_turn(project, entry, capsys, monkeypatch, worker, kind):
-    """One real turn through callva-agentworker, with the engine CLI replaced by
+def _harness_turn(project, entry, capsys, monkeypatch, worker, kind):
+    """One real turn through callva-harness-runner, with the harness CLI replaced by
     a stand-in that records what it was started with."""
-    record = project / "engine.jsonl"
+    record = project / "harness.jsonl"
     monkeypatch.setenv("FAKE_ENGINE_RECORD", str(record))
-    rewrite(project, f"[workers.{worker}.profile]\nengine = \"claude\"\n",
-            f"[workers.{worker}.profile]\nengine = \"claude\"\n"
+    rewrite(project, f"[workers.{worker}.profile]\nharness = \"claude\"\n",
+            f"[workers.{worker}.profile]\nharness = \"claude\"\n"
             f"cli_path = \"{FAKE_CLAUDE}\"\n")
     mod.cmd_add(entry, ["--type", kind, "--title", "A probe", "--key", f"t-{kind}",
                         "--status", "todo"])
@@ -896,7 +1033,7 @@ def _flag(argv, name):
 def test_an_act_profile_runs_a_claimed_turn_through_the_library(project, store,
                                                                 monkeypatch, capsys):
     entry, _schema, _conn = store
-    report, turn = _engine_turn(project, entry, capsys, monkeypatch,
+    report, turn = _harness_turn(project, entry, capsys, monkeypatch,
                                 "implementation", "defect")
     assert report["claimed"] == "t-defect" and report["attempt"] == 1
     argv = turn["argv"]
@@ -913,7 +1050,7 @@ def test_an_act_profile_runs_a_claimed_turn_through_the_library(project, store,
 def test_a_read_profile_runs_a_claimed_turn_through_the_library(project, store,
                                                                monkeypatch, capsys):
     entry, _schema, _conn = store
-    report, turn = _engine_turn(project, entry, capsys, monkeypatch,
+    report, turn = _harness_turn(project, entry, capsys, monkeypatch,
                                 "evaluation", "proposal")
     assert report["claimed"] == "t-proposal"
     argv = turn["argv"]
@@ -925,6 +1062,52 @@ def test_a_read_profile_runs_a_claimed_turn_through_the_library(project, store,
     assert _flag(argv, "--max-budget-usd") == "10"
     assert _flag(argv, "--add-dir") == str(project / "elsewhere")
     assert _flag(argv, "--effort") == "high"
+
+
+@needs_store
+@pytest.mark.parametrize("worker,kind,text", (
+    ("implementation", "defect", IMPLEMENTATION_PROFILE),
+    ("evaluation", "proposal", EVALUATION_PROFILE)))
+def test_a_named_profile_runs_a_claimed_turn_as_its_inline_twin_does(
+        project, store, monkeypatch, capsys, worker, kind, text):
+    """The same knobs, carried inline and by name, start the same command."""
+    entry, _schema, _conn = store
+    argvs = []
+    for shape in ("inline", "named"):
+        if shape == "named":
+            by_name(project, worker, worker,
+                    text=text.replace("[claude]\n", f'[claude]\ncli_path = "{FAKE_CLAUDE}"\n'))
+        record = project / f"{shape}.jsonl"
+        monkeypatch.setenv("FAKE_ENGINE_RECORD", str(record))
+        if shape == "inline":
+            rewrite(project, f"[workers.{worker}.profile]\nharness = \"claude\"\n",
+                    f"[workers.{worker}.profile]\nharness = \"claude\"\n"
+                    f"cli_path = \"{FAKE_CLAUDE}\"\n")
+        mod.cmd_add(entry, ["--type", kind, "--title", "A probe", "--key",
+                            f"t-{shape}", "--status", "todo"])
+        capsys.readouterr()
+        mod.cmd_run(entry, [worker, "--key", f"t-{shape}", "--apply"])
+        assert _answer(capsys)["claimed"] == f"t-{shape}"
+        [turn] = [json.loads(line) for line in record.read_text().splitlines()]
+        argvs.append([a for a in turn["argv"] if not a.startswith("--session-id")])
+    assert argvs[0] == argvs[1]
+
+
+@needs_store
+def test_a_name_nothing_resolves_claims_nothing(project, store, capsys):
+    entry, schema, conn = store
+    by_name(project, "implementation", "no-such-profile")
+    mod.cmd_add(entry, ["--type", "defect", "--title", "A probe", "--key", "t-probe",
+                        "--status", "todo"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exit_info:
+        mod.cmd_run(entry, ["implementation", "--apply"])
+    assert exit_info.value.code == 6
+    assert "no profile named 'no-such-profile'" in json.loads(
+        capsys.readouterr().err)["error"]["message"]
+    mod.cmd_show(entry, ["t-probe"])
+    assert _answer(capsys)["task"]["status"] == "todo"
+    assert conn.execute(f"select count(*) from {schema}.task_executions").fetchone()[0] == 0
 
 
 @needs_store
@@ -953,14 +1136,14 @@ def test_a_turn_that_wrote_nothing_is_returned_held_and_marked(
     capsys.readouterr()
 
     class Spent:
-        Profile, Session, FailureKind = (agentworker.Profile, agentworker.Session,
+        Profile, Session, FailureKind = (harness_runner.Profile, harness_runner.Session,
                                          FailureKind)
 
         def run(self, prompt, profile, cwd, **kw):
-            return Result(ok=False, engine="claude", cost_usd=0.4,
+            return Result(ok=False, harness="claude", cost_usd=0.4,
                           failure=Failure(FailureKind.QUOTA, "hit your limit"))
 
-    monkeypatch.setattr(mod, "_agentworker", Spent)
+    monkeypatch.setattr(mod, "_harness_runner", Spent)
     mod.cmd_run(entry, ["implementation", "--apply"])
     report = _answer(capsys)
     assert report["returned_unspent"] is True and report["held_until"]

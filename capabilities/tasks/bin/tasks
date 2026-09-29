@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "psycopg[binary]>=3.2",
-#     "callva-agentworker==0.2.0",
+#     "callva-harness-runner==0.4.0",
 # ]
 # ///
 """tasks — what has to be done, and what was done about it.
@@ -60,7 +60,7 @@ EXECUTION  (also needs allow_write)
                                   close that claim and say what came of it
   tasks run <worker> [--key KEY] [--apply]
                                   one turn of the conveyor: claim by that
-                                  worker's selector, boot one engine turn on
+                                  worker's selector, boot one harness turn on
                                   what it took, and settle the raise from where
                                   the turn left the task. Reports what it would
                                   take and writes nothing without `--apply`
@@ -92,7 +92,7 @@ EXECUTION  (also needs allow_write)
 
 ONE TURN OF THE CONVEYOR
   `run` is claim, boot and release in one call, and it is the only verb that
-  starts an engine. It takes the next task the named worker's selector matches,
+  starts a harness. It takes the next task the named worker's selector matches,
   boots one headless turn on it, and closes the raise against wherever that turn
   left the task. It never reads the turn's answer: the worker moves the status
   and writes the trail itself, through these same verbs, and `run` measures.
@@ -124,7 +124,7 @@ ONE TURN OF THE CONVEYOR
                                 one no claim would take and no lease would free
     todo otherwise              failed - put back without saying why
 
-  A turn the engine's own report says ran out of quota, and one that fails in
+  A turn the harness's own report says ran out of quota, and one that fails in
   seconds having written nothing, are not attempts at the work: the raise is
   marked `exhausted`, the task is held for a while rather than handed straight
   back into a limit that has not lifted, and the count that parks a task does
@@ -143,13 +143,8 @@ WORKERS
     [workers.<name>]
     selector = { types = ["defect", "change"], tags = [], assignee = "" }
     park_hint = "one sentence added to the handback when a task is parked"
-
-    [workers.<name>.profile]      # one callva-agentworker profile
-    engine = "claude"
-    model = "claude-opus-5"
-    effort = "max"
-    timeout_seconds = 10800
-    permission_mode = "bypassPermissions"
+    profile = "implementation"    # a named profile file, and the table of it
+    harness = "claude"            # the turn runs; or an inline table instead
 
     [workers.<name>.routines]     # which routines the turn is told to load
     defect = ["capability-development"]
@@ -169,16 +164,27 @@ WORKERS
   yields: the order is the whole of the arbitration, because something broken is
   taken before something that could merely be better.
 
-  The profile is callva-agentworker's own set of explicit knobs, handed to it as
-  written after `${VAR}` expansion: what the turn may run, on which model, at
-  what effort and for how long is whatever it sets and nothing else, and a knob
-  it leaves out leaves the engine's own default. The knobs and what each does on
-  each engine are the library's, listed in its README. One spelling is this
-  file's: TOML has no null, so `true` inside `claude_extra_args` stands for a
-  bare flag, as in `claude_extra_args = { restricted = true }`. A profile the
-  library refuses is reported with the library's own message, and no task is
-  claimed for its worker. `doctor` reports each worker's engine and the knobs its
-  profile sets.
+  A worker's profile is one callva-harness-runner profile: its explicit knobs
+  decide what the turn may run, on which model, at what effort and for how long,
+  and a knob it leaves out leaves the harness's own default. The knobs and what
+  each does on each harness are the library's, listed in its README.
+
+  A worker names its profile or carries it inline, never both. `profile =
+  "NAME"` with `harness = "claude"` (or `"codex"`) beside it names a profile
+  file, found the way the library finds one: `capabilities/tasks/profiles/
+  NAME.toml` in this project's envelope first, then the machine's profile
+  folder, then the profiles the library ships. The first file found is used
+  whole, and the turn runs its `[<harness>]` table. `[workers.<name>.profile]`
+  instead carries the knobs inline, with `harness` among them.
+
+  Either way the knobs go to the library as written after `${VAR}` expansion.
+  One spelling is this capability's: TOML has no null, so `true` inside
+  `claude_extra_args` stands for a bare flag, as in `claude_extra_args = {
+  restricted = true }`. A name nothing resolves, and a profile the library
+  refuses, are reported with the library's own message, and no task is claimed
+  for its worker. `doctor` reports each worker's harness, where its profile came
+  from - `inline`, or its name with the library's source and the file's path -
+  and the knobs it sets.
 
   `routines` and `instructions` are keyed by task type, and a task carrying a
   `stage` in its metadata takes `"<type>:<stage>"` when that key is present. A
@@ -5410,19 +5416,20 @@ _LIMIT_DEFAULTS = {"attempts": 3, "lease_seconds": 11400,
 _UNSPENT_MARKS = ("exhausted", "waiting")
 
 
-def _agentworker():
-    """The engine library, imported at the moment a turn is about to run.
+def _harness_runner():
+    """The harness library, imported at the moment a worker is read or a turn is
+    about to run.
 
     Every other verb here works without it, and a reading verb should not wait
     on a dependency it never reaches."""
     try:
-        from callva import agentworker
+        from callva import harness_runner
     except ImportError as exc:  # pragma: no cover - a broken install, not a path
-        _die(5, "engine_library_missing",
-             f"the engine library is not importable: {exc}",
+        _die(5, "harness_library_missing",
+             f"the harness library is not importable: {exc}",
              "reinstall the capability; its script header declares "
-             "callva-agentworker and uv resolves it")
-    return agentworker
+             "callva-harness-runner and uv resolves it")
+    return harness_runner
 
 
 def _project_here() -> Path:
@@ -5437,6 +5444,12 @@ def _project_here() -> Path:
 
 def _workers_file() -> Path:
     return _project_capabilities_dir(_project_here()) / NAME / "workers.toml"
+
+
+def _profiles_dir() -> Path:
+    """This project's own profile files, searched before the machine's and the
+    library's."""
+    return _project_capabilities_dir(_project_here()) / NAME / "profiles"
 
 
 def _instruction_dir() -> Path:
@@ -5504,7 +5517,7 @@ def _declarations() -> dict:
 
 def _handler(profile) -> str:
     """What held the task, in the words that would start it again."""
-    parts = [profile.engine]
+    parts = [profile.harness]
     if profile.model:
         parts += ["--model", profile.model]
     if profile.effort:
@@ -5521,6 +5534,40 @@ def _bare_flags(profile: dict) -> dict:
         return profile
     return {**profile, "claude_extra_args": {flag: None if value is True else value
                                              for flag, value in extra.items()}}
+
+
+def _resolve_profile(table: dict) -> tuple[object, dict, dict]:
+    """The worker's profile, the knobs it sets and where it came from.
+
+    A named profile is found the way the library's `find_profile` finds one -
+    this project's profiles folder, then the machine's, then the shipped set -
+    through `find_profile_file`, because the knobs have to pass through `${VAR}`
+    expansion and the bare-flag reading before a Profile is built from them. A
+    file with no table for the harness, or a table naming another harness, is
+    refused by the library's own `ProfileFile.profile`, in its words."""
+    runner = _harness_runner()
+    declared, harness = table.get("profile"), table.get("harness")
+    if isinstance(declared, dict):
+        if "harness" in table:
+            raise ValueError("it names `harness` beside an inline profile table; an "
+                             "inline profile names its harness inside the table")
+        knobs, origin = dict(declared), {"source": "inline"}
+    elif isinstance(declared, str):
+        if not isinstance(harness, str) or not harness.strip():
+            raise ValueError(f"it names the profile {declared!r} and no `harness` to "
+                             "run from it: harness = \"claude\" or \"codex\"")
+        found = runner.find_profile_file(declared, [_profiles_dir()])
+        tables = found.tables()
+        if (harness not in tables or harness not in runner.HARNESSES
+                or tables[harness].get("harness", harness) != harness):
+            found.profile(harness)  # the library's own refusal
+        knobs = _expanded({**tables[harness], "harness": harness},
+                          f"profile {declared!r} at {found.path}")
+        origin = {"name": declared, "source": found.source, "path": found.path}
+    else:
+        raise ValueError("it declares no profile: profile = \"NAME\" with harness "
+                         "beside it, or a [workers.<name>.profile] table")
+    return runner.Profile.from_dict(_bare_flags(knobs)), knobs, origin
 
 
 def _read_worker(name: str, table) -> tuple[dict | None, list[tuple]]:
@@ -5567,15 +5614,13 @@ def _read_worker(name: str, table) -> tuple[dict | None, list[tuple]]:
         for unknown in sorted(set(selector) - {"types", "tags", "assignee"}):
             wrong(f"its selector names {unknown!r}, which nothing reads")
 
-    profile = None
-    declared_profile = table.get("profile")
-    if not isinstance(declared_profile, dict):
-        wrong("it declares no profile table")
-    else:
-        try:
-            profile = _agentworker().Profile.from_dict(_bare_flags(declared_profile))
-        except (ValueError, TypeError, KeyError) as exc:
-            wrong(f"its profile is refused by callva-agentworker: {exc}")
+    profile, knobs, origin = None, {}, {}
+    try:
+        profile, knobs, origin = _resolve_profile(table)
+    except Refusal as refused:
+        wrong(refused.message)
+    except (ValueError, TypeError, KeyError) as exc:
+        wrong(f"its profile is refused by callva-harness-runner: {exc}")
 
     routines = table.get("routines") or {}
     if not isinstance(routines, dict):
@@ -5632,14 +5677,14 @@ def _read_worker(name: str, table) -> tuple[dict | None, list[tuple]]:
     if not isinstance(hint, str):
         wrong("its `park_hint` is one sentence")
         hint = ""
-    for unknown in sorted(set(table) - {"selector", "profile", "routines",
+    for unknown in sorted(set(table) - {"selector", "profile", "harness", "routines",
                                         "instructions", "limits", "park_hint"}):
         wrong(f"it names {unknown!r}, which nothing reads")
 
     if problems:
         return None, problems
     return {"name": name, "types": types, "tags": tags, "assignee": assignee,
-            "profile": profile, "knobs": dict(declared_profile),
+            "profile": profile, "knobs": knobs, "profile_source": origin,
             "routines": routines, "instructions": instructions,
             "limits": limits, "park_hint": hint.strip(),
             "handler": _handler(profile)}, []
@@ -5667,7 +5712,8 @@ def _workers_report() -> tuple[list[dict], list[str]]:
         row = {"worker": name, "ok": not problems}
         if worker:
             row["types"] = worker["types"]
-            row["engine"] = worker["profile"].engine
+            row["harness"] = worker["profile"].harness
+            row["profile_source"] = worker["profile_source"]
             row["profile"] = worker["knobs"]
         if problems:
             row["problems"] = [sentence for _code, _slug, sentence in problems]
@@ -5972,7 +6018,7 @@ def _settle(landed: str, held_ahead: bool, stage_moved: bool,
     A turn that reports success and moved nothing is not believed, and a turn
     that says nothing while the task is finished is not doubted."""
     if unspent:
-        # The account is out of quota, or the engine never got to the work. Not
+        # The account is out of quota, or the harness never got to the work. Not
         # an attempt at it, so the task goes back and the raise says so.
         return "todo", "failed", {"exhausted": True}
     if landed in ("complete", "closed"):
@@ -6004,7 +6050,7 @@ def _settle(landed: str, held_ahead: bool, stage_moved: bool,
 
 
 def _boot(worker: dict, prompt: str, execution: str, cwd: Path):
-    """One engine turn, and the wall time it took. The only thing here that
+    """One harness turn, and the wall time it took. The only thing here that
     knows how a turn is started.
 
     The raise goes down with it: `TASKS_EXECUTION` signs every write the turn
@@ -6019,16 +6065,16 @@ def _boot(worker: dict, prompt: str, execution: str, cwd: Path):
     needs in order to decide whether an attempt was spent."""
     import time
     import uuid
-    engine = _agentworker()
+    runner = _harness_runner()
     profile = worker["profile"]
     # A pinned id makes the transcript addressable before the turn starts, so a
     # turn that is killed still has one. Only claude takes it; codex learns its
     # own from the stream, and the pointer is then whatever came back.
     pinned = str(uuid.uuid4())
-    session = (engine.Session.pinned(pinned) if profile.engine == "claude"
-               else engine.Session.fresh())
+    session = (runner.Session.pinned(pinned) if profile.harness == "claude"
+               else runner.Session.fresh())
     started = time.monotonic()
-    result = engine.run(prompt, profile, str(cwd), session=session,
+    result = runner.run(prompt, profile, str(cwd), session=session,
                         environ=os.environ, extra_env={"TASKS_EXECUTION": execution})
     return result, pinned, int((time.monotonic() - started) * 1000)
 
@@ -6135,29 +6181,29 @@ def cmd_run(entry, args: list[str]) -> None:
     result, pinned, elapsed_ms = _boot(worker, prompt, execution, _project_here())
     landing, grew_to = _state(entry, tid)
 
-    engine = _agentworker()
+    runner = _harness_runner()
     detail = result.failure.message[:300] if result.failure else ""
     # Two ways of recognising a turn that never got to the work, because one is
-    # exact and the other covers what the exact one cannot name. The engine
-    # saying it ran out is the fact, and the library names it from the engine's
+    # exact and the other covers what the exact one cannot name. The harness
+    # saying it ran out is the fact, and the library names it from the harness's
     # own answer rather than from how long the turn lasted. Failing in seconds
     # while writing nothing is the shape of a turn that never started, whatever
     # it was.
     idle = (not result.ok and grew_to == grew_from
             and elapsed_ms < worker["limits"]["idle_failure_seconds"] * 1000)
     unspent = idle or (result.failure is not None
-                       and result.failure.kind == engine.FailureKind.QUOTA)
+                       and result.failure.kind == runner.FailureKind.QUOTA)
 
     landed, outcome, marks = _settle(landing["status"], _held_ahead(landing),
                                      _stage_of(landing) != stage, unspent)
-    # What the turn cost is kept whenever the engine reported it, on every path:
+    # What the turn cost is kept whenever the harness reported it, on every path:
     # a turn stopped by the account's limit after real work still spent that.
     measured = (("cost_usd", result.cost_usd), ("duration_ms", result.duration_ms),
                 ("num_turns", result.num_turns), ("elapsed_ms", elapsed_ms),
                 ("model", result.model))
     metrics = {k: v for k, v in measured if v is not None}
     metrics.update(marks)
-    pointer = pinned if result.engine == "claude" else (result.session_id or pinned)
+    pointer = pinned if result.harness == "claude" else (result.session_id or pinned)
     # A returned id that is not the one the turn was given means it did not
     # honour the pin, and the pointer would otherwise name a transcript that was
     # never written.
@@ -6168,7 +6214,7 @@ def cmd_run(entry, args: list[str]) -> None:
         report["returned_unspent"] = True
 
     _close(entry, execution, outcome, landed, detail if not result.ok else None,
-           result.engine, pointer, metrics, tid, report)
+           result.harness, pointer, metrics, tid, report)
     if unspent:
         report["held_until"] = _hold_off(entry, tid,
                                          worker["limits"]["hold_seconds_on_exhaustion"])
@@ -6182,7 +6228,7 @@ def cmd_run(entry, args: list[str]) -> None:
               "Raised and left no record: the turn ended without writing to the trail "
               f"({'no answer' if not result.ok else 'answered but recorded nothing'}"
               f"{': ' + detail if detail else ''}).")
-    # The reading of the turn, not the turn itself: the answer and the engine's
+    # The reading of the turn, not the turn itself: the answer and the harness's
     # raw report are the worker's, and this verb reads neither.
     turn = {k: v for k, v in result.to_dict().items()
             if k not in ("answer", "structured", "raw")}
