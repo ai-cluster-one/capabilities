@@ -199,9 +199,11 @@ PROJECT VERBS (run inside a consuming project)
         Wire the project: scaffold the durable project identity, the
         manager-owned capabilities/.gitignore, and settings.json only in files
         mode; per host, wire the
-        SessionStart hook/context compiler and generate the skill. No flags
-        defaults to Claude Code wiring; Codex projects must pass --codex.
-        The Codex compiler is manager-owned and overwritten on each init.
+        SessionStart hook and the generated context file and generate the
+        skill. No flags defaults to Claude Code wiring; Codex projects must
+        pass --codex. Host wiring is manager-owned: each init brings the hook
+        entries and Codex config keys it owns to their current form, and
+        refuses a host settings file it cannot parse rather than replace it.
         Idempotent. When `.contextkit/config.toml` is present, init keeps the
         envelope and skill setup but skips host wiring: ContextKit owns it.
         A legacy project `.capabilities/` envelope is preflighted and migrated
@@ -219,21 +221,31 @@ PROJECT VERBS (run inside a consuming project)
         Compose the session injection from the gate + snapshots + project
         envelopes. --fragment prints the manager-owned Markdown block without
         writing host files; context owners such as ContextKit insert this output
-        verbatim. The host modes place the same block where the host reads it (--claude:
-        .claude/rules/CAPABILITIES.md; --codex: the capabilities fragment used
-        by the generated .codex context compiler).
+        verbatim. The host modes place the same block where the host reads it
+        (--claude: .claude/rules/CAPABILITIES.md; --codex:
+        .codex/generated/capabilities.md, which Codex loads through the root
+        .capabilities.md link named by project_doc_fallback_filenames in
+        .codex/config.toml) and replace the file whole. In a Codex-wired
+        project --codex also creates or repairs that link and config entry,
+        replacing the manager's earlier fallback names and keeping others.
         Composition reads the active records backend and degradation is
-        per-capability, never whole; when Codex wiring exists, --codex also asks the generated local
-        compiler to refresh .codex/generated/context.md. The generated agent
-        instruction paragraph defaults to identifier persistence guidance and
-        can be overridden with CAPABILITIES_CONTEXT_PROMPT in the project's
-        .env/.env.local.
+        per-capability, never whole. Run by hand, a host mode prints the file
+        it wrote and the enabled set. Run as the host's SessionStart hook (the
+        harness pipes a payload whose hook_event_name is SessionStart), it
+        prints nothing unless the session must be told: the file was just
+        created or changed since the session loaded it, it could not be
+        rebuilt, or Codex cannot load it because a root AGENTS.md or
+        AGENTS.override.md takes precedence. The hook always exits 0, and the
+        context reaches the agent through the host's own file loading, never
+        through hook output. The generated agent instruction paragraph
+        defaults to identifier persistence guidance and can be overridden with
+        CAPABILITIES_CONTEXT_PROMPT in the project's .env/.env.local.
         Do not create or edit generated context files by hand; rerun this
-        command (or the generated Codex compiler hook) after manual envelope
-        changes. In a ContextKit-managed project (`.contextkit/config.toml`),
-        ContextKit owns both host bindings and the combined context; the host
-        modes delegate without writing and point to `contextkit build`, while
-        --fragment remains the read-only provider surface ContextKit calls.
+        command after manual envelope changes. In a ContextKit-managed project
+        (`.contextkit/config.toml`), ContextKit owns both host bindings and
+        the combined context; the host modes delegate without writing and
+        point to `contextkit build`, while --fragment remains the read-only
+        provider surface ContextKit calls.
   inventory [NAME ...] [--detail] [--network]
         What this project's capabilities are and what they hold. One row per
         effective-enabled capability: its tier (as in `list`), gate and the
@@ -268,7 +280,9 @@ PROJECT VERBS (run inside a consuming project)
 VERIFICATION VERBS
   doctor
         Reconcile machine registry ↔ snapshots ↔ project gate ↔ gitignore
-        guard ↔ deny rules; report drift. Exit 0 clean, 7 drift found.
+        guard ↔ deny rules ↔ standalone host wiring, including what keeps
+        Codex from loading the capability context; report drift. Exit 0
+        clean, 7 drift found.
   audit <name> [--from <path>]
         Contract conformance: call the contract verbs, validate output
         shapes, exercise the gate (enabled / disabled / absent) in a
@@ -317,6 +331,7 @@ import json
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import stat
@@ -326,7 +341,7 @@ import tarfile
 import tempfile
 import time
 import zlib
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from typing import NoReturn
 
@@ -390,7 +405,13 @@ PROJECT_IDENTITY_SCHEMA = "capabilities.project.v1"
 CONTEXT_BEGIN = "<!-- capabilities:begin — generated by `capabilities context`; do not edit -->"
 CONTEXT_END = "<!-- capabilities:end -->"
 CONTEXT_PROMPT_ENV = "CAPABILITIES_CONTEXT_PROMPT"
+CLAUDE_CAPABILITIES_REL = Path(".claude") / "rules" / "CAPABILITIES.md"
 CODEX_CAPABILITIES_REL = Path(".codex") / "generated" / "capabilities.md"
+# The root name Codex loads the generated file through (DOCTRINE rule 13).
+CODEX_ROOT_LINK_REL = Path(".capabilities.md")
+# Earlier releases named the generated files themselves as Codex fallbacks.
+CODEX_RETIRED_FALLBACKS = (CODEX_CAPABILITIES_REL.as_posix(),
+                           ".codex/generated/context.md")
 CODEX_CONFIG_REL = Path(".codex") / "config.toml"
 CODEX_HOOKS_REL = Path(".codex") / "hooks.json"
 CONTEXTKIT_CONFIG_REL = Path(".contextkit") / "config.toml"
@@ -399,6 +420,13 @@ CONTEXTKIT_ENVELOPE_QUERY = ("path", "capabilities")
 ENVELOPE_ENV = "CAPABILITIES_PROJECT_ENVELOPE"
 ENVELOPE_ROOT_ENV = "CAPABILITIES_PROJECT_ENVELOPE_ROOT"
 CODEX_HOOK_COMMAND = "capabilities context --codex"
+# Codex reloads its project docs itself after compaction, so the managed hook
+# only refreshes the generated file when a session begins.
+CODEX_SESSION_MATCHER = "startup|resume|clear"
+# Root instruction files Codex loads in place of any fallback filename.
+CODEX_ROOT_DOCS = ("AGENTS.override.md", "AGENTS.md")
+# How long a host mode waits for a harness hook's payload on stdin.
+HOOK_PAYLOAD_WAIT_SECONDS = 0.5
 DEFAULT_CONTEXT_PROMPT = (
     "Identifiers are durable, non-secret project lookups discovered while using "
     "a capability: ids, codes, labels, classifications, account handles, "
@@ -865,6 +893,39 @@ def _write_json(path: Path, value) -> None:
     tmp.replace(path)
 
 
+def _atomic_write_text(path: Path, body: str) -> None:
+    """Replace a file whole, so a host starting a session never reads half of it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=path.parent,
+                                     prefix=f".{path.name}.", suffix=".tmp") as tmp:
+        tmp_path = Path(tmp.name)
+        try:
+            tmp.write(body)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    tmp_path.chmod(mode)
+    tmp_path.replace(path)
+
+
+def _read_host_settings(path: Path) -> dict:
+    """An existing host settings file as a JSON object; absent or blank reads as empty.
+
+    A file that holds text but is not a JSON object is refused rather than
+    replaced: it holds the person's own host configuration beside the manager's hooks.
+    """
+    if not path.exists() or not path.read_text().strip():
+        return {}
+    value = _read_json(path)
+    if not isinstance(value, dict):
+        _die(6, "host_settings_unreadable",
+             f"{path} exists but is not a readable JSON object",
+             "repair or remove it, then rerun `capabilities init`; the manager "
+             "does not replace host settings it cannot read")
+    return value
+
+
 def _active_takeover_leases() -> list[dict]:
     """Scan account-global control roots for nonterminal durable takeovers."""
     root = _STATE_HOME / "telegram"
@@ -1100,6 +1161,10 @@ def _retire_capabilities_host_wiring(root: Path) -> list[str]:
             lambda hook: "capabilities context --codex" in str(hook.get("command", ""))):
         removed.append("codex_hook")
     codex_fragment = root / CODEX_CAPABILITIES_REL
+    codex_link = root / CODEX_ROOT_LINK_REL
+    if _codex_link_ok(root):
+        codex_link.unlink()
+        removed.append(str(codex_link))
     if _remove_generated_file(codex_fragment, CONTEXT_BEGIN):
         removed.append(str(codex_fragment))
     return removed
@@ -1114,9 +1179,10 @@ def _project_visibility_hint(name: str | None = None) -> list[str]:
         "with `capabilities context --codex`.",
         "Claude Code: run `capabilities init --claude` once in the consuming "
         f"project, then `{enable}`.",
-        "No project-root instruction markdown file is required or assumed. Do not "
-        "create or edit generated capabilities context by hand; the manager owns "
-        ".codex/generated/capabilities.md and .claude/rules/CAPABILITIES.md.",
+        "No hand-authored project-root instruction markdown file is required or "
+        "assumed. Do not create or edit generated capabilities context by hand; "
+        "the manager owns .codex/generated/capabilities.md, its root "
+        ".capabilities.md link, and .claude/rules/CAPABILITIES.md.",
         "ContextKit exception: when .contextkit/config.toml is present, ContextKit "
         "owns both host bindings and the combined context; use `contextkit build`.",
     ]
@@ -4627,6 +4693,27 @@ def _front_matter(source: Path | str) -> dict:
     return out
 
 
+def _context_references(adapter, root: Path, name: str) -> list[str]:
+    """The on-demand reference menu lines for one capability."""
+    refs = []
+    for key in adapter.document_keys(name):
+        if not key.startswith("reference."):
+            continue
+        doc = adapter.document_read(name, key)
+        if not doc:
+            continue
+        fm = _front_matter(doc["body"])
+        if not fm.get("name"):
+            continue
+        path = adapter.document_path(name, key)
+        target = (str(path.relative_to(root)) if path is not None
+                  and path.is_relative_to(root)
+                  else f"{name} refs show {key.removeprefix('reference.')}")
+        desc = fm.get("description", "")
+        refs.append(f"- `{target}` — {desc}".rstrip(" —"))
+    return refs
+
+
 def _compose_context(root: Path) -> str:
     """Deterministic injection body: gate, snapshots, and resolved records."""
     project_caps, global_caps = _policy_views(root)
@@ -4656,11 +4743,16 @@ def _compose_context(root: Path) -> str:
                 lines += [f"Enabled but not installed — run `capabilities install {name}`.", ""]
                 continue
             lines += [_md_escape(stub), ""]
-            bullet: list[str] = []
             try:
                 ids = adapter.resolve(name, "identifier")
+                refs = _context_references(adapter, root, name)
             except _store_module().StoreError as exc:
-                _die(6, exc.slug, exc.message, exc.hint)
+                # One unreadable capability must not cost the others their block.
+                lines += [f"Project records for `{name}` are unavailable: "
+                          f"{_md_escape(exc.message)}. `capabilities doctor` "
+                          f"names the repair.", ""]
+                continue
+            bullet: list[str] = []
             if ids:
                 bullet.append(f"- Identifiers ({len(ids)}): run `capabilities ids {name}` "
                               f"for the full labelled list; `{name} ids get <label>` "
@@ -4681,26 +4773,6 @@ def _compose_context(root: Path) -> str:
                     f"start at `{SERVICE_SUPERVISION_CAPABILITY} help`."
                     if _registry_dir(SERVICE_SUPERVISION_CAPABILITY).is_dir()
                     else "it is not installed here."))
-            refs = []
-            try:
-                keys = adapter.document_keys(name)
-            except _store_module().StoreError as exc:
-                _die(6, exc.slug, exc.message, exc.hint)
-            for key in keys:
-                if not key.startswith("reference."):
-                    continue
-                doc = adapter.document_read(name, key)
-                if not doc:
-                    continue
-                fm = _front_matter(doc["body"])
-                if not fm.get("name"):
-                    continue
-                path = adapter.document_path(name, key)
-                target = (str(path.relative_to(root)) if path is not None
-                          and path.is_relative_to(root)
-                          else f"{name} refs show {key.removeprefix('reference.')}")
-                desc = fm.get("description", "")
-                refs.append(f"- `{target}` — {desc}".rstrip(" —"))
             if refs:
                 if bullet:
                     bullet.append("")
@@ -4720,22 +4792,30 @@ def _refresh_context(root: Path) -> dict | None:
     if _contextkit_managed(root):
         return None
     out = {}
-    claude_file = root / ".claude" / "rules" / "CAPABILITIES.md"
-    if claude_file.exists():
-        claude_file.write_text(_compose_context(root))
-        out["claude"] = str(claude_file)
-    codex_fragment = root / CODEX_CAPABILITIES_REL
-    if codex_fragment.exists():
-        out["codex"] = str(_write_codex_capabilities(root))
+    for host, rel in (("claude", CLAUDE_CAPABILITIES_REL),
+                      ("codex", CODEX_CAPABILITIES_REL)):
+        if (root / rel).exists():
+            out[host] = str(_write_host_context(root, host)["path"])
     return out or None
 
 
-def _write_codex_capabilities(root: Path) -> Path:
-    """Write the capabilities fragment for Codex."""
-    target = root / CODEX_CAPABILITIES_REL
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(_compose_context(root))
-    return target
+def _write_host_context(root: Path, host: str) -> dict:
+    """Rebuild one host's capabilities file and say how it differs from before.
+
+    What was on disk before this rebuild is what a starting session loaded,
+    so `created` and `changed` are exactly what that session must be told.
+    """
+    target = root / (CLAUDE_CAPABILITIES_REL if host == "claude"
+                     else CODEX_CAPABILITIES_REL)
+    try:
+        before = target.read_text()
+    except FileNotFoundError:
+        before = None
+    body = _compose_context(root)
+    if body != before:
+        _atomic_write_text(target, body)
+    return {"path": target, "created": before is None,
+            "changed": before is not None and body != before}
 
 
 def _id_value(v) -> str:
@@ -4820,58 +4900,115 @@ def cmd_set(name: str, collection: str, key: str,
         adapter.close()
 
 
+# A TOML table header; every key after the first one belongs to that table.
+_TOML_TABLE_HEADER = re.compile(r"^[ \t]*\[{1,2}[^\[\]\n]+\]{1,2}[ \t]*(?:#.*)?$", re.M)
+
+
+def _toml_root_end(text: str) -> int:
+    m = _TOML_TABLE_HEADER.search(text)
+    return m.start() if m else len(text)
+
+
 def _wire_codex_config(root: Path) -> bool:
+    """Name the root link as a Codex fallback, keeping names the person added."""
     path = root / CODEX_CONFIG_REL
-    path.parent.mkdir(parents=True, exist_ok=True)
-    capabilities_rel = CODEX_CAPABILITIES_REL.as_posix()
-    if not path.exists():
-        path.write_text(
-            f'project_doc_fallback_filenames = ["{capabilities_rel}"]\n'
-            "project_doc_max_bytes = 131072\n")
-        return True
-    text = path.read_text()
-    changed = False
+    link_rel = CODEX_ROOT_LINK_REL.as_posix()
+    budget_line = "project_doc_max_bytes = 131072"
+    manager_lines = [f"project_doc_fallback_filenames = [{json.dumps(name)}]"
+                     for name in (link_rel, *CODEX_RETIRED_FALLBACKS)] + [budget_line]
+    original = path.read_text() if path.exists() else None
+    text = original or ""
+    # Codex reads both keys only at the root. Earlier wiring appended them after
+    # the last table, which files them under it; lift those manager lines out.
+    end = _toml_root_end(text)
+    tail = text[end:]
+    for line in manager_lines:
+        tail = re.sub(rf"^{re.escape(line)}[ \t]*(?:\n|\Z)", "", tail, flags=re.M)
+    head = text[:end]
+    inserts: list[str] = []
     m = re.search(r"^project_doc_fallback_filenames\s*=\s*\[(.*?)\]\s*$",
-                  text, flags=re.M | re.S)
+                  head, flags=re.M | re.S)
     if m:
         items = re.findall(r'"([^"]+)"|\'([^\']+)\'', m.group(1))
         values = [a or b for a, b in items]
-        # REBIND: remove legacy context.md, keep only capabilities.md
-        legacy_context = ".codex/generated/context.md"
-        filtered = [v for v in values if v != legacy_context]
-        if capabilities_rel not in filtered:
-            filtered.append(capabilities_rel)
+        filtered = [v for v in values if v not in CODEX_RETIRED_FALLBACKS]
+        if link_rel not in filtered:
+            filtered.append(link_rel)
         if filtered != values:
             replacement = "project_doc_fallback_filenames = [" + \
                 ", ".join(json.dumps(v) for v in filtered) + "]"
-            text = text[:m.start()] + replacement + text[m.end():]
-            changed = True
+            head = head[:m.start()] + replacement + head[m.end():]
     else:
-        text = text.rstrip("\n") + \
-            f'\nproject_doc_fallback_filenames = ["{capabilities_rel}"]\n'
-        changed = True
-    if "project_doc_max_bytes" not in text:
-        text = text.rstrip("\n") + "\nproject_doc_max_bytes = 131072\n"
-        changed = True
-    if changed:
-        path.write_text(text if text.endswith("\n") else text + "\n")
-    return changed
+        inserts.append(manager_lines[0])
+    if not re.search(r"^project_doc_max_bytes\s*=", head, flags=re.M):
+        inserts.append(budget_line)
+    if inserts:
+        body = head.rstrip("\n")
+        head = (body + "\n" if body else "") + "\n".join(inserts) + "\n"
+        if tail:
+            head += "\n"
+    text = head + tail
+    if not text.endswith("\n"):
+        text += "\n"
+    if text == original:
+        return False
+    _atomic_write_text(path, text)
+    return True
+
+
+def _codex_link_ok(root: Path) -> bool:
+    """True when the root link resolves to the generated capabilities file."""
+    link = root / CODEX_ROOT_LINK_REL
+    return (link.is_symlink()
+            and link.resolve() == (root / CODEX_CAPABILITIES_REL).resolve())
+
+
+def _link_codex_root(root: Path) -> str:
+    """Point the root name Codex loads at the generated file.
+
+    Returns `kept`, `linked`, or `blocked: ...`. Only a missing path, a dangling
+    link, or manager-generated context is replaced; anything else stays with
+    its owner.
+    """
+    link = root / CODEX_ROOT_LINK_REL
+    if _codex_link_ok(root):
+        return "kept"
+    if link.is_symlink() or link.exists():
+        target = link.resolve()
+        try:
+            owned = not target.exists() or CONTEXT_BEGIN in target.read_text()
+        except (OSError, UnicodeDecodeError):
+            owned = False
+        if not owned:
+            return (f"blocked: `{CODEX_ROOT_LINK_REL.as_posix()}` exists and is "
+                    "not manager-generated context")
+    temp = root / f".{link.name}.{os.getpid()}.tmp"
+    temp.unlink(missing_ok=True)
+    temp.symlink_to(CODEX_CAPABILITIES_REL)
+    temp.replace(link)
+    return "linked"
+
+
+def _deliver_codex(root: Path) -> dict:
+    """Bring the root link and the config naming it to their current form."""
+    return {"config_changed": _wire_codex_config(root),
+            "link": _link_codex_root(root)}
 
 
 def _wire_codex_hooks(root: Path) -> bool:
     path = root / CODEX_HOOKS_REL
-    hooks = _read_json(path) if path.exists() else None
-    if not isinstance(hooks, dict):
-        hooks = {}
+    hooks = _read_host_settings(path)
     root_hooks = hooks.setdefault("hooks", {})
     session = root_hooks.setdefault("SessionStart", [])
+    # An existing entry is left as it is: Codex records trust against the whole
+    # entry, matcher included, and a run on compaction only prints a notice.
     for entry in session:
         for h in (entry or {}).get("hooks", []):
             cmd = h.get("command", "")
-            if "capabilities context --codex" in cmd:
+            if CODEX_HOOK_COMMAND in cmd:
                 return False
     session.append({
-        "matcher": "startup|resume|clear|compact",
+        "matcher": CODEX_SESSION_MATCHER,
         "hooks": [{
             "type": "command",
             "command": CODEX_HOOK_COMMAND,
@@ -4884,16 +5021,130 @@ def _wire_codex_hooks(root: Path) -> bool:
 
 
 def _wire_codex(root: Path) -> dict:
+    context = _write_host_context(root, "codex")["path"]
+    delivery = _deliver_codex(root)
     return {
         "config": str(root / CODEX_CONFIG_REL),
-        "config_changed": _wire_codex_config(root),
+        "config_changed": delivery["config_changed"],
         "hooks": str(root / CODEX_HOOKS_REL),
         "hook_added": _wire_codex_hooks(root),
-        "capabilities_context": str(_write_codex_capabilities(root)),
+        "capabilities_context": str(context),
+        "root_link": delivery["link"],
     }
 
 
+def _codex_delivery_blockers(root: Path) -> list[str]:
+    """Name what keeps Codex from loading the capabilities file it is wired to."""
+    for name in CODEX_ROOT_DOCS:
+        if (root / name).exists():
+            return [f"Codex loads the root `{name}` and then ignores the fallback "
+                    f"`{CODEX_ROOT_LINK_REL.as_posix()}`; move the content of "
+                    f"`{name}` elsewhere or remove it (the manager never edits it)"]
+    return []
+
+
+def _codex_wired(root: Path) -> bool:
+    """True when the project's Codex config names a manager-generated file."""
+    try:
+        text = (root / CODEX_CONFIG_REL).read_text()
+    except OSError:
+        return False
+    return any(name in text for name in
+               (CODEX_ROOT_LINK_REL.as_posix(), *CODEX_RETIRED_FALLBACKS))
+
+
+def _session_start_payload() -> dict | None:
+    """The host's SessionStart payload when a harness hook invoked this run.
+
+    Claude Code and Codex both pipe a JSON object carrying
+    `hook_event_name: "SessionStart"` to the hook's stdin. A terminal, an
+    empty or foreign stdin, or a pipe that stays silent reads as no payload.
+    """
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return None
+        fd = sys.stdin.fileno()
+        deadline = time.monotonic() + HOOK_PAYLOAD_WAIT_SECONDS
+        chunks: list[bytes] = []
+        while True:
+            ready, _, _ = select.select([fd], [], [],
+                                        max(0.0, deadline - time.monotonic()))
+            if not ready:
+                return None
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = json.loads(b"".join(chunks))
+    except (OSError, ValueError):
+        return None
+    if isinstance(payload, dict) and payload.get("hook_event_name") == "SessionStart":
+        return payload
+    return None
+
+
+def _session_notice(host: str) -> str | None:
+    """Rebuild the host's capabilities file and say what this session must be told.
+
+    The file reaches the agent through the host's own loading, so hook output
+    carries only a short notice, and only when the loaded copy is missing,
+    stale, or cannot load. A failure becomes the notice: session start never
+    breaks. None means ContextKit owns this project's hooks.
+    """
+    errors = io.StringIO()
+    try:
+        with redirect_stderr(errors):
+            root = _require_project()
+            if _contextkit_managed(root):
+                return None
+            build = _write_host_context(root, host)
+            blockers = []
+            linked = False
+            if host == "codex" and _codex_wired(root):
+                link = _deliver_codex(root)["link"]
+                linked = link == "linked"
+                if link.startswith("blocked: "):
+                    blockers.append(link.removeprefix("blocked: "))
+            if host == "codex":
+                blockers += _codex_delivery_blockers(root)
+    except (SystemExit, Exception) as exc:
+        reason = str(exc) if not isinstance(exc, SystemExit) else "unknown error"
+        for line in reversed(errors.getvalue().splitlines()):
+            try:
+                reason = json.loads(line)["error"]["message"]
+                break
+            except (ValueError, KeyError, TypeError):
+                continue
+        notice = (f"The capabilities manager could not rebuild the capability "
+                  f"context: {_md_escape(reason)}. This session may carry a stale "
+                  f"or missing copy. Tell the user; `capabilities doctor` names "
+                  f"the repair.")
+    else:
+        if blockers:
+            notice = ("The capability context did not load in this session: "
+                      + "; ".join(blockers)
+                      + ". Tell the user; `capabilities doctor` names the repair.")
+        elif build["created"] or linked:
+            notice = ("The capabilities manager created the capability context "
+                      "after this session started, so this session has none "
+                      "loaded. Tell the user; a new or resumed session loads it.")
+        elif build["changed"]:
+            notice = ("The capability context changed after this session loaded "
+                      "it, so the loaded copy is stale. Tell the user; a new or "
+                      "resumed session loads the update.")
+        else:
+            return ""
+    return "# Capabilities Session Notice\n\n" + notice + "\n"
+
+
 def cmd_context(host: str) -> None:
+    # The same command line serves as the host's SessionStart hook, so wired
+    # projects need no migration; a terminal run keeps its JSON result.
+    if host != "fragment" and _session_start_payload() is not None:
+        notice = _session_notice(host)
+        if notice is not None:
+            sys.stdout.write(notice)
+            return
     root = _require_project()
     if host == "fragment":
         _emit(_compose_context(root))
@@ -4903,12 +5154,10 @@ def cmd_context(host: str) -> None:
         result["skipped"] = True
         _emit(result)
         return
-    if host == "claude":
-        target = root / ".claude" / "rules" / "CAPABILITIES.md"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_compose_context(root))
-    else:
-        target = _write_codex_capabilities(root)
+    target = _write_host_context(root, host)["path"]
+    # A wired project converts in place: no one reruns init for a new layout.
+    if host == "codex" and _codex_wired(root):
+        _deliver_codex(root)
     project_caps, global_caps = _policy_views(root)
     enabled = [
         n for n in set(project_caps) | set(global_caps)
@@ -4924,7 +5173,7 @@ HOOK_COMMAND = "capabilities context --claude"
 
 def _wire_claude_hook(root: Path) -> bool:
     settings_file = root / ".claude" / "settings.json"
-    settings = _read_json(settings_file) or {}
+    settings = _read_host_settings(settings_file)
     hooks = settings.setdefault("hooks", {})
     session = hooks.setdefault("SessionStart", [])
     for entry in session:
@@ -4956,12 +5205,14 @@ def cmd_init(claude: bool, codex: bool) -> None:
         _sync_skill(force_claude=claude, force_codex=codex)
         _emit(result)
         return
+    # Refuse an unreadable host settings file before either host is touched.
+    if claude:
+        _read_host_settings(root / ".claude" / "settings.json")
+    if codex:
+        _read_host_settings(root / CODEX_HOOKS_REL)
     if claude:
         result["hook_added"] = _wire_claude_hook(root)
-        target = root / ".claude" / "rules" / "CAPABILITIES.md"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_compose_context(root))
-        result["context"] = str(target)
+        result["context"] = str(_write_host_context(root, "claude")["path"])
     if codex:
         migration = _migrate_codex_legacy(root)
         if migration["removed"]:
@@ -5220,6 +5471,24 @@ def cmd_doctor() -> None:
                 if ".codex/generated/context.md" in config_text:
                     findings.append("project: .codex/config.toml points to legacy context.md "
                                     "— run `capabilities init --codex` to migrate to capabilities.md")
+            if _codex_wired(root):
+                link_rel = CODEX_ROOT_LINK_REL.as_posix()
+                fallback = re.search(
+                    r"^project_doc_fallback_filenames\s*=\s*\[(.*?)\]",
+                    config_text[:_toml_root_end(config_text)], flags=re.M | re.S)
+                if not fallback or json.dumps(link_rel) not in fallback.group(1) \
+                        and repr(link_rel) not in fallback.group(1):
+                    findings.append(
+                        f"project: .codex/config.toml does not name `{link_rel}` in its "
+                        "root project_doc_fallback_filenames — run `capabilities "
+                        "context --codex` to repair")
+                if not _codex_link_ok(root) or not (root / CODEX_CAPABILITIES_REL).is_file():
+                    findings.append(
+                        f"project: `{link_rel}` is missing or does not link to "
+                        f"{CODEX_CAPABILITIES_REL.as_posix()} — run `capabilities "
+                        "context --codex` to repair")
+                for blocker in _codex_delivery_blockers(root):
+                    findings.append(f"project: Codex capability context does not load — {blocker}")
     report = {"ok": not findings, "findings": findings}
     if findings:
         _emit(report)

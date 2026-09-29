@@ -259,6 +259,7 @@ def test_contextkit_init_retires_only_legacy_capabilities_wiring(tmp_path: Path)
     assert not (project / ".codex" / "hooks" / "build-context.sh").exists()
     assert not (project / ".codex" / "generated" / "capabilities.md").exists()
     assert not (project / ".codex" / "generated" / "context.md").exists()
+    assert not (project / ".capabilities.md").is_symlink()
     next_settings = json.loads(claude_settings.read_text())
     commands = [
         hook["command"]
