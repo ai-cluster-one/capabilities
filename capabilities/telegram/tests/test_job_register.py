@@ -68,6 +68,16 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(self.store._project_id("testproject"),
                          "11111111-1111-4111-8111-111111111111")
 
+    def test_a_read_leaves_registration_out(self):
+        """A read whose project id may not be stamped opens the register
+        without registering, and reads the project as it is registered."""
+        (self.envelope / "project.json").write_text(
+            json.dumps({"slug": "testproject", "store": "db"}))
+        read_store, reader = jobs.open_register(
+            store, self.envelope, "development", url=self.url, register=False)
+        self.addCleanup(read_store.close)
+        self.assertEqual(reader.project_id, "11111111-1111-4111-8111-111111111111")
+
     def test_a_topic_key_round_trips(self):
         """The key is written by whoever registers the job and read back by the
         daemon delivering the answer. A shape that does not survive that trip

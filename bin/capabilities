@@ -38,6 +38,13 @@ ENVIRONMENT
                        project passes that handoff over and resolves its own.
                        Alone it carries no answer; an envelope supplied without
                        it is honored wherever it is inherited.
+  CAPABILITIES_PROJECT_ID
+                       the project id a write may stamp, handed down beside the
+                       envelope by a process that resolved it, so a descendant
+                       uses it without asking ContextKit.
+  CAPABILITIES_PROJECT_ID_ROOT
+                       the project root that id answers for, scoping it the way
+                       CAPABILITIES_PROJECT_ENVELOPE_ROOT scopes the envelope.
 
 PROJECT PATH VERB
   path --json [--identity]
@@ -430,6 +437,8 @@ CONTEXTKIT_ENVELOPE_QUERY = ("path", "capabilities")
 CONTEXTKIT_IDENTITY_QUERY = ("identity", "show", "--json", "--project")
 ENVELOPE_ENV = "CAPABILITIES_PROJECT_ENVELOPE"
 ENVELOPE_ROOT_ENV = "CAPABILITIES_PROJECT_ENVELOPE_ROOT"
+PROJECT_ID_ENV = "CAPABILITIES_PROJECT_ID"
+PROJECT_ID_ROOT_ENV = "CAPABILITIES_PROJECT_ID_ROOT"
 CODEX_HOOK_COMMAND = "capabilities context --codex"
 # Codex reloads its project docs itself after compaction, so the managed hook
 # only refreshes the generated file when a session begins.
@@ -916,6 +925,11 @@ def _contextkit_identity(root: Path) -> dict:
         return _identity_problem(
             "contextkit_unavailable", f"could not run ContextKit: {exc}",
             "install/repair ContextKit or remove the broken .contextkit binding")
+    if proc.returncode != 0 and re.search(r"invalid choice: '(identity|show)'",
+                                          proc.stderr or ""):
+        # A ContextKit that has no identity verb cannot hold an id: the project
+        # is bound and waiting for adoption, exactly as if it answered null.
+        return {"bound": True, "id": None}
     if proc.returncode != 0:
         return _identity_problem(
             "contextkit_identity_failed",
@@ -1013,20 +1027,59 @@ def _cached_project_id(root: Path) -> str | None:
     return str(identity.get("id") or "").strip() or None
 
 
+def _handed_off_project_id(root: Path) -> str:
+    """The project id handed down for THIS root, or "" when there is none.
+
+    Scoped by $CAPABILITIES_PROJECT_ID_ROOT exactly as the envelope handoff is
+    scoped by its companion: a handoff for another root is passed over, and one
+    supplied without the companion is honored as given."""
+    handed = os.environ.get(PROJECT_ID_ENV, "").strip()
+    if not handed:
+        return ""
+    scope = os.environ.get(PROJECT_ID_ROOT_ENV, "").strip()
+    if not scope:
+        return handed
+    try:
+        if Path(scope).expanduser().resolve() != root.resolve():
+            return ""
+    except OSError:
+        return ""
+    return handed
+
+
 def _project_id_state(root: Path) -> dict:
     """The project's id, where it came from, and whether it can be trusted.
 
-    Reads use `id` in every state; `_project_id_for_write` decides writes."""
-    context = _context_identity(root)
+    A live handoff for this root outranks ContextKit, as the envelope handoff
+    outranks the record. Reads use `id` in every state;
+    `_project_id_for_write` decides writes."""
     cached = _cached_project_id(root)
-    if "error" in context:
-        state = {"state": "unresolved", "id": cached, "bound": True,
-                 "contextkit_id": None, "error": context["error"]}
+    handed = _handed_off_project_id(root)
+    if handed:
+        state = _identity_verdict(True, handed, cached)
+        if state["state"] != "mismatch":
+            state["state"] = "handed"
+        state.update(bound=None, contextkit_id=handed)
     else:
-        state = _identity_verdict(context["bound"], context["id"], cached)
-        state.update(bound=context["bound"], contextkit_id=context["id"])
+        context = _context_identity(root)
+        if "error" in context:
+            state = {"state": "unresolved", "id": cached, "bound": True,
+                     "contextkit_id": None, "error": context["error"]}
+        else:
+            state = _identity_verdict(context["bound"], context["id"], cached)
+            state.update(bound=context["bound"], contextkit_id=context["id"])
     state["project_json_id"] = cached
     return state
+
+
+def _project_id_handoff(root: Path) -> dict[str, str]:
+    """The id hand-down for a process launched to stand in `root`: the id a
+    write may stamp there, scoped to that root, or nothing when none may be."""
+    root = Path(root)
+    state = _project_id_state(root)
+    if not state["id"] or _identity_refusal(state) is not None:
+        return {}
+    return {PROJECT_ID_ENV: state["id"], PROJECT_ID_ROOT_ENV: str(root.resolve())}
 
 
 def _project_id_for_write(root: Path) -> str | None:
@@ -3438,6 +3491,7 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
             "CAPABILITIES_PROJECT_ENVELOPE": str(envelope),
             "CAPABILITIES_DEV_PROJECT": str(project),
             "CAPABILITIES_DEV_EXECUTION": "project",
+            **_project_id_handoff(project),
         })
         if registry_mode == "db":
             env["CAPABILITIES_STORE_URL"] = (
@@ -3573,6 +3627,7 @@ def _dev_live_env(session: dict, inputs: dict,
         "CLAUDE_PROJECT_DIR": str(inputs["project"]),
         "CAPABILITIES_PROJECT_ENVELOPE": str(inputs["envelope"]),
         "CAPABILITIES_DEV_PROJECT": str(inputs["project"]),
+        **_project_id_handoff(inputs["project"]),
     })
     return env, projection
 
@@ -3725,6 +3780,7 @@ def cmd_dev_live_start(session_id: str, adapter: str) -> None:
     canonical_env = dict(os.environ)
     canonical_env["CLAUDE_PROJECT_DIR"] = str(inputs["project"])
     canonical_env["CAPABILITIES_PROJECT_ENVELOPE"] = str(inputs["envelope"])
+    canonical_env.update(_project_id_handoff(inputs["project"]))
     canonical_status = _dev_live_command(
         canonical, ["service", "status", "--connection", inputs["connection"]],
         inputs["project"], canonical_env, inputs["secrets"])
@@ -3876,6 +3932,7 @@ def _dev_live_recover_locked(session_id: str, adapter: str, lease: dict) -> None
     env["CLAUDE_PROJECT_DIR"] = str(project)
     envelope = _project_capabilities_dir(project)
     env["CAPABILITIES_PROJECT_ENVELOPE"] = str(envelope)
+    env.update(_project_id_handoff(project))
     connection = str(lease["connection"])
     secrets_list: list[str] = []
     _dev_live_reconcile_owner(lease)
@@ -4652,10 +4709,13 @@ def _ensure_project_identity(capdir: Path, root: Path) -> dict:
     context = (_context_identity(root) if _contextkit_managed(root)
                else {"bound": False, "id": None})
     if context.get("bound") or "error" in context:
-        # ContextKit owns a bound project's id, so the copy takes the id it has
-        # and waits, without one, for `contextkit identity adopt` to assign it.
-        if context.get("id"):
-            identity["id"] = context["id"]
+        # ContextKit owns a bound project's id, so the copy takes the id it has.
+        # Without one nothing is written: `contextkit identity adopt` reads an
+        # absent file as "no id yet" and refuses one that carries no id, and the
+        # next init after adoption writes the copy.
+        if not context.get("id"):
+            return {}
+        identity["id"] = context["id"]
     else:
         # Twelve hex characters, for the reason a document version has twelve:
         # an identifier nobody can read is an identifier nobody checks.

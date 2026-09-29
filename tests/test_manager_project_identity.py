@@ -29,7 +29,8 @@ def _project(tmp_path: Path, *, bound: bool, contextkit_id: str | None = None,
     return project
 
 
-def _contextkit(tmp_path: Path, *, identity_exit: int = 0) -> Path:
+def _contextkit(tmp_path: Path, *, identity_exit: int = 0,
+                identity_error: str = "no such command") -> Path:
     """A stand-in `contextkit` that answers both questions out of the project's
     own binding, the way the real one does, and logs each call."""
     bin_dir = tmp_path / "fakebin"
@@ -40,7 +41,7 @@ def _contextkit(tmp_path: Path, *, identity_exit: int = 0) -> Path:
         "#!/bin/sh\n"
         f'echo "$@" >> "{log}"\n'
         'if [ "$1" = path ]; then printf "%s/capabilities\\n" "$(pwd)"; exit 0; fi\n'
-        f"if [ {identity_exit} -ne 0 ]; then echo 'no such command' >&2; exit {identity_exit}; fi\n"
+        f"if [ {identity_exit} -ne 0 ]; then echo \"{identity_error}\" >&2; exit {identity_exit}; fi\n"
         'root="$5"\n'
         'id=$(sed -n \'s/^id = "\\(.*\\)"$/\\1/p\' "$root/.contextkit/config.toml")\n'
         'if [ -n "$id" ]; then id="\\"$id\\""; else id=null; fi\n'
@@ -109,7 +110,10 @@ def test_init_mints_no_id_while_contextkit_has_none(tmp_path: Path) -> None:
 
     _json(_run(tmp_path, project, "init"))
 
-    assert "id" not in _copy(project)
+    # No copy at all: `contextkit identity adopt` reads an absent project.json
+    # as "no id yet", and refuses one that carries no id.
+    assert not (project / "capabilities" / "project.json").exists()
+    assert (project / "capabilities" / "settings.json").is_file()
     report = _json(_run(tmp_path, project, "doctor"))
     assert report["project_identity"]["state"] == "pending"
     assert report["project_identity"]["id"] is None
@@ -218,7 +222,7 @@ def test_contextkit_that_cannot_answer_mints_nothing_and_is_reported(tmp_path: P
     doctor = _run(tmp_path, project, "doctor")
     _run(tmp_path, project, "path", "--json", "--identity")
 
-    assert "id" not in _copy(project)
+    assert not (project / "capabilities" / "project.json").exists()
     assert path.returncode == 6
     assert _error(path)["code"] == "contextkit_identity_failed"
     assert doctor.returncode == 7
@@ -251,3 +255,46 @@ def test_a_capability_reads_the_recorded_identity_without_the_manager(tmp_path: 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"read": "prj_0000000000e1",
                                          "write": "prj_0000000000e1"}
+
+
+def test_contextkit_without_the_identity_verb_is_pending_adoption(tmp_path: Path) -> None:
+    project = _project(tmp_path, bound=True,
+                       copy={"schema": "capabilities.project.v1", "slug": "p",
+                             "id": "prj_0000000000f1"})
+    log = _contextkit(tmp_path, identity_exit=2, identity_error=(
+        "contextkit: error: argument command: invalid choice: 'identity' "
+        "(choose from 'help', 'path', 'build')"))
+
+    first = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
+    doctor = json.loads(_run(tmp_path, project, "doctor").stdout)
+    _json(_run(tmp_path, project, "path", "--json", "--identity"))
+
+    assert (first["state"], first["id"]) == ("pending", "prj_0000000000f1")
+    assert doctor["project_identity"]["state"] == "pending"
+    assert not [f for f in doctor["findings"] if "project id" in f]
+    # A ContextKit without the verb is an answer, and is recorded like one.
+    assert _identity_calls(log) == 1
+
+
+def test_a_handed_down_id_is_used_without_asking_contextkit(tmp_path: Path) -> None:
+    project = _project(tmp_path, bound=True, contextkit_id="prj_0000000000f2",
+                       copy={"schema": "capabilities.project.v1", "slug": "p",
+                             "id": "prj_0000000000f2"})
+    env = _env(tmp_path, project)
+    env["PATH"] = os.pathsep.join(p for p in env["PATH"].split(os.pathsep)
+                                  if not (Path(p) / "contextkit").exists())
+    env.update({"CAPABILITIES_PROJECT_ENVELOPE": str(project / "capabilities"),
+                "CAPABILITIES_PROJECT_ENVELOPE_ROOT": str(project),
+                "CAPABILITIES_PROJECT_ID": "prj_0000000000f2",
+                "CAPABILITIES_PROJECT_ID_ROOT": str(project)})
+
+    result = subprocess.run([sys.executable, str(MANAGER), "path", "--json", "--identity"],
+                            cwd=project, env=env, text=True, capture_output=True, timeout=60)
+    identity = _json(result)["project_identity"]
+    assert (identity["state"], identity["id"]) == ("handed", "prj_0000000000f2")
+
+    env["CAPABILITIES_PROJECT_ID_ROOT"] = str(tmp_path / "elsewhere")
+    elsewhere = subprocess.run([sys.executable, str(MANAGER), "path", "--json", "--identity"],
+                               cwd=project, env=env, text=True, capture_output=True, timeout=60)
+    assert elsewhere.returncode == 6
+    assert _error(elsewhere)["code"] == "contextkit_unavailable"

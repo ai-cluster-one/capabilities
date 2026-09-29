@@ -54,6 +54,10 @@ def declares(tmp_path, monkeypatch):
                             lambda r: tmp_path / envelope)
         monkeypatch.setattr(mod, "_context_identity",
                             lambda r: contextkit or {"bound": False, "id": None})
+        # Resolving hands the id down in this process's environment; keep that
+        # inside the test.
+        monkeypatch.setenv("CAPABILITIES_PROJECT_ID", "")
+        monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", "")
         return tmp_path
     return write
 
@@ -159,6 +163,32 @@ def test_contextkit_that_cannot_answer_leaves_reads_and_refuses_writes(
         mod._writing_project()
     assert exit_info.value.code == 6
     assert _error(capsys)["code"] == "contextkit_identity_failed"
+
+
+def test_a_handed_down_id_outranks_contextkit_and_is_handed_on(declares, monkeypatch):
+    def never(root):
+        raise AssertionError("ContextKit was asked despite a live hand-down")
+
+    root = declares({"id": HERE, "slug": "a-project"})
+    monkeypatch.setattr(mod, "_context_identity", never)
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID", HERE)
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(root))
+    state = mod._project_id_state()
+    assert (state["state"], state["id"]) == ("handed", HERE)
+    assert mod._identity_refusal(state) is None
+
+
+def test_a_resolved_id_a_write_may_stamp_is_handed_down(declares):
+    root = declares({"id": HERE, "slug": "a-project"}, contextkit=_bound(HERE))
+    mod._project_id_state()
+    assert os.environ["CAPABILITIES_PROJECT_ID"] == HERE
+    assert os.environ["CAPABILITIES_PROJECT_ID_ROOT"] == str(root)
+
+
+def test_an_id_a_write_may_not_stamp_is_not_handed_down(declares):
+    declares({"id": THERE, "slug": "a-project"}, contextkit=_bound(HERE))
+    mod._project_id_state()
+    assert os.environ["CAPABILITIES_PROJECT_ID"] == ""
 
 
 # --- What each direction does with it ----------------------------------------

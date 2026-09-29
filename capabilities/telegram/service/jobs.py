@@ -51,6 +51,7 @@ remember, which is the whole reason `JobRegister` exists as a boundary.
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -321,9 +322,22 @@ def project_identity(envelope: Path) -> dict:
                        "run `capabilities init` in the project") from exc
 
 
+def handed_project_id(root: Path) -> str:
+    """The project id its launcher handed down for this root, scoped by
+    CAPABILITIES_PROJECT_ID_ROOT the way the envelope handoff is scoped."""
+    handed = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
+    scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
+    if not handed or not scope:
+        return handed
+    try:
+        return handed if Path(scope).resolve() == Path(root).resolve() else ""
+    except OSError:
+        return ""
+
+
 def open_register(store_module, envelope: Path, environment: str,
                   surface: str = "telegram", url: str | None = None,
-                  project_id: str | None = None):
+                  project_id: str | None = None, register: bool = True):
     """The store this project's jobs live in, and the register onto it.
 
     There is no file-mode register. A queue, a slot count and a cancellation
@@ -333,7 +347,8 @@ def open_register(store_module, envelope: Path, environment: str,
 
     Registering stamps the project id, so the id is the one the launching CLI
     resolved for a write and passes in; project.json's own id stands in only
-    where no launcher resolved one.
+    where no launcher resolved one. A read whose project id may not be stamped
+    passes `register` False and reads the project as it is already registered.
     """
     identity = project_identity(envelope)
     slug = identity.get("slug")
@@ -344,7 +359,8 @@ def open_register(store_module, envelope: Path, environment: str,
     store = store_module.open_store(url)
     try:
         store.migrate()
-        store.project_register(project_id or identity.get("id"), slug)
+        if register:
+            store.project_register(project_id or identity.get("id"), slug)
         for version in range(1, STORE_VERSION + 1):
             if store.schema_version(STORE_NAMESPACE) < version:
                 store.migrate(

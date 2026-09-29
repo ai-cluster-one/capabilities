@@ -1606,15 +1606,52 @@ def test_a_dedupe_collision_still_yields_rather_than_raising(tmp_path):
     st.close()
 
 
-def test_registration_stamps_the_id_its_launcher_resolved(monkeypatch):
+def test_registration_stamps_the_id_its_launcher_resolved(tmp_path, monkeypatch):
     """The id a run is registered under is the one the automations CLI resolved
     for a write: installed in process, handed to the daemon it launches, and
     project.json's own only where no launcher resolved one."""
     identity = {"id": "prj_copy00000000", "slug": "labelled"}
     monkeypatch.setattr(RUNTIME, "PROJECT_ID_FOR_WRITE", None)
-    monkeypatch.delenv("AUTOMATIONS_PROJECT_ID", raising=False)
-    assert RUNTIME._registration_id(identity) == "prj_copy00000000"
-    monkeypatch.setenv("AUTOMATIONS_PROJECT_ID", "prj_handed000000")
-    assert RUNTIME._registration_id(identity) == "prj_handed000000"
-    monkeypatch.setattr(RUNTIME, "PROJECT_ID_FOR_WRITE", lambda: "prj_resolved0000")
-    assert RUNTIME._registration_id(identity) == "prj_resolved0000"
+    monkeypatch.delenv("CAPABILITIES_PROJECT_ID", raising=False)
+    monkeypatch.delenv("CAPABILITIES_PROJECT_ID_ROOT", raising=False)
+    assert RUNTIME._registration_id(tmp_path, identity) == "prj_copy00000000"
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID", "prj_handed000000")
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(tmp_path))
+    assert RUNTIME._registration_id(tmp_path, identity) == "prj_handed000000"
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(tmp_path / "elsewhere"))
+    assert RUNTIME._registration_id(tmp_path, identity) == "prj_copy00000000"
+    asked = []
+    monkeypatch.setattr(RUNTIME, "PROJECT_ID_FOR_WRITE",
+                        lambda strict=True: asked.append(strict) or "prj_resolved0000")
+    assert RUNTIME._registration_id(tmp_path, identity) == "prj_resolved0000"
+    assert RUNTIME._registration_id(tmp_path, identity, strict=False) == "prj_resolved0000"
+    assert asked == [True, False]
+
+
+def test_a_read_whose_id_may_not_be_stamped_reads_without_registering(tmp_path, monkeypatch):
+    """A read never refuses over the project id: the registration it would make
+    is left out, and an unregistered project reads as empty, never as every
+    project."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
+    import store as store_mod
+
+    root = tmp_path / "project"
+    (root / "capabilities").mkdir(parents=True)
+    (root / "capabilities" / "project.json").write_text(json.dumps(
+        {"schema": "capabilities.project.v1", "slug": "unstamped"}))
+    monkeypatch.setenv("CAPABILITIES_STORE_URL", str(tmp_path / "shared.db"))
+    other = store_mod.SQLiteStore.open(str(tmp_path / "shared.db"))
+    other.migrate()
+    other.project_register("prj_other0000000", "other")
+    other.migrate(RUNTIME.STORE_NAMESPACE, RUNTIME.STORE_VERSION, RUNTIME.STORE_MIGRATIONS)
+    other.close()
+    monkeypatch.setattr(RUNTIME, "PROJECT_ID_FOR_WRITE", lambda strict=True: None)
+
+    st, ledger = RUNTIME.open_ledger(root, {"engine": {"environment": "development"}},
+                                     strict=False)
+    try:
+        assert st._project_id("unstamped") is None
+        assert ledger._scoped and ledger.list(limit=10) == []
+    finally:
+        st.close()

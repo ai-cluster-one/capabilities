@@ -465,16 +465,30 @@ def _project_identity(root: Path) -> dict:
 
 
 # The id a registration stamps is the one the launching CLI resolves for a
-# write: in process the CLI installs its resolver here, and the daemon it
-# launches is handed the answer as AUTOMATIONS_PROJECT_ID. project.json's own id
-# stands in only where no launcher resolved one.
+# write: in process the CLI installs its resolver here, called with `strict`
+# False on a read path so a project whose id may not be stamped reads instead of
+# refusing, and the daemon it launches is handed the answer as
+# CAPABILITIES_PROJECT_ID. project.json's own id stands in only where no
+# launcher resolved one.
 PROJECT_ID_FOR_WRITE = None
 
 
-def _registration_id(identity: dict) -> str | None:
+def _handed_project_id(root: Path) -> str:
+    """The id handed down for this root, scoped the way the envelope is."""
+    handed = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
+    scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
+    if not handed or not scope:
+        return handed
+    try:
+        return handed if Path(scope).resolve() == Path(root).resolve() else ""
+    except OSError:
+        return ""
+
+
+def _registration_id(root: Path, identity: dict, strict: bool = True) -> str | None:
     if callable(PROJECT_ID_FOR_WRITE):
-        return PROJECT_ID_FOR_WRITE()
-    return os.environ.get("AUTOMATIONS_PROJECT_ID") or identity.get("id")
+        return PROJECT_ID_FOR_WRITE(strict)
+    return _handed_project_id(root) or identity.get("id")
 
 
 def materialise_script(state_dir: Path, key: str, version: str, body: str) -> Path:
@@ -695,13 +709,17 @@ def applies(item: dict[str, Any], environment: str) -> bool:
     )
 
 
-def open_ledger(root: Path, config: dict[str, Any]):
+def open_ledger(root: Path, config: dict[str, Any], strict: bool = True):
     """The store this project's runs live in, and the ledger onto it.
 
     There is no file-mode ledger any more. A run, a queue, a cursor are records
     nobody authors and nobody reviews, so a capability keeping its own database
     for them was only ever the easy thing; the store exists unconditionally and
-    this is where automations joins it. The caller closes the store."""
+    this is where automations joins it. The caller closes the store.
+
+    Opening registers the project, which stamps its id. A read path passes
+    `strict` False: where the id may not be stamped the registration is left
+    out and the ledger reads the project as it is registered, or as empty."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         import store as _store
@@ -712,14 +730,18 @@ def open_ledger(root: Path, config: dict[str, Any]):
     identity = _project_identity(root)
     st = _store.open_store()
     try:
+        registered = _registration_id(root, identity, strict)
         st.migrate()
-        st.project_register(_registration_id(identity), identity["slug"])
+        if registered or strict:
+            st.project_register(registered, identity["slug"])
         st.migrate(STORE_NAMESPACE, STORE_VERSION, STORE_MIGRATIONS)
     except _store.StoreError as exc:
         st.close()
         raise ConfigError(f"cannot prepare the store: {exc.message}") from exc
     project_id = st._project_id(identity["slug"])
-    return st, RunLedger(st._conn, project_id, config["engine"]["environment"])
+    # An unregistered project reads as empty, never as every project.
+    return st, RunLedger(st._conn, "" if project_id is None else project_id,
+                         config["engine"]["environment"])
 
 
 class RunLedger:
@@ -942,7 +964,7 @@ def enqueue_manual(
 
 def list_runs(root: Path, config: dict[str, Any], *, limit: int = 50,
               status: str | None = None) -> list[dict[str, Any]]:
-    store, ledger = open_ledger(root, config)
+    store, ledger = open_ledger(root, config, strict=False)
     try:
         return ledger.list(limit=limit, status=status)
     finally:
@@ -950,7 +972,7 @@ def list_runs(root: Path, config: dict[str, Any], *, limit: int = 50,
 
 
 def get_run(root: Path, config: dict[str, Any], run_id: str) -> dict[str, Any] | None:
-    store, ledger = open_ledger(root, config)
+    store, ledger = open_ledger(root, config, strict=False)
     try:
         return ledger.get(run_id)
     finally:
@@ -958,7 +980,7 @@ def get_run(root: Path, config: dict[str, Any], run_id: str) -> dict[str, Any] |
 
 
 def counts(root: Path, config: dict[str, Any]) -> dict[str, int]:
-    store, ledger = open_ledger(root, config)
+    store, ledger = open_ledger(root, config, strict=False)
     try:
         return ledger.counts()
     finally:
