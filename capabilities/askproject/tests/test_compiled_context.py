@@ -18,6 +18,7 @@ import sys
 import time
 from pathlib import Path
 
+from _peer import fake_source
 
 CAPABILITY = Path(__file__).resolve().parents[1]
 SCRIPT = next((path for path in (
@@ -25,16 +26,7 @@ SCRIPT = next((path for path in (
     if path.is_file()), CAPABILITY / "bin" / "askproject")
 
 
-CLAUDE_FAKE = r'''#!/usr/bin/env python3
-import json
-import sys
-
-print(json.dumps({
-    "type": "result", "subtype": "success", "is_error": False,
-    "result": "PEER ANSWER", "session_id": "claude-session",
-    "duration_ms": 1, "num_turns": 1, "total_cost_usd": 0.01, "usage": {},
-}), flush=True)
-'''
+CLAUDE_FAKE = fake_source("claude")
 
 
 def _project(path: Path) -> Path:

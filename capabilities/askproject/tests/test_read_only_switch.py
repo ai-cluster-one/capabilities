@@ -2,8 +2,10 @@
 
 Act mode exists to hand a peer write tools, so under the switch it is refused
 before any peer starts. Read mode still runs, and its peer inherits the switch
-by name, so the peer's own capability calls change nothing either. The session
-askproject records about the call is its operational state and is still kept.
+by name whatever its profile, so the peer's own capability calls change nothing
+either. The session askproject records about the call is its operational state
+and is still kept. With the switch off, the shipped read profile sets it for
+its own peer, and a profile that sets nothing hands the peer nothing new.
 """
 
 import json
@@ -14,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from _peer import fake_source
 
 CAPABILITY = Path(__file__).resolve().parents[1]
 SCRIPT = next((path for path in (
@@ -22,20 +25,10 @@ SCRIPT = next((path for path in (
 
 SWITCH = "CAPABILITIES_READ_ONLY"
 
-# Records what switch it was started under, so both the refusal (no record)
-# and the carry (the value it saw) are read off the peer itself.
-CLAUDE_FAKE = r'''#!/usr/bin/env python3
-import json
-import os
-
-with open(os.environ["PEER_MARKER"], "a") as seen:
-    seen.write(os.environ.get("CAPABILITIES_READ_ONLY", "<unset>") + "\n")
-print(json.dumps({
-    "type": "result", "subtype": "success", "is_error": False,
-    "result": "PEER ANSWER", "session_id": "claude-session",
-    "duration_ms": 1, "num_turns": 1, "total_cost_usd": 0.01, "usage": {},
-}), flush=True)
-'''
+# The shared fake appends the switch it was started under to $PEER_MARKER, so
+# both the refusal (no record) and the carry (the value it saw) are read off
+# the peer itself.
+CLAUDE_FAKE = fake_source("claude")
 
 
 def _project(path: Path) -> Path:
@@ -102,10 +95,32 @@ def test_read_mode_runs_and_carries_the_switch_to_its_peer(lab, value):
 
 
 @pytest.mark.parametrize("value", [None, "0", "false"])
-def test_with_the_switch_off_read_hands_the_peer_nothing_new(lab, value):
+def test_with_the_switch_off_the_shipped_read_profile_sets_it(lab, value):
     proc = _run(lab, str(lab["target"]), "what is here?", "--quiet", switch=value)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _peer_saw(lab) == ["1"]
+
+
+@pytest.mark.parametrize("value", [None, "0", "false"])
+def test_with_the_switch_off_a_bare_profile_hands_the_peer_nothing_new(lab, value):
+    profiles = lab["caller"] / "capabilities" / "askproject" / "profiles"
+    profiles.mkdir(parents=True)
+    (profiles / "bare.toml").write_text('[claude]\nengine = "claude"\n')
+    proc = _run(lab, str(lab["target"]), "what is here?", "--quiet",
+                "--profile", "bare", switch=value)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert _peer_saw(lab) == [value if value is not None else "<unset>"]
+
+
+@pytest.mark.parametrize("value", ["1", "true"])
+def test_under_the_switch_a_bare_profile_still_carries_it(lab, value):
+    profiles = lab["caller"] / "capabilities" / "askproject" / "profiles"
+    profiles.mkdir(parents=True)
+    (profiles / "bare.toml").write_text('[claude]\nengine = "claude"\n')
+    proc = _run(lab, str(lab["target"]), "what is here?", "--quiet",
+                "--profile", "bare", switch=value)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _peer_saw(lab) == ["1"]
 
 
 @pytest.mark.parametrize("value", [None, "0", "false"])

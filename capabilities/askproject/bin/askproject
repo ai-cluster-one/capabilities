@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
+#     "callva-agentworker==0.2.0",
 # ]
 # ///
 """
@@ -15,13 +16,15 @@ that peer reads whatever project context is compiled on disk there at that
 moment (Claude reads CLAUDE.md, Codex reads AGENTS.md) / settings / rights —
 then hands back the answer with cost, token, and files-changed data.
 
-Two engines drive the peer, selected with `--engine`:
-  claude (default)  headless `claude -p` — the newest Sonnet in read mode, the
-                    newest Opus in act mode, at high reasoning effort; override
-                    either with --model / --effort.
-  codex             headless `codex exec`; uses your ~/.codex/config.toml model
-                    (the newest) unless you pass --model. No USD cost is
-                    reported under ChatGPT auth, so cost_usd stays null.
+Two engines drive the peer, selected with `--engine`, and each is launched
+through the callva-agentworker library (Claude Code through its agent SDK, Codex
+through its app-server SDK, always the CLI installed on this machine), which
+applies the profile, resumes sessions, keeps the deadline and reads cost, tokens
+and the session id back out of what the engine reported:
+  claude (default)  Claude Code.
+  codex             Codex. No USD cost is reported under ChatGPT auth, so
+                    cost_usd stays null.
+What the peer may do, and on which model, is its profile — see PROFILES.
 
 Run `askproject help` to (re)load this contract on demand — do not rely on
 memorised knowledge of its surface.
@@ -35,6 +38,11 @@ COMMANDS
   askproject targets [--json]              List targets you've talked to (this
                                           project) + their last session. Add
                                           --json for machine-readable output.
+  askproject profiles                      List every profile in sight (JSON):
+                                          name, where it comes from, and the
+                                          same-named files it shadows.
+  askproject profiles show <name>          Print the file <name> resolves to,
+                                          verbatim, to copy and edit.
   askproject help                          Print this document.
 
 <target> is a path to the other project: absolute, ~-expanded, or relative to
@@ -58,37 +66,85 @@ COMPILED PROJECT CONTEXT
   before asking when the difference matters.
 
 ────────────────────────────────────────────────────────────────────────────
-MODES  (the fence; how each engine implements it differs)
-  read  (default;   Pure research. claude: the turn's built-in tool set IS
-        --read)     Read/Glob/Grep (--tools), so it has no shell and nothing
-                    that writes, plus plan mode.
-                    codex: an OS read-only sandbox (sandbox_mode=read-only) —
-                    it may run read-only shell but cannot write. Use for
-                    "what does X do", reviews.
-  act   (--act)     Peer can edit, run tests, commit, and push from inside the
-                    target project without prompts. claude: bypassPermissions +
-                    target as --add-dir. codex: bypass approvals + sandbox.
-                    Use for "fix X", "refactor".
+MODES
+  read  (default;   Research. The shipped `read` profile holds the peer to
+        --read)     reading by instruction alone: it has every tool, a full
+                    shell and the network, with no tool fence and no OS
+                    sandbox, so it can run the target's own commands and
+                    capabilities to answer. It loads the target's own context
+                    (claude: the project and local settings, CLAUDE.md and
+                    rules, not your user settings; codex: AGENTS.md), and it
+                    runs with CAPABILITIES_READ_ONLY=1, so every capability call
+                    it makes is read-only. Use for "what does X do", reviews.
+  act   (--act)     The shipped `act` profile gives the peer full access:
+                    every tool without a prompt on claude, no sandbox and no
+                    approvals on codex. It can edit, run tests, commit, and
+                    push from inside the target project. Use for "fix X",
+                    "refactor". Under CAPABILITIES_READ_ONLY --act is refused
+                    before any peer starts.
 
-MODELS: on claude the mode auto-picks the model — reading and comparing code
-does not need the top tier, writing it does, so read mode runs the newest Sonnet
-and act mode the newest Opus. Pass `--model haiku` to buy a cheaper peer where
-the question is small, or name any model to force it. On codex no model is
-forced — it uses your ~/.codex/config.toml default (the newest) unless --model
-is given.
+  Read mode is an instruction, not a fence: nothing but the prompt and the
+  capabilities' read-only switch stops a read peer from writing. The git
+  snapshot (below) is the check — a read call that changed the target returns
+  ok=false. A peer started while you run under CAPABILITIES_READ_ONLY carries
+  the switch whatever its profile.
 
-EFFORT: on claude the peer thinks at `high` reasoning effort by default;
---effort takes low|medium|high|xhigh|max. Effort is a claude-engine control —
-codex takes its reasoning settings from your ~/.codex/config.toml, so on codex
-the reported effort is null.
+────────────────────────────────────────────────────────────────────────────
+PROFILES
+  A profile is a TOML file, <name>.toml, with a [claude] and a [codex] table.
+  Each table is one whole callva-agentworker 0.2.0 profile — its knobs only
+  (model, effort, timeout_seconds, permission_mode, setting_sources, tools,
+  codex_config, approval_policy, append_system_prompt, env_set, ...); the
+  library's README lists every knob and what it does on each engine. --engine
+  picks the table, --profile <name> picks the file. Without --profile a read
+  uses `read` and --act uses `act`; a -c follow-up keeps the profile its thread
+  ran under while it keeps its mode.
 
-FENCING REALITY: in read mode the invocation itself is the fence — claude is
-given only the reading tools, so no permission setting on your machine can hand
-the peer a shell or a writer, and the turn carries an empty MCP configuration
-that no file on that machine is merged into, so a configured MCP server puts no
-tool in front of the peer either; codex runs in an OS read-only sandbox. act
-mode intentionally drops the peer's prompts so it can complete build work
-end-to-end. The prompt and the git snapshot (below) are your safety net.
+  A name is looked up in this order, and the first file found is used whole —
+  nothing is merged from a same-named file further down, nothing inherited:
+    1. the project envelope    capabilities/askproject/profiles/<name>.toml
+    2. this machine            $XDG_CONFIG_HOME/askproject/profiles/<name>.toml
+                               (default ~/.config/askproject/profiles/)
+    3. shipped with askproject `read` and `act`
+  So a project or machine file named `read` or `act` replaces the shipped one.
+  `askproject profiles` shows what each name resolves to.
+
+  The shipped profiles run claude on claude-opus-5-5 and codex on gpt-6-sol,
+  both at effort medium, with a 3600-second timeout; `askproject profiles show
+  read` prints the whole file. To write your own, copy one of them into the
+  project envelope or the machine folder under a new name and edit it; the
+  profile table must be one callva-agentworker accepts, and a profile it refuses
+  is reported with its own message before any peer starts.
+
+  askproject adds to every profile, per call: its bridge instruction, in front
+  of the profile's own append_system_prompt (the engine's system prompt is
+  appended to, never replaced), then --append, then on claude the --schema;
+  the peer name on claude; the --schema as codex's output schema. The peer
+  starts in the target with CLAUDE_PROJECT_DIR naming it, and without the
+  caller's envelope handoff or ingress worker keys.
+
+OVERRIDES
+  --model, --effort and --timeout override the chosen profile's values for the
+  engine that runs, and so do their environment variables. Each resolves in
+  this order, the first that is set winning:
+    1. the flag              --engine  --model  --effort  --timeout
+    2. the project's .env.local  } ASKPROJECT_ENGINE  ASKPROJECT_MODEL
+    3. the project's .env        } ASKPROJECT_EFFORT  ASKPROJECT_TIMEOUT
+    4. the process environment   }
+    5. the profile (the engine: claude)
+  An unknown ASKPROJECT_ENGINE or ASKPROJECT_EFFORT, and an ASKPROJECT_TIMEOUT
+  that is not a positive whole number of seconds, is ignored; the same values
+  given as flags are refused.
+
+  ASKPROJECT_MODEL and ASKPROJECT_EFFORT belong to the engine that
+  ASKPROJECT_ENGINE (or the default engine) selects, and apply only to a run on
+  that engine. A run on the other engine — by --engine, or by a -c resume of a
+  thread that engine started — keeps its profile's values, so a model or effort
+  written for one engine never reaches the other. The --model and --effort
+  flags name this call and apply to whichever engine it runs on.
+
+  On claude the `haiku`/`sonnet`/`opus` aliases resolve to known-good full ids;
+  on codex a model is passed verbatim. --effort takes low|medium|high|xhigh|max.
 
 ────────────────────────────────────────────────────────────────────────────
 SESSION CONTINUITY  (state is LOCAL to the project you call from)
@@ -124,10 +180,11 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   {
     "ok": bool, "error": str|null,
     "target": "<abs path>", "engine": "claude|codex", "mode": "read|act",
-    "model": "<model id>|null", "effort": "<level>|null",
+    "profile": {"name", "source": "project|machine|shipped", "path"},
+    "model": "<model id>", "effort": "<level>",
     "session_id": "<uuid>", "peer_name": "<name>|null", "resumed": bool,
     "answer": <string OR parsed object when --schema is used>,
-    "cost_usd": float, "duration_ms": int, "num_turns": int,
+    "cost_usd": float|null, "duration_ms": int, "num_turns": int|null,
     "tokens": {input, output, cache_read, cache_creation},
     "git": {"repo": bool, "head_before","head_after","dirty_before",
             "files_changed":[{"path","status"}]},
@@ -150,28 +207,33 @@ FLAGS
   --engine <claude|codex>  Which peer engine to spawn (default: claude, or
                         $ASKPROJECT_ENGINE). A -c resume adopts the session's
                         own engine — a codex thread can't be resumed by claude.
-  --act                 Modification mode (bypass prompts).
-  --read                Read-only mode. It is already the default for a fresh
-                        call; on a -c resume of an act thread it is how you
-                        deliberately fence the follow-up back to reading.
+  --act                 Modification mode: the `act` profile unless
+                        --profile names another.
+  --read                Read mode: the `read` profile unless --profile names
+                        another. It is already the default for a fresh call;
+                        on a -c resume of an act thread it is how you
+                        deliberately put the follow-up back in read mode.
                         Contradicts --act.
   -c, --continue        Resume the last session for this target, retaining its
                         engine. A read thread continues in read mode. An act
                         thread refuses until you say which mode this follow-up
-                        runs in: --act to keep writing, --read to fence it.
+                        runs in: --act to keep writing, --read to read.
   --fork                Reserved; neither headless CLI has a non-interactive
                         fork, so this exits with a controlled error.
-  --model <m>           Override the model, forcing it regardless of mode
-                        (default on claude: the newest Sonnet in read mode, the
-                        newest Opus in act mode, or $ASKPROJECT_MODEL). On claude
-                        the `haiku`/`sonnet`/`opus` aliases resolve to known-good
-                        full ids; on codex the value is passed straight to
-                        `codex -m`.
-  --effort <level>      Reasoning effort on claude: low|medium|high|xhigh|max
-                        (default: high, or $ASKPROJECT_EFFORT).
+  --profile <name>      The profile to run (default: `read`, or `act` with
+                        --act). See PROFILES.
+  --model <m>           The model for this call's engine (default: the
+                        profile's, or $ASKPROJECT_MODEL on the engine it
+                        belongs to).
+  --effort <level>      Reasoning effort for this call's engine:
+                        low|medium|high|xhigh|max (default: the profile's, or
+                        $ASKPROJECT_EFFORT on the engine it belongs to).
   --schema <file|json>  Pass a JSON Schema to constrain the peer's answer;
                         `answer` is then the parsed object.
-  --timeout <seconds>   Kill the peer after N seconds (default 3600).
+  --timeout <seconds>   Kill the peer after N seconds (default: the
+                        profile's, 3600 in the shipped ones, or
+                        $ASKPROJECT_TIMEOUT). The peer's whole process tree
+                        is stopped; resume it with -c.
   --text                Print only the answer to stdout (still exits non-zero
                         on error).
   --quiet               Suppress the concise progress stream on stderr.
@@ -206,11 +268,9 @@ CONTRACT  (self-description an agent loads on demand; this capability has NO
 import argparse
 import json
 import os
-import queue
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -220,7 +280,7 @@ from typing import NoReturn
 
 NAME = "askproject"
 SUMMARY = ("Bridge to a coding agent in ANOTHER project — spawn a headless peer "
-           "(claude or codex) in a target project, fenced by mode (read/act), and "
+           "(claude or codex) in a target project under a read or act profile, and "
            "return its answer with cost, token, and files-changed traceability.")
 SCOPE = "user"      # credential scope: "project" | "user"
 CRED_KEYS: list = []   # no credentials — it drives the local `claude` CLI on PATH
@@ -236,22 +296,19 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 ENGINES = ("claude", "codex")
 DEFAULT_ENGINE = "claude"
 
-# claude: the mode picks the model — reading and comparing code does not need the
-# top tier, writing it does; these aliases resolve to full ids. codex: no model is
-# forced — it falls back to ~/.codex/config.toml (the newest).
-READ_MODEL = "claude-sonnet-5"
-ACT_MODEL = "claude-opus-5"
+# A profile is a TOML file holding one callva-agentworker profile per engine, a
+# [claude] and a [codex] table. Without --profile a read uses PROFILE_FOR_MODE's
+# "read" and --act uses "act"; both ship in the bundle's profiles/ folder.
+PROFILE_FOR_MODE = {"read": "read", "act": "act"}
+PROFILE_NAME_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+# claude only: short names resolved to full ids. codex takes --model verbatim.
 MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5-20251001",
-    "sonnet": READ_MODEL,
-    "opus": ACT_MODEL,
+    "sonnet": "claude-sonnet-5",
+    "opus": "claude-opus-5-5",
 }
 
-# claude: `--effort` levels. codex takes its reasoning settings from its own
-# config, so effort is a claude-engine control and stays null elsewhere.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-DEFAULT_EFFORT = "high"
-DEFAULT_TIMEOUT = 3600
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -3297,21 +3354,6 @@ class PeerTimeout(Exception):
         self.session_id = session_id
 
 
-def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
-    value = exc.output or ""
-    if isinstance(value, bytes):
-        return value.decode(errors="replace")
-    return value
-
-
-def _parse_claude_session_id(stdout: str) -> str | None:
-    for line in (stdout or "").splitlines():
-        evt = _event(line)
-        if evt and evt.get("session_id"):
-            return evt["session_id"]
-    return None
-
-
 def _state_path() -> Path:
     """State home following the standard project envelope convention.
 
@@ -3539,22 +3581,47 @@ def resolve_model(model: str) -> str:
     return MODEL_ALIASES.get(model, model)
 
 
-def _env_default(key: str, fallback: str) -> str:
-    """A default overridable by $ASKPROJECT_<KEY> (project .env or process env)."""
-    return (_project_env().get(key) or os.environ.get(key) or fallback).strip()
+def _env_value(key: str) -> str | None:
+    """$<KEY> from the chain below a flag: the project's .env.local, then its
+    .env, then the process environment. None when no layer sets it."""
+    value = (_project_env().get(key) or os.environ.get(key) or "").strip()
+    return value or None
 
 
 def _default_engine() -> str:
     """Engine when --engine is not passed. An unknown value falls back."""
-    v = _env_default("ASKPROJECT_ENGINE", DEFAULT_ENGINE).lower()
+    v = (_env_value("ASKPROJECT_ENGINE") or DEFAULT_ENGINE).lower()
     return v if v in ENGINES else DEFAULT_ENGINE
 
 
-def _default_model(mode: str) -> str:
-    """Model when --model is not passed: the mode picks it (claude; codex falls
-    back to its own). $ASKPROJECT_MODEL outranks the mode's choice."""
-    fallback = ACT_MODEL if mode == "act" else READ_MODEL
-    return _env_default("ASKPROJECT_MODEL", fallback) or fallback
+def _env_override(engine: str, key: str) -> str | None:
+    """$ASKPROJECT_<KEY> for `engine`, or None to leave the profile's value.
+
+    $ASKPROJECT_MODEL and $ASKPROJECT_EFFORT belong to the engine the same chain
+    selects through $ASKPROJECT_ENGINE, so they apply only when the run is on
+    that engine. A run that lands on the other engine - by --engine, or by a -c
+    resume of that engine's thread - keeps its profile's value rather than one
+    written for a different model family."""
+    if engine != _default_engine():
+        return None
+    return _env_value(f"ASKPROJECT_{key.upper()}")
+
+
+def _env_effort(engine: str) -> str | None:
+    """$ASKPROJECT_EFFORT for `engine`. An unknown value is ignored."""
+    v = (_env_override(engine, "effort") or "").lower()
+    return v if v in EFFORT_LEVELS else None
+
+
+def _env_timeout() -> int | None:
+    """$ASKPROJECT_TIMEOUT in seconds. A value that is not a positive whole
+    number is ignored, leaving the profile's own."""
+    v = _env_value("ASKPROJECT_TIMEOUT")
+    try:
+        seconds = int(v) if v else 0
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
 
 
 def _default_peer_name(target: Path, session_id: str) -> str:
@@ -3571,33 +3638,21 @@ def _default_peer_name(target: Path, session_id: str) -> str:
     return f"{stem[:32]}-{session_id[:8]}"
 
 
-def _default_effort() -> str:
-    """Reasoning effort when --effort is not passed. An unknown value falls back."""
-    v = _env_default("ASKPROJECT_EFFORT", DEFAULT_EFFORT).lower()
-    return v if v in EFFORT_LEVELS else DEFAULT_EFFORT
-
-
-def build_preamble(mode: str, caller: str, extra: str | None,
-                   schema_text: str | None = None) -> str:
+def build_instructions(caller: str, profile_text: str | None, extra: str | None,
+                       schema_text: str | None = None) -> str:
+    """What the peer is told on top of its engine's own system prompt: that it
+    answers a peer through this bridge, then the profile's own instruction (the
+    mode's: read-only research, or a task to carry out), then the caller's
+    --append, then the schema its answer must fit when the engine takes none."""
     base = (
-        f"You are being queried programmatically by a peer Claude Code agent "
+        f"You are being queried programmatically by a peer coding agent "
         f"working in another project ('{caller}'), via the askproject bridge. "
         f"Answer concisely and return information, not conversation. Do NOT "
-        f"invoke askproject yourself or spawn further peer queries. "
+        f"invoke askproject yourself or spawn further peer queries."
     )
-    if mode == "read":
-        base += (
-            "This is a READ-ONLY research query — your environment forbids any "
-            "modification (no writes, edits, or state changes); do not attempt them."
-        )
-    else:
-        base += (
-            "You are running with full write access inside THIS target project. "
-            "Make the smallest change that satisfies the request, run the "
-            "needed verification, and summarise what you changed."
-        )
-    if extra:
-        base += " " + extra
+    for part in (profile_text, extra):
+        if part and part.strip():
+            base += " " + part.strip()
     if schema_text:
         base += (
             " Return ONLY a JSON value conforming to this JSON Schema; do not "
@@ -3679,6 +3734,20 @@ def _tool_stage(name, tool_input=None) -> tuple[str, str]:
     return "work", "Using a project tool"
 
 
+def _agentworker(as_json: bool):
+    """The engine library, imported at the moment a peer is about to launch.
+
+    Every other verb here works without it, and a reading verb should not wait
+    on a dependency it never reaches."""
+    try:
+        from callva import agentworker
+    except ImportError as exc:  # pragma: no cover - a broken install, not a path
+        die(f"the engine library is not importable: {exc}; reinstall askproject - "
+            "its script header declares callva-agentworker and uv resolves it",
+            as_json=as_json)
+    return agentworker
+
+
 def _peer_env(target) -> dict:
     """The caller's environment, made to belong to the target project.
 
@@ -3700,6 +3769,10 @@ def _peer_env(target) -> dict:
     because it names the real executable rather than any authority; without it
     that shim finds itself on PATH again and re-execs forever.
 
+    The markers a calling Claude session leaves in its children's environment
+    are removed by callva-agentworker unless the profile says otherwise, so a
+    peer does not believe it runs inside its caller's session.
+
     Everything else is inherited deliberately: PATH, HOME, the language runtime
     and the engine's own credentials are what let the peer run at all, and no
     list written here could name them.
@@ -3719,379 +3792,307 @@ def _peer_env(target) -> dict:
     return env
 
 
-def _stream_process(cmd: list[str], *, cwd: str, env: dict, timeout: int,
-                    on_stdout) -> subprocess.CompletedProcess:
-    """Capture both pipes without deadlock while delivering stdout lines live."""
-    proc = subprocess.Popen(
-        cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, bufsize=1,
-    )
-    events: queue.Queue = queue.Queue()
-
-    def pump(kind: str, stream) -> None:
-        try:
-            for line in iter(stream.readline, ""):
-                events.put((kind, line))
-        finally:
-            events.put((kind, None))
-
-    threads = [
-        threading.Thread(target=pump, args=("stdout", proc.stdout), daemon=True),
-        threading.Thread(target=pump, args=("stderr", proc.stderr), daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
-
-    captured = {"stdout": [], "stderr": []}
-    open_streams = 2
-    deadline = time.monotonic() + timeout
-    while open_streams:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            proc.kill()
-            proc.wait()
-            raise subprocess.TimeoutExpired(
-                cmd, timeout,
-                output="".join(captured["stdout"]),
-                stderr="".join(captured["stderr"]),
-            )
-        try:
-            kind, line = events.get(timeout=min(0.25, remaining))
-        except queue.Empty:
-            continue
-        if line is None:
-            open_streams -= 1
-            continue
-        captured[kind].append(line)
-        if kind == "stdout":
-            on_stdout(line)
-
-    returncode = proc.wait()
-    for thread in threads:
-        thread.join(timeout=1)
-    return subprocess.CompletedProcess(
-        cmd, returncode,
-        stdout="".join(captured["stdout"]),
-        stderr="".join(captured["stderr"]),
-    )
-
-
-def _event(line: str) -> dict | None:
-    try:
-        value = json.loads(line)
-    except (TypeError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
 class CodexProgress:
-    """Render Codex JSONL while withholding the last agent message (the answer)."""
+    """Render codex app-server notifications while withholding the answer.
+
+    Each event is `{"method", "params"}` as callva-agentworker hands it over."""
 
     def __init__(self, reporter: ProgressReporter):
         self.reporter = reporter
         self.pending_message = ""
 
-    def feed(self, line: str) -> None:
-        evt = _event(line)
-        if evt is None:
-            return
-        kind = evt.get("type")
-        item = evt.get("item") if isinstance(evt.get("item"), dict) else {}
+    def feed(self, evt: dict) -> None:
+        kind = evt.get("method")
+        params = evt.get("params") if isinstance(evt.get("params"), dict) else {}
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
         item_type = item.get("type")
 
-        if kind == "item.completed" and item_type == "agent_message":
-            # Codex uses the same event for commentary and the final answer.
-            # Hold it until the next event: a following tool makes it commentary;
-            # turn.completed makes it the answer, which progress must not echo.
-            self.pending_message = _brief(item.get("text"))
+        if kind == "item/completed" and item_type == "agentMessage":
+            # Commentary and the final answer arrive the same way; the phase
+            # says which, and the answer is never echoed. A message without a
+            # phase is held: a following item makes it commentary, and the
+            # turn's completion makes it the answer.
+            phase = item.get("phase")
+            if phase == "commentary":
+                self.reporter.emit("update", _brief(item.get("text")))
+            elif phase != "final_answer":
+                self.pending_message = _brief(item.get("text"))
             return
 
-        if self.pending_message:
-            if kind != "turn.completed":
-                self.reporter.emit("update", self.pending_message)
+        if kind == "turn/completed":
+            self.pending_message = ""
+        elif self.pending_message and kind in ("item/started", "item/completed"):
+            self.reporter.emit("update", self.pending_message)
             self.pending_message = ""
 
-        if kind == "thread.started":
+        if kind == "turn/started":
             self.reporter.emit("started", "Codex peer started")
-        elif kind == "turn.started":
-            self.reporter.emit("work", "Peer is working")
-        elif kind == "item.started":
-            if item_type == "command_execution":
+        elif kind == "item/started":
+            if item_type == "commandExecution":
                 self.reporter.emit(*_command_stage(item.get("command")))
-            elif item_type in ("file_change", "file_changes"):
+            elif item_type == "fileChange":
                 self.reporter.emit("edit", "Updating project files")
-            elif item_type in ("mcp_tool_call", "dynamic_tool_call"):
+            elif item_type in ("mcpToolCall", "dynamicToolCall"):
                 self.reporter.emit("work", "Using a project tool")
-            elif item_type == "web_search":
+            elif item_type == "webSearch":
                 self.reporter.emit("research", "Checking external documentation")
-        elif kind == "item.completed" and item_type == "command_execution":
-            if item.get("exit_code") not in (None, 0):
+        elif kind == "item/completed" and item_type == "commandExecution":
+            if item.get("exitCode") not in (None, 0):
                 self.reporter.emit("update", "A command failed; the peer is handling it")
-        elif kind == "item.completed" and item_type in ("file_change", "file_changes"):
+        elif kind == "item/completed" and item_type == "fileChange":
             self.reporter.emit("edit", "Updated project files")
-        elif kind == "turn.completed":
-            self.reporter.emit("completed", "Codex peer finished")
-        elif kind in ("turn.failed", "error"):
+        elif kind == "turn/completed":
+            turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+            if turn.get("status") == "completed":
+                self.reporter.emit("completed", "Codex peer finished")
+            else:
+                self.reporter.emit("failed", "Codex peer reported a failure")
+        elif kind == "error":
             self.reporter.emit("failed", "Codex peer reported a failure")
 
 
 def _claude_progress(evt: dict, reporter: ProgressReporter) -> None:
+    """Render one claude-agent-sdk message as callva-agentworker hands it over:
+    the engine's own system event, or a message's fields plus its class name."""
     kind = evt.get("type")
     if kind == "system" and evt.get("subtype") == "init":
         reporter.emit("started", "Claude peer started")
         return
-    if kind == "assistant":
-        message = evt.get("message") if isinstance(evt.get("message"), dict) else {}
-        content = message.get("content") if isinstance(message.get("content"), list) else []
+    if kind == "AssistantMessage":
+        content = evt.get("content") if isinstance(evt.get("content"), list) else []
         tools = [block for block in content
-                 if isinstance(block, dict) and block.get("type") == "tool_use"]
+                 if isinstance(block, dict) and "name" in block and "input" in block]
         if tools:
             # Text accompanying a tool call is commentary, not the final answer.
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    reporter.emit("update", block.get("text", ""))
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    reporter.emit("update", block["text"])
                     break
             for block in tools:
                 reporter.emit(*_tool_stage(block.get("name"), block.get("input")))
         return
-    if kind == "result":
+    if kind == "ResultMessage":
         if evt.get("is_error"):
             reporter.emit("failed", "Claude peer reported a failure")
         else:
             reporter.emit("completed", "Claude peer finished")
 
 
-# --- engines -----------------------------------------------------------------
-# Each engine turns (target, prompt, mode, model, effort, resume) into ONE
-# normalized dict so run() stays engine-blind:
+# --- profiles ----------------------------------------------------------------
+# A profile is a TOML file with a [claude] and a [codex] table, each one whole
+# callva-agentworker profile. A name resolves to the first file found, in the
+# order _profile_sources gives, and that file is used whole: nothing is merged
+# from a file of the same name further down, and nothing is inherited.
+
+def _bundle_dir() -> Path:
+    executable = Path(__file__).resolve()
+    return (executable.parent.parent
+            if executable.parent.name == "bin" else executable.parent)
+
+
+def _profile_sources() -> list[tuple[str, Path]]:
+    """Where a profile is looked for, in order: the project envelope, the
+    machine-wide askproject config folder, then the profiles askproject ships."""
+    sources: list[tuple[str, Path]] = []
+    env_dir = _env_dir()
+    if env_dir is not None:
+        sources.append(("project", env_dir / "profiles"))
+    sources.append(("machine", _CONFIG_HOME / NAME / "profiles"))
+    sources.append(("shipped", _bundle_dir() / "profiles"))
+    return sources
+
+
+def _profile_files(name: str) -> list[dict]:
+    """Every file holding profile `name`, in lookup order; the first is used."""
+    return [{"source": source, "path": str(folder / f"{name}.toml")}
+            for source, folder in _profile_sources()
+            if (folder / f"{name}.toml").is_file()]
+
+
+def _check_profile_name(name: str) -> str | None:
+    import re
+    if re.fullmatch(PROFILE_NAME_RE, name or ""):
+        return None
+    return (f"profile name {name!r} is not a plain name: letters, digits, '.', "
+            "'_' and '-', starting with a letter or digit")
+
+
+def _resolve_profile(name: str, *, as_json: bool) -> dict:
+    """The file profile `name` resolves to: {name, source, path}."""
+    problem = _check_profile_name(name)
+    if problem:
+        die(problem, as_json=as_json)
+    found = _profile_files(name)
+    if not found:
+        where = ", ".join(f"{source} {folder}" for source, folder in _profile_sources())
+        die(f"no profile named {name!r}; looked in {where}. "
+            "`askproject profiles` lists the ones that exist", as_json=as_json)
+    return {"name": name, **found[0]}
+
+
+def _profile_table(resolved: dict, engine: str, *, as_json: bool) -> dict:
+    """The [engine] table of a resolved profile file, exactly as written."""
+    import tomllib
+    label = f"profile {resolved['name']!r} ({resolved['source']} {resolved['path']})"
+    try:
+        data = tomllib.loads(Path(resolved["path"]).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        die(f"{label} cannot be read as TOML: {exc}", as_json=as_json)
+    table = data.get(engine)
+    if not isinstance(table, dict):
+        die(f"{label} has no [{engine}] table, so it cannot run the {engine} "
+            "engine", as_json=as_json)
+    if table.get("engine", engine) != engine:
+        die(f"{label}: its [{engine}] table names engine {table.get('engine')!r}",
+            as_json=as_json)
+    return {**table, "engine": engine}
+
+
+def cmd_profiles(argv: list[str]) -> None:
+    """`profiles` lists every profile in sight; `profiles show NAME` prints the
+    file NAME resolves to, verbatim, for an operator to copy and edit."""
+    if argv and argv[0] == "show":
+        if len(argv) != 2:
+            _die(6, "input", "usage: askproject profiles show <name>")
+        name = argv[1]
+        problem = _check_profile_name(name)
+        if problem:
+            _die(6, "input", problem)
+        found = _profile_files(name)
+        if not found:
+            _die(3, "not_found", f"no profile named {name!r}",
+                 "`askproject profiles` lists the ones that exist")
+        _emit(Path(found[0]["path"]).read_text(encoding="utf-8"))
+        return
+    if argv:
+        _die(6, "input", "usage: askproject profiles [show <name>]")
+    seen: dict[str, dict] = {}
+    for source, folder in _profile_sources():
+        files = sorted(folder.glob("*.toml")) if folder.is_dir() else []
+        for path in files:
+            if _check_profile_name(path.stem):
+                continue
+            here = {"source": source, "path": str(path)}
+            if path.stem in seen:
+                seen[path.stem]["shadows"].append(here)
+            else:
+                seen[path.stem] = {"name": path.stem, **here, "shadows": []}
+    _emit({
+        "profiles": [seen[name] for name in sorted(seen)],
+        "lookup": [{"source": source, "dir": str(folder)}
+                   for source, folder in _profile_sources()],
+    })
+
+
+# --- the peer ---------------------------------------------------------------
+# callva-agentworker runs the engine: it turns the profile into the engine's
+# own configuration, resumes sessions, keeps the deadline and reads what the
+# engine reported. askproject owns which profile runs, what the peer is asked
+# and told, where it stands, and what is reported. The launcher turns one call
+# into ONE normalized dict so run() stays engine-blind:
 #   {answer, session_id, model, effort, cost_usd, duration_ms, num_turns,
 #    tokens:{input,output,cache_read,cache_creation}, is_error, permission_denials}
 
-def run_claude(target, prompt, mode, model, effort, caller, append,
-               schema_text, resume_id, timeout, as_json,
-               reporter: ProgressReporter, peer_name=None,
-               session_id=None) -> dict:
-    """Headless Claude. Progress uses stream-json; --quiet retains json mode."""
-    output_format = "stream-json" if reporter.enabled else "json"
-    cmd = ["claude", "-p", prompt, "--output-format", output_format,
-           "--model", model, "--effort", effort]
-    if reporter.enabled:
-        cmd += ["--verbose"]
-    if resume_id:
-        # A resumed conversation already carries its id; naming a second one
-        # would address a different session than the one being continued.
-        cmd += ["--resume", resume_id]
-    elif session_id:
-        cmd += ["--session-id", session_id]
-    if peer_name:
-        cmd += ["--name", peer_name]
-    if mode == "read":
-        # --tools is what makes read mode a fence: it decides which built-in
-        # tools exist for the turn, so Bash/Edit/Write are absent from the
-        # schema and no settings file on the calling machine can hand them back.
-        # --allowedTools only says the listed tools need no prompt; it removes
-        # nothing, so under a permissive user settings file the peer kept a
-        # working shell. It stays so the three reading tools remain
-        # pre-approved, and plan mode stays as the model-facing signal.
-        #
-        # --tools decides the BUILT-IN set only, so an MCP server configured on
-        # the calling machine sits outside it and hands the peer its tools
-        # beside the three. An empty --mcp-config is the whole MCP
-        # configuration for the turn, and --strict-mcp-config is what stops the
-        # machine's own files being merged back into it, so the read peer has
-        # no MCP surface to reach. The pair is unconditional: the fence is what
-        # this tool knows read mode to be, not something a caller declares.
-        cmd += ["--tools", "Read,Glob,Grep",
-                "--allowedTools", "Read,Glob,Grep", "--permission-mode", "plan",
-                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
-    else:
-        cmd += ["--permission-mode", "bypassPermissions", "--add-dir", str(target)]
-    cmd += ["--append-system-prompt", build_preamble(mode, caller, append, schema_text)]
+def run_peer(engine, target, prompt, profile, resume_id, schema_text, as_json,
+             reporter: ProgressReporter, session_id=None) -> dict:
+    """One headless turn of the peer through callva-agentworker.
 
-    result_event: dict = {}
-    peer_env = _peer_env(target)
-    try:
-        if reporter.enabled:
-            def on_stdout(line: str) -> None:
-                evt = _event(line)
-                if evt is None:
-                    return
+    claude runs under the session id chosen before launch; codex reports its
+    own thread id. The schema reaches codex as its native output schema and
+    claude as an instruction, as the profile built in run() says."""
+    aw = _agentworker(as_json)
+    if engine == "claude":
+        session = (aw.Session.resume(resume_id) if resume_id
+                   else aw.Session.pinned(session_id))
+    else:
+        session = aw.Session.resume(resume_id) if resume_id else aw.Session.fresh()
+    on_event = None
+    if reporter.enabled:
+        if engine == "claude":
+            def on_event(evt: dict) -> None:
                 _claude_progress(evt, reporter)
-                if evt.get("type") == "result":
-                    result_event.update(evt)
-
-            proc = _stream_process(cmd, cwd=str(target), env=peer_env,
-                                   timeout=timeout, on_stdout=on_stdout)
         else:
-            proc = subprocess.run(cmd, cwd=str(target), env=peer_env,
-                                  capture_output=True,
-                                  text=True, timeout=timeout,
-                                  stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired as exc:
-        reporter.emit("failed", f"Peer timed out after {timeout}s")
-        # The id was settled before launch, so a peer that times out mid-turn
-        # is still addressable. Reading it out of partial output stays as the
-        # fallback for a caller that supplied none.
-        known = resume_id or session_id
-        raise PeerTimeout(
-            timeout,
-            known or _parse_claude_session_id(_timeout_output(exc))) from exc
-    if proc.returncode != 0:
-        reporter.emit("failed", f"Claude peer exited with status {proc.returncode}")
-        snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
-        die(f"peer exited {proc.returncode}: {snippet}", as_json=as_json)
-    if reporter.enabled:
-        env = result_event
-        if not env:
-            die(f"could not parse peer output: {proc.stdout[:800]}", as_json=as_json)
-    else:
-        try:
-            env = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            die(f"could not parse peer output: {proc.stdout[:800]}", as_json=as_json)
+            on_event = CodexProgress(reporter).feed
 
-    answer = env.get("result", "")
+    result = aw.run(prompt, profile, str(target), session=session,
+                    environ=_peer_env(target), on_event=on_event)
+
+    failure = result.failure
+    if failure is not None and failure.kind == aw.FailureKind.TIMEOUT:
+        reporter.emit("failed", f"Peer timed out after {profile.timeout_seconds:g}s")
+        # claude's id was settled before launch and codex's is known once its
+        # thread started, so a peer stopped mid-turn stays resumable whenever
+        # an id exists at all.
+        raise PeerTimeout(int(profile.timeout_seconds), result.session_id)
+    if failure is not None and failure.kind == aw.FailureKind.BINARY_MISSING:
+        die(f"`{engine}` CLI not found on PATH", as_json=as_json)
+    # A schema answer that did not parse is still the peer's answer; it is
+    # returned as text, as it always was, rather than failed.
+    if failure is not None and failure.kind != aw.FailureKind.INVALID_OUTPUT:
+        reporter.emit("failed", f"{engine.capitalize()} peer failed: {failure.kind}")
+        exited = "" if result.exit_code is None else f", exit {result.exit_code}"
+        die(f"peer failed ({failure.kind}{exited}): {failure.message[-800:]}",
+            as_json=as_json)
+
+    answer = result.answer
     if schema_text:
-        # structured output may arrive parsed in `structured_output`, or as a
-        # JSON string in `result` depending on harness version — handle both.
-        if env.get("structured_output") is not None:
-            answer = env["structured_output"]
-        elif isinstance(answer, str):
-            try:
-                answer = json.loads(answer)
-            except json.JSONDecodeError:
-                pass
-    usage = env.get("usage", {}) or {}
-    return {
-        "answer": answer,
-        "session_id": env.get("session_id") or session_id or resume_id,
-        "model": model,
-        "effort": effort,
-        "cost_usd": env.get("total_cost_usd"),
-        "duration_ms": env.get("duration_ms"),
-        "num_turns": env.get("num_turns"),
-        "tokens": {
-            "input": usage.get("input_tokens"),
-            "output": usage.get("output_tokens"),
-            "cache_read": usage.get("cache_read_input_tokens"),
-            "cache_creation": usage.get("cache_creation_input_tokens"),
-        },
-        "is_error": bool(env.get("is_error", False)),
-        "permission_denials": env.get("permission_denials", []),
-    }
-
-
-def _parse_codex_events(stdout: str) -> tuple[dict, str | None, bool]:
-    """Pull usage + thread id (+ any failure) out of codex's --json JSONL."""
-    usage: dict = {}
-    thread_id = None
-    is_error = False
-    for line in (stdout or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            o = json.loads(line)
-        except ValueError:
-            continue
-        t = o.get("type")
-        if t == "turn.completed":
-            usage = o.get("usage") or usage
-        elif t == "thread.started":
-            thread_id = o.get("thread_id") or thread_id
-        elif t in ("turn.failed", "error"):
-            is_error = True
-    return usage, thread_id, is_error
-
-
-def run_codex(target, prompt, mode, model, effort, caller, append,
-              schema_text, resume_id, timeout, as_json,
-              reporter: ProgressReporter, peer_name=None,
-              session_id=None) -> dict:
-    """Headless `codex exec`. codex has no system-prompt flag, so the peer
-    preamble is folded into the prompt; the final message is read from -o and
-    usage/thread id from the --json JSONL. Schema uses codex's native
-    --output-schema. Reasoning effort comes from ~/.codex/config.toml, so the
-    reported effort is null. No USD cost under ChatGPT auth → cost_usd null."""
-    import tempfile
-    prompt = build_preamble(mode, caller, append, None) + "\n\n" + prompt
-    out_fd, outfile = tempfile.mkstemp(prefix="askproject-codex-", suffix=".txt")
-    os.close(out_fd)
-    schema_file = None
-    try:
-        cmd = ["codex", "exec"]
-        if resume_id:
-            cmd += ["resume", resume_id]
-        cmd += [prompt, "--skip-git-repo-check", "--json", "-o", outfile]
-        if mode == "read":
-            # -s/--sandbox is absent on `resume`; the config override works on
-            # both the fresh and resume paths and genuinely blocks writes.
-            cmd += ["-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
+        if result.structured is not None:
+            answer = result.structured
         else:
-            cmd += ["--dangerously-bypass-approvals-and-sandbox"]
-        if model:
-            cmd += ["-m", model]
-        if schema_text:
-            s_fd, schema_file = tempfile.mkstemp(prefix="askproject-schema-", suffix=".json")
-            os.close(s_fd)
-            Path(schema_file).write_text(schema_text)
-            cmd += ["--output-schema", schema_file]
-
-        peer_env = _peer_env(target)
-        try:
-            if reporter.enabled:
-                progress = CodexProgress(reporter)
-                proc = _stream_process(cmd, cwd=str(target), env=peer_env,
-                                       timeout=timeout, on_stdout=progress.feed)
-            else:
-                proc = subprocess.run(cmd, cwd=str(target), env=peer_env,
-                                      capture_output=True,
-                                      text=True, timeout=timeout,
-                                      stdin=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired as exc:
-            reporter.emit("failed", f"Peer timed out after {timeout}s")
-            _, session_id, _ = _parse_codex_events(_timeout_output(exc))
-            raise PeerTimeout(timeout, session_id or resume_id) from exc
-        if proc.returncode != 0:
-            reporter.emit("failed", f"Codex peer exited with status {proc.returncode}")
-            snippet = (proc.stderr or proc.stdout or "").strip()[-800:]
-            die(f"peer exited {proc.returncode}: {snippet}", as_json=as_json)
-
-        answer = Path(outfile).read_text().strip()
-        usage, thread_id, evt_error = _parse_codex_events(proc.stdout)
-        if schema_text and answer:
             try:
                 answer = json.loads(answer)
-            except json.JSONDecodeError:
+            except (TypeError, ValueError):
                 pass
-    finally:
-        for f in (outfile, schema_file):
-            if f:
-                try:
-                    os.unlink(f)
-                except OSError:
-                    pass
-
+    tokens = result.tokens
     return {
         "answer": answer,
-        "session_id": thread_id,
-        "model": model,
-        "effort": None,
-        "cost_usd": None,
-        "duration_ms": None,
-        "num_turns": None,
+        "session_id": result.session_id,
+        "model": result.model or profile.model,
+        "effort": profile.effort,
+        "cost_usd": result.cost_usd,
+        "duration_ms": result.duration_ms,
+        "num_turns": result.num_turns,
         "tokens": {
-            "input": usage.get("input_tokens"),
-            "output": usage.get("output_tokens"),
-            "cache_read": usage.get("cached_input_tokens"),
-            "cache_creation": None,
+            "input": tokens.input,
+            "output": tokens.output,
+            "cache_read": tokens.cache_read,
+            "cache_creation": tokens.cache_creation,
         },
-        "is_error": bool(evt_error or not answer),
-        "permission_denials": [],
+        "is_error": False,
+        "permission_denials": list(result.permission_denials),
     }
 
 
-ENGINE_RUNNERS = {"claude": run_claude, "codex": run_codex}
+def _build_profile(resolved: dict, engine: str, *, caller: str, model, effort,
+                   timeout, append, schema_text, peer_name, as_json: bool):
+    """The profile this call runs: the resolved file's [engine] table, whole,
+    with the call's overrides and askproject's own per-call settings on top."""
+    aw = _agentworker(as_json)
+    label = f"profile {resolved['name']!r} ({resolved['source']} {resolved['path']})"
+    table = _profile_table(resolved, engine, as_json=as_json)
+    try:
+        aw.Profile.from_dict(table)
+    except aw.ProfileError as exc:
+        die(f"{label} is refused by callva-agentworker: {exc}", as_json=as_json)
+    data = dict(table)
+    if model:
+        data["model"] = model
+    if effort:
+        data["effort"] = effort
+    if timeout:
+        data["timeout_seconds"] = timeout
+    data["append_system_prompt"] = build_instructions(
+        caller, table.get("append_system_prompt"), append,
+        schema_text if engine == "claude" else None)
+    if engine == "claude":
+        data["name"] = peer_name
+    elif schema_text:
+        data["output_schema"] = json.loads(schema_text)
+    try:
+        return aw.Profile.from_dict(data)
+    except aw.ProfileError as exc:
+        die(f"{label} with this call's overrides is refused by "
+            f"callva-agentworker: {exc}", as_json=as_json)
 
 
 def run(args):
@@ -4119,6 +4120,7 @@ def run(args):
     # session's own engine (a codex thread can't be resumed by claude).
     resumed = False
     resume_id = None
+    stored_profile = None
     if args.cont:
         last_attempt = entry.get("last_attempt") or {}
         timed_out = last_attempt.get("status") == "timed_out"
@@ -4147,9 +4149,13 @@ def run(args):
         if stored_mode == "act" and not (args.act or args.read):
             die(f"cannot resume {target} without naming a mode: the last "
                 "session used act, so the peer could write; pass --act to "
-                "continue writing or --read to continue fenced to reading",
+                "continue writing or --read to continue in read mode",
                 as_json=as_json)
         mode = "read" if args.read else stored_mode
+        # The thread keeps the profile it ran under while it keeps its mode;
+        # a follow-up in the other mode takes that mode's profile.
+        if mode == stored_mode:
+            stored_profile = (session_source.get("profile") or entry.get("last_profile"))
         if args.fork:
             die("--fork is not supported in headless mode", as_json=as_json)
         resumed = True
@@ -4162,20 +4168,41 @@ def run(args):
         # started from here may change anything, so it is not started at all.
         _read_only_gate("`askproject --act`")
 
-    if not shutil.which(engine):
+    if not _agentworker(as_json).find_binary(engine):
         die(f"`{engine}` CLI not found on PATH", as_json=as_json)
 
-    if engine == "claude":
-        model = resolve_model(args.model or _default_model(mode))
-    else:
-        model = args.model or None   # codex: fall back to its config default (newest)
+    profile_name = args.profile or stored_profile or PROFILE_FOR_MODE[mode]
+    resolved = _resolve_profile(profile_name, as_json=as_json)
 
-    effort = (args.effort or _default_effort()).strip().lower()
-    if effort not in EFFORT_LEVELS:
-        die(f"unknown effort {args.effort!r}; expected one of "
-            f"{', '.join(EFFORT_LEVELS)}", as_json=as_json)
+    # Overrides of the profile's values: a flag names this call, else the
+    # environment chain; neither leaves the profile's own value in place.
+    model = (args.model or _env_override(engine, "model") or "").strip() or None
+    if model and engine == "claude":
+        model = resolve_model(model)
+
+    effort = None
+    if args.effort:
+        effort = args.effort.strip().lower()
+        if effort not in EFFORT_LEVELS:
+            die(f"unknown effort {args.effort!r}; expected one of "
+                f"{', '.join(EFFORT_LEVELS)}", as_json=as_json)
+    else:
+        effort = _env_effort(engine)
+
+    timeout = args.timeout if args.timeout is not None else _env_timeout()
+    if timeout is not None and timeout <= 0:
+        die(f"--timeout takes a positive number of seconds, not {timeout}",
+            as_json=as_json)
 
     schema_text = resolve_schema(args.schema) if args.schema else None
+    if schema_text and engine == "codex":
+        try:
+            parsed_schema = json.loads(schema_text)
+        except ValueError:
+            parsed_schema = None
+        if not isinstance(parsed_schema, dict):
+            die("--schema must be a JSON object (a file or inline JSON)",
+                as_json=as_json)
 
     if args.name and engine != "claude":
         die(f"--name is a claude-engine control; {engine} names no peer",
@@ -4193,35 +4220,44 @@ def run(args):
         session_id_upfront = None
         peer_name = None
 
+    profile = _build_profile(resolved, engine, caller=caller, model=model,
+                             effort=effort, timeout=timeout, append=args.append,
+                             schema_text=schema_text, peer_name=peer_name,
+                             as_json=as_json)
+    profile_record = {"name": resolved["name"], "source": resolved["source"],
+                      "path": resolved["path"]}
+
     reporter = ProgressReporter(engine, enabled=not args.quiet)
     # Before the launch line: stdout carries the result only at exit, so this is
     # the only moment a caller watching a live run learns what it is watching.
     if peer_name:
         reporter.emit("peer", f"{peer_name} session {session_id_upfront}")
-    reporter.emit("starting", f"Launching {engine} peer")
+    reporter.emit("starting",
+                  f"Launching {engine} peer with profile {resolved['name']} "
+                  f"({resolved['source']})")
     before = snapshot(target)
     # Read before the peer starts: an engine that builds its context at session
     # start rewrites this file during the run, and the peer answered from the
     # revision that was there when it began.
     compiled_context = _compiled_context(target, engine)
     try:
-        res = ENGINE_RUNNERS[engine](target, args.prompt, mode, model, effort,
-                                     caller, args.append, schema_text, resume_id,
-                                     args.timeout, as_json, reporter, peer_name,
-                                     session_id_upfront)
+        res = run_peer(engine, target, args.prompt, profile, resume_id,
+                       schema_text, as_json, reporter, session_id_upfront)
     except PeerTimeout as exc:
         entry["last_attempt"] = {
             "status": "timed_out",
             "engine": engine,
             "mode": mode,
+            "profile": resolved["name"],
             "session_id": exc.session_id,
             "at": time.time(),
         }
         if exc.session_id:
             entry["last_session_id"] = exc.session_id
-            entry["last_model"] = model
-            entry["last_effort"] = effort if engine == "claude" else None
+            entry["last_model"] = profile.model
+            entry["last_effort"] = profile.effort
             entry["last_mode"] = mode
+            entry["last_profile"] = resolved["name"]
             entry["engine"] = engine
         state[key] = entry
         save_state(state)
@@ -4245,6 +4281,7 @@ def run(args):
         entry["last_model"] = res.get("model")
         entry["last_effort"] = res.get("effort")
         entry["last_mode"] = mode
+        entry["last_profile"] = resolved["name"]
         entry["engine"] = engine
         entry["interactions"] = entry.get("interactions", 0) + 1
         entry["last_used_at"] = time.time()
@@ -4252,6 +4289,7 @@ def run(args):
             "status": "completed",
             "engine": engine,
             "mode": mode,
+            "profile": resolved["name"],
             "session_id": session_id,
             "at": entry["last_used_at"],
         }
@@ -4269,6 +4307,7 @@ def run(args):
         "target": str(target),
         "engine": engine,
         "mode": mode,
+        "profile": profile_record,
         "model": res.get("model"),
         "effort": res.get("effort"),
         "session_id": session_id,
@@ -4314,6 +4353,7 @@ def cmd_targets():
                 "engine": v.get("engine", "claude"),
                 "model": v.get("last_model"),
                 "effort": v.get("last_effort"),
+                "profile": v.get("last_profile"),
                 "interactions": v.get("interactions", 0),
             }
             last_used = v.get("last_used_at")
@@ -4368,6 +4408,9 @@ def main():
     if argv[0] == "targets":
         cmd_targets()
         return
+    if argv[0] == "profiles":
+        cmd_profiles(argv[1:])
+        return
 
     p = argparse.ArgumentParser(prog="askproject", add_help=False)
     p.add_argument("target")
@@ -4380,7 +4423,8 @@ def main():
     p.add_argument("--model")
     p.add_argument("--effort")
     p.add_argument("--schema")
-    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    p.add_argument("--timeout", type=int)
+    p.add_argument("--profile")
     p.add_argument("--text", action="store_true")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--append")

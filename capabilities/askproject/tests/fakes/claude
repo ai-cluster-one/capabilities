@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""A fake Claude Code for askproject's suite, speaking claude-agent-sdk's stream-json protocol.
+
+callva-agentworker starts it through the SDK exactly as it starts the real CLI.
+It answers the SDK's control requests, and answers the user message with an
+init event, one assistant message carrying a tool call, and a result document.
+
+  PEER_RECORD   append {"engine", "argv", "cwd", "env", "prompt"} per turn (JSONL)
+  PEER_MARKER   append the CAPABILITIES_READ_ONLY it saw, or <unset>, per turn
+  PEER_SLEEP    seconds to work before answering
+  PEER_MUTATE   write written-by-peer.txt into the working directory
+  FAKE_ANSWER   the answer text (default: PEER ANSWER)
+  FAKE_FAIL     answer with a failed turn carrying this sentence
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+argv = sys.argv[1:]
+if argv in (["-v"], ["--version"]):
+    print("2.1.280 (Claude Code)")
+    sys.exit(0)
+
+
+def arg(name):
+    for index, item in enumerate(argv):
+        if item == name and index + 1 < len(argv):
+            return argv[index + 1]
+        if item.startswith(name + "="):
+            return item.split("=", 1)[1]
+    return None
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def record(prompt):
+    path = os.environ.get("PEER_RECORD")
+    if path:
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"engine": "claude", "argv": argv, "cwd": os.getcwd(),
+                                 "env": dict(os.environ), "prompt": prompt}) + "\n")
+    marker = os.environ.get("PEER_MARKER")
+    if marker:
+        with open(marker, "a") as fh:
+            fh.write(os.environ.get("CAPABILITIES_READ_ONLY", "<unset>") + "\n")
+
+
+session = arg("--session-id") or arg("--resume") or "learned-session"
+model = arg("--model") or "claude-fake"
+
+for line in sys.stdin:
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    if message.get("type") == "control_request":
+        emit({"type": "control_response", "response": {
+            "subtype": "success", "request_id": message["request_id"], "response": {}}})
+        continue
+    if message.get("type") != "user":
+        continue
+    content = message.get("message", {}).get("content")
+    prompt = content if isinstance(content, str) else json.dumps(content)
+    record(prompt)
+    emit({"type": "system", "subtype": "init", "session_id": session, "apiKeySource": "none",
+          "model": model, "claude_code_version": "2.1.280", "tools": [], "cwd": os.getcwd(),
+          "permissionMode": arg("--permission-mode") or "default"})
+    time.sleep(float(os.environ.get("PEER_SLEEP") or 0))
+    if os.environ.get("PEER_MUTATE"):
+        Path("written-by-peer.txt").write_text("x")
+    emit({"type": "assistant", "session_id": session, "parent_tool_use_id": None,
+          "message": {"model": model, "role": "assistant", "content": [
+              {"type": "text", "text": "I will inspect the relevant module."},
+              {"type": "tool_use", "id": "toolu_1", "name": "Read",
+               "input": {"file_path": "/private/code.py"}}]}})
+    failure = os.environ.get("FAKE_FAIL")
+    emit({"type": "result", "subtype": "success", "is_error": bool(failure),
+          "duration_ms": 5, "duration_api_ms": 4, "num_turns": 1,
+          "result": failure or os.environ.get("FAKE_ANSWER", "PEER ANSWER"),
+          "session_id": session, "total_cost_usd": 0.02,
+          "usage": {"input_tokens": 4, "output_tokens": 3,
+                    "cache_read_input_tokens": 2, "cache_creation_input_tokens": 1},
+          "modelUsage": {model: {"outputTokens": 3}},
+          "permission_denials": [{"tool_name": "Bash"}]})
+    if failure:
+        sys.exit(1)
+sys.exit(0)

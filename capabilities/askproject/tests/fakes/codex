@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""A fake `codex app-server` for askproject's suite, speaking openai-codex's JSON-RPC over stdio.
+
+callva-agentworker starts it through the SDK exactly as it starts the real CLI.
+The response shapes are those a real codex 0.159.0 app-server sends, with the
+machine's values replaced. A turn reports commentary, a command, a file change
+and the final answer.
+
+  PEER_RECORD         append {"engine", "argv", "cwd", "env", "requests"} per turn (JSONL)
+  PEER_MARKER         append the CAPABILITIES_READ_ONLY it saw, or <unset>, per turn
+  PEER_SLEEP          seconds to work inside the turn, after the thread exists
+  PEER_SLEEP_BEFORE   seconds to wait before answering thread/start, so no id is known
+  PEER_MUTATE         write written-by-peer.txt into the working directory
+  FAKE_THREAD_ID      the id thread/start hands out (default: codex-thread)
+  FAKE_ANSWER         the answer text (default: PEER ANSWER)
+"""
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+
+argv = sys.argv[1:]
+if argv == ["--version"]:
+    print("codex-cli 0.159.0")
+    sys.exit(0)
+
+requests = []
+
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def notify(method, params):
+    send({"method": method, "params": params})
+
+
+def record():
+    path = os.environ.get("PEER_RECORD")
+    if path:
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"engine": "codex", "argv": argv, "cwd": os.getcwd(),
+                                 "env": dict(os.environ), "requests": requests}) + "\n")
+    marker = os.environ.get("PEER_MARKER")
+    if marker:
+        with open(marker, "a") as fh:
+            fh.write(os.environ.get("CAPABILITIES_READ_ONLY", "<unset>") + "\n")
+
+
+def thread_obj(thread_id, cwd, model):
+    return {
+        "id": thread_id, "environments": [{"environmentId": "local", "cwd": cwd,
+                                           "runtimeWorkspaceRoots": [cwd]}],
+        "extra": None, "sessionId": thread_id, "forkedFromId": None, "parentThreadId": None,
+        "preview": "", "ephemeral": False, "section": None, "sectionEnteredAt": None,
+        "projectId": None, "historyMode": "paginated", "modelProvider": "openai", "model": model,
+        "reasoningEffort": "medium", "createdAt": 1790695150, "updatedAt": 1790695150,
+        "recencyAt": 1790695150, "status": {"type": "idle"}, "path": None, "cwd": cwd,
+        "cliVersion": "0.159.0", "originator": "codex_python_sdk", "source": "vscode",
+        "canAcceptDirectInput": True, "threadSource": None, "agentNickname": None,
+        "agentRole": None, "gitInfo": None, "name": None, "daybreakEnabled": None, "turns": [],
+    }
+
+
+def thread_result(thread_id, params):
+    cwd = params.get("cwd") or os.getcwd()
+    model = params.get("model") or "gpt-fake"
+    return {
+        "thread": thread_obj(thread_id, cwd, model), "model": model, "modelProvider": "openai",
+        "serviceTier": params.get("serviceTier"), "disabledPluginIds": [], "cwd": cwd,
+        "runtimeWorkspaceRoots": [cwd], "instructionSources": [],
+        "approvalPolicy": params.get("approvalPolicy") or "on-request",
+        "approvalsReviewer": "user", "sandbox": {"type": "dangerFullAccess"},
+        "activePermissionProfile": None,
+        "reasoningEffort": "medium", "multiAgentMode": "explicitRequestOnly",
+    }
+
+
+def turn_obj(turn_id, status, items=None):
+    return {"id": turn_id, "items": items or [], "itemsView": "summary" if items else "notLoaded",
+            "status": status, "error": None, "startedAt": 1790695151,
+            "completedAt": None if status == "inProgress" else 1790695154,
+            "durationMs": None if status == "inProgress" else 3683}
+
+
+COMMAND = "/bin/zsh -lc 'pytest /private/project/test_secret.py'"
+
+
+def run_turn(thread_id, turn_id):
+    ids = {"threadId": thread_id, "turnId": turn_id}
+    notify("turn/started", {"threadId": thread_id, "turn": turn_obj(turn_id, "inProgress")})
+    time.sleep(float(os.environ.get("PEER_SLEEP") or 0))
+    if os.environ.get("PEER_MUTATE"):
+        Path("written-by-peer.txt").write_text("x")
+    notify("item/completed", {**ids, "completedAtMs": 1790695152000, "item": {
+        "type": "agentMessage", "id": "msg_0", "phase": "commentary",
+        "text": "I will run the focused checks now."}})
+    command = {"type": "commandExecution", "id": "cmd_1", "command": COMMAND,
+               "cwd": os.getcwd(), "processId": None, "source": "agent",
+               "status": "inProgress", "commandActions": [], "aggregatedOutput": None,
+               "exitCode": None, "durationMs": None}
+    notify("item/started", {**ids, "startedAtMs": 1790695152100, "item": command})
+    notify("item/completed", {**ids, "completedAtMs": 1790695152500, "item": {
+        **command, "status": "completed", "aggregatedOutput": "sensitive command output",
+        "exitCode": 0, "durationMs": 400}})
+    notify("item/completed", {**ids, "completedAtMs": 1790695153000, "item": {
+        "type": "fileChange", "id": "patch_1", "status": "completed",
+        "changes": [{"path": "/private/changed.py", "kind": {"type": "update"}, "diff": ""}]}})
+    answer = {"type": "agentMessage", "id": "msg_1", "phase": "final_answer",
+              "text": os.environ.get("FAKE_ANSWER", "PEER ANSWER")}
+    notify("item/completed", {**ids, "item": answer, "completedAtMs": 1790695154880})
+    notify("thread/tokenUsage/updated", {**ids, "tokenUsage": {
+        "total": {"totalTokens": 5, "inputTokens": 3, "cachedInputTokens": 1,
+                  "cacheWriteInputTokens": 0, "outputTokens": 2, "reasoningOutputTokens": 0},
+        "last": {"totalTokens": 5, "inputTokens": 3, "cachedInputTokens": 1,
+                 "cacheWriteInputTokens": 0, "outputTokens": 2, "reasoningOutputTokens": 0},
+        "modelContextWindow": 258400}})
+    notify("turn/completed", {"threadId": thread_id,
+                              "turn": turn_obj(turn_id, "completed", items=[answer])})
+
+
+for line in sys.stdin:
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    method = message.get("method")
+    params = message.get("params") or {}
+    requests.append({"method": method, "params": params})
+    rid = message.get("id")
+    if rid is None:
+        continue
+    if method == "initialize":
+        send({"id": rid, "result": {
+            "userAgent": "codex_python_sdk/0.159.0 (Fake OS; arm64) unknown (codex_python_sdk; 0.159.0)",
+            "codexHome": "/nonexistent/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
+    elif method == "thread/start":
+        time.sleep(float(os.environ.get("PEER_SLEEP_BEFORE") or 0))
+        send({"id": rid, "result": thread_result(
+            os.environ.get("FAKE_THREAD_ID", "codex-thread"), params)})
+    elif method == "thread/resume":
+        send({"id": rid, "result": thread_result(params["threadId"], params)})
+    elif method == "thread/name/set":
+        send({"id": rid, "result": {}})
+    elif method == "turn/start":
+        turn_id = str(uuid.uuid4())
+        record()
+        send({"id": rid, "result": {"turn": turn_obj(turn_id, "inProgress")}})
+        run_turn(params["threadId"], turn_id)
+    else:
+        send({"id": rid, "error": {"code": -32601, "message": f"fake has no {method}"}})
