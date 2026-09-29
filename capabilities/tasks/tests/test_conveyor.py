@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-agentworker==0.1.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-agentworker==0.2.0"]
 # ///
 """One turn of the conveyor: what is declared, what is claimed, what is settled.
 
@@ -13,7 +13,7 @@ TASKS_TEST_DSN and skip when it is unset; every run works in a schema of its own
 and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'callva-agentworker==0.1.2' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-agentworker==0.2.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ park_hint = "Check the lane before reading the task as stuck."
 
 [workers.implementation.profile]
 engine = "claude"
-fence = "act"
 model = "claude-opus-5"
 effort = "max"
 timeout_seconds = 10800
+permission_mode = "bypassPermissions"
 
 [workers.implementation.routines]
 defect = ["development"]
@@ -66,12 +66,16 @@ selector = { types = ["proposal"] }
 
 [workers.evaluation.profile]
 engine = "claude"
-fence = "read"
 model = "claude-opus-5"
 effort = "high"
 timeout_seconds = 1800
 budget_usd = 10
-allow_tools = ["Bash(tasks:*)"]
+tools = ["Read", "Glob", "Grep", "Bash"]
+allowed_tools = ["Read", "Glob", "Grep", "Bash(tasks:*)"]
+permission_mode = "default"
+strict_mcp = true
+mcp_config = { mcpServers = {} }
+claude_extra_args = { restricted = true }
 add_dirs = ["${A_CHECKOUT}"]
 
 [workers.evaluation.routines]
@@ -112,7 +116,8 @@ def rewrite(project: Path, old: str, new: str) -> None:
 def test_a_worker_is_read_whole(project):
     worker = mod._worker("implementation")
     assert worker["types"] == ["defect", "change"]
-    assert (worker["profile"].engine, worker["profile"].fence) == ("claude", "act")
+    assert worker["profile"].engine == "claude"
+    assert worker["profile"].permission_mode == "bypassPermissions"
     assert worker["profile"].timeout_seconds == 10800
     assert worker["limits"]["attempts"] == 3
     assert worker["handler"] == "claude --model claude-opus-5 --effort max"
@@ -166,10 +171,39 @@ def test_a_type_the_selector_takes_needs_somewhere_to_send_the_turn(project):
     assert any("takes 'change' and its routines name none" in one for one in broken)
 
 
-def test_a_profile_the_schema_refuses_names_its_worker(project):
-    rewrite(project, 'fence = "act"', 'fence = "sideways"')
+def test_a_profile_the_library_refuses_names_its_worker_and_the_librarys_words(project):
+    rewrite(project, 'permission_mode = "bypassPermissions"', 'fence = "act"')
     _rows, broken = mod._workers_report()
-    assert any("implementation" in one and "fence" in one for one in broken)
+    [said] = [one for one in broken if one.startswith("implementation:")]
+    assert "refused by callva-agentworker" in said
+    assert "'fence' was removed in 0.2.0" in said
+
+
+def test_true_in_claude_extra_args_is_a_bare_flag_and_nothing_else_moves():
+    declared = {"engine": "claude", "claude_extra_args": {"restricted": True,
+                                                          "name": "turn"},
+                "strict_mcp": True}
+    assert mod._bare_flags(declared) == {
+        "engine": "claude", "claude_extra_args": {"restricted": None, "name": "turn"},
+        "strict_mcp": True}
+    assert mod._bare_flags({"engine": "claude"}) == {"engine": "claude"}
+
+
+def test_the_evaluation_shape_is_read_whole(project):
+    profile = mod._worker("evaluation")["profile"]
+    assert profile.tools == ("Read", "Glob", "Grep", "Bash")
+    assert profile.permission_mode == "default" and profile.strict_mcp is True
+    assert profile.claude_extra_args == {"restricted": None}
+    assert profile.mcp_config == {"mcpServers": {}}
+
+
+def test_the_report_says_what_each_profile_sets_and_no_fence(project):
+    rows, broken = mod._workers_report()
+    assert broken == []
+    by_name = {row["worker"]: row for row in rows}
+    assert all("fence" not in row for row in rows)
+    assert by_name["implementation"]["profile"]["permission_mode"] == "bypassPermissions"
+    assert by_name["evaluation"]["profile"]["claude_extra_args"] == {"restricted": True}
 
 
 def test_a_key_nothing_reads_is_a_declaration_doing_nothing(project):
@@ -186,7 +220,7 @@ def test_a_project_declaring_no_workers_is_not_an_error(project):
 
 
 def test_the_report_names_every_worker_and_what_is_wrong(project):
-    rewrite(project, 'fence = "read"', 'fence = "sideways"')
+    rewrite(project, 'permission_mode = "default"', 'fence = "read"')
     rows, broken = mod._workers_report()
     assert [row["worker"] for row in rows] == ["evaluation", "implementation"]
     assert [row["ok"] for row in rows] == [False, True]
@@ -455,7 +489,7 @@ def test_a_finished_turn_carries_its_measurements_and_its_pinned_session(
     report, released = one_turn(monkeypatch, capsys, store, engine)
 
     profile = engine.seen["profile"]
-    assert (profile.engine, profile.fence) == ("claude", "act")
+    assert (profile.engine, profile.permission_mode) == ("claude", "bypassPermissions")
     assert engine.seen["session"].kind == "pinned"
     assert engine.seen["cwd"] == str(project)
     assert engine.seen["environ"] is os.environ
@@ -832,6 +866,82 @@ def test_no_value_the_task_carries_is_printed_outside_the_markers(project, store
         assert hostile not in outside, hostile
     assert key in data and stage in data
     assert f'tasks activity {tid} "..."' in tail
+
+
+FAKE_CLAUDE = Path(__file__).resolve().parent / "fakes" / "claude"
+
+
+def _engine_turn(project, entry, capsys, monkeypatch, worker, kind):
+    """One real turn through callva-agentworker, with the engine CLI replaced by
+    a stand-in that records what it was started with."""
+    record = project / "engine.jsonl"
+    monkeypatch.setenv("FAKE_ENGINE_RECORD", str(record))
+    rewrite(project, f"[workers.{worker}.profile]\nengine = \"claude\"\n",
+            f"[workers.{worker}.profile]\nengine = \"claude\"\n"
+            f"cli_path = \"{FAKE_CLAUDE}\"\n")
+    mod.cmd_add(entry, ["--type", kind, "--title", "A probe", "--key", f"t-{kind}",
+                        "--status", "todo"])
+    capsys.readouterr()
+    mod.cmd_run(entry, [worker, "--apply"])
+    report = _answer(capsys)
+    [turn] = [json.loads(line) for line in record.read_text().splitlines()]
+    return report, turn
+
+
+def _flag(argv, name):
+    return argv[argv.index(name) + 1]
+
+
+@needs_store
+def test_an_act_profile_runs_a_claimed_turn_through_the_library(project, store,
+                                                                monkeypatch, capsys):
+    entry, _schema, _conn = store
+    report, turn = _engine_turn(project, entry, capsys, monkeypatch,
+                                "implementation", "defect")
+    assert report["claimed"] == "t-defect" and report["attempt"] == 1
+    argv = turn["argv"]
+    assert _flag(argv, "--model") == "claude-opus-5" and _flag(argv, "--effort") == "max"
+    assert _flag(argv, "--permission-mode") == "bypassPermissions"
+    assert "--restricted" not in argv and "--tools" not in argv
+    assert turn["env"]["TASKS_EXECUTION"] and "You are the worker" in turn["prompt"]
+    mod.cmd_runs(entry, ["t-defect"])
+    [raised] = _answer(capsys)["executions"]
+    assert raised["status"] != "running" and raised["run_system"] == "claude"
+
+
+@needs_store
+def test_a_read_profile_runs_a_claimed_turn_through_the_library(project, store,
+                                                               monkeypatch, capsys):
+    entry, _schema, _conn = store
+    report, turn = _engine_turn(project, entry, capsys, monkeypatch,
+                                "evaluation", "proposal")
+    assert report["claimed"] == "t-proposal"
+    argv = turn["argv"]
+    assert "--restricted" in argv and "--strict-mcp-config" in argv
+    assert _flag(argv, "--tools") == "Read,Glob,Grep,Bash"
+    assert _flag(argv, "--allowedTools") == "Read,Glob,Grep,Bash(tasks:*)"
+    assert _flag(argv, "--permission-mode") == "default"
+    assert json.loads(_flag(argv, "--mcp-config")) == {"mcpServers": {}}
+    assert _flag(argv, "--max-budget-usd") == "10"
+    assert _flag(argv, "--add-dir") == str(project / "elsewhere")
+    assert _flag(argv, "--effort") == "high"
+
+
+@needs_store
+def test_a_refused_profile_claims_nothing(project, store, monkeypatch, capsys):
+    entry, schema, conn = store
+    rewrite(project, 'permission_mode = "bypassPermissions"', 'fence = "act"')
+    mod.cmd_add(entry, ["--type", "defect", "--title", "A probe", "--key", "t-probe",
+                        "--status", "todo"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exit_info:
+        mod.cmd_run(entry, ["implementation", "--apply"])
+    assert exit_info.value.code == 6
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert "'fence' was removed in 0.2.0" in error["message"]
+    mod.cmd_show(entry, ["t-probe"])
+    assert _answer(capsys)["task"]["status"] == "todo"
+    assert conn.execute(f"select count(*) from {schema}.task_executions").fetchone()[0] == 0
 
 
 @needs_store

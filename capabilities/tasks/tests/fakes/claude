@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""A stand-in Claude Code for the tasks suite, speaking the stream-json protocol
+claude-agent-sdk speaks, so callva-agentworker starts it exactly as it starts
+the real CLI.
+
+It answers the SDK's control requests, and answers the user message with an
+init event and a result document. It does no work.
+
+  FAKE_ENGINE_RECORD   append {"argv", "cwd", "env", "prompt"} per turn (JSONL)
+"""
+import json
+import os
+import sys
+
+argv = sys.argv[1:]
+if argv in (["-v"], ["--version"]):
+    print("2.1.280 (Claude Code)")
+    sys.exit(0)
+
+
+def arg(name):
+    for index, item in enumerate(argv):
+        if item == name and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+session = arg("--session-id") or arg("--resume") or "learned-session"
+model = arg("--model") or "claude-fake"
+
+for line in sys.stdin:
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    if message.get("type") == "control_request":
+        emit({"type": "control_response", "response": {
+            "subtype": "success", "request_id": message["request_id"], "response": {}}})
+        continue
+    if message.get("type") != "user":
+        continue
+    content = message.get("message", {}).get("content")
+    prompt = content if isinstance(content, str) else json.dumps(content)
+    record = os.environ.get("FAKE_ENGINE_RECORD")
+    if record:
+        with open(record, "a") as fh:
+            fh.write(json.dumps({"argv": argv, "cwd": os.getcwd(),
+                                 "env": dict(os.environ), "prompt": prompt}) + "\n")
+    emit({"type": "system", "subtype": "init", "session_id": session,
+          "apiKeySource": "none", "model": model, "claude_code_version": "2.1.280",
+          "tools": [], "cwd": os.getcwd(),
+          "permissionMode": arg("--permission-mode") or "default"})
+    emit({"type": "result", "subtype": "success", "is_error": False,
+          "duration_ms": 5, "duration_api_ms": 4, "num_turns": 1, "result": "done",
+          "session_id": session, "total_cost_usd": 0.01,
+          "usage": {"input_tokens": 4, "output_tokens": 3,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+          "modelUsage": {model: {"outputTokens": 3}}, "permission_denials": []})
+sys.exit(0)

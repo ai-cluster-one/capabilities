@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "psycopg[binary]>=3.2",
-#     "callva-agentworker==0.1.2",
+#     "callva-agentworker==0.2.0",
 # ]
 # ///
 """tasks — what has to be done, and what was done about it.
@@ -102,10 +102,10 @@ ONE TURN OF THE CONVEYOR
   write: without it nothing is claimed, no turn is started, and the answer says
   which task a claim would have taken.
 
-  The turn is bounded twice and neither bound is the prompt's. The profile's
-  fence decides what it may run and its timeout kills the whole process tree;
-  the raise decides what it may write, because `TASKS_EXECUTION` goes down with
-  the turn and worker scope answers for every write it makes.
+  The turn is bounded twice and neither bound is the prompt's. The profile
+  decides what it may run and its timeout kills the whole process tree; the
+  raise decides what it may write, because `TASKS_EXECUTION` goes down with the
+  turn and worker scope answers for every write it makes.
 
   Where the task stands when the turn is over is what scores the raise, so a
   turn that reports success and moved nothing is not believed:
@@ -144,12 +144,12 @@ WORKERS
     selector = { types = ["defect", "change"], tags = [], assignee = "" }
     park_hint = "one sentence added to the handback when a task is parked"
 
-    [workers.<name>.profile]      # the engine profile, validated against the
-    engine = "claude"             # schema `callva-agentworker` ships
-    fence = "act"                 # read | write | act
+    [workers.<name>.profile]      # one callva-agentworker profile
+    engine = "claude"
     model = "claude-opus-5"
     effort = "max"
     timeout_seconds = 10800
+    permission_mode = "bypassPermissions"
 
     [workers.<name>.routines]     # which routines the turn is told to load
     defect = ["capability-development"]
@@ -168,6 +168,17 @@ WORKERS
   `types` is tried in order, one claim per type, stopping at the first that
   yields: the order is the whole of the arbitration, because something broken is
   taken before something that could merely be better.
+
+  The profile is callva-agentworker's own set of explicit knobs, handed to it as
+  written after `${VAR}` expansion: what the turn may run, on which model, at
+  what effort and for how long is whatever it sets and nothing else, and a knob
+  it leaves out leaves the engine's own default. The knobs and what each does on
+  each engine are the library's, listed in its README. One spelling is this
+  file's: TOML has no null, so `true` inside `claude_extra_args` stands for a
+  bare flag, as in `claude_extra_args = { restricted = true }`. A profile the
+  library refuses is reported with the library's own message, and no task is
+  claimed for its worker. `doctor` reports each worker's engine and the knobs its
+  profile sets.
 
   `routines` and `instructions` are keyed by task type, and a task carrying a
   `stage` in its metadata takes `"<type>:<stage>"` when that key is present. A
@@ -5445,8 +5456,8 @@ def _expand(value: str, where: str) -> str:
     A machine-local path belongs in local environment configuration rather than
     in a versioned declaration, so the declaration names it instead of carrying
     it. A name nothing answers for is refused rather than expanded to nothing:
-    an empty expansion would quietly drop the directory a fenced turn was meant
-    to be able to reach, and the turn would fail at something else."""
+    an empty expansion would quietly drop the directory a turn was meant to be
+    able to reach, and the turn would fail at something else."""
     def one(match) -> str:
         found = (os.environ.get(match.group(1))
                  or _project_env().get(match.group(1)) or "").strip()
@@ -5501,6 +5512,17 @@ def _handler(profile) -> str:
     return " ".join(parts)
 
 
+def _bare_flags(profile: dict) -> dict:
+    """The profile as the library takes it. TOML has no null, which is how the
+    library spells a bare claude flag, so `true` inside `claude_extra_args` is
+    read as one; every other value, there and anywhere else, goes as written."""
+    extra = profile.get("claude_extra_args")
+    if not isinstance(extra, dict):
+        return profile
+    return {**profile, "claude_extra_args": {flag: None if value is True else value
+                                             for flag, value in extra.items()}}
+
+
 def _read_worker(name: str, table) -> tuple[dict | None, list[tuple]]:
     """One worker as this capability reads it, and everything wrong with it.
 
@@ -5551,9 +5573,9 @@ def _read_worker(name: str, table) -> tuple[dict | None, list[tuple]]:
         wrong("it declares no profile table")
     else:
         try:
-            profile = _agentworker().Profile.from_dict(declared_profile)
+            profile = _agentworker().Profile.from_dict(_bare_flags(declared_profile))
         except (ValueError, TypeError, KeyError) as exc:
-            wrong(f"its profile is refused by the engine schema: {exc}")
+            wrong(f"its profile is refused by callva-agentworker: {exc}")
 
     routines = table.get("routines") or {}
     if not isinstance(routines, dict):
@@ -5617,7 +5639,8 @@ def _read_worker(name: str, table) -> tuple[dict | None, list[tuple]]:
     if problems:
         return None, problems
     return {"name": name, "types": types, "tags": tags, "assignee": assignee,
-            "profile": profile, "routines": routines, "instructions": instructions,
+            "profile": profile, "knobs": dict(declared_profile),
+            "routines": routines, "instructions": instructions,
             "limits": limits, "park_hint": hint.strip(),
             "handler": _handler(profile)}, []
 
@@ -5645,7 +5668,7 @@ def _workers_report() -> tuple[list[dict], list[str]]:
         if worker:
             row["types"] = worker["types"]
             row["engine"] = worker["profile"].engine
-            row["fence"] = worker["profile"].fence
+            row["profile"] = worker["knobs"]
         if problems:
             row["problems"] = [sentence for _code, _slug, sentence in problems]
             broken += [f"{name}: {sentence}" for _code, _slug, sentence in problems]
@@ -5985,7 +6008,7 @@ def _boot(worker: dict, prompt: str, execution: str, cwd: Path):
     knows how a turn is started.
 
     The raise goes down with it: `TASKS_EXECUTION` signs every write the turn
-    makes and bounds what those writes may reach. The fence cannot do that - it
+    makes and bounds what those writes may reach. The profile cannot do that - it
     decides which commands may run, not which rows one of them may move. It is
     passed rather than exported, so it reaches the turn and its children and
     nothing else in this process.
