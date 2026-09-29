@@ -298,3 +298,32 @@ def test_a_handed_down_id_is_used_without_asking_contextkit(tmp_path: Path) -> N
                                cwd=project, env=env, text=True, capture_output=True, timeout=60)
     assert elsewhere.returncode == 6
     assert _error(elsewhere)["code"] == "contextkit_unavailable"
+
+
+def test_resolving_the_envelope_alone_hands_the_id_down_beside_it(tmp_path: Path) -> None:
+    """A capability that never asks for the id still hands it to its children
+    with the envelope, where a write may stamp it, and hands nothing down on a
+    mismatch."""
+    _contextkit(tmp_path)
+    probe = (
+        "import importlib.util, json, os\n"
+        "spec = importlib.util.spec_from_loader('cap', loader=None)\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        f"mod.__file__ = {str(TASKS)!r}\n"
+        f"src = open({str(TASKS)!r}).read().replace('if __name__ == \"__main__\":\\n    main()\\n', '')\n"
+        "exec(compile(src, mod.__file__, 'exec'), mod.__dict__)\n"
+        "mod._envelope_home(mod._project_root())\n"
+        "print(json.dumps({k: os.environ.get(k) for k in ('CAPABILITIES_PROJECT_ID', 'CAPABILITIES_PROJECT_ID_ROOT')}))\n")
+    for contextkit_id, copy_id, handed in (("prj_0000000000f3", "prj_0000000000f3", "prj_0000000000f3"),
+                                           ("prj_0000000000f3", "prj_0000000000f4", None)):
+        base = tmp_path / copy_id
+        base.mkdir()
+        project = _project(base, bound=True, contextkit_id=contextkit_id,
+                           copy={"schema": "capabilities.project.v1", "slug": "p", "id": copy_id})
+        env = _env(tmp_path, project)
+        result = subprocess.run([sys.executable, "-c", probe], cwd=project, env=env,
+                                text=True, capture_output=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "CAPABILITIES_PROJECT_ID": handed,
+            "CAPABILITIES_PROJECT_ID_ROOT": str(project.resolve()) if handed else None}

@@ -554,6 +554,12 @@ def _envelope_home(root: Path) -> Path:
     _ENVELOPE_HOME[root] = home
     os.environ["CAPABILITIES_PROJECT_ENVELOPE"] = str(home)
     os.environ["CAPABILITIES_PROJECT_ENVELOPE_ROOT"] = str(root)
+    # The id travels with the envelope: resolved at read level, handed down
+    # only where a write may stamp it, and never a reason to refuse here.
+    try:
+        _project_id_state_at(root)
+    except Exception:
+        pass
     return home
 
 
@@ -589,6 +595,11 @@ def _context_identity(root: Path) -> dict:
     known = _CONTEXT_IDENTITY.get(root)
     if known is not None:
         return known
+    if not (root / ".contextkit" / "config.toml").is_file():
+        # The binding the manager asks ContextKit about is absent, so the
+        # manager's answer is already known: unbound, with no id of its own.
+        _CONTEXT_IDENTITY[root] = {"bound": False, "id": None}
+        return _CONTEXT_IDENTITY[root]
     entry = _cached_record("identity", IDENTITY_CACHE_VERSION, root)
     if (entry is not None and isinstance(entry.get("bound"), bool)
             and (entry.get("id") is None or isinstance(entry.get("id"), str))):
@@ -679,6 +690,11 @@ def _project_id_state():
     root = _project_root()
     if root is None:
         return None
+    return _project_id_state_at(root)
+
+
+def _project_id_state_at(root: Path) -> dict:
+    """`_project_id_state` for a known project root."""
     try:
         declared = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
     except (OSError, ValueError):
