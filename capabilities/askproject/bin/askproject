@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "callva-agentworker==0.2.0",
+#     "callva-harness-runner==0.4.0",
 # ]
 # ///
 """
@@ -16,11 +16,12 @@ that peer reads whatever project context is compiled on disk there at that
 moment (Claude reads CLAUDE.md, Codex reads AGENTS.md) / settings / rights —
 then hands back the answer with cost, token, and files-changed data.
 
-Two engines drive the peer, selected with `--engine`, and each is launched
-through the callva-agentworker library (Claude Code through its agent SDK, Codex
-through its app-server SDK, always the CLI installed on this machine), which
-applies the profile, resumes sessions, keeps the deadline and reads cost, tokens
-and the session id back out of what the engine reported:
+Two engines (harnesses) drive the peer, selected with `--engine`, and each is
+launched through the callva-harness-runner library (Claude Code through its
+agent SDK, Codex through its app-server SDK, always the CLI installed on this
+machine), which finds and applies the profile, resumes sessions, keeps the
+deadline and reads cost, tokens and the session id back out of what the
+harness reported:
   claude (default)  Claude Code.
   codex             Codex. No USD cost is reported under ChatGPT auth, so
                     cost_usd stays null.
@@ -67,7 +68,7 @@ COMPILED PROJECT CONTEXT
 
 ────────────────────────────────────────────────────────────────────────────
 MODES
-  read  (default;   Research. The shipped `read` profile holds the peer to
+  read  (default;   Research. The `read` profile holds the peer to
         --read)     reading by instruction alone: it has every tool, a full
                     shell and the network, with no tool fence and no OS
                     sandbox, so it can run the target's own commands and
@@ -76,44 +77,56 @@ MODES
                     rules, not your user settings; codex: AGENTS.md), and it
                     runs with CAPABILITIES_READ_ONLY=1, so every capability call
                     it makes is read-only. Use for "what does X do", reviews.
-  act   (--act)     The shipped `act` profile gives the peer full access:
+  act   (--act)     The `act` profile gives the peer full access:
                     every tool without a prompt on claude, no sandbox and no
                     approvals on codex. It can edit, run tests, commit, and
                     push from inside the target project. Use for "fix X",
                     "refactor". Under CAPABILITIES_READ_ONLY --act is refused
                     before any peer starts.
 
-  Read mode is an instruction, not a fence: nothing but the prompt and the
-  capabilities' read-only switch stops a read peer from writing. The git
-  snapshot (below) is the check — a read call that changed the target returns
-  ok=false. A peer started while you run under CAPABILITIES_READ_ONLY carries
-  the switch whatever its profile.
+  Under `read`, read mode is an instruction, not a fence: nothing but the
+  prompt and the capabilities' read-only switch stops the peer from writing.
+  `--profile read-sandboxed` is the same read enforced by the operating system:
+  the target directory cannot be written, while the network, ~/.cache and the
+  temporary directory stay writable; on claude it runs no target hooks, so
+  context a hook would build is read as it already is on disk. The git snapshot
+  (below) is the check either way — a read call that changed the target
+  returns ok=false. A peer started while you run under CAPABILITIES_READ_ONLY
+  carries the switch whatever its profile.
 
 ────────────────────────────────────────────────────────────────────────────
 PROFILES
-  A profile is a TOML file, <name>.toml, with a [claude] and a [codex] table.
-  Each table is one whole callva-agentworker 0.2.0 profile — its knobs only
-  (model, effort, timeout_seconds, permission_mode, setting_sources, tools,
-  codex_config, approval_policy, append_system_prompt, env_set, ...); the
-  library's README lists every knob and what it does on each engine. --engine
-  picks the table, --profile <name> picks the file. Without --profile a read
-  uses `read` and --act uses `act`; a -c follow-up keeps the profile its thread
-  ran under while it keeps its mode.
+  A profile is a TOML file, <name>.toml, with one table per harness, [claude]
+  and [codex]; the table name is the harness, and nothing else sits at the top
+  of the file. Each table is one callva-harness-runner 0.4.0 profile — its
+  knobs only (model, effort, timeout_seconds, permission_mode, setting_sources,
+  settings, tools, codex_config, approval_policy, append_system_prompt,
+  env_set, ...); the library's README lists every knob and what it does on each
+  harness. --engine picks the table, --profile <name> picks the file. Without
+  --profile a read uses `read` and --act uses `act`; a -c follow-up keeps the
+  profile its thread ran under while it keeps its mode.
 
-  A name is looked up in this order, and the first file found is used whole —
-  nothing is merged from a same-named file further down, nothing inherited:
-    1. the project envelope    capabilities/askproject/profiles/<name>.toml
-    2. this machine            $XDG_CONFIG_HOME/askproject/profiles/<name>.toml
-                               (default ~/.config/askproject/profiles/)
-    3. shipped with askproject `read` and `act`
+  callva-harness-runner finds a name in this order, and the first file found is
+  used whole — nothing is merged from a same-named file further down, nothing
+  inherited; a file without the table for the harness is an error, not a
+  reason to look further:
+    1. folder    this project's capabilities/askproject/profiles/<name>.toml
+    2. machine   the library's machine folder, shared by everything that runs
+                 on callva-harness-runner:
+                 $XDG_CONFIG_HOME/callva-harness-runner/profiles/<name>.toml
+                 (default ~/.config/callva-harness-runner/profiles/). Put a
+                 machine-wide profile there.
+    3. shipped   the library's own `read`, `act` and `read-sandboxed`
   So a project or machine file named `read` or `act` replaces the shipped one.
-  `askproject profiles` shows what each name resolves to.
+  `askproject profiles` lists every profile in sight — name, source, path, the
+  harness tables it defines, and the same-named files it shadows — and
+  `askproject profiles show <name>` prints the file a name resolves to, after a
+  comment line naming its source and path.
 
   The shipped profiles run claude on claude-opus-5-5 and codex on gpt-6-sol,
-  both at effort medium, with a 3600-second timeout; `askproject profiles show
-  read` prints the whole file. To write your own, copy one of them into the
-  project envelope or the machine folder under a new name and edit it; the
-  profile table must be one callva-agentworker accepts, and a profile it refuses
+  both at effort medium, with a 3600-second timeout. To write your own, copy
+  one (`askproject profiles show read`) into this project's folder or the
+  machine folder under a new name and edit it; a profile the library refuses
   is reported with its own message before any peer starts.
 
   askproject adds to every profile, per call: its bridge instruction, in front
@@ -180,7 +193,7 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   {
     "ok": bool, "error": str|null,
     "target": "<abs path>", "engine": "claude|codex", "mode": "read|act",
-    "profile": {"name", "source": "project|machine|shipped", "path"},
+    "profile": {"name", "source": "folder|machine|shipped", "path"},
     "model": "<model id>", "effort": "<level>",
     "session_id": "<uuid>", "peer_name": "<name>|null", "resumed": bool,
     "answer": <string OR parsed object when --schema is used>,
@@ -296,11 +309,10 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 ENGINES = ("claude", "codex")
 DEFAULT_ENGINE = "claude"
 
-# A profile is a TOML file holding one callva-agentworker profile per engine, a
-# [claude] and a [codex] table. Without --profile a read uses PROFILE_FOR_MODE's
-# "read" and --act uses "act"; both ship in the bundle's profiles/ folder.
+# A profile is a TOML file holding one callva-harness-runner profile per
+# harness, a [claude] and a [codex] table. Without --profile a read uses
+# PROFILE_FOR_MODE's "read" and --act uses "act"; the library ships both.
 PROFILE_FOR_MODE = {"read": "read", "act": "act"}
-PROFILE_NAME_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 # claude only: short names resolved to full ids. codex takes --model verbatim.
 MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5-20251001",
@@ -3734,18 +3746,18 @@ def _tool_stage(name, tool_input=None) -> tuple[str, str]:
     return "work", "Using a project tool"
 
 
-def _agentworker(as_json: bool):
-    """The engine library, imported at the moment a peer is about to launch.
+def _runner(as_json: bool):
+    """The harness library, imported at the moment a profile or a peer is needed.
 
     Every other verb here works without it, and a reading verb should not wait
     on a dependency it never reaches."""
     try:
-        from callva import agentworker
+        from callva import harness_runner
     except ImportError as exc:  # pragma: no cover - a broken install, not a path
-        die(f"the engine library is not importable: {exc}; reinstall askproject - "
-            "its script header declares callva-agentworker and uv resolves it",
+        die(f"the harness library is not importable: {exc}; reinstall askproject - "
+            "its script header declares callva-harness-runner and uv resolves it",
             as_json=as_json)
-    return agentworker
+    return harness_runner
 
 
 def _peer_env(target) -> dict:
@@ -3770,7 +3782,7 @@ def _peer_env(target) -> dict:
     that shim finds itself on PATH again and re-execs forever.
 
     The markers a calling Claude session leaves in its children's environment
-    are removed by callva-agentworker unless the profile says otherwise, so a
+    are removed by callva-harness-runner unless the profile says otherwise, so a
     peer does not believe it runs inside its caller's session.
 
     Everything else is inherited deliberately: PATH, HOME, the language runtime
@@ -3795,7 +3807,7 @@ def _peer_env(target) -> dict:
 class CodexProgress:
     """Render codex app-server notifications while withholding the answer.
 
-    Each event is `{"method", "params"}` as callva-agentworker hands it over."""
+    Each event is `{"method", "params"}` as callva-harness-runner hands it over."""
 
     def __init__(self, reporter: ProgressReporter):
         self.reporter = reporter
@@ -3852,7 +3864,7 @@ class CodexProgress:
 
 
 def _claude_progress(evt: dict, reporter: ProgressReporter) -> None:
-    """Render one claude-agent-sdk message as callva-agentworker hands it over:
+    """Render one claude-agent-sdk message as callva-harness-runner hands it over:
     the engine's own system event, or a message's fields plus its class name."""
     kind = evt.get("type")
     if kind == "system" and evt.get("subtype") == "init":
@@ -3879,113 +3891,54 @@ def _claude_progress(evt: dict, reporter: ProgressReporter) -> None:
 
 
 # --- profiles ----------------------------------------------------------------
-# A profile is a TOML file with a [claude] and a [codex] table, each one whole
-# callva-agentworker profile. A name resolves to the first file found, in the
-# order _profile_sources gives, and that file is used whole: nothing is merged
-# from a file of the same name further down, and nothing is inherited.
+# A profile is a TOML file with one table per harness, [claude] and [codex],
+# each one callva-harness-runner profile. callva-harness-runner finds it by
+# name: askproject's own folder in the project envelope first, then the
+# library's machine folder, then the profiles the library ships. The first file
+# found is used whole.
 
-def _bundle_dir() -> Path:
-    executable = Path(__file__).resolve()
-    return (executable.parent.parent
-            if executable.parent.name == "bin" else executable.parent)
-
-
-def _profile_sources() -> list[tuple[str, Path]]:
-    """Where a profile is looked for, in order: the project envelope, the
-    machine-wide askproject config folder, then the profiles askproject ships."""
-    sources: list[tuple[str, Path]] = []
+def _profile_folders() -> list[Path]:
+    """askproject's own profile folders, searched before the library's machine
+    folder and shipped set: the project envelope's askproject/profiles."""
     env_dir = _env_dir()
-    if env_dir is not None:
-        sources.append(("project", env_dir / "profiles"))
-    sources.append(("machine", _CONFIG_HOME / NAME / "profiles"))
-    sources.append(("shipped", _bundle_dir() / "profiles"))
-    return sources
+    return [env_dir / "profiles"] if env_dir is not None else []
 
 
-def _profile_files(name: str) -> list[dict]:
-    """Every file holding profile `name`, in lookup order; the first is used."""
-    return [{"source": source, "path": str(folder / f"{name}.toml")}
-            for source, folder in _profile_sources()
-            if (folder / f"{name}.toml").is_file()]
-
-
-def _check_profile_name(name: str) -> str | None:
-    import re
-    if re.fullmatch(PROFILE_NAME_RE, name or ""):
-        return None
-    return (f"profile name {name!r} is not a plain name: letters, digits, '.', "
-            "'_' and '-', starting with a letter or digit")
-
-
-def _resolve_profile(name: str, *, as_json: bool) -> dict:
-    """The file profile `name` resolves to: {name, source, path}."""
-    problem = _check_profile_name(name)
-    if problem:
-        die(problem, as_json=as_json)
-    found = _profile_files(name)
-    if not found:
-        where = ", ".join(f"{source} {folder}" for source, folder in _profile_sources())
-        die(f"no profile named {name!r}; looked in {where}. "
-            "`askproject profiles` lists the ones that exist", as_json=as_json)
-    return {"name": name, **found[0]}
-
-
-def _profile_table(resolved: dict, engine: str, *, as_json: bool) -> dict:
-    """The [engine] table of a resolved profile file, exactly as written."""
-    import tomllib
-    label = f"profile {resolved['name']!r} ({resolved['source']} {resolved['path']})"
-    try:
-        data = tomllib.loads(Path(resolved["path"]).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        die(f"{label} cannot be read as TOML: {exc}", as_json=as_json)
-    table = data.get(engine)
-    if not isinstance(table, dict):
-        die(f"{label} has no [{engine}] table, so it cannot run the {engine} "
-            "engine", as_json=as_json)
-    if table.get("engine", engine) != engine:
-        die(f"{label}: its [{engine}] table names engine {table.get('engine')!r}",
-            as_json=as_json)
-    return {**table, "engine": engine}
+def _profile_lookup(runner) -> list[dict]:
+    """Where a name is looked for, in order, as the library searches."""
+    return ([{"source": "folder", "dir": str(folder)} for folder in _profile_folders()]
+            + [{"source": "machine", "dir": str(runner.machine_folder())},
+               {"source": "shipped", "dir": "the profiles shipped in callva-harness-runner"}])
 
 
 def cmd_profiles(argv: list[str]) -> None:
-    """`profiles` lists every profile in sight; `profiles show NAME` prints the
-    file NAME resolves to, verbatim, for an operator to copy and edit."""
+    """`profiles` lists every profile in sight, as the library lists it;
+    `profiles show NAME` prints the file NAME resolves to after a comment line
+    naming its source and path, for an operator to copy and edit."""
+    runner = _runner(as_json=True)
+    folders = _profile_folders()
     if argv and argv[0] == "show":
         if len(argv) != 2:
             _die(6, "input", "usage: askproject profiles show <name>")
-        name = argv[1]
-        problem = _check_profile_name(name)
-        if problem:
-            _die(6, "input", problem)
-        found = _profile_files(name)
-        if not found:
-            _die(3, "not_found", f"no profile named {name!r}",
-                 "`askproject profiles` lists the ones that exist")
-        _emit(Path(found[0]["path"]).read_text(encoding="utf-8"))
+        try:
+            found = runner.find_profile_file(argv[1], folders)
+        except runner.ProfileNotFound as exc:
+            _die(3, "not_found", str(exc), "`askproject profiles` lists the ones that exist")
+        except runner.ProfileError as exc:
+            _die(6, "input", str(exc))
+        text = found.text if found.text.endswith("\n") else found.text + "\n"
+        sys.stdout.write(f"# {found.source}: {found.path}\n{text}")
         return
     if argv:
         _die(6, "input", "usage: askproject profiles [show <name>]")
-    seen: dict[str, dict] = {}
-    for source, folder in _profile_sources():
-        files = sorted(folder.glob("*.toml")) if folder.is_dir() else []
-        for path in files:
-            if _check_profile_name(path.stem):
-                continue
-            here = {"source": source, "path": str(path)}
-            if path.stem in seen:
-                seen[path.stem]["shadows"].append(here)
-            else:
-                seen[path.stem] = {"name": path.stem, **here, "shadows": []}
     _emit({
-        "profiles": [seen[name] for name in sorted(seen)],
-        "lookup": [{"source": source, "dir": str(folder)}
-                   for source, folder in _profile_sources()],
+        "profiles": [entry.to_dict() for entry in runner.list_profiles(folders)],
+        "lookup": _profile_lookup(runner),
     })
 
 
 # --- the peer ---------------------------------------------------------------
-# callva-agentworker runs the engine: it turns the profile into the engine's
+# callva-harness-runner runs the harness: it turns the profile into the harness's
 # own configuration, resumes sessions, keeps the deadline and reads what the
 # engine reported. askproject owns which profile runs, what the peer is asked
 # and told, where it stands, and what is reported. The launcher turns one call
@@ -3995,17 +3948,17 @@ def cmd_profiles(argv: list[str]) -> None:
 
 def run_peer(engine, target, prompt, profile, resume_id, schema_text, as_json,
              reporter: ProgressReporter, session_id=None) -> dict:
-    """One headless turn of the peer through callva-agentworker.
+    """One headless turn of the peer through callva-harness-runner.
 
     claude runs under the session id chosen before launch; codex reports its
     own thread id. The schema reaches codex as its native output schema and
     claude as an instruction, as the profile built in run() says."""
-    aw = _agentworker(as_json)
+    runner = _runner(as_json)
     if engine == "claude":
-        session = (aw.Session.resume(resume_id) if resume_id
-                   else aw.Session.pinned(session_id))
+        session = (runner.Session.resume(resume_id) if resume_id
+                   else runner.Session.pinned(session_id))
     else:
-        session = aw.Session.resume(resume_id) if resume_id else aw.Session.fresh()
+        session = runner.Session.resume(resume_id) if resume_id else runner.Session.fresh()
     on_event = None
     if reporter.enabled:
         if engine == "claude":
@@ -4014,21 +3967,21 @@ def run_peer(engine, target, prompt, profile, resume_id, schema_text, as_json,
         else:
             on_event = CodexProgress(reporter).feed
 
-    result = aw.run(prompt, profile, str(target), session=session,
+    result = runner.run(prompt, profile, str(target), session=session,
                     environ=_peer_env(target), on_event=on_event)
 
     failure = result.failure
-    if failure is not None and failure.kind == aw.FailureKind.TIMEOUT:
+    if failure is not None and failure.kind == runner.FailureKind.TIMEOUT:
         reporter.emit("failed", f"Peer timed out after {profile.timeout_seconds:g}s")
         # claude's id was settled before launch and codex's is known once its
         # thread started, so a peer stopped mid-turn stays resumable whenever
         # an id exists at all.
         raise PeerTimeout(int(profile.timeout_seconds), result.session_id)
-    if failure is not None and failure.kind == aw.FailureKind.BINARY_MISSING:
+    if failure is not None and failure.kind == runner.FailureKind.BINARY_MISSING:
         die(f"`{engine}` CLI not found on PATH", as_json=as_json)
     # A schema answer that did not parse is still the peer's answer; it is
     # returned as text, as it always was, rather than failed.
-    if failure is not None and failure.kind != aw.FailureKind.INVALID_OUTPUT:
+    if failure is not None and failure.kind != runner.FailureKind.INVALID_OUTPUT:
         reporter.emit("failed", f"{engine.capitalize()} peer failed: {failure.kind}")
         exited = "" if result.exit_code is None else f", exit {result.exit_code}"
         die(f"peer failed ({failure.kind}{exited}): {failure.message[-800:]}",
@@ -4063,36 +4016,39 @@ def run_peer(engine, target, prompt, profile, resume_id, schema_text, as_json,
     }
 
 
-def _build_profile(resolved: dict, engine: str, *, caller: str, model, effort,
+def _build_profile(name: str, engine: str, *, caller: str, model, effort,
                    timeout, append, schema_text, peer_name, as_json: bool):
-    """The profile this call runs: the resolved file's [engine] table, whole,
-    with the call's overrides and askproject's own per-call settings on top."""
-    aw = _agentworker(as_json)
-    label = f"profile {resolved['name']!r} ({resolved['source']} {resolved['path']})"
-    table = _profile_table(resolved, engine, as_json=as_json)
+    """The profile this call runs, and where it came from: the [engine] table
+    of the file `name` resolves to, whole, with the call's overrides and
+    askproject's own per-call settings on top."""
+    import dataclasses
+    runner = _runner(as_json)
+    folders = _profile_folders()
     try:
-        aw.Profile.from_dict(table)
-    except aw.ProfileError as exc:
-        die(f"{label} is refused by callva-agentworker: {exc}", as_json=as_json)
-    data = dict(table)
+        found = runner.find_profile_file(name, folders)
+        profile = runner.find_profile(name, engine, folders)
+    except runner.ProfileError as exc:
+        die(f"profile {name!r} is refused by callva-harness-runner: {exc}",
+            as_json=as_json)
+    record = {"name": found.name, "source": found.source, "path": found.path}
+    changes = {"append_system_prompt": build_instructions(
+        caller, profile.append_system_prompt, append,
+        schema_text if engine == "claude" else None)}
     if model:
-        data["model"] = model
+        changes["model"] = model
     if effort:
-        data["effort"] = effort
+        changes["effort"] = effort
     if timeout:
-        data["timeout_seconds"] = timeout
-    data["append_system_prompt"] = build_instructions(
-        caller, table.get("append_system_prompt"), append,
-        schema_text if engine == "claude" else None)
+        changes["timeout_seconds"] = timeout
     if engine == "claude":
-        data["name"] = peer_name
+        changes["name"] = peer_name
     elif schema_text:
-        data["output_schema"] = json.loads(schema_text)
+        changes["output_schema"] = json.loads(schema_text)
     try:
-        return aw.Profile.from_dict(data)
-    except aw.ProfileError as exc:
-        die(f"{label} with this call's overrides is refused by "
-            f"callva-agentworker: {exc}", as_json=as_json)
+        return dataclasses.replace(profile, **changes), record
+    except runner.ProfileError as exc:
+        die(f"profile {name!r} ({found.source} {found.path}) with this call's "
+            f"overrides is refused by callva-harness-runner: {exc}", as_json=as_json)
 
 
 def run(args):
@@ -4168,11 +4124,10 @@ def run(args):
         # started from here may change anything, so it is not started at all.
         _read_only_gate("`askproject --act`")
 
-    if not _agentworker(as_json).find_binary(engine):
+    if not _runner(as_json).find_binary(engine):
         die(f"`{engine}` CLI not found on PATH", as_json=as_json)
 
     profile_name = args.profile or stored_profile or PROFILE_FOR_MODE[mode]
-    resolved = _resolve_profile(profile_name, as_json=as_json)
 
     # Overrides of the profile's values: a flag names this call, else the
     # environment chain; neither leaves the profile's own value in place.
@@ -4220,12 +4175,10 @@ def run(args):
         session_id_upfront = None
         peer_name = None
 
-    profile = _build_profile(resolved, engine, caller=caller, model=model,
-                             effort=effort, timeout=timeout, append=args.append,
-                             schema_text=schema_text, peer_name=peer_name,
-                             as_json=as_json)
-    profile_record = {"name": resolved["name"], "source": resolved["source"],
-                      "path": resolved["path"]}
+    profile, profile_record = _build_profile(
+        profile_name, engine, caller=caller, model=model, effort=effort,
+        timeout=timeout, append=args.append, schema_text=schema_text,
+        peer_name=peer_name, as_json=as_json)
 
     reporter = ProgressReporter(engine, enabled=not args.quiet)
     # Before the launch line: stdout carries the result only at exit, so this is
@@ -4233,8 +4186,8 @@ def run(args):
     if peer_name:
         reporter.emit("peer", f"{peer_name} session {session_id_upfront}")
     reporter.emit("starting",
-                  f"Launching {engine} peer with profile {resolved['name']} "
-                  f"({resolved['source']})")
+                  f"Launching {engine} peer with profile {profile_record['name']} "
+                  f"({profile_record['source']})")
     before = snapshot(target)
     # Read before the peer starts: an engine that builds its context at session
     # start rewrites this file during the run, and the peer answered from the
@@ -4248,7 +4201,7 @@ def run(args):
             "status": "timed_out",
             "engine": engine,
             "mode": mode,
-            "profile": resolved["name"],
+            "profile": profile_record["name"],
             "session_id": exc.session_id,
             "at": time.time(),
         }
@@ -4257,7 +4210,7 @@ def run(args):
             entry["last_model"] = profile.model
             entry["last_effort"] = profile.effort
             entry["last_mode"] = mode
-            entry["last_profile"] = resolved["name"]
+            entry["last_profile"] = profile_record["name"]
             entry["engine"] = engine
         state[key] = entry
         save_state(state)
@@ -4281,7 +4234,7 @@ def run(args):
         entry["last_model"] = res.get("model")
         entry["last_effort"] = res.get("effort")
         entry["last_mode"] = mode
-        entry["last_profile"] = resolved["name"]
+        entry["last_profile"] = profile_record["name"]
         entry["engine"] = engine
         entry["interactions"] = entry.get("interactions", 0) + 1
         entry["last_used_at"] = time.time()
@@ -4289,7 +4242,7 @@ def run(args):
             "status": "completed",
             "engine": engine,
             "mode": mode,
-            "profile": resolved["name"],
+            "profile": profile_record["name"],
             "session_id": session_id,
             "at": entry["last_used_at"],
         }

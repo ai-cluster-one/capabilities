@@ -1,13 +1,13 @@
-"""What the askproject suite shares: the script, the fake engines, and one ask.
+"""What the askproject suite shares: the script, the fake harnesses, and one ask.
 
-The fakes under fakes/ speak the protocols callva-agentworker's SDKs speak, so
-an ask here runs the real library against them. Each launch is appended to
-$PEER_RECORD, so a test reads what the engine was actually handed.
+The fakes under fakes/ speak the protocols callva-harness-runner's SDKs speak,
+so an ask here runs the real library against them. Each launch is appended to
+$PEER_RECORD, so a test reads what the harness was actually handed.
 
-The script imports callva-agentworker when a peer launches, so the suite runs
-where that library is importable:
+The script imports callva-harness-runner when a profile or a peer is needed, so
+the suite runs where that library is importable:
 
-    uv run --with pytest --with 'callva-agentworker==0.2.0' \\
+    uv run --with pytest --with 'callva-harness-runner==0.4.0' \\
         python -m pytest capabilities/askproject/tests -q
 """
 
@@ -22,7 +22,12 @@ SCRIPT = next((path for path in (
     CAPABILITY / "bin" / "askproject", CAPABILITY / "askproject")
     if path.is_file()), CAPABILITY / "bin" / "askproject")
 FAKES = Path(__file__).resolve().parent / "fakes"
-SHIPPED = CAPABILITY / "profiles"
+
+def shipped_path(name: str) -> Path:
+    """Where the library keeps the profile it ships as `name`."""
+    from callva.harness_runner.discovery import shipped_folder
+    return Path(str(shipped_folder().joinpath(f"{name}.toml")))
+
 
 CHAIN_KEYS = ("ASKPROJECT_ENGINE", "ASKPROJECT_MODEL", "ASKPROJECT_EFFORT",
               "ASKPROJECT_TIMEOUT")
@@ -80,8 +85,12 @@ class Lab:
         self.env["PEER_RECORD"] = str(self.record)
 
     def write_profile(self, where: str, name: str, body: str) -> Path:
-        folder = (self.caller / "capabilities" / "askproject" / "profiles"
-                  if where == "project" else self.config / "askproject" / "profiles")
+        """Write profile `name` into this project's folder ("project"), the
+        library's machine folder ("machine"), or any folder under config."""
+        folder = {
+            "project": self.caller / "capabilities" / "askproject" / "profiles",
+            "machine": self.config / "callva-harness-runner" / "profiles",
+        }.get(where) or self.config / where
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"{name}.toml"
         path.write_text(body)
@@ -138,18 +147,18 @@ def thread_params(launch: dict) -> dict:
 
 
 def model_of(launch: dict) -> str | None:
-    if launch["engine"] == "claude":
+    if launch["harness"] == "claude":
         return value(launch["argv"], "--model")
     return thread_params(launch).get("model")
 
 
 def effort_of(launch: dict) -> str | None:
-    if launch["engine"] == "claude":
+    if launch["harness"] == "claude":
         return value(launch["argv"], "--effort")
     return request(launch, "turn/start").get("effort")
 
 
 def instructions_of(launch: dict) -> str | None:
-    if launch["engine"] == "claude":
+    if launch["harness"] == "claude":
         return value(launch["argv"], "--append-system-prompt")
     return thread_params(launch).get("developerInstructions")

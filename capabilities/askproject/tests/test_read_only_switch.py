@@ -105,7 +105,7 @@ def test_with_the_switch_off_the_shipped_read_profile_sets_it(lab, value):
 def test_with_the_switch_off_a_bare_profile_hands_the_peer_nothing_new(lab, value):
     profiles = lab["caller"] / "capabilities" / "askproject" / "profiles"
     profiles.mkdir(parents=True)
-    (profiles / "bare.toml").write_text('[claude]\nengine = "claude"\n')
+    (profiles / "bare.toml").write_text('[claude]\n')
     proc = _run(lab, str(lab["target"]), "what is here?", "--quiet",
                 "--profile", "bare", switch=value)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -116,7 +116,7 @@ def test_with_the_switch_off_a_bare_profile_hands_the_peer_nothing_new(lab, valu
 def test_under_the_switch_a_bare_profile_still_carries_it(lab, value):
     profiles = lab["caller"] / "capabilities" / "askproject" / "profiles"
     profiles.mkdir(parents=True)
-    (profiles / "bare.toml").write_text('[claude]\nengine = "claude"\n')
+    (profiles / "bare.toml").write_text('[claude]\n')
     proc = _run(lab, str(lab["target"]), "what is here?", "--quiet",
                 "--profile", "bare", switch=value)
     assert proc.returncode == 0, proc.stdout + proc.stderr
