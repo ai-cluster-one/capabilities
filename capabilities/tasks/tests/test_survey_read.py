@@ -99,6 +99,13 @@ def test_unsaid_each_scan_keeps_its_own_order():
     assert mod._order({"sort": "updated"}, "created_at asc").startswith("updated_at desc")
 
 
+def test_every_sort_breaks_ties_by_id():
+    for value, order in mod._SORTS.items():
+        assert order.endswith(", id desc"), value
+    assert set(mod._SORTS) == {"touched", "updated", "created", "pickup"}
+    assert mod._SORTS["pickup"].startswith("pickup_at asc nulls last")
+
+
 # --- Counts ------------------------------------------------------------------
 
 @pytest.mark.parametrize("flag", ("--per-page", "--page", "--sort", "--activities",
@@ -152,10 +159,15 @@ def test_the_connection_flag_is_not_looked_for_past_the_end_of_the_flags(
 def test_the_help_documents_every_new_surface_beside_its_neighbours():
     doc = mod.__doc__
     reading = doc.split("READING")[1].split("WRITING")[0]
-    assert "tasks counts [filters]" in reading and "--sort updated" in reading
+    assert "tasks counts [filters]" in reading and "`--sort`" in reading
     assert "FILTERS  (list, ready, search, counts)" in doc
     order = doc.split("ORDER  (list, search)")[1].split("PAGING")[0]
-    assert "--sort updated" in order
+    for value in ("touched", "updated", "created", "pickup"):
+        assert f"--sort {value}" in order
+    assert "no pickup last" in order and "before the page is cut" in order
+    collections = doc.split("\nCOLLECTIONS\n")[1].split("\nACTIVITY\n")[0]
+    assert "`last_touched_at`" in collections and "never null" in collections
+    assert "`last_activity_at` is the newest trail entry" in collections
     paging = doc.split("PAGING  (list, ready, search)")[1].split("COLLECTIONS")[0]
     assert "1 or more" in paging and "every match" in paging
     assert "tasks search -- --literal" in doc.split("ARGUMENTS")[1]
@@ -314,9 +326,9 @@ def test_counts_match_list_under_a_project_and_across_the_store(seeded, capsys):
     assert _answer(capsys)["counts"]["closed"] == 1
 
 
-@needs_store
-def test_counts_is_one_question_of_the_store(seeded, capsys, monkeypatch):
-    entry, _schema, _conn = seeded
+@pytest.fixture
+def statements(monkeypatch):
+    """Every statement the store is handed, written down in order."""
     real = mod._connect
     asked = []
 
@@ -355,6 +367,13 @@ def test_counts_is_one_question_of_the_store(seeded, capsys, monkeypatch):
             return self.conn.__exit__(*exc)
 
     monkeypatch.setattr(mod, "_connect", lambda e: Watched(real(e)))
+    return asked
+
+
+@needs_store
+def test_counts_is_one_question_of_the_store(seeded, capsys, statements):
+    entry, _schema, _conn = seeded
+    asked = statements
     mod.cmd_counts(entry, ["--all-projects"])
     assert _answer(capsys)["total"] == 7
     assert len(asked) == 1
@@ -375,6 +394,162 @@ def test_a_search_for_text_that_begins_with_dashes(store, capsys, monkeypatch):
     # And without the marker it is a flag, refused as one.
     error = _refused(capsys, mod.cmd_search, entry, ["--literal"])
     assert error["exit"] == 6 and error["message"] == "unknown flag --literal"
+
+
+# --- Last touched ------------------------------------------------------------
+
+def _row(entry, capsys, key: str, *extra: str) -> dict:
+    mod.cmd_list(entry, ["--all-projects", "--per-page", "100", *extra])
+    return next(t for t in _answer(capsys)["tasks"] if t["unique_key"] == key)
+
+
+def _at(value) -> "datetime.datetime":
+    """A moment as written in an answer or in a test, compared as a moment: the
+    zone an answer is rendered in is not what is being proven."""
+    import datetime
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+@needs_store
+def test_last_touched_is_the_latest_of_its_three_sources(store, capsys, monkeypatch):
+    entry, schema, conn = store
+    _add(monkeypatch, entry, capsys, HERE, "k-1")
+    tid = conn.execute(f"select id from {schema}.tasks where unique_key = 'k-1'"
+                       ).fetchone()[0]
+    conn.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
+    conn.execute(f"update {schema}.tasks set updated_at = '2026-01-01T00:00Z' "
+                 f"where id = %s", (tid,))
+
+    # A field moving, and nothing else yet.
+    row = _row(entry, capsys, "k-1")
+    assert _at(row["last_touched_at"]) == _at("2026-01-01T00:00Z")
+    assert row["last_activity_at"] is None and row["activities_count"] == 0
+
+    # The trail growing.
+    conn.execute(f"insert into {schema}.task_activities (task_id, description, "
+                 f"created_at) values (%s, 'did a thing', '2026-01-02T00:00Z')", (tid,))
+    row = _row(entry, capsys, "k-1")
+    assert _at(row["last_touched_at"]) == _at("2026-01-02T00:00Z")
+    assert _at(row["last_activity_at"]) == _at("2026-01-02T00:00Z")
+    assert row["activities_count"] == 1
+
+    # A raise starting, then ending.
+    eid = conn.execute(f"insert into {schema}.task_executions (task_id, attempt, "
+                       f"started_at) values (%s, 1, '2026-01-03T00:00Z') returning id",
+                       (tid,)).fetchone()[0]
+    assert _at(_row(entry, capsys, "k-1")["last_touched_at"]) == \
+        _at("2026-01-03T00:00Z")
+    conn.execute(f"update {schema}.task_executions set status = 'ok', "
+                 f"ended_at = '2026-01-04T00:00Z' where id = %s", (eid,))
+    row = _row(entry, capsys, "k-1", "--full")
+    assert _at(row["last_touched_at"]) == _at("2026-01-04T00:00Z")
+    # What the trail says is still only the trail.
+    assert _at(row["last_activity_at"]) == _at("2026-01-02T00:00Z")
+    assert row["activities_count"] == 1
+
+    # And a field moving after all of it wins again.
+    conn.execute(f"update {schema}.tasks set updated_at = '2026-01-05T00:00Z' "
+                 f"where id = %s", (tid,))
+    mod.cmd_search(entry, ["k-1"])
+    assert _at(_answer(capsys)["tasks"][0]["last_touched_at"]) == \
+        _at("2026-01-05T00:00Z")
+    conn.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
+
+
+@pytest.fixture
+def four_orders(seeded):
+    """The seeded store, arranged so the four sorts give four different orders:
+    a trail entry and a raise lift two tasks above their last move, and the
+    pickups are neither the creation order nor its reverse, with two tasks here
+    and both there holding none."""
+    entry, schema, conn = seeded
+    pickups = {"h-0": "2026-01-03", "h-1": None, "h-2": "2026-01-01",
+               "h-3": "2026-01-02", "h-4": None}
+    conn.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
+    for key, pickup in pickups.items():
+        conn.execute(f"update {schema}.tasks set pickup_at = %s::timestamptz "
+                     f"where unique_key = %s", (pickup, key))
+    conn.execute(f"update {schema}.tasks set pickup_at = null where project_id = %s",
+                 (THERE,))
+    conn.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
+    ids = {r[0]: str(r[1]) for r in conn.execute(
+        f"select unique_key, id from {schema}.tasks")}
+    conn.execute(f"insert into {schema}.task_activities (task_id, description, "
+                 f"created_at) values (%s, 'late word', '2026-03-25T00:00Z')",
+                 (ids["h-3"],))
+    conn.execute(f"insert into {schema}.task_executions (task_id, attempt, "
+                 f"started_at) values (%s, 1, '2026-03-24T00:00Z')", (ids["h-1"],))
+    return entry, ids
+
+
+def _no_pickup_last(ids: dict, keys: list[str]) -> list[str]:
+    return sorted(keys, key=lambda k: ids[k], reverse=True)
+
+
+def _walk(call, entry, capsys, args: list[str], per: int) -> list[str]:
+    """Every page of a scan in turn, so what is proven is the order of the whole
+    set and not of one page."""
+    keys, page = [], 1
+    while True:
+        call(entry, [*args, "--per-page", str(per), "--page", str(page)])
+        answer = _answer(capsys)
+        keys += _keys(answer)
+        if page >= answer["pagination"]["last_page"]:
+            return keys
+        page += 1
+
+
+@needs_store
+@pytest.mark.parametrize("scope", ("project", "all"))
+@pytest.mark.parametrize("verb", ("list", "search"))
+def test_each_sort_orders_the_whole_set_across_pages(four_orders, capsys, scope, verb):
+    entry, ids = four_orders
+    here = ["h-0", "h-1", "h-2", "h-3", "h-4"]
+    there = ["t-0", "t-1"]
+    expected = {
+        "touched": ["h-3", "h-1", "h-0", "h-2", "h-4"] + (there if scope == "all" else []),
+        "updated": here + (there if scope == "all" else []),
+        "created": (["t-1", "t-0"] if scope == "all" else []) + here[::-1],
+        "pickup": ["h-2", "h-3", "h-0"] + _no_pickup_last(
+            ids, ["h-1", "h-4"] + (there if scope == "all" else [])),
+    }
+    call = {"list": mod.cmd_list, "search": mod.cmd_search}[verb]
+    lead = ["title"] if verb == "search" else []
+    narrow = ["--all-projects"] if scope == "all" else ["--project", HERE]
+    for value, keys in expected.items():
+        assert _walk(call, entry, capsys, [*lead, *narrow, "--sort", value], 2) == keys, value
+
+
+@needs_store
+def test_a_page_costs_the_same_questions_however_large(four_orders, capsys,
+                                                      statements):
+    entry, _ids = four_orders
+    counts = []
+    for per in ("1", "7"):
+        for call, lead in ((mod.cmd_list, []), (mod.cmd_search, ["title"])):
+            statements.clear()
+            call(entry, [*lead, "--all-projects", "--sort", "touched", "--per-page", per])
+            capsys.readouterr()
+            counts.append((call.__name__, len(statements)))
+    assert counts[:2] == counts[2:]
+
+
+@needs_store
+def test_unsaid_the_order_and_the_trail_fields_are_what_they_were(four_orders, capsys):
+    entry, _ids = four_orders
+    mod.cmd_list(entry, ["--project", HERE])
+    listed = _answer(capsys)
+    # Soonest pickup, none last, then creation order: the default it always had.
+    assert _keys(listed) == ["h-2", "h-3", "h-0", "h-1", "h-4"]
+    mod.cmd_search(entry, ["title"])
+    assert _keys(_answer(capsys)) == ["h-0", "h-1", "h-2", "h-3", "h-4"]
+    rows = {t["unique_key"]: t for t in listed["tasks"]}
+    assert rows["h-3"]["activities_count"] == 1
+    assert _at(rows["h-3"]["last_activity_at"]) == _at("2026-03-25T00:00Z")
+    assert _at(rows["h-3"]["last_touched_at"]) == _at("2026-03-25T00:00Z")
+    assert rows["h-1"]["last_activity_at"] is None
+    assert rows["h-1"]["activities_count"] == 0
+    assert all(t["last_touched_at"] for t in listed["tasks"])
 
 
 if __name__ == "__main__":

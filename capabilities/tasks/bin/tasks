@@ -15,15 +15,15 @@ happened.
 
 READING
   tasks list [filters]            a scan: identity, state, and how much activity
-                                  each task has. Soonest pickup first, or most
-                                  recently moved first with `--sort updated`
+                                  each task has. Soonest pickup first, or in the
+                                  order `--sort` names
   tasks ready [filters]           the queue a worker consumes: every field and
                                   the whole trail, for what may be picked up now
   tasks show <task>               one task, every field, whole activity trail
   tasks search <text> [filters]   the same scan, narrowed by substring over
                                   title, objective, description, unique key,
                                   assignee and the metadata JSON. Earliest
-                                  created first, or `--sort updated`
+                                  created first, or in the order `--sort` names
   tasks counts [filters]          how many tasks hold each status, every status
                                   named and zero included, plus the total, for
                                   the filters `list` takes. Answers no rows
@@ -370,12 +370,16 @@ FILTERS  (list, ready, search, counts)
   two and both must hold.
 
 ORDER  (list, search)
-  --sort updated        most recently moved first: updated_at, newest first,
-                        applied before the page is cut, so page 1 holds the
-                        most recently moved tasks of everything matching.
-                        `updated` is the one accepted value. Unsaid, `list`
-                        answers soonest pickup first and `search` earliest
-                        created first
+  --sort touched        last touched first: last_touched_at, newest first
+  --sort updated        last moved first: updated_at, newest first
+  --sort created        newest created first: created_at, newest first
+  --sort pickup         soonest pickup first: pickup_at, earliest first, and
+                        tasks with no pickup last
+
+  A sort is applied before the page is cut, so page 1 holds the first rows of
+  everything matching, and ties go to the higher id first. Those four are the
+  accepted values. Unsaid, `list` answers soonest pickup first and `search`
+  earliest created first.
 
 PAGING  (list, ready, search)
   --per-page N          rows in this answer, a whole number of 1 or more
@@ -394,6 +398,11 @@ COLLECTIONS
   `activities_count` and `last_activity_at` - enough to choose which task to look
   at, and cheap enough to ask for often. `objective` and `description` are the
   expensive half of a task and stay out until asked for.
+
+  `last_activity_at` is the newest trail entry, null when there is none.
+  `last_touched_at` is the last moment anything happened to the task: the latest
+  of `updated_at`, the newest trail entry, and the newest start or end of a
+  raise. It is never null.
 
   `ready` reads: every field and the whole trail, because it is the queue a
   worker consumes to act, and what is actionable now is short by construction.
@@ -3816,11 +3825,29 @@ _LIST_BOOLS = ("pickup-set", "pickup-unset", "full")
 # question only the two scans answer.
 _SCAN_BOOLS = _LIST_BOOLS + ("all-projects",)
 # The order a scan may be asked for. Each verb keeps its own order unsaid.
-_SORTS = {"updated": "updated_at desc, id desc"}
+_SORTS = {"touched": "last_touched_at desc, id desc",
+          "updated": "updated_at desc, id desc",
+          "created": "created_at desc, id desc",
+          "pickup": "pickup_at asc nulls last, id desc"}
 _SCAN_FLAGS = _LIST_FLAGS + ("sort",)
 # What `counts` narrows by: the filters `list` takes, and nothing that shapes rows.
 _COUNT_FLAGS = ("project", "type", "status", "tag", "assignee") + tuple(_DATE_FILTERS)
 _COUNT_BOOLS = ("pickup-set", "pickup-unset", "all-projects")
+
+
+def _scan_columns(opts: dict) -> str:
+    """What one row of a scan carries, read from `t`, the tasks table.
+
+    `last_touched_at` is the last moment anything happened to the task: a field
+    moved, the trail grew, or a raise started or ended. It is computed in the
+    same query as the rows, so it can order the whole set before the page is
+    cut, and it is never null because `updated_at` never is."""
+    touched = (f"greatest(t.updated_at, "
+               f"(select max(a.created_at) from {SCHEMA}.task_activities a "
+               f"where a.task_id = t.id), "
+               f"(select max(greatest(e.started_at, e.ended_at)) "
+               f"from {SCHEMA}.task_executions e where e.task_id = t.id))")
+    return f"{'t.*' if opts.get('full') else _LEAN}, {touched} as last_touched_at"
 
 
 def _order(opts: dict, unsaid: str) -> str:
@@ -3938,7 +3965,7 @@ def cmd_list(entry, args: list[str]) -> None:
         cur.execute(f"select count(*) as n from {SCHEMA}.tasks{where}", params)
         total = cur.fetchone()["n"]
         per, offset, pagination = _page(opts, total)
-        cur.execute(f"""select {'*' if opts.get('full') else _LEAN} from {SCHEMA}.tasks{where}
+        cur.execute(f"""select {_scan_columns(opts)} from {SCHEMA}.tasks t{where}
                          order by {order}
                          limit %s offset %s""", params + [per, offset])
         tasks = _attach_activities(cur, _rows(cur), opts, embed=False)
@@ -4019,7 +4046,7 @@ def cmd_search(entry, args: list[str]) -> None:
         cur.execute(f"select count(*) as n from {SCHEMA}.tasks{where}", params)
         total = cur.fetchone()["n"]
         per, offset, pagination = _page(opts, total, default=max(total, 1))
-        cur.execute(f"""select {'*' if opts.get('full') else _LEAN} from {SCHEMA}.tasks{where}
+        cur.execute(f"""select {_scan_columns(opts)} from {SCHEMA}.tasks t{where}
                          order by {order}
                          limit %s offset %s""", params + [per, offset])
         _emit({"store": store, "query": opts["_loose"][0], "pagination": pagination,
