@@ -221,7 +221,7 @@ class FakeCursor:
     def execute(self, sql, params=None):
         if "task_executions" in sql:
             self.answer = [dict(self.row)] if self.row else []
-        elif sql.strip().startswith("select id, project_id from"):
+        elif sql.strip().startswith("select id, project_id"):
             # Every task the fake holds is this project's, so what is proven
             # below is worker scope and never the project boundary above it.
             self.answer = [{"id": params[0], "project_id": HERE}]

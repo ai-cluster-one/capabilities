@@ -84,7 +84,9 @@ comment on column tasks.tasks.project_id is
   'Which project the task belongs to, as that project declares its own id. The '
   'only key: a readable name for a project lives in the project, and a copy of '
   'it here would be a second source of one fact. Reads may name another '
-  'project; a write only ever reaches the project it runs in.';
+  'project; a write only ever reaches the project it runs in, with one '
+  'exception: the project a task is assigned to may add to its trail and set '
+  'its assignee.';
 
 -- A store created before a status existed keeps the check it was created with,
 -- and `create table if not exists` never revisits one. The constraint therefore
@@ -115,6 +117,7 @@ create table if not exists tasks.task_activities (
   task_id     uuid not null references tasks.tasks (id) on delete cascade,
   description text not null,
   actor       text,
+  origin_project text,
   created_at  timestamptz not null default now()
 );
 
@@ -127,6 +130,14 @@ alter table tasks.task_activities add column if not exists actor text;
 comment on column tasks.task_activities.actor is
   'Who recorded the entry, as the CLI resolved it: the raise it ran under, the '
   'actor it was told, or the account it ran as.';
+-- In the create above for a new store, and added here for one that predates it.
+-- Nothing is written into rows that exist: an entry with no origin was written
+-- before origins were kept, when only the task's own project could write one.
+alter table tasks.task_activities add column if not exists origin_project text;
+comment on column tasks.task_activities.origin_project is
+  'The project that wrote the entry, stamped by the CLI from the writer''s own '
+  'declared id and never from anything it was given. Null on an entry written '
+  'before origins were kept, which is the task''s own project.';
 
 create index if not exists task_activities_task_idx on tasks.task_activities (task_id, created_at desc);
 
@@ -194,6 +205,7 @@ create table if not exists tasks.task_changes (
   new_value     text,
   execution_id  uuid references tasks.task_executions (id) on delete set null,
   actor         text,
+  origin_project text,
   changed_at    timestamptz not null default now()
 );
 
@@ -203,6 +215,13 @@ comment on table tasks.task_changes is
   'never by recording everything that can change.';
 comment on column tasks.task_changes.execution_id is
   'The raise that caused the move, where one did. Null for a move a person made.';
+-- In the create above for a new store, and added here for one that predates it,
+-- with nothing written into rows that exist.
+alter table tasks.task_changes add column if not exists origin_project text;
+comment on column tasks.task_changes.origin_project is
+  'The project that made the move, stamped by the CLI from the writer''s own '
+  'declared id. Null on a move recorded before origins were kept, which is the '
+  'task''s own project.';
 comment on column tasks.task_changes.actor is
   'Who made the move: the worker holding the raise for claim and release, and '
   'otherwise the identity the CLI resolved - a raise, a named actor, or the account it ran as.';

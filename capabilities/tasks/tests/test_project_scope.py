@@ -5,7 +5,8 @@
 # ///
 """Which project a task belongs to, and how far a command may reach.
 
-Reads cross the project boundary and writes never do. The project is read from
+Reads cross the project boundary and writes never do, but for the two writes the
+project a task is assigned to may make on it. The project is read from
 the project's own identity file, which is checked here against a real file on
 disk rather than against a value a test set, so what is proven is the path a
 consuming project actually takes.
@@ -280,7 +281,9 @@ def test_every_scan_takes_one(verb):
 
 
 def test_the_help_states_the_rule_and_files_the_filter_with_the_others():
-    assert "Reads cross the project boundary and writes never do." in mod.__doc__
+    assert ("Reads cross the project boundary and writes never do, with one exception: "
+            "the\n  project a task is assigned to may add to its trail and set its "
+            "assignee.") in mod.__doc__
     filters = mod.__doc__.split("FILTERS  (list, ready, search, counts)")[1]
     assert "--project ID" in filters.split("PAGING")[0]
     assert "--all-projects" in filters.split("PAGING")[0]

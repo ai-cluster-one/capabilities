@@ -238,8 +238,11 @@ def test_the_sweep_returns_a_wait_that_is_over():
     assert returned["status"] == "todo"
     # The move says who made it, because nobody did: a change row with neither a
     # raise nor an actor reads as a person's.
-    assert cur.changes == [("t-1", "status", "waiting", "todo", None, mod.SWEEP_ACTOR)]
-    [(task_id, description, actor)] = cur.activities
+    # Stamped with the project the sweep runs in, the one it may write.
+    assert cur.changes == [("t-1", "status", "waiting", "todo", None, mod.SWEEP_ACTOR,
+                            HERE)]
+    [(task_id, description, actor, origin)] = cur.activities
+    assert origin == HERE
     assert (task_id, actor) == ("t-1", mod.SWEEP_ACTOR)
     assert description == "Returned to the queue from waiting: its pickup moment has passed."
 
