@@ -55,6 +55,19 @@ class RegisterCase(unittest.TestCase):
 
     # -- the channel a job reports into --------------------------------------
 
+    def test_registration_stamps_the_id_the_launcher_resolved(self):
+        """The id is the one the telegram CLI resolved for a write and passed
+        in, not project.json's copy of it."""
+        url = str(Path(self.tmp.name) / "resolved.sqlite3")
+        resolved_store, _reg = jobs.open_register(
+            store, self.envelope, "development", url=url,
+            project_id="22222222-2222-4222-8222-222222222222")
+        self.addCleanup(resolved_store.close)
+        self.assertEqual(resolved_store._project_id("testproject"),
+                         "22222222-2222-4222-8222-222222222222")
+        self.assertEqual(self.store._project_id("testproject"),
+                         "11111111-1111-4111-8111-111111111111")
+
     def test_a_topic_key_round_trips(self):
         """The key is written by whoever registers the job and read back by the
         daemon delivering the answer. A shape that does not survive that trip

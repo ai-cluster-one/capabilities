@@ -111,7 +111,7 @@ def test_doctor_does_not_judge_contextkit_owned_codex_paths(tmp_path: Path) -> N
         path.write_text(body)
 
     report = _json(_run(tmp_path, project, "doctor"))
-    assert report == {"ok": True, "findings": []}
+    assert (report["ok"], report["findings"]) == (True, [])
 
 
 def test_context_fragment_is_manager_owned_and_write_free(tmp_path: Path) -> None:

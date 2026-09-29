@@ -2,172 +2,172 @@
   "capabilities": {
     "asana": {
       "path": "capabilities/asana",
-      "payload_sha256": "07883da23810469e86c9b4ecfbc27ac57d3d9741c5531cd03dfd428a39f7aa1b",
+      "payload_sha256": "eb572f1abb08b12209db8db2e38c1848d790ee4dd504353d47b8e9497edc2f2d",
       "summary": "Asana CLI over the REST API — read/create/comment-on tasks and subtasks, @mention, manage tags, board sections, dependencies, and the API-only machine-state field."
     },
     "askproject": {
       "path": "capabilities/askproject",
-      "payload_sha256": "6d4c004c19ff3f44c3ce067a03eeb03ac535bb2d8f3e6df40db6cbbaf3b901f1",
+      "payload_sha256": "1850d4588c6b98f2d8ea81cda3f239d1c43c0407a02acfb697e2b574ae439907",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project, fenced by mode (read/act), and return its answer with cost, token, and files-changed traceability."
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "39efd8d4e2f48747645f2af0e6a66ac5a21c8bd1a300d01f066c928c1500a1f3",
+      "payload_sha256": "21a1a3221f12298d7a6d3da1e250531289d774781a8ac72aecc367bb517a6742",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
       "path": "capabilities/calcomc",
-      "payload_sha256": "e467565cb78df7e53ed6c1341dccf7f36fbd8b322206c972c2b7eede72cc31f8",
+      "payload_sha256": "400e94a657a4e590ff810b840253843d5eb76cc194be43a38febde100f3ea774",
       "summary": "Credential harness around the official `calcom` CLI — resolves a Cal.com API key per connection, injects it, and forwards your command straight to `calcom` (everything but calcomc's own verbs passes through untouched); the command surface is `calcom help`."
     },
     "calendar": {
       "path": "capabilities/calendar",
-      "payload_sha256": "204d32baabeb8d8f1590c21ed0f76593dbd5daaa28475ff4d28754948383dceb",
+      "payload_sha256": "87d42a8de5016de535f9de56588b59e8a1a64b85b1209724cc0cc21515cfed1b",
       "summary": "CalDAV CLI for remote calendars — list calendars, read, search and check busy blocks, and book events on a principal."
     },
     "callva": {
       "path": "capabilities/callva",
-      "payload_sha256": "3a04770830526a76f5d8ebc02983db725af9b12a66d0569c008a54aa22a88d6f",
+      "payload_sha256": "6fef143740bfc3cedea2daf75416779164966ca61598cc832819c5a4f3167b3b",
       "summary": "CallVA voice-AI platform CLI over the External API — read/create/update/delete agents, the speech-stack presets they run on and the tools they call, assets (prompts), calls, transcripts, recordings, call analytics, custom fields, webhook schedules, automations (Windmill scripts), webhook logs, variables, settings, projects, phone numbers, and providers."
     },
     "callvatest": {
       "path": "capabilities/callvatest",
-      "payload_sha256": "719131fd48ef37f295c4ab42b7e68d87a2228a3b4dbd7e8363974f9669b35c61",
+      "payload_sha256": "61d586f88c5694ad2193b59a27d92f0f6e4740f87fa1855d91971bde7fe9c544",
       "summary": "CallVA agent test harness — drives a deployed voice agent through a real LiveKit room over text, then asserts the transcript, the tools it called, the arguments it generated, the results it answered from, and the fields stored after the call."
     },
     "clickup": {
       "path": "capabilities/clickup",
-      "payload_sha256": "fd86a1fc1023bcdc5634c92e3fd36637ad015bf8afc065053bcc7435204b44a2",
+      "payload_sha256": "398fed5b9e5f4422ac3cf7b5ffee66ab03589bd93e2e518521dc2d01972a936d",
       "summary": "ClickUp CLI over the REST API — read/create/update/comment-on tasks and subtasks, complete via status, manage assignees, tags, dependencies, custom fields, attachments, and webhooks across spaces and lists."
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "3c47e873955799e154ed0dfdd65ce503dadf628ba768ee2d090c2fa023cce2a2",
+      "payload_sha256": "1c070ebde0035cd5f4aa35d0b4d8354fcd58c7c52cff3fd7556c7d704df18a84",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "4de4f02eb34547f31ea45b217104d895f352a758e559cf1a7b5a97b044db6052",
+      "payload_sha256": "29af51eab87df620a0de9bc5950ac7193828c10da0bf17fc22dcab831b9be40f",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into supervised processes on the machine itself, and describe the targets they deploy to."
     },
     "directo": {
       "path": "capabilities/directo",
-      "payload_sha256": "baa1694156a661cd36b2cfc3e465d8a96269acb6ca200e2d71c79ca459094475",
+      "payload_sha256": "71cc8a291d8f00904c29ca319225cd1c1025fbe27d3db774f21e03a448a24a58",
       "summary": "Directo ERP CLI over the browser-session endpoints its web UI uses — log in, select a location, and read the authed `*.asp` surface (sales, purchases, stock, ledger). Stateful — run `directo doctor` first."
     },
     "emta": {
       "path": "capabilities/emta",
-      "payload_sha256": "9b83df2a053cb20e0bde6ff56e51125af4ba356906e924b25bc4d64651d2d160",
+      "payload_sha256": "23ef48c559fd25596cf4ad25df2cce6285a2ac3c8674dff16a5a048abb24b685",
       "summary": "Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay balances, per-period balances, prepay ledger. Session is paste-fed from a logged-in browser. Stateful — run `emta doctor` first."
     },
     "fathom": {
       "path": "capabilities/fathom",
-      "payload_sha256": "da100b04c7f9fccf635ef2a7789d01cb15d9355dae01b740e23681f3f390ccdc",
+      "payload_sha256": "cfef1369e00a529b2a9386e3f9f6c9602d6d4b3066744f491e3a199964ce9b02",
       "summary": "Fathom CLI over the External API + a PostgreSQL store — sync meetings and transcripts in one pass, read/update stored meetings, manage a vocabulary, and search the store at three levels."
     },
     "geminitalk": {
       "path": "capabilities/geminitalk",
-      "payload_sha256": "458e259259af8348375bebfa9d8437ac665065a903aaecbfc0f2de8225f51c09",
+      "payload_sha256": "61bfe3ef265ca00c7b9368ce35b801908198e6838cf4434aee6122cae72fff48",
       "summary": "Gemini Live native-audio project companion with continuous duplex audio, bounded project tools, optional headless Codex delegation, and an active Codex-thread relay."
     },
     "ical": {
       "path": "capabilities/ical",
-      "payload_sha256": "d8c1cb7d2141cd5b2d259e41c01916e4638ab8d9dbc1e9d1884130366fc42cf8",
+      "payload_sha256": "33c835f512cd26abb9360556354fbf5db3b3ddf9242f02d74d15cecf722c6397",
       "summary": "macOS Calendar CLI with indexed EventKit reads and Calendar.app automation writes across configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); no credential is stored on disk."
     },
     "instagram": {
       "path": "capabilities/instagram",
-      "payload_sha256": "c9cec67184f0c98c41e990390231d16ef31121a757e55452b7ad203cb78a6036",
+      "payload_sha256": "1562c43de50a496ff6c29c683a40d3d45ab74de4e3cd3d60b39dc18c638ccca2",
       "summary": "Instagram CLI over a captured browser session — validate identity, read profiles, resolve Direct threads, and send text messages. Stateful — run `instagram doctor` first."
     },
     "journal": {
       "path": "capabilities/journal",
-      "payload_sha256": "018a0314aa12fc1ff36885816370d900bdf22cb90ae0d729578b82d01bf373d5",
+      "payload_sha256": "1c1999ee8d6d6c27e31e2f8107613123d1ab6d58fe7cd73553be793e63097c49",
       "summary": "Journal CLI over a PostgreSQL store — list and read voice-journal entries, write enrichment back, chunk transcripts for embedding, and search the store at three levels."
     },
     "macmail": {
       "path": "capabilities/macmail",
-      "payload_sha256": "d26f2bc49ecaecb784c48d4da90af443fef4a4bb29264c559a86231370b76481",
+      "payload_sha256": "e382a8dfbdcefdfd9ebc25f535c02db5d0688cb4d6570b181ba2f6ea67edf5ac",
       "summary": "Mail.app CLI over macOS Automation — read/search mail across configured accounts, show a message, save attachments, draft (never send), and export a mailbox to JSON."
     },
     "mailbox": {
       "path": "capabilities/mailbox",
-      "payload_sha256": "735ea52e9a85f4b5544dba61b1af6532e3c59d396fc673d2eb4f0f564efe7a88",
+      "payload_sha256": "c38e9f186dffa65367e2ab13a13d0b5f9361afb0ca7a4f799eca51d0ab29b2c5",
       "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, and send."
     },
     "notion": {
       "path": "capabilities/notion",
-      "payload_sha256": "c0213a1926516e74427794ede400d6d76bdce59be76ac3403aa9f65475dbd74c",
+      "payload_sha256": "9885b9fe8b94df2cd2f9e17e850a874b33fcceddcd1d0a041b610716064448e0",
       "summary": "Notion CLI over the REST API — publish markdown to pages: list child pages, fetch a page as markdown, replace a page's body and title, create under a parent, and upsert by exact title."
     },
     "railwayc": {
       "path": "capabilities/railwayc",
-      "payload_sha256": "f1c49a86d0a4779d270ddca11caced2a124315a6b3b2d96979746a7ed4c53472",
+      "payload_sha256": "8affae2e43907583a2161a511dd33c736a75a9e58ce392c294fe160f2d712d20",
       "summary": "Credential harness around the official `railway` CLI — resolves a project-scoped Railway token, injects it, and forwards your command straight to `railway` (everything but railwayc's own verbs passes through untouched); the command surface is `railway help`."
     },
     "rclonec": {
       "path": "capabilities/rclonec",
-      "payload_sha256": "3e982880ceada344efee3f993f485bb5032ff937b7795f220abbefea0b4e904e",
+      "payload_sha256": "e55ed79fb04f49b275d906f0cc9a587279dc5a7d5bb8ffbde92eb6c7d327667f",
       "summary": "Credential harness around the official `rclone` binary — resolves one named connection into a single rclone remote (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV and rclone's other backends), injects it as configuration, and forwards your command straight to `rclone` (everything but rclonec's own verbs passes through untouched); the command surface is `rclone help`."
     },
     "resend": {
       "path": "capabilities/resend",
-      "payload_sha256": "8e1207309df51c325e776fab26893a3eb3b8ce98be0de93dc7980331f34a6ea9",
+      "payload_sha256": "622cf2740b99217b43edd4a7f7af773a9b06932b720a79bbbbc7aef0d47f678d",
       "summary": "Send-only email CLI over the Resend HTTP API — deliver mail from a verified sending domain (send, write-gated with an optional recipient allow-list), list sending domains and their verification status (domains), and prove key + reachability (doctor). One-way by construction: no read or receive surface."
     },
     "routine": {
       "path": "capabilities/routine",
-      "payload_sha256": "7e5e3788926c14700412b6095225a6136522e2e718e3a4723e0e3e591d825f7b",
+      "payload_sha256": "6df38c73458a7ad7307d958d9a05c0bb93ee6be3b22611412f6875e56383726e",
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes."
     },
     "signoz": {
       "path": "capabilities/signoz",
-      "payload_sha256": "05642568fb31df997a709dd7024b1d6427d7d3df93828a478872f15165a65eba",
+      "payload_sha256": "1cbf6d0371909ddc4bc49c59afc20447efbe3ad4781e4850efa43056a5f680bd",
       "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances."
     },
     "simplbooks": {
       "path": "capabilities/simplbooks",
-      "payload_sha256": "d8d6f4412e526b9a475971172e25ba119d278fbaca62e0374c3070aa46d79310",
+      "payload_sha256": "66c61c48a433a78cafaec01111ebb23d5d54a8d9fc050d88a118868dd5b5b659",
       "summary": "SimpleBooks accounting CLI over a browser session (no public API) — read clients/invoices/purchases/accounts/bank-transactions/financial_transactions, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist. Stateful — run `simplbooks doctor` first."
     },
     "slack": {
       "path": "capabilities/slack",
-      "payload_sha256": "5a17176b4d601ada61d77409e982c3e8dba8c73c943114146d00ff30321f3217",
+      "payload_sha256": "535ffca1d5745a118b1fce4fa4917edfaca6f11521cc5fb5ef7646d82c510517",
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
     "stripe": {
       "path": "capabilities/stripe",
-      "payload_sha256": "708ba7801127239ed86ab7e585fea99b728261956271cafa0a155ec2c3015a61",
+      "payload_sha256": "9d8ebaa534e41a1d168427cdb813c35567d9866e45982c65c8c967c58d049509",
       "summary": "Read-only Stripe CLI over the REST API — emit a neutral JSON contract of account activity (sync-plan), check identity/reachability (doctor), list invoices and download their PDFs, and read balance-transactions and payouts."
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "681eba0b79389d4fe66d6cd3b1624b0442c1c6ddcee68f17db1f119147285c40",
+      "payload_sha256": "12ee248881920b7568c0485640986057a0b047875afb372c2a81a2ff19b6bb90",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "c4a44ec7d4e12d28e856b63e77e914d4a62a3a7f6cbdc04994dc2b6928e86c1e",
+      "payload_sha256": "9bbd79e34a32fa6c8e17f8cec5d8c5b8acee5b61652565ac07c51fe5d138de48",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
       "path": "capabilities/vapic",
-      "payload_sha256": "7a1ff974ebc0cd12236eb89f78755eeb0464745fbc4fb784726472087fe7b584",
+      "payload_sha256": "60def4946a9a7753d5cc75c37db22c17e540997c328c608324fe489b381b8bd6",
       "summary": "Connection harness around the official `vapi` CLI - resolves a Vapi API key, injects it, and forwards commands to `vapi` with a narrow read-list fallback; the command surface is `vapi --help`."
     },
     "whatsapp": {
       "path": "capabilities/whatsapp",
-      "payload_sha256": "06f7eceb7a3ee42911c7598b277d7b89b53078d20fea1a85bbbbbbda15b20001",
+      "payload_sha256": "69f580843e5d2b949a5ed8144334e5fcdb5bbd7239e73d9746fd69b022cbc193",
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a local store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {
       "path": "capabilities/windmill",
-      "payload_sha256": "48a4fac01c2ea23b2a7daabf09d5a9dac01b03c470e573f7772c06f5936e06e8",
+      "payload_sha256": "6cc065eab3e14c7d968847afa8327f95330450affaff67e9a5d0887725283121",
       "summary": "Windmill CLI over the REST API — deploy scripts, attach cron schedules, run jobs, read run history/logs, and manage secret variables and folders."
     },
     "youtrack": {
       "path": "capabilities/youtrack",
-      "payload_sha256": "8b35d5f7484cfc2692561c7924d34e75fd62bf54527bea463cc098e19f4ed188",
+      "payload_sha256": "c6066b2b451a6a849ce97c914250bcc1c2f5efba2a0b68c5877d864ee53c5a62",
       "summary": "YouTrack CLI for issues (read with links and tags, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, add/remove issue links by direction phrase, tag and untag by tag name, and log and list work items), user and group lookup, project reads and paged custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments)."
     }
   }

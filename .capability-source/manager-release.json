@@ -1,11 +1,11 @@
 {
   "assets": {
-    "DOCTRINE.md": "dfc6ff902167efd319b39b1754ab6320e390f20fb4ee7eeba0d8b90c9d40eba0",
+    "DOCTRINE.md": "9595f13c268065d16a010c33acdb4fc6466c34e80e16172492b11bedff9fed3a",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "0432b4d0d16bb01157bea85742cf151294343af078319e925a25754aa9729fe7",
+    "SHEBANG.md": "49ec5993f8aed9c462b91f4ead081202e3253e2d0dadab333e44b00266e7dccf",
     "SOURCES.md": "8e8b7f1f500b8ebe3d1abb2874616071e8142c69b897110be5cbc0f0194b0085",
-    "TEMPLATE.md": "0c07edaa304d846a9c11d1924067c4ba60aa0f1904c163c15f9198f1cfb9c68c",
-    "contract/preamble.py": "160c7138e092f9c0cef6a261743979ec56994a44ebe4376b13496b3b6ac70dc6",
+    "TEMPLATE.md": "f0eb0069570509b7669be7a9c660703e86924ade416ccf87983eaa447169233d",
+    "contract/preamble.py": "3c751ea50d06878d850e49f655ff571299a2005c3865873a23c3e3fc5be93dda",
     "contract/store.py": "eebb1f849aa8be51e30aaf9566fbc3f8c02e96c0b788342ad58fcfb8f89598c5",
     "guides/authoring.md": "e467e5343a54e99c991592d06233fd98b7be13fa32a174d0f27d3a8a06478724",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
@@ -21,7 +21,7 @@
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "f274bd422e7d7d6c70b60a59c50b5bfca4200780b49bd2e23121d6fd95bedf05"
+    "sha256": "16e998ac3f8ebe0afffc7ed4e75f93a5946777d986ca0020c17154b2abcfd13c"
   },
   "schema": "capabilities.manager-release.v1"
 }

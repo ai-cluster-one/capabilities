@@ -322,13 +322,18 @@ def project_identity(envelope: Path) -> dict:
 
 
 def open_register(store_module, envelope: Path, environment: str,
-                  surface: str = "telegram", url: str | None = None):
+                  surface: str = "telegram", url: str | None = None,
+                  project_id: str | None = None):
     """The store this project's jobs live in, and the register onto it.
 
     There is no file-mode register. A queue, a slot count and a cancellation
     flag are records nobody authors and nobody reviews, and a capability keeping
     its own database for them was only ever the easy thing. The caller closes
     the store.
+
+    Registering stamps the project id, so the id is the one the launching CLI
+    resolved for a write and passes in; project.json's own id stands in only
+    where no launcher resolved one.
     """
     identity = project_identity(envelope)
     slug = identity.get("slug")
@@ -339,7 +344,7 @@ def open_register(store_module, envelope: Path, environment: str,
     store = store_module.open_store(url)
     try:
         store.migrate()
-        store.project_register(identity["id"], slug)
+        store.project_register(project_id or identity.get("id"), slug)
         for version in range(1, STORE_VERSION + 1):
             if store.schema_version(STORE_NAMESPACE) < version:
                 store.migrate(

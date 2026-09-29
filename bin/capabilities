@@ -40,11 +40,14 @@ ENVIRONMENT
                        it is honored wherever it is inherited.
 
 PROJECT PATH VERB
-  path --json
+  path --json [--identity]
         Resolve the current project root and capability envelope once, returning
         project_root, project_envelope, and provider. Plain projects use
         <root>/capabilities. ContextKit-bound projects must return a usable
         absolute in-project path; a broken binding is an error, never a fallback.
+        --identity adds project_identity: the project id, its state (unbound,
+        pending, adopted, mismatch), ContextKit's id and project.json's copy. A
+        bound project whose ContextKit cannot answer is an error.
 
 THE PROJECT ENVELOPE
   Every project file the system owns — identity, the state guard, and each
@@ -198,7 +201,8 @@ PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex]
         Wire the project: scaffold the durable project identity, the
         manager-owned capabilities/.gitignore, and settings.json only in files
-        mode; per host, wire the
+        mode; in a ContextKit-bound project the identity copies ContextKit's
+        id and mints none while ContextKit has none; per host, wire the
         SessionStart hook and the generated context file and generate the
         skill. No flags defaults to Claude Code wiring; Codex projects must
         pass --codex. Host wiring is manager-owned: each init brings the hook
@@ -281,8 +285,9 @@ VERIFICATION VERBS
   doctor
         Reconcile machine registry ↔ snapshots ↔ project gate ↔ gitignore
         guard ↔ deny rules ↔ standalone host wiring, including what keeps
-        Codex from loading the capability context; report drift. Exit 0
-        clean, 7 drift found.
+        Codex from loading the capability context ↔ project identity; report
+        drift, and the project's project_identity state. A project.json id
+        that differs from ContextKit's is drift. Exit 0 clean, 7 drift found.
   audit <name> [--from <path>]
         Contract conformance: call the contract verbs, validate output
         shapes, exercise the gate (enabled / disabled / absent) in a
@@ -362,6 +367,11 @@ ENVELOPE_CACHE_VERSION = 1
 # catch what a stat cannot see — a context owner that starts answering
 # differently without its own program or the project's binding changing.
 ENVELOPE_CACHE_TTL = 3600
+# ContextKit's answer to "which id is this project?", recorded the same way and
+# against the same inputs: the id lives in the binding the envelope record
+# already watches.
+IDENTITY_CACHE_ROOT = _CACHE_HOME / "capabilities" / "identity"
+IDENTITY_CACHE_VERSION = 1
 OFFICIAL_SOURCE_ID = "official"
 OFFICIAL_GIT_URL = "https://github.com/ai-cluster-one/capabilities.git"
 RESERVED_CAPABILITY_NAMES = {"sources"}
@@ -417,6 +427,7 @@ CODEX_HOOKS_REL = Path(".codex") / "hooks.json"
 CONTEXTKIT_CONFIG_REL = Path(".contextkit") / "config.toml"
 CONTEXTKIT_BIN = "contextkit"
 CONTEXTKIT_ENVELOPE_QUERY = ("path", "capabilities")
+CONTEXTKIT_IDENTITY_QUERY = ("identity", "show", "--json", "--project")
 ENVELOPE_ENV = "CAPABILITIES_PROJECT_ENVELOPE"
 ENVELOPE_ROOT_ENV = "CAPABILITIES_PROJECT_ENVELOPE_ROOT"
 CODEX_HOOK_COMMAND = "capabilities context --codex"
@@ -691,18 +702,18 @@ def _handed_off_envelope(root: Path) -> str:
     return override
 
 
-def _envelope_cache_file(key: str) -> Path:
-    """Where this manager records its answer for one absolute project root.
+def _record_file(cache_root: Path, key: str) -> Path:
+    """Where this manager records one answer for one absolute project root.
 
     The file name only buckets roots apart; the entry's own `root` field is what
     proves identity, so two roots landing in one bucket cost a miss rather than
     a wrong answer.
     """
-    return ENVELOPE_CACHE_ROOT / f"{format(zlib.crc32(key.encode()), '08x')}.json"
+    return cache_root / f"{format(zlib.crc32(key.encode()), '08x')}.json"
 
 
 def _envelope_witness(path) -> dict:
-    """One input the envelope answer rests on, as that input stands right now."""
+    """One input a recorded answer rests on, as that input stands right now."""
     try:
         seen = os.stat(path)
     except OSError:
@@ -711,8 +722,8 @@ def _envelope_witness(path) -> dict:
             "size": seen.st_size, "mtime_ns": seen.st_mtime_ns}
 
 
-def _cached_envelope(root: Path) -> Path | None:
-    """The recorded answer for this root while every input it rests on holds.
+def _cached_record(cache_root: Path, version: int, root: Path) -> dict | None:
+    """The recorded entry for this root while every input it rests on holds.
 
     Every reader re-observes the inputs the record names and compares each of
     them whole. Anything at all in doubt — an unreadable file, an unexpected
@@ -722,12 +733,12 @@ def _cached_envelope(root: Path) -> Path | None:
     """
     key = str(root.resolve())
     try:
-        entry = json.loads(_envelope_cache_file(key).read_text())
+        entry = json.loads(_record_file(cache_root, key).read_text())
     except (OSError, ValueError):
         return None
     if not isinstance(entry, dict):
         return None
-    if entry.get("version") != ENVELOPE_CACHE_VERSION or entry.get("root") != key:
+    if entry.get("version") != version or entry.get("root") != key:
         return None
     written, expires = entry.get("written_at"), entry.get("expires_at")
     if not isinstance(written, (int, float)) or not isinstance(expires, (int, float)):
@@ -742,17 +753,26 @@ def _cached_envelope(root: Path) -> Path | None:
         if (not isinstance(observed, dict)
                 or _envelope_witness(observed.get("path")) != observed):
             return None
+    return entry
+
+
+def _cached_envelope(root: Path) -> Path | None:
+    """The recorded envelope for this root, while its record stands."""
+    entry = _cached_record(ENVELOPE_CACHE_ROOT, ENVELOPE_CACHE_VERSION, root)
+    if entry is None:
+        return None
     envelope = Path(str(entry.get("envelope") or ""))
     if not envelope.is_absolute():
         return None
     try:
-        envelope.resolve().relative_to(key)
+        envelope.resolve().relative_to(entry["root"])
     except (OSError, ValueError):
         return None
     return envelope
 
 
-def _record_envelope(key: str, envelope: Path, witness: list[dict]) -> None:
+def _write_record(cache_root: Path, version: int, key: str, fields: dict,
+                  witness: list[dict]) -> None:
     """Record one resolved answer with the inputs it rests on.
 
     The entry is written under a process-unique name beside its home and moved
@@ -761,10 +781,9 @@ def _record_envelope(key: str, envelope: Path, witness: list[dict]) -> None:
     speed and nothing else.
     """
     now = time.time()
-    entry = {"version": ENVELOPE_CACHE_VERSION, "root": key,
-             "envelope": str(envelope), "witness": witness,
+    entry = {**fields, "version": version, "root": key, "witness": witness,
              "written_at": now, "expires_at": now + ENVELOPE_CACHE_TTL}
-    path = _envelope_cache_file(key)
+    path = _record_file(cache_root, key)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -775,6 +794,11 @@ def _record_envelope(key: str, envelope: Path, witness: list[dict]) -> None:
             tmp.unlink()
         except OSError:
             pass
+
+
+def _record_envelope(key: str, envelope: Path, witness: list[dict]) -> None:
+    _write_record(ENVELOPE_CACHE_ROOT, ENVELOPE_CACHE_VERSION, key,
+                  {"envelope": str(envelope)}, witness)
 
 
 def _contextkit_envelope(root: Path) -> Path:
@@ -861,7 +885,161 @@ def _gate_file(root: Path) -> Path:
     return _project_capabilities_dir(root) / "settings.json"
 
 
-def cmd_path(json_output: bool) -> None:
+_CONTEXT_IDENTITY: dict[Path, dict] = {}
+
+
+def _identity_problem(code: str, message: str, hint: str) -> dict:
+    return {"error": {"code": code, "message": message, "hint": hint}}
+
+
+def _contextkit_identity(root: Path) -> dict:
+    """ContextKit's own answer about this project: `{"bound", "id"}`, or
+    `{"error": ...}` when it cannot give one.
+
+    Bound means ContextKit reads a configuration for the project; its id is null
+    until the project is adopted, and is never guessed here."""
+    try:
+        proc = subprocess.run(
+            [CONTEXTKIT_BIN, *CONTEXTKIT_IDENTITY_QUERY, str(root)],
+            cwd=root, capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        return _identity_problem(
+            "contextkit_unavailable",
+            "this project is bound to ContextKit but contextkit is not available",
+            "install/repair ContextKit or remove the broken .contextkit binding")
+    except subprocess.TimeoutExpired:
+        return _identity_problem(
+            "contextkit_timeout",
+            "ContextKit did not answer the project identity within 10 seconds",
+            "repair the project context binding, then retry")
+    except OSError as exc:
+        return _identity_problem(
+            "contextkit_unavailable", f"could not run ContextKit: {exc}",
+            "install/repair ContextKit or remove the broken .contextkit binding")
+    if proc.returncode != 0:
+        return _identity_problem(
+            "contextkit_identity_failed",
+            f"ContextKit could not answer the project identity (exit {proc.returncode})",
+            (proc.stderr or proc.stdout).strip()
+            or "use a ContextKit release that answers `contextkit identity show --json`")
+    try:
+        answer = json.loads(proc.stdout)
+    except ValueError:
+        answer = None
+    ident = answer.get("id") if isinstance(answer, dict) else None
+    if (not isinstance(answer, dict) or "config" not in answer or "id" not in answer
+            or (ident is not None and (not isinstance(ident, str) or not ident.strip()))):
+        return _identity_problem(
+            "contextkit_identity_malformed",
+            "ContextKit returned a malformed project identity",
+            "expected a JSON object carrying `config` and `id`")
+    bound = answer["config"] is not None
+    return {"bound": bound, "id": ident.strip() if bound and ident else None}
+
+
+def _context_identity(root: Path) -> dict:
+    """Whether a context owner binds this project, and the id it holds for it.
+
+    Asked once per invocation and recorded like the envelope, against the same
+    inputs — the project's binding, where ContextKit keeps the id, and the
+    program that answered — so a write never takes an id from a record whose
+    binding has moved since. An unbound project is recorded too, which is what
+    lets a capability learn it without starting the manager. A failed answer is
+    never recorded."""
+    root = root.resolve()
+    known = _CONTEXT_IDENTITY.get(root)
+    if known is not None:
+        return known
+    entry = _cached_record(IDENTITY_CACHE_ROOT, IDENTITY_CACHE_VERSION, root)
+    if (entry is not None and isinstance(entry.get("bound"), bool)
+            and (entry.get("id") is None or isinstance(entry.get("id"), str))):
+        answer = {"bound": entry["bound"], "id": entry.get("id")}
+    else:
+        witness = [_envelope_witness(root / CONTEXTKIT_CONFIG_REL)]
+        if _contextkit_managed(root):
+            program = shutil.which(CONTEXTKIT_BIN)
+            if program:
+                witness.append(_envelope_witness(program))
+            answer = _contextkit_identity(root)
+        else:
+            answer = {"bound": False, "id": None}
+        if "error" not in answer:
+            _write_record(IDENTITY_CACHE_ROOT, IDENTITY_CACHE_VERSION, str(root),
+                          answer, witness)
+    _CONTEXT_IDENTITY[root] = answer
+    return answer
+
+
+def _identity_verdict(bound: bool, contextkit_id: str | None,
+                      cached_id: str | None) -> dict:
+    """Which id a project answers to, from the three facts that decide it.
+
+    Unbound, the project's own project.json is the source. Bound, ContextKit's
+    id is authoritative and project.json holds at most its copy; until
+    ContextKit has an id, the copy is the id it will adopt."""
+    if not bound:
+        return {"state": "unbound", "id": cached_id}
+    if contextkit_id is None:
+        return {"state": "pending", "id": cached_id}
+    if cached_id is not None and cached_id != contextkit_id:
+        return {"state": "mismatch", "id": contextkit_id}
+    return {"state": "adopted", "id": contextkit_id}
+
+
+def _identity_refusal(state: dict) -> dict | None:
+    """Why a write may not stamp this project's id, or None when it may.
+
+    An unbound project without an id is left to the caller, whose refusal
+    already names `capabilities init`."""
+    if state["state"] == "unresolved":
+        return state["error"]
+    if state["state"] == "mismatch":
+        return {"code": "project_id_mismatch",
+                "message": f"project.json holds project id {state['project_json_id']}, "
+                           f"but ContextKit answers {state['contextkit_id']}",
+                "hint": "reconcile the two by hand: ContextKit's id is the "
+                        "project's, and project.json keeps only its copy"}
+    if state["state"] == "pending" and not state["id"]:
+        return {"code": "project_id_unassigned",
+                "message": "this project's ContextKit identity has no id yet",
+                "hint": "run `contextkit identity adopt` in the project"}
+    return None
+
+
+def _cached_project_id(root: Path) -> str | None:
+    identity = _read_json(_project_capabilities_dir(root) / PROJECT_IDENTITY_REL)
+    if not isinstance(identity, dict):
+        return None
+    return str(identity.get("id") or "").strip() or None
+
+
+def _project_id_state(root: Path) -> dict:
+    """The project's id, where it came from, and whether it can be trusted.
+
+    Reads use `id` in every state; `_project_id_for_write` decides writes."""
+    context = _context_identity(root)
+    cached = _cached_project_id(root)
+    if "error" in context:
+        state = {"state": "unresolved", "id": cached, "bound": True,
+                 "contextkit_id": None, "error": context["error"]}
+    else:
+        state = _identity_verdict(context["bound"], context["id"], cached)
+        state.update(bound=context["bound"], contextkit_id=context["id"])
+    state["project_json_id"] = cached
+    return state
+
+
+def _project_id_for_write(root: Path) -> str | None:
+    """The id a write stamps, verified against ContextKit for this invocation,
+    or a refusal. None only where an unbound project declares no id."""
+    state = _project_id_state(root)
+    refusal = _identity_refusal(state)
+    if refusal:
+        _die(6, refusal["code"], refusal["message"], refusal.get("hint"))
+    return state["id"]
+
+
+def cmd_path(json_output: bool, identity: bool = False) -> None:
     if not json_output:
         _die(6, "input", "path requires --json")
     root = _require_project().resolve()
@@ -872,11 +1050,18 @@ def cmd_path(json_output: bool) -> None:
         provider = "contextkit"
     else:
         provider = "default"
-    _emit({
+    answer = {
         "project_root": str(root),
         "project_envelope": str(envelope),
         "provider": provider,
-    })
+    }
+    if identity:
+        state = _project_id_state(root)
+        if state["state"] == "unresolved":
+            error = state["error"]
+            _die(6, error["code"], error["message"], error.get("hint"))
+        answer["project_identity"] = state
+    _emit(answer)
 
 
 def _read_json(path: Path):
@@ -4453,14 +4638,28 @@ def _ensure_project_identity(capdir: Path, root: Path) -> dict:
     rather than admitted into someone else's rows."""
     identity_file = capdir / PROJECT_IDENTITY_REL
     if identity_file.is_file():
-        return _read_json(identity_file) or {}
-    identity = {
-        "schema": PROJECT_IDENTITY_SCHEMA,
+        identity = _read_json(identity_file) or {}
+        # A copy is filled from ContextKit where it has none; an id already
+        # written is never rewritten, even where it disagrees (doctor says so).
+        if (isinstance(identity, dict) and _contextkit_managed(root)
+                and not str(identity.get("id") or "").strip()):
+            context = _context_identity(root)
+            if context.get("bound") and context.get("id"):
+                identity["id"] = context["id"]
+                _write_json(identity_file, identity)
+        return identity
+    identity = {"schema": PROJECT_IDENTITY_SCHEMA, "slug": _default_project_slug(root)}
+    context = (_context_identity(root) if _contextkit_managed(root)
+               else {"bound": False, "id": None})
+    if context.get("bound") or "error" in context:
+        # ContextKit owns a bound project's id, so the copy takes the id it has
+        # and waits, without one, for `contextkit identity adopt` to assign it.
+        if context.get("id"):
+            identity["id"] = context["id"]
+    else:
         # Twelve hex characters, for the reason a document version has twelve:
         # an identifier nobody can read is an identifier nobody checks.
-        "id": "prj_" + secrets.token_hex(6),
-        "slug": _default_project_slug(root),
-    }
+        identity["id"] = "prj_" + secrets.token_hex(6)
     _write_json(identity_file, identity)
     return identity
 
@@ -4470,11 +4669,6 @@ def _default_project_slug(root: Path) -> str:
     the directory may be renamed afterwards without the project moving."""
     slug = re.sub(r"[^a-z0-9-]+", "-", root.name.lower()).strip("-")
     return slug or "project"
-
-
-def _project_identity(root: Path) -> dict | None:
-    identity = _read_json(_envelope_home(root) / PROJECT_IDENTITY_REL)
-    return identity if isinstance(identity, dict) and identity.get("id") else None
 
 
 def cmd_relabel(slug: str) -> None:
@@ -4492,8 +4686,9 @@ def cmd_relabel(slug: str) -> None:
     thing that needs no command at all.
     """
     root = _require_project()
-    identity = _project_identity(root)
-    if identity is None:
+    identity = _read_json(_envelope_home(root) / PROJECT_IDENTITY_REL)
+    project_id = _project_id_for_write(root)
+    if not isinstance(identity, dict) or not project_id:
         _die(6, "no_project_identity",
              f"{_envelope_home(root) / PROJECT_IDENTITY_REL} carries no project id",
              "run `capabilities init` in the project to mint its identity")
@@ -4512,7 +4707,7 @@ def cmd_relabel(slug: str) -> None:
         # from a registry that exists, rather than guessed from an exception a
         # locked or unreadable store raises in the same words.
         store.migrate()
-        registry["previous"] = store.project_relabel(identity["id"], slug)
+        registry["previous"] = store.project_relabel(project_id, slug)
         registry["registered"] = True
     except store_module.StoreError as exc:
         # A project that has never opened the store holds no row to move; that
@@ -4525,7 +4720,7 @@ def cmd_relabel(slug: str) -> None:
             store.close()
     identity["slug"] = slug
     _write_json(_envelope_home(root) / PROJECT_IDENTITY_REL, identity)
-    _emit({"ok": True, "project": str(root), "id": identity["id"],
+    _emit({"ok": True, "project": str(root), "id": project_id,
            "slug": slug, "previous_slug": registry["previous"],
            "identity": str(_envelope_home(root) / PROJECT_IDENTITY_REL),
            "store_registry": "relabelled" if registry["registered"] else "no row to move",
@@ -5425,6 +5620,17 @@ def cmd_doctor() -> None:
             "project: legacy .capabilities/ envelope is still present — run "
             "`capabilities init` to migrate it into visible capabilities/")
     envelope = _project_capabilities_dir(root) if root else None
+    identity = _project_id_state(root) if root else None
+    if identity and identity["state"] == "mismatch":
+        findings.append(
+            f"project: project.json holds project id {identity['project_json_id']}, "
+            f"but ContextKit answers {identity['contextkit_id']} — reconcile them "
+            "by hand; writes that stamp the project id refuse until they agree")
+    elif identity and identity["state"] == "unresolved":
+        findings.append(
+            f"project: ContextKit could not answer the project id "
+            f"({identity['error']['message']}) — writes that stamp the project id "
+            "refuse until it can")
     if root and envelope and ((envelope / "settings.json").is_file()
                               or (envelope / PROJECT_IDENTITY_REL).is_file()):
         caps, _global_caps = _policy_views(root)
@@ -5490,6 +5696,8 @@ def cmd_doctor() -> None:
                 for blocker in _codex_delivery_blockers(root):
                     findings.append(f"project: Codex capability context does not load — {blocker}")
     report = {"ok": not findings, "findings": findings}
+    if identity is not None:
+        report["project_identity"] = identity
     if findings:
         _emit(report)
         sys.exit(7)
@@ -8389,7 +8597,7 @@ def main() -> None:
     elif cmd == "path" and pos and pos[0] == "store":
         cmd_path_store()
     elif cmd == "path":
-        cmd_path(flag("--json"))
+        cmd_path(flag("--json"), flag("--identity"))
     elif cmd == "search":
         cmd_search(pos[0] if pos else None, opt("--source"))
     elif cmd == "source":

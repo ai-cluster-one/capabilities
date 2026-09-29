@@ -464,6 +464,19 @@ def _project_identity(root: Path) -> dict:
         raise ConfigError(f"no project identity under {root}") from exc
 
 
+# The id a registration stamps is the one the launching CLI resolves for a
+# write: in process the CLI installs its resolver here, and the daemon it
+# launches is handed the answer as AUTOMATIONS_PROJECT_ID. project.json's own id
+# stands in only where no launcher resolved one.
+PROJECT_ID_FOR_WRITE = None
+
+
+def _registration_id(identity: dict) -> str | None:
+    if callable(PROJECT_ID_FOR_WRITE):
+        return PROJECT_ID_FOR_WRITE()
+    return os.environ.get("AUTOMATIONS_PROJECT_ID") or identity.get("id")
+
+
 def materialise_script(state_dir: Path, key: str, version: str, body: str) -> Path:
     """Write a script's active version where a subprocess can run it.
 
@@ -700,7 +713,7 @@ def open_ledger(root: Path, config: dict[str, Any]):
     st = _store.open_store()
     try:
         st.migrate()
-        st.project_register(identity["id"], identity["slug"])
+        st.project_register(_registration_id(identity), identity["slug"])
         st.migrate(STORE_NAMESPACE, STORE_VERSION, STORE_MIGRATIONS)
     except _store.StoreError as exc:
         st.close()

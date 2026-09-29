@@ -1604,3 +1604,17 @@ def test_a_dedupe_collision_still_yields_rather_than_raising(tmp_path):
     assert ledger.claim(automation_id, "nightly", tmp_path,
                         trigger="schedule", dedupe_key=dedupe) is None
     st.close()
+
+
+def test_registration_stamps_the_id_its_launcher_resolved(monkeypatch):
+    """The id a run is registered under is the one the automations CLI resolved
+    for a write: installed in process, handed to the daemon it launches, and
+    project.json's own only where no launcher resolved one."""
+    identity = {"id": "prj_copy00000000", "slug": "labelled"}
+    monkeypatch.setattr(RUNTIME, "PROJECT_ID_FOR_WRITE", None)
+    monkeypatch.delenv("AUTOMATIONS_PROJECT_ID", raising=False)
+    assert RUNTIME._registration_id(identity) == "prj_copy00000000"
+    monkeypatch.setenv("AUTOMATIONS_PROJECT_ID", "prj_handed000000")
+    assert RUNTIME._registration_id(identity) == "prj_handed000000"
+    monkeypatch.setattr(RUNTIME, "PROJECT_ID_FOR_WRITE", lambda: "prj_resolved0000")
+    assert RUNTIME._registration_id(identity) == "prj_resolved0000"

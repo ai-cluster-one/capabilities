@@ -62,6 +62,15 @@ def _binding_reading_contextkit(tmp_path: Path) -> Path:
     return log
 
 
+def _envelope_lookups(log: Path) -> list[str]:
+    """The envelope questions asked of ContextKit, leaving out the identity
+    question a bound project's init also asks."""
+    if not log.exists():
+        return []
+    return [line for line in log.read_text().splitlines()
+            if not line.startswith("identity ")]
+
+
 def _env(tmp_path: Path, project: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update({
@@ -106,7 +115,7 @@ def test_contextkit_body_root_relocates_the_whole_envelope(tmp_path: Path) -> No
     assert gate["capabilities"]["asana"]["enabled"] is True
     assert enabled["gate"] == str(envelope.resolve() / "settings.json")
     # One lookup covers both invocations: the second reads the first's record.
-    assert log.read_text().splitlines() == ["path capabilities"]
+    assert _envelope_lookups(log) == ["path capabilities"]
 
     listed = _json(_run(tmp_path, project, "list"))
     assert listed["project_envelope"] == str(envelope.resolve())
@@ -139,7 +148,7 @@ def test_contextkit_without_body_root_keeps_the_root_envelope(tmp_path: Path) ->
 
     assert init["gate"] == str((project / "capabilities" / "settings.json").resolve())
     assert (project / "capabilities" / "settings.json").is_file()
-    assert log.read_text().splitlines() == ["path capabilities"]
+    assert _envelope_lookups(log) == ["path capabilities"]
 
 
 def test_project_without_contextkit_never_asks(tmp_path: Path) -> None:
@@ -217,7 +226,7 @@ def test_supplied_envelope_replaces_the_lookup(tmp_path: Path) -> None:
     init = _json(_run(tmp_path, project, "init", env=env))
 
     assert init["gate"] == str(envelope.resolve() / "settings.json")
-    assert not log.exists()
+    assert _envelope_lookups(log) == []
 
 
 def test_path_json_reports_plain_project_provenance(tmp_path: Path) -> None:

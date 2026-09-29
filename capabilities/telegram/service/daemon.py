@@ -438,7 +438,8 @@ def job_register():
     if _JOB_REGISTER is None:
         _JOB_STORE, _JOB_REGISTER = jobs.open_register(
             _records_module(), PROJECT_CAPABILITIES_DIR, ENVIRONMENT,
-            url=STORE_URL)
+            url=STORE_URL,
+            project_id=os.environ.get("TELEGRAM_SERVICE_PROJECT_ID") or None)
     return _JOB_REGISTER
 
 

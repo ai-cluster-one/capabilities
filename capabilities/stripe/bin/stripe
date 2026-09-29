@@ -280,10 +280,11 @@ def _handed_off_envelope(root: Path) -> str:
 
 
 ENVELOPE_CACHE_VERSION = 1
+IDENTITY_CACHE_VERSION = 1
 
 
-def _envelope_cache_file(key: str) -> Path:
-    """Where the manager records its answer for one absolute project root.
+def _record_file(kind: str, key: str) -> Path:
+    """Where the manager records one kind of answer for one absolute project root.
 
     The file name only buckets roots apart; the entry's own `root` field is what
     proves identity, so two roots landing in one bucket cost a miss rather than
@@ -292,12 +293,12 @@ def _envelope_cache_file(key: str) -> Path:
     import zlib
 
     base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
-    return (base / "capabilities" / "envelope"
+    return (base / "capabilities" / kind
             / f"{format(zlib.crc32(key.encode()), '08x')}.json")
 
 
 def _envelope_witness(path) -> dict:
-    """One input the envelope answer rests on, as that input stands right now."""
+    """One input a recorded answer rests on, as that input stands right now."""
     try:
         seen = os.stat(path)
     except OSError:
@@ -306,8 +307,8 @@ def _envelope_witness(path) -> dict:
             "size": seen.st_size, "mtime_ns": seen.st_mtime_ns}
 
 
-def _cached_envelope(root: Path):
-    """The recorded answer for this root while every input it rests on holds.
+def _cached_record(kind: str, version: int, root: Path):
+    """The recorded entry for this root while every input it rests on holds.
 
     The manager writes the record and names the inputs its answer consulted; a
     reader re-observes each of them and compares it whole. Anything at all in
@@ -319,12 +320,12 @@ def _cached_envelope(root: Path):
 
     key = str(root.resolve())
     try:
-        entry = json.loads(_envelope_cache_file(key).read_text())
+        entry = json.loads(_record_file(kind, key).read_text())
     except (OSError, ValueError):
         return None
     if not isinstance(entry, dict):
         return None
-    if entry.get("version") != ENVELOPE_CACHE_VERSION or entry.get("root") != key:
+    if entry.get("version") != version or entry.get("root") != key:
         return None
     written, expires = entry.get("written_at"), entry.get("expires_at")
     if not isinstance(written, (int, float)) or not isinstance(expires, (int, float)):
@@ -339,22 +340,29 @@ def _cached_envelope(root: Path):
         if (not isinstance(observed, dict)
                 or _envelope_witness(observed.get("path")) != observed):
             return None
+    return entry
+
+
+def _cached_envelope(root: Path):
+    """The recorded envelope for this root, while its record stands."""
+    entry = _cached_record("envelope", ENVELOPE_CACHE_VERSION, root)
+    if entry is None:
+        return None
     envelope = Path(str(entry.get("envelope") or ""))
     if not envelope.is_absolute():
         return None
     try:
-        envelope.resolve().relative_to(key)
+        envelope.resolve().relative_to(entry["root"])
     except (OSError, ValueError):
         return None
     return envelope
 
 
-def _manager_project_envelope(root: Path) -> Path:
-    """Consume the capabilities manager's one authoritative project answer."""
-    override = _handed_off_envelope(root)
-    if override:
-        return _validated_project_envelope(root, override, "environment handoff")
+def _ask_manager(root: Path, *flags: str) -> tuple:
+    """`capabilities path --json` for this root: (answer, None) or (None, error).
 
+    The error carries the exit code the caller should use and the manager's own
+    code, message and hint where it gave them."""
     import subprocess
 
     env = dict(os.environ)
@@ -365,40 +373,51 @@ def _manager_project_envelope(root: Path) -> Path:
         manager = str(source_manager) if source_manager.is_file() else "capabilities"
     try:
         proc = subprocess.run(
-            [manager, "path", "--json"], cwd=root, env=env,
+            [manager, "path", "--json", *flags], cwd=root, env=env,
             capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
-        _die(6, "capabilities_manager_unavailable",
-             "the capabilities manager is required to resolve the project envelope",
-             "install or repair the `capabilities` command")
+        return None, {"exit": 6, "code": "capabilities_manager_unavailable",
+                      "message": "the capabilities manager is required to resolve the project",
+                      "hint": "install or repair the `capabilities` command"}
     except subprocess.TimeoutExpired:
-        _die(6, "capabilities_path_timeout",
-             "the capabilities manager did not resolve the project envelope within 10 seconds")
+        return None, {"exit": 6, "code": "capabilities_path_timeout",
+                      "message": "the capabilities manager did not resolve the project within 10 seconds"}
     except OSError as exc:
-        _die(6, "capabilities_manager_unavailable",
-             f"could not run the capabilities manager: {exc}")
+        return None, {"exit": 6, "code": "capabilities_manager_unavailable",
+                      "message": f"could not run the capabilities manager: {exc}"}
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()
         try:
             error = json.loads(detail).get("error", {})
         except (AttributeError, ValueError):
             error = {}
-        _die(proc.returncode if proc.returncode in (3, 4, 5, 6) else 6,
-             str(error.get("code") or "capabilities_path_failed"),
-             str(error.get("message") or "the capabilities manager could not resolve the project envelope"),
-             str(error.get("hint") or detail or "run `capabilities path --json` for details"))
+        return None, {"exit": proc.returncode if proc.returncode in (3, 4, 5, 6) else 6,
+                      "code": str(error.get("code") or "capabilities_path_failed"),
+                      "message": str(error.get("message") or "the capabilities manager could not resolve the project"),
+                      "hint": str(error.get("hint") or detail or "run `capabilities path --json` for details")}
     try:
         answer = json.loads(proc.stdout)
     except ValueError as exc:
-        _die(6, "capabilities_path_malformed",
-             f"the capabilities manager returned invalid JSON: {exc}")
+        return None, {"exit": 6, "code": "capabilities_path_malformed",
+                      "message": f"the capabilities manager returned invalid JSON: {exc}"}
     if not isinstance(answer, dict):
-        _die(6, "capabilities_path_malformed",
-             "the capabilities manager path answer must be a JSON object")
+        return None, {"exit": 6, "code": "capabilities_path_malformed",
+                      "message": "the capabilities manager path answer must be a JSON object"}
     manager_root = Path(str(answer.get("project_root") or ""))
     if not manager_root.is_absolute() or manager_root.resolve() != root.resolve():
-        _die(6, "capabilities_project_mismatch",
-             "the capabilities manager resolved a different project root")
+        return None, {"exit": 6, "code": "capabilities_project_mismatch",
+                      "message": "the capabilities manager resolved a different project root"}
+    return answer, None
+
+
+def _manager_project_envelope(root: Path) -> Path:
+    """Consume the capabilities manager's one authoritative project answer."""
+    override = _handed_off_envelope(root)
+    if override:
+        return _validated_project_envelope(root, override, "environment handoff")
+    answer, error = _ask_manager(root)
+    if error:
+        _die(error["exit"], error["code"], error["message"], error.get("hint"))
     provider = str(answer.get("provider") or "capabilities manager")
     return _validated_project_envelope(
         root, answer.get("project_envelope"), provider)
@@ -450,6 +469,115 @@ def _project_capabilities_dir(root: Path) -> Path:
             or not legacy.is_dir()):
         return current
     return legacy
+
+
+_CONTEXT_IDENTITY: dict = {}
+
+
+def _context_identity(root: Path) -> dict:
+    """Whether a context owner binds this project, and the id it holds for it.
+
+    The capabilities manager owns the answer, as it owns the envelope's: this
+    reads the manager's record while every input it rests on stands, and asks
+    the manager otherwise. `{"bound", "id"}`, or `{"error"}` when the manager
+    cannot answer, which leaves reads on project.json and refuses writes."""
+    root = root.resolve()
+    known = _CONTEXT_IDENTITY.get(root)
+    if known is not None:
+        return known
+    entry = _cached_record("identity", IDENTITY_CACHE_VERSION, root)
+    if (entry is not None and isinstance(entry.get("bound"), bool)
+            and (entry.get("id") is None or isinstance(entry.get("id"), str))):
+        answer = {"bound": entry["bound"], "id": entry.get("id")}
+    else:
+        reply, error = _ask_manager(root, "--identity")
+        state = (reply or {}).get("project_identity")
+        if error or not isinstance(state, dict) or not isinstance(state.get("bound"), bool):
+            answer = {"error": error or {
+                "code": "capabilities_path_malformed",
+                "message": "the capabilities manager returned no project identity"}}
+        else:
+            answer = {"bound": state["bound"], "id": state.get("contextkit_id") or None}
+    _CONTEXT_IDENTITY[root] = answer
+    return answer
+
+
+def _identity_verdict(bound: bool, contextkit_id, cached_id) -> dict:
+    """Which id a project answers to, from the three facts that decide it.
+
+    Unbound, the project's own project.json is the source. Bound, ContextKit's
+    id is authoritative and project.json holds at most its copy; until
+    ContextKit has an id, the copy is the id it will adopt."""
+    if not bound:
+        return {"state": "unbound", "id": cached_id}
+    if contextkit_id is None:
+        return {"state": "pending", "id": cached_id}
+    if cached_id is not None and cached_id != contextkit_id:
+        return {"state": "mismatch", "id": contextkit_id}
+    return {"state": "adopted", "id": contextkit_id}
+
+
+def _identity_refusal(state: dict):
+    """Why a write may not stamp this project's id, or None when it may.
+
+    An unbound project without an id is left to the caller, whose refusal
+    already names `capabilities init`."""
+    if state["state"] == "unresolved":
+        return state["error"]
+    if state["state"] == "mismatch":
+        return {"code": "project_id_mismatch",
+                "message": f"project.json holds project id {state['project_json_id']}, "
+                           f"but ContextKit answers {state['contextkit_id']}",
+                "hint": "reconcile the two by hand: ContextKit's id is the "
+                        "project's, and project.json keeps only its copy"}
+    if state["state"] == "pending" and not state["id"]:
+        return {"code": "project_id_unassigned",
+                "message": "this project's ContextKit identity has no id yet",
+                "hint": "run `contextkit identity adopt` in the project"}
+    return None
+
+
+def _project_id_state():
+    """The id of the project this command stands in, where it came from, and
+    whether a write may stamp it; None outside a project.
+
+    Reading it asks no records backend: the id is what selects a project's
+    records, so it is read before any of them."""
+    root = _project_root()
+    if root is None:
+        return None
+    try:
+        declared = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
+    except (OSError, ValueError):
+        declared = None
+    cached = (str(declared.get("id") or "").strip() or None
+              if isinstance(declared, dict) else None)
+    context = _context_identity(root)
+    if "error" in context:
+        state = {"state": "unresolved", "id": cached, "bound": True,
+                 "contextkit_id": None, "error": context["error"]}
+    else:
+        state = _identity_verdict(context["bound"], context["id"], cached)
+        state.update(bound=context["bound"], contextkit_id=context["id"])
+    state["project_json_id"] = cached
+    return state
+
+
+def _project_id(write: bool = False):
+    """The project id this command stands in, or None where there is none.
+
+    A read takes the id in every state. A write that stamps it takes it only
+    once it is verified against ContextKit for this invocation, and otherwise
+    exits 6 naming what to settle; an unbound project that declares no id is
+    still None, left to the caller's own refusal."""
+    state = _project_id_state()
+    if state is None:
+        return None
+    if write:
+        refusal = _identity_refusal(state)
+        if refusal:
+            _die(6, refusal["code"], refusal["message"], refusal.get("hint"))
+    return state["id"]
 
 
 def _project_env() -> dict:

@@ -40,8 +40,11 @@ HERE, THERE = "prj_here", "prj_there"
 @pytest.fixture
 def declares(tmp_path, monkeypatch):
     """A project on disk that declares itself, the way `capabilities init` leaves
-    one. The file is real, so what is exercised is the reader and not a stub."""
-    def write(body, *, envelope="capabilities"):
+    one. The file is real, so what is exercised is the reader and not a stub.
+
+    Whether a context owner binds the project is the manager's answer, so that
+    one answer is given here: unbound unless a test says what ContextKit holds."""
+    def write(body, *, envelope="capabilities", contextkit=None):
         root = tmp_path / envelope
         root.mkdir(parents=True, exist_ok=True)
         (root / "project.json").write_text(body if isinstance(body, str)
@@ -49,6 +52,8 @@ def declares(tmp_path, monkeypatch):
         monkeypatch.setattr(mod, "_project_root", lambda: tmp_path)
         monkeypatch.setattr(mod, "_project_capabilities_dir",
                             lambda r: tmp_path / envelope)
+        monkeypatch.setattr(mod, "_context_identity",
+                            lambda r: contextkit or {"bound": False, "id": None})
         return tmp_path
     return write
 
@@ -91,6 +96,69 @@ def test_nowhere_and_nothing_declared_are_both_no_project(tmp_path, monkeypatch,
     monkeypatch.setattr(mod, "_project_root", lambda: tmp_path)
     monkeypatch.setattr(mod, "_project_capabilities_dir", lambda r: tmp_path / "empty")
     assert mod._declared_project() is None
+
+
+# --- A ContextKit-bound project declares itself through ContextKit -----------
+
+def _bound(contextkit_id):
+    return {"bound": True, "id": contextkit_id}
+
+
+def test_a_bound_project_is_the_id_contextkit_answers(declares):
+    declares({"slug": "a-project"}, contextkit=_bound(HERE))
+    assert mod._declared_project() == HERE
+    assert mod._project_id_state()["state"] == "adopted"
+
+
+def test_a_project_waiting_for_adoption_keeps_its_copy(declares):
+    declares({"id": HERE, "slug": "a-project"}, contextkit=_bound(None))
+    state = mod._project_id_state()
+    assert (state["state"], state["id"]) == ("pending", HERE)
+    assert mod._identity_refusal(state) is None
+
+
+def test_a_mismatch_reads_as_contextkit_and_refuses_writes_naming_both(
+        declares, monkeypatch, capsys):
+    declares({"id": THERE, "slug": "a-project"}, contextkit=_bound(HERE))
+    state = mod._project_id_state()
+    assert (state["state"], mod._declared_project()) == ("mismatch", HERE)
+    monkeypatch.setattr(mod, "PROJECT_IDENTITY", state)
+    monkeypatch.setattr(mod, "PROJECT", state["id"])
+    assert mod._reading_project(None) == HERE
+    with pytest.raises(SystemExit) as exit_info:
+        mod._writing_project()
+    assert exit_info.value.code == 6
+    error = _error(capsys)
+    assert error["code"] == "project_id_mismatch"
+    assert HERE in error["message"] and THERE in error["message"]
+
+
+def test_a_bound_project_with_no_id_anywhere_refuses_writes(declares, monkeypatch, capsys):
+    declares({"slug": "a-project"}, contextkit=_bound(None))
+    state = mod._project_id_state()
+    monkeypatch.setattr(mod, "PROJECT_IDENTITY", state)
+    monkeypatch.setattr(mod, "PROJECT", state["id"])
+    with pytest.raises(SystemExit) as exit_info:
+        mod._writing_project()
+    assert exit_info.value.code == 6
+    error = _error(capsys)
+    assert error["code"] == "project_id_unassigned"
+    assert "contextkit identity adopt" in error["hint"]
+
+
+def test_contextkit_that_cannot_answer_leaves_reads_and_refuses_writes(
+        declares, monkeypatch, capsys):
+    failed = {"error": {"code": "contextkit_identity_failed", "message": "no answer",
+                        "hint": "repair it"}}
+    declares({"id": HERE, "slug": "a-project"}, contextkit=failed)
+    state = mod._project_id_state()
+    assert (state["state"], mod._declared_project()) == ("unresolved", HERE)
+    monkeypatch.setattr(mod, "PROJECT_IDENTITY", state)
+    monkeypatch.setattr(mod, "PROJECT", state["id"])
+    with pytest.raises(SystemExit) as exit_info:
+        mod._writing_project()
+    assert exit_info.value.code == 6
+    assert _error(capsys)["code"] == "contextkit_identity_failed"
 
 
 # --- What each direction does with it ----------------------------------------
