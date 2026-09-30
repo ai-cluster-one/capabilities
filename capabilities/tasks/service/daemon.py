@@ -16,6 +16,10 @@ It wakes when the store notifies that a task became claimable, at every poll,
 at the earliest moment a pickup or a lease falls due, and when one of its own
 turns claims or ends. A store without the notification leaves it the poll.
 
+It outlives the store being away. A listener it loses, or cannot open, is asked
+for again on a doubling interval until the store answers, and the moment it
+listens again it asks the store for work, since nothing it missed was announced.
+
 It never starts a turn on a task one of its turns holds, or on one a turn of its
 own ended on less than `retry_delay_seconds` ago: its turns are told to claim
 other tasks, and it wakes again when the delay is over. However a turn fails,
@@ -49,11 +53,17 @@ EXCLUDE_ENV = "TASKS_TURN_EXCLUDE"
 # A stop or a reload is taken within this, and so is a turn that ended.
 TICK_SECONDS = 1.0
 
+# How soon a listener that was lost, or could not be opened, is asked for again:
+# the first interval, doubled after every attempt that fails, up to the longest.
+RELISTEN_FIRST_SECONDS = 1.0
+RELISTEN_LONGEST_SECONDS = 30.0
+
 # Wakes that may start a turn only to have its claim run the sweeps: a lapsed
 # lease and an ended wait are put back by a claim and by nothing else, and no
 # write announces either. Starting one on every wake would spin on a sweep that
-# keeps failing, so it happens on the clock and nowhere else.
-_SWEEP_WAKES = {"start", "poll", "pickup", "reload"}
+# keeps failing, so it happens on the clock and nowhere else. Listening again
+# after the store was away counts as the clock: a lease may have lapsed meanwhile.
+_SWEEP_WAKES = {"start", "poll", "pickup", "reload", "relisten"}
 
 
 def now_iso() -> str:
@@ -192,6 +202,10 @@ class Daemon:
         self.listener = None
         self.listen_error: str | None = None
         self.notification_installed: bool | None = None
+        # While there is no listener: when to ask for one again, and how long
+        # the wait after that attempt will be if it fails too.
+        self.relisten_at: float | None = None
+        self.relisten_delay = RELISTEN_FIRST_SECONDS
         self.next_poll = 0.0
         self.next_moment: float | None = None
         self.wakes: set[str] = {"start"}
@@ -368,6 +382,9 @@ class Daemon:
                 self._connect_listener()
             else:
                 self._check_notification()
+        elif self.listener is None and self.relisten_at is not None \
+                and now >= self.relisten_at:
+            self._connect_listener()
         if self.next_moment is not None and now >= self.next_moment:
             self.wakes.add("pickup")
             self.next_moment = None
@@ -384,22 +401,40 @@ class Daemon:
         self.publish()
         if wait and not self.stop_requested:
             deadlines = ([self.next_poll] + ([self.next_moment] if self.next_moment else [])
+                         + ([self.relisten_at] if self.relisten_at else [])
                          + [r["until"] for r in self.recent.values()])
             self.wait(max(0.0, min([self.tick] + [d - time.monotonic() for d in deadlines])))
 
     # --- waking ----------------------------------------------------------------
 
     def _connect_listener(self) -> None:
+        """Open the listener. A failure is said once, not on every attempt, and
+        the next attempt is planned; a listener opened after one was lost or
+        refused is a wake, since what the store announced meanwhile was lost."""
         self._drop_listener()
         try:
             self.listener = self.host.listen()
-            self.listen_error = None
         except (Exception, SystemExit) as exc:
             self.listener = None
-            self.listen_error = _why(exc)
-            self.log(f"cannot listen for the store's notification, waking by the "
-                     f"poll every {self.settings()['poll_seconds']}s: {self.listen_error}")
+            why = _why(exc)
+            if why != self.listen_error:
+                self.log(f"cannot listen for the store's notification, waking by the "
+                         f"poll every {self.settings()['poll_seconds']}s and asking "
+                         f"again: {why}")
+            self.listen_error = why
+            self._relisten_later()
+            return
+        if self.listen_error is not None:
+            self.log(f"listening on {self.host.channel} again; asking the store for work")
+            self.wakes.add("relisten")
+        self.listen_error = None
+        self.relisten_at = None
+        self.relisten_delay = RELISTEN_FIRST_SECONDS
         self._check_notification()
+
+    def _relisten_later(self) -> None:
+        self.relisten_at = time.monotonic() + self.relisten_delay
+        self.relisten_delay = min(self.relisten_delay * 2, RELISTEN_LONGEST_SECONDS)
 
     def _check_notification(self) -> None:
         try:
@@ -434,10 +469,11 @@ class Daemon:
             if got:
                 got += list(self.listener.notifies(timeout=0))
         except Exception as exc:
-            self.log(f"lost the store's notification, waking by the poll until it is "
-                     f"back: {_why(exc)}")
+            self.log(f"lost the store's notification, waking by the poll and asking "
+                     f"for it again: {_why(exc)}")
             self._drop_listener()
             self.listen_error = _why(exc)
+            self._relisten_later()
             return
         for note in got:
             try:

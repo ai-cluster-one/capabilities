@@ -13,7 +13,9 @@ reports a claim and waits, so a lane's cap, a wake and a stop are observed
 rather than inferred. One test then runs the real daemon through the CLI, whose
 turns are real `tasks run` children on the stand-in harness. The store-backed
 checks read TASKS_TEST_DSN and skip when it is unset; every run works in a
-schema of its own and drops it.
+schema of its own and drops it. The store going away is a relay the test owns
+between the daemon and the store being closed and opened again, so no test
+stops a server it did not start.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
         --with 'callva-harness-runner==0.5.0' python -m pytest capabilities/tasks/tests -q
@@ -24,9 +26,11 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -227,6 +231,79 @@ def test_the_notification_is_part_of_the_schema():
     assert "create trigger tasks_notify_claimable after insert or update on elsewhere.tasks" in ddl
     assert "pg_notify('tasks_claimable'" in ddl
     assert "elsewhere.notify_claimable()" in ddl
+
+
+class _AwayListener:
+    def notifies(self, timeout=None, stop_after=None):
+        time.sleep(timeout or 0)
+        return iter(())
+
+    def close(self):
+        pass
+
+
+class _AwayHost:
+    """A host whose store refuses a listener until `away` is cleared."""
+
+    channel, project, schema = "tasks_claimable", "prj_away", "tasks"
+
+    def __init__(self, state_dir: Path):
+        self.state_dir = self.root = state_dir
+        self.away = True
+        self.attempts: list[float] = []
+
+    def listen(self):
+        self.attempts.append(time.monotonic())
+        if self.away:
+            raise mod.Refusal(5, "unreachable", "cannot reach the store: refused")
+        return _AwayListener()
+
+    def notification_installed(self):
+        return True
+
+    def next_moment(self):
+        return None
+
+    def sweep_due(self):
+        return False
+
+
+def test_a_listener_the_store_refuses_is_asked_for_again_on_a_doubling_interval(tmp_path):
+    service = mod._service_module()
+    service.RELISTEN_FIRST_SECONDS, service.RELISTEN_LONGEST_SECONDS = 0.2, 0.8
+    host = _AwayHost(tmp_path / "state")
+    declaration = {"settings": {"poll_seconds": 3600, "max_parallel": 1,
+                                "shutdown_grace_seconds": 0, "retry_delay_seconds": 60},
+                   "lanes": [], "idle": [], "fingerprint": "f"}
+    daemon = service.Daemon(host, declaration, tick=0.05)
+    daemon.open()
+    try:
+        deadline = time.monotonic() + 3.3
+        while time.monotonic() < deadline:
+            daemon.step()
+        gaps = [b - a for a, b in zip(host.attempts, host.attempts[1:])]
+        # Asked at start, then after 0.2s, 0.4s, and 0.8s from then on.
+        assert len(host.attempts) >= 5, gaps
+        assert gaps[0] < gaps[1] < gaps[2], gaps
+        assert all(0.7 < gap < 1.2 for gap in gaps[2:]), gaps
+        assert daemon.listener is None
+        assert daemon.status()["notification"]["listening"] is False
+        log = (daemon.state_dir / "daemon.log").read_text()
+        # Said once, however many times it was asked.
+        assert log.count("cannot listen for the store's notification") == 1
+        host.away = False
+        deadline = time.monotonic() + 3
+        while daemon.listener is None and time.monotonic() < deadline:
+            daemon.step()
+        assert daemon.listener is not None
+        assert "relisten" in daemon.last_wake["reasons"]
+        assert daemon.status()["wake_by"] == "notification"
+        assert daemon.relisten_at is None
+        assert daemon.relisten_delay == service.RELISTEN_FIRST_SECONDS
+        assert "listening on tasks_claimable again" in (
+            daemon.state_dir / "daemon.log").read_text()
+    finally:
+        daemon.close()
 
 
 # --- Against a real store ----------------------------------------------------
@@ -583,6 +660,138 @@ def test_run_writes_the_receipt_the_service_reads(project, store, capsys, monkey
     assert mod._RECEIPT_ENV not in seen["env"]
 
 
+# --- The store going away ----------------------------------------------------
+
+class Relay:
+    """A TCP relay to the store on a port of its own. `down()` cuts every
+    connection through it and refuses new ones, as a store that went away does;
+    `up()` opens the same port again."""
+
+    def __init__(self, host: str, port: int):
+        self.target = (host, port)
+        self.pairs: list[tuple[socket.socket, socket.socket]] = []
+        self.lock = threading.Lock()
+        self.listener: socket.socket | None = None
+        self.port = 0
+        self.up()
+
+    def up(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", self.port))
+        listener.listen(16)
+        self.port = listener.getsockname()[1]
+        self.listener = listener
+        threading.Thread(target=self._accept, args=(listener,), daemon=True).start()
+
+    def down(self) -> None:
+        listener, self.listener = self.listener, None
+        if listener is not None:
+            listener.close()
+        with self.lock:
+            pairs, self.pairs = self.pairs, []
+        for pair in pairs:
+            for end in pair:
+                try:
+                    end.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                end.close()
+
+    def _accept(self, listener: socket.socket) -> None:
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                upstream = socket.create_connection(self.target)
+            except OSError:
+                client.close()
+                continue
+            with self.lock:
+                self.pairs.append((client, upstream))
+            for a, b in ((client, upstream), (upstream, client)):
+                threading.Thread(target=self._pump, args=(a, b), daemon=True).start()
+
+    @staticmethod
+    def _pump(source: socket.socket, sink: socket.socket) -> None:
+        try:
+            while True:
+                data = source.recv(65536)
+                if not data:
+                    break
+                sink.sendall(data)
+        except OSError:
+            pass
+        for end in (source, sink):
+            try:
+                end.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+@pytest.fixture
+def relay():
+    from psycopg.conninfo import conninfo_to_dict
+
+    info = conninfo_to_dict(DSN)
+    found = Relay(info.get("host") or "127.0.0.1", int(info.get("port") or 5432))
+    try:
+        yield found
+    finally:
+        found.down()
+
+
+@needs_store
+def test_the_daemon_outlives_the_store_going_away_and_listens_again(
+        project, store, relay, capsys):
+    """The store goes away under a daemon running a turn: the daemon keeps
+    running and keeps the turn, and when the store is back it listens again
+    without a restart, takes the work it could not hear about, and then takes a
+    task by the store's notification."""
+    entry, schema, conn = store
+    write_worker(project, "gamma", "takes: [gamma]\nprofile: plain")
+    write_settings(project, "version = 1\npoll_seconds = 3600\nmax_parallel = 3\n")
+    # The daemon reaches the store through the relay; the test writes directly.
+    through = {**entry, "db_host": "127.0.0.1", "db_port": str(relay.port)}
+    add(entry, capsys, "alpha")
+    with Harness(project, through) as h:
+        h.steps(lambda: h.running("alpha") == 1 and all(
+            t.phase == "working" for t in h.daemon.turns.values()))
+        assert h.daemon.status()["wake_by"] == "notification"
+        [turn] = h.daemon.turns.values()
+
+        relay.down()
+        h.steps(lambda: h.daemon.listener is None, seconds=5)
+        # Work written while the daemon cannot hear the store.
+        add(entry, capsys, "beta")
+        h.settle(2.5)
+        status = h.daemon.status()
+        assert status["notification"]["listening"] is False
+        assert "cannot reach the store" in status["notification"]["error"]
+        assert h.running("beta") == 0
+        assert turn.process.poll() is None and h.daemon.turns[turn.id] is turn
+
+        relay.up()
+        h.steps(lambda: h.daemon.listener is not None, seconds=8)
+        assert "relisten" in h.daemon.last_wake["reasons"]
+        h.steps(lambda: h.running("beta") == 1 and all(
+            t.phase == "working" for t in h.daemon.turns.values()))
+        assert h.daemon.status()["wake_by"] == "notification"
+        assert turn.process.poll() is None
+
+        # A task written now is heard, not polled for.
+        add(entry, capsys, "gamma")
+        took = h.steps(lambda: h.running("gamma") == 1, seconds=5)
+        assert took < 3
+        assert "notify" in h.daemon.last_wake["reasons"]
+        assert "poll" not in h.daemon.last_wake["reasons"]
+        log = (h.daemon.state_dir / "daemon.log").read_text()
+        assert "lost the store's notification" in log
+        assert "listening on tasks_claimable again" in log
+
+
 # --- The daemon, through the CLI ---------------------------------------------
 
 @pytest.fixture()
@@ -788,3 +997,119 @@ def test_a_task_whose_turns_fail_at_once_is_retried_no_faster_than_the_delay(lab
     time.sleep(1.2)
     by_hand = answer_of(tasks_cli(lab, "run", "alpha", "--apply"))
     assert by_hand["claimed"] == "t-fail"
+
+
+@needs_store
+def test_service_doctor_warns_while_the_daemon_waits_out_the_store(lab, relay):
+    """The probe a supervisor runs: with a daemon running, the store being away
+    is a warning and exit 0, and a stale declaration still fails; with no
+    daemon it fails. The daemon lives through it and works when the store is
+    back."""
+    project = lab["project"]
+    connections = project / "capabilities" / "tasks" / "connections.json"
+    registry = json.loads(connections.read_text())
+    registry["connections"]["relayed"] = {**registry["connections"]["local"],
+                                          "db_host": "127.0.0.1", "db_port": str(relay.port)}
+    registry["default"] = "relayed"
+    connections.write_text(json.dumps(registry))
+    assert answer_of(tasks_cli(lab, "service", "init"))["written"]
+    write_settings(project, "version = 1\npoll_seconds = 3600\nshutdown_grace_seconds = 5\n")
+
+    relay.down()
+    without = tasks_cli(lab, "service", "doctor")
+    assert without.returncode == 5
+    assert json.loads(without.stderr)["error"]["code"] == "unreachable"
+
+    relay.up()
+    doctor = answer_of(tasks_cli(lab, "service", "doctor"))
+    assert doctor["ok"] and doctor["store"] == {"reachable": True}
+    started = answer_of(tasks_cli(lab, "service", "start"))
+    pid = started["pid"]
+    assert started["wake_by"] == "notification"
+
+    relay.down()
+    away = answer_of(tasks_cli(lab, "service", "doctor"))
+    assert away["ok"] is True and "problems" not in away
+    assert away["store"]["reachable"] is False
+    assert "cannot reach the store" in away["store"]["error"]
+    assert "unreachable" in away["warning"]
+    assert away["service"]["running"] is True
+    # A daemon behind the files on disk fails the probe, store or no store.
+    worker = project / "capabilities" / "tasks" / "workers" / "alpha.md"
+    kept = worker.read_text()
+    worker.write_text(kept + "\nedited.\n")
+    stale = tasks_cli(lab, "service", "doctor")
+    assert stale.returncode == 6 and "declaration_stale" in json.loads(stale.stdout)
+    worker.write_text(kept)
+    time.sleep(3)
+    os.kill(pid, 0)
+    assert answer_of(tasks_cli(lab, "service", "status"))["notification"]["listening"] is False
+
+    relay.up()
+    poll_for(lambda: answer_of(tasks_cli(lab, "service", "status"))["notification"]["listening"],
+             40)
+    answer_of(tasks_cli(lab, "add", "--type", "alpha", "--title", "after", "--key", "t-after",
+                        "--status", "todo"))
+    poll_for(lambda: answer_of(tasks_cli(lab, "show", "t-after"))["task"]["status"] == "complete",
+             60)
+    back = answer_of(tasks_cli(lab, "service", "doctor"))
+    assert back["ok"] and back["store"] == {"reachable": True}
+    assert back["service"]["pid"] == pid
+    log = "\n".join(answer_of(tasks_cli(lab, "service", "logs", "--tail", "200"))["lines"])
+    assert "listening on tasks_claimable again" in log
+    assert answer_of(tasks_cli(lab, "service", "stop"))["stopped"] is True
+
+
+@needs_store
+def test_a_turn_starts_with_the_projects_env_files_over_the_daemons_environment(lab):
+    """A supervisor starts the daemon with next to nothing in its environment.
+    Each turn still gets the project's .env and .env.local over it, .env.local
+    winning over .env and both over the process, parsed as every capability
+    parses them - the environment an automations job starts with."""
+    project = lab["project"]
+    record = lab["tmp"] / "engine.jsonl"
+    (project / ".env").write_text(
+        f"TASKS_TEST_PASSWORD={lab['env']['TASKS_TEST_PASSWORD']}\n"
+        f"FAKE_ENGINE_TASKS={lab['env']['FAKE_ENGINE_TASKS']}\n"
+        "TURN_PROBE_OVER_PROCESS=dotenv\n"
+        "TURN_PROBE_LAYERED=dotenv\n"
+        "TURN_PROBE_DOTENV=dotenv\n")
+    (project / ".env.local").write_text(
+        "# a comment, and a blank line, are not variables\n\n"
+        f"export FAKE_ENGINE_RECORD='{record}'\n"
+        "TURN_PROBE_LAYERED=local\n"
+        'export TURN_PROBE_QUOTED="a quoted value"\n')
+    assert answer_of(tasks_cli(lab, "service", "init"))["written"]
+    write_settings(project, "version = 1\npoll_seconds = 3600\nshutdown_grace_seconds = 5\n")
+    minimal = {key: lab["env"][key] for key in (
+        "PATH", "HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "UV_CACHE_DIR",
+        "CAPABILITIES_HOME", "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_MANAGER_BIN",
+        "TMPDIR") if key in lab["env"]}
+    minimal.update({"TURN_PROBE_OVER_PROCESS": "process", "TURN_PROBE_PROCESS": "process"})
+    log = (lab["tmp"] / "supervised.log").open("w")
+    daemon = subprocess.Popen([str(_cli.CLI_PATH), "service", "run"], cwd=project, env=minimal,
+                              stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+    try:
+        poll_for(lambda: answer_of(tasks_cli(lab, "service", "status"))["running"], 60)
+        answer_of(tasks_cli(lab, "add", "--type", "alpha", "--title", "probe", "--key",
+                            "t-env", "--status", "todo"))
+        poll_for(lambda: answer_of(tasks_cli(lab, "show", "t-env"))["task"]["status"]
+                 == "complete", 60)
+    finally:
+        tasks_cli(lab, "service", "stop", "--timeout", "30", "--force")
+        daemon.wait(timeout=60)
+        log.close()
+    [turn] = [json.loads(line) for line in record.read_text().splitlines()]
+    env = turn["env"]
+    assert env["TURN_PROBE_PROCESS"] == "process"
+    assert env["TURN_PROBE_OVER_PROCESS"] == "dotenv"
+    assert env["TURN_PROBE_DOTENV"] == "dotenv"
+    assert env["TURN_PROBE_LAYERED"] == "local"
+    assert env["TURN_PROBE_QUOTED"] == "a quoted value"
+    assert "TASKS_EXECUTION" in env
+    # What the files hold is handed to the turn, never written to the log.
+    said = "\n".join(answer_of(tasks_cli(lab, "service", "logs", "--tail", "500"))["lines"])
+    said += (lab["tmp"] / "supervised.log").read_text()
+    assert "a quoted value" not in said
+    if lab["env"]["TASKS_TEST_PASSWORD"]:
+        assert lab["env"]["TASKS_TEST_PASSWORD"] not in said

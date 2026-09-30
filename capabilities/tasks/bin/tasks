@@ -253,7 +253,9 @@ SERVICE
                                   from the shipped template
   tasks service doctor            settings, workers, store and notification, and
                                   whether a running daemon holds the declaration
-                                  on disk; exit 6 when anything is wrong
+                                  on disk; exit 6 when anything is wrong, exit 5
+                                  when the store is unreachable and no daemon
+                                  runs; with one running that is a warning
   tasks service run               the daemon in the foreground, for a supervisor
   tasks service start             the daemon detached, logging to its state
   tasks service reload [--timeout 30]
@@ -270,7 +272,9 @@ SERVICE
   off, is not. Whenever a lane has room and the store holds a task it would
   take, the daemon starts `tasks run <worker> --apply` as a child process: the
   same claim, frame, profile, turn and settlement as that command run by hand,
-  with its lease. The daemon decides nothing about a task.
+  with its lease. The daemon decides nothing about a task. A turn starts with
+  the daemon's environment and the project's .env and .env.local over it,
+  .env.local winning, as they were when the daemon started.
 
   It wakes when the store notifies that a task of this project became
   claimable - inserted in todo, moved to todo, or its pickup changed while in
@@ -282,6 +286,13 @@ SERVICE
   lease and an ended wait are put back by a claim and nothing else, so on the
   poll, with nothing else to start, a daemon that sees one due starts a turn
   whose claim puts it back.
+
+  The daemon outlives the store being away. Its running turns are left to
+  finish, and it asks for the notification again after 1s, then at a doubling
+  interval of at most 30s, until the store answers; it then listens again and
+  asks the store for work at once. `service doctor` reports the store being
+  away as a warning while the daemon runs, so a supervisor probing it does not
+  restart the daemon and end its turns for an outage.
 
   The settings are capabilities/tasks/service/config.toml:
 
@@ -318,7 +329,8 @@ SERVICE
   never touched by a reload, and each turn reads its worker file and profile
   afresh anyway. What a reload cannot change needs `stop` and `start`: the
   connection and the store and schema it reaches, the project the daemon
-  stands in, its state directory, and the executable itself.
+  stands in, its state directory, the environment its turns start with, and
+  the executable itself.
 
   `service stop` stops the daemon claiming and gives running turns
   `shutdown_grace_seconds`; what is still running then is ended, its process
@@ -3972,7 +3984,10 @@ def _secret_key(entry: dict | None) -> str:
     return (entry or {}).get("secret_env") or DEFAULT_SECRET_ENV
 
 
-def _connect(entry: dict | None):
+def _connect(entry: dict | None, *, raising: bool = False):
+    """A connection to the store, or exit 5 saying why there is none. A caller
+    that outlives an unreachable store passes `raising` and is handed the same
+    refusal as a Refusal instead."""
     try:
         import psycopg
         from psycopg.rows import dict_row
@@ -3987,8 +4002,11 @@ def _connect(entry: dict | None):
             password=password, sslmode=_conf(entry, "db_sslmode", "prefer"),
             connect_timeout=10, row_factory=dict_row)
     except Exception as exc:
-        _die(5, "unreachable", f"cannot reach the store: {exc}",
-             f"`{NAME} connections` shows where every value resolves")
+        refusal = Refusal(5, "unreachable", f"cannot reach the store: {exc}",
+                          f"`{NAME} connections` shows where every value resolves")
+        if raising:
+            raise refusal from exc
+        _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
 
 
 SCHEMA = "tasks"          # replaced per run from the selected connection
@@ -7048,14 +7066,27 @@ class _ServiceHost:
         self.state_dir = _service_state_dir()
         self.project = _writing_project()
         self.schema = SCHEMA
+        # What every turn starts from, read once when the daemon starts: this
+        # process's environment with the project's .env and .env.local over it,
+        # .env.local winning - the environment an automations job is started
+        # with, so a turn loses nothing by the service starting it instead.
+        self.environment = {**os.environ,
+                            **{key: str(value) for key, value in _project_env().items()}}
 
     def load(self) -> dict:
         return _service_declaration()
 
     def listen(self):
-        conn = _connect(self.entry)
-        conn.autocommit = True
-        conn.execute(f"listen {CLAIMABLE_CHANNEL}")
+        """A connection listening on the channel. The daemon keeps asking while
+        the store is away, so a store it cannot reach is raised to it rather
+        than written to the log on every attempt."""
+        conn = _connect(self.entry, raising=True)
+        try:
+            conn.autocommit = True
+            conn.execute(f"listen {CLAIMABLE_CHANNEL}")
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def notification_installed(self) -> bool:
@@ -7083,7 +7114,7 @@ class _ServiceHost:
     def turn_env(self) -> dict:
         # A raise this process was started under is not the turn's: the turn's
         # own claim opens the raise that bounds it.
-        env = dict(os.environ)
+        env = dict(self.environment)
         env.pop("TASKS_EXECUTION", None)
         env.pop(_RECEIPT_ENV, None)
         env.pop(_EXCLUDE_ENV, None)
@@ -7183,20 +7214,35 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     conn_id, entry = _service_connection(wanted)
     answer["connection"] = conn_id
     answer["schema"] = SCHEMA
-    with _connect(entry) as conn, conn.cursor() as cur:
-        tables = _tables_present(cur, SCHEMA)
-        missing = [t for t in _TABLES if t not in tables]
-        silent = _notify_behind(cur, SCHEMA, tables)
-    if missing:
-        problems.append(f"schema {SCHEMA} is missing {', '.join(missing)}; "
-                        f"`{NAME} migrate --apply` creates them")
-    answer["notification"] = {"channel": CLAIMABLE_CHANNEL,
-                              "installed": not missing and not silent}
-    if silent:
-        answer["warning"] = (f"the store has no claimable notification ({silent[0]}), so "
-                             "the service wakes by its poll alone; "
-                             f"`{NAME} migrate --apply` adds it")
     status = _service_status(module)
+    try:
+        with _connect(entry, raising=True) as conn, conn.cursor() as cur:
+            tables = _tables_present(cur, SCHEMA)
+            missing = [t for t in _TABLES if t not in tables]
+            silent = _notify_behind(cur, SCHEMA, tables)
+    except Refusal as unreachable:
+        # A running daemon outlives the store being away and picks up where it
+        # was when the store answers again, so for it this is a warning. With
+        # no daemon, nothing here can be told apart from a store that is wrong.
+        if not status["running"]:
+            _die(unreachable.exit_code, unreachable.code, unreachable.message,
+                 unreachable.hint)
+        answer["store"] = {"reachable": False, "error": unreachable.message}
+        answer["notification"] = {"channel": CLAIMABLE_CHANNEL, "installed": None}
+        answer["warning"] = ("the store is unreachable, so its schema and notification "
+                             "are not checked; the running daemon keeps its turns and "
+                             "waits for the store, listening again as soon as it answers")
+    else:
+        answer["store"] = {"reachable": True}
+        if missing:
+            problems.append(f"schema {SCHEMA} is missing {', '.join(missing)}; "
+                            f"`{NAME} migrate --apply` creates them")
+        answer["notification"] = {"channel": CLAIMABLE_CHANNEL,
+                                  "installed": not missing and not silent}
+        if silent:
+            answer["warning"] = (f"the store has no claimable notification ({silent[0]}), "
+                                 "so the service wakes by its poll alone; "
+                                 f"`{NAME} migrate --apply` adds it")
     answer["service"] = status
     if status["running"]:
         loaded = module.read_fingerprint(_service_state_dir())
