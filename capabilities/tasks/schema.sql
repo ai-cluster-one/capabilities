@@ -151,6 +151,29 @@ $$ language plpgsql;
 create trigger tasks_touch_updated_at before update on tasks.tasks
     for each row execute function tasks.touch_updated_at();
 
+-- Tell whoever listens that a task became claimable: inserted in todo, moved to
+-- todo, or given a different pickup while in todo. One channel serves the whole
+-- database, so the payload names the schema and the project and a listener acts
+-- only on its own. Notifications are delivered when the writing transaction
+-- commits, so a listener never hears of a task it cannot yet see. Replaced on
+-- every apply, like the trigger above, so a store that predates it gains it.
+create or replace function tasks.notify_claimable() returns trigger as $$
+begin
+    if new.status = 'todo' and (tg_op = 'INSERT'
+            or old.status is distinct from new.status
+            or old.pickup_at is distinct from new.pickup_at) then
+        perform pg_notify('tasks_claimable', json_build_object(
+            'schema', tg_table_schema, 'project', new.project_id,
+            'task', new.id, 'pickup_at', new.pickup_at)::text);
+    end if;
+    return null;
+end;
+$$ language plpgsql;
+
+drop trigger if exists tasks_notify_claimable on tasks.tasks;
+create trigger tasks_notify_claimable after insert or update on tasks.tasks
+    for each row execute function tasks.notify_claimable();
+
 create table if not exists tasks.task_executions (
   id           uuid primary key default gen_random_uuid(),
   task_id      uuid        not null references tasks.tasks (id) on delete cascade,

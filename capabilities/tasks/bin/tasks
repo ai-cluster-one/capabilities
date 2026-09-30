@@ -243,9 +243,96 @@ WORKERS
   `doctor` and `run`: that file is no longer read, and its workers belong in
   `workers/`.
 
-  A worker's cadence is not declared here. Something outside runs `tasks run
+  A worker's cadence is not declared in its file. The service below runs it
+  whenever the store holds work it takes; anything else may run `tasks run
   <worker> --apply` on whatever schedule it keeps, and a worker nothing runs
   never runs.
+
+SERVICE
+  tasks service init [--force]    write capabilities/tasks/service/config.toml
+                                  from the shipped template
+  tasks service doctor            settings, workers, store and notification, and
+                                  whether a running daemon holds the declaration
+                                  on disk; exit 6 when anything is wrong
+  tasks service run               the daemon in the foreground, for a supervisor
+  tasks service start             the daemon detached, logging to its state
+  tasks service reload [--timeout 30]
+                                  hand the running daemon the declaration on disk
+  tasks service stop [--timeout S] [--force]
+                                  stop claiming, let running turns finish within
+                                  the grace period, end the rest
+  tasks service status            the lanes, the running turns and the next wake
+  tasks service logs [--tail 100] the end of the service log
+
+  One daemon per project runs the conveyor on its own. Every enabled worker that
+  takes something - a `takes` list, or the shipped `default` taking every type
+  nobody names - is a lane; a worker that only runs on request, or is switched
+  off, is not. Whenever a lane has room and the store holds a task it would
+  take, the daemon starts `tasks run <worker> --apply` as a child process: the
+  same claim, frame, profile, turn and settlement as that command run by hand,
+  with its lease. The daemon decides nothing about a task.
+
+  It wakes when the store notifies that a task of this project became
+  claimable - inserted in todo, moved to todo, or its pickup changed while in
+  todo - at every poll, at the earliest pickup or lease still ahead, and when
+  one of its turns claims or ends. The notification is a trigger `tasks
+  migrate --apply` adds; one channel serves the whole database, and its payload
+  names the schema and the project, so a daemon acts only on its own. A store
+  without it leaves the daemon the poll, and `service doctor` says so. A lapsed
+  lease and an ended wait are put back by a claim and nothing else, so on the
+  poll, with nothing else to start, a daemon that sees one due starts a turn
+  whose claim puts it back.
+
+  The settings are capabilities/tasks/service/config.toml:
+
+    version = 1
+    poll_seconds = 60             # the fallback wake, and when a lapsed lease
+                                  # or an ended wait is noticed
+    max_parallel = 2              # turns running at once across every lane
+    shutdown_grace_seconds = 60   # how long a stop waits for running turns
+    retry_delay_seconds = 60      # how long after a turn on a task ends before
+                                  # the service starts another on it
+
+    [lanes.implementation]        # one table per worker, by its name
+    max_parallel = 1              # turns of this worker at once; default 1
+
+  Any other key is refused, and so is a lane naming no worker declared here. A
+  worker file this capability cannot read refuses the whole declaration, as
+  `doctor` does. A lane whose turn takes nothing, or fails before claiming,
+  waits for the next poll rather than being asked again at once.
+
+  The service never starts a turn on a task it ran one on within the last
+  `retry_delay_seconds`, nor on a task one of its turns still holds: its turns
+  are told to claim other tasks, and a notification for such a task is deferred
+  to the moment the delay is over rather than dropped. A turn that fails and
+  puts its task straight back is therefore retried at that pace and no faster,
+  whatever the failure. This is the service's own rule: `tasks run` by hand
+  selects as it always has.
+
+  The daemon publishes a fingerprint of what it loaded - the settings, every
+  worker file and every profile a worker names - beside its pid, and `service
+  doctor` fails while that differs from the files on disk. `service reload`
+  validates the files first and refuses what does not load, then signals the
+  daemon alone and waits until it publishes the new fingerprint; a daemon that
+  rejects them keeps what it had and says why in its log. Running turns are
+  never touched by a reload, and each turn reads its worker file and profile
+  afresh anyway. What a reload cannot change needs `stop` and `start`: the
+  connection and the store and schema it reaches, the project the daemon
+  stands in, its state directory, and the executable itself.
+
+  `service stop` stops the daemon claiming and gives running turns
+  `shutdown_grace_seconds`; what is still running then is ended, its process
+  tree with it, and the raise it held is settled the way a lapsed lease is:
+  closed as abandoned, the task back in todo. `--force` ends the daemon and
+  its turns at once and leaves their raises to lapse.
+
+  `init`, `start` and `run` need tasks enabled for this project itself;
+  enabled globally is not asking for a daemon here. `start` and `run` need a
+  connection that allows writes. The pid, the fingerprint, the published
+  status and the log live in the project's capability state,
+  `$XDG_STATE_HOME/capabilities/projects/<project-slug>/tasks/`, and `tasks
+  inventory` reports from them whether a daemon runs, its lanes and how many
+  turns it is running.
 
 ARGUMENTS
   A lone `--` ends the flags: everything after it is positional text as written,
@@ -590,9 +677,42 @@ WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
                "release", "run", "migrate"}
 WRITE_DEFAULT = False
 DOCS_BASE = ""
-STATE = False
-INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
+STATE = True        # the service's pid, fingerprint, status and log, per project
+INVENTORY = {"network": "none"}   # the service's state on this machine; the queue is the store's
 POST_INSTALL: list[dict] = []
+SERVICE = {
+    "name": "conveyor",
+    "summary": ("Project-local daemon that runs one turn of the conveyor for each "
+                "worker lane with work, woken by the store."),
+    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
+    "config": "capabilities/tasks/service/config.toml",
+    "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/tasks",
+    "deploy": {
+        "schema": "capabilities.service.deploy.v1",
+        # A turn spends money and acts on the project, so a runtime runs this
+        # service only where it names it; being enabled in the project is not
+        # asking for a daemon.
+        "default_policy": "disabled",
+        "command": ["tasks", "service", "run"],
+        "environment": {
+            "required": [],
+            "optional": [{"key": "TASKS_DB_PASSWORD"}],
+        },
+        "mounts": [
+            # The project state root automations keeps its state under too. One
+            # directory is one volume: a second name for it would mount two
+            # volumes at one path in a container that runs both services.
+            {"name": "automations_state", "kind": "state",
+             "target": "{agent_home}/.local/state/capabilities/projects"},
+            {"name": "claude_state", "kind": "shared",
+             "target": "{agent_home}/.claude"},
+            {"name": "codex_state", "kind": "shared",
+             "target": "{agent_home}/.codex"},
+        ],
+        "restart": "unless-stopped",
+        "doctor": ["tasks", "service", "doctor"],
+    },
+}
 
 STATUSES = ("draft", "todo", "in_progress", "waiting", "complete", "closed")
 
@@ -5233,6 +5353,15 @@ def _not_types(where: str, params: list, types) -> tuple[str, list]:
     return f"{where}{joiner}not (type = any(%s))", [*params, list(types)]
 
 
+def _not_ids(where: str, params: list, ids) -> tuple[str, list]:
+    """Narrow a selection to tasks other than these: what the service passes for
+    the tasks it ran a turn on too recently to run again."""
+    if not ids:
+        return where, params
+    joiner = " and " if where else " where "
+    return f"{where}{joiner}not (id::text = any(%s))", [*params, list(ids)]
+
+
 def _type_refusal(task: dict, opts: dict) -> str | None:
     """Why the worker named in these options does not take this task's type, or
     None when it does. A task named with --key reaches past the order a worker
@@ -5265,6 +5394,7 @@ def _claim(entry, opts: dict) -> dict:
                                if k in ("type", "assignee", "tag")},
                             "project": project}, _zone(entry))
     where, params = _not_types(where, params, opts.get("not_types"))
+    where, params = _not_ids(where, params, opts.get("not_ids"))
     joiner = " and " if where else " where "
     with _connect(entry) as conn, conn.cursor() as cur:
         swept = _sweep_leases(cur, project)
@@ -6153,7 +6283,7 @@ def _key_types(worker: dict) -> dict:
     return {"accept_types": list(worker["types"]) + list(worker["on_request"])}
 
 
-def _take(entry, worker: dict, key: str | None) -> dict:
+def _take(entry, worker: dict, key: str | None, exclude: tuple = ()) -> dict:
     """Take the next task this worker matches, or exactly the one named.
 
     One claim per type, in the order `takes` lists them, stopping at the first
@@ -6165,6 +6295,8 @@ def _take(entry, worker: dict, key: str | None) -> dict:
     base = {"lease": str(worker["limits"]["lease_seconds"]),
             "worker": worker["name"], "handler": worker["handler"]}
     base.update(_selector_filters(worker))
+    if exclude:
+        base["not_ids"] = list(exclude)
     if key:
         return _claim(entry, {**base, "key": key, **_key_types(worker)})
     if worker["catch_all"]:
@@ -6182,7 +6314,7 @@ def _take(entry, worker: dict, key: str | None) -> dict:
     return answer
 
 
-def _would_take(entry, worker: dict, key: str | None) -> dict:
+def _would_take(entry, worker: dict, key: str | None, exclude: tuple = ()) -> dict:
     """The task a claim would take, asked in the order the claim asks in, and
     writing nothing: no sweep, no raise, no status move.
 
@@ -6210,6 +6342,7 @@ def _would_take(entry, worker: dict, key: str | None) -> dict:
                                         **{k: v for k, v in ask.items() if k == "type"},
                                         "project": project}, tz)
                 where, params = _not_types(where, params, ask.get("not_types"))
+                where, params = _not_ids(where, params, exclude)
                 joiner = " and " if where else " where "
                 cur.execute(f"""select * from {SCHEMA}.tasks{where}{joiner}
                                   status = 'todo'
@@ -6415,6 +6548,13 @@ def cmd_run(entry, args: list[str]) -> None:
     second claim on a row that already has one. A turn that dies renews nothing,
     so the lease lapses and the next claim sweeps it: there is no window here to
     invent and no stranded run to detect."""
+    # Where the service that started this turn wants to hear what it took. Read
+    # once and removed, so it reaches this process and not the turn it starts.
+    receipt = os.environ.pop(_RECEIPT_ENV, None)
+    # And the tasks it ran a turn on too recently to run again. Set only by the
+    # service, so a run by hand selects exactly as it always has.
+    exclude = tuple(one for one in os.environ.pop(_EXCLUDE_ENV, "").split(",") if one)
+    narrowed = (exclude,) if exclude else ()
     opts = _flags(args, ("key",), bools=("apply",), takes=1)
     if not opts["_loose"]:
         _die(6, "input", "run needs a worker",
@@ -6423,10 +6563,10 @@ def cmd_run(entry, args: list[str]) -> None:
     if not opts.get("apply"):
         # Nothing is claimed without --apply, so this says which task a claim
         # would find rather than pretending to have taken it.
-        _emit(_would_take(entry, worker, opts.get("key")))
+        _emit(_would_take(entry, worker, opts.get("key"), *narrowed))
         return
 
-    held = _take(entry, worker, opts.get("key"))
+    held = _take(entry, worker, opts.get("key"), *narrowed)
     report = {"worker": worker["name"], "claimed": None,
               "swept": held.get("swept") or [], "applied": True}
     if held.get("claimed") is None:
@@ -6438,6 +6578,9 @@ def cmd_run(entry, args: list[str]) -> None:
     execution = str(held["execution"]["id"])
     attempt = held["attempt"]
     report.update(claimed=_address(task), attempt=attempt, execution=execution)
+    if receipt:
+        _write_receipt(receipt, {"task": _address(task), "task_id": tid,
+                                 "execution": execution, "attempt": attempt})
 
     # A worker naming a routine or a profile that is not there has nothing whole
     # to give a turn. The task goes back to a person saying what is missing, and
@@ -6563,6 +6706,708 @@ def cmd_history(entry, args: list[str]) -> None:
         # A store not yet migrated keeps no origin; the answer's shape is the same.
         row.setdefault("origin_project", None)
     _emit({"task": tid, "changes": rows})
+
+
+# --- The service -------------------------------------------------------------
+
+# One daemon per project runs the conveyor on its own: every enabled worker that
+# takes something is a lane, and whenever a lane has room and the store holds
+# work it would take, the daemon starts `tasks run <worker> --apply` as a child.
+# The loop and the processes are in service/daemon.py; what the project declares
+# and what the store holds is answered here, by the same code every other verb
+# uses, so a turn the service starts is the turn a person starts.
+
+_SERVICE_VERBS = ("init", "doctor", "run", "start", "reload", "stop", "status", "logs")
+
+# What the settings file may say, and what it leaves to this capability. Any
+# other key is refused: a key nothing reads is a declaration doing nothing.
+_SERVICE_DEFAULTS = {"poll_seconds": 60, "max_parallel": 2, "shutdown_grace_seconds": 60,
+                     "retry_delay_seconds": 60}
+_SERVICE_MINIMUMS = {"poll_seconds": 1, "max_parallel": 1, "shutdown_grace_seconds": 0,
+                     "retry_delay_seconds": 1}
+_SERVICE_KEYS = ("version", *_SERVICE_DEFAULTS, "lanes")
+_LANE_DEFAULTS = {"max_parallel": 1}
+
+# The store notifies this channel when a task becomes claimable. It is one
+# channel for the whole database, so the payload says which schema and which
+# project the task belongs to, and a daemon acts only on its own.
+CLAIMABLE_CHANNEL = "tasks_claimable"
+_NOTIFY_TRIGGER = ("tasks", "tasks_notify_claimable")
+
+# Where `run` writes what it claimed, when the service that started it asks, and
+# the tasks the service tells it not to claim.
+_RECEIPT_ENV = "TASKS_TURN_RECEIPT"
+_EXCLUDE_ENV = "TASKS_TURN_EXCLUDE"
+
+
+def _write_receipt(path: str, claim: dict) -> None:
+    """Tell the service which task this turn holds, as soon as it holds one.
+
+    A service that has to end a turn settles the raise it held; it can name that
+    raise only if the turn said which one it was. A receipt that cannot be
+    written changes nothing about the turn."""
+    target = Path(path)
+    spare = target.with_name(f".{target.name}.{os.getpid()}")
+    try:
+        spare.write_text(json.dumps(claim, default=str) + "\n")
+        os.replace(spare, target)
+    except OSError:
+        pass
+
+
+def _service_settings_path() -> Path:
+    return _envelope_dir() / "service" / "config.toml"
+
+
+def _service_template() -> Path:
+    return _bundle_dir() / "service" / "templates" / "config.toml"
+
+
+def _service_state_dir() -> Path:
+    """The capability state root of this project: the project's slug, or a
+    digest of its path where it declares none, under the machine's state home."""
+    root = _project_here()
+    try:
+        identity = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
+    except (OSError, ValueError):
+        identity = {}
+    slug = identity.get("slug") if isinstance(identity, dict) else None
+    key = (slug.strip() if isinstance(slug, str) and slug.strip()
+           else "path-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16])
+    return _STATE_HOME / "capabilities" / "projects" / key / NAME
+
+
+def _service_module():
+    """The bundled daemon, loaded from beside this executable."""
+    import importlib.util
+
+    path = _bundle_dir() / "service" / "daemon.py"
+    if not path.is_file():
+        _die(3, "service_bundle_missing", f"the bundled service is missing at {path}",
+             "reinstall the capability from a bundled source")
+    spec = importlib.util.spec_from_file_location("tasks_service_daemon", path)
+    module = importlib.util.module_from_spec(spec)
+    # Loading it writes nothing beside it: the bundle is an installed payload.
+    previous, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+def _inventory(network: bool) -> dict:
+    """The service's state, read from what it left on this machine: whether a
+    daemon runs for this project, its lanes and how many turns it is running.
+    The queue itself is the store's and is not counted here. Local, and nothing
+    is written."""
+    if _project_root() is None:
+        return {"service": {"state": "stopped", "detail": "not in a project"}}
+    module = _service_module()
+    state = _service_state_dir()
+    pid = module.read_pid(state)
+    if not module.pid_alive(pid):
+        initialized = _service_settings_path().is_file()
+        return {"service": {"state": "stopped",
+                            "detail": "no daemon runs for this project" + (
+                                "" if initialized else "; its settings are not initialized")}}
+    published = module.read_status(state) or {}
+    lanes = ", ".join(str(row.get("worker")) for row in published.get("lanes") or []
+                      if isinstance(row, dict))
+    return {"service": {"state": "running",
+                        "detail": f"pid {pid}, lanes {lanes or 'none'}, "
+                                  f"{len(published.get('turns') or [])} turn(s) running, "
+                                  f"woken by {published.get('wake_by') or 'the poll'}"}}
+
+
+def _read_service_settings(path: Path) -> dict:
+    """The settings file, whole and checked, or the refusal that says what is
+    wrong with it."""
+    import tomllib
+
+    def refuse(sentence: str) -> NoReturn:
+        raise Refusal(6, "service_invalid", f"{path}: {sentence}",
+                      f"`{NAME} help` states the settings; `{NAME} service init --force` "
+                      "writes the shipped template")
+
+    if not path.is_file():
+        raise Refusal(3, "service_not_initialized", f"no service settings at {path}",
+                      f"`{NAME} service init` writes them from the shipped template")
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        refuse(f"it could not be read: {exc}")
+    unknown = sorted(set(raw) - set(_SERVICE_KEYS))
+    if unknown:
+        refuse(f"it names {', '.join(map(repr, unknown))}, which nothing reads")
+    if isinstance(raw.get("version"), bool) or raw.get("version") != 1:
+        refuse("its `version` is 1")
+    settings: dict = {"version": 1}
+    for key, default in _SERVICE_DEFAULTS.items():
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < _SERVICE_MINIMUMS[key]:
+            refuse(f"its `{key}` is a whole number of at least {_SERVICE_MINIMUMS[key]}")
+        settings[key] = value
+    lanes = raw.get("lanes", {})
+    if not isinstance(lanes, dict):
+        refuse("its `lanes` is one table per worker, `[lanes.<worker>]`")
+    settings["lanes"] = {}
+    for name, lane in lanes.items():
+        if not isinstance(lane, dict):
+            refuse(f"its `lanes.{name}` is a table")
+        extra = sorted(set(lane) - set(_LANE_DEFAULTS))
+        if extra:
+            refuse(f"its `lanes.{name}` names {', '.join(map(repr, extra))}, which nothing reads")
+        value = lane.get("max_parallel", _LANE_DEFAULTS["max_parallel"])
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            refuse(f"its `lanes.{name}.max_parallel` is a whole number of at least 1")
+        settings["lanes"][name] = {"max_parallel": value}
+    return settings
+
+
+def _service_fingerprint() -> str:
+    """Which declaration the files hold right now: the settings file, every
+    worker file, and every profile a worker names, by path and content.
+
+    The daemon publishes this for what it loaded and every command that asks
+    whether it is current computes it again, the same way, from the disk. It
+    never refuses: a file that cannot be read is part of the answer."""
+    import yaml
+
+    def seen(path: Path) -> str:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return "absent"
+
+    settings = _service_settings_path()
+    retired = _envelope_dir() / "workers.toml"
+    parts: list = [["settings", str(settings), seen(settings)],
+                   ["retired", str(retired), seen(retired)]]
+    files = [_shipped_workers_dir() / f"{DEFAULT_WORKER}.md"]
+    if _workers_dir().is_dir():
+        files += sorted(_workers_dir().glob("*.md"))
+    profiles: set = set()
+    for path in files:
+        parts.append(["worker", str(path), seen(path)])
+        try:
+            head, _body = _split_front_matter(path.read_text())
+            named = (yaml.safe_load(head) or {}).get("profile")
+            if isinstance(named, str) and named.strip():
+                profiles.add(_expand(named.strip(), path.name))
+        except Exception:
+            continue
+    runner = _harness_runner()
+    for name in sorted(profiles):
+        try:
+            found = runner.find_profile_file(name, [_profiles_dir()])
+            parts.append(["profile", name, str(found.path),
+                           hashlib.sha256(found.text.encode()).hexdigest()])
+        except Exception:
+            parts.append(["profile", name, "absent"])
+    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()
+
+
+def _service_declaration() -> dict:
+    """What the service runs by: its settings, its lanes, the workers that are
+    not lanes and why, and the fingerprint of the files all of it was read from.
+
+    The fingerprint is taken before anything is read, so a file edited while
+    this runs leaves the published answer older than what was loaded, never
+    newer: a daemon can be told it is stale when it is current, and never the
+    reverse. A worker this capability cannot read refuses the whole declaration,
+    the way `doctor` refuses it. Raises Refusal."""
+    fingerprint = _service_fingerprint()
+    path = _service_settings_path()
+    settings = _read_service_settings(path)
+    retired = _retired_workers_file()
+    if retired:
+        raise Refusal(*_retired_refusal(retired))
+    declared = _declarations()
+    unknown = sorted(set(settings["lanes"]) - set(declared))
+    if unknown:
+        raise Refusal(6, "service_invalid",
+                      f"{path}: its lanes name {', '.join(map(repr, unknown))}, and no "
+                      "worker of that name is declared here",
+                      f"a lane is a worker in {_workers_dir()}; remove the table or add "
+                      "the worker")
+    lanes, idle, problems = [], [], []
+    for name, found in sorted(declared.items()):
+        worker, wrong = _read_worker(name, found)
+        if wrong:
+            problems += [f"{name}: {sentence}" for _code, _slug, sentence in wrong]
+            continue
+        if not worker["enabled"]:
+            idle.append({"worker": name, "why": "switched off by `enabled: false`"})
+            continue
+        if worker["catch_all"]:
+            taken, unknowable = _others_take(name, declared)
+            if unknowable:
+                problems.append(f"{name}: {_unknowable_refusal(name, unknowable)}")
+                continue
+            worker["not_types"] = sorted(taken)
+        elif not worker["types"]:
+            idle.append({"worker": name,
+                         "why": "it runs only on request, named with --key"})
+            continue
+        cap = settings["lanes"].get(name, _LANE_DEFAULTS)["max_parallel"]
+        lanes.append({"worker": name, "max_parallel": cap, "spec": worker})
+    if problems:
+        raise Refusal(6, "worker_invalid",
+                      f"{len(problems)} problem(s) among the workers in {_workers_dir()}: "
+                      + "; ".join(problems),
+                      f"`{NAME} doctor` reports every worker this project can run")
+    return {"settings": settings, "lanes": lanes, "idle": idle, "fingerprint": fingerprint}
+
+
+def _lane_rows(declaration: dict) -> list[dict]:
+    return [{"worker": lane["worker"], "max_parallel": lane["max_parallel"]}
+            for lane in declaration["lanes"]]
+
+
+def _notify_behind(cur, schema: str, tables: list[str]) -> list[str]:
+    """The claimable notification, as table.trigger, when the store lacks it."""
+    table, trigger = _NOTIFY_TRIGGER
+    if table not in tables:
+        return []
+    cur.execute("""select 1 from pg_trigger g
+                     join pg_class t on t.oid = g.tgrelid
+                     join pg_namespace n on n.oid = t.relnamespace
+                    where n.nspname = %s and t.relname = %s and g.tgname = %s
+                      and not g.tgisinternal""", (schema, table, trigger))
+    return [] if cur.fetchone() else [f"{table}.{trigger}"]
+
+
+def _service_sweep_due(entry) -> bool:
+    """Whether a claim in this project would put something back: a raise whose
+    lease has passed, or a waiting task whose wait is over. Neither is announced
+    by a write, and only a claim acts on either, so the service starts one."""
+    project = _writing_project()
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select 1 from {SCHEMA}.task_executions e
+                          join {SCHEMA}.tasks t on t.id = e.task_id
+                         where t.project_id = %s and e.status = 'running'
+                           and e.lease_until is not null and e.lease_until < now()
+                         limit 1""", (project,))
+        if cur.fetchone():
+            return True
+        cur.execute(f"""select *, (pickup_at is not null and pickup_at <= now()) as due
+                          from {SCHEMA}.tasks
+                         where status = 'waiting' and project_id = %s""", (project,))
+        waiting = _rows(cur)
+        ended = _ended_among(cur, sorted({key for task in waiting
+                                          for key in _blocked_by(task)}), project)
+    return any(_wait_over(task, ended) for task in waiting)
+
+
+def _service_next_moment(entry) -> float | None:
+    """Seconds until the earliest moment work of this project falls due without
+    anybody writing: a pickup still ahead on a task in todo or waiting, or a
+    lease still running. None when there is none. The store's clock decides, as
+    it does for every pickup."""
+    project = _writing_project()
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select extract(epoch from (min(at) - now()))::float8 as seconds
+                          from (select pickup_at as at from {SCHEMA}.tasks
+                                 where project_id = %s and status in ('todo', 'waiting')
+                                   and pickup_at > now()
+                                union all
+                                select e.lease_until from {SCHEMA}.task_executions e
+                                  join {SCHEMA}.tasks t on t.id = e.task_id
+                                 where t.project_id = %s and e.status = 'running'
+                                   and e.lease_until > now()) as moments""",
+                    (project, project))
+        row = cur.fetchone()
+    return row["seconds"] if row and row["seconds"] is not None else None
+
+
+def _settle_cut_off(entry, execution: str) -> list[str]:
+    """Settle the raise of a turn the service ended the way a lapsed lease is
+    settled: its lease is made to have passed, and the sweep every claim runs
+    closes it as abandoned and puts its task back."""
+    project = _writing_project()
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""update {SCHEMA}.task_executions
+                           set lease_until = now() - interval '1 second',
+                               detail = coalesce(detail, 'cut off when the service stopped')
+                         where id::text = %s and status = 'running'""", (execution,))
+        swept = _sweep_leases(cur, project)
+        conn.commit()
+    return [str(row["id"]) for row in swept]
+
+
+class _ServiceHost:
+    """What the daemon asks of this project, answered by this executable."""
+
+    channel = CLAIMABLE_CHANNEL
+
+    def __init__(self, entry, connection: str | None):
+        self.entry = entry
+        self.connection = connection
+        self.root = _project_here()
+        self.state_dir = _service_state_dir()
+        self.project = _writing_project()
+        self.schema = SCHEMA
+
+    def load(self) -> dict:
+        return _service_declaration()
+
+    def listen(self):
+        conn = _connect(self.entry)
+        conn.autocommit = True
+        conn.execute(f"listen {CLAIMABLE_CHANNEL}")
+        return conn
+
+    def notification_installed(self) -> bool:
+        with _connect(self.entry) as conn, conn.cursor() as cur:
+            tables = _tables_present(cur, SCHEMA)
+            return "tasks" in tables and not _notify_behind(cur, SCHEMA, tables)
+
+    def lane_has_work(self, worker: dict, exclude: tuple = ()) -> bool:
+        return _would_take(self.entry, worker, None, exclude)["would_claim"] is not None
+
+    def sweep_due(self) -> bool:
+        return _service_sweep_due(self.entry)
+
+    def next_moment(self) -> float | None:
+        return _service_next_moment(self.entry)
+
+    def turn_command(self, worker: str) -> list[str]:
+        """Exactly `tasks run <worker> --apply`, by this executable under this
+        interpreter, on the connection the daemon was started with."""
+        argv = [sys.executable, str(Path(__file__).resolve())]
+        if self.connection:
+            argv += ["--connection", self.connection]
+        return argv + ["run", worker, "--apply"]
+
+    def turn_env(self) -> dict:
+        # A raise this process was started under is not the turn's: the turn's
+        # own claim opens the raise that bounds it.
+        env = dict(os.environ)
+        env.pop("TASKS_EXECUTION", None)
+        env.pop(_RECEIPT_ENV, None)
+        env.pop(_EXCLUDE_ENV, None)
+        return env
+
+    def settle_cut_off(self, execution: str) -> list[str]:
+        return _settle_cut_off(self.entry, execution)
+
+    def kill_tree(self, pids) -> set:
+        from callva.harness_runner.tree import kill_tree
+        return kill_tree(pids)
+
+
+def _service_connection(wanted: str | None) -> tuple[str, dict | None]:
+    """The connection the service works on, and the schema and project every
+    query it makes is bounded by, resolved the way `main` resolves them."""
+    reg, _f = _connections_registry()
+    conn_id, entry = _select_connection(reg, wanted)
+    globals()["SCHEMA"] = _schema(entry)
+    globals()["PROJECT_IDENTITY"] = _project_id_state()
+    globals()["PROJECT"] = _declared_project()
+    return conn_id, entry
+
+
+def _loaded_declaration(hint: str | None = None) -> dict:
+    try:
+        return _service_declaration()
+    except Refusal as refused:
+        _die(refused.exit_code, refused.code, refused.message, hint or refused.hint)
+
+
+def _service_status(module) -> dict:
+    """Whether the daemon runs, and what it published about itself: its lanes,
+    its running turns and when it wakes next. Without a daemon, the lanes the
+    files on disk declare."""
+    state = _service_state_dir()
+    pid = module.read_pid(state)
+    running = module.pid_alive(pid)
+    settings = _service_settings_path()
+    answer = {"running": running, "pid": pid if running else None,
+              "stale_pid": bool(pid and not running), "project": str(_project_here()),
+              "config": str(settings), "initialized": settings.is_file(),
+              "state_dir": str(state), "log_file": str(state / module.LOG_FILE)}
+    published = module.read_status(state) if running else None
+    if published:
+        for key in ("started_at", "wake_by", "notification", "poll_seconds",
+                    "max_parallel", "shutdown_grace_seconds", "retry_delay_seconds",
+                    "lanes", "idle", "turns", "deferred", "next_wake", "last_wake",
+                    "reload_error", "stopping"):
+            answer[key] = published.get(key)
+        answer["current"] = module.read_fingerprint(state) == _service_fingerprint()
+        return answer
+    try:
+        declaration = _service_declaration()
+    except Refusal as refused:
+        answer["declaration_error"] = refused.message
+        return answer
+    answer["lanes"] = [{**row, "running": 0} for row in _lane_rows(declaration)]
+    answer["idle"] = declaration["idle"]
+    return answer
+
+
+def cmd_service_init(args: list[str]) -> None:
+    opts = _flags(args, (), bools=("force",))
+    template = _service_template()
+    if not template.is_file():
+        _die(3, "service_bundle_missing", f"the shipped settings template is missing at {template}",
+             "reinstall the capability from a bundled source")
+    target = _service_settings_path()
+    written, skipped = [], []
+    if target.exists() and not opts.get("force"):
+        skipped.append(str(target))
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(template.read_text())
+        written.append(str(target))
+    _emit({"initialized": NAME, "project": str(_project_here()), "config": str(target),
+           "written": written, "skipped": skipped,
+           "next": ["add a [lanes.<worker>] table for a worker whose cap is not 1",
+                    f"`{NAME} service doctor`",
+                    f"`{NAME} service start`, or `{NAME} service run` under a supervisor"]})
+
+
+def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
+    _flags(args, ())
+    module = _service_module()
+    problems: list[str] = []
+    answer: dict = {"ok": True, "project": str(_project_here()),
+                    "config": str(_service_settings_path())}
+    try:
+        declaration = _service_declaration()
+        answer["settings"] = {k: v for k, v in declaration["settings"].items() if k != "lanes"}
+        answer["lanes"] = _lane_rows(declaration)
+        answer["idle"] = declaration["idle"]
+    except Refusal as refused:
+        problems.append(refused.message)
+    conn_id, entry = _service_connection(wanted)
+    answer["connection"] = conn_id
+    answer["schema"] = SCHEMA
+    with _connect(entry) as conn, conn.cursor() as cur:
+        tables = _tables_present(cur, SCHEMA)
+        missing = [t for t in _TABLES if t not in tables]
+        silent = _notify_behind(cur, SCHEMA, tables)
+    if missing:
+        problems.append(f"schema {SCHEMA} is missing {', '.join(missing)}; "
+                        f"`{NAME} migrate --apply` creates them")
+    answer["notification"] = {"channel": CLAIMABLE_CHANNEL,
+                              "installed": not missing and not silent}
+    if silent:
+        answer["warning"] = (f"the store has no claimable notification ({silent[0]}), so "
+                             "the service wakes by its poll alone; "
+                             f"`{NAME} migrate --apply` adds it")
+    status = _service_status(module)
+    answer["service"] = status
+    if status["running"]:
+        loaded = module.read_fingerprint(_service_state_dir())
+        current = _service_fingerprint()
+        if loaded != current:
+            answer["declaration_stale"] = {"loaded": loaded, "current": current}
+            problems.append("the running daemon loaded a declaration that has changed "
+                            "since: settings, a worker file or a profile it names; "
+                            f"`{NAME} service reload` hands it the one on disk")
+    answer["ok"] = not problems
+    if problems:
+        answer["problems"] = problems
+    _emit(answer)
+    if problems:
+        sys.exit(6)
+
+
+def cmd_service_run(wanted: str | None, args: list[str]) -> None:
+    """The daemon, in the foreground: what a supervisor runs, and what `start`
+    runs detached."""
+    _flags(args, ())
+    module = _service_module()
+    declaration = _loaded_declaration()
+    conn_id, entry = _service_connection(wanted)
+    _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
+    daemon = module.Daemon(_ServiceHost(entry, wanted), declaration)
+    try:
+        daemon.run()
+    except RuntimeError as exc:
+        _die(5, "service_running", str(exc),
+             f"`{NAME} service status` names the daemon that holds it")
+
+
+def cmd_service_start(wanted: str | None, args: list[str]) -> None:
+    import subprocess
+    import time as _time
+
+    _flags(args, ())
+    module = _service_module()
+    _loaded_declaration()
+    conn_id, entry = _service_connection(wanted)
+    _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
+    state = _service_state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    status = _service_status(module)
+    if status["running"]:
+        status["already_running"] = True
+        _emit(status)
+        return
+    log_path = state / module.LOG_FILE
+    argv = [sys.executable, str(Path(__file__).resolve())]
+    if wanted:
+        argv += ["--connection", wanted]
+    with log_path.open("a", encoding="utf-8") as log:
+        process = subprocess.Popen(argv + ["service", "run"], cwd=str(_project_here()),
+                                   env=dict(os.environ), stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=log, start_new_session=True)
+    deadline = _time.monotonic() + 30
+    while True:
+        if process.poll() is not None:
+            tail = log_path.read_text(errors="replace").splitlines()[-8:]
+            _die(5, "service_start_failed", f"the daemon exited with {process.returncode}",
+                 "\n".join(tail))
+        if module.read_pid(state) == process.pid and module.read_status(state):
+            break
+        if _time.monotonic() > deadline:
+            _die(5, "service_start_failed", "the daemon did not report itself running "
+                 "within 30s", f"`{NAME} service logs`")
+        _time.sleep(0.1)
+    answer = _service_status(module)
+    answer["started"] = True
+    _emit(answer)
+
+
+def _seconds(value, flag: str) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        _die(6, "input", f"--{flag} is a number of seconds")
+    if seconds <= 0:
+        _die(6, "input", f"--{flag} is a number of seconds above zero")
+    return seconds
+
+
+def cmd_service_reload(args: list[str]) -> None:
+    """Hand the running daemon the declaration on disk, and wait until it says
+    it holds it."""
+    import signal
+    import time as _time
+
+    opts = _flags(args, ("timeout",))
+    timeout = _seconds(opts.get("timeout") or 30, "timeout")
+    module = _service_module()
+    state = _service_state_dir()
+    pid = module.read_pid(state)
+    if not module.pid_alive(pid):
+        _die(5, "service_not_running", "no tasks daemon is running for this project",
+             f"`{NAME} service start` starts one")
+    declaration = _loaded_declaration(
+        "the daemon keeps the declaration it has; repair the file and reload again")
+    target = declaration["fingerprint"]
+    answer = {"running": True, "pid": pid, "fingerprint": target,
+              "lanes": _lane_rows(declaration)}
+    if module.read_fingerprint(state) == target:
+        _emit({"reloaded": False, **answer,
+               "reason": "the daemon already runs this declaration"})
+        return
+    try:
+        # The daemon alone, never its process group: the turns it runs are
+        # exactly what a reload leaves where it is.
+        os.kill(pid, signal.SIGHUP)
+    except ProcessLookupError:
+        _die(5, "service_not_running", "the daemon exited before the reload")
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if not module.pid_alive(pid):
+            _die(5, "service_reload_failed", "the daemon exited during the reload",
+                 f"`{NAME} service logs`")
+        if module.read_fingerprint(state) == target:
+            _emit({"reloaded": True, **answer})
+            return
+        _time.sleep(0.1)
+    _die(5, "service_reload_failed",
+         f"the daemon did not publish the new declaration within {timeout:g}s",
+         f"it may have rejected it; `{NAME} service logs` says why")
+
+
+def cmd_service_stop(args: list[str]) -> None:
+    """Ask the daemon to stop and wait for it. It stops claiming, gives running
+    turns its grace period, then ends them and settles what they held."""
+    import contextlib
+    import signal
+    import time as _time
+
+    opts = _flags(args, ("timeout",), bools=("force",))
+    module = _service_module()
+    state = _service_state_dir()
+    pid = module.read_pid(state)
+    if not module.pid_alive(pid):
+        (state / module.PID_FILE).unlink(missing_ok=True)
+        _emit({"stopped": False, "running": False, "pid": None})
+        return
+    published = module.read_status(state) or {}
+    grace = published.get("shutdown_grace_seconds")
+    if not isinstance(grace, int):
+        grace = _SERVICE_DEFAULTS["shutdown_grace_seconds"]
+    timeout = (_seconds(opts["timeout"], "timeout") if opts.get("timeout")
+               else float(grace + 30))
+    started = _time.monotonic()
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    while _time.monotonic() - started < timeout:
+        if not module.pid_alive(pid):
+            _emit({"stopped": True, "running": False, "pid": pid,
+                   "waited_seconds": round(_time.monotonic() - started, 1)})
+            return
+        _time.sleep(0.1)
+    if not opts.get("force"):
+        _die(5, "service_stop_timeout", f"the daemon did not stop within {timeout:g}s",
+             "its turns may still be finishing; `--force` ends the daemon and its "
+             "turns now, and what they held is freed when their leases lapse")
+    turns = [row.get("pid") for row in published.get("turns") or []
+             if isinstance(row, dict) and isinstance(row.get("pid"), int)]
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    if turns:
+        from callva.harness_runner.tree import kill_tree
+        kill_tree(turns)
+    for name in (module.PID_FILE, module.FINGERPRINT_FILE, module.STATUS_FILE):
+        (state / name).unlink(missing_ok=True)
+    _emit({"stopped": True, "killed": True, "running": False, "pid": pid,
+           "turns_killed": turns})
+
+
+def cmd_service_logs(args: list[str]) -> None:
+    opts = _flags(args, ("tail",))
+    try:
+        tail = int(opts.get("tail") or 100)
+    except ValueError:
+        _die(6, "input", "--tail is a whole number of lines")
+    module = _service_module()
+    path = _service_state_dir() / module.LOG_FILE
+    if not path.is_file():
+        _die(3, "logs_not_found", f"the service log does not exist yet: {path}",
+             f"`{NAME} service start` writes it")
+    lines = path.read_text(errors="replace").splitlines()
+    _emit({"log_file": str(path), "lines": lines[-max(0, tail):]})
+
+
+def cmd_service(wanted: str | None, args: list[str]) -> None:
+    if not args or args[0] not in _SERVICE_VERBS:
+        _die(6, "input", f"unknown service verb {args[0]!r}" if args else "service needs a verb",
+             f"{NAME} service {'|'.join(_SERVICE_VERBS)}")
+    verb, rest = args[0], args[1:]
+    if verb == "init":
+        cmd_service_init(rest)
+    elif verb == "doctor":
+        cmd_service_doctor(wanted, rest)
+    elif verb == "run":
+        cmd_service_run(wanted, rest)
+    elif verb == "start":
+        cmd_service_start(wanted, rest)
+    elif verb == "reload":
+        cmd_service_reload(rest)
+    elif verb == "stop":
+        cmd_service_stop(rest)
+    elif verb == "status":
+        _flags(rest, ())
+        _emit(_service_status(_service_module()))
+    else:
+        cmd_service_logs(rest)
 
 
 # --- Store schema ------------------------------------------------------------
@@ -6694,7 +7539,8 @@ def cmd_migrate(entry, args: list[str]) -> None:
         missing = [t for t in _TABLES if t not in before]
         lacking = (_columns_absent(cur, schema, before)
                    + _constraints_behind(cur, schema, before)
-                   + _key_scope_behind(cur, schema, before))
+                   + _key_scope_behind(cur, schema, before)
+                   + _notify_behind(cur, schema, before))
         if not opts.get("apply"):
             _emit({"schema": schema, "project": project, "present": before,
                    "would_create": missing, "would_add": lacking, "applied": False})
@@ -6718,7 +7564,8 @@ def cmd_migrate(entry, args: list[str]) -> None:
         still = ([t for t in _TABLES if t not in after]
                  + _columns_absent(cur, schema, after)
                  + _constraints_behind(cur, schema, after)
-                 + _key_scope_behind(cur, schema, after))
+                 + _key_scope_behind(cur, schema, after)
+                 + _notify_behind(cur, schema, after))
     if still:
         _die(5, "schema_incomplete",
              f"schema {schema} is still missing {', '.join(still)} after applying",
@@ -6745,7 +7592,8 @@ def cmd_doctor(wanted: str | None) -> None:
         # column behind still answers, so it is a warning rather than a failure.
         behind = (_columns_absent(cur, schema, tables)
                   + _constraints_behind(cur, schema, tables)
-                  + _key_scope_behind(cur, schema, tables))
+                  + _key_scope_behind(cur, schema, tables)
+                  + _notify_behind(cur, schema, tables))
     missing = [t for t in _TABLES if t not in tables]
     if missing:
         _die(5, "schema_missing",
@@ -6791,6 +7639,15 @@ def _guarded(handler, entry, rest) -> None:
 def main() -> None:
     _gate()
     argv = sys.argv[1:]
+    if argv[:1] == ["manifest"]:
+        # The contract's manifest carries no service; this one declares one.
+        _emit({"name": NAME, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE,
+                        "topics": [entry["topic"] for entry in _guide_menu()]},
+               "state": STATE, "inventory": _inventory_declaration(),
+               "post_install": POST_INSTALL, "service": SERVICE})
+        return
     _contract(argv)
     wanted = None
     cleaned = []
@@ -6810,6 +7667,8 @@ def main() -> None:
     verb, rest = cleaned[0], cleaned[1:]
     if verb == "doctor":
         cmd_doctor(wanted); return
+    if verb == "service":
+        cmd_service(wanted, rest); return
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
     globals()["SCHEMA"] = _schema(entry)

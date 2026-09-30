@@ -1,0 +1,24 @@
+# The tasks service: one daemon for this project that runs
+# `tasks run <worker> --apply` for each lane with room whenever the store holds
+# work that worker takes. Every enabled worker that takes something is a lane.
+# `tasks help` states every key; any other is refused.
+version = 1
+
+# Seconds between polls: the wake when the store cannot notify, and the moment
+# a lapsed lease or an ended wait is noticed.
+poll_seconds = 60
+
+# Turns running at once across every lane.
+max_parallel = 2
+
+# How long `tasks service stop` waits for running turns before ending them.
+shutdown_grace_seconds = 60
+
+# Seconds after a turn on a task ends before the service starts another on it,
+# whatever the turn's ending.
+retry_delay_seconds = 60
+
+# One table per worker whose cap is not 1, named by the worker:
+#
+# [lanes.<worker>]
+# max_parallel = 1

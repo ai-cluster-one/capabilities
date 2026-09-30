@@ -7,10 +7,20 @@ It answers the SDK's control requests, and answers the user message with an
 init event and a result document. It does no work.
 
   FAKE_ENGINE_RECORD   append {"argv", "cwd", "env", "prompt"} per turn (JSONL)
+  FAKE_ENGINE_TASKS    a tasks executable: finish the task the prompt names the
+                       way a worker does, with an activity and `complete`, under
+                       the raise the turn was started with
+  FAKE_ENGINE_SLEEP    seconds to hold the turn open before answering
+  FAKE_ENGINE_FAIL     `idle`: answer with an error at once, having written
+                       nothing; `ordinary`: write an activity through
+                       FAKE_ENGINE_TASKS, then answer with an error
 """
 import json
 import os
+import re
+import subprocess
 import sys
+import time
 
 argv = sys.argv[1:]
 if argv in (["-v"], ["--version"]):
@@ -51,12 +61,27 @@ for line in sys.stdin:
         with open(record, "a") as fh:
             fh.write(json.dumps({"argv": argv, "cwd": os.getcwd(),
                                  "env": dict(os.environ), "prompt": prompt}) + "\n")
+    if os.environ.get("FAKE_ENGINE_SLEEP"):
+        time.sleep(float(os.environ["FAKE_ENGINE_SLEEP"]))
+    tasks = os.environ.get("FAKE_ENGINE_TASKS")
+    named = re.search(r"tasks activity ([0-9a-f-]{36})", prompt)
+    failing = os.environ.get("FAKE_ENGINE_FAIL")
+    if tasks and named and failing == "ordinary":
+        subprocess.run([tasks, "activity", named.group(1), "tried and failed"],
+                       capture_output=True, timeout=120)
+    elif tasks and named and not failing:
+        subprocess.run([tasks, "activity", named.group(1), "done by the stand-in"],
+                       capture_output=True, timeout=120)
+        subprocess.run([tasks, "set", named.group(1), "--status", "complete"],
+                       capture_output=True, timeout=120)
     emit({"type": "system", "subtype": "init", "session_id": session,
           "apiKeySource": "none", "model": model, "claude_code_version": "2.1.280",
           "tools": [], "cwd": os.getcwd(),
           "permissionMode": arg("--permission-mode") or "default"})
-    emit({"type": "result", "subtype": "success", "is_error": False,
-          "duration_ms": 5, "duration_api_ms": 4, "num_turns": 1, "result": "done",
+    emit({"type": "result", "subtype": "error_during_execution" if failing else "success",
+          "is_error": bool(failing),
+          "duration_ms": 5, "duration_api_ms": 4, "num_turns": 1,
+          "result": "the stand-in failed" if failing else "done",
           "session_id": session, "total_cost_usd": 0.01,
           "usage": {"input_tokens": 4, "output_tokens": 3,
                     "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
