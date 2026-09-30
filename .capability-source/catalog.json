@@ -142,7 +142,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "161b8bed0b40f559e8ae42050bf1cce2e2eb8109a8cf490c2c21939ffc91dd5d",
+      "payload_sha256": "11451eaa9edd46f407b224313be85aaa45e40cfcd51cc756255806cb65046789",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
