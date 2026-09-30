@@ -24,6 +24,7 @@ import os
 import re
 import secrets
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -80,8 +81,7 @@ allowed_tools = ["Read", "Glob", "Grep", "Bash(tasks:*)"]
 permission_mode = "default"
 strict_mcp = true
 mcp_config = { mcpServers = {} }
-claude_extra_args = { restricted = true }
-add_dirs = ["${A_CHECKOUT}"]
+add_dirs = ["/srv/a-checkout"]
 """
 
 
@@ -255,19 +255,24 @@ def test_a_worker_name_is_a_plain_name(project):
     assert "is not a worker name" in said
 
 
-def test_a_declared_variable_is_read_from_the_environment(project, tmp_path):
-    """A machine-local path belongs in local environment configuration, so the
-    declaration names it rather than carrying it."""
-    assert mod._worker("evaluation")["profile"].add_dirs == (str(tmp_path / "elsewhere"),)
-
-
-def test_a_variable_nothing_sets_is_refused_by_name(project, monkeypatch):
-    monkeypatch.delenv("A_CHECKOUT")
+@pytest.mark.parametrize("old, new, knob", [
+    ('add_dirs = ["/srv/a-checkout"]', 'add_dirs = ["${A_CHECKOUT}"]', "add_dirs[0]"),
+    ('model = "claude-opus-5"', 'model = "${A_CHECKOUT}"', "model"),
+    ('mcp_config = { mcpServers = {} }',
+     'mcp_config = { mcpServers = { a = { command = "${A_CHECKOUT}/bin/a" } } }',
+     "mcp_config.mcpServers.a.command"),
+])
+def test_a_profile_knob_carrying_a_substitution_is_refused(project, old, new, knob):
+    """Profile files are read as the library reads them. A `${` is refused even
+    where the environment would answer for it, because no other reader of the
+    file would substitute it."""
+    rewrite(profile_file(project, "evaluation"), old, new)
     with pytest.raises(SystemExit) as exit_code:
         mod._worker("evaluation")
     assert exit_code.value.code == 6
     [said] = problems_of("evaluation")
-    assert "A_CHECKOUT" in said and "evaluation.toml" in said
+    assert f"its `{knob}` carries `${{`" in said and "evaluation.toml" in said
+    assert "profile files are read as the library reads them" in said
 
 
 def test_a_front_matter_variable_is_read_the_same_way(project, monkeypatch):
@@ -285,21 +290,22 @@ def test_an_unknown_worker_is_refused_and_the_known_ones_named(project, capsys):
     assert "default, evaluation, implementation" in error["hint"]
 
 
-def test_true_in_claude_extra_args_is_a_bare_flag_and_nothing_else_moves():
-    declared = {"harness": "claude", "claude_extra_args": {"restricted": True,
-                                                          "name": "turn"},
-                "strict_mcp": True}
-    assert mod._bare_flags(declared) == {
-        "harness": "claude", "claude_extra_args": {"restricted": None, "name": "turn"},
-        "strict_mcp": True}
-    assert mod._bare_flags({"harness": "claude"}) == {"harness": "claude"}
+def test_true_in_claude_extra_args_goes_as_written_and_the_library_refuses_it(project):
+    rewrite(profile_file(project, "evaluation"), 'permission_mode = "default"',
+            'permission_mode = "default"\nclaude_extra_args = { restricted = true }')
+    with pytest.raises(SystemExit) as exit_code:
+        mod._worker("evaluation")
+    assert exit_code.value.code == 6
+    [said] = problems_of("evaluation")
+    assert "refused by callva-harness-runner" in said
+    assert "claude_extra_args.restricted" in said
 
 
 def test_the_evaluation_shape_is_read_whole(project):
     profile = mod._worker("evaluation")["profile"]
     assert profile.tools == ("Read", "Glob", "Grep", "Bash")
     assert profile.permission_mode == "default" and profile.strict_mcp is True
-    assert profile.claude_extra_args == {"restricted": None}
+    assert profile.claude_extra_args == {}
     assert profile.mcp_config == {"mcpServers": {}}
 
 
@@ -309,7 +315,7 @@ def test_the_report_says_what_each_profile_sets_and_no_fence(project):
     by_name = {row["worker"]: row for row in rows}
     assert all("fence" not in row for row in rows)
     assert by_name["implementation"]["profile"]["permission_mode"] == "bypassPermissions"
-    assert by_name["evaluation"]["profile"]["claude_extra_args"] == {"restricted": True}
+    assert by_name["evaluation"]["profile"]["add_dirs"] == ["/srv/a-checkout"]
     assert by_name["implementation"]["source"] == "project"
     assert by_name["implementation"]["routines"] == ["development", "reachability"]
 
@@ -556,11 +562,11 @@ def test_a_named_profile_is_read_from_the_projects_own_folder(project):
     assert by_worker["implementation"]["harness"] == "claude"
 
 
-def test_a_named_profile_expands_variables_and_reads_bare_flags(project, tmp_path):
-    profile = mod._worker("evaluation")["profile"]
-    assert profile.add_dirs == (str(tmp_path / "elsewhere"),)
-    assert profile.claude_extra_args == {"restricted": None}
-    assert profile.tools == ("Read", "Glob", "Grep", "Bash")
+def test_a_named_profile_goes_to_the_library_as_written(project):
+    worker = mod._worker("evaluation")
+    assert worker["knobs"] == tomllib.loads(EVALUATION_PROFILE)
+    assert worker["profile"] == harness_runner.Profile.from_dict(
+        tomllib.loads(EVALUATION_PROFILE))
 
 
 def test_the_projects_file_comes_before_the_machines_and_the_shipped_one(
@@ -1398,13 +1404,13 @@ def test_a_read_profile_runs_a_claimed_turn_through_the_library(project, store,
                                 "evaluation", "proposal")
     assert report["claimed"] == "t-proposal"
     argv = turn["argv"]
-    assert "--restricted" in argv and "--strict-mcp-config" in argv
+    assert "--restricted" not in argv and "--strict-mcp-config" in argv
     assert _flag(argv, "--tools") == "Read,Glob,Grep,Bash"
     assert _flag(argv, "--allowedTools") == "Read,Glob,Grep,Bash(tasks:*)"
     assert _flag(argv, "--permission-mode") == "default"
     assert json.loads(_flag(argv, "--mcp-config")) == {"mcpServers": {}}
     assert _flag(argv, "--max-budget-usd") == "10"
-    assert _flag(argv, "--add-dir") == str(project / "elsewhere")
+    assert _flag(argv, "--add-dir") == "/srv/a-checkout"
     assert _flag(argv, "--effort") == "high"
 
 

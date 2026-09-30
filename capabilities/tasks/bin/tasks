@@ -199,12 +199,14 @@ WORKERS
   knobs and what each does on each harness are the library's, listed in its
   README. A worker names no harness.
 
-  The knobs go to the library as written after `${VAR}` expansion. One spelling
-  is this capability's: TOML has no null, so `true` inside `claude_extra_args`
-  stands for a bare flag, as in `claude_extra_args = { restricted = true }`. A
-  profile the library refuses is reported with the library's own message, and
-  no task is claimed for its worker. A lease is derived from the profile's
-  `timeout_seconds`; a profile without one needs `limits.lease_seconds`.
+  Profile files are read as the library reads them: the knobs go to it exactly
+  as written, and nothing in them is substituted. A knob carrying `${` is
+  refused by `doctor` and `run`, naming the knob, because a profile that
+  depended on a substitution would mean something else to every other reader of
+  the same file. A profile the library refuses is reported with the library's
+  own message, and no task is claimed for its worker. A lease is derived from
+  the profile's `timeout_seconds`; a profile without one needs
+  `limits.lease_seconds`.
 
   A routine name resolves to `routines/<name>.md` at the project root. The first
   routine is the procedure; a worker naming none leaves the turn to choose one
@@ -5651,31 +5653,44 @@ def _handler(profile) -> str:
     return " ".join(parts)
 
 
-def _bare_flags(profile: dict) -> dict:
-    """The profile as the library takes it. TOML has no null, which is how the
-    library spells a bare claude flag, so `true` inside `claude_extra_args` is
-    read as one; every other value, there and anywhere else, goes as written."""
-    extra = profile.get("claude_extra_args")
-    if not isinstance(extra, dict):
-        return profile
-    return {**profile, "claude_extra_args": {flag: None if value is True else value
-                                             for flag, value in extra.items()}}
+def _substitution_in(value, where: str = "") -> str | None:
+    """Where a profile's knobs carry a `${` sequence, or None when none does."""
+    if isinstance(value, str):
+        return where if "${" in value else None
+    if isinstance(value, list):
+        found = (_substitution_in(v, f"{where}[{i}]") for i, v in enumerate(value))
+    elif isinstance(value, dict):
+        found = (f"{where}.{k}".lstrip(".") if "${" in str(k)
+                 else _substitution_in(v, f"{where}.{k}".lstrip("."))
+                 for k, v in value.items())
+    else:
+        return None
+    return next((one for one in found if one), None)
 
 
 def _resolve_profile(name: str) -> tuple[object, dict, dict]:
     """The worker's profile, the knobs it sets and where it came from.
 
     The profile is found the way the library's `find_profile` finds one - this
-    project's profiles folder, then the machine's, then the shipped set -
-    through `find_profile_file`, because the knobs have to pass through `${VAR}`
-    expansion and the bare-flag reading before a Profile is built from them. The
-    file names its harness; a file that is not one flat profile is refused by
-    the library's own `ProfileFile.knobs`, in its words."""
+    project's profiles folder, then the machine's, then the shipped set - and
+    read the way the library reads it, so the file means the same to `tasks` as
+    to every other reader of it. The file names its harness; a file that is not
+    one flat profile is refused by the library's own `ProfileFile.knobs`, in its
+    words. A `${` sequence is refused rather than passed on, because the
+    library would take it literally where its author meant a substitution."""
     runner = _harness_runner()
     found = runner.find_profile_file(name, [_profiles_dir()])
-    knobs = _expanded(found.knobs(), f"profile {name!r} at {found.path}")
+    knobs = found.knobs()
+    where = _substitution_in(knobs)
+    if where:
+        raise Refusal(6, "worker_invalid",
+                      f"profile {name!r} at {found.path}: its `{where}` carries `${{`, "
+                      "and profile files are read as the library reads them, with "
+                      "nothing substituted",
+                      "write the value itself into the profile, or keep a "
+                      "machine-local profile in the machine's profile folder")
     origin = {"name": name, "source": found.source, "path": found.path}
-    return runner.Profile.from_dict(_bare_flags(knobs)), knobs, origin
+    return runner.Profile.from_dict(knobs), knobs, origin
 
 
 def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
