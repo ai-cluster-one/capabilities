@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "psycopg[binary]>=3.2",
-#     "callva-harness-runner==0.4.0",
+#     "callva-harness-runner==0.5.0",
 # ]
 # ///
 """tasks — what has to be done, and what was done about it.
@@ -143,8 +143,8 @@ WORKERS
     [workers.<name>]
     selector = { types = ["defect", "change"], tags = [], assignee = "" }
     park_hint = "one sentence added to the handback when a task is parked"
-    profile = "implementation"    # a named profile file, and the table of it
-    harness = "claude"            # the turn runs; or an inline table instead
+    profile = "implementation"    # a named profile file, which names its
+                                  # harness; or an inline table instead
 
     [workers.<name>.routines]     # which routines the turn is told to load
     defect = ["capability-development"]
@@ -170,21 +170,23 @@ WORKERS
   each does on each harness are the library's, listed in its README.
 
   A worker names its profile or carries it inline, never both. `profile =
-  "NAME"` with `harness = "claude"` (or `"codex"`) beside it names a profile
-  file, found the way the library finds one: `capabilities/tasks/profiles/
-  NAME.toml` in this project's envelope first, then the machine's profile
-  folder, then the profiles the library ships. The first file found is used
-  whole, and the turn runs its `[<harness>]` table. `[workers.<name>.profile]`
-  instead carries the knobs inline, with `harness` among them.
+  "NAME"` names a profile file, found the way the library finds one:
+  `capabilities/tasks/profiles/NAME.toml` in this project's envelope first,
+  then the machine's profile folder, then the profiles the library ships. The
+  first file found is used whole: its top-level `harness = "claude"` (or
+  `"codex"`) is the harness the turn runs, and its knobs sit beside it. A
+  worker says nothing of the harness itself, so a `harness` beside `profile`
+  is refused. `[workers.<name>.profile]` instead carries the knobs inline, with
+  `harness` among them.
 
   Either way the knobs go to the library as written after `${VAR}` expansion.
   One spelling is this capability's: TOML has no null, so `true` inside
   `claude_extra_args` stands for a bare flag, as in `claude_extra_args = {
   restricted = true }`. A name nothing resolves, and a profile the library
   refuses, are reported with the library's own message, and no task is claimed
-  for its worker. `doctor` reports each worker's harness, where its profile came
-  from - `inline`, or its name with the library's source and the file's path -
-  and the knobs it sets.
+  for its worker. `doctor` reports each worker's harness, taken from its
+  profile, where that profile came from - `inline`, or its name with the
+  library's source and the file's path - and the knobs it sets.
 
   `routines` and `instructions` are keyed by task type, and a task carrying a
   `stage` in its metadata takes `"<type>:<stage>"` when that key is present. A
@@ -5542,31 +5544,28 @@ def _resolve_profile(table: dict) -> tuple[object, dict, dict]:
     A named profile is found the way the library's `find_profile` finds one -
     this project's profiles folder, then the machine's, then the shipped set -
     through `find_profile_file`, because the knobs have to pass through `${VAR}`
-    expansion and the bare-flag reading before a Profile is built from them. A
-    file with no table for the harness, or a table naming another harness, is
-    refused by the library's own `ProfileFile.profile`, in its words."""
+    expansion and the bare-flag reading before a Profile is built from them. The
+    file names its harness; a file that is not one flat profile is refused by
+    the library's own `ProfileFile.knobs`, in its words."""
     runner = _harness_runner()
-    declared, harness = table.get("profile"), table.get("harness")
+    declared = table.get("profile")
     if isinstance(declared, dict):
         if "harness" in table:
             raise ValueError("it names `harness` beside an inline profile table; an "
                              "inline profile names its harness inside the table")
         knobs, origin = dict(declared), {"source": "inline"}
     elif isinstance(declared, str):
-        if not isinstance(harness, str) or not harness.strip():
-            raise ValueError(f"it names the profile {declared!r} and no `harness` to "
-                             "run from it: harness = \"claude\" or \"codex\"")
+        if "harness" in table:
+            raise ValueError(f"it names `harness` beside the profile {declared!r}; a "
+                             "profile file names its own harness: remove `harness` "
+                             "from the worker and put harness = \"claude\" or "
+                             f"\"codex\" at the top of {declared}.toml")
         found = runner.find_profile_file(declared, [_profiles_dir()])
-        tables = found.tables()
-        if (harness not in tables or harness not in runner.HARNESSES
-                or tables[harness].get("harness", harness) != harness):
-            found.profile(harness)  # the library's own refusal
-        knobs = _expanded({**tables[harness], "harness": harness},
-                          f"profile {declared!r} at {found.path}")
+        knobs = _expanded(found.knobs(), f"profile {declared!r} at {found.path}")
         origin = {"name": declared, "source": found.source, "path": found.path}
     else:
-        raise ValueError("it declares no profile: profile = \"NAME\" with harness "
-                         "beside it, or a [workers.<name>.profile] table")
+        raise ValueError("it declares no profile: profile = \"NAME\", or a "
+                         "[workers.<name>.profile] table")
     return runner.Profile.from_dict(_bare_flags(knobs)), knobs, origin
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.4.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.5.0"]
 # ///
 """One turn of the conveyor: what is declared, what is claimed, what is settled.
 
@@ -13,7 +13,7 @@ TASKS_TEST_DSN and skip when it is unset; every run works in a schema of its own
 and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'callva-harness-runner==0.4.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.5.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -229,15 +229,14 @@ def test_the_report_names_every_worker_and_what_is_wrong(project):
 
 # --- A profile by name ---------------------------------------------------------
 
-IMPLEMENTATION_PROFILE = """[claude]
+IMPLEMENTATION_PROFILE = """harness = "claude"
 model = "claude-opus-5"
 effort = "max"
 timeout_seconds = 10800
 permission_mode = "bypassPermissions"
 """
 
-EVALUATION_PROFILE = """[claude]
-harness = "claude"
+EVALUATION_PROFILE = """harness = "claude"
 model = "claude-opus-5"
 effort = "high"
 timeout_seconds = 1800
@@ -252,8 +251,7 @@ add_dirs = ["${A_CHECKOUT}"]
 """
 
 
-def by_name(project: Path, worker: str, name: str, harness: str = "claude",
-            text: str | None = None) -> Path:
+def by_name(project: Path, worker: str, name: str, text: str | None = None) -> Path:
     """Turn a worker's inline table into a named profile, and write the file it
     names into the project's own profiles folder when text is given."""
     path = project / "capabilities" / "tasks" / "workers.toml"
@@ -262,7 +260,7 @@ def by_name(project: Path, worker: str, name: str, harness: str = "claude",
     end = body.index("\n\n", start)
     body = body[:start] + body[end + 2:]
     head = f"[workers.{worker}]\n"
-    body = body.replace(head, head + f'profile = "{name}"\nharness = "{harness}"\n', 1)
+    body = body.replace(head, head + f'profile = "{name}"\n', 1)
     path.write_text(body)
     folder = project / "capabilities" / "tasks" / "profiles"
     if text is not None:
@@ -304,9 +302,9 @@ def test_the_projects_file_comes_before_the_machines_and_the_shipped_one(
         project, tmp_path, monkeypatch):
     machine = tmp_path / "xdg" / "callva-harness-runner" / "profiles"
     machine.mkdir(parents=True)
-    (machine / "act.toml").write_text('[claude]\nmodel = "machine-model"\n')
+    (machine / "claude-act.toml").write_text('harness = "claude"\nmodel = "machine-model"\n')
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    by_name(project, "implementation", "act")
+    by_name(project, "implementation", "claude-act")
     # No file of that name in the project: the machine's comes first.
     worker = mod._worker("implementation")
     assert worker["profile_source"]["source"] == "machine"
@@ -314,15 +312,16 @@ def test_the_projects_file_comes_before_the_machines_and_the_shipped_one(
     # A file in the project hides it.
     folder = project / "capabilities" / "tasks" / "profiles"
     folder.mkdir()
-    (folder / "act.toml").write_text('[claude]\nmodel = "project-model"\n')
+    (folder / "claude-act.toml").write_text('harness = "claude"\nmodel = "project-model"\n')
     worker = mod._worker("implementation")
     assert (worker["profile_source"]["source"], worker["profile"].model) == (
         "folder", "project-model")
     # With neither, the library's own shipped profile answers.
-    (folder / "act.toml").unlink()
-    (machine / "act.toml").unlink()
+    (folder / "claude-act.toml").unlink()
+    (machine / "claude-act.toml").unlink()
     worker = mod._worker("implementation")
     assert worker["profile_source"]["source"] == "shipped"
+    assert worker["profile"].harness == "claude"
     assert worker["profile"].permission_mode == "bypassPermissions"
 
 
@@ -336,16 +335,41 @@ def test_a_name_nothing_resolves_is_refused_in_the_librarys_words(project, capsy
     assert "no profile named 'no-such-profile'" in message
 
 
-def test_a_file_without_the_harness_is_refused_in_the_librarys_words(project):
-    by_name(project, "implementation", "codex-only",
-            text='[codex]\nmodel = "gpt-6-sol"\n')
+def test_the_file_names_the_harness_the_turn_runs(project):
+    path = by_name(project, "implementation", "codex-own",
+                   text='harness = "codex"\nmodel = "gpt-6-sol"\n')
+    worker = mod._worker("implementation")
+    assert (worker["profile"].harness, worker["profile"].model) == ("codex", "gpt-6-sol")
+    assert worker["handler"] == "codex --model gpt-6-sol"
+    rows, broken = mod._workers_report()
+    assert broken == []
+    row = next(row for row in rows if row["worker"] == "implementation")
+    assert row["harness"] == "codex"
+    assert row["profile_source"] == {"name": "codex-own", "source": "folder",
+                                     "path": str(path)}
+
+
+def test_a_file_that_is_not_one_flat_profile_is_refused_in_the_librarys_words(project):
+    by_name(project, "implementation", "tables",
+            text='[claude]\nmodel = "claude-opus-5"\n')
     _rows, broken = mod._workers_report()
     [said] = [one for one in broken if one.startswith("implementation:")]
-    assert "has no [claude] table" in said
-    by_name(project, "evaluation", "mismatch", text='[claude]\nharness = "codex"\n')
+    assert "refused by callva-harness-runner" in said
+    assert "[claude] is a harness table, which 0.5.0 no longer reads" in said
+    by_name(project, "evaluation", "unnamed", text='model = "claude-opus-5"\n')
     _rows, broken = mod._workers_report()
     [said] = [one for one in broken if one.startswith("evaluation:")]
-    assert "the table name is the harness" in said
+    assert "no top-level `harness`" in said
+
+
+def test_a_split_shipped_name_is_refused_with_the_names_that_replace_it(project, capsys):
+    by_name(project, "implementation", "act")
+    with pytest.raises(SystemExit) as exit_info:
+        mod._worker("implementation")
+    assert exit_info.value.code == 6
+    message = json.loads(capsys.readouterr().err)["error"]["message"]
+    assert "no profile named 'act'" in message
+    assert "'claude-act' and 'codex-act'" in message
 
 
 def test_a_worker_names_its_profile_or_carries_it_never_both(project):
@@ -354,14 +378,21 @@ def test_a_worker_names_its_profile_or_carries_it_never_both(project):
     _rows, broken = mod._workers_report()
     [said] = [one for one in broken if one.startswith("implementation:")]
     assert "beside an inline profile" in said
-    rewrite(project, '[workers.implementation]\nharness = "claude"\n',
-            "[workers.implementation]\n")
+
+
+def test_a_harness_beside_a_named_profile_is_refused_and_the_file_named(project, capsys):
     path = by_name(project, "implementation", "implementation", text=IMPLEMENTATION_PROFILE)
-    workers = project / "capabilities" / "tasks" / "workers.toml"
-    workers.write_text(workers.read_text().replace('harness = "claude"\n', "", 1))
+    rewrite(project, 'profile = "implementation"\n',
+            'profile = "implementation"\nharness = "claude"\n')
     _rows, broken = mod._workers_report()
     [said] = [one for one in broken if one.startswith("implementation:")]
-    assert "no `harness`" in said and path.is_file()
+    assert "names `harness` beside the profile 'implementation'" in said
+    assert "remove `harness` from the worker" in said
+    assert 'harness = "claude" or "codex" at the top of implementation.toml' in said
+    assert "which nothing reads" not in said and path.is_file()
+    with pytest.raises(SystemExit) as exit_info:
+        mod._worker("implementation")
+    assert exit_info.value.code == 6
 
 
 def test_a_stage_takes_its_own_pair_and_falls_back_when_it_has_none(project):
@@ -1076,7 +1107,8 @@ def test_a_named_profile_runs_a_claimed_turn_as_its_inline_twin_does(
     for shape in ("inline", "named"):
         if shape == "named":
             by_name(project, worker, worker,
-                    text=text.replace("[claude]\n", f'[claude]\ncli_path = "{FAKE_CLAUDE}"\n'))
+                    text=text.replace('harness = "claude"\n',
+                                      f'harness = "claude"\ncli_path = "{FAKE_CLAUDE}"\n'))
         record = project / f"{shape}.jsonl"
         monkeypatch.setenv("FAKE_ENGINE_RECORD", str(record))
         if shape == "inline":

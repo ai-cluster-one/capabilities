@@ -7,7 +7,7 @@
     },
     "askproject": {
       "path": "capabilities/askproject",
-      "payload_sha256": "4f9c2130d96d0bfa9315bd566350c246579b84fc64d41b29f0dfc3ae9b04d9cd",
+      "payload_sha256": "628c33f1e6484f2a6de9e12f6f291e8871093688e191cc4c139b5903bf05d41a",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability."
     },
     "automations": {
@@ -142,7 +142,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "46c383933a78df04d2cae8b1f49f1a4bccac71e9d8585cc7692f165bedab2fc9",
+      "payload_sha256": "161b8bed0b40f559e8ae42050bf1cce2e2eb8109a8cf490c2c21939ffc91dd5d",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

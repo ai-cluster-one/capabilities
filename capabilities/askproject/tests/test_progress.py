@@ -85,7 +85,7 @@ def test_codex_progress_is_concise_and_stdout_stays_json(lab):
     assert result["answer"] == "FINAL ANSWER MUST NOT BE PROGRESS"
     assert result["session_id"] == "codex-thread"
 
-    assert "askproject[codex] starting: Launching codex peer with profile read (shipped)" in proc.stderr
+    assert "askproject[codex] starting: Launching codex peer with profile codex-read (shipped)" in proc.stderr
     assert "askproject[codex] started: Codex peer started" in proc.stderr
     assert "askproject[codex] update: I will run the focused checks now." in proc.stderr
     assert "askproject[codex] verify: Running tests" in proc.stderr
@@ -174,7 +174,7 @@ def test_read_resumes_an_act_thread_in_read_mode(lab):
     resumed, result, launch = lab.ask("-c", "--read")
     assert resumed.returncode == 0, resumed.stderr
     assert (result["mode"], result["resumed"], result["profile"]["name"]) == (
-        "read", True, "read")
+        "read", True, "codex-read")
     assert launch["env"]["CAPABILITIES_READ_ONLY"] == "1"
 
 

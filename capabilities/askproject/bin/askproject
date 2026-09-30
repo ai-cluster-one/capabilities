@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "callva-harness-runner==0.4.0",
+#     "callva-harness-runner==0.5.0",
 # ]
 # ///
 """
@@ -16,12 +16,13 @@ that peer reads whatever project context is compiled on disk there at that
 moment (Claude reads CLAUDE.md, Codex reads AGENTS.md) / settings / rights —
 then hands back the answer with cost, token, and files-changed data.
 
-Two engines (harnesses) drive the peer, selected with `--engine`, and each is
-launched through the callva-harness-runner library (Claude Code through its
-agent SDK, Codex through its app-server SDK, always the CLI installed on this
-machine), which finds and applies the profile, resumes sessions, keeps the
-deadline and reads cost, tokens and the session id back out of what the
-harness reported:
+Two engines (harnesses) drive the peer, and the profile a call runs names its
+engine: `--engine` picks the shipped profile of that engine, and `--profile`
+names a file that names its own. Each is launched through the
+callva-harness-runner library (Claude Code through its agent SDK, Codex through
+its app-server SDK, always the CLI installed on this machine), which finds and
+applies the profile, resumes sessions, keeps the deadline and reads cost,
+tokens and the session id back out of what the harness reported:
   claude (default)  Claude Code.
   codex             Codex. No USD cost is reported under ChatGPT auth, so
                     cost_usd stays null.
@@ -68,66 +69,76 @@ COMPILED PROJECT CONTEXT
 
 ────────────────────────────────────────────────────────────────────────────
 MODES
-  read  (default;   Research. The `read` profile holds the peer to
-        --read)     reading by instruction alone: it has every tool, a full
-                    shell and the network, with no tool fence and no OS
-                    sandbox, so it can run the target's own commands and
-                    capabilities to answer. It loads the target's own context
-                    (claude: the project and local settings, CLAUDE.md and
-                    rules, not your user settings; codex: AGENTS.md), and it
-                    runs with CAPABILITIES_READ_ONLY=1, so every capability call
-                    it makes is read-only. Use for "what does X do", reviews.
-  act   (--act)     The `act` profile gives the peer full access:
-                    every tool without a prompt on claude, no sandbox and no
-                    approvals on codex. It can edit, run tests, commit, and
-                    push from inside the target project. Use for "fix X",
-                    "refactor". Under CAPABILITIES_READ_ONLY --act is refused
-                    before any peer starts.
+  read  (default;   Research. The engine's read profile, claude-read or
+        --read)     codex-read, holds the peer to reading by instruction alone:
+                    it has every tool, a full shell and the network, with no
+                    tool fence and no OS sandbox, so it can run the target's own
+                    commands and capabilities to answer. It loads the target's
+                    own context (claude: the project and local settings,
+                    CLAUDE.md and rules, not your user settings; codex:
+                    AGENTS.md), and it runs with CAPABILITIES_READ_ONLY=1, so
+                    every capability call it makes is read-only. Use for "what
+                    does X do", reviews.
+  act   (--act)     The engine's act profile, claude-act or codex-act, gives
+                    the peer full access: every tool without a prompt on claude,
+                    no sandbox and no approvals on codex. It can edit, run
+                    tests, commit, and push from inside the target project. Use
+                    for "fix X", "refactor". Under CAPABILITIES_READ_ONLY --act
+                    is refused before any peer starts.
 
-  Under `read`, read mode is an instruction, not a fence: nothing but the
-  prompt and the capabilities' read-only switch stops the peer from writing.
-  `--profile read-sandboxed` is the same read enforced by the operating system:
-  the target directory cannot be written, while the network, ~/.cache and the
-  temporary directory stay writable; on claude it runs no target hooks, so
-  context a hook would build is read as it already is on disk. The git snapshot
-  (below) is the check either way — a read call that changed the target
-  returns ok=false. A peer started while you run under CAPABILITIES_READ_ONLY
-  carries the switch whatever its profile.
+  Under a read profile, read mode is an instruction, not a fence: nothing but
+  the prompt and the capabilities' read-only switch stops the peer from
+  writing. `--profile claude-read-sandboxed` (or codex-read-sandboxed) is the
+  same read enforced by the operating system: the target directory cannot be
+  written, while the network, ~/.cache and the temporary directory stay
+  writable; on claude it runs no target hooks, so context a hook would build is
+  read as it already is on disk. The git snapshot (below) is the check either
+  way — a read call that changed the target returns ok=false. A peer started
+  while you run under CAPABILITIES_READ_ONLY carries the switch whatever its
+  profile.
 
 ────────────────────────────────────────────────────────────────────────────
 PROFILES
-  A profile is a TOML file, <name>.toml, with one table per harness, [claude]
-  and [codex]; the table name is the harness, and nothing else sits at the top
-  of the file. Each table is one callva-harness-runner 0.4.0 profile — its
-  knobs only (model, effort, timeout_seconds, permission_mode, setting_sources,
-  settings, tools, codex_config, approval_policy, append_system_prompt,
-  env_set, ...); the library's README lists every knob and what it does on each
-  harness. --engine picks the table, --profile <name> picks the file. Without
-  --profile a read uses `read` and --act uses `act`; a -c follow-up keeps the
-  profile its thread ran under while it keeps its mode.
+  A profile is a TOML file, <name>.toml, holding one callva-harness-runner
+  0.5.0 profile: a top-level `harness = "claude"` or `harness = "codex"`, and
+  that harness's knobs beside it (model, effort, timeout_seconds,
+  permission_mode, setting_sources, settings, tools, codex_config,
+  approval_policy, append_system_prompt, env_set, ...); the library's README
+  lists every knob and what it does on each harness. A profile is one engine,
+  so the profile a call runs decides the engine:
+    --engine E          runs the profile E-read, or E-act with --act.
+    --profile <name>    runs that file on the engine its `harness` names. An
+                        --engine naming the other engine is refused before any
+                        peer starts.
+  With neither flag the engine is ASKPROJECT_ENGINE's, else claude (see
+  OVERRIDES), and its read or act profile runs. A -c follow-up keeps the
+  profile its thread ran under while it keeps its mode, and a --profile given
+  with -c must run the thread's own engine.
 
   callva-harness-runner finds a name in this order, and the first file found is
   used whole — nothing is merged from a same-named file further down, nothing
-  inherited; a file without the table for the harness is an error, not a
-  reason to look further:
+  inherited; a file that is not one flat profile is an error, not a reason to
+  look further:
     1. folder    this project's capabilities/askproject/profiles/<name>.toml
     2. machine   the library's machine folder, shared by everything that runs
                  on callva-harness-runner:
                  $XDG_CONFIG_HOME/callva-harness-runner/profiles/<name>.toml
                  (default ~/.config/callva-harness-runner/profiles/). Put a
                  machine-wide profile there.
-    3. shipped   the library's own `read`, `act` and `read-sandboxed`
-  So a project or machine file named `read` or `act` replaces the shipped one.
-  `askproject profiles` lists every profile in sight — name, source, path, the
-  harness tables it defines, and the same-named files it shadows — and
+    3. shipped   the library's own claude-read, claude-act,
+                 claude-read-sandboxed, codex-read, codex-act and
+                 codex-read-sandboxed
+  So a project or machine file named claude-read or codex-act replaces the
+  shipped one. `askproject profiles` lists every profile in sight — name,
+  source, path, the harness it runs, and the same-named files it shadows — and
   `askproject profiles show <name>` prints the file a name resolves to, after a
   comment line naming its source and path.
 
   The shipped profiles run claude on claude-opus-5-5 and codex on gpt-6-sol,
   both at effort medium, with a 3600-second timeout. To write your own, copy
-  one (`askproject profiles show read`) into this project's folder or the
-  machine folder under a new name and edit it; a profile the library refuses
-  is reported with its own message before any peer starts.
+  one (`askproject profiles show claude-read`) into this project's folder or
+  the machine folder under a new name and edit it; a profile the library
+  refuses is reported with its own message before any peer starts.
 
   askproject adds to every profile, per call: its bridge instruction, in front
   of the profile's own append_system_prompt (the engine's system prompt is
@@ -145,16 +156,18 @@ OVERRIDES
     3. the project's .env        } ASKPROJECT_EFFORT  ASKPROJECT_TIMEOUT
     4. the process environment   }
     5. the profile (the engine: claude)
-  An unknown ASKPROJECT_ENGINE or ASKPROJECT_EFFORT, and an ASKPROJECT_TIMEOUT
-  that is not a positive whole number of seconds, is ignored; the same values
-  given as flags are refused.
+  A --profile settles the engine ahead of this chain: its file's harness runs,
+  whatever ASKPROJECT_ENGINE says. An unknown ASKPROJECT_ENGINE or
+  ASKPROJECT_EFFORT, and an ASKPROJECT_TIMEOUT that is not a positive whole
+  number of seconds, is ignored; the same values given as flags are refused.
 
   ASKPROJECT_MODEL and ASKPROJECT_EFFORT belong to the engine that
   ASKPROJECT_ENGINE (or the default engine) selects, and apply only to a run on
-  that engine. A run on the other engine — by --engine, or by a -c resume of a
-  thread that engine started — keeps its profile's values, so a model or effort
-  written for one engine never reaches the other. The --model and --effort
-  flags name this call and apply to whichever engine it runs on.
+  that engine. A run on the other engine — by --engine, by a --profile of that
+  engine, or by a -c resume of a thread that engine started — keeps its
+  profile's values, so a model or effort written for one engine never reaches
+  the other. The --model and --effort flags name this call and apply to
+  whichever engine it runs on.
 
   On claude the `haiku`/`sonnet`/`opus` aliases resolve to known-good full ids;
   on codex a model is passed verbatim. --effort takes low|medium|high|xhigh|max.
@@ -218,13 +231,15 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
 
 FLAGS
   --engine <claude|codex>  Which peer engine to spawn (default: claude, or
-                        $ASKPROJECT_ENGINE). A -c resume adopts the session's
+                        $ASKPROJECT_ENGINE): its read profile, or its act
+                        profile with --act. A -c resume adopts the session's
                         own engine — a codex thread can't be resumed by claude.
-  --act                 Modification mode: the `act` profile unless
+                        Refused beside a --profile that runs the other engine.
+  --act                 Modification mode: the engine's act profile unless
                         --profile names another.
-  --read                Read mode: the `read` profile unless --profile names
-                        another. It is already the default for a fresh call;
-                        on a -c resume of an act thread it is how you
+  --read                Read mode: the engine's read profile unless --profile
+                        names another. It is already the default for a fresh
+                        call; on a -c resume of an act thread it is how you
                         deliberately put the follow-up back in read mode.
                         Contradicts --act.
   -c, --continue        Resume the last session for this target, retaining its
@@ -233,8 +248,9 @@ FLAGS
                         runs in: --act to keep writing, --read to read.
   --fork                Reserved; neither headless CLI has a non-interactive
                         fork, so this exits with a controlled error.
-  --profile <name>      The profile to run (default: `read`, or `act` with
-                        --act). See PROFILES.
+  --profile <name>      The profile to run, on the engine its file names
+                        (default: <engine>-read, or <engine>-act with --act).
+                        See PROFILES.
   --model <m>           The model for this call's engine (default: the
                         profile's, or $ASKPROJECT_MODEL on the engine it
                         belongs to).
@@ -309,10 +325,13 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 ENGINES = ("claude", "codex")
 DEFAULT_ENGINE = "claude"
 
-# A profile is a TOML file holding one callva-harness-runner profile per
-# harness, a [claude] and a [codex] table. Without --profile a read uses
-# PROFILE_FOR_MODE's "read" and --act uses "act"; the library ships both.
-PROFILE_FOR_MODE = {"read": "read", "act": "act"}
+# A profile is a TOML file holding one callva-harness-runner profile, and so
+# one harness. Without --profile a call runs its engine's profile for its mode,
+# "<engine>-read" or "<engine>-act"; the library ships all four.
+def default_profile(engine: str, mode: str) -> str:
+    return f"{engine}-{mode}"
+
+
 # claude only: short names resolved to full ids. codex takes --model verbatim.
 MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5-20251001",
@@ -3891,11 +3910,11 @@ def _claude_progress(evt: dict, reporter: ProgressReporter) -> None:
 
 
 # --- profiles ----------------------------------------------------------------
-# A profile is a TOML file with one table per harness, [claude] and [codex],
-# each one callva-harness-runner profile. callva-harness-runner finds it by
-# name: askproject's own folder in the project envelope first, then the
+# A profile is a TOML file holding one callva-harness-runner profile: a
+# top-level `harness` and that harness's knobs. callva-harness-runner finds it
+# by name: askproject's own folder in the project envelope first, then the
 # library's machine folder, then the profiles the library ships. The first file
-# found is used whole.
+# found is used whole, and its harness is the engine the call runs.
 
 def _profile_folders() -> list[Path]:
     """askproject's own profile folders, searched before the library's machine
@@ -4016,17 +4035,28 @@ def run_peer(engine, target, prompt, profile, resume_id, schema_text, as_json,
     }
 
 
-def _build_profile(name: str, engine: str, *, caller: str, model, effort,
+def _find_profile(name: str, as_json: bool):
+    """The file `name` resolves to and the harness it names, or the library's
+    refusal before any peer starts."""
+    runner = _runner(as_json)
+    try:
+        found = runner.find_profile_file(name, _profile_folders())
+        return found, found.harness
+    except runner.ProfileError as exc:
+        die(f"profile {name!r} is refused by callva-harness-runner: {exc}",
+            as_json=as_json)
+
+
+def _build_profile(found, engine: str, *, caller: str, model, effort,
                    timeout, append, schema_text, peer_name, as_json: bool):
-    """The profile this call runs, and where it came from: the [engine] table
-    of the file `name` resolves to, whole, with the call's overrides and
-    askproject's own per-call settings on top."""
+    """The profile this call runs, and where it came from: the file `found`,
+    whole, with the call's overrides and askproject's own per-call settings on
+    top."""
     import dataclasses
     runner = _runner(as_json)
-    folders = _profile_folders()
+    name = found.name
     try:
-        found = runner.find_profile_file(name, folders)
-        profile = runner.find_profile(name, engine, folders)
+        profile = found.profile()
     except runner.ProfileError as exc:
         die(f"profile {name!r} is refused by callva-harness-runner: {exc}",
             as_json=as_json)
@@ -4124,10 +4154,25 @@ def run(args):
         # started from here may change anything, so it is not started at all.
         _read_only_gate("`askproject --act`")
 
+    # A profile is one engine. A named profile runs the engine its file names,
+    # and an --engine naming the other one is a contradiction, refused before
+    # anything starts; without one, the engine's own profile for the mode runs.
+    profile_name = args.profile or stored_profile
+    if profile_name:
+        found, harness = _find_profile(profile_name, as_json)
+        if args.engine and args.engine != harness:
+            die(f"--profile {profile_name} runs {harness} and --engine names "
+                f"{args.engine}; drop --engine, or name a {args.engine} profile "
+                f"such as {default_profile(args.engine, mode)}", as_json=as_json)
+        if resumed and harness != engine:
+            die(f"cannot resume {target} with profile {profile_name!r}: it runs "
+                f"{harness} and the last session used {engine}", as_json=as_json)
+        engine = harness
+    else:
+        found, _harness = _find_profile(default_profile(engine, mode), as_json)
+
     if not _runner(as_json).find_binary(engine):
         die(f"`{engine}` CLI not found on PATH", as_json=as_json)
-
-    profile_name = args.profile or stored_profile or PROFILE_FOR_MODE[mode]
 
     # Overrides of the profile's values: a flag names this call, else the
     # environment chain; neither leaves the profile's own value in place.
@@ -4176,7 +4221,7 @@ def run(args):
         peer_name = None
 
     profile, profile_record = _build_profile(
-        profile_name, engine, caller=caller, model=model, effort=effort,
+        found, engine, caller=caller, model=model, effort=effort,
         timeout=timeout, append=args.append, schema_text=schema_text,
         peer_name=peer_name, as_json=as_json)
 

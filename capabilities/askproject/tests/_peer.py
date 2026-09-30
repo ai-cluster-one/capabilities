@@ -7,7 +7,7 @@ $PEER_RECORD, so a test reads what the harness was actually handed.
 The script imports callva-harness-runner when a profile or a peer is needed, so
 the suite runs where that library is importable:
 
-    uv run --with pytest --with 'callva-harness-runner==0.4.0' \\
+    uv run --with pytest --with 'callva-harness-runner==0.5.0' \\
         python -m pytest capabilities/askproject/tests -q
 """
 

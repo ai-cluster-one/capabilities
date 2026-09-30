@@ -35,14 +35,14 @@ def test_askproject_ships_no_profiles_of_its_own():
     assert not (CAPABILITY / "profiles").exists()
 
 
-def test_the_library_ships_read_act_and_read_sandboxed():
+def test_the_library_ships_a_read_an_act_and_a_read_sandboxed_per_engine():
     from callva.harness_runner import find_profile
 
     for name in ("read", "act", "read-sandboxed"):
         for harness, model in (("claude", "claude-opus-5-5"), ("codex", "gpt-6-sol")):
-            profile = find_profile(name, harness, [])
-            assert (profile.model, profile.effort, profile.timeout_seconds) == (
-                model, "medium", 3600)
+            profile = find_profile(f"{harness}-{name}", [])
+            assert (profile.harness, profile.model, profile.effort,
+                    profile.timeout_seconds) == (harness, model, "medium", 3600)
 
 
 def test_read_on_claude_is_limited_by_instruction_only(lab):
@@ -60,7 +60,8 @@ def test_read_on_claude_is_limited_by_instruction_only(lab):
     assert appended.index(BRIDGE_TEXT) < appended.index(READ_TEXT)
     assert "--system-prompt" not in argv
     assert launch["env"]["CAPABILITIES_READ_ONLY"] == "1"
-    assert result["profile"]["name"] == "read" and result["profile"]["source"] == "shipped"
+    assert result["profile"]["name"] == "claude-read"
+    assert result["profile"]["source"] == "shipped"
     assert (result["mode"], result["model"], result["effort"]) == (
         "read", "claude-opus-5-5", "medium")
 
@@ -77,7 +78,7 @@ def test_read_on_codex_is_limited_by_instruction_only(lab):
     assert "baseInstructions" not in params
     assert launch["env"]["CAPABILITIES_READ_ONLY"] == "1"
     assert (result["profile"]["name"], result["model"], result["effort"]) == (
-        "read", "gpt-6-sol", "medium")
+        "codex-read", "gpt-6-sol", "medium")
 
 
 def test_act_has_full_access_on_both_engines(lab):
@@ -88,7 +89,7 @@ def test_act_has_full_access_on_both_engines(lab):
     assert value(argv, "--setting-sources") is None
     assert ACT_TEXT in instructions_of(launch)
     assert "CAPABILITIES_READ_ONLY" not in launch["env"]
-    assert (result["mode"], result["profile"]["name"]) == ("act", "act")
+    assert (result["mode"], result["profile"]["name"]) == ("act", "claude-act")
     assert (model_of(launch), effort_of(launch)) == ("claude-opus-5-5", "medium")
 
     proc, result, launch = lab.ask("--engine", "codex", "--act")
@@ -99,10 +100,11 @@ def test_act_has_full_access_on_both_engines(lab):
     assert ACT_TEXT in params["developerInstructions"]
     assert "CAPABILITIES_READ_ONLY" not in launch["env"]
     assert (model_of(launch), effort_of(launch)) == ("gpt-6-sol", "medium")
+    assert (result["mode"], result["profile"]["name"]) == ("act", "codex-act")
 
 
 def test_read_sandboxed_is_selectable_by_profile(lab):
-    proc, result, launch = lab.ask("--profile", "read-sandboxed")
+    proc, result, launch = lab.ask("--profile", "claude-read-sandboxed")
     _ok(proc)
     argv = launch["argv"]
     settings = json.loads(value(argv, "--settings"))
@@ -113,10 +115,12 @@ def test_read_sandboxed_is_selectable_by_profile(lab):
     assert READ_TEXT in instructions_of(launch)
     assert launch["env"]["CAPABILITIES_READ_ONLY"] == "1"
     assert (result["mode"], result["profile"]["name"], result["profile"]["source"]) == (
-        "read", "read-sandboxed", "shipped")
+        "read", "claude-read-sandboxed", "shipped")
 
-    proc, result, launch = lab.ask("--profile", "read-sandboxed", "--engine", "codex")
+    # The file names its engine: no --engine is needed to run codex.
+    proc, result, launch = lab.ask("--profile", "codex-read-sandboxed")
     _ok(proc)
+    assert launch["harness"] == "codex" and result["engine"] == "codex"
     config = thread_params(launch)["config"]
     assert config["default_permissions"] == "read-sandboxed"
     assert config["permissions"]["read-sandboxed"]["extends"] == ":read-only"
@@ -131,28 +135,53 @@ def test_the_default_engine_is_claude(lab):
 # --- OPERATOR PROFILES --------------------------------------------------------
 
 FAST = """
-[claude]
+harness = "claude"
 model = "{model}"
 effort = "low"
 permission_mode = "plan"
+"""
 
-[codex]
+FAST_CODEX = """
+harness = "codex"
 model = "{model}-codex"
 effort = "low"
 """
 
 
-def test_a_project_profile_is_picked_by_name(lab):
+def test_a_project_profile_is_picked_by_name_and_runs_its_own_engine(lab):
     path = lab.write_profile("project", "fast", FAST.format(model="m-project"))
     proc, result, launch = lab.ask("--profile", "fast")
     _ok(proc)
+    assert launch["harness"] == "claude" and result["engine"] == "claude"
     assert (model_of(launch), effort_of(launch)) == ("m-project", "low")
     assert value(launch["argv"], "--permission-mode") == "plan"
     assert result["profile"] == {"name": "fast", "source": "folder", "path": str(path)}
 
-    proc, result, launch = lab.ask("--profile", "fast", "--engine", "codex")
+    lab.write_profile("project", "fast-codex", FAST_CODEX.format(model="m-project"))
+    proc, result, launch = lab.ask("--profile", "fast-codex",
+                                   env={"ASKPROJECT_ENGINE": "claude"})
     _ok(proc)
+    assert launch["harness"] == "codex" and result["engine"] == "codex"
     assert (model_of(launch), effort_of(launch)) == ("m-project-codex", "low")
+
+    # Naming the engine the file names is allowed, and changes nothing.
+    proc, result, launch = lab.ask("--profile", "fast-codex", "--engine", "codex")
+    _ok(proc)
+    assert (launch["harness"], model_of(launch)) == ("codex", "m-project-codex")
+
+
+@pytest.mark.parametrize("profile, engine", [
+    ("fast", "codex"), ("fast-codex", "claude"),
+    ("claude-read", "codex"), ("codex-act", "claude")])
+def test_a_profile_and_an_engine_naming_another_harness_are_refused(lab, profile, engine):
+    lab.write_profile("project", "fast", FAST.format(model="m-project"))
+    lab.write_profile("project", "fast-codex", FAST_CODEX.format(model="m-project"))
+    proc, result, launch = lab.ask("--profile", profile, "--engine", engine)
+    assert proc.returncode == 1
+    assert f"--profile {profile} runs" in result["error"]
+    assert f"--engine names {engine}" in result["error"]
+    assert f"{engine}-read" in result["error"]
+    assert launch is None
 
 
 def test_the_project_shadows_the_machine_which_shadows_the_shipped(lab):
@@ -170,10 +199,12 @@ def test_the_project_shadows_the_machine_which_shadows_the_shipped(lab):
     listing = json.loads(lab.run("profiles").stdout)
     by_name = {entry["name"]: entry for entry in listing["profiles"]}
     assert by_name["fast"] == {"name": "fast", "source": "folder", "path": str(project),
-                               "harnesses": ["claude", "codex"], "shadows": [str(machine)]}
-    for name in ("read", "act", "read-sandboxed"):
-        assert by_name[name]["source"] == "shipped"
-        assert by_name[name]["harnesses"] == ["claude", "codex"]
+                               "harness": "claude", "shadows": [str(machine)]}
+    for harness in ("claude", "codex"):
+        for name in ("read", "act", "read-sandboxed"):
+            assert by_name[f"{harness}-{name}"]["source"] == "shipped"
+            assert by_name[f"{harness}-{name}"]["harness"] == harness
+    assert not {"read", "act", "read-sandboxed"} & set(by_name)
     assert [entry["source"] for entry in listing["lookup"]] == ["folder", "machine", "shipped"]
     assert listing["lookup"][1]["dir"] == str(lab.config / "callva-harness-runner" / "profiles")
 
@@ -189,10 +220,10 @@ def test_askproject_has_no_machine_folder_of_its_own(lab):
 
 
 def test_a_shipped_name_is_replaced_whole_by_an_operator_file(lab):
-    # A project `read` with no env_set and no setting_sources: nothing of the
-    # shipped `read` is merged into it.
-    path = lab.write_profile("project", "read", """
-[claude]
+    # A project `claude-read` with no env_set and no setting_sources: nothing of
+    # the shipped `claude-read` is merged into it.
+    path = lab.write_profile("project", "claude-read", """
+harness = "claude"
 model = "m-own-read"
 """)
     proc, result, launch = lab.ask()
@@ -203,23 +234,24 @@ model = "m-own-read"
     assert value(launch["argv"], "--permission-mode") is None
     assert "CAPABILITIES_READ_ONLY" not in launch["env"]
     assert READ_TEXT not in instructions_of(launch)
-    assert result["profile"] == {"name": "read", "source": "folder", "path": str(path)}
+    assert result["profile"] == {"name": "claude-read", "source": "folder",
+                                 "path": str(path)}
 
     listing = json.loads(lab.run("profiles").stdout)
-    read = next(e for e in listing["profiles"] if e["name"] == "read")
-    assert (read["source"], read["harnesses"]) == ("folder", ["claude"])
-    assert read["shadows"] == [str(shipped_path("read"))]
+    read = next(e for e in listing["profiles"] if e["name"] == "claude-read")
+    assert (read["source"], read["harness"]) == ("folder", "claude")
+    assert read["shadows"] == [str(shipped_path("claude-read"))]
 
 
 def test_profiles_show_prints_the_resolved_file(lab):
-    proc = lab.run("profiles", "show", "read")
+    proc = lab.run("profiles", "show", "codex-read")
     _ok(proc)
-    shipped = shipped_path("read")
+    shipped = shipped_path("codex-read")
     assert proc.stdout == f"# shipped: {shipped}\n" + shipped.read_text()
 
     body = FAST.format(model="m-project")
-    path = lab.write_profile("project", "read", body)
-    assert lab.run("profiles", "show", "read").stdout == f"# folder: {path}\n" + body
+    path = lab.write_profile("project", "claude-read", body)
+    assert lab.run("profiles", "show", "claude-read").stdout == f"# folder: {path}\n" + body
 
     missing = lab.run("profiles", "show", "nope")
     assert missing.returncode == 3
@@ -227,12 +259,13 @@ def test_profiles_show_prints_the_resolved_file(lab):
 
 
 @pytest.mark.parametrize("body, said", [
-    ('[claude]\nfence = "read"\n', "'fence' was removed in 0.2.0"),
-    ('[claude]\nengine = "claude"\n', "'engine' was renamed 'harness'"),
-    ('[claude]\ncodex_config = { sandbox_mode = "read-only" }\n',
+    ('harness = "claude"\nfence = "read"\n', "'fence' was removed in 0.2.0"),
+    ('harness = "claude"\nengine = "claude"\n', "'engine' was renamed 'harness'"),
+    ('harness = "claude"\ncodex_config = { sandbox_mode = "read-only" }\n',
      "profile.codex_config: claude cannot honour it"),
-    ('[claude]\nmodel = 5\n', "profile.model: expected string or null"),
-    ('model = "x"\n', "is not a harness table"),
+    ('harness = "claude"\nmodel = 5\n', "profile.model: expected string or null"),
+    ('model = "x"\n', "no top-level `harness`"),
+    ('[claude]\nmodel = "x"\n', "[claude] is a harness table, which 0.5.0 no longer reads"),
 ])
 def test_a_profile_the_library_refuses_is_reported_and_nothing_runs(lab, body, said):
     lab.write_profile("project", "broken", body)
@@ -243,11 +276,12 @@ def test_a_profile_the_library_refuses_is_reported_and_nothing_runs(lab, body, s
     assert launch is None
 
 
-def test_a_profile_without_the_engine_table_is_refused(lab):
-    lab.write_profile("project", "claudeonly", '[claude]\n')
-    proc, result, launch = lab.ask("--profile", "claudeonly", "--engine", "codex")
+@pytest.mark.parametrize("name", ["read", "act", "read-sandboxed"])
+def test_a_split_shipped_name_is_refused_with_the_names_that_replace_it(lab, name):
+    proc, result, launch = lab.ask("--profile", name)
     assert proc.returncode == 1
-    assert "has no [codex] table" in result["error"]
+    assert f"no profile named {name!r}" in result["error"]
+    assert f"'claude-{name}' and 'codex-{name}'" in result["error"]
     assert launch is None
 
 
@@ -329,7 +363,7 @@ def test_timeout_resolves_flag_then_env_local_then_env_then_process_then_profile
     # With nothing set, the profile's own timeout decides.
     lab.dotenv(".env", None)
     lab.dotenv(".env.local", None)
-    lab.write_profile("project", "short", '[codex]\ntimeout_seconds = 1\n')
+    lab.write_profile("project", "short", 'harness = "codex"\ntimeout_seconds = 1\n')
     proc, result, _ = lab.ask("--engine", "codex", "--profile", "short", env=slow)
     assert proc.returncode == 1
     assert "peer timed out after 1s" in result["error"]
@@ -382,7 +416,7 @@ def test_resume_keeps_engine_mode_and_profile(lab):
     assert value(launch["argv"], "--session-id") is None
     assert READ_TEXT in instructions_of(launch)
     assert (result["resumed"], result["mode"], result["profile"]["name"]) == (
-        True, "read", "read")
+        True, "read", "claude-read")
 
     # A codex act thread resumed with no --engine stays on codex, in act mode.
     proc, _, _ = lab.ask("--engine", "codex", "--act")
@@ -393,13 +427,15 @@ def test_resume_keeps_engine_mode_and_profile(lab):
     assert ACT_TEXT in instructions_of(launch)
     assert model_of(launch) == "gpt-6-sol"
     assert (result["engine"], result["mode"], result["resumed"]) == ("codex", "act", True)
+    assert result["profile"]["name"] == "codex-act"
 
-    # The same act thread continued with --read takes the read profile.
+    # The same act thread continued with --read takes its engine's read profile.
     proc, result, launch = lab.ask("-c", "--read")
     _ok(proc)
     assert READ_TEXT in instructions_of(launch)
     assert launch["env"]["CAPABILITIES_READ_ONLY"] == "1"
-    assert (result["mode"], result["profile"]["name"]) == ("read", "read")
+    assert (result["engine"], result["mode"], result["profile"]["name"]) == (
+        "codex", "read", "codex-read")
 
 
 def test_resume_keeps_an_operator_profile(lab):
@@ -410,6 +446,16 @@ def test_resume_keeps_an_operator_profile(lab):
     _ok(proc)
     assert model_of(launch) == "m-project"
     assert result["profile"]["name"] == "fast"
+
+
+def test_a_resume_refuses_a_profile_of_the_other_engine(lab):
+    lab.write_profile("project", "fast-codex", FAST_CODEX.format(model="m-project"))
+    proc, _, _ = lab.ask()
+    _ok(proc)
+    proc, result, launch = lab.ask("-c", "--profile", "fast-codex")
+    assert proc.returncode == 1
+    assert "cannot resume" in result["error"] and "runs codex" in result["error"]
+    assert launch is None
 
 
 # --- KEPT ---------------------------------------------------------------------
@@ -462,7 +508,7 @@ def test_the_answer_carries_its_traceability(lab):
     assert entry["target"] == str(lab.target)
     assert (entry["last_session_id"], entry["engine"], entry["model"], entry["effort"],
             entry["profile"]) == (result["session_id"], "claude", "claude-opus-5-5",
-                                  "medium", "read")
+                                  "medium", "claude-read")
 
     proc, result, _ = lab.ask("--engine", "codex")
     _ok(proc)
