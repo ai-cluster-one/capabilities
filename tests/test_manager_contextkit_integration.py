@@ -335,6 +335,24 @@ def test_init_refuses_envelope_collision_without_partial_move(tmp_path: Path) ->
     assert json.loads((legacy / "asana" / "identifiers.json").read_text())["project"] == "old"
 
 
+def test_init_refuses_to_migrate_a_machine_registry(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=False)
+    registry = project / ".capabilities"
+    (registry / ".manager" / "releases").mkdir(parents=True)
+    (registry / "tracker").mkdir()
+    (registry / "settings.json").write_text('{"capabilities": {}}\n')
+    (registry / "tracker" / "identifiers.json").write_text('{"board": "kept"}\n')
+
+    result = _run(tmp_path, project, "init", "--claude")
+
+    assert result.returncode == 6
+    assert _stderr_error(result)["code"] == "envelope_is_machine_registry"
+    assert (registry / ".manager" / "releases").is_dir()
+    assert json.loads(
+        (registry / "tracker" / "identifiers.json").read_text())["board"] == "kept"
+    assert not (project / "capabilities").exists()
+
+
 def test_capability_reads_legacy_gate_before_migration(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=False)
     legacy = project / ".capabilities"

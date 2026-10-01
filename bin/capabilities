@@ -659,6 +659,24 @@ def _guide_menu(guide_dir: Path, command: str) -> list[dict[str, str]]:
 
 # ---------------------------------------------------------------- shared shape
 
+def _is_machine_registry(path: Path) -> bool:
+    """Whether this tree is a machine registry rather than a project envelope.
+
+    The registry and the legacy project envelope share the name
+    `.capabilities/`, and only the registry carries `.manager/` - the installer
+    creates it before the manager has run once, and nothing writes that name
+    anywhere else. A registry this manager was pointed at names itself too, so
+    the one tree this process is the sole writer of is never migrated as a
+    consumer's envelope even after its `.manager/` has been removed.
+    """
+    try:
+        if path.resolve() == CAP_HOME.resolve():
+            return True
+    except OSError:
+        return False
+    return (path / ".manager").is_dir()
+
+
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
     the first directory holding capabilities/, legacy .capabilities/,
@@ -4630,6 +4648,10 @@ def _merge_gate_values(legacy: Path, current: Path) -> dict | None:
 def _migrate_legacy_envelope(root: Path) -> list[str]:
     """Move legacy .capabilities/ into visible capabilities/ without data loss.
 
+    A `.capabilities/` that is a machine registry is refused outright: the two
+    share that name, and moving a registry breaks every path on the machine
+    that points into it.
+
     The whole merge is preflighted before writes. Identical files coalesce;
     settings.json merges disjoint capability entries; .gitignore merges lines.
     Any other collision refuses the migration and leaves both trees untouched.
@@ -4638,6 +4660,12 @@ def _migrate_legacy_envelope(root: Path) -> list[str]:
     current = _envelope_home(root)
     if not legacy.is_dir():
         return []
+    if _is_machine_registry(legacy):
+        _die(6, "envelope_is_machine_registry",
+             f"cannot migrate {legacy} into {current}: that tree is a machine "
+             "registry, not a legacy project envelope",
+             "run this from a project directory instead of a home directory; "
+             "neither tree was changed")
     conflicts: list[str] = []
     merged_gate: dict | None = None
     merged_gitignore: str | None = None
