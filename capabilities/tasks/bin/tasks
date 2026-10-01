@@ -391,8 +391,11 @@ FIELDS  (add and set take the same set)
                         `blocked_by` whose tasks have all ended. Appoint the
                         moment in the same call - `--status waiting --assignee
                         <who> --pickup <when>` - and it stands, because it was
-                        chosen for the wait. A `blocked_by` still naming an open
-                        task is left alone: that is a live reason to wait.
+                        chosen for the wait. A task already waiting is not
+                        entering it: landing it in `waiting` again, by `set` or
+                        `release`, leaves a pickup still ahead where it is. A
+                        `blocked_by` still naming an open task is left alone:
+                        that is a live reason to wait.
 
                         Two states end a task and they do not mean the same
                         thing. `complete` says the work was done. `closed` says
@@ -4719,12 +4722,22 @@ def _settle_the_wait(cur, status: str | None, before: dict,
     one, which is a moment chosen for the wait rather than inherited, and the
     spent `blocked_by` goes with it. Both are visible where a field move always
     is: the dropped pickup as a change row, the removed key in the verb's own
-    answer."""
+    answer.
+
+    A task already waiting begins no wait by landing there again, whether a
+    person passes it on or a release closes the raise that stopped it there. Its
+    pickup was given to the wait it is in, so it stays while it is still ahead;
+    one already passed is that wait over, and goes like any inherited hold. The
+    store tells the two apart, by the clock the sweep reads to end the wait, so
+    the landing never keeps a moment the sweep counts as passed, nor drops one
+    it counts as still to come."""
     if status != "waiting":
         return [], []
     assignments = []
     if not pickup_named and before.get("pickup_at") is not None:
-        assignments.append("pickup_at = null")
+        assignments.append(
+            "pickup_at = case when pickup_at > now() then pickup_at else null end"
+            if before.get("status") == "waiting" else "pickup_at = null")
     spent = _spent_blockers(cur, before)
     if spent:
         assignments.append("metadata = metadata - 'blocked_by'")
@@ -5639,8 +5652,9 @@ def _release(entry, ref: str, outcome: str, status: str, detail: str | None,
                      execution["id"]))
         closed = _rows(cur)[0]
         before = _task_row(cur, tid)
-        # `release` appoints no moment of its own, so a pickup it finds on the
-        # way into `waiting` is always one from before the wait.
+        # `release` appoints no moment of its own: a pickup it finds on the way
+        # into `waiting` is one from before the wait, and one on a task its raise
+        # already stopped in `waiting` is the moment that wait was given.
         settled, spent = _settle_the_wait(cur, status, before, False)
         extra = "".join(f", {one}" for one in settled)
         cur.execute(f"""update {SCHEMA}.tasks set status = %s{extra}, updated_at = now()

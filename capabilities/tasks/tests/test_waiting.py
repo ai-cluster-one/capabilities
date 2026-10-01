@@ -71,7 +71,8 @@ def test_the_help_says_what_waiting_means():
                    "it lands that task on draft, todo, waiting, complete or closed",
                    "A wait begins clean, because a hold from before the wait "
                    "does not say when the wait is over",
-                   "Appoint the moment in the same call"):
+                   "Appoint the moment in the same call",
+                   "A task already waiting is not entering it"):
         assert needle in said
     # And `draft` keeps the one meaning it had.
     assert "`draft` means one thing and only one: nobody has released it yet" in said
@@ -152,10 +153,21 @@ def test_a_wait_drops_a_pickup_written_before_it():
     # Whatever that moment was for, it was not this wait, and left in place the
     # next claim reads it as the wait being over.
     cur = Ended()
-    assert mod._settle_the_wait(cur, "waiting", waits(pickup_at="then"), False) == (
-        ["pickup_at = null"], [])
+    for entering in mod.STATUSES:
+        if entering != "waiting":
+            assert mod._settle_the_wait(
+                cur, "waiting", waits(status=entering, pickup_at="then"), False) == (
+                ["pickup_at = null"], [])
     # Nothing to drop is nothing written.
     assert mod._settle_the_wait(cur, "waiting", waits(), False) == ([], [])
+
+
+def test_a_wait_landed_in_again_leaves_its_moment_to_the_store():
+    # A task already waiting begins no wait: a moment still ahead was given to
+    # the wait it is in and stays, one already passed is that wait over. The
+    # store tells the two apart, by the clock the sweep reads to end the wait.
+    assert mod._settle_the_wait(Ended(), "waiting", waits(pickup_at="then"), False) == (
+        ["pickup_at = case when pickup_at > now() then pickup_at else null end"], [])
 
 
 def test_a_moment_appointed_in_the_same_call_stands():
@@ -819,6 +831,50 @@ def test_a_wait_keeps_what_was_chosen_for_it(store, capsys):
     capsys.readouterr()
     mod.cmd_claim(entry, ["--type", "nothing"])
     assert _answer(capsys)["returned"] == ["g-5"]
+
+
+@needs_store
+def test_landing_a_wait_again_keeps_the_moment_it_was_given(store, capsys, monkeypatch):
+    entry, schema, conn = store
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    # Passed on to somebody else, the task is still in the wait its moment was
+    # appointed for, and nothing moves the moment.
+    seed(entry, capsys, "a-1", status="todo")
+    mod.cmd_set(entry, ["a-1", "--status", "waiting", "--assignee", "the owner",
+                        "--pickup", tomorrow])
+    appointed = _answer(capsys)["task"]["pickup_at"]
+    mod.cmd_set(entry, ["a-1", "--status", "waiting", "--assignee", "a reviewer"])
+    passed_on = _answer(capsys)
+    assert passed_on["task"]["pickup_at"] == appointed
+    assert passed_on["moved"] == ["assignee"]
+    mod.cmd_history(entry, ["a-1", "--field", "pickup"])
+    assert [(c["old_value"], c["new_value"]) for c in _answer(capsys)["changes"]] == [
+        (None, appointed)]
+
+    # A raise that stopped its task there and passed it on itself, then closed
+    # as a handback: the moment the raise appointed is the one the task waits for.
+    seed(entry, capsys, "a-2", status="todo", assignee="the owner")
+    mod.cmd_claim(entry, ["--key", "a-2", "--worker", "a worker"])
+    execution = _answer(capsys)["execution"]["id"]
+    monkeypatch.setenv("TASKS_EXECUTION", execution)
+    mod.cmd_set(entry, ["a-2", "--status", "waiting", "--assignee", "the owner",
+                        "--pickup", tomorrow])
+    appointed = _answer(capsys)["task"]["pickup_at"]
+    mod.cmd_set(entry, ["a-2", "--status", "waiting", "--assignee", "a reviewer"])
+    assert _answer(capsys)["task"]["pickup_at"] == appointed
+    monkeypatch.delenv("TASKS_EXECUTION")
+    mod.cmd_release(entry, [execution, "--outcome", "handback"])
+    released = _answer(capsys)
+    assert released["task"]["status"] == "waiting"
+    assert released["task"]["pickup_at"] == appointed and released["moved"] == []
+
+    # A moment already passed is that wait over, and landing it again begins clean.
+    seed(entry, capsys, "a-3", status="waiting", assignee="the owner", pickup=past)
+    mod.cmd_set(entry, ["a-3", "--status", "waiting", "--assignee", "a reviewer"])
+    over = _answer(capsys)
+    assert over["task"]["pickup_at"] is None and "pickup" in over["moved"]
 
 
 @needs_store

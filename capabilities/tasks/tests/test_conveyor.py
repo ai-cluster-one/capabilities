@@ -1256,6 +1256,52 @@ def test_a_whole_turn_against_the_store(project, store, monkeypatch, capsys):
 
 
 @needs_store
+def test_a_turn_that_stops_in_waiting_keeps_the_moment_it_appointed(project, store,
+                                                                    monkeypatch, capsys):
+    """A turn that hands its task to a person in `waiting`, with a moment to come
+    back at, leaves it that way: the release closing the raise as a handback
+    keeps the moment and moves nothing of its own."""
+    import datetime
+    entry, _schema, _conn = store
+    tomorrow = (datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(days=1)).isoformat()
+    mod.cmd_add(entry, ["--type", "defect", "--title", "A probe", "--key", "t-gate",
+                        "--status", "todo"])
+    capsys.readouterr()
+
+    class Worker:
+        Profile, Session, FailureKind = (harness_runner.Profile, harness_runner.Session,
+                                         FailureKind)
+        find_profile_file = staticmethod(harness_runner.find_profile_file)
+        ProfileNotFound = harness_runner.ProfileNotFound
+
+        def run(self, prompt, profile, cwd, *, session=None, environ=None, **kw):
+            monkeypatch.setenv("TASKS_EXECUTION", kw["extra_env"]["TASKS_EXECUTION"])
+            mod.cmd_activity(entry, ["t-gate", "asked the owner; back tomorrow"])
+            mod.cmd_set(entry, ["t-gate", "--status", "waiting", "--assignee", "the owner",
+                                "--pickup", tomorrow])
+            capsys.readouterr()
+            monkeypatch.delenv("TASKS_EXECUTION")
+            return Result(ok=True, harness="claude", answer="waiting", session_id=session.id,
+                          model="claude-opus-5", cost_usd=0.2, duration_ms=900, num_turns=3)
+
+    monkeypatch.setattr(mod, "_harness_runner", Worker)
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    assert _answer(capsys)["claimed"] == "t-gate"
+
+    mod.cmd_show(entry, ["t-gate"])
+    task = _answer(capsys)["task"]
+    assert (task["status"], task["assignee"]) == ("waiting", "the owner")
+    mod.cmd_history(entry, ["t-gate", "--field", "pickup"])
+    [appointed] = _answer(capsys)["changes"]
+    assert appointed["old_value"] is None and appointed["new_value"] == task["pickup_at"]
+    assert appointed["actor"].startswith("execution:")
+    mod.cmd_runs(entry, ["t-gate"])
+    [raised] = _answer(capsys)["executions"]
+    assert raised["status"] == "handback"
+
+
+@needs_store
 def test_the_task_and_its_trail_reach_the_turn_as_marked_data(project, store,
                                                              monkeypatch, capsys):
     """The prompt a real claim composes, captured by a harness that only records
