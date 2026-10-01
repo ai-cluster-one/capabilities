@@ -820,5 +820,88 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(self.reg.next_waiting()["id"], row["id"])
 
 
+    # -- work that holds no slot ----------------------------------------------
+    #
+    # A task started on a call is recorded here and starts at once: its attempt
+    # has an owner, a token and a lease, and no slot row. Everything below is
+    # what the register has to do differently for it, and nothing more.
+
+    DIRECT = jobs.direct_owner("host-a:1:1")
+
+    def direct(self, **overrides):
+        row = self.register(submit=False, channel_key="777", requested_by="777",
+                            description="Asked on a call: look it up", **overrides)
+        return self.reg.begin_direct(row["id"], owner_id=self.DIRECT,
+                                     owner_host="host-a")
+
+    def expire(self, job_id):
+        with self.store.transaction():
+            self.store._execute(
+                "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00.000000+00:00", job_id))
+
+    def test_a_direct_attempt_runs_without_waiting_or_a_slot(self):
+        row = self.direct()
+        self.assertEqual(row["state"], jobs.RUNNING)
+        self.assertEqual(row["attempt"], 1)
+        self.assertEqual(row["lease_owner"], self.DIRECT)
+        self.assertIsNotNone(row["attempt_token"])
+        slots = self.store._execute(
+            "SELECT COUNT(*) FROM tg_worker_job_slots").fetchone()[0]
+        self.assertEqual(slots, 0)
+        # The one slot is still free for queued work, and the direct row is
+        # never what the runner takes.
+        queued = self.register(description="queued")
+        claimed = self.reg.claim_next(owner_id="daemon", owner_host="host-a",
+                                      max_parallel=1)
+        self.assertEqual(claimed["id"], queued["id"])
+        self.assertEqual(self.reg.running(), 1)
+
+    def test_only_a_direct_owner_may_begin_outside_the_slots(self):
+        row = self.register(submit=False)
+        with self.assertRaises(jobs.JobError) as caught:
+            self.reg.begin_direct(row["id"], owner_id="daemon", owner_host="host-a")
+        self.assertEqual(caught.exception.slug, "not_a_direct_owner")
+        submitted = self.register()
+        self.assertIsNone(self.reg.begin_direct(
+            submitted["id"], owner_id=self.DIRECT, owner_host="host-a"))
+
+    def test_a_direct_attempt_renews_and_lands_without_a_slot(self):
+        row = self.direct()
+        self.assertTrue(self.reg.renew(row["id"], row["attempt_token"], self.DIRECT))
+        landed = self.reg.stop(row["id"], jobs.SUCCEEDED, exit_code=0,
+                               session_id="thread-1",
+                               attempt_token=row["attempt_token"],
+                               owner_id=self.DIRECT, result_silent=True)
+        self.assertEqual(landed["state"], jobs.STOPPED)
+        self.assertEqual(landed["outcome"], jobs.SUCCEEDED)
+        self.assertEqual(landed["delivery_state"], "delivered")
+        self.assertIsNone(landed["pid"])
+
+    def test_an_expired_direct_attempt_is_fenced_with_its_notice(self):
+        row = self.direct()
+        self.reg.attach_process(row["id"], row["attempt_token"], self.DIRECT, pid=4321)
+        self.expire(row["id"])
+        observed = self.reg.expired_active()
+        self.assertEqual([r["id"] for r in observed], [row["id"]])
+        fenced = self.reg.fence_expired_attempt(
+            observed[0], "service restarted", result_text="It was cut off.")
+        self.assertEqual(fenced["state"], jobs.STOPPED)
+        self.assertEqual(fenced["outcome"], jobs.INTERRUPTED)
+        self.assertIsNone(fenced["pid"])
+        self.assertEqual(fenced["result_text"], "It was cut off.")
+        self.assertEqual(fenced["delivery_state"], "pending")
+        self.assertEqual([r["id"] for r in self.reg.claim_deliveries("daemon")],
+                         [row["id"]])
+
+    def test_a_direct_row_is_listed_in_its_callers_channel_only(self):
+        row = self.direct()
+        self.assertEqual([r["id"] for r in self.reg.open_jobs("777", actor_id="777")],
+                         [row["id"]])
+        self.assertEqual(self.reg.open_jobs("888", actor_id="888"), [])
+        self.assertEqual(self.reg.list(channel_key="-100:7", actor_id="777"), [])
+        self.assertIsNone(self.reg.get(row["id"], actor_id="888"))
+
+
 if __name__ == "__main__":
     unittest.main()

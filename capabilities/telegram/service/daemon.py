@@ -424,6 +424,8 @@ _JOB_STORE = None
 _JOB_REGISTER = None
 JOB_OWNER_HOST = os.uname().nodename
 JOB_OWNER_ID = f"{JOB_OWNER_HOST}:{os.getpid()}:{time.time_ns()}"
+# The owner a call's task runs under: this daemon, outside the runner's slots.
+VOICE_OWNER_ID = jobs.direct_owner(JOB_OWNER_ID)
 JOB_LEASE_SECONDS = 30.0
 
 
@@ -3162,6 +3164,22 @@ def voice_task_job(caller_id, caller_name, text, task_id):
         "kind": "voice_call_task",
         "text": text,
     }
+
+
+def call_task_description(text, tail=None):
+    """The one line a call's task is listed under in the job register.
+
+    A provider that hands the turn over sends the same frame as its request
+    every time, and what was asked is the caller's last line in the tail it
+    sends with it; a provider that calls a tool sends the task's own words and
+    no tail."""
+    said = next((row.get("text") for row in reversed(tail or [])
+                 if not row.get("is_assistant") and str(row.get("text") or "").strip()),
+                None)
+    line = " ".join(str(said or text or "").split())
+    if len(line) > 200:
+        line = line[:199] + "…"
+    return f"Asked on a call: {line}" if line else "Asked on a call"
 
 
 VOICE_TASK_DELIVERY = (
@@ -6639,6 +6657,11 @@ async def run_session(client):
     # broke". Without it an amendment lands as a failed job.
     amending = set()
     stopping_jobs = set()
+    # Rows of tasks started on a call and running in this session, by job id:
+    # the attempt token their lease is renewed under and the proc key of the
+    # worker running now. They hold no slot; the runner renews their lease and
+    # honours a stop for them, and nothing else about them is its business.
+    voice_rows = {}
     quota = {"until": None, "reason": None}
 
     def jobs_available():
@@ -6695,6 +6718,14 @@ async def run_session(client):
         return (row.get("engine") == "stub"
                 or (row.get("engine") == "codex" and bool(row.get("session_id"))))
 
+    def interrupted_call_notice(row):
+        """What the person is told when work they started on a call was cut off
+        by the service going down. Nothing continues it by itself: the call it
+        was answering is over, and running it again through the queue would make
+        it chat work nobody asked for."""
+        return (f"Interrupted: «{row['description']}» did not finish because the "
+                "service restarted. It keeps its place and can be continued.")
+
     # -- the asks the register carries ----------------------------------------
     #
     # Cancel, stop and amend all arrive as rows, not as messages: whoever wrote
@@ -6719,6 +6750,14 @@ async def run_session(client):
                         result_text=message) if process_stopped else None)
                 finally:
                     stopping_jobs.discard(row["id"])
+            elif (row.get("lease_owner") == VOICE_OWNER_ID
+                    and row["id"] in voice_rows):
+                # A call's task lands its own row on the way out; the kill is
+                # recorded against its run so it ends as stopped, not as broken.
+                proc_key = voice_rows[row["id"]].get("proc_key")
+                if proc_key and kill_worker_proc(proc_key, "stopped by request"):
+                    stopping.add(proc_key)
+                stopped = None
             else:
                 stopped = None
             if stopped is not None:
@@ -6755,12 +6794,15 @@ async def run_session(client):
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(int(pgid), signal.SIGKILL)
 
+            slotted = jobs.holds_slot(row.get("lease_owner"))
             stopped = register.fence_expired_attempt(
-                row, reason, before_release=stop_local_group)
+                row, reason, before_release=stop_local_group,
+                result_text=None if slotted else interrupted_call_notice(row))
             if stopped is None:
                 continue
             interrupted.append(row)
-            if JOB_RECOVERY == "requeue" and local_owner and safe_job_recovery(row):
+            if (slotted and JOB_RECOVERY == "requeue" and local_owner
+                    and safe_job_recovery(row)):
                 register.resume(row["id"])
         return interrupted
 
@@ -7159,6 +7201,11 @@ async def run_session(client):
                     if active_row.get("lease_owner") == JOB_OWNER_ID:
                         register.renew(active_row["id"], active_row["attempt_token"],
                                        JOB_OWNER_ID,
+                                       max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
+                    elif (active_row.get("lease_owner") == VOICE_OWNER_ID
+                            and active_row["id"] in voice_rows):
+                        register.renew(active_row["id"], active_row["attempt_token"],
+                                       VOICE_OWNER_ID,
                                        max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
                 await reconcile_expired_attempts(register)
                 await honour_asks(register)
@@ -7829,9 +7876,91 @@ async def run_session(client):
                         continue
                     on_progress(note, "worker")
 
+        def open_voice_row(key, description, s):
+            """Record a call's task in the job register, already running.
+
+            The record never decides whether the task runs: a register that
+            cannot be reached costs the task its row, never the caller their
+            answer."""
+            draft = None
+            try:
+                register = job_register()
+                draft = register.register(
+                    channel_key=key, requested_by=key, description=description,
+                    engine=s["worker"], model=s["model"])
+                row = register.begin_direct(
+                    draft["id"], owner_id=VOICE_OWNER_ID, owner_host=JOB_OWNER_HOST,
+                    lease_seconds=max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
+                if row is None:
+                    register.discard(draft["id"])
+                    raise RuntimeError(f"job {draft['id']} could not be started")
+            except Exception as exc:
+                log(f"voice: task runs unrecorded — {_short_error(exc)}")
+                return None
+            voice_rows[row["id"]] = {"proc_key": None}
+            log(f"voice: task recorded as job {row['id']}")
+            return row
+
+        def note_voice_attempt(row, proc_key, number):
+            """Point the row at the worker this attempt runs, and refuse to start
+            one a stop is already waiting for."""
+            voice_rows[row["id"]] = {"proc_key": proc_key}
+            try:
+                register = job_register()
+                if number > 1:
+                    register.update_attempt(row["id"], row["attempt_token"],
+                                            VOICE_OWNER_ID, attempt=number)
+                current = register.get(row["id"])
+            except Exception as exc:
+                log(f"voice: job {row['id']} attempt not recorded — {_short_error(exc)}")
+                return
+            if current is not None and current.get("stop_requested"):
+                raise WorkerStopped(f"job {row['id']} stopped by request")
+
+        def record_voice_attempt(row, **columns):
+            """One write against the attempt this daemon owns. Called on the event
+            loop; a worker thread hands it over with `call_soon_threadsafe`."""
+            try:
+                job_register().update_attempt(
+                    row["id"], row["attempt_token"], VOICE_OWNER_ID, **columns)
+            except Exception as exc:
+                log(f"voice: job {row['id']} not updated — {_short_error(exc)}")
+
+        def land_voice_row(row, outcome, *, error=None, meta=None, notice=False):
+            """Stop a call's row with the reason its task ended.
+
+            The call path delivers the result itself, spoken or to the chat, so
+            the row's result is silent, except for the notice of an interruption
+            nothing else will send. An amendment written from the chat while the
+            task ran is continued on the same session, the way any job's is."""
+            if row is None:
+                return
+            voice_rows.pop(row["id"], None)
+            meta = meta or {}
+            try:
+                register = job_register()
+                landed = register.stop(
+                    row["id"], outcome, error=error,
+                    exit_code=0 if outcome == jobs.SUCCEEDED else None,
+                    session_id=meta.get("session_id"), model=meta.get("model"),
+                    attempt_token=row["attempt_token"], owner_id=VOICE_OWNER_ID,
+                    result_text=interrupted_call_notice(row) if notice else None,
+                    result_silent=not notice)
+                if landed is None:
+                    log(f"voice: job {row['id']} was no longer this daemon's to land")
+                    return
+                log(f"voice: job {row['id']} stopped ({outcome})")
+                if (outcome == jobs.SUCCEEDED
+                        and register.has_pending_amendment(row["id"])):
+                    continued = register.amend(row["id"])
+                    log(f"voice: job {row['id']} has an amendment from the chat; "
+                        f"{continued['state'] if continued else 'not found'}")
+            except Exception as exc:
+                log(f"voice: job {row['id']} could not be landed — {_short_error(exc)}")
+
         async def run_voice_task(caller_id, caller_name, text,
                                  delivery=VOICE_TASK_DELIVERY, on_progress=None,
-                                 lane=None, tail=None, provider=None):
+                                 lane=None, tail=None, provider=None, record=None):
             """One task the caller asked for mid-call, run by the project's own
             worker — the same machinery a message runs, under the authority the
             same user's messages resolve to.
@@ -7843,10 +7972,19 @@ async def run_session(client):
 
             With a `lane`, the session a finished turn ran in is kept for the rest
             of the call. Without one — the post-call summary takes this path — every
-            run stands alone, which is what a summary wants."""
+            run stands alone, which is what a summary wants.
+
+            With a `record`, the line it is listed under, the task is a row in the
+            job register for as long as it runs and after: the caller's own
+            channel lists it, `jobs stop` reaches it, and a restart that cuts it
+            off leaves it interrupted rather than gone. It starts at once and
+            holds none of the runner's slots."""
             s = voice_agent_settings()
             key = str(caller_id)
             provider = provider or voice_agent.DEFAULT_PROVIDER
+            row = open_voice_row(key, record, s) if record else None
+            attempts = {"n": 0}
+            event_loop = asyncio.get_running_loop()
 
             async def attempt(resume_session, seen):
                 """One worker run, from its own clean slate.
@@ -7865,6 +8003,9 @@ async def run_session(client):
                 job = voice_task_job(caller_id, caller_name, worker_text, task_id)
                 authority = _authority_policy_for(job, None, True)
                 proc_key = worker_proc_key(key, task_id)
+                attempts["n"] += 1
+                if row is not None:
+                    note_voice_attempt(row, proc_key, attempts["n"])
                 authority_context = None
                 worker_session = None
                 cancel_event = threading.Event()
@@ -7875,6 +8016,9 @@ async def run_session(client):
                     thread_id = codex_thread_started(line)
                     if thread_id and not seen["thread_id"]:
                         seen["thread_id"] = thread_id
+                        if row is not None:
+                            event_loop.call_soon_threadsafe(
+                                lambda: record_voice_attempt(row, session_id=thread_id))
                         if lane is not None:
                             # Written here, seconds into the run, rather than on
                             # the way out: the whole point is that there is no
@@ -7923,6 +8067,11 @@ async def run_session(client):
                              "resume_reanchor": reanchor,
                              "cancel_event": cancel_event,
                              "proc_key": proc_key}
+                    if row is not None:
+                        state["on_worker_start"] = (
+                            lambda pid, pgid: event_loop.call_soon_threadsafe(
+                                lambda: record_voice_attempt(
+                                    row, pid=int(pid), pgid=int(pgid or pid))))
                     log(f"voice: task {task_id} dispatched worker={s['worker']} "
                         f"model={s['model'] or 'default'} "
                         f"session={resume_session or 'new'} "
@@ -8037,8 +8186,28 @@ async def run_session(client):
                         # call or in a call days from now.
                         lane.needs_reanchor = bool(seen["compacted"])
                         save_lane(caller_id, lane)
+                    land_voice_row(row, jobs.SUCCEEDED, meta=result.get("meta"))
                     return result
+            except asyncio.CancelledError:
+                land_voice_row(row, jobs.INTERRUPTED, notice=True,
+                               error="voice task cancelled before completion")
+                raise
+            except WorkerStopped:
+                land_voice_row(row, jobs.CANCELLED, error="stopped by request")
+                raise
+            except WorkerModelRefused as exc:
+                land_voice_row(row, jobs.MODEL_REFUSED,
+                               error=_short_error(exc, limit=480))
+                raise
+            except Exception as exc:
+                # A worker killed because the session is closing broke for the
+                # same reason a restart breaks one, and is recorded as that.
+                land_voice_row(row, jobs.INTERRUPTED if closing else jobs.FAILED,
+                               notice=closing, error=_short_error(exc, limit=480))
+                raise
             finally:
+                if row is not None:
+                    voice_rows.pop(row["id"], None)
                 if watching:
                     voice_tasks_running[key] = voice_tasks_running.get(key, 1) - 1
                     if voice_tasks_running[key] <= 0:
@@ -8428,7 +8597,8 @@ async def run_session(client):
                 result = await run_voice_task(caller_id, caller_name, text,
                                               on_progress=note_task_progress,
                                               lane=lane, tail=tail,
-                                              provider=policy.get("provider"))
+                                              provider=policy.get("provider"),
+                                              record=call_task_description(text, tail))
                 return result["reply"]
 
             task_runner = voice_agent.VoiceTaskRunner(

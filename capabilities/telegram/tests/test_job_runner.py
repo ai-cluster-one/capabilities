@@ -26,6 +26,7 @@ from test_assistant_service import (  # noqa: E402
     CODEX_MODEL_REFUSAL_STDOUT,
     REFUSED_MODEL,
     Event,
+    StubVoiceCallSession,
     FakeClient,
     Message,
     import_daemon,
@@ -1126,6 +1127,211 @@ def codex_file_change(item_id, *paths):
         "id": item_id, "type": "file_change", "status": "in_progress",
         "changes": [{"path": f"/work/ledger/{path}", "kind": "add"}
                     for path in paths]}}
+
+
+
+class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
+    """A task started on a call is a job row, and still nothing waits for it.
+
+    The person who asked on a call must find the work from their chat - see it,
+    stop it - and nobody else may. A restart that cuts it off must leave it
+    recorded and say so. And none of that may cost the caller a queue: the row
+    is a record, not a place in line."""
+
+    CALLER = "777"
+
+    def call_settings(self, **overrides):
+        base = job_settings(**overrides)
+        base["defaults"]["voice_agent"] = {"worker": "codex"}
+        base["allowed_users"] = {self.CALLER: {"name": "Caller", "role": "owner",
+                                               "voice_agent": {"mode": "enabled"}}}
+        return base
+
+    async def answered_call(self, td, worker, **overrides):
+        daemon = import_daemon(Path(td), self.call_settings(**overrides),
+                               voice_context="Answer briefly.",
+                               project_env={"GOOGLE_API_KEY": "test-key"},
+                               store=True)
+        self.addCleanup(daemon.close_job_register)
+        daemon.WORKERS["codex"] = worker
+        captured = {}
+
+        def capture_runner(run_task, *args, **kwargs):
+            captured["run"] = run_task
+            return types.SimpleNamespace()
+
+        daemon.voice_agent.VoiceTaskRunner = capture_runner
+        daemon.voice_agent.VoiceCallSession = StubVoiceCallSession
+        client = FakeClient([])
+        session_task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        calls = daemon.PyTgCalls.instances[-1]
+        await calls.handlers["incoming_p2p_call"](
+            None, types.SimpleNamespace(chat_id=int(self.CALLER)))
+        await wait_until(lambda: "run" in captured, timeout=10)
+        return daemon, client, session_task, captured["run"]
+
+    def child_worker(self, holder, seconds):
+        """A codex-shaped worker running a real child through the daemon's own
+        process runner, so the process the row records is a real one."""
+        def worker(chat, tail, state=None, procs=None):
+            holder["runs"] = holder.get("runs", 0) + 1
+            holder["procs"] = procs
+            rc, _out, _err = holder["daemon"].run_worker_proc(
+                state["proc_key"],
+                [sys.executable, "-c", f"import time; time.sleep({seconds})"],
+                procs, cancel_event=state.get("cancel_event"),
+                on_start=state.get("on_worker_start"))
+            if rc != 0:
+                raise RuntimeError(f"codex worker failed: exit {rc}")
+            return {"reply": "found it", "meta": {"session_id": "thread-9"}}
+        return worker
+
+    @staticmethod
+    def call_rows(register, caller="777"):
+        return [row for row in register.list(channel_key=caller, actor_id=caller)
+                if row["description"].startswith("Asked on a call")]
+
+    async def finish(self, client, session_task):
+        client.disconnected.set()
+        await asyncio.wait_for(session_task, timeout=10)
+
+    async def test_a_call_task_is_a_row_its_caller_sees_and_nobody_else(self):
+        with tempfile.TemporaryDirectory() as td:
+            holder = {}
+            daemon, client, session_task, run_task = await self.answered_call(
+                td, self.child_worker(holder, 1.5))
+            holder["daemon"] = daemon
+            store, cli = JobRunnerTests.as_cli(daemon)
+            self.addCleanup(store.close)
+            task = asyncio.create_task(run_task("look something up"))
+            await wait_until(lambda: any(r["pid"] for r in self.call_rows(cli)),
+                             timeout=10)
+
+            [row] = self.call_rows(cli)
+            self.assertEqual(row["state"], daemon.jobs.RUNNING)
+            self.assertEqual(row["description"],
+                             "Asked on a call: look something up")
+            self.assertEqual((row["channel_key"], row["requested_by"]),
+                             (self.CALLER, self.CALLER))
+            self.assertEqual(row["attempt"], 1)
+            self.assertEqual(row["engine"], "codex")
+            # The same person's direct chat lists it; another person's does not,
+            # and neither does that person's id.
+            self.assertEqual([r["id"] for r in cli.open_jobs(
+                self.CALLER, actor_id=self.CALLER)], [row["id"]])
+            self.assertEqual(cli.open_jobs("888", actor_id="888"), [])
+            self.assertIsNone(cli.get(row["id"], actor_id="888"))
+
+            self.assertEqual(await asyncio.wait_for(task, timeout=15), "found it")
+            done = cli.get(row["id"])
+            self.assertEqual(done["state"], daemon.jobs.STOPPED)
+            self.assertEqual(done["outcome"], daemon.jobs.SUCCEEDED)
+            self.assertEqual(done["session_id"], "thread-9")
+            self.assertIsNone(done["pid"])
+            # The call delivered the answer itself; the row sends nothing.
+            self.assertEqual(done["delivery_state"], "delivered")
+            await self.finish(client, session_task)
+
+    async def test_a_stop_from_the_chat_ends_the_call_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            holder = {}
+            daemon, client, session_task, run_task = await self.answered_call(
+                td, self.child_worker(holder, 30))
+            holder["daemon"] = daemon
+            store, cli = JobRunnerTests.as_cli(daemon)
+            self.addCleanup(store.close)
+            task = asyncio.create_task(run_task("look something up"))
+            await wait_until(lambda: any(r["pid"] for r in self.call_rows(cli)),
+                             timeout=10)
+            [row] = self.call_rows(cli)
+            self.assertIsNone(cli.request_stop(row["id"], actor_id="888"))
+            self.assertIsNotNone(cli.request_stop(row["id"], actor_id=self.CALLER))
+
+            with self.assertRaises(daemon.WorkerStopped):
+                await asyncio.wait_for(task, timeout=15)
+            stopped = cli.get(row["id"])
+            self.assertEqual(stopped["state"], daemon.jobs.STOPPED)
+            self.assertEqual(stopped["outcome"], daemon.jobs.CANCELLED)
+            self.assertEqual(holder["runs"], 1)
+            await self.finish(client, session_task)
+
+    async def test_a_call_task_never_waits_for_a_job_slot(self):
+        with tempfile.TemporaryDirectory() as td:
+            holder = {}
+            daemon, client, session_task, run_task = await self.answered_call(
+                td, self.child_worker(holder, 0.2), max_parallel_jobs=1)
+            holder["daemon"] = daemon
+            release = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def chat_worker(chat, tail, state=None, procs=None):
+                asyncio.run_coroutine_threadsafe(release.wait(), loop).result()
+                return successful_result("done")
+
+            daemon.WORKERS["stub"] = chat_worker
+            store, cli = JobRunnerTests.as_cli(daemon)
+            self.addCleanup(store.close)
+            chat_job = queued(cli, channel_key=self.CALLER, requested_by=self.CALLER,
+                              description="long chat work", engine="stub")
+            await wait_until(
+                lambda: cli.get(chat_job["id"])["state"] == daemon.jobs.RUNNING,
+                timeout=10)
+
+            self.assertEqual(await asyncio.wait_for(
+                run_task("look something up"), timeout=10), "found it")
+            # The one slot was held the whole time, and still held now.
+            self.assertEqual(cli.get(chat_job["id"])["state"], daemon.jobs.RUNNING)
+            self.assertEqual(cli.running(), 1)
+            [row] = self.call_rows(cli)
+            self.assertEqual(row["outcome"], daemon.jobs.SUCCEEDED)
+            release.set()
+            await self.finish(client, session_task)
+
+    async def test_a_call_task_cut_off_by_a_restart_is_recorded_and_told(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.call_settings(), store=True)
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            # What a daemon that died mid-call leaves behind: a call's row,
+            # running under its owner, with a checkpoint the queue could resume.
+            draft = register.register(
+                channel_key=self.CALLER, requested_by=self.CALLER,
+                description="Asked on a call: look something up",
+                engine="codex")
+            dead = daemon.jobs.direct_owner("gone-host:1:1")
+            row = register.begin_direct(draft["id"], owner_id=dead,
+                                        owner_host=daemon.JOB_OWNER_HOST)
+            register.update_attempt(row["id"], row["attempt_token"], dead,
+                                    session_id="thread-9")
+            with register.store.transaction():
+                register.store._execute(
+                    "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
+                    ("2000-01-01T00:00:00+00:00", row["id"]))
+
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(lambda: any(
+                "did not finish because the service restarted" in item.get("text", "")
+                for item in client.sent), timeout=10)
+            await asyncio.sleep(0.3)
+            after = register.get(row["id"])
+            self.assertEqual(after["state"], daemon.jobs.STOPPED)
+            self.assertEqual(after["outcome"], daemon.jobs.INTERRUPTED)
+            self.assertEqual(after["delivery_state"], "delivered")
+            await JobRunnerTests.stop_session(self, client, task)
+
+    def test_the_line_a_call_task_is_listed_under(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.call_settings())
+            describe = daemon.call_task_description
+            self.assertEqual(describe("check  the\nboard"), "Asked on a call: check the board")
+            tail = [{"is_assistant": False, "text": "what's on the board?"},
+                    {"is_assistant": True, "text": "One moment."}]
+            self.assertEqual(describe("You have just been handed the turn", tail),
+                             "Asked on a call: what's on the board?")
+            self.assertTrue(len(describe("x" * 500)) < 230)
 
 
 class StreamProgressFactTests(unittest.TestCase):
