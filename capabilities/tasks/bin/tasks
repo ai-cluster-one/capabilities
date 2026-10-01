@@ -14,6 +14,14 @@ of what was actually done to move it. The two together answer the question a
 chat log cannot: what is open, what may be picked up now, and what already
 happened.
 
+It is a job queue: the agent's own queue of technical work, there so an agent
+can work autonomously by taking the work set in front of it. It is not a
+replacement for ClickUp, Asana or Notion, and ranking, a status vocabulary per
+project, and holding a large backlog so nothing is lost are outside it. Order
+comes from the worker's type order, `pickup_at` and `blocked_by`; tags filter;
+anything else a consumer wants to carry goes in metadata, which takes any key
+and any value and which `search` matches over.
+
 READING
   tasks list [filters]            a scan: identity, state, and how much activity
                                   each task has. Soonest pickup first, or in the
