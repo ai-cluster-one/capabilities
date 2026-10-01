@@ -4107,6 +4107,25 @@ def cmd_attachments(c: httpx.Client, task: str) -> list:
     return obj.get("attachments") or []
 
 
+_TEXT_FIELD_TYPES = ("short_text", "text")   # ClickUp's short and long text
+
+
+def _holds_value(task: dict, field: str, value: str) -> bool:
+    """Whether the task's own value in custom field <field> is <value>, by
+    that field's own equality.
+
+    A text field's value must equal <value> exactly, letter case and
+    surrounding spaces included. Every other field type keeps ClickUp's own
+    match, which already compares by the field's equality (a currency
+    numerically, so 0.00 finds a stored 0)."""
+    for f in task.get("custom_fields") or []:
+        if str(f.get("id") or "").lower() == field.lower():
+            if f.get("type") in _TEXT_FIELD_TYPES:
+                return f.get("value") == value
+            return True
+    return False
+
+
 def cmd_find(c: httpx.Client, workspace: str, custom_task_id: str | None = None,
              field: str | None = None, value: str | None = None) -> dict | None:
     """Resolve a task by a dedup key, returning the task or None on a miss.
@@ -4119,15 +4138,29 @@ def cmd_find(c: httpx.Client, workspace: str, custom_task_id: str | None = None,
     A dedup-key field is meant to be unique; only the first match is returned.
     The custom-field lookup asks for closed tasks and subtasks unconditionally,
     so a done or nested task is still resolved — status is a property of the
-    returned row, not a gate on existence."""
+    returned row, not a gate on existence.
+
+    ClickUp's `=` filter only narrows the search: on a text field it matches
+    any value that contains <v>, in any letter case, and ranks the candidates
+    newest first, 100 to a page. So each candidate is checked (`_holds_value`),
+    page after page, until one holds <v> or the pages end."""
     if field is not None:
         flt = json.dumps([{"field_id": field, "operator": "=", "value": value}])
-        body = _request(c, "GET", f"/team/{workspace}/task",
-                        params={"custom_fields": flt,
-                                "include_closed": "true",
-                                "subtasks": "true"})
-        tasks = (body or {}).get("tasks") or []
-        return tasks[0] if tasks else None
+        page = 0
+        while True:
+            body = _request(c, "GET", f"/team/{workspace}/task",
+                            params={"custom_fields": flt,
+                                    "include_closed": "true",
+                                    "subtasks": "true",
+                                    "page": page}) or {}
+            tasks = body.get("tasks") or []
+            hit = next((t for t in tasks if _holds_value(t, field, value)), None)
+            if hit is not None:
+                return hit
+            # A short or empty page ends the walk where `last_page` is absent.
+            if body.get("last_page") or len(tasks) < 100:
+                return None
+            page += 1
     res = _request(c, "GET", f"/task/{custom_task_id}",
                    params={"custom_task_ids": "true", "team_id": workspace},
                    allow_404=True)

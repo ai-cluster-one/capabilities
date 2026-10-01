@@ -37,7 +37,7 @@
     },
     "clickup": {
       "path": "capabilities/clickup",
-      "payload_sha256": "1460136ca0742b08bc69f853dd657398556de096b4672d5e8216b163202e4280",
+      "payload_sha256": "6ede33f6a4959761fa25cb869f9d0b1f556576c160003b9fe09e1b8524bb8d72",
       "summary": "ClickUp CLI over the REST API — read/create/update/comment-on tasks and subtasks, complete via status, manage assignees, tags, dependencies, custom fields, attachments, and webhooks across spaces and lists."
     },
     "coolify": {
