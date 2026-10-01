@@ -525,7 +525,7 @@ def _defaults(value, path, project_root, service_dir):
     value = _object(value, path)
     allowed = {
         "assistant_name", "tail_size", "sync_interval", "sync_stale_after",
-        "debounce", "worker_timeout", "progress_after",
+        "debounce", "worker_timeout", "progress_after", "progress_from_stream",
         "max_parallel_dialogue", "max_parallel_jobs", "job_poll_interval",
         "job_recovery", "max_attempts", "group_aliases", "worker", "workers",
         "voice_agent", "delegation",
@@ -534,6 +534,8 @@ def _defaults(value, path, project_root, service_dir):
     _unknown(value, allowed, path)
     if "link_preview" in value:
         _boolean(value["link_preview"], f"{path}.link_preview")
+    if "progress_from_stream" in value:
+        _boolean(value["progress_from_stream"], f"{path}.progress_from_stream")
     if "assistant_name" in value:
         _string(value["assistant_name"], f"{path}.assistant_name", nonempty=True)
     if "delegation" in value:

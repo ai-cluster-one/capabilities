@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -1101,6 +1102,204 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             register = daemon.job_register()
             self.assertEqual(register.get(row["id"])["state"], daemon.jobs.WAITING)
             self.assertEqual(self.left_behind(daemon), [])
+
+
+# Events in the shape a `codex exec --json` job worker emits them, as captured
+# from real runs: the engine's hook-trust notices and the thread opening first,
+# then each command as a start and an end, and a file change as it starts.
+HOOK_NOTICE = {"type": "item.completed", "item": {
+    "id": "item_0", "type": "error",
+    "message": "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks "
+               "may run without review for this invocation."}}
+
+
+def codex_command(item_id, command, phase, exit_code=None):
+    return {"type": f"item.{phase}", "item": {
+        "id": item_id, "type": "command_execution",
+        "command": f"/bin/zsh -lc \"{command}\"", "aggregated_output": "",
+        "exit_code": exit_code,
+        "status": "in_progress" if phase == "started" else "completed"}}
+
+
+def codex_file_change(item_id, *paths):
+    return {"type": "item.started", "item": {
+        "id": item_id, "type": "file_change", "status": "in_progress",
+        "changes": [{"path": f"/work/ledger/{path}", "kind": "add"}
+                    for path in paths]}}
+
+
+class StreamProgressFactTests(unittest.TestCase):
+    """What one codex event says to a person reading the chat."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.daemon = import_daemon(Path(self._td.name), job_settings())
+
+    def fact(self, event):
+        return self.daemon.codex_progress_fact(json.dumps(event))
+
+    def test_a_command_reads_as_what_ran_and_whether_it_worked(self):
+        self.assertEqual(
+            self.fact(codex_command("item_2", "pwd && ls", "started")),
+            "running `pwd && ls`")
+        self.assertEqual(
+            self.fact(codex_command("item_2", "pwd && ls", "completed", 0)),
+            "ran `pwd && ls` - ok")
+        self.assertEqual(
+            self.fact(codex_command("item_3", "python3 -m pytest -q",
+                                    "completed", 1)),
+            "ran `python3 -m pytest -q` - failed (exit 1)")
+
+    def test_a_file_change_names_the_files_being_written(self):
+        self.assertEqual(
+            self.fact(codex_file_change("item_4", "cli.py", "models.py")),
+            "writing 2 file(s): cli.py, models.py")
+        self.assertEqual(
+            self.fact(codex_file_change(
+                "item_5", "a.py", "b.py", "c.py", "d.py", "e.py", "f.py")),
+            "writing 6 file(s): a.py, b.py, c.py, d.py +2 more")
+
+    def test_startup_reasoning_and_engine_notices_say_nothing(self):
+        for event in (
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {"type": "turn.completed", "usage": {}},
+                HOOK_NOTICE,
+                {"type": "item.completed", "item": {
+                    "id": "item_6", "type": "reasoning", "text": "**Planning**"}},
+                {"type": "item.completed", "item": {
+                    "id": "item_7", "type": "agent_message", "text": "Done."}},
+                codex_command("item_8", "telegram send 123 'half way'",
+                              "started")):
+            self.assertIsNone(self.fact(event), event)
+        self.assertIsNone(self.daemon.codex_progress_fact("not json"))
+
+    def test_a_finished_command_takes_the_place_of_its_own_start(self):
+        window = []
+        for event in (codex_command("item_2", "pwd", "started"),
+                      codex_command("item_3", "pip install pytest", "started"),
+                      codex_command("item_2", "pwd", "completed", 0)):
+            self.daemon.note_stream_fact(window, self.fact(event))
+        self.assertEqual(window, [("stream", "running `pip install pytest`"),
+                                  ("stream", "ran `pwd` - ok")])
+
+
+class StreamProgressJobTests(unittest.IsolatedAsyncioTestCase):
+    """A codex job's text-chat progress, folded from its own event stream."""
+
+    async def run_codex_job(self, td, worker, **overrides):
+        daemon = import_daemon(Path(td), job_settings(**overrides), store=True)
+        self.addCleanup(daemon.close_job_register)
+        register = daemon.job_register()
+        row = queued(register, channel_key="123", requested_by="777",
+                     description="reconcile the ledger", engine="codex")
+        daemon.WORKERS["codex"] = worker
+        client = FakeClient([])
+        task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        await wait_until(
+            lambda: register.get(row["id"])["outcome"] == daemon.jobs.SUCCEEDED
+            and any(item.get("text") == "the ledger is reconciled"
+                    for item in client.sent),
+            timeout=15)
+        client.disconnected.set()
+        await asyncio.wait_for(task, timeout=5)
+        return [item.get("text") for item in client.sent
+                if item.get("text") != "the ledger is reconciled"]
+
+    @staticmethod
+    def streaming_worker(steps):
+        """A codex worker that emits each step's events, then waits a beat.
+
+        A step may also carry a line the worker writes itself, which goes to
+        the run's outbox the way its `telegram send` does."""
+        def worker(_chat, _tail, state=None, _procs=None):
+            for events, note, pause in steps:
+                if note is not None:
+                    with open(state["progress_outbox"], "a",
+                              encoding="utf-8") as fh:
+                        fh.write(json.dumps({"text": note}) + "\n")
+                for event in events:
+                    state["on_worker_line"](json.dumps(event))
+                time.sleep(pause)
+            return successful_result("the ledger is reconciled")
+        return worker
+
+    async def test_a_long_job_reports_what_its_stream_shows(self):
+        worker = self.streaming_worker([
+            ([{"type": "thread.started", "thread_id": "thread-1"},
+              HOOK_NOTICE, HOOK_NOTICE, {"type": "turn.started"},
+              codex_command("item_2", "pwd && ls", "started"),
+              codex_command("item_2", "pwd && ls", "completed", 0)], None, 2.5),
+            ([codex_file_change("item_3", "cli.py", "models.py")], None, 2.5),
+            ([codex_command("item_4", "python3 -m pytest -q", "started"),
+              codex_command("item_4", "python3 -m pytest -q", "completed", 1)],
+             "the tests need pytest, installing it", 2.5),
+        ])
+        with tempfile.TemporaryDirectory() as td:
+            sent = await self.run_codex_job(
+                td, worker, progress_after=1, progress_from_stream=True)
+
+        self.assertTrue(any("ran `pwd && ls` - ok" in text for text in sent),
+                        sent)
+        self.assertTrue(any("writing 2 file(s): cli.py, models.py" in text
+                            for text in sent), sent)
+        # The worker's own words win the fold they land in, whole.
+        self.assertIn("the tests need pytest, installing it", sent)
+        for text in sent:
+            self.assertNotIn("hook", text)
+            self.assertNotIn("running `pwd", text)
+            self.assertNotIn("starting", text)
+        self.assertEqual(len(sent), len(set(sent)), "no line is sent twice")
+
+    async def test_a_line_from_the_stream_alone_owes_the_whole_interval(self):
+        worker = self.streaming_worker([
+            ([codex_command("item_2", "pwd", "started"),
+              codex_command("item_2", "pwd", "completed", 0)], None, 2.0),
+        ])
+        with tempfile.TemporaryDirectory() as td:
+            sent = await self.run_codex_job(
+                td, worker, progress_after=3600, progress_from_stream=True)
+        self.assertEqual(sent, [])
+
+    async def test_the_workers_first_line_still_reaches_the_chat_at_once(self):
+        worker = self.streaming_worker([
+            ([codex_command("item_2", "pwd", "started")],
+             "looking at the ledger", 2.0),
+        ])
+        with tempfile.TemporaryDirectory() as td:
+            sent = await self.run_codex_job(
+                td, worker, progress_after=3600, progress_from_stream=True)
+        self.assertEqual(sent, ["looking at the ledger"])
+
+    async def test_with_the_setting_off_the_stream_reaches_no_chat(self):
+        worker = self.streaming_worker([
+            ([codex_command("item_2", "pwd && ls", "started"),
+              codex_command("item_2", "pwd && ls", "completed", 0)], None, 2.5),
+            ([codex_file_change("item_3", "cli.py")], None, 2.5),
+        ])
+        with tempfile.TemporaryDirectory() as td:
+            sent = await self.run_codex_job(td, worker, progress_after=1)
+        self.assertEqual(sent, [])
+
+    def test_the_setting_is_a_boolean(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), job_settings())
+            root = Path(td)
+            document = {
+                "connection": "test", "assistant_name": "Assistant",
+                "direct_messages": {"mode": "anyone",
+                                    "default_role": "direct_user"},
+                "allowed_users": {}, "allowed_groups": {}}
+            daemon.validate_settings(
+                {**document, "defaults": {"progress_from_stream": True}},
+                root, root)
+            with self.assertRaisesRegex(
+                    Exception, "progress_from_stream: must be a boolean"):
+                daemon.validate_settings(
+                    {**document, "defaults": {"progress_from_stream": "on"}},
+                    root, root)
 
 
 if __name__ == "__main__":

@@ -3298,6 +3298,87 @@ def codex_event_stage(line):
     return None
 
 
+def _bare_command(command, limit=70):
+    """The command a codex shell step ran, past the `<shell> -lc` wrapper, on
+    one line and short enough to read in a chat."""
+    if isinstance(command, (list, tuple)):
+        parts = [str(part) for part in command]
+        text = parts[-1] if parts else ""
+    else:
+        text = str(command or "")
+    for marker in (" -lc ", " -c "):
+        if marker in text:
+            text = text.split(marker, 1)[1]
+    text = " ".join(text.strip().strip("'\"").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def codex_progress_fact(line):
+    """Turn one codex `--json` event into a fact a reader of the chat can use.
+
+    The text-chat counterpart of `codex_event_stage`: a chat is read rather
+    than heard, so it gets what the event itself states - which command ran
+    and whether it worked, which files are being written - instead of the
+    phrase a caller on the line would want. Returns None for everything else:
+    the thread and turn events, reasoning, the engine's own notices, and the
+    worker's `telegram send`, whose words arrive through the outbox.
+    """
+    try:
+        event = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    kind = event.get("type")
+    if kind not in ("item.started", "item.completed"):
+        return None
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    item_type = item.get("type") or item.get("item_type")
+    if item_type == "command_execution":
+        command = item.get("command")
+        if _shell_stage(command) is None:
+            return None
+        shown = _bare_command(command)
+        if not shown:
+            return None
+        if kind == "item.started":
+            return f"running `{shown}`"
+        code = item.get("exit_code")
+        outcome = ("ok" if code == 0 else
+                   "failed" if code is None else f"failed (exit {code})")
+        return f"ran `{shown}` - {outcome}"
+    if item_type == "file_change" and kind == "item.started":
+        names = [str(change.get("path") or "").rsplit("/", 1)[-1]
+                 for change in item.get("changes") or []
+                 if isinstance(change, dict)]
+        names = [name for name in names if name]
+        if not names:
+            return None
+        shown = ", ".join(names[:4])
+        if len(names) > 4:
+            shown += f" +{len(names) - 4} more"
+        return f"writing {len(names)} file(s): {shown}"
+    return None
+
+
+def note_stream_fact(window, fact):
+    """Add one fact to a run's progress window.
+
+    A finished command takes the place of its own start still waiting in the
+    window, so a quick step reads once rather than as a start and an end. The
+    window keeps the last 40 entries, as the voice window does."""
+    if fact is None:
+        return
+    if fact.startswith("ran `"):
+        started = "running `" + fact[len("ran `"):].rsplit("` - ", 1)[0] + "`"
+        for index in range(len(window) - 1, -1, -1):
+            if window[index] == ("stream", started):
+                del window[index]
+                break
+    window.append(("stream", fact))
+    del window[:-40]
+
+
 def voice_task_preamble(chat_id, seconds):
     """Prepended to a task asked for by voice.
 
@@ -3375,6 +3456,7 @@ def channel_settings(reg, key):
         "debounce": s.get("debounce", DEFAULTS.get("debounce", 3)),
         "worker_timeout": s.get("worker_timeout", configured_timeout),
         "progress_after": s.get("progress_after", DEFAULTS.get("progress_after", 15)),
+        "progress_from_stream": bool(DEFAULTS.get("progress_from_stream", False)),
         "max_parallel_dialogue": s.get(
             "max_parallel_dialogue", DEFAULTS.get("max_parallel_dialogue", 1)),
         "max_attempts": s.get("max_attempts", DEFAULTS.get("max_attempts", 3)),
@@ -5835,7 +5917,8 @@ async def run_session(client):
         return True
 
     async def drain_progress(key, outbox, ent_id, is_direct, reply_to, offset,
-                             throttle, mark=None, delivered=None, handoff=None):
+                             throttle, mark=None, delivered=None, handoff=None,
+                             window=None):
         path = Path(outbox)
         if not path.exists():
             return offset
@@ -5862,6 +5945,13 @@ async def run_session(client):
             text = str(item.get("text") or "").strip()
             if not text or text in ("-", ".", "..."):
                 continue
+            if window is not None:
+                # A run whose progress is folded from its stream: the worker's
+                # own line joins the window and outranks the derived facts at
+                # the next fold rather than being sent on its own.
+                window.append(("worker", text))
+                del window[:-40]
+                continue
             # The window is the last thing a line passes, and it governs chat
             # text alone: a `job_submitted` line left this loop above, handed
             # off whatever the window says, because it is control flow. A line
@@ -5880,9 +5970,38 @@ async def run_session(client):
             log(f"{key}: progress job msg={reply_to or 'direct'} «{text[:80]}»")
         return offset
 
+    async def relay_folded_progress(key, window, ent_id, is_direct, reply_to,
+                                    throttle, last, mark=None, delivered=None):
+        """Send one line folded from a run's progress window, when one is due.
+
+        The fold and its priority are the voice path's own: the worker's
+        latest line if it wrote one, otherwise the facts the stream carried.
+        A worker's first line is never held, as on the outbox path; a line
+        built from the stream alone owes the whole interval, from launch for
+        the first, so a short run stays silent. An empty fold and a repeat of
+        the last line sent are nothing worth sending."""
+        if not window:
+            return
+        worker_wrote = any(source == "worker" for source, _ in window)
+        if not (throttle.elapsed() >= throttle.after
+                or (worker_wrote and not throttle.relayed)):
+            return
+        text = voice_agent.summarize_progress(window)
+        window.clear()
+        if not text or text == last.get("text"):
+            return
+        _, _ = await send_channel_message(
+            ent_id, text, is_direct,
+            reply_to=None if is_direct else reply_to, mark=mark)
+        throttle.sent()
+        last["text"] = text
+        if delivered is not None:
+            delivered.append(_normalize_delivered(text))
+        log(f"{key}: progress folded msg={reply_to or 'direct'} «{text[:80]}»")
+
     async def pump_progress(key, outbox, ent_id, is_direct, reply_to, stop_event,
                             progress_after, mark=None, delivered=None,
-                            handoff=None):
+                            handoff=None, window=None):
         offset = 0
         # The pump is created as the turn is dispatched, so one throttle spans
         # the whole turn: the first line it sees is the turn's first line and
@@ -5890,17 +6009,24 @@ async def run_session(client):
         # The window is required rather than defaulted: a call site that
         # forgot it would silently relay everything, which is the defect.
         throttle = ProgressThrottle(progress_after)
+        last = {"text": None}
         while not stop_event.is_set():
             offset = await drain_progress(
                 key, outbox, ent_id, is_direct, reply_to, offset, throttle,
-                mark=mark, delivered=delivered, handoff=handoff)
+                mark=mark, delivered=delivered, handoff=handoff, window=window)
+            if window is not None:
+                await relay_folded_progress(
+                    key, window, ent_id, is_direct, reply_to, throttle, last,
+                    mark=mark, delivered=delivered)
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=1)
             except asyncio.TimeoutError:
                 pass
+        # A folded window is not sent once the run is over: the result is
+        # about to say where the work ended.
         await drain_progress(
             key, outbox, ent_id, is_direct, reply_to, offset, throttle,
-            mark=mark, delivered=delivered, handoff=handoff)
+            mark=mark, delivered=delivered, handoff=handoff, window=window)
 
     def reserve_job(key, message, group_policy, is_direct, reason, chat_id=None):
         """Persist ownership of a message before any transcription or other await.
@@ -6761,6 +6887,11 @@ async def run_session(client):
         future = None
         progress_task = progress_stop = progress_outbox = None
         worker_session = authority_context = None
+        # Text-chat progress folded from the worker's own event stream, where
+        # the project turned it on. Only codex streams its events while it
+        # runs, so any other engine keeps the outbox path as it was.
+        progress_window = ([] if s.get("progress_from_stream")
+                           and s["worker"] == "codex" else None)
         participants = [{"name": sender["name"], "role": sender["role"]}]
         try:
             ent_id = await registered_chat_ref(key)
@@ -6839,6 +6970,14 @@ async def run_session(client):
 
                 loop.call_soon_threadsafe(persist)
 
+            def on_worker_line(line):
+                remember_worker_session(line)
+                if progress_window is not None:
+                    fact = codex_progress_fact(line)
+                    if fact is not None:
+                        loop.call_soon_threadsafe(
+                            note_stream_fact, progress_window, fact)
+
             state = {"now": now_display(), "chat_id": chat_id,
                      "channel_key": key, "connection": CONNECTION,
                      "chat_type": "private" if is_direct else "group",
@@ -6859,7 +6998,7 @@ async def run_session(client):
                      "authority_context": authority_context,
                      "progress_outbox": str(progress_outbox),
                      "worker_session": worker_session,
-                     "on_worker_line": remember_worker_session,
+                     "on_worker_line": on_worker_line,
                      "on_worker_start": remember_worker_process,
                      "cancel_event": cancel_event,
                      "resume_session": resume_session,
@@ -6873,7 +7012,8 @@ async def run_session(client):
             progress_task = asyncio.create_task(
                 pump_progress(key, str(progress_outbox), ent_id, is_direct,
                               delivery_reply_id, progress_stop,
-                              progress_after=s["progress_after"]))
+                              progress_after=s["progress_after"],
+                              window=progress_window))
             current_before_start = register.get(job_id)
             if (current_before_start is not None
                     and current_before_start.get("stop_requested")):
@@ -6994,6 +7134,8 @@ async def run_session(client):
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await asyncio.wait_for(progress_task, timeout=5)
             discard_progress_outbox(progress_outbox)
+            if progress_window is not None:
+                progress_window.clear()
             cleanup_worker_session(worker_session)
             if authority_context:
                 with contextlib.suppress(OSError):
