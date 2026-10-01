@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.5.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """One turn of the conveyor: what is declared, what is claimed, what is settled.
@@ -14,7 +14,7 @@ TASKS_TEST_DSN and skip when it is unset; every run works in a schema of its own
 and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'callva-harness-runner==0.5.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations

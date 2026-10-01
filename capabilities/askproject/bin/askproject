@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "callva-harness-runner==0.5.0",
+#     "callva-harness-runner==0.8.0",
 # ]
 # ///
 """
@@ -100,8 +100,8 @@ MODES
 ────────────────────────────────────────────────────────────────────────────
 PROFILES
   A profile is a TOML file, <name>.toml, holding one callva-harness-runner
-  0.5.0 profile: a top-level `harness = "claude"` or `harness = "codex"`, and
-  that harness's knobs beside it (model, effort, timeout_seconds,
+  profile: a top-level `harness = "claude"` or `harness = "codex"`, and that
+  harness's knobs beside it (model, effort, timeout_seconds,
   permission_mode, setting_sources, settings, tools, codex_config,
   approval_policy, append_system_prompt, env_set, ...); the library's README
   lists every knob and what it does on each harness. A profile is one engine,
@@ -134,10 +134,10 @@ PROFILES
   `askproject profiles show <name>` prints the file a name resolves to, after a
   comment line naming its source and path.
 
-  The shipped profiles run claude on claude-opus-5-5 and codex on gpt-6-sol,
-  both at effort medium, with a 3600-second timeout. To write your own, copy
-  one (`askproject profiles show claude-read`) into this project's folder or
-  the machine folder under a new name and edit it; a profile the library
+  `askproject profiles show <name>` is where a shipped profile's model,
+  effort and timeout are read; they move with the library. To write your own,
+  copy one (`askproject profiles show claude-read`) into this project's folder
+  or the machine folder under a new name and edit it; a profile the library
   refuses is reported with its own message before any peer starts.
 
   askproject adds to every profile, per call: its bridge instruction, in front

@@ -39,7 +39,7 @@ def test_the_library_ships_a_read_an_act_and_a_read_sandboxed_per_engine():
     from callva.harness_runner import find_profile
 
     for name in ("read", "act", "read-sandboxed"):
-        for harness, model in (("claude", "claude-opus-5-5"), ("codex", "gpt-6-sol")):
+        for harness, model in (("claude", "opus"), ("codex", "sol")):
             profile = find_profile(f"{harness}-{name}", [])
             assert (profile.harness, profile.model, profile.effort,
                     profile.timeout_seconds) == (harness, model, "medium", 3600)
@@ -49,7 +49,7 @@ def test_read_on_claude_is_limited_by_instruction_only(lab):
     proc, result, launch = lab.ask("--engine", "claude")
     _ok(proc)
     argv = launch["argv"]
-    assert (model_of(launch), effort_of(launch)) == ("claude-opus-5-5", "medium")
+    assert (model_of(launch), effort_of(launch)) == ("opus", "medium")
     assert value(argv, "--permission-mode") == "bypassPermissions"
     assert value(argv, "--setting-sources") == "project,local"
     for fence in ("--tools", "--allowedTools", "--disallowedTools", "--restricted",
@@ -63,14 +63,14 @@ def test_read_on_claude_is_limited_by_instruction_only(lab):
     assert result["profile"]["name"] == "claude-read"
     assert result["profile"]["source"] == "shipped"
     assert (result["mode"], result["model"], result["effort"]) == (
-        "read", "claude-opus-5-5", "medium")
+        "read", "opus", "medium")
 
 
 def test_read_on_codex_is_limited_by_instruction_only(lab):
     proc, result, launch = lab.ask("--engine", "codex")
     _ok(proc)
     params = thread_params(launch)
-    assert (model_of(launch), effort_of(launch)) == ("gpt-6-sol", "medium")
+    assert (model_of(launch), effort_of(launch)) == ("gpt-6.1-sol", "medium")
     assert params["config"] == {"sandbox_mode": "danger-full-access"}
     assert params["approvalPolicy"] == "never"
     assert BRIDGE_TEXT in params["developerInstructions"]
@@ -78,7 +78,7 @@ def test_read_on_codex_is_limited_by_instruction_only(lab):
     assert "baseInstructions" not in params
     assert launch["env"]["CAPABILITIES_READ_ONLY"] == "1"
     assert (result["profile"]["name"], result["model"], result["effort"]) == (
-        "codex-read", "gpt-6-sol", "medium")
+        "codex-read", "gpt-6.1-sol", "medium")
 
 
 def test_act_has_full_access_on_both_engines(lab):
@@ -90,7 +90,7 @@ def test_act_has_full_access_on_both_engines(lab):
     assert ACT_TEXT in instructions_of(launch)
     assert "CAPABILITIES_READ_ONLY" not in launch["env"]
     assert (result["mode"], result["profile"]["name"]) == ("act", "claude-act")
-    assert (model_of(launch), effort_of(launch)) == ("claude-opus-5-5", "medium")
+    assert (model_of(launch), effort_of(launch)) == ("opus", "medium")
 
     proc, result, launch = lab.ask("--engine", "codex", "--act")
     _ok(proc)
@@ -99,7 +99,7 @@ def test_act_has_full_access_on_both_engines(lab):
     assert params["approvalPolicy"] == "never"
     assert ACT_TEXT in params["developerInstructions"]
     assert "CAPABILITIES_READ_ONLY" not in launch["env"]
-    assert (model_of(launch), effort_of(launch)) == ("gpt-6-sol", "medium")
+    assert (model_of(launch), effort_of(launch)) == ("gpt-6.1-sol", "medium")
     assert (result["mode"], result["profile"]["name"]) == ("act", "codex-act")
 
 
@@ -389,14 +389,14 @@ def test_a_model_written_for_one_engine_never_reaches_the_other(lab):
     proc, _, launch = lab.ask("--engine", "codex", env={
         "ASKPROJECT_MODEL": "claude-sonnet-5", "ASKPROJECT_EFFORT": "high"})
     _ok(proc)
-    assert (model_of(launch), effort_of(launch)) == ("gpt-6-sol", "medium")
+    assert (model_of(launch), effort_of(launch)) == ("gpt-6.1-sol", "medium")
 
     codex_chain = {"ASKPROJECT_ENGINE": "codex", "ASKPROJECT_MODEL": "gpt-6-luna",
                    "ASKPROJECT_EFFORT": "low"}
     lab.dotenv(".env", codex_chain)
     proc, _, launch = lab.ask("--engine", "claude")
     _ok(proc)
-    assert (model_of(launch), effort_of(launch)) == ("claude-opus-5-5", "medium")
+    assert (model_of(launch), effort_of(launch)) == ("opus", "medium")
 
     proc, _, launch = lab.ask()
     _ok(proc)
@@ -425,7 +425,7 @@ def test_resume_keeps_engine_mode_and_profile(lab):
     _ok(proc)
     assert request(launch, "thread/resume")["threadId"] == "codex-thread"
     assert ACT_TEXT in instructions_of(launch)
-    assert model_of(launch) == "gpt-6-sol"
+    assert model_of(launch) == "gpt-6.1-sol"
     assert (result["engine"], result["mode"], result["resumed"]) == ("codex", "act", True)
     assert result["profile"]["name"] == "codex-act"
 
@@ -507,7 +507,7 @@ def test_the_answer_carries_its_traceability(lab):
     [entry] = json.loads(targets.stdout)["targets"]
     assert entry["target"] == str(lab.target)
     assert (entry["last_session_id"], entry["engine"], entry["model"], entry["effort"],
-            entry["profile"]) == (result["session_id"], "claude", "claude-opus-5-5",
+            entry["profile"]) == (result["session_id"], "claude", "opus",
                                   "medium", "claude-read")
 
     proc, result, _ = lab.ask("--engine", "codex")

@@ -4,7 +4,7 @@
 callva-harness-runner starts it through the SDK exactly as it starts the real CLI.
 The response shapes are those a real codex 0.159.0 app-server sends, with the
 machine's values replaced. A turn reports commentary, a command, a file change
-and the final answer.
+and the final answer. model/list answers the catalog in MODELS, one page.
 
   PEER_RECORD         append {"harness", "argv", "cwd", "env", "requests"} per turn (JSONL)
   PEER_MARKER         append the CAPABILITIES_READ_ONLY it saw, or <unset>, per turn
@@ -86,6 +86,16 @@ def turn_obj(turn_id, status, items=None):
             "durationMs": None if status == "inProgress" else 3683}
 
 
+MODELS = ("gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna")
+
+
+def model_entry(slug):
+    return {"id": slug, "model": slug, "displayName": slug, "description": "",
+            "hidden": False, "isDefault": slug == "gpt-6.1-sol",
+            "defaultReasoningEffort": "medium",
+            "supportedReasoningEfforts": [{"reasoningEffort": "medium", "description": ""}]}
+
+
 COMMAND = "/bin/zsh -lc 'pytest /private/project/test_secret.py'"
 
 
@@ -143,6 +153,9 @@ for line in sys.stdin:
             os.environ.get("FAKE_THREAD_ID", "codex-thread"), params)})
     elif method == "thread/resume":
         send({"id": rid, "result": thread_result(params["threadId"], params)})
+    elif method == "model/list":
+        send({"id": rid, "result": {"data": [model_entry(m) for m in MODELS],
+                                    "nextCursor": None}})
     elif method == "thread/name/set":
         send({"id": rid, "result": {}})
     elif method == "turn/start":
