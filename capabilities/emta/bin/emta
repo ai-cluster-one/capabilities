@@ -3512,7 +3512,10 @@ def _ids_get(label: str) -> str | None:
 def _ids_set_silent(label: str, value, note: str = "") -> bool:
     """Direct write to the ids envelope without stdout side effects, so the
     ingest verb can auto-populate principal_person_id without polluting its
-    own response. Returns True on success."""
+    own response. Returns True on success. An identifier is a project record,
+    so under the read-only switch this writes nothing and returns False."""
+    if read_only_switch():
+        return False
     envdir = _env_dir()
     if envdir is None or not envdir.parent.is_dir():
         return False
@@ -3808,7 +3811,8 @@ def _bootstrap(cid: str, session: dict) -> dict:
             note="discovered from /client/session-user; sent as the "
                  "x-principal-person-id header on every data call"):
         return {"ok": True, "status": 200, "ids_action": action}
-    # No project envelope to write into — stash in the session as a fallback
+    # No project envelope to write into, or the read-only switch keeps the
+    # project's identifiers as they are — stash in the session as a fallback
     # so the same process and later invocations on this connection still work.
     session["principal_person_id_fallback"] = pid
     _save_session(cid, session)

@@ -57,7 +57,7 @@
     },
     "emta": {
       "path": "capabilities/emta",
-      "payload_sha256": "095abe405da3b7bf7bd6a7571cd496ce5c72df41709eb2d7dcad2713d3baf17d",
+      "payload_sha256": "cb70a02f4e81e18697f2a4799c4bad56cdfdc5066185f2a55b4b93922c9c4c53",
       "summary": "Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay balances, per-period balances, prepay ledger. Session is paste-fed from a logged-in browser. Stateful — run `emta doctor` first."
     },
     "fathom": {
