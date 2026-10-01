@@ -875,6 +875,8 @@ def _auth_capability_allowed(rule) -> bool:
         return True
     if rule in (False, None):
         return False
+    if isinstance(rule, list):
+        return True
     if isinstance(rule, dict):
         if rule.get("deny") is True:
             return False
@@ -882,6 +884,28 @@ def _auth_capability_allowed(rule) -> bool:
             return False
         return True
     return False
+
+
+# Verbs a rule's verb list never withholds: they say what the capability is and
+# how it is configured, which is what an agent should reach for before acting.
+_AUTH_CONTRACT_VERBS = frozenset(
+    {"help", "guide", "ids", "connections", "refs", "stub", "manifest"})
+
+
+def _auth_rule_verbs(rule) -> list | None:
+    """The verbs a capability rule limits its grant to, or None when it grants
+    the whole capability. A bare list is shorthand for {"verbs": [...]}."""
+    if isinstance(rule, list):
+        verbs = rule
+    elif isinstance(rule, dict) and "verbs" in rule:
+        verbs = rule["verbs"]
+    else:
+        return None
+    if not isinstance(verbs, list) or not all(isinstance(v, str) for v in verbs):
+        _die(4, "auth_context_invalid",
+             f"runtime authority context has invalid verbs for {NAME}",
+             "verbs must be a list of verb names")
+    return verbs
 
 
 def _auth_gate() -> None:
@@ -893,18 +917,26 @@ def _auth_gate() -> None:
         return
     if allowed is True or allowed == "*":
         return
+    source = ctx.get("source") or "runtime"
+    role = ctx.get("sender_role") or ctx.get("role") or "unknown"
+    chat = ctx.get("chat_id") or "unknown"
     if isinstance(allowed, list):
         if NAME in allowed or "*" in allowed:
             return
     elif isinstance(allowed, dict):
-        if _auth_capability_allowed(allowed.get(NAME, allowed.get("*"))):
-            return
+        rule = allowed.get(NAME, allowed.get("*"))
+        if _auth_capability_allowed(rule):
+            verbs = _auth_rule_verbs(rule)
+            verb = sys.argv[1] if len(sys.argv) > 1 else "help"
+            if verbs is None or verb in verbs or verb in _AUTH_CONTRACT_VERBS:
+                return
+            _die(4, "verb_not_authorized",
+                 f"verb refused: `{NAME} {verb}` is not among the verbs this "
+                 f"{source} request may run ({', '.join(verbs) or 'none'})",
+                 f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")
     else:
         _die(4, "auth_context_invalid",
              "runtime authority context has invalid allowed_capabilities")
-    source = ctx.get("source") or "runtime"
-    role = ctx.get("sender_role") or ctx.get("role") or "unknown"
-    chat = ctx.get("chat_id") or "unknown"
     _die(4, "capability_not_authorized",
          f"{NAME} is not authorized for this {source} request",
          f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")

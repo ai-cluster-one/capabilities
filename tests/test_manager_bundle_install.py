@@ -603,6 +603,58 @@ def test_capability_auth_context_denies_unlisted_capability() -> None:
     assert "mailbox" in payload["error"]["message"]
 
 
+def test_capability_auth_context_verb_list_gates_domain_verbs() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project"
+        (project / ".git").mkdir(parents=True)
+        config = Path(td) / "config"
+        policy = config / "capabilities" / "settings.json"
+        policy.parent.mkdir(parents=True)
+        policy.write_text(json.dumps({
+            "capabilities": {"mailbox": {"enabled": True}},
+        }) + "\n")
+        base = dict(os.environ)
+        base.pop("CAPABILITIES_STORE_URL", None)
+        base.update({"XDG_CONFIG_HOME": str(config),
+                     "CLAUDE_PROJECT_DIR": str(project)})
+
+        def run(rule, *argv):
+            env = dict(base)
+            env["CAPABILITIES_AUTH_CONTEXT"] = json.dumps({
+                "source": "telegram",
+                "chat_id": "-1001",
+                "sender_role": "group_member",
+                "allowed_capabilities": {"mailbox": rule},
+            })
+            return subprocess.run(
+                [str(MAILBOX_SCRIPT), *argv], cwd=str(project), env=env,
+                capture_output=True, text=True, timeout=30,
+            )
+
+        for rule in ({"allow": True, "verbs": ["ids"]}, ["ids"]):
+            refused = run(rule, "list")
+            assert refused.returncode == 4, refused.stderr
+            payload = _error_envelope(refused)
+            assert payload["error"]["code"] == "verb_not_authorized"
+            assert "verb refused" in payload["error"]["message"]
+            assert "`mailbox list`" in payload["error"]["message"]
+            listed = run(rule, "ids", "list")
+            assert listed.returncode == 0, listed.stderr
+            contract = run(rule, "stub")
+            assert contract.returncode == 0, contract.stderr
+
+        nothing = run({"allow": True, "verbs": []}, "list")
+        assert nothing.returncode == 4
+        assert _error_envelope(nothing)["error"]["code"] == "verb_not_authorized"
+
+        whole = {"allow": True}
+        listed = run(whole, "ids", "list")
+        assert listed.returncode == 0, listed.stderr
+        domain = run(whole, "list")
+        assert "verb_not_authorized" not in domain.stderr
+        assert "capability_not_authorized" not in domain.stderr
+
+
 def test_telegram_worker_wrapper_limits_current_chat_scope() -> None:
     env = dict(os.environ)
     env.update({
