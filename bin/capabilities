@@ -348,6 +348,7 @@ import importlib.util
 import io
 import json
 import os
+import pwd
 import re
 import secrets
 import select
@@ -659,6 +660,35 @@ def _guide_menu(guide_dir: Path, command: str) -> list[dict[str, str]]:
 
 # ---------------------------------------------------------------- shared shape
 
+def _home_dirs() -> set[Path]:
+    """Every directory that is a home directory of the account running this.
+
+    $HOME answers for the process and moves wherever a caller points it; the
+    password database answers for the account and cannot be pointed anywhere.
+    A caller that redirects $HOME - a dev lane, a service under a supervisor, a
+    sandbox - would otherwise carry the guard onto the home it invented and stop
+    excluding the account's own, which is the one the machine registry sits in.
+    """
+    homes: set[Path] = set()
+    candidates = [Path.home()]
+    try:
+        account = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        account = ""
+    # The account's field counts only when it is absolute. An empty or relative
+    # one names no directory of its own: it resolves against the cwd, an empty
+    # one to the cwd itself, so taken as a home it would stop the walk wherever
+    # the process stands. Some service accounts carry an empty field.
+    if os.path.isabs(account):
+        candidates.append(Path(account))
+    for candidate in candidates:
+        try:
+            homes.add(candidate.resolve())
+        except OSError:
+            continue
+    return homes
+
+
 def _is_machine_registry(path: Path) -> bool:
     """Whether this tree is a machine registry rather than a project envelope.
 
@@ -666,7 +696,7 @@ def _is_machine_registry(path: Path) -> bool:
     `.capabilities/`, and only the registry carries `.manager/` - the installer
     creates it before the manager has run once, and nothing writes that name
     anywhere else. A registry this manager was pointed at names itself too, so
-    the one tree this process is the sole writer of is never migrated as a
+    the one tree this process is the sole writer of is never read as a
     consumer's envelope even after its `.manager/` has been removed.
     """
     try:
@@ -683,13 +713,16 @@ def _project_root() -> Path | None:
     .contextkit/config.toml, .env(.local), or .git.
     Markers are read from the filesystem alone: the root is what the envelope
     location is resolved against, so resolving one cannot depend on the other.
-    $HOME is never a project root (the machine registry lives there)."""
+    A home directory is never a project root (the machine registry lives in
+    one), and a `.capabilities/` that is a machine registry names that registry
+    rather than a legacy envelope."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
-    home = Path.home().resolve()
+    homes = _home_dirs()
     for d in (here, *here.parents):
-        if d == home:
+        if d in homes:
             return None
+        legacy = d / LEGACY_PROJECT_CAPABILITIES_REL
         # Either marker names a project. `settings.json` is the gate and
         # `project.json` the identity; a project keeping its records in the
         # store needs the second and may eventually stop carrying the first,
@@ -697,7 +730,7 @@ def _project_root() -> Path | None:
         if ((d / PROJECT_CAPABILITIES_REL / "settings.json").is_file()
                 or (d / PROJECT_CAPABILITIES_REL / PROJECT_IDENTITY_REL).is_file()
                 or (d / CONTEXTKIT_CONFIG_REL).is_file()
-                or (d / LEGACY_PROJECT_CAPABILITIES_REL).is_dir()
+                or (legacy.is_dir() and not _is_machine_registry(legacy))
                 or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
