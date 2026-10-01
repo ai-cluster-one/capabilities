@@ -788,7 +788,8 @@ DEFAULT_SECRET_ENV = "TASKS_DB_PASSWORD"
 WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
                "release", "run", "migrate"}
 WRITE_DEFAULT = False
-DOCS_BASE = ""
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/tasks/guides/")
 STATE = True        # the service's pid, fingerprint, status and log, per project
 INVENTORY = {"network": "none"}   # the service's state on this machine; the queue is the store's
 POST_INSTALL: list[dict] = []
