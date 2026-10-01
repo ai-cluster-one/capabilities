@@ -41,7 +41,9 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
   tasks tag <task> <tag> [tag...]               add tags, never replacing
   tasks untag <task> <tag> [tag...]             remove tags by name
   tasks meta show <task>                        the whole metadata object
-  tasks meta set <task> <key> <value>           set exactly one key
+  tasks meta set <task> <key> <value> [<key> <value>...]
+                                                set the keys named, all or none,
+                                                leaving the rest as they were
   tasks meta rm <task> <key> [key...]           remove keys by name
   tasks activity <task> "what happened"          record real work done
   tasks migrate [--apply]                       create what this connection's
@@ -419,12 +421,20 @@ FIELDS  (add and set take the same set)
 
   Tags and metadata are absent from this table on purpose. No flag takes a whole
   tag list or a whole metadata object, so a call meaning to change one thing can
-  never drop the rest. They are edited by their own verbs, one element at a time.
+  never drop the rest. They are edited by their own verbs, which name every
+  element they change.
 
 METADATA VALUES
-  `meta set` reads the value as JSON when it parses, and as plain text otherwise.
-  So 11 stores a number, true stores a boolean, "text" stores a string, and
-  bare text stores that text. Quote for the shell accordingly.
+  `meta set` takes the task and then one or more keys, each followed by its
+  value, and writes them together: every pair lands or none does, and a key the
+  call does not name is left as it was. A key named twice, or a key left without
+  a value, is refused and nothing is written.
+
+  Each value is one argument, read as JSON when it parses and as plain text
+  otherwise. So 11 stores a number, true stores a boolean, "text" stores a
+  string, and bare text stores that text. Quote for the shell accordingly, and
+  quote a value that contains spaces: left unquoted, its words are read as
+  further keys and values.
 
   Metadata is for what code filters on. Anything a person reads belongs in the
   description: a copy of the conversation in here will disagree with the
@@ -505,8 +515,10 @@ WORKER SCOPE
 
   On every other task a worker adds and never takes away: an activity, a tag, a
   metadata key not already there. It may not remove a tag or a key, overwrite a
-  key already present, or move a status. `add` creates in draft whatever
-  --status says, and the answer reports the coercion under `coerced`.
+  key already present, or move a status. A `meta set` naming several keys is
+  judged key by key, and one key it may not write refuses the whole call. `add`
+  creates in draft whatever --status says, and the answer reports the coercion
+  under `coerced`.
 
   A raise that has been closed or swept holds nothing, so a worker whose raise
   is over writes no field on any task, its own former task included. A lapse
@@ -5008,20 +5020,51 @@ def cmd_tag(entry, args: list[str], remove: bool = False) -> None:
         _emit({"task": tid, "removed" if remove else "added": names, "tags": tags})
 
 
+def _meta_pairs(rest: list[str]) -> list[tuple[str, str]]:
+    """The keys and values of a `meta set`, read in pairs after the task.
+
+    A key left without a value is refused rather than guessed at: it is what a
+    value with a space in it becomes when it is not quoted. A key named twice is
+    refused too, because which of its values was meant cannot be told, and
+    keeping either would drop the other without a word."""
+    if len(rest) < 2:
+        _die(6, "input", "meta set needs a task, a key and a value",
+             "quote a value that contains spaces")
+    if len(rest) % 2 == 0:
+        _die(6, "input",
+             f"meta set needs a value for every key, and {rest[-1]!r} has none",
+             "give each key its value, and quote a value that contains spaces: "
+             "left unquoted, its words are read as further keys and values")
+    keys, twice = rest[1::2], []
+    for i, key in enumerate(keys):
+        if key in keys[:i] and key not in twice:
+            twice.append(key)
+    if twice:
+        _die(6, "input",
+             f"meta set names {', '.join(map(repr, twice))} more than once, so "
+             "which value is meant cannot be told",
+             "name each key once in a call")
+    return list(zip(keys, rest[2::2]))
+
+
 def cmd_meta(entry, args: list[str]) -> None:
-    """Metadata is edited one key at a time. No verb takes a whole object, so a
-    call meaning to set one key cannot drop the others."""
+    """Metadata is edited by key, and a call names every key it changes. No verb
+    takes a whole object, so a call meaning to set some keys cannot drop the
+    others.
+
+    `set` writes all of its pairs in one statement, so they land together or not
+    at all: a task holding some of the keys a caller sent reads exactly like one
+    holding all of them, and nothing on it would say the rest never arrived."""
     opts = _flags(args, ("actor",), takes=99)
     loose = opts["_loose"]
     if not loose:
         _die(6, "input", "meta needs an action",
-             f"{NAME} meta set <task> <key> <value> | {NAME} meta rm <task> <key>...")
+             f"{NAME} meta set <task> <key> <value> [<key> <value>...] | "
+             f"{NAME} meta rm <task> <key>...")
     action, rest = loose[0], loose[1:]
     if action not in ("set", "rm", "show"):
         _die(6, "input", f"unknown meta action {action!r}", "one of: set, rm, show")
-    if action == "set" and len(rest) != 3:
-        _die(6, "input", "meta set needs a task, a key and a value",
-             "quote a value that contains spaces")
+    pairs = _meta_pairs(rest) if action == "set" else []
     if action in ("rm", "show") and not rest:
         _die(6, "input", f"meta {action} needs a task")
     with _connect(entry) as conn, conn.cursor() as cur:
@@ -5035,20 +5078,28 @@ def cmd_meta(entry, args: list[str]) -> None:
         if action == "rm":
             _worker_gate("meta-rm", tid, lookup)
         if action == "set":
-            key, raw = rest[1], rest[2]
             # Adding a key and writing over one are different acts to a worker,
             # and only the store knows which this is. Asked only when there is a
             # worker to answer for, so an ordinary caller pays nothing for it.
-            over = bool(_worker_execution()) and key in (_task_row(cur, tid)["metadata"] or {})
-            _worker_gate("meta-overwrite" if over else "meta-set", tid, lookup)
-            try:
-                value = json.loads(raw)
-            except json.JSONDecodeError:
-                value = raw
+            # Every key is judged before anything is written, so one key the
+            # worker may not write refuses the whole call.
+            carried = (_task_row(cur, tid)["metadata"] or {}) if _worker_execution() else {}
+            for key, _raw in pairs:
+                _worker_gate("meta-overwrite" if key in carried else "meta-set", tid, lookup)
+            params: list = []
+            for key, raw in pairs:
+                try:
+                    value = json.loads(raw)
+                except json.JSONDecodeError:
+                    value = raw
+                params += [key, json.dumps(value)]
+            # One statement for every pair. jsonb_build_object takes at most 100
+            # arguments, so 50 pairs; the parser above admits 48.
+            built = ", ".join(["%s::text, %s::jsonb"] * len(pairs))
             cur.execute(f"""update {SCHEMA}.tasks
-                               set metadata = metadata || jsonb_build_object(%s::text, %s::jsonb)
+                               set metadata = metadata || jsonb_build_object({built})
                              where id = %s returning metadata""",
-                        (key, json.dumps(value), tid))
+                        (*params, tid))
         else:
             cur.execute(f"""update {SCHEMA}.tasks set metadata = metadata - %s::text[]
                              where id = %s returning metadata""", (rest[1:], tid))
