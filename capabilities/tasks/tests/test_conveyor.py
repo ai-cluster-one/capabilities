@@ -1072,8 +1072,8 @@ def test_a_task_at_the_ceiling_is_parked_and_no_turn_is_started(
     assert report["parked"] is True and harness.seen == {}
     assert released["outcome"] == "handback"
     assert "Raised 3 times without finishing" in store.notes[0]
-    # The project's own sentence goes back with it.
-    assert "Check the lane" in store.notes[0]
+    # The project's own sentence goes back with it, on the trail and on the raise.
+    assert "Check the lane" in store.notes[0] and "Check the lane" in released["detail"]
 
 
 def test_a_worker_missing_a_routine_parks_the_task_without_spending_an_attempt(
@@ -1091,8 +1091,10 @@ def test_a_worker_missing_a_routine_parks_the_task_without_spending_an_attempt(
     assert mod._spent([{"metrics": released["metrics"]}]) == 0
     [note] = store.notes
     assert "'reachability' is not at" in note and "without spending an attempt" in note
-    # The project's own sentence goes back with it.
-    assert "Check the lane" in note
+    # What is missing is the whole account: the project's own sentence speaks to
+    # work that was tried, and no turn was started on this task.
+    assert note.endswith("`tasks doctor` names the same.")
+    assert "Check the lane" not in note and "Check the lane" not in released["detail"]
     assert report["missing"] == [one for one in report["missing"] if "reachability" in one]
 
 
@@ -1479,6 +1481,8 @@ def test_a_profile_nothing_resolves_parks_the_task_without_spending_an_attempt(
     [entry_] = shown["activities"]
     assert "no profile named 'no-such-profile'" in entry_["description"]
     assert "without spending an attempt" in entry_["description"]
+    # The worker's park hint is for the ceiling park alone.
+    assert "Check the lane" not in entry_["description"]
     mod.cmd_runs(entry, ["t-probe"])
     [raised] = _answer(capsys)["executions"]
     assert raised["metrics"] == {"missing": True}

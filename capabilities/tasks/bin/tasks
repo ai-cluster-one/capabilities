@@ -160,7 +160,7 @@ WORKERS
       hold_seconds_on_exhaustion: 1200
       idle_failure_seconds: 120   # under this, having written nothing, a failed
                                   # turn is one that never started
-    park_hint: one sentence added to the handback when a task is parked
+    park_hint: one sentence added to the handback at the `attempts` ceiling
     ---
 
     What this worker is and how it carries the work: its role, how it works,
@@ -6602,14 +6602,10 @@ def _close(entry, execution: str, outcome: str, status: str, detail: str | None,
         report["release_refused"] = refused.message
 
 
-def _park(entry, worker: dict, tid: str, execution: str, why: str,
+def _park(entry, tid: str, execution: str, why: str,
           marks: dict | None = None) -> None:
-    """Hand a task back to a person, carrying why it came back. The project's own
-    sentence goes with it: what a person about to read a parked task needs to
-    check is the project's knowledge, not this capability's. `marks` go on the
+    """Hand a task back to a person, carrying why it came back. `marks` go on the
     raise, so one that was never an attempt at the work says so."""
-    if worker["park_hint"]:
-        why = f"{why} {worker['park_hint']}"
     _note(entry, tid, why)
     try:
         _release(entry, execution, "handback", _OUTCOMES["handback"], why[:200],
@@ -6669,7 +6665,7 @@ def cmd_run(entry, args: list[str]) -> None:
     # to give a turn. The task goes back to a person saying what is missing, and
     # the raise is marked so that it spends no attempt: the task was never tried.
     if worker["missing"]:
-        _park(entry, worker, tid, execution,
+        _park(entry, tid, execution,
               f"Worker {worker['name']!r} cannot run this task: "
               + "; ".join(worker["missing"])
               + ". Handed back without starting a turn and without spending an "
@@ -6682,9 +6678,14 @@ def cmd_run(entry, args: list[str]) -> None:
 
     # Counted after the claim, because the claim is what made this raise exist.
     if _spent_attempts(entry, tid) > worker["limits"]["attempts"]:
-        _park(entry, worker, tid, execution,
-              f"Raised {worker['limits']['attempts']} times without finishing; handed "
-              "back for a decision rather than dispatched again.")
+        # The project's own sentence goes back with this park alone: it speaks to
+        # work that was tried, and what a person about to read a task the work kept
+        # failing on needs to check is the project's knowledge, not this capability's.
+        why = (f"Raised {worker['limits']['attempts']} times without finishing; handed "
+               "back for a decision rather than dispatched again.")
+        if worker["park_hint"]:
+            why = f"{why} {worker['park_hint']}"
+        _park(entry, tid, execution, why)
         report["parked"] = True
         _emit(report)
         return
