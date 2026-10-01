@@ -3408,6 +3408,9 @@ def _state_project_key(root: Path) -> str:
     return f"path-{digest}"
 
 
+STATE_RECORD = "state-root.json"
+
+
 def _state_marker_path(root: Path) -> Path:
     """Where a starting daemon records the state root it is actually using.
 
@@ -3415,8 +3418,31 @@ def _state_marker_path(root: Path) -> Path:
     so an invocation that re-derives the root can only guess at a daemon started
     with an override. The record is written by the process that starts the
     daemon, from the same value it hands the daemon, so the two cannot disagree.
+
+    The record is this project's operational state and names a path on one
+    machine, so it lives in the capability's project state home, which the
+    manager-owned guard keeps out of everything the project commits.
     """
-    return _project_capabilities_dir(root) / NAME / "state-root.json"
+    return _legacy_state_path(root) / STATE_RECORD
+
+
+def _unguarded_marker_path(root: Path) -> Path:
+    """The record's place beside the state home, where earlier releases wrote it.
+
+    No guard reaches this file, so a project that commits its body commits it.
+    It is still read, because a daemon an earlier release started is findable
+    through nothing else, and it goes as soon as the record in the state home
+    answers for a daemon, and with `stop`.
+    """
+    return _project_capabilities_dir(root) / NAME / STATE_RECORD
+
+
+def _record_made_its_directory(path: Path) -> bool:
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(record, dict) and record.get("created_directory") is True
 
 
 def _record_state_root(root: Path, state: Path) -> str | None:
@@ -3427,26 +3453,61 @@ def _record_state_root(root: Path, state: Path) -> str | None:
     regardless, and that cannot be a reason for the daemon not to exist. The
     failure is returned for the caller to surface rather than thrown, because
     unrecorded and unreported is the invisibility this record exists to remove.
+
+    The state home is also where the envelope layout kept all of the service's
+    state, and the upgrade from that layout takes the directory's existence for
+    one. A record that has to create the directory says so, which lets the
+    upgrade see past it and lets `stop` take the directory back with the record.
     """
     path = _state_marker_path(root)
+    made = False
     try:
+        made = not path.parent.exists()
+        created = made or _record_made_its_directory(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"state_dir": str(state)}, indent=2) + "\n")
+        record: dict[str, Any] = {"state_dir": str(state)}
+        if created:
+            record["created_directory"] = True
+        path.write_text(json.dumps(record, indent=2) + "\n")
     except OSError as exc:
+        if made:
+            with contextlib.suppress(OSError):
+                path.parent.rmdir()
         return (f"state root not recorded in {path}: {exc.strerror or exc}"
                 " - an invocation that does not carry AUTOMATIONS_STATE_DIR will answer"
                 " about the default root rather than about this daemon")
+    return _forget_unguarded_record(root)
+
+
+def _forget_unguarded_record(root: Path) -> str | None:
+    path = _unguarded_marker_path(root)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        return (f"state root record not removed from {path}: {exc.strerror or exc}"
+                " - it stays behind where the project commits it, and is ignored"
+                " while no live daemon answers for it")
     return None
 
 
 def _forget_state_root(root: Path) -> str | None:
     path = _state_marker_path(root)
+    created = _record_made_its_directory(path)
+    reasons: list[str] = []
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        return (f"state root record not removed from {path}: {exc.strerror or exc}"
-                " - it stays behind, and is ignored while no live daemon answers for it")
-    return None
+        reasons.append(f"state root record not removed from {path}: {exc.strerror or exc}"
+                       " - it stays behind, and is ignored while no live daemon answers for it")
+    else:
+        if created:
+            # Only while it is empty: whatever else is in it is not the record's.
+            with contextlib.suppress(OSError):
+                path.parent.rmdir()
+    unguarded = _forget_unguarded_record(root)
+    if unguarded is not None:
+        reasons.append(unguarded)
+    return "; ".join(reasons) or None
 
 
 def _state_record_unwritable(root: Path) -> str | None:
@@ -3467,16 +3528,20 @@ def _state_record_unwritable(root: Path) -> str | None:
             " not carry AUTOMATIONS_STATE_DIR")
 
 
-def _recorded_state_root(root: Path) -> Path | None:
-    try:
-        record = json.loads(_state_marker_path(root).read_text())
-    except (OSError, ValueError):
-        return None
-    raw = record.get("state_dir") if isinstance(record, dict) else None
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    path = Path(raw.strip()).expanduser()
-    return path if path.is_absolute() else root / path
+def _recorded_state_roots(root: Path) -> list[Path]:
+    """Every root a record names, the state home's record first."""
+    roots: list[Path] = []
+    for marker in (_state_marker_path(root), _unguarded_marker_path(root)):
+        try:
+            record = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            continue
+        raw = record.get("state_dir") if isinstance(record, dict) else None
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        path = Path(raw.strip()).expanduser()
+        roots.append(path if path.is_absolute() else root / path)
+    return roots
 
 
 def _state_resolution(root: Path) -> tuple[Path, str, list[str]]:
@@ -3491,13 +3556,14 @@ def _state_resolution(root: Path) -> tuple[Path, str, list[str]]:
     """
     default = _STATE_HOME / "capabilities" / "projects" / _state_project_key(root) / NAME
     override = _state_override(root)
-    recorded = _recorded_state_root(root)
+    recorded = _recorded_state_roots(root)
     considered = [str(path) for path in
-                  dict.fromkeys(path for path in (override, recorded, default) if path is not None)]
+                  dict.fromkeys(path for path in (override, *recorded, default) if path is not None)]
     if override is not None:
         return override, "override", considered
-    if recorded is not None and recorded != default and _pid_alive(_read_pid(recorded / "daemon.pid")):
-        return recorded, "daemon_record", considered
+    for path in recorded:
+        if path != default and _pid_alive(_read_pid(path / "daemon.pid")):
+            return path, "daemon_record", considered
     return default, "default", considered
 
 
@@ -3540,6 +3606,15 @@ def _copy_legacy_state(source: Path, destination: Path) -> int:
     return 1
 
 
+def _holds_only_its_own_record(legacy: Path) -> bool:
+    """Whether the directory exists only because the daemon's record made it."""
+    try:
+        names = [entry.name for entry in legacy.iterdir()]
+    except OSError:
+        return False
+    return names == [STATE_RECORD] and _record_made_its_directory(legacy / STATE_RECORD)
+
+
 def _migrate_legacy_state(root: Path, runtime, config: dict[str, Any]) -> dict[str, Any] | None:
     """Copy durable envelope state once and repoint historical run logs.
 
@@ -3547,6 +3622,10 @@ def _migrate_legacy_state(root: Path, runtime, config: dict[str, Any]) -> dict[s
     proving the XDG copy and the restarted service, which keeps rollback safe.
     Explicit AUTOMATIONS_STATE_DIR overrides are deliberate and never trigger
     an implicit migration from the former default.
+
+    The daemon's state root record lives in the same directory and is never part
+    of the envelope layout: it is not copied, and a directory that holds nothing
+    but a record that had to create it is not taken for that layout.
     """
     if _state_override(root) is not None:
         return None
@@ -3554,10 +3633,12 @@ def _migrate_legacy_state(root: Path, runtime, config: dict[str, Any]) -> dict[s
     target = _state_path(root)
     if not legacy.is_dir() or legacy.resolve() == target.resolve():
         return None
+    if _holds_only_its_own_record(legacy):
+        return None
     copied = 0
     try:
         for source in sorted(legacy.iterdir()):
-            if source.name in LEGACY_REGENERATED:
+            if source.name in LEGACY_REGENERATED or source.name == STATE_RECORD:
                 continue
             destination = target / source.name
             if source.name in LEGACY_APPENDED and source.is_file():
@@ -3715,7 +3796,7 @@ def cmd_service_init(force: bool) -> dict[str, Any]:
 
 def service_status(root: Path) -> dict[str, Any]:
     state, state_source, considered = _state_resolution(root)
-    record_error = None if _recorded_state_root(root) is not None \
+    record_error = None if _recorded_state_roots(root) \
         else _state_record_unwritable(root)
     pid_file = state / "daemon.pid"
     pid = _read_pid(pid_file)

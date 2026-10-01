@@ -8,6 +8,7 @@ import json
 import os
 import pytest
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -183,6 +184,66 @@ retries = 1
                 return row
             time.sleep(0.1)
         self.fail(f"run {run_id} did not reach {wanted}")
+
+    def git(self, *args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+             "-c", "commit.gpgsign=false", *args],
+            cwd=self.root, env=self.env, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            self.fail(f"git {args} exited {proc.returncode}\nstderr={proc.stderr}")
+        return proc.stdout
+
+    def commit_project(self) -> None:
+        """Make the fixture a repository whose envelope carries the manager's guard.
+
+        The guard is the manager's, so the manager writes it here rather than
+        this suite restating what it holds."""
+        home = Path(self.tmp.name) / "manager-home"
+        home.mkdir(exist_ok=True)
+        env = {**self.env, "HOME": str(home), "CAPABILITIES_HOME": str(home / ".capabilities"),
+               "XDG_CONFIG_HOME": str(home / ".config"), "XDG_CACHE_HOME": str(home / ".cache")}
+        proc = subprocess.run([str(MANAGER), "init"], cwd=self.root, env=env,
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.git("init", "-q")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "project")
+
+    def staged(self) -> list[str]:
+        """Everything a project that commits its whole body would commit now."""
+        self.git("add", "-A")
+        return self.git("diff", "--cached", "--name-status").splitlines()
+
+    def live_daemon(self, state_dir: str | Path) -> int:
+        """The pid of the daemon running on `state_dir`, once it has written it.
+
+        `service start` answers a moment after the launch, and on a loaded
+        machine that is before the daemon has written its pid file, so the
+        `pid` in the answer can be null and the file can still name the daemon
+        before it."""
+        pid_file = Path(state_dir) / "daemon.pid"
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, 0)
+                return pid
+            except (OSError, ValueError):
+                time.sleep(0.1)
+        self.fail(f"no running daemon wrote {pid_file}")
+
+    def kill_daemon(self, pid: int) -> None:
+        """End a daemon the way a crash or a reboot does: nothing runs after it."""
+        os.kill(pid, signal.SIGKILL)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"daemon {pid} survived SIGKILL")
 
     def test_agent_profiles_ship_without_configuration(self) -> None:
         agents = RUNTIME.load_agents({})
@@ -360,7 +421,7 @@ retries = 1
         # execs and has stderr, `start` returns a payload, and `status` is
         # where a reader checks a `running` they doubt.
         envelope = self.root / "capabilities" / "automations"
-        marker = envelope / "state-root.json"
+        marker = envelope / "state" / "state-root.json"
         pinned = Path(self.tmp.name) / "container-state"
         envelope.chmod(0o555)
         try:
@@ -390,6 +451,144 @@ retries = 1
         finally:
             envelope.chmod(0o755)
             self.cli("service", "stop", "--force", check=False)
+
+    def test_the_state_root_record_stays_out_of_what_the_project_commits(self) -> None:
+        # The record names a path on this machine, and some projects commit their
+        # whole body on an interval. It lives in the project state home, which the
+        # manager's guard keeps out of every commit, whether the daemon was started
+        # on the default root or under a supervisor's override.
+        self.commit_project()
+        marker = self.root / "capabilities" / "automations" / "state" / "state-root.json"
+
+        started = json.loads(self.cli("service", "start").stdout)
+        self.live_daemon(started["state_dir"])
+        self.assertEqual(json.loads(marker.read_text())["state_dir"], started["state_dir"])
+        self.assertEqual(self.staged(), [])
+        self.cli("service", "stop", "--timeout", "5")
+
+        pinned = Path(self.tmp.name) / "supervised-state"
+        supervised = subprocess.Popen(
+            [str(CLI), "service", "run"], cwd=self.root,
+            env={**self.env, "AUTOMATIONS_STATE_DIR": str(pinned)},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline and not (pinned / "daemon.pid").is_file():
+                time.sleep(0.1)
+            self.assertTrue((pinned / "daemon.pid").is_file(), "supervised daemon did not start")
+            self.assertEqual(json.loads(marker.read_text())["state_dir"], str(pinned))
+            self.assertEqual(self.staged(), [])
+        finally:
+            supervised.terminate()
+            supervised.wait(timeout=15)
+
+    def test_a_daemon_an_earlier_release_started_is_still_found_and_stopped(self) -> None:
+        # An earlier release wrote the record beside the state home. A daemon it
+        # started under an override is findable through that record alone, so a
+        # later shell still answers about it and `stop` still reaches it, and the
+        # record goes with the daemon.
+        envelope = self.root / "capabilities" / "automations"
+        unguarded = envelope / "state-root.json"
+        pinned = Path(self.tmp.name) / "earlier-release-state"
+        started = json.loads(subprocess.run(
+            [str(CLI), "service", "start"], cwd=self.root,
+            env={**self.env, "AUTOMATIONS_STATE_DIR": str(pinned)},
+            capture_output=True, text=True, timeout=30, check=True).stdout)
+        pid = self.live_daemon(started["state_dir"])
+        # What that release leaves behind: the same record, in its old place only.
+        (envelope / "state" / "state-root.json").unlink()
+        (envelope / "state").rmdir()
+        unguarded.write_text(json.dumps({"state_dir": str(pinned)}, indent=2) + "\n")
+
+        status = json.loads(self.cli("service", "status").stdout)
+        self.assertTrue(status["running"])
+        self.assertEqual(status["pid"], pid)
+        self.assertEqual(status["state_dir"], str(pinned))
+        self.assertEqual(status["state_dir_source"], "daemon_record")
+
+        stopped = json.loads(self.cli("service", "stop", "--timeout", "10").stdout)
+        self.assertTrue(stopped["stopped"])
+        self.assertEqual(stopped["pid"], pid)
+        self.assertNotIn("state_record_error", stopped)
+        self.assertFalse(unguarded.exists())
+        self.assertFalse((pinned / "daemon.pid").exists())
+
+    def test_the_first_start_stops_the_project_carrying_an_earlier_record(self) -> None:
+        # A record an earlier release left beside the state home, committed with
+        # the body, leaves the project at the first daemon start: the project's
+        # next commit takes it out and adds nothing in its place.
+        self.commit_project()
+        unguarded = self.root / "capabilities" / "automations" / "state-root.json"
+        unguarded.write_text(json.dumps(
+            {"state_dir": str(Path(self.tmp.name) / "spent-state")}, indent=2) + "\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "a record an earlier release wrote")
+
+        started = json.loads(self.cli("service", "start").stdout)
+        self.assertTrue(started["started"])
+        self.assertNotIn("state_record_error", started)
+        self.assertFalse(unguarded.exists())
+        self.assertEqual(self.staged(),
+                         ["D\tcapabilities/automations/state-root.json"])
+        self.git("commit", "-qm", "snapshot")
+        self.assertFalse([path for path in self.git("ls-files").splitlines()
+                          if path.endswith("state-root.json")])
+
+    def test_the_state_root_record_never_reads_as_the_envelope_layout(self) -> None:
+        # The record lives in the directory the envelope layout kept its state in,
+        # and the upgrade from that layout takes that directory's existence for
+        # one. Nothing the record does - a start, a stop, a daemon that died with
+        # its record still in place - may set the upgrade off or be copied by it.
+        state_home = self.root / "capabilities" / "automations" / "state"
+        first = json.loads(self.cli("service", "start").stdout)
+        self.assertNotIn("state_migration", first)
+        self.assertTrue((state_home / "state-root.json").is_file())
+        self.live_daemon(first["state_dir"])
+        self.cli("service", "stop", "--timeout", "5")
+        self.assertFalse(state_home.exists())
+
+        second = json.loads(self.cli("service", "start").stdout)
+        self.assertNotIn("state_migration", second)
+        self.kill_daemon(self.live_daemon(second["state_dir"]))
+        self.assertTrue((state_home / "state-root.json").is_file())
+
+        third = json.loads(self.cli("service", "start").stdout)
+        self.assertTrue(third["started"])
+        self.assertNotIn("state_migration", third)
+        self.assertFalse((Path(third["state_dir"]) / "state-root.json").exists())
+        self.live_daemon(third["state_dir"])
+        self.cli("service", "stop", "--timeout", "5")
+        self.assertFalse(state_home.exists())
+
+    def test_a_legacy_state_directory_the_record_shares_is_migrated_as_before(self) -> None:
+        # A directory the record found already there is the envelope layout as
+        # it always was, emptied or not: it is still migrated and kept, and the
+        # record sharing it is neither copied nor a conflict.
+        legacy = self.root / "capabilities" / "automations" / "state"
+        legacy.mkdir(parents=True)
+        (legacy / "cursor.json").write_text('{"cursor": 1}\n')
+
+        first = json.loads(self.cli("service", "start").stdout)
+        self.assertEqual(first["state_migration"]["files_copied"], 1)
+        target = Path(first["state_dir"])
+        self.kill_daemon(self.live_daemon(target))
+        self.assertTrue((legacy / "state-root.json").is_file())
+
+        second = json.loads(self.cli("service", "start").stdout)
+        self.assertTrue(second["started"])
+        self.assertEqual(second["state_migration"]["files_copied"], 0)
+        self.assertFalse((target / "state-root.json").exists())
+        self.live_daemon(target)
+        self.cli("service", "stop", "--timeout", "5")
+        self.assertEqual(sorted(path.name for path in legacy.iterdir()), ["cursor.json"])
+
+        (legacy / "cursor.json").unlink()
+        third = json.loads(self.cli("service", "start").stdout)
+        self.assertEqual(third["state_migration"]["files_copied"], 0)
+        self.live_daemon(target)
+        self.cli("service", "stop", "--timeout", "5")
+        self.assertTrue(legacy.is_dir())
+        self.assertEqual(list(legacy.iterdir()), [])
 
     def test_declared_agent_adds_and_overrides_field_by_field(self) -> None:
         agents = RUNTIME.load_agents({
