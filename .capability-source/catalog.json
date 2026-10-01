@@ -67,7 +67,7 @@
     },
     "geminitalk": {
       "path": "capabilities/geminitalk",
-      "payload_sha256": "2a3bc029233f26f2f6031da4a97ae1ecc74f631cc8ce7ad60ab06bf137ac2cf0",
+      "payload_sha256": "1e26b02ca02a738d490cb47326617a2073c87a4566c14babc80cfcb314aa9879",
       "summary": "Gemini Live native-audio project companion with continuous duplex audio, bounded project tools, optional headless Codex delegation, and an active Codex-thread relay."
     },
     "ical": {

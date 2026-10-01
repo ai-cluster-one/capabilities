@@ -5057,6 +5057,7 @@ def main() -> None:
     if cmd == "init":
         if rest:
             _die(6, "input", "usage: geminitalk init")
+        _read_only_gate(f"`{NAME} init`")
         _emit(cmd_init())
         return
     reg, _ = _connections_registry()
