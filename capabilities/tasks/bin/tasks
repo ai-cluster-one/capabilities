@@ -259,10 +259,11 @@ WORKERS
   not, so switching a worker off or breaking its file never hands its types to
   `default` - on the library's `claude-act` profile, with no routines. While a
   worker file's types cannot be read at all, `default` takes nothing: `run`
-  refuses it naming the file, and `doctor` says so. Its body tells the turn to treat the task as the
-  request of the person responsible for it, work out from the task, its trail
-  and the project's own context what is asked, and hand the task to a person in
-  `waiting` with the question when one is needed. A project file
+  refuses it naming the file, and `doctor` says so. Its body tells the turn to treat the task as an
+  assignment given within the project's own authority: work out from the task,
+  its trail and the project's own context what is asked, act inside what the
+  project's doctrine lets an unattended turn do, and hand the task to a named
+  person in `waiting` with the question when one is needed. A project file
   `workers/default.md` replaces it whole, and `enabled: false` in that file
   switches it off. Like every worker it claims only its own project's tasks, so
   it never takes one another project created.

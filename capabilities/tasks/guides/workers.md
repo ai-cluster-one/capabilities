@@ -65,7 +65,7 @@ Here `scripts/resource-free.py` reads the task from stdin, exits 0 when the reso
 
 ## Shipped workers and project files
 
-The capability ships two workers. `default` takes every `todo` task of a type no project worker file names in `takes` or `on_request`, so a project with no workers of its own still has its queue worked; its body treats each task as a request from the person responsible for it. `supervisor` ships switched off; `tasks guide loops` explains its role.
+The capability ships two workers. `default` takes every `todo` task of a type no project worker file names in `takes` or `on_request`, so a project with no workers of its own still has its queue worked; its body treats each task as an assignment given within the project's own authority, to act on inside what the project's doctrine lets an unattended turn do. `supervisor` ships switched off; `tasks guide loops` explains its role.
 
 A project file with the name of a shipped worker replaces the shipped file whole. Nothing is merged: to change one setting of a shipped worker, copy the whole shipped file - `doctor` names its path - into the project's `workers/` and edit it there. `doctor` reports the project file as the worker's source and names the shipped file it shadows. A project switches the supervisor on this way, with its own `workers/supervisor.md`.
 

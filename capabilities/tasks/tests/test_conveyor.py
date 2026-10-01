@@ -370,11 +370,13 @@ def test_the_shipped_default_takes_what_nothing_else_does(project):
 
 def test_the_shipped_default_says_what_it_is_for(project):
     body = mod._worker("default")["body"]
-    for said in ("as if the person responsible for it had written it to you in a "
-                 "conversation",
+    for said in ("Treat this task as an assignment given within this project's own "
+                 "authority",
                  "Work out from the task, its trail and this project's own context what "
                  "is being asked and what to do",
-                 "hand the task to them in `waiting` with the question"):
+                 "act on it inside what this project's doctrine lets an unattended "
+                 "turn do",
+                 "hand the task to that person by name in `waiting` with the question"):
         assert said in body, said
 
 
@@ -833,7 +835,7 @@ def test_a_worker_naming_no_routine_is_told_to_choose_and_say_so(project):
 def test_the_shipped_default_prompt_is_whole(project):
     prompt = mod._prompt(mod._worker("default"), a_task("chore"), [], 1, None)
     assert "You are the worker `default`" in prompt
-    assert "as if the person responsible for it had written it" in prompt
+    assert "as an assignment given within this project's own authority" in prompt
     assert "No procedure is named for this work." in prompt
 
 
