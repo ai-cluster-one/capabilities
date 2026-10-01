@@ -189,19 +189,68 @@ def _parse_env_file(path: Path) -> dict:
     return out
 
 
+def _home_dirs() -> set[Path]:
+    """Every directory that is a home directory of the account running this.
+
+    $HOME answers for the process and moves wherever a caller points it; the
+    password database answers for the account and cannot be pointed anywhere.
+    A caller that redirects $HOME - a dev lane, a service under a supervisor, a
+    sandbox - would otherwise carry the guard onto the home it invented and stop
+    excluding the account's own, which is the one the machine registry sits in.
+    """
+    import pwd
+
+    homes: set[Path] = set()
+    candidates = [Path.home()]
+    try:
+        account = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        account = ""
+    # The account's field counts only when it is absolute. An empty or relative
+    # one names no directory of its own: it resolves against the cwd, an empty
+    # one to the cwd itself, so taken as a home it would stop the walk wherever
+    # the process stands. Some service accounts carry an empty field.
+    if os.path.isabs(account):
+        candidates.append(Path(account))
+    for candidate in candidates:
+        try:
+            homes.add(candidate.resolve())
+        except OSError:
+            continue
+    return homes
+
+
+def _is_machine_registry(path: Path) -> bool:
+    """Whether this `.capabilities/` is a machine registry, not a legacy envelope.
+
+    The two share the name, and only the registry carries `.manager/`. The
+    registry $CAPABILITIES_HOME points at names itself even without it.
+    """
+    registry = Path(os.environ.get("CAPABILITIES_HOME") or (Path.home() / ".capabilities"))
+    try:
+        if path.resolve() == registry.resolve():
+            return True
+    except OSError:
+        return False
+    return (path / ".manager").is_dir()
+
+
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
     the first directory holding capabilities/, legacy .capabilities/,
     .contextkit/config.toml, .env(.local), or .git.
     Markers are read from the filesystem alone: the root is what the envelope
     location is resolved against, so resolving one cannot depend on the other.
-    $HOME is never a project root (the machine registry lives there)."""
+    A home directory is never a project root (the machine registry lives in
+    one), and a `.capabilities/` that is a machine registry names that registry
+    rather than a legacy envelope."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
-    home = Path.home().resolve()
+    homes = _home_dirs()
     for d in (here, *here.parents):
-        if d == home:
+        if d in homes:
             return None
+        legacy = d / ".capabilities"
         # Either marker names a project. `settings.json` is the gate and
         # `project.json` the identity; a project keeping its records in the
         # store needs the second and may eventually stop carrying the first,
@@ -209,7 +258,7 @@ def _project_root() -> Path | None:
         if ((d / "capabilities" / "settings.json").is_file()
                 or (d / "capabilities" / "project.json").is_file()
                 or (d / ".contextkit" / "config.toml").is_file()
-                or (d / ".capabilities").is_dir()
+                or (legacy.is_dir() and not _is_machine_registry(legacy))
                 or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
             return d
