@@ -7944,6 +7944,15 @@ def main():
         allow_write = bool((entry or {}).get("allow_write", WRITE_DEFAULT))
         _write_gate(cid, allow_write, args.command)
 
+    # Pairing changes the account: the phone gains a linked device, and on a
+    # WAHA connection the bridge's session is created, started or discarded.
+    # It is still not a write verb, because a connection's grant is about
+    # sending and a connection that may not send is paired all the same to be
+    # read. So the read-only switch refuses it here on its own, before any
+    # request is made and before the engine starts.
+    if args.command == "pair":
+        _read_only_gate(f"`{NAME} pair`")
+
     result = {
         "help": cmd_help,
         "contract": cmd_contract,
