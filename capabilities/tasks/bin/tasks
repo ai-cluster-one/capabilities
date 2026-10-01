@@ -21,6 +21,7 @@ READING
   tasks ready [filters]           the queue a worker consumes: every field and
                                   the whole trail, for what may be picked up now
   tasks show <task>               one task, every field, whole activity trail
+  tasks meta show <task>          the whole metadata object
   tasks search <text> [filters]   the same scan, narrowed by substring over
                                   title, objective, description, unique key,
                                   assignee and the metadata JSON. Earliest
@@ -40,7 +41,6 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
                                                 moves updated_at
   tasks tag <task> <tag> [tag...]               add tags, never replacing
   tasks untag <task> <tag> [tag...]             remove tags by name
-  tasks meta show <task>                        the whole metadata object
   tasks meta set <task> <key> <value> [<key> <value>...]
                                                 set the keys named, all or none,
                                                 leaving the rest as they were
@@ -48,7 +48,8 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
   tasks activity <task> "what happened"          record real work done
   tasks migrate [--apply]                       create what this connection's
                                                 schema is missing; reports and
-                                                touches nothing without --apply
+                                                touches nothing without --apply,
+                                                and then needs no allow_write
 
 EXECUTION  (also needs allow_write)
   tasks claim [filters | --key KEY] [--lease 3h] [--worker NAME] [--handler CMD]
@@ -66,7 +67,8 @@ EXECUTION  (also needs allow_write)
                                   worker's `takes` selects, boot one harness turn on
                                   what it took, and settle the raise from where
                                   the turn left the task. Reports what it would
-                                  take and writes nothing without `--apply`
+                                  take and writes nothing without `--apply`,
+                                  and then needs no allow_write
 
   A claim is held by a lease and nothing else. Give one longer than the work
   itself can take: when the moment passes, the next claim closes the raise as
@@ -4224,7 +4226,7 @@ def _one_of(value: str, allowed: tuple, label: str) -> None:
 
 
 def _flags(args: list[str], names: tuple, multi: tuple = (), bools: tuple = (), *,
-           takes: int = 0) -> dict:
+           takes: int = 0, raising: bool = False) -> dict:
     """--key value and --key=value; a key in `multi` accumulates instead of
     overwriting.
 
@@ -4235,7 +4237,16 @@ def _flags(args: list[str], names: tuple, multi: tuple = (), bools: tuple = (), 
     success.
 
     A lone `--` ends the flags: every token after it is positional as written,
-    so a text that begins with dashes can still be given."""
+    so a text that begins with dashes can still be given.
+
+    A caller that only asks how a call reads passes `raising`, and a call that
+    cannot be read is handed back to it as a Refusal instead of ending the
+    process."""
+    def refuse(message: str, hint: str | None = None) -> NoReturn:
+        if raising:
+            raise Refusal(6, "input", message, hint)
+        _die(6, "input", message, hint)
+
     out: dict = {}
     loose: list[str] = []
     i = 0
@@ -4259,14 +4270,14 @@ def _flags(args: list[str], names: tuple, multi: tuple = (), bools: tuple = (), 
             if key in bools and not inline:
                 out[key] = True; i += 1; continue
             if key not in names:
-                _die(6, "input", f"unknown flag --{key}",
-                     f"accepted: {', '.join('--' + n for n in sorted(set(names) | set(bools)))}")
+                refuse(f"unknown flag --{key}",
+                       f"accepted: {', '.join('--' + n for n in sorted(set(names) | set(bools)))}")
             if inline:
                 value = inline; i += 1
             elif i + 1 < len(args):
                 value = args[i + 1]; i += 2
             else:
-                _die(6, "input", f"--{key} needs a value")
+                refuse(f"--{key} needs a value")
             if key in multi:
                 out.setdefault(key, []).append(value)
             else:
@@ -4275,8 +4286,8 @@ def _flags(args: list[str], names: tuple, multi: tuple = (), bools: tuple = (), 
         loose.append(a); i += 1
     out["_loose"] = loose[:takes]
     if len(loose) > takes:
-        _die(6, "input", f"unexpected argument {loose[takes]!r}",
-             "quote a value that contains spaces")
+        refuse(f"unexpected argument {loose[takes]!r}",
+               "quote a value that contains spaces")
     return out
 
 
@@ -5330,7 +5341,7 @@ def cmd_meta(entry, args: list[str]) -> None:
     `set` writes all of its pairs in one statement, so they land together or not
     at all: a task holding some of the keys a caller sent reads exactly like one
     holding all of them, and nothing on it would say the rest never arrived."""
-    opts = _flags(args, ("actor",), takes=99)
+    opts = _flags(args, **_FORM_ARGS["meta"])
     loose = opts["_loose"]
     if not loose:
         _die(6, "input", "meta needs an action",
@@ -7308,7 +7319,7 @@ def cmd_run(entry, args: list[str]) -> None:
     # service, so a run by hand selects exactly as it always has.
     exclude = tuple(one for one in os.environ.pop(_EXCLUDE_ENV, "").split(",") if one)
     narrowed = (exclude,) if exclude else ()
-    opts = _flags(args, ("key",), bools=("apply",), takes=1)
+    opts = _flags(args, **_FORM_ARGS["run"])
     if not opts["_loose"]:
         _die(6, "input", "run needs a worker",
              f"{NAME} run <worker> [--key KEY] [--apply]")
@@ -8325,7 +8336,7 @@ def cmd_migrate(entry, args: list[str]) -> None:
     than by trusting that the statements ran, because a partially applied
     schema and a fully applied one both return without error from a batch of
     `if not exists`."""
-    opts = _flags(args, (), bools=("apply",))
+    opts = _flags(args, **_FORM_ARGS["migrate"])
     schema = _schema(entry)
     ddl = _schema_ddl(schema)
     # Asked before anything is read, because it is also the value the backfill
@@ -8434,6 +8445,37 @@ def _guarded(handler, entry, rest) -> None:
              f"`{NAME} doctor` proves the store is reachable and the schema is present")
 
 
+# The write verbs that also have a form writing nothing, and how each reads its
+# arguments. The verb parses its call with this spec and so does the write gate,
+# so the two cannot read one call as different forms.
+_FORM_ARGS = {
+    "meta": {"names": ("actor",), "takes": 99},
+    "migrate": {"names": (), "bools": ("apply",)},
+    "run": {"names": ("key",), "bools": ("apply",), "takes": 1},
+}
+
+
+def _reads_only(verb: str, rest: list[str]) -> bool:
+    """Whether this call of a write verb is its form that writes nothing: `meta
+    show`, or `migrate` or `run` without `--apply`. That form answers whatever
+    the connection grants, so a read-only grant or the read-only switch leaves it
+    reading.
+
+    The call is read with the verb's own spec, so a call the verb would take as
+    a write is never let past the gate as a read. A call the verb cannot read
+    at all is no read either, and goes to the gate as it always did."""
+    spec = _FORM_ARGS.get(verb)
+    if spec is None:
+        return False
+    try:
+        opts = _flags(rest, **spec, raising=True)
+    except Refusal:
+        return False
+    if verb == "meta":
+        return opts["_loose"][:1] == ["show"]
+    return not opts.get("apply")
+
+
 def main() -> None:
     _gate()
     argv = sys.argv[1:]
@@ -8474,7 +8516,7 @@ def main() -> None:
     # every verb below asks the same question of the same answer.
     globals()["PROJECT_IDENTITY"] = _project_id_state()
     globals()["PROJECT"] = _declared_project()
-    if verb in WRITE_VERBS:
+    if verb in WRITE_VERBS and not _reads_only(verb, rest):
         _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), verb)
     handlers = {
         "list": cmd_list, "ready": cmd_ready, "show": cmd_show, "search": cmd_search,

@@ -5,10 +5,12 @@
 # ///
 """Under CAPABILITIES_READ_ONLY the task tracker reads and records nothing.
 
-Every write verb reaches the contract's write gate, which the switch closes
-whatever the connection grants, so the queue can be read by a process that may
-not move it. These run the CLI as a project would, against TASKS_TEST_DSN in a
-schema of their own that they drop, and skip when it is unset.
+Every write reaches the contract's write gate, which the switch closes whatever
+the connection grants, so the queue can be read by a process that may not move
+it. `meta show`, and `migrate` and `run` without `--apply`, write nothing and
+answer under the switch and under a read-only grant alike. These run the CLI as
+a project would, against TASKS_TEST_DSN in a schema of their own that they
+drop, and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
 """
@@ -49,13 +51,15 @@ def lab(tmp_path):
     (envelope / "project.json").write_text(json.dumps({
         "schema": "capabilities.project.v1",
         "id": "prj_" + uuid.uuid4().hex[:12], "slug": "lab"}))
+    store = {
+        "db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
+        "db_user": info.get("user"), "db_name": info.get("dbname"),
+        "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
+        "secret_env": "TASKS_TEST_PASSWORD"}
     (envelope / "tasks" / "connections.json").write_text(json.dumps({
         "default": "local",
-        "connections": {"local": {
-            "db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-            "db_user": info.get("user"), "db_name": info.get("dbname"),
-            "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-            "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}}}))
+        "connections": {"local": {**store, "allow_write": True},
+                        "reader": {**store, "allow_write": False}}}))
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),
@@ -118,6 +122,40 @@ def test_reads_work_and_every_write_verb_is_refused(lab, value):
     assert after["task"]["status"] == "draft"
     assert after["activities"] == []
     assert _total(lab) == 1
+
+
+@pytest.mark.parametrize("gate", ["1", "true", "reader"])
+def test_the_forms_that_write_nothing_answer_and_their_writes_stay_refused(lab, gate):
+    """`meta show`, and `migrate` and `run` without `--apply`, answer behind the
+    gate exactly as they do in front of it, while every form of those verbs that
+    writes - however its flags are placed - is still refused before the store."""
+    made = _tasks(lab, "add", "--type", "proposal", "--title", "forms", "--key", "f-1")
+    assert made.returncode == 0, made.stdout + made.stderr
+    assert _tasks(lab, "meta", "set", "f-1", "a", "1").returncode == 0
+    if gate == "reader":
+        switch, connection, code = None, ("--connection", "reader"), "read_only"
+    else:
+        switch, connection, code = gate, (), "read_only_switch"
+
+    for args in (("meta", "show", "f-1"), ("migrate",), ("run", "default")):
+        open_ = _tasks(lab, *args)
+        gated = _tasks(lab, *connection, *args, switch=switch)
+        assert gated.returncode == 0, (args, gated.stdout, gated.stderr)
+        assert gated.stdout == open_.stdout, args
+
+    before = _tasks(lab, "show", "f-1").stdout
+    for args in (("meta", "set", "f-1", "a", "2"),
+                 ("meta", "rm", "f-1", "a"),
+                 ("meta", "--actor", "show", "set", "f-1", "a", "2"),
+                 ("migrate", "--apply"),
+                 ("migrate", "--apply="),
+                 ("run", "default", "--apply"),
+                 ("run", "--apply", "default")):
+        refused = _tasks(lab, *connection, *args, switch=switch)
+        assert refused.returncode == 4, (args, refused.stdout, refused.stderr)
+        error = json.loads(refused.stderr.strip().splitlines()[-1])["error"]
+        assert error["code"] == code, args
+    assert _tasks(lab, "show", "f-1").stdout == before
 
 
 def test_connections_names_the_switch(lab):
