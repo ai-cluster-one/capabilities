@@ -5777,6 +5777,11 @@ async def run_session(client):
         each message on its own, and an untagged tail chunk would wake it."""
         sent = None
         sent_ids = []
+        # `defaults.link_preview`, read per send so a reload takes effect. Named
+        # only when it is off: Telethon's own default is a preview, so a service
+        # that never set it makes exactly the call it always made.
+        if DEFAULTS.get("link_preview", True) is False:
+            kwargs.setdefault("link_preview", False)
         threaded = reply_to is not None and (force_reply or not is_direct)
         for chunk in message_chunks(text, reserve=len(mark) + 2 if mark else 0):
             body = _with_marker(chunk, mark) if mark else chunk

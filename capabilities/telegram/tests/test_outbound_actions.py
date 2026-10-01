@@ -340,6 +340,14 @@ class OutboundActionsTests(unittest.TestCase):
         self.assertEqual(result["reply_to"], 7597)
         self.assertEqual(self.client.messages[0][2], {"reply_to": 7597})
 
+    def test_send_can_go_without_a_link_preview(self):
+        asyncio.run(self.cli.cmd_send(
+            {"id": "test"}, "-1001", "see https://example.com",
+            None, None, False, False))
+
+        self.assertEqual(self.client.messages[0][2],
+                         {"reply_to": None, "link_preview": False})
+
     def test_send_refuses_two_conflicting_reply_targets(self):
         with self.assertRaises(SystemExit) as stopped:
             asyncio.run(self.cli.cmd_send(

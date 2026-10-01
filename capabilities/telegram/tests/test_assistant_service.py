@@ -6266,6 +6266,57 @@ class UnsignedSsrcTests(unittest.TestCase):
             self.assertEqual({1, 2}, daemon._ssrc_set([1, 2, None]))
 
 
+class LinkPreviewTests(unittest.IsolatedAsyncioTestCase):
+    """`defaults.link_preview` decides the preview card on the reply path."""
+
+    async def answer(self, reply, **default_overrides):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(**default_overrides))
+            daemon.WORKERS["stub"] = lambda *_args, **_kwargs: successful_result(reply)
+            message = Message(91, text="Assistant, answer this")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 91)
+            client.disconnected.set()
+            await asyncio.wait_for(task, timeout=5)
+            return client.sent
+
+    async def test_unset_leaves_the_call_as_it_was(self):
+        sent = await self.answer("See https://example.com/docs.")
+
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("link_preview", sent[0])
+
+    async def test_false_sends_every_chunk_without_a_preview(self):
+        sent = await self.answer("https://example.com/a " + "word " * 1200,
+                                 link_preview=False)
+
+        self.assertGreater(len(sent), 1)
+        self.assertEqual([item.get("link_preview") for item in sent],
+                         [False] * len(sent))
+
+    def test_a_value_that_is_not_a_boolean_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td)
+            document = {
+                "connection": "test", "assistant_name": "Assistant",
+                "direct_messages": {"mode": "anyone",
+                                    "default_role": "direct_user"},
+                "allowed_users": {}, "allowed_groups": {}}
+
+            daemon.validate_settings(
+                {**document, "defaults": {"link_preview": False}}, root, root)
+            with self.assertRaisesRegex(Exception,
+                                        "link_preview: must be a boolean"):
+                daemon.validate_settings(
+                    {**document, "defaults": {"link_preview": "off"}},
+                    root, root)
+
+
 class MediaLogLevelTests(unittest.TestCase):
     """The media stack is read at the level the settings ask for."""
 

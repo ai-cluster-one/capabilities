@@ -112,12 +112,18 @@ Commands:
                                                the same forum-topic scoping and
                                                `topic_id` as `read`.
   telegram send <chat> <text> [--reply-to MSG_ID | --topic TOPIC_ID] [--external]
+            [--no-link-preview]
                                                Send a message. In a forum, a
                                                message lands in the topic named
                                                by --topic (its root message id)
                                                or in the topic owning the
                                                --reply-to message; with neither
                                                it lands in General.
+                                               --no-link-preview sends it
+                                               without the preview card Telegram
+                                               attaches to a link; the service's
+                                               own messages take the same switch
+                                               as `defaults.link_preview`.
   telegram send-media <chat> <path> [--caption TEXT]
             [--reply-to MSG_ID | --topic TOPIC_ID]
                                                  Send a local media file; the
@@ -4369,13 +4375,17 @@ def _external_request(text: str) -> str:
 
 
 async def cmd_send(cfg, chat: str, text: str, reply_to: int | None = None,
-                   topic: int | None = None, external: bool = False) -> dict:
+                   topic: int | None = None, external: bool = False,
+                   link_preview: bool = True) -> dict:
     text = _external_request(text) if external else text
     target = _reply_target(reply_to, topic)
     client = make_client(cfg)
     await _require_auth(client)
     entity = await resolve_chat(client, chat)
-    sent = await client.send_message(entity, text, reply_to=target)
+    # Named only when it is off: Telethon's own default is a preview, so a send
+    # without the flag makes exactly the call it always made.
+    preview = {} if link_preview else {"link_preview": False}
+    sent = await client.send_message(entity, text, reply_to=target, **preview)
     await client.disconnect()
     return {"sent_id": sent.id, "to": entity_label(entity), "reply_to": target}
 
@@ -6526,6 +6536,11 @@ def main() -> None:
     pn.add_argument("--external", action="store_true",
                     help="ask the answering assistant to tag its reply so no "
                          "peer daemon answers it")
+    pn.add_argument("--no-link-preview", dest="link_preview",
+                    action="store_false",
+                    help="send without the preview card Telegram attaches to "
+                         "a link; the service's switch is "
+                         "defaults.link_preview")
 
     pm = sub.add_parser("send-media", help="send a local media file")
     pm.add_argument("chat")
@@ -6790,7 +6805,7 @@ def main() -> None:
         elif args.cmd == "send":
             _emit(asyncio.run(cmd_send(
                 cfg, args.chat, args.text, args.reply_to, args.topic,
-                args.external)))
+                args.external, args.link_preview)))
         elif args.cmd == "send-media":
             _emit(asyncio.run(cmd_send_media(
                 cfg, args.chat, args.path, args.caption, args.reply_to,

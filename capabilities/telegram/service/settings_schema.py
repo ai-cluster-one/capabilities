@@ -529,9 +529,11 @@ def _defaults(value, path, project_root, service_dir):
         "max_parallel_dialogue", "max_parallel_jobs", "job_poll_interval",
         "job_recovery", "max_attempts", "group_aliases", "worker", "workers",
         "voice_agent", "delegation",
-        "media_log_level",
+        "media_log_level", "link_preview",
     }
     _unknown(value, allowed, path)
+    if "link_preview" in value:
+        _boolean(value["link_preview"], f"{path}.link_preview")
     if "assistant_name" in value:
         _string(value["assistant_name"], f"{path}.assistant_name", nonempty=True)
     if "delegation" in value:
