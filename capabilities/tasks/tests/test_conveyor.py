@@ -1731,5 +1731,474 @@ def test_a_disabled_workers_types_never_fall_to_the_default(project, store,
     assert conn.execute(f"select count(*) from {schema}.task_executions").fetchone()[0] == 0
 
 
+# --- Handoff by assignee, and a cut-off session resumed ----------------------
+
+class Turns:
+    """The library with the turn replaced by a list of turns, taken in order.
+    Each is called with the raise and the session it was given, writes through
+    the verbs as a worker would, and returns the harness's result."""
+
+    Profile, Session, FailureKind = (harness_runner.Profile, harness_runner.Session,
+                                     FailureKind)
+    find_profile_file = staticmethod(harness_runner.find_profile_file)
+    ProfileNotFound = harness_runner.ProfileNotFound
+
+    def __init__(self, *turns):
+        self.turns, self.calls = list(turns), []
+
+    def run(self, prompt, profile, cwd, *, session=None, environ=None, extra_env=None,
+            **kw):
+        execution = extra_env["TASKS_EXECUTION"]
+        self.calls.append({"prompt": prompt, "session": session,
+                           "execution": execution, "harness": profile.harness})
+        return self.turns.pop(0)(execution, session)
+
+
+def _turns(monkeypatch, *turns) -> Turns:
+    harness = Turns(*turns)
+    monkeypatch.setattr(mod, "_harness_runner", lambda: harness)
+    return harness
+
+
+def _as_raise(monkeypatch, capsys, execution, *calls):
+    """Write under the raise, the way the turn's own `tasks` calls do."""
+    monkeypatch.setenv("TASKS_EXECUTION", execution)
+    try:
+        for verb, args in calls:
+            verb(*args)
+    finally:
+        monkeypatch.delenv("TASKS_EXECUTION")
+    capsys.readouterr()
+
+
+def _done(session):
+    return Result(ok=True, harness="claude", answer="done", session_id=session.id,
+                  model="m", cost_usd=0.1, duration_ms=10, num_turns=1)
+
+
+def _timed_out(session):
+    return Result(ok=False, harness="claude", session_id=session.id, model="m",
+                  cost_usd=0.5, duration_ms=10_800_000, num_turns=30,
+                  failure=Failure(FailureKind.TIMEOUT, "turn timed out after 10800s"))
+
+
+def _raises(entry, capsys, key):
+    mod.cmd_runs(entry, [key])
+    return _answer(capsys)["executions"]
+
+
+def _todo(entry, capsys, key, *extra):
+    mod.cmd_add(entry, ["--type", "defect", "--title", "A probe", "--key", key,
+                        "--status", "todo", *extra])
+    capsys.readouterr()
+
+
+def _lands(entry, monkeypatch, capsys, key, *set_args, note="worked on it"):
+    """A turn that writes an entry and then sets the task as `set_args` say."""
+    def turn(execution, session):
+        calls = [(mod.cmd_activity, (entry, [key, note]))]
+        if set_args:
+            calls.append((mod.cmd_set, (entry, [key, *set_args])))
+        _as_raise(monkeypatch, capsys, execution, *calls)
+        return _done(session)
+    return turn
+
+
+@needs_store
+def test_landing_in_todo_with_another_assignee_is_a_handoff(project, store, monkeypatch,
+                                                            capsys):
+    entry, _schema, _conn = store
+    _todo(entry, capsys, "t-hand", "--assignee", "builder")
+    _turns(monkeypatch, _lands(entry, monkeypatch, capsys, "t-hand",
+                               "--status", "todo", "--assignee", "dispatcher"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    assert report["handoff"] is True
+    [raised] = _raises(entry, capsys, "t-hand")
+    assert raised["status"] == "ok" and raised["metrics"]["handoff"] is True
+    mod.cmd_show(entry, ["t-hand"])
+    task = _answer(capsys)["task"]
+    assert (task["status"], task["assignee"]) == ("todo", "dispatcher")
+
+
+@needs_store
+def test_an_assignee_given_to_a_task_that_had_none_is_a_handoff(project, store,
+                                                                monkeypatch, capsys):
+    entry, _schema, _conn = store
+    _todo(entry, capsys, "t-first")
+    _turns(monkeypatch, _lands(entry, monkeypatch, capsys, "t-first",
+                               "--status", "todo", "--assignee", "dispatcher"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    assert _answer(capsys)["handoff"] is True
+    assert _raises(entry, capsys, "t-first")[0]["status"] == "ok"
+
+
+@needs_store
+def test_landing_in_todo_with_the_same_assignee_and_stage_is_a_failure(
+        project, store, monkeypatch, capsys):
+    entry, _schema, _conn = store
+    _todo(entry, capsys, "t-same", "--assignee", "builder")
+    mod.cmd_meta(entry, ["set", "t-same", "stage", "build"])
+    capsys.readouterr()
+    _turns(monkeypatch, _lands(entry, monkeypatch, capsys, "t-same", "--status", "todo",
+                               "--assignee", "builder"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    assert "handoff" not in report
+    [raised] = _raises(entry, capsys, "t-same")
+    assert raised["status"] == "failed" and "handoff" not in raised["metrics"]
+    # It ended on purpose, badly: not a cut-off, so nothing is resumed from it.
+    assert "cut_off" not in raised["metrics"]
+
+
+@needs_store
+def test_a_new_stage_alone_is_still_a_handoff(project, store, monkeypatch, capsys):
+    entry, _schema, _conn = store
+    _todo(entry, capsys, "t-stage", "--assignee", "builder")
+
+    def turn(execution, session):
+        _as_raise(monkeypatch, capsys, execution,
+                  (mod.cmd_activity, (entry, ["t-stage", "built it"])),
+                  (mod.cmd_meta, (entry, ["set", "t-stage", "stage", "verify"])),
+                  (mod.cmd_set, (entry, ["t-stage", "--status", "todo"])))
+        return _done(session)
+
+    _turns(monkeypatch, turn)
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    assert _answer(capsys)["handoff"] is True
+    [raised] = _raises(entry, capsys, "t-stage")
+    assert raised["status"] == "ok" and raised["metrics"]["handoff"] is True
+
+
+@needs_store
+@pytest.mark.parametrize("set_args, raised_as, task_as, mark", [
+    (("--status", "complete"), "ok", "complete", None),
+    (("--status", "closed"), "ok", "closed", None),
+    (("--status", "waiting", "--assignee", "owner"), "handback", "waiting", None),
+    (("--status", "draft", "--assignee", "dispatcher"), "handback", "draft", None),
+    (("--status", "todo", "--assignee", "dispatcher", "--pickup", "2099-01-01"),
+     "ok", "todo", "waiting"),
+])
+def test_every_other_ending_scores_as_it_did(project, store, monkeypatch, capsys,
+                                             set_args, raised_as, task_as, mark):
+    """A new assignee changes nothing about an ending that was already scored on
+    its own: the status it lands on, or a hold still ahead, decides."""
+    entry, _schema, _conn = store
+    _todo(entry, capsys, "t-end", "--assignee", "builder")
+    _turns(monkeypatch, _lands(entry, monkeypatch, capsys, "t-end", *set_args))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    [raised] = _raises(entry, capsys, "t-end")
+    assert raised["status"] == raised_as
+    assert "handoff" not in raised["metrics"] and "handoff" not in report
+    if mark:
+        assert raised["metrics"][mark] is True
+    mod.cmd_show(entry, ["t-end"])
+    assert _answer(capsys)["task"]["status"] == task_as
+
+
+DECIDER = """---
+takes: {status: [waiting], assignee: [decider]}
+profile: implementation
+---
+
+decide it.
+"""
+
+
+@needs_store
+@pytest.mark.parametrize("set_args, raised_as, task_as, marks", [
+    (("--status", "todo", "--assignee", "builder"), "ok", "todo", {"handoff"}),
+    (("--status", "todo"), "ok", "todo", set()),
+    ((), "failed", "waiting", {"cut_off"}),
+])
+def test_a_raise_taken_from_waiting_scores_its_release_the_same_way(
+        project, store, monkeypatch, capsys, set_args, raised_as, task_as, marks):
+    """Moving a waiting task to todo is the decision it was taken for, with a new
+    assignee or without; a turn that moved nothing sends it back to the wait."""
+    entry, _schema, _conn = store
+    worker_file(project, "decider").write_text(DECIDER)
+    _todo(entry, capsys, "t-wait")
+    mod.cmd_set(entry, ["t-wait", "--status", "waiting", "--assignee", "decider"])
+    capsys.readouterr()
+    _turns(monkeypatch, _lands(entry, monkeypatch, capsys, "t-wait", *set_args))
+    mod.cmd_run(entry, ["decider", "--apply"])
+    _answer(capsys)
+    [raised] = _raises(entry, capsys, "t-wait")
+    assert raised["status"] == raised_as
+    assert {k for k in ("handoff", "cut_off") if raised["metrics"].get(k)} == marks
+    mod.cmd_show(entry, ["t-wait"])
+    assert _answer(capsys)["task"]["status"] == task_as
+
+
+@needs_store
+def test_the_session_is_on_the_raise_from_the_claim(project, store, monkeypatch,
+                                                    capsys):
+    entry, _schema, _conn = store
+    _todo(entry, capsys, "t-ref")
+    seen = {}
+
+    def turn(execution, session):
+        # Read while the turn is still running: the raise names its session.
+        [open_raise] = _raises(entry, capsys, "t-ref")
+        seen.update(raise_=open_raise, session=session)
+        return _lands(entry, monkeypatch, capsys, "t-ref", "--status", "complete")(
+            execution, session)
+
+    _turns(monkeypatch, turn)
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    _answer(capsys)
+    open_raise, session = seen["raise_"], seen["session"]
+    assert open_raise["status"] == "running"
+    assert (open_raise["run_system"], open_raise["run_ref"]) == ("claude", session.id)
+    assert session.kind == "pinned" and session.id
+    [closed] = _raises(entry, capsys, "t-ref")
+    assert closed["status"] == "ok"
+    assert (closed["run_system"], closed["run_ref"]) == ("claude", session.id)
+
+
+@needs_store
+def test_the_harness_is_started_with_the_session_the_raise_names(project, store,
+                                                                 monkeypatch, capsys):
+    """Through the real library and a stand-in CLI: the id it is started with is
+    the one the claim wrote."""
+    entry, _schema, _conn = store
+    report, turn = _harness_turn(project, entry, capsys, monkeypatch,
+                                 "implementation", "defect")
+    [raised] = _raises(entry, capsys, "t-defect")
+    [pinned] = [one.split("=", 1)[1] for one in turn["argv"]
+                if one.startswith("--session-id=")]
+    assert pinned == raised["run_ref"]
+    assert raised["run_system"] == "claude"
+
+
+def _keep_session(project, monkeypatch, ref):
+    """A transcript for this session where claude keeps them."""
+    home = project / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+    folder = home / "projects" / "-some-project"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{ref}.jsonl").write_text("{}\n")
+
+
+def _cut(entry, monkeypatch, capsys, key):
+    """A turn that worked, wrote to the trail, and was then killed at its limit
+    with the task still in progress."""
+    def turn(execution, session):
+        _as_raise(monkeypatch, capsys, execution,
+                  (mod.cmd_activity, (entry, [key, "halfway through"])))
+        return _timed_out(session)
+    return turn
+
+
+@needs_store
+def test_a_cut_off_raise_is_resumed_by_the_same_worker(project, store, monkeypatch,
+                                                       capsys):
+    entry, _schema, _conn = store
+    _todo(entry, capsys, "t-cut")
+    seen = {}
+
+    def resumed(execution, session):
+        [_first, second] = _raises(entry, capsys, "t-cut")
+        seen["open"] = second
+        return _lands(entry, monkeypatch, capsys, "t-cut", "--status", "complete")(
+            execution, session)
+
+    harness = _turns(monkeypatch, _cut(entry, monkeypatch, capsys, "t-cut"), resumed)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(project / "claude-config"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    _answer(capsys)
+    [first] = _raises(entry, capsys, "t-cut")
+    assert first["status"] == "failed" and first["metrics"]["cut_off"] is True
+    _keep_session(project, monkeypatch, first["run_ref"])
+
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    call = harness.calls[1]
+    assert call["session"].kind == "resume" and call["session"].id == first["run_ref"]
+    prompt = call["prompt"]
+    assert "was cut off" in prompt and str(first["task_id"]) in prompt
+    assert "Continue from where the turn stopped" in prompt
+    assert "the frame at the start of this session" in prompt
+    assert "You are the worker" not in prompt and "TASK DATA" not in prompt
+    # A new raise as always, naming the session it continues from the claim on.
+    assert call["execution"] != harness.calls[0]["execution"]
+    assert seen["open"]["run_ref"] == first["run_ref"]
+    assert report["resumed_from"] == str(first["id"]) and report["attempt"] == 2
+    [_first, second] = _raises(entry, capsys, "t-cut")
+    assert second["status"] == "ok" and second["run_ref"] == first["run_ref"]
+    assert second["metrics"]["resumed_from"] == str(first["id"])
+    assert second["detail"] is None
+
+
+def _abandoned_raise(entry, conn, schema, worker, ref):
+    """A raise of `worker` whose lease has lapsed, as a killed turn leaves one."""
+    held = mod._claim(entry, {"lease": "600", "worker": worker, "handler": "h",
+                              "run": ("claude", ref), "type": "defect"})
+    conn.execute(f"""update {schema}.task_executions
+                        set lease_until = now() - interval '1 second'
+                      where id = %s""", (held["execution"]["id"],))
+    return held
+
+
+@needs_store
+def test_a_lapsed_raise_of_the_same_worker_is_resumed(project, store, monkeypatch,
+                                                      capsys):
+    entry, schema, conn = store
+    _todo(entry, capsys, "t-lapse")
+    ref = "0f3c2a1e-0000-4000-8000-000000000001"
+    _abandoned_raise(entry, conn, schema, "implementation", ref)
+    _keep_session(project, monkeypatch, ref)
+    harness = _turns(monkeypatch, _lands(entry, monkeypatch, capsys, "t-lapse",
+                                         "--status", "complete"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    _answer(capsys)
+    [first, second] = _raises(entry, capsys, "t-lapse")
+    assert first["status"] == "abandoned"
+    assert harness.calls[0]["session"].kind == "resume"
+    assert harness.calls[0]["session"].id == ref
+    assert "lease lapsed" in harness.calls[0]["prompt"]
+    assert second["run_ref"] == ref and second["metrics"]["resumed_from"] == str(first["id"])
+
+
+@needs_store
+def test_a_cut_off_raise_of_another_worker_is_never_resumed(project, store, monkeypatch,
+                                                            capsys):
+    entry, schema, conn = store
+    _todo(entry, capsys, "t-other")
+    ref = "0f3c2a1e-0000-4000-8000-000000000002"
+    _abandoned_raise(entry, conn, schema, "someone-else", ref)
+    _keep_session(project, monkeypatch, ref)
+    harness = _turns(monkeypatch, _lands(entry, monkeypatch, capsys, "t-other",
+                                         "--status", "complete"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    call = harness.calls[0]
+    assert call["session"].kind == "pinned" and call["session"].id != ref
+    assert "You are the worker `implementation`" in call["prompt"]
+    assert "resumed_from" not in report
+    assert _raises(entry, capsys, "t-other")[1]["run_ref"] == call["session"].id
+
+
+@needs_store
+def test_a_raise_that_ended_on_its_own_is_never_resumed(project, store, monkeypatch,
+                                                        capsys):
+    entry, _schema, _conn = store
+    _todo(entry, capsys, "t-ended")
+    harness = _turns(monkeypatch,
+                     _lands(entry, monkeypatch, capsys, "t-ended", "--status", "todo"),
+                     _lands(entry, monkeypatch, capsys, "t-ended", "--status", "complete"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    _answer(capsys)
+    [first] = _raises(entry, capsys, "t-ended")
+    assert first["status"] == "failed" and "cut_off" not in first["metrics"]
+    _keep_session(project, monkeypatch, first["run_ref"])
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    assert harness.calls[1]["session"].kind == "pinned"
+    assert harness.calls[1]["session"].id != first["run_ref"]
+    assert "You are the worker `implementation`" in harness.calls[1]["prompt"]
+    assert "resumed_from" not in report and "resume_fell_back" not in report
+
+
+@needs_store
+def test_a_session_no_longer_kept_starts_fresh_and_says_so(project, store, monkeypatch,
+                                                           capsys):
+    entry, schema, conn = store
+    _todo(entry, capsys, "t-gone")
+    ref = "0f3c2a1e-0000-4000-8000-000000000003"
+    _abandoned_raise(entry, conn, schema, "implementation", ref)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(project / "empty-claude-config"))
+    harness = _turns(monkeypatch, _lands(entry, monkeypatch, capsys, "t-gone",
+                                         "--status", "complete"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    [call] = harness.calls
+    assert call["session"].kind == "pinned" and call["session"].id != ref
+    assert "You are the worker `implementation`" in call["prompt"]
+    assert "no longer on this machine" in report["resume_fell_back"]
+    [_first, second] = _raises(entry, capsys, "t-gone")
+    assert second["status"] == "ok" and second["run_ref"] == call["session"].id
+    assert "no longer on this machine" in second["detail"] and ref in second["detail"]
+    assert "resumed_from" not in second["metrics"]
+
+
+@needs_store
+def test_a_resume_refused_at_launch_starts_fresh_and_says_so(project, store, monkeypatch,
+                                                             capsys):
+    entry, schema, conn = store
+    _todo(entry, capsys, "t-refused")
+    ref = "0f3c2a1e-0000-4000-8000-000000000004"
+    _abandoned_raise(entry, conn, schema, "implementation", ref)
+    _keep_session(project, monkeypatch, ref)
+
+    def refused(execution, session):
+        return Result(ok=False, harness="claude", session_id=session.id,
+                      failure=Failure(FailureKind.ERROR,
+                                      f"No conversation found with session ID: {ref}"))
+
+    harness = _turns(monkeypatch, refused,
+                     _lands(entry, monkeypatch, capsys, "t-refused", "--status", "complete"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    resume, fresh = harness.calls
+    assert resume["session"].kind == "resume" and resume["session"].id == ref
+    assert fresh["session"].kind == "pinned" and fresh["session"].id != ref
+    assert "You are the worker `implementation`" in fresh["prompt"]
+    # One raise for both launches: the fresh turn is this raise's turn.
+    assert resume["execution"] == fresh["execution"]
+    assert "failed at launch" in report["resume_fell_back"]
+    [_first, second] = _raises(entry, capsys, "t-refused")
+    assert second["status"] == "ok" and second["run_ref"] == fresh["session"].id
+    assert "failed at launch" in second["detail"]
+    assert "No conversation found" in second["detail"]
+    assert report["attempt"] == 2
+
+
+CODEX_PROFILE = """harness = "codex"
+model = "gpt-6-sol"
+timeout_seconds = 1800
+"""
+
+
+@needs_store
+def test_a_codex_profile_keeps_starting_fresh(project, store, monkeypatch, capsys):
+    """Codex takes no chosen id, so its raise names its run when it is closed and
+    a cut-off turn of it is started again from the whole frame."""
+    entry, _schema, _conn = store
+    names(project, "implementation", "codex-act", CODEX_PROFILE)
+    _todo(entry, capsys, "t-codex")
+    seen = {}
+
+    def cut(execution, session):
+        [open_raise] = _raises(entry, capsys, "t-codex")
+        seen["open"] = open_raise
+        _as_raise(monkeypatch, capsys, execution,
+                  (mod.cmd_activity, (entry, ["t-codex", "halfway through"])))
+        return Result(ok=False, harness="codex", session_id="thread-1",
+                      duration_ms=10_800_000,
+                      failure=Failure(FailureKind.TIMEOUT, "turn timed out after 1800s"))
+
+    def finish(execution, session):
+        _as_raise(monkeypatch, capsys, execution,
+                  (mod.cmd_set, (entry, ["t-codex", "--status", "complete"])))
+        return Result(ok=True, harness="codex", session_id="thread-2", cost_usd=0.1,
+                      duration_ms=10, num_turns=1)
+
+    harness = _turns(monkeypatch, cut, finish)
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    _answer(capsys)
+    assert seen["open"]["run_system"] is None and seen["open"]["run_ref"] is None
+    [first] = _raises(entry, capsys, "t-codex")
+    assert first["metrics"]["cut_off"] is True
+    assert (first["run_system"], first["run_ref"]) == ("codex", "thread-1")
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    for call in harness.calls:
+        assert call["harness"] == "codex" and call["session"].kind == "fresh"
+        assert "You are the worker `implementation`" in call["prompt"]
+    assert "resumed_from" not in report and "resume_fell_back" not in report
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

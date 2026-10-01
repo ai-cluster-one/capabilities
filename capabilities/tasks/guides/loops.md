@@ -29,7 +29,7 @@ Moving a task from `draft` to `todo` is the act that permits work on it. It belo
 
 A role taking `[defect, change]` carries released work to a verified result. Its body and routines make it an orchestrator: it gives the work to one executor and the result to an independent reviewer that sees the goal and the result but not the executor's reasoning, and returns accepted findings to the same executor. That orchestration happens inside the role's turn, so its profile has to allow the turn to start agents and to run as long as the work takes.
 
-The role ends its task in one of four places: `complete` when the work is done, `closed` when it will not be done, `todo` with a new `stage` in metadata when it reached a boundary the next turn continues from, or `waiting` on the supervisor when it needs a decision.
+The role ends its task in one of four places: `complete` when the work is done, `closed` when it will not be done, `todo` with a new `stage` in metadata, or assigned to the role that carries the next step, when it reached a boundary the next turn continues from, or `waiting` on the supervisor when it needs a decision.
 
 ### A proposal goes through evaluation to a decision
 
@@ -58,7 +58,7 @@ A task need not wait on a person. Landed in `waiting` with a pickup moment (`tas
 The capability provides the guard rails under that design:
 
 - Worker scope. What a turn may write is fixed by its raise at the claim and enforced by the store, and a refusal exits 4 naming the rule. A raise that has ended writes no field anywhere.
-- Leases. A claim is held by a lease, derived from the profile's timeout unless the worker sets `lease_seconds`. A turn that dies renews nothing; the next claim closes its raise as abandoned and frees the task.
+- Leases. A claim is held by a lease, derived from the profile's timeout unless the worker sets `lease_seconds`. A turn that dies renews nothing; the next claim closes its raise as abandoned and frees the task. When the same worker takes that task again on a claude profile, its turn resumes the session that was cut off rather than starting over.
 - Attempts and parking. A task raised `attempts` times without finishing is parked - handed back for a decision, with the worker's `park_hint` - instead of dispatched again. A turn that ran out of quota or never got to the work is not an attempt, and a worker naming a missing profile or routine parks without spending one.
 - Waiting stays waiting. Whatever a turn on a task taken from `waiting` fails to settle - a lease that lapses, a turn that never got to the work, a turn that ended with the task still in progress - goes back to `waiting` rather than into the queue, and a park lands it in `draft`, because a wait would hand it straight back.
 - A trace for every turn. Every raise leaves an entry on the trail, so a stalled loop is visible on the task. `tasks runs <task>` lists every raise and what came of it, and `tasks history <task>` how its status and assignee moved.
