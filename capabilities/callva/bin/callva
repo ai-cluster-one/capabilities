@@ -14,6 +14,10 @@ agents, assets (prompts), calls, transcripts, recordings, analytics, custom
 fields, webhook schedules, automations (Windmill scripts), webhook logs,
 variables, settings, projects, phone numbers, and providers.
 
+`agents config` is the one place callva reaches outside the External API: it
+calls the platform's call-configuration endpoint, POST /config/livekit, on the
+same base URL with the same key.
+
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
   connection. Its values resolve by the cascade (first non-empty wins):
@@ -47,8 +51,9 @@ CONNECTIONS
   read-only: every mutating verb (the create/update/delete/batch/store/
   reorder/deploy/run actions on agents, assets, calls, transcripts, fields,
   field-groups, schedules, automations, and variables, the add/update/remove/
-  toggle trigger actions on automations, plus the outbound `call`) exits 4, and
-  no flag lifts the gate.
+  toggle trigger actions on automations, the outbound `call`, and `agents
+  config`, which runs the agent's start-of-call automation) exits 4, and no
+  flag lifts the gate.
 
   Selection: --connection <id> (accepted anywhere on the command line).
   Unflagged, the registry's "default" pointer applies, else the sole entry;
@@ -91,6 +96,7 @@ Commands (`-f key=value` is repeatable for list filters):
                      [--agent-speaks-first B] [--config JSON] [--data JSON]
   agents clone <id> [--name N]
   agents delete <id>
+  agents config <id> [--direction inbound|outbound]
 
   --data is the base object of an update and every flag above writes over it
   under that flag's own key: pass --data and --prompt together and the prompt
@@ -103,6 +109,15 @@ Commands (`-f key=value` is repeatable for list filters):
   configuration per preset and keeps the ones it is not running, so switching
   stacks loses nothing — and comparing two configurations of one stack means
   two agents, which is what `agents clone` is for.
+
+  `agents get` and `presets get` show what is stored; `agents config` shows
+  what a call actually starts from — the configuration the voice worker is
+  handed for a call in that direction (default inbound): the agent, its active
+  preset including backend_instructions, every {{prompt:...}} reference
+  resolved, and whatever the agent's custom_config_url automation returned.
+  Producing it runs that automation and files a call record on the platform,
+  left in status `starting`, so the verb is write-gated; run it only against an
+  agent whose start-of-call automation is safe to fire.
 
   presets catalog
   presets describe <preset> [--group G]
@@ -349,6 +364,7 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platform
     "agents update", "agents delete", "agents clone",
+    "agents config",    # runs the agent's custom_config_url automation
     "presets set", "presets patch", "presets activate",
     "tools set", "tools patch", "tools delete",
     "assets create", "assets update", "assets delete",
@@ -4077,6 +4093,19 @@ def agents_delete(args):
     return {"deleted": args.id}
 
 
+def agents_config(args):
+    """The configuration a call starts from, as the voice worker receives it.
+
+    This is the one endpoint callva calls outside /external/: the platform
+    composes the agent, its active preset and resolved prompt assets, then runs
+    the agent's custom_config_url automation over the result. Returned as sent,
+    since the composition is the thing being inspected.
+    """
+    return api("POST", "/config/livekit",
+               {"agent_id": args.id, "direction": args.direction},
+               query={"agent_id": args.id})
+
+
 # ---------------------------------------------------------------------------
 # Presets — the speech stack an agent runs on
 # ---------------------------------------------------------------------------
@@ -5172,6 +5201,10 @@ def build_parser():
     ag_cl.add_argument("--name", help="Name for the copy; derived from the source when omitted")
     ag_del = ag_sub.add_parser("delete", help="Delete agent")
     ag_del.add_argument("id", help="Agent UUID")
+    ag_cfg = ag_sub.add_parser("config", help="The configuration a call starts from (runs its start-of-call automation)")
+    ag_cfg.add_argument("id", help="Agent UUID")
+    ag_cfg.add_argument("--direction", choices=["inbound", "outbound"], default="inbound",
+                        help="Which call to compose for (default inbound)")
 
     # --- presets ---
     pr = subs.add_parser("presets", help="The speech stack an agent runs on")
@@ -5558,6 +5591,7 @@ DISPATCH = {
     "agents": {
         "list": agents_list, "default": agents_default, "get": agents_get,
         "update": agents_update, "clone": agents_clone, "delete": agents_delete,
+        "config": agents_config,
     },
     "presets": {
         "catalog": presets_catalog, "describe": presets_describe,
