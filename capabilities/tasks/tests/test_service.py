@@ -120,8 +120,9 @@ def test_every_enabled_worker_that_takes_something_is_a_lane(project):
     assert [(lane["worker"], lane["max_parallel"]) for lane in declaration["lanes"]] == [
         ("alpha", 1), ("beta", 1)]
     idle = {row["worker"]: row["why"] for row in declaration["idle"]}
-    assert set(idle) == {"default", "triage"}
+    assert set(idle) == {"default", "supervisor", "triage"}
     assert "on request" in idle["triage"] and "enabled: false" in idle["default"]
+    assert "enabled: false" in idle["supervisor"]
 
 
 def test_the_shipped_default_is_a_lane_taking_what_nobody_names(project):

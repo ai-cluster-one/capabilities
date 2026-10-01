@@ -324,8 +324,9 @@ def test_the_report_names_every_worker_and_what_is_wrong(project):
     rewrite(profile_file(project, "evaluation"), 'permission_mode = "default"',
             'fence = "read"')
     rows, broken = mod._workers_report()
-    assert [row["worker"] for row in rows] == ["default", "evaluation", "implementation"]
-    assert [row["ok"] for row in rows] == [True, False, True]
+    assert [row["worker"] for row in rows] == ["default", "evaluation", "implementation",
+                                               "supervisor"]
+    assert [row["ok"] for row in rows] == [True, False, True, True]
     assert len(broken) == 1 and broken[0].startswith("evaluation:")
 
 
