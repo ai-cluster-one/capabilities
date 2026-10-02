@@ -56,10 +56,12 @@ USAGE
       level with the branch it tracks, in both directions, so what was pushed
       reaches the box and what the agent commits there both survives a redeploy
       and reaches the remote. `host-agents` supervises the same declared
-      services as processes on the machine itself: `sync` writes one launchd
-      agent per service under `compiler.host.agents_dir`, and `deployment next`
-      hands over the launchctl steps. `generic` stays declaration-only. Run
-      `deployment guide profiles` for the trade-offs.
+      services as processes on the machine itself, on macOS: `sync` writes one
+      launchd agent per service under `compiler.host.agents_dir`, and
+      `deployment next` hands over the launchctl steps. `generic` stays
+      declaration-only. A Linux host uses a container profile, or `generic`
+      with a supervisor the project owns. Run `deployment guide profiles` for
+      the trade-offs.
 
   deployment freeze [--force]
       Refresh deployment/capabilities.lock from the current project capability gate.
@@ -179,8 +181,8 @@ from typing import NoReturn
 
 NAME = "deployment"
 SUMMARY = ("Project deployment standard - declare the services a project runs, "
-           "compile them into a container image or into supervised processes "
-           "on the machine itself, and describe the targets they deploy to.")
+           "compile them into a container image or into launchd-supervised "
+           "processes on a Mac, and describe the targets they deploy to.")
 SCOPE = "project"
 CRED_KEYS: list = []
 WRITE_VERBS = {"init", "freeze", "setup", "scaffold", "sync"}

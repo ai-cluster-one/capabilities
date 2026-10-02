@@ -28,7 +28,8 @@ arrives at run time on a volume. Everything else about it - the Compose file,
 the embedded services, the Supervisor configuration, the mounts - is what
 `agent-box` produces.
 
-`host-agents` compiles supervised processes on the machine itself. There is no
+`host-agents` compiles supervised processes on the machine itself, and that
+machine is a Mac: launchd is the one supervisor it compiles for. There is no
 image and no Compose file. `sync` writes one launchd agent per service into
 `compiler.host.agents_dir` (default `deployment/launchd/`), and `deployment
 next` prints the `launchctl` steps that hand them over.
@@ -36,6 +37,11 @@ next` prints the `launchctl` steps that hand them over.
 `generic` declares a runtime without compiling anything. Use it when the
 project describes its shape for a reader and something outside this capability
 executes it.
+
+A Linux host runs the same services one of two ways. A container profile
+compiles them into the image and Compose file the host runs. `generic` declares
+them, and a supervisor the project owns on that host - a
+systemd unit, for instance - starts them and keeps them running.
 
 ## What changes between a baked body and a checkout body
 
